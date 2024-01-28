@@ -29,14 +29,13 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install '.[tests,tgs]'
-        mypy --install-types --non-interactive -p efb_telegram_master
     - name: Install binary dependencies
       run: |
         sudo apt update
         sudo apt install -y ffmpeg libmagic-dev libwebp6
     - name: Check with mypy
       run: |
-        mypy -p efb_telegram_master --ignore-missing-imports
+        mypy -p efb_telegram_master --ignore-missing-imports --non-interactive
     - name: Test with pytest (unit tests only)
       env:
         TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
