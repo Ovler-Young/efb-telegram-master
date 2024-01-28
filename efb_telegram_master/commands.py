@@ -70,10 +70,10 @@ class CommandsManager(LocaleMixin):
 
     def register_command(self, message: Message, commands: ETMCommandMsgStorage):
         message_identifier = (message.chat.id, message.message_id)
-        self.command_conv.conversations[message_identifier] = Flags.COMMAND_PENDING
+        self.command_conv._conversations[message_identifier] = Flags.COMMAND_PENDING
         self.msg_storage[message_identifier] = commands
 
-    def command_exec(self, update: Update, context: CallbackContext) -> Optional[int]:
+    async def command_exec(self, update: Update, context: CallbackContext) -> Optional[int]:
         """
         Run a command from a command message.
         Triggered by callback message with status `Flags.COMMAND_PENDING`.
