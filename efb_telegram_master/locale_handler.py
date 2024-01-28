@@ -6,16 +6,16 @@ from pkg_resources import resource_filename
 from typing import TYPE_CHECKING
 
 from language_tags import tags
-from telegram.ext.handler import Handler
+from telegram.ext.handler import BaseHandler
 from telegram import Update
 
 if TYPE_CHECKING:
     from . import TelegramChannel
 
 
-class LocaleHandler(Handler):
+class LocaleHandler(BaseHandler):
     """
-    Handler class Extract.
+    BaseHandler class Extract.
 
     Args:
         channel (TelegramChannel): The ETM channel object.
