@@ -297,7 +297,7 @@ class DatabaseManager:
             return log.master_msg_id
         return None
 
-    def pickle_misc_msg(self, message: EFBMessage) -> Optional[bytes]:
+    async def pickle_misc_msg(self, message: EFBMessage) -> Optional[bytes]:
         """Pickle miscellaneous information of a message.
 
         Since 2.0.0b34, this would be a dict that reflects the following
@@ -321,12 +321,12 @@ class DatabaseManager:
         if message.substitutions:
             data['substitutions'] = {
                 k: chat_id_to_str(chat=v)
-                for k, v in message.substitutions.items()
+                for k, v in await message.substitutions.items()
             }
         if message.reactions:
             data['reactions'] = {
                 k: tuple(chat_id_to_str(chat=i) for i in v)
-                for k, v in message.reactions.items()
+                for k, v in await message.reactions.items()
             }
         if message.target:
             target_id = self.get_master_msg_id(message.target)

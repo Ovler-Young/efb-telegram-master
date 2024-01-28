@@ -11,8 +11,7 @@ import cjkwrap
 from ruamel.yaml import YAML
 from telegram import Bot
 from telegram.error import TelegramError
-from telegram.ext.filters import Filters
-from telegram.ext import MessageHandler, Updater
+from telegram.ext import MessageHandler, Updater, filters
 from telegram.utils.request import Request
 
 from ehforwarderbot import coordinator, utils
@@ -346,7 +345,7 @@ def input_admin_ids(default=None):
             return values
 
 
-def setup_admins(data):
+async def setup_admins(data):
     print()
     print_wrapped(_(
         "2. Set up Bot administrators\n"
@@ -371,18 +370,18 @@ def setup_admins(data):
             updater = Updater(token=data.data['token'],
                               request_kwargs=data.data.get(
                                   'request_kwargs', None))
-            updater.dispatcher.add_handler(
+            updater.application.add_handler(
                 MessageHandler(
-                    Filters.all,
+                    filters.ALL,
                     lambda update, context:
-                    update.effective_message.reply_text(
+                    await update.effective_message.reply_text(
                         _("Your Telegram user ID is {id}.").format(
                             id=update.effective_user.id
                         )
                     )
                 )
             )
-            updater.start_polling()
+            application.run_polling()
 
             print(_("OK"))
             print()

@@ -10,7 +10,7 @@ import humanize
 from telegram import Update, Message, Chat, Contact, File
 from telegram.constants import MAX_FILESIZE_DOWNLOAD
 from telegram.error import TelegramError
-from telegram.ext import MessageHandler, Filters, CallbackContext, CommandHandler
+from telegram.ext import MessageHandler, filters, CallbackContext, CommandHandler
 from telegram.helpers import escape_markdown
 
 from ehforwarderbot import coordinator
@@ -60,25 +60,25 @@ class MasterMessageProcessor(LocaleMixin):
         TGMsgType.Dice: MsgType.Text,
     }
 
-    def __init__(self, channel: 'TelegramChannel'):
+    async def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
 
-        self.bot.dispatcher.add_handler(CommandHandler("rm", self.delete_message))
+        await self.bot.application.add_handler(CommandHandler("rm", self.delete_message))
 
-        self.bot.dispatcher.add_handler(MessageHandler(
-            (Filters.text | Filters.photo | Filters.sticker | Filters.document |
-             Filters.venue | Filters.location | Filters.audio | Filters.voice |
-             Filters.video | Filters.contact | Filters.video_note | Filters.dice) &
-            Filters.update,
+        await self.bot.application.add_handler(MessageHandler(
+            (filters.TEXT | filters.PHOTO | filters.STICKER | filters.DOCUMENT |
+             filters.VENUE | filters.LOCATION | filters.AUDIO | filters.VOICE |
+             filters.VIDEO | filters.CONTACT | filters.VIDEO_NOTE | filters.DICE) &
+            filters.UPDATE,
             self.enqueue_message
         ))
-        self.bot.dispatcher.add_handler(MessageHandler(
-            (Filters.passport_data | Filters.invoice | Filters.game | Filters.successful_payment |
-             Filters.poll) & Filters.update,
+        await self.bot.application.add_handler(MessageHandler(
+            (filters.PASSPORT_DATA | filters.INVOICE | filters.GAME | filters.SUCCESSFUL_PAYMENT |
+             filters.POLL) & filters.UPDATE,
             self.unsupported_message
         ))
         self.logger: logging.Logger = logging.getLogger(__name__)
@@ -92,7 +92,7 @@ class MasterMessageProcessor(LocaleMixin):
         self.message_worker_thread = Thread(target=self.message_worker, name="ETM master messages worker thread")
         self.message_worker_thread.start()
 
-    def message_worker(self):
+    async def message_worker(self):
         # TODO: Implement a per-chat queue to prevent one message blocking all others?
         while True:
             content = self.message_queue.get()
@@ -106,7 +106,7 @@ class MasterMessageProcessor(LocaleMixin):
                 self.logger.exception(
                     "Error [%r] occurred while processing update %s.", e, update)
                 if update.effective_message:
-                    update.effective_message.reply_text(
+                    await update.effective_message.reply_text(
                         self._("Unknown error has occurred while "
                                "trying to process this message. See log for "
                                "details.\n\n{error!r}").format(error=e))
@@ -119,17 +119,17 @@ class MasterMessageProcessor(LocaleMixin):
         self.message_queue.put(None)
         self.message_worker_thread.join()
 
-    def enqueue_message(self, update: Update, context: CallbackContext):
+    async def enqueue_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
 
         self.message_queue.put((update, context))
         if not self.message_worker_thread.is_alive():
             if update.effective_message:
-                update.effective_message.reply_text(
+                await update.effective_message.reply_text(
                     self._(
                         "ETM message worker is not running due to unforeseen reason. This might be a bug. Please see log for details."))
 
-    def msg(self, update: Update, context: CallbackContext):
+    async def msg(self, update: Update, context: CallbackContext):
         """
         Process, wrap and dispatch messages from user.
         """
@@ -140,7 +140,7 @@ class MasterMessageProcessor(LocaleMixin):
         message: Message = update.effective_message
         mid = utils.message_id_to_str(update=update)
 
-        self.logger.debug("[%s] Received message from Telegram: %s", mid, message.to_dict())
+        self.logger.debug("[%s] Received message from Telegram: %s", mid, await message.to_dict())
 
         destination = None
         edited = None
@@ -150,7 +150,7 @@ class MasterMessageProcessor(LocaleMixin):
             self.logger.debug('[%s] Message is edited: %s', mid, message.edit_date)
             msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update))
             if not msg_log or msg_log.slave_message_id == self.db.FAIL_FLAG:
-                message.reply_text(self._("Error: This message cannot be edited, and thus is not sent. (ME01)"), quote=True)
+                await message.reply_text(self._("Error: This message cannot be edited, and thus is not sent. (ME01)"), quote=True)
                 return
             destination = msg_log.slave_origin_uid
             edited = msg_log
@@ -195,14 +195,14 @@ class MasterMessageProcessor(LocaleMixin):
             )
             if candidates:
                 self.logger.debug("[%s] Candidate suggestions are found for this message: %s", mid, candidates)
-                tg_err_msg = message.reply_text(self._("Error: No recipient specified.\n"
+                tg_err_msg = await message.reply_text(self._("Error: No recipient specified.\n"
                                                        "Please reply to a previous message. (MS01)"), quote=True)
                 self.channel.chat_binding.register_suggestions(update, candidates,
                                                                TelegramChatID(update.effective_chat.id),
                                                                TelegramMessageID(tg_err_msg.message_id))
             else:
                 self.logger.debug("[%s] Candidate suggestions not found, give up.", mid)
-                message.reply_text(self._("Error: No recipient specified.\n"
+                await message.reply_text(self._("Error: No recipient specified.\n"
                                           "Please reply to a previous message. (MS02)"), quote=True)
         else:
             return self.process_telegram_message(update, context, destination, quote=quote, edited=edited)
@@ -217,7 +217,7 @@ class MasterMessageProcessor(LocaleMixin):
             return chats[0]
         return None
 
-    def process_telegram_message(self, update: Update, context: CallbackContext,
+    async def process_telegram_message(self, update: Update, context: CallbackContext,
                                  destination: EFBChannelChatIDStr, quote: bool = False,
                                  edited: Optional["MsgLog"] = None):
         """
@@ -240,7 +240,7 @@ class MasterMessageProcessor(LocaleMixin):
 
         channel, uid, gid = utils.chat_id_str_to_id(destination)
         if channel not in coordinator.slaves:
-            return self.bot.reply_error(update,
+            return await self.bot.reply_error(update,
                                         self._("Internal error: Slave channel “{0}” not found.").format(channel))
 
         m = ETMMsg()
@@ -306,11 +306,11 @@ class MasterMessageProcessor(LocaleMixin):
                     ))
                     if not self.channel.flag('prevent_message_removal'):
                         try:
-                            message.delete()
+                            await message.delete()
                         except TelegramError:
-                            message.reply_text(self._("Message is removed in remote chat."))
+                            await message.reply_text(self._("Message is removed in remote chat."))
                     else:
-                        message.reply_text(self._("Message is removed in remote chat."))
+                        await message.reply_text(self._("Message is removed in remote chat."))
                     log_message = False
                     return
                 self.logger.debug('[%s] Message is edited (%s)', m.uid, m.edit)
@@ -409,17 +409,17 @@ class MasterMessageProcessor(LocaleMixin):
             else:
                 m.uid = None
         except EFBChatNotFound as e:
-            self.bot.reply_error(update, e.args[0] or self._("Chat is not found."))
+            await self.bot.reply_error(update, e.args[0] or self._("Chat is not found."))
         except EFBMessageTypeNotSupported as e:
-            self.bot.reply_error(update, e.args[0] or self._("Message type is not supported."))
+            await self.bot.reply_error(update, e.args[0] or self._("Message type is not supported."))
         except EFBOperationNotSupported as e:
-            self.bot.reply_error(update,
+            await self.bot.reply_error(update,
                                  self._("Message editing is not supported.\n\n{exception!s}".format(exception=e)))
         except EFBException as e:
-            self.bot.reply_error(update, self._("Message is not sent.\n\n{exception!s}".format(exception=e)))
+            await self.bot.reply_error(update, self._("Message is not sent.\n\n{exception!s}".format(exception=e)))
             self.logger.exception("Message is not sent. (update: %s, exception: %s)", update, e)
         except Exception as e:
-            self.bot.reply_error(update, self._("Message is not sent.\n\n{exception!r}".format(exception=e)))
+            await self.bot.reply_error(update, self._("Message is not sent.\n\n{exception!r}".format(exception=e)))
             self.logger.exception("Message is not sent. (update: %s, exception: %s)", update, e)
         finally:
             if log_message:
@@ -453,7 +453,7 @@ class MasterMessageProcessor(LocaleMixin):
                           tg_msg.message_id, target_msg.chat.uid, target_msg.uid)
         return etm_msg
 
-    def _send_cached_chat_warning(self, update: Update,
+    async def _send_cached_chat_warning(self, update: Update,
                                   cache_key: TelegramChatID,
                                   cached_dest: EFBChannelChatIDStr):
         """Send warning about cached chat."""
@@ -473,7 +473,7 @@ class MasterMessageProcessor(LocaleMixin):
                 dest_name = dest_chat.full_name
             else:
                 dest_name = cached_dest
-            update.effective_message.reply_text(
+            await update.effective_message.reply_text(
                 self._(
                     "This message is sent to “{dest}” with quick reply feature.\n"
                     "\n"
@@ -504,7 +504,7 @@ class MasterMessageProcessor(LocaleMixin):
                     "Attachment is too large ({size}). Maximum allowed by Telegram Bot API is {max_size}. (AT01)").format(
                     size=size_str, max_size=max_size_str))
 
-    def delete_message(self, update: Update, context: CallbackContext):
+    async def delete_message(self, update: Update, context: CallbackContext):
         """Remove an arbitrary message from its remote chat.
         Triggered by command ``/rm``.
         """
@@ -513,7 +513,7 @@ class MasterMessageProcessor(LocaleMixin):
 
         message: Message = update.message
         if message.reply_to_message is None:
-            return self.bot.reply_error(update, self._(
+            return await self.bot.reply_error(update, self._(
                 "Reply /rm to a message to remove it from its remote chat."
             ))
         reply: Message = message.reply_to_message
@@ -522,18 +522,18 @@ class MasterMessageProcessor(LocaleMixin):
                 chat_id=TelegramChatID(reply.chat_id),
                 message_id=TelegramMessageID(reply.message_id)))
         if not msg_log or msg_log.slave_member_uid == self.db.FAIL_FLAG:
-            return self.bot.reply_error(update, self._(
+            return await self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."
             ))
         try:
             etm_msg: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
         except UnpicklingError:
-            return self.bot.reply_error(update, self._(
+            return await self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."
             ))
         dest_channel = coordinator.slaves.get(etm_msg.chat.module_id, None)
         if dest_channel is None:
-            return self.bot.reply_error(update, self._(
+            return await self.bot.reply_error(update, self._(
                 "Module of this message ({module_id}) could not be found, or is not a slave channel."
             ).format(module_id=etm_msg.chat.module_id))
         # noinspection PyBroadException
@@ -559,12 +559,12 @@ class MasterMessageProcessor(LocaleMixin):
         else:
             reply.reply_text(self._("Message is removed in remote chat."))
 
-    def unsupported_message(self, update: Update, context: CallbackContext):
+    async def unsupported_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
         assert update.effective_message
 
         message_type = get_msg_type(update.effective_message)
-        self.bot.reply_error(
+        await self.bot.reply_error(
             update,
             self._("{type_name} messages are not supported by "
                    "EFB Telegram Master channel.")

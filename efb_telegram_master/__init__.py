@@ -15,7 +15,7 @@ from PIL import Image, WebPImagePlugin
 from pkg_resources import resource_filename
 from ruamel.yaml import YAML
 from telegram import Update, Message
-from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext, Filters
+from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext, filters
 
 import ehforwarderbot  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, coordinator
@@ -135,18 +135,18 @@ class TelegramChannel(MasterChannel):
                                           fallback=True)
 
         # Basic message handlers
-        non_edit_filter = Filters.update.message | Filters.update.channel_post
-        self.bot_manager.dispatcher.add_handler(
+        non_edit_filter = filters.Update.MESSAGE | filters.Update.channel_post
+        self.bot_manager.application.add_handler(
             CommandHandler("start", self.start, filters=non_edit_filter))
-        self.bot_manager.dispatcher.add_handler(
+        self.bot_manager.application.add_handler(
             CommandHandler("help", self.help, filters=non_edit_filter))
-        self.bot_manager.dispatcher.add_handler(
+        self.bot_manager.application.add_handler(
             CommandHandler("info", self.info, filters=non_edit_filter))
-        self.bot_manager.dispatcher.add_handler(
+        self.bot_manager.application.add_handler(
             CallbackQueryHandler(self.void_callback_handler, pattern="void"))
-        self.bot_manager.dispatcher.add_handler(
+        self.bot_manager.application.add_handler(
             await CallbackQueryHandler(self.bot_manager.session_expired))
-        self.bot_manager.dispatcher.add_handler(
+        self.bot_manager.application.add_handler(
             CommandHandler("react", self.react, filters=non_edit_filter)
         )
 
@@ -154,7 +154,7 @@ class TelegramChannel(MasterChannel):
         # commands to be delivered as messages
         self.master_messages: MasterMessageProcessor = MasterMessageProcessor(self)
 
-        self.bot_manager.dispatcher.add_error_handler(self.error)
+        self.bot_manager.application.add_error_handler(self.error)
 
         self.rpc_utilities = RPCUtilities(self)
 
@@ -196,7 +196,7 @@ class TelegramChannel(MasterChannel):
 
             self.config = data.copy()
 
-    def info(self, update: Update, context: CallbackContext):
+    async def info(self, update: Update, context: CallbackContext):
         """
         Show info of the current telegram conversation.
         Triggered by `/info`.
@@ -211,7 +211,7 @@ class TelegramChannel(MasterChannel):
         else:  # Talking to the bot.
             msg = self.info_general()
 
-        update.effective_message.reply_text(msg)
+        await update.effective_message.reply_text(msg)
 
     def info_general(self):
         """Generate string for information of the current running EFB instance."""
@@ -334,19 +334,19 @@ class TelegramChannel(MasterChannel):
                          "To learn more, please visit https://etm.1a23.studio .")
             self.bot_manager.send_message(update.effective_chat.id, txt)
 
-    def react(self, update: Update, context: CallbackContext):
+    async def react(self, update: Update, context: CallbackContext):
         """React to a message."""
         assert isinstance(update, Update)
         assert isinstance(update.effective_message, Message)
         message: Message = update.effective_message
 
         reaction = None
-        args = message.text and message.text.split(' ', 1)
+        args = message.text and await message.text.split(' ', 1)
         if args and len(args) > 1:
             reaction = ReactionName(args[1])
 
         if not message.reply_to_message:
-            message.reply_html(self._("Reply to a message with this command and an emoji "
+            await message.reply_html(self._("Reply to a message with this command and an emoji "
                                       "to send a reaction. "
                                       "Ex.: <code>/react 👍</code>.\n"
                                       "Send <code>/react -</code> to remove your reaction "
@@ -357,7 +357,7 @@ class TelegramChannel(MasterChannel):
         msg_log = self.db.get_msg_log(master_msg_id=etm_utils.message_id_to_str(chat_id=TelegramChatID(target.chat_id),
                                                                                 message_id=TelegramMessageID(target.message_id)))
         if msg_log is None:
-            message.reply_text(self._("The message you replied to is not recorded in ETM database. "
+            await message.reply_text(self._("The message you replied to is not recorded in ETM database. "
                                       "You cannot react to this message."))
             return
 
@@ -365,7 +365,7 @@ class TelegramChannel(MasterChannel):
             msg_log_obj: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
             reactors = msg_log_obj.reactions
             if not reactors:
-                message.reply_html(self._("This message has no reactions yet. "
+                await message.reply_html(self._("This message has no reactions yet. "
                                           "Reply to a message with this command and "
                                           "an emoji to send a reaction. "
                                           "Ex.: <code>/react 👍</code>."))
@@ -379,28 +379,28 @@ class TelegramChannel(MasterChannel):
                     for j in values:
                         text += f"    {j.display_name}\n"
                 text = text.strip()
-                message.reply_text(text)
+                await message.reply_text(text)
                 return
 
         message_id = msg_log.slave_message_id
         channel_id, chat_uid, _ = etm_utils.chat_id_str_to_id(msg_log.slave_origin_uid)
 
         if channel_id not in coordinator.slaves:
-            message.reply_text(self._("The slave channel involved in this message ({}) is not available. "
+            await message.reply_text(self._("The slave channel involved in this message ({}) is not available. "
                                       "You cannot react to this message.").format(channel_id))
             return
 
         channel = coordinator.slaves[channel_id]
 
         if channel.suggested_reactions is None:
-            message.reply_text(self._("The channel involved in this message ({}) does not accept reactions. "
+            await message.reply_text(self._("The channel involved in this message ({}) does not accept reactions. "
                                       "You cannot react to this message.").format(channel_id))
             return
 
         try:
             chat_obj = channel.get_chat(chat_uid)
         except EFBChatNotFound:
-            message.reply_text(self._("The chat involved in this message ({}) is not found. "
+            await message.reply_text(self._("The chat involved in this message ({}) is not found. "
                                       "You cannot react to this message.").format(chat_uid))
             return
 
@@ -410,17 +410,17 @@ class TelegramChannel(MasterChannel):
         try:
             coordinator.send_status(ReactToMessage(chat=chat_obj, msg_id=message_id, reaction=reaction))
         except EFBOperationNotSupported:
-            message.reply_text(self._("You cannot react anything to this message."))
+            await message.reply_text(self._("You cannot react anything to this message."))
             return
         except EFBMessageReactionNotPossible:
             prompt = self._("{} is not accepted as a reaction to this message.").format(reaction)
             if channel.suggested_reactions:
                 # TRANSLATORS: {} is a list of names of possible reactions, separated with comma.
                 prompt += "\n" + self._("You may want to try: {}").format(", ".join(channel.suggested_reactions[:10]))
-            message.reply_text(prompt)
+            await message.reply_text(prompt)
             return
 
-    def help(self, update: Update, context: CallbackContext):
+    async def help(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
         assert isinstance(update.message, Message)
         txt = self._("EFB Telegram Master Channel\n"
@@ -445,7 +445,7 @@ class TelegramChannel(MasterChannel):
                      "    Remove the quoted message from its remote chat.\n"
                      "/help\n"
                      "    Print this command list.")
-        update.message.reply_text(txt)
+        await update.message.reply_text(txt)
 
     def poll(self):
         """
@@ -453,7 +453,7 @@ class TelegramChannel(MasterChannel):
         """
         self.bot_manager.polling()
 
-    def error(self, update: object, context: CallbackContext):
+    async def error(self, update: object, context: CallbackContext):
         """
         Print error to console, and send error message to first admin.
         Triggered by python-telegram-bot error callback.
@@ -497,7 +497,7 @@ class TelegramChannel(MasterChannel):
                               "Number of network error occurred since last startup: %s\n%s\nUpdate: %s",
                               self.timeout_count, str(error), str(update))
             if isinstance(update, Update) and isinstance(update.message, Message):
-                update.message.reply_text(self._("This message is not processed due to poor internet environment "
+                await update.message.reply_text(self._("This message is not processed due to poor internet environment "
                                                  "of the server.\n"
                                                  "<code>{code}</code>").format(code=html.escape(str(error))),
                                           quote=True,

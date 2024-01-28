@@ -57,13 +57,13 @@ class ETMMsg(Message):
         self.type_telegram = type_telegram
         self.file_id = file_id
 
-    def _load_file(self):
+    async def _load_file(self):
         if self.file_id:
             # noinspection PyUnresolvedReferences
             bot = coordinator.master.bot_manager
 
             try:
-                file_meta = bot.get_file(self.file_id)
+                file_meta = await bot.get_file(self.file_id)
             except BadRequest as e:
                 logger.exception("Bad request while trying to get file metadata: %s", e)
                 return
