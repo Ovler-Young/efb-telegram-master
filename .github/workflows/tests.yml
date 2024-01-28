@@ -36,7 +36,7 @@ jobs:
         sudo apt install -y ffmpeg libmagic-dev libwebp-dev
     - name: Check with mypy
       run: |
-        mypy -p efb_telegram_master --ignore-missing-imports --non-interactive
+        mypy -p efb_telegram_master --ignore-missing-imports
     - name: Test with pytest (unit tests only)
       env:
         TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
