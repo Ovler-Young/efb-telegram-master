@@ -9,7 +9,8 @@ from pkg_resources import resource_filename
 
 import cjkwrap
 from ruamel.yaml import YAML
-from telegram import Bot, TelegramError
+from telegram import Bot
+from telegram.error import TelegramError
 from telegram.ext.filters import Filters
 from telegram.ext import MessageHandler, Updater
 from telegram.utils.request import Request

@@ -18,7 +18,8 @@ import telegram.error
 import telegram.ext
 from PIL import Image
 from telegram import InputFile, ChatAction, InputMediaPhoto, InputMediaDocument, InputMediaVideo, InputMediaAnimation, \
-    InlineKeyboardMarkup, InlineKeyboardButton, TelegramError, InputMedia
+    InlineKeyboardMarkup, InlineKeyboardButton, InputMedia
+from telegram.error import TelegramError
 
 from ehforwarderbot import Message, Status, coordinator
 from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat

@@ -7,8 +7,9 @@ from threading import Thread
 from typing import Optional, TYPE_CHECKING, Tuple, Any
 
 import humanize
-from telegram import Update, Message, Chat, TelegramError, Contact, File
+from telegram import Update, Message, Chat, Contact, File
 from telegram.constants import MAX_FILESIZE_DOWNLOAD
+from telegram.error import TelegramError
 from telegram.ext import MessageHandler, Filters, CallbackContext, CommandHandler
 from telegram.helpers import escape_markdown
 
