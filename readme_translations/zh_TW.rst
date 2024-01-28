@@ -32,7 +32,7 @@ API，``python-telegram-bot`` 建立。
 依賴
 ====
 
-* Python >= 3.6
+* Python >= 3.7
 
 * EH Forwarder Bot >= 2.0.0
 
