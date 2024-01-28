@@ -18,7 +18,7 @@ import telegram.error
 import telegram.ext
 from PIL import Image
 from telegram import InputFile, ChatAction, InputMediaPhoto, InputMediaDocument, InputMediaVideo, InputMediaAnimation, \
-    InlineKeyboardMarkup, InlineKeyboardButton, ReplyMarkup, TelegramError, InputMedia
+    InlineKeyboardMarkup, InlineKeyboardButton, TelegramError, InputMedia
 
 from ehforwarderbot import Message, Status, coordinator
 from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
@@ -297,7 +297,6 @@ class SlaveMessageProcessor(LocaleMixin):
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
                            old_msg_id: OldMsgID = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
-                           reply_markup: Optional[ReplyMarkup] = None,
                            silent: bool = False) -> telegram.Message:
         """
         Send message as text to Telegram.
@@ -341,7 +340,6 @@ class SlaveMessageProcessor(LocaleMixin):
     def slave_message_link(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
                            old_msg_id: OldMsgID = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
-                           reply_markup: Optional[ReplyMarkup] = None,
                            silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.TYPING)
 
@@ -384,8 +382,7 @@ class SlaveMessageProcessor(LocaleMixin):
     def slave_message_image(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
                             old_msg_id: OldMsgID = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
-                            reply_markup: Optional[ReplyMarkup] = None,
-                            silent: bool = False) -> telegram.Message:
+                             silent: bool = False) -> telegram.Message:
         assert msg.file
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO)
         self.logger.debug("[%s] Message is of %s type; Path: %s; MIME: %s", msg.uid, msg.type, msg.path, msg.mime)
@@ -502,8 +499,7 @@ class SlaveMessageProcessor(LocaleMixin):
     def slave_message_animation(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
                                 old_msg_id: OldMsgID = None,
                                 target_msg_id: Optional[TelegramMessageID] = None,
-                                reply_markup: Optional[ReplyMarkup] = None,
-                                silent: bool = None) -> telegram.Message:
+                                     silent: bool = None) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO)
 
         self.logger.debug("[%s] Message is an Animation; Path: %s; MIME: %s", msg.uid, msg.path, msg.mime)
@@ -645,7 +641,6 @@ class SlaveMessageProcessor(LocaleMixin):
     def slave_message_file(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
                            old_msg_id: OldMsgID = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
-                           reply_markup: Optional[ReplyMarkup] = None,
                            silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_DOCUMENT)
 
@@ -713,8 +708,7 @@ class SlaveMessageProcessor(LocaleMixin):
     def slave_message_voice(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
                             old_msg_id: OldMsgID = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
-                            reply_markup: Optional[ReplyMarkup] = None,
-                            silent: bool = False) -> telegram.Message:
+                             silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.RECORD_AUDIO)
         if msg.text:
             text = self.html_substitutions(msg)
@@ -793,8 +787,7 @@ class SlaveMessageProcessor(LocaleMixin):
     def slave_message_video(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
                             old_msg_id: OldMsgID = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
-                            reply_markup: Optional[ReplyMarkup] = None,
-                            silent: bool = False) -> telegram.Message:
+                             silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_VIDEO)
         if msg.text:
             text = self.html_substitutions(msg)
@@ -845,8 +838,7 @@ class SlaveMessageProcessor(LocaleMixin):
     def slave_message_unsupported(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
                                   old_msg_id: OldMsgID = None,
                                   target_msg_id: Optional[TelegramMessageID] = None,
-                                  reply_markup: Optional[ReplyMarkup] = None,
-                                  silent: bool = False) -> telegram.Message:
+                                         silent: bool = False) -> telegram.Message:
         self.logger.debug("[%s] Sending as an unsupported message.", msg.uid)
         self.bot.send_chat_action(tg_dest, ChatAction.TYPING)
 
