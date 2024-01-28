@@ -10,7 +10,7 @@ import humanize
 from telegram import Update, Message, Chat, TelegramError, Contact, File
 from telegram.constants import MAX_FILESIZE_DOWNLOAD
 from telegram.ext import MessageHandler, Filters, CallbackContext, CommandHandler
-from telegram.utils.helpers import escape_markdown
+from telegram.helpers import escape_markdown
 
 from ehforwarderbot import coordinator
 from ehforwarderbot.constants import MsgType
