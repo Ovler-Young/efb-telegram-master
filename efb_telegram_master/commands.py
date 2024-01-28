@@ -35,7 +35,7 @@ class CommandsManager(LocaleMixin):
     Additional features of slave channels.
     """
 
-    def __init__(self, channel: 'TelegramChannel'):
+    async def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         self.bot = channel.bot_manager
         self.msg_storage: Dict[Tuple[int, int], ETMCommandMsgStorage] = dict()
@@ -55,7 +55,7 @@ class CommandsManager(LocaleMixin):
         self.command_conv = ConversationHandler(
             entry_points=[],
             states={Flags.COMMAND_PENDING: [CallbackQueryHandler(self.command_exec)]},
-            fallbacks=[CallbackQueryHandler(self.bot.session_expired)],
+            fallbacks=[await CallbackQueryHandler(self.bot.session_expired)],
             per_message=True,
             per_chat=True,
             per_user=False

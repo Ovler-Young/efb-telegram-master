@@ -92,7 +92,7 @@ class ChatBindingManager(LocaleMixin):
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
 
-    def __init__(self, channel: 'TelegramChannel'):
+    async def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
@@ -108,7 +108,7 @@ class ChatBindingManager(LocaleMixin):
                 Flags.LINK_CONFIRM: [CallbackQueryHandler(self.link_chat_confirm)],
                 Flags.LINK_EXEC: [CallbackQueryHandler(self.link_chat_exec)],
             },
-            fallbacks=[CallbackQueryHandler(self.bot.session_expired)],
+            fallbacks=[await CallbackQueryHandler(self.bot.session_expired)],
             per_message=True,
             per_chat=True,
             per_user=False
@@ -123,7 +123,7 @@ class ChatBindingManager(LocaleMixin):
             states={
                 Flags.CHAT_HEAD_CONFIRM: [CallbackQueryHandler(self.make_chat_head)],
             },
-            fallbacks=[CallbackQueryHandler(self.bot.session_expired)],
+            fallbacks=[await CallbackQueryHandler(self.bot.session_expired)],
             per_message=True,
             per_chat=True,
             per_user=False
@@ -138,7 +138,7 @@ class ChatBindingManager(LocaleMixin):
         self.suggestion_handler: ConversationHandler = ConversationHandler(
             entry_points=[],
             states={Flags.SUGGEST_RECIPIENTS: [CallbackQueryHandler(self.suggested_recipient)]},
-            fallbacks=[CallbackQueryHandler(self.bot.session_expired)],
+            fallbacks=[await CallbackQueryHandler(self.bot.session_expired)],
             per_message=True,
             per_chat=True,
             per_user=False

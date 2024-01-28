@@ -471,12 +471,12 @@ class TelegramBotManager(LocaleMixin):
     def get_me(self, *args, **kwargs):
         return self.updater.bot.get_me(*args, **kwargs)
 
-    def session_expired(self, update: Update, context: CallbackContext):
+    async def session_expired(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
         assert update.effective_message
         assert update.effective_chat
         if update.callback_query:
-            update.callback_query.answer()
+            await update.callback_query.answer()
         self.edit_message_text(text=self._("Session expired. Please try again. (SE01)"),
                                chat_id=update.effective_chat.id,
                                message_id=update.effective_message.message_id)

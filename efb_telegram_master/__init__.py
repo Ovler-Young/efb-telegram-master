@@ -91,7 +91,7 @@ class TelegramChannel(MasterChannel):
     # RPC server
     rpc_server: Optional[SimpleXMLRPCServer] = None
 
-    def __init__(self, instance_id: InstanceID = None):
+    async def __init__(self, instance_id: InstanceID = None):
         """
         Initialization.
         """
@@ -145,7 +145,7 @@ class TelegramChannel(MasterChannel):
         self.bot_manager.dispatcher.add_handler(
             CallbackQueryHandler(self.void_callback_handler, pattern="void"))
         self.bot_manager.dispatcher.add_handler(
-            CallbackQueryHandler(self.bot_manager.session_expired))
+            await CallbackQueryHandler(self.bot_manager.session_expired))
         self.bot_manager.dispatcher.add_handler(
             CommandHandler("react", self.react, filters=non_edit_filter)
         )
