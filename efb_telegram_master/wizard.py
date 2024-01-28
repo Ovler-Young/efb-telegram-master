@@ -370,18 +370,18 @@ def setup_admins(data):
             updater = Updater(token=data.data['token'],
                               request_kwargs=data.data.get(
                                   'request_kwargs', None))
-            updater.dispatcher.add_handler(
+            updater.application.add_handler(
                 MessageHandler(
-                    Filters.all,
+                    filters.ALL,
                     lambda update, context:
-                    update.effective_message.reply_text(
+                    await update.effective_message.reply_text(
                         _("Your Telegram user ID is {id}.").format(
                             id=update.effective_user.id
                         )
                     )
                 )
             )
-            updater.start_polling()
+            application.run_polling()
 
             print(_("OK"))
             print()

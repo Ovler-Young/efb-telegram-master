@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from . import TelegramChannel
 
 
-class LocaleHandler(Handler):
+class LocaleHandler\(BaseHandler)\):
     """
     Handler class Extract.
 
@@ -50,7 +50,7 @@ class LocaleHandler(Handler):
                 if tag.region:
                     locale += "_" + tag.region.format
             else:
-                locale = update.effective_user.language_code.replace('-', '_')
+                locale = await update.effective_user.language_code.replace('-', '_')
             self.logger.info("Updating locale to %s", locale)
             self.channel.translator = gettext.translation("efb_telegram_master",
                                                           resource_filename('efb_telegram_master', 'locale'),
@@ -58,5 +58,5 @@ class LocaleHandler(Handler):
                                                           fallback=True)
         return False
 
-    def handle_update(self, update, dispatcher, check_result, context=None):
+    def handle_update(self, update, application, check_result, context=None):
         pass

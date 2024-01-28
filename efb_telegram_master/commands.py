@@ -42,15 +42,15 @@ class CommandsManager(LocaleMixin):
         self.msg_storage: Dict[Tuple[int, int], ETMCommandMsgStorage] = dict()
         self.logger = logging.getLogger(__name__)
 
-        self.bot.dispatcher.add_handler(
+        await self.bot.application.add_handler(
             CommandHandler("extra", self.extra_listing))
-        self.bot.dispatcher.add_handler(
+        await self.bot.application.add_handler(
             MessageHandler(
-                Filters.regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
+                filters.Regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
                 self.extra_usage))
-        self.bot.dispatcher.add_handler(
+        await self.bot.application.add_handler(
             MessageHandler(
-                Filters.regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
+                filters.Regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
                 self.extra_call))
 
         self.command_conv = ConversationHandler(
@@ -62,7 +62,7 @@ class CommandsManager(LocaleMixin):
             per_user=False
         )
 
-        self.bot.dispatcher.add_handler(self.command_conv)
+        await self.bot.application.add_handler(self.command_conv)
 
         self.modules_list: List[Any[SlaveChannel, Middleware]] = []
         for i in sorted(coordinator.slaves.keys()):
@@ -100,14 +100,14 @@ class CommandsManager(LocaleMixin):
         if not callback.isdecimal():
             msg = self._("Invalid parameter: {0}. (CE01)").format(callback)
             self.msg_storage.pop(index, None)
-            self.bot.edit_message_text(text=msg, chat_id=chat_id, message_id=message_id)
-            update.callback_query.answer()
+            await self.bot.edit_message_text(text=msg, chat_id=chat_id, message_id=message_id)
+            await update.callback_query.answer()
             return ConversationHandler.END
         elif not (0 <= int(callback) < len(self.msg_storage[index].commands)):
             msg = self._("Index out of bound: {0}. (CE02)").format(callback)
             self.msg_storage.pop(index, None)
-            self.bot.edit_message_text(text=msg, chat_id=chat_id, message_id=message_id)
-            update.callback_query.answer()
+            await self.bot.edit_message_text(text=msg, chat_id=chat_id, message_id=message_id)
+            await update.callback_query.answer()
             return ConversationHandler.END
 
         callback_idx = int(callback)
@@ -119,7 +119,7 @@ class CommandsManager(LocaleMixin):
         self.logger.debug("[%s.%s] Command execution callback is valid. Command storage item: %s", chat_id, message_id, command_storage)
 
         # Clear inline buttons.
-        update.callback_query.edit_message_reply_markup(None)
+        await update.callback_query.edit_message_reply_markup(None)
         self.logger.debug("[%s.%s] Inline buttons cleared", chat_id, message_id)
 
         fn = getattr(module, command.callable_name, None)
@@ -138,12 +138,12 @@ class CommandsManager(LocaleMixin):
         self.logger.debug("[%s.%s] Command execution outcome: %s", chat_id, message_id, msg)
         if msg is not None:
             self.msg_storage.pop(index, None)
-        # self.bot.edit_message_text(prefix=prefix, text=msg,
+        # await self.bot.edit_message_text(prefix=prefix, text=msg,
         #                            chat_id=chat_id, message_id=message_id)
         if msg is None:
-            update.callback_query.answer()
+            await update.callback_query.answer()
             return None
-        self.bot.answer_callback_query(
+        await self.bot.answer_callback_query(
             prefix=prefix, text=msg,
             callback_query_id=update.callback_query.id
         )
@@ -187,7 +187,7 @@ class CommandsManager(LocaleMixin):
                     )
             else:
                 msg += "\n" + self._("No command found.")
-        self.bot.send_message(update.effective_chat.id, msg, parse_mode="HTML")
+        await self.bot.send_message(update.effective_chat.id, msg, parse_mode="HTML")
 
     def extra_usage(self, update: Update, context: CallbackContext):
         assert context.match
@@ -196,13 +196,13 @@ class CommandsManager(LocaleMixin):
 
         groupdict = context.match.groupdict()
         if int(groupdict['id']) >= len(self.modules_list):
-            return self.bot.reply_error(update, self._("Invalid module ID. (XC03)"))
+            return await self.bot.reply_error(update, self._("Invalid module ID. (XC03)"))
 
         channel = self.modules_list[int(groupdict['id'])]
         functions = channel.get_extra_functions()
 
         if groupdict['command'] not in functions:
-            return self.bot.reply_error(update, self._("Command not found in selected module. (XC04)"))
+            return await self.bot.reply_error(update, self._("Command not found in selected module. (XC04)"))
 
         command = getattr(channel, groupdict['command'])
 
@@ -218,7 +218,7 @@ class CommandsManager(LocaleMixin):
             html.escape(fn_name),
             html.escape(command.name),
             html.escape(command.desc.format(function_name=fn_name)))
-        self.bot.send_message(update.effective_chat.id, msg, parse_mode="HTML")
+        await self.bot.send_message(update.effective_chat.id, msg, parse_mode="HTML")
 
     def extra_call(self, update: Update, context: CallbackContext):
         """
@@ -230,7 +230,7 @@ class CommandsManager(LocaleMixin):
 
         groupdict = context.match.groupdict()
         if int(groupdict['id']) >= len(coordinator.slaves):
-            return self.bot.reply_error(update, self._("Invalid module ID. (XC01)"))
+            return await self.bot.reply_error(update, self._("Invalid module ID. (XC01)"))
 
         slaves = coordinator.slaves
 
@@ -238,21 +238,21 @@ class CommandsManager(LocaleMixin):
         functions = channel.get_extra_functions()
 
         if groupdict['command'] not in functions:
-            return self.bot.reply_error(update, self._("Command not found in selected module. (XC02)"))
+            return await self.bot.reply_error(update, self._("Command not found in selected module. (XC02)"))
 
         # noinspection PyUnresolvedReferences
         header = "{} {}: {}\n-------\n".format(
                 channel.channel_emoji, channel.channel_name,
                 functions[groupdict['command']].name  # type: ignore
         )
-        msg = self.bot.send_message(update.message.chat.id,
+        msg = await self.bot.send_message(update.message.chat.id,
                                     prefix=header, text=self._("Please wait..."))
 
         assert update.message.text
         result = functions[ExtraCommandName(groupdict['command'])](
             " ".join(update.message.text.split(' ', 1)[1:]))
 
-        self.bot.edit_message_text(prefix=header, text=result,
+        await self.bot.edit_message_text(prefix=header, text=result,
                                    chat_id=update.message.chat.id, message_id=msg.message_id)
 
     def _command_fallback(self, *args, __channel_id: str, __callable: str, **kwargs) -> str:
