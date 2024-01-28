@@ -369,8 +369,7 @@ def setup_admins(data):
 
             updater = Updater(token=data.data['token'],
                               request_kwargs=data.data.get(
-                                  'request_kwargs', None),
-                              use_context=True)
+                                  'request_kwargs', None))
             updater.dispatcher.add_handler(
                 MessageHandler(
                     Filters.all,

@@ -156,8 +156,7 @@ class TelegramBotManager(LocaleMixin):
         self.updater: Updater = Updater(config['token'],
                                         base_url=channel.flag('api_base_url'),
                                         base_file_url=channel.flag('api_base_file_url'),
-                                        request_kwargs=req_kwargs,
-                                        use_context=True)
+                                        request_kwargs=req_kwargs)
 
         if isinstance(config.get('webhook'), dict):
             self.logger.debug("Setting up webhook...")
