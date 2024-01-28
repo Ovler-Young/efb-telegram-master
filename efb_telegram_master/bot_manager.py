@@ -11,7 +11,7 @@ import telegram.constants
 import telegram.error
 from retrying import retry
 from telegram import Update, InputFile, User, File
-from telegram.ext import CallbackContext, filters, MessageHandler, Updater, Dispatcher
+from telegram.ext import CallbackContext, filters, MessageHandler, Updater, Application
 
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
@@ -169,7 +169,7 @@ class TelegramBotManager(LocaleMixin):
         self.me: User = me
         self.logger.debug("Connection to Telegram bot API is OK...")
         self.admins: List[int] = config['admins']
-        self.application: Dispatcher = self.updater.application
+        self.application: Application = self.updater.application
         self.logger.debug("Adding base applications...")
         # New whitelist handler
         whitelist_filter = ~filters.User(user_id=self.admins)
