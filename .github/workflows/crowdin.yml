@@ -5,6 +5,9 @@ on:
     paths:
       - 'efb_telegram_master/**.py'
       - 'README.rst'
+  pull_request:
+    branches:
+      - master
 
 jobs:
   crowdin:
