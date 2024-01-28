@@ -4,8 +4,7 @@ import logging
 from typing import Tuple, Dict, TYPE_CHECKING, List, Any, Union, Optional
 
 from telegram import Message, Update
-from telegram.ext import CommandHandler, ConversationHandler, CallbackQueryHandler, MessageHandler, CallbackContext
-from telegram.ext.filters import Filters
+from telegram.ext import CommandHandler, ConversationHandler, CallbackQueryHandler, MessageHandler, CallbackContext, filters
 
 from ehforwarderbot import coordinator, Channel, Middleware
 from ehforwarderbot.channel import SlaveChannel
@@ -46,11 +45,11 @@ class CommandsManager(LocaleMixin):
             CommandHandler("extra", self.extra_listing))
         self.bot.dispatcher.add_handler(
             MessageHandler(
-                Filters.regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
+                filters.Regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
                 self.extra_usage))
         self.bot.dispatcher.add_handler(
             MessageHandler(
-                Filters.regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
+                filters.Regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
                 self.extra_call))
 
         self.command_conv = ConversationHandler(
