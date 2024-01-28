@@ -11,6 +11,7 @@ on:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
+  workflow_dispatch:
 
 jobs:
   tests:
