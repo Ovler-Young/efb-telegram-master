@@ -296,7 +296,7 @@ class SlaveMessageProcessor(LocaleMixin):
         return text
 
     async def slave_message_text(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                           old_msg_id: OldMsgID = None,
+                           old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
                            silent: bool = False) -> telegram.Message:
         """
@@ -339,7 +339,7 @@ class SlaveMessageProcessor(LocaleMixin):
         return tg_msg
 
     async def slave_message_link(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                           old_msg_id: OldMsgID = None,
+                           old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
                            silent: bool = False) -> telegram.Message:
         await self.bot.send_chat_action(tg_dest, ChatAction.TYPING)
@@ -381,7 +381,7 @@ class SlaveMessageProcessor(LocaleMixin):
     """Threshold of aspect ratio (longer side to shorter side) to send as file, used alone."""
 
     async def slave_message_image(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                            old_msg_id: OldMsgID = None,
+                            old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
                              silent: bool = False) -> telegram.Message:
         assert msg.file
@@ -498,9 +498,9 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.file.close()
 
     async def slave_message_animation(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                                old_msg_id: OldMsgID = None,
+                                old_msg_id: Optional[OldMsgID] = None,
                                 target_msg_id: Optional[TelegramMessageID] = None,
-                                     silent: bool = None) -> telegram.Message:
+                                     silent: Optional[bool] = None) -> telegram.Message:
         await self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO)
 
         self.logger.debug("[%s] Message is an Animation; Path: %s; MIME: %s", msg.uid, msg.path, msg.mime)
@@ -552,7 +552,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.file.close()
 
     async def slave_message_sticker(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                              old_msg_id: OldMsgID = None,
+                              old_msg_id: Optional[OldMsgID] = None,
                               target_msg_id: Optional[TelegramMessageID] = None,
                               reply_markup: Optional[InlineKeyboardMarkup] = None,
                               silent: bool = False) -> telegram.Message:
@@ -640,7 +640,7 @@ class SlaveMessageProcessor(LocaleMixin):
         return sticker_reply_markup
 
     async def slave_message_file(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                           old_msg_id: OldMsgID = None,
+                           old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
                            silent: bool = False) -> telegram.Message:
         await self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_DOCUMENT)
@@ -707,7 +707,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.file.close()
 
     async def slave_message_voice(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                            old_msg_id: OldMsgID = None,
+                            old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
                              silent: bool = False) -> telegram.Message:
         await self.bot.send_chat_action(tg_dest, ChatAction.RECORD_AUDIO)
@@ -757,7 +757,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.file.close()
 
     async def slave_message_location(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                               old_msg_id: OldMsgID = None,
+                               old_msg_id: Optional[OldMsgID] = None,
                                target_msg_id: Optional[TelegramMessageID] = None,
                                reply_markup: Optional[InlineKeyboardMarkup] = None,
                                silent: bool = False) -> telegram.Message:
@@ -786,7 +786,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                       disable_notification=silent)
 
     async def slave_message_video(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                            old_msg_id: OldMsgID = None,
+                            old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
                              silent: bool = False) -> telegram.Message:
         await self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_VIDEO)
@@ -837,7 +837,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.file.close()
 
     async def slave_message_unsupported(self, msg: Message, tg_dest: TelegramChatID, msg_template: str, reactions: str,
-                                  old_msg_id: OldMsgID = None,
+                                  old_msg_id: Optional[OldMsgID] = None,
                                   target_msg_id: Optional[TelegramMessageID] = None,
                                          silent: bool = False) -> telegram.Message:
         self.logger.debug("[%s] Sending as an unsupported message.", msg.uid)

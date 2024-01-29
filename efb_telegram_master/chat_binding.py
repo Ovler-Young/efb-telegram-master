@@ -349,8 +349,8 @@ class ChatBindingManager(LocaleMixin):
         return legend, chat_btn_list
 
     async def link_chat_gen_list(self, chat_id: TelegramChatID,
-                           message_id: TelegramMessageID = None, offset: int = 0,
-                           pattern: str = "", chats: List[EFBChannelChatIDStr] = None,
+                           message_id: Optional[TelegramMessageID] = None, offset: int = 0,
+                           pattern: str = "", chats: Optional[List[EFBChannelChatIDStr]] = None,
                            filter_availability: bool = True):
         """
         Generate the list for chat linking, and update it to a message.
@@ -646,9 +646,9 @@ class ChatBindingManager(LocaleMixin):
         return self.chat_head_req_generate(target, pattern=" ".join(args), chats=chats)
 
     async def chat_head_req_generate(self, chat_id: TelegramChatID,
-                               message_id: TelegramMessageID = None,
+                               message_id: Optional[TelegramMessageID] = None,
                                offset: int = 0, pattern: str = "",
-                               chats: List[EFBChannelChatIDStr] = None):
+                               chats: Optional[List[EFBChannelChatIDStr]] = None):
         """
         Generate the list for chat head, and update it to a message.
 

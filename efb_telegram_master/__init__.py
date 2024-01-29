@@ -91,7 +91,7 @@ class TelegramChannel(MasterChannel):
     # RPC server
     rpc_server: Optional[SimpleXMLRPCServer] = None
 
-    async def __init__(self, instance_id: InstanceID = None):
+    async def __init__(self, instance_id: Optional[InstanceID] = None):
         """
         Initialization.
         """
