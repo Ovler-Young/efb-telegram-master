@@ -35,19 +35,19 @@ class CommandsManager(LocaleMixin):
     Additional features of slave channels.
     """
 
-    async def __init__(self, channel: 'TelegramChannel'):
+    def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         self.bot = channel.bot_manager
         self.msg_storage: Dict[Tuple[int, int], ETMCommandMsgStorage] = dict()
         self.logger = logging.getLogger(__name__)
 
-        await self.bot.application.add_handler(
+        self.bot.application.add_handler(
             CommandHandler("extra", self.extra_listing))
-        await self.bot.application.add_handler(
+        self.bot.application.add_handler(
             MessageHandler(
                 filters.Regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
                 self.extra_usage))
-        await self.bot.application.add_handler(
+        self.bot.application.add_handler(
             MessageHandler(
                 filters.Regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
                 self.extra_call))
@@ -55,13 +55,13 @@ class CommandsManager(LocaleMixin):
         self.command_conv = ConversationHandler(
             entry_points=[],
             states={Flags.COMMAND_PENDING: [CallbackQueryHandler(self.command_exec)]},
-            fallbacks=[await CallbackQueryHandler(self.bot.session_expired)],
+            fallbacks=[CallbackQueryHandler(self.bot.session_expired)],
             per_message=True,
             per_chat=True,
             per_user=False
         )
 
-        await self.bot.application.add_handler(self.command_conv)
+        self.bot.application.add_handler(self.command_conv)
 
         self.modules_list: List[Any[SlaveChannel, Middleware]] = []
         for i in sorted(coordinator.slaves.keys()):
