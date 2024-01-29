@@ -91,7 +91,7 @@ class TelegramChannel(MasterChannel):
     # RPC server
     rpc_server: Optional[SimpleXMLRPCServer] = None
 
-    async def __init__(self, instance_id: Optional[InstanceID] = None):
+    def __init__(self, instance_id: InstanceID):
         """
         Initialization.
         """
@@ -145,7 +145,7 @@ class TelegramChannel(MasterChannel):
         self.bot_manager.application.add_handler(
             CallbackQueryHandler(self.void_callback_handler, pattern="void"))
         self.bot_manager.application.add_handler(
-            await CallbackQueryHandler(self.bot_manager.session_expired))
+            CallbackQueryHandler(self.bot_manager.session_expired))
         self.bot_manager.application.add_handler(
             CommandHandler("react", self.react, filters=non_edit_filter)
         )
@@ -314,7 +314,7 @@ class TelegramChannel(MasterChannel):
                     )
         return msg
 
-    def start(self, update: Update, context: CallbackContext):
+    async def start(self, update: Update, context: CallbackContext):
         """
         Process bot command `/start`.
         """
@@ -325,7 +325,7 @@ class TelegramChannel(MasterChannel):
             if update.effective_message.chat.type != telegram.Chat.PRIVATE or \
                     (update.effective_message.forward_from_chat and
                      update.effective_message.forward_from_chat.type == telegram.Chat.CHANNEL):
-                self.chat_binding.link_chat(update, context.args)
+                await self.chat_binding.link_chat(update, context.args)
             else:
                 self.bot_manager.send_message(update.effective_chat.id,
                                               self._('You cannot link remote chats to here. Please try again.'))
@@ -341,7 +341,7 @@ class TelegramChannel(MasterChannel):
         message: Message = update.effective_message
 
         reaction = None
-        args = message.text and await message.text.split(' ', 1)
+        args = message.text and message.text.split(' ', 1)
         if args and len(args) > 1:
             reaction = ReactionName(args[1])
 
