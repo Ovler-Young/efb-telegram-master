@@ -34,7 +34,7 @@ class LocaleHandler(BaseHandler):
         self.channel = channel
         self.auto_locale = self.channel.flag('auto_locale')
 
-    async def check_update(self, update: object):
+    def check_update(self, update: object):
         if not self.auto_locale:
             return False
         if not isinstance(update, Update):
@@ -50,7 +50,7 @@ class LocaleHandler(BaseHandler):
                 if tag.region:
                     locale += "_" + tag.region.format
             else:
-                locale = await update.effective_user.language_code.replace('-', '_')
+                locale = update.effective_user.language_code.replace('-', '_')
             self.logger.info("Updating locale to %s", locale)
             self.channel.translator = gettext.translation("efb_telegram_master",
                                                           resource_filename('efb_telegram_master', 'locale'),
