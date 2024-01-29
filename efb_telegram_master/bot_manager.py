@@ -17,12 +17,7 @@ from telegram.ext import CallbackContext, filters, MessageHandler, Updater, Appl
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
 
-update_queue = asyncio.Queue()
-
-if TYPE_CHECKING:
-    from . import TelegramChannel
-
-MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
+update_queue: asyncio.Queue[object] = asyncio.Queue()
 
 
 class TelegramBotManager(LocaleMixin):
