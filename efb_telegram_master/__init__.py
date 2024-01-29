@@ -478,7 +478,7 @@ class TelegramChannel(MasterChannel):
         # noinspection PyBroadException
         try:
             raise error
-        except telegram.error.Unauthorized:
+        except telegram.error.Forbidden:
             self.logger.error("The bot is not authorised to send update:\n%s\n%s", str(update), str(error))
         except telegram.error.BadRequest as e:
             assert isinstance(update, Update)
