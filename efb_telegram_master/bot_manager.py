@@ -2,6 +2,7 @@
 import collections
 import html
 import io
+import asyncio
 import logging
 import os
 from functools import wraps
@@ -15,6 +16,8 @@ from telegram.ext import CallbackContext, filters, MessageHandler, Updater, Appl
 
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
+
+update_queue = asyncio.Queue()
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -153,7 +156,7 @@ class TelegramBotManager(LocaleMixin):
             req_kwargs.update(conf_req_kwargs)
 
         self.logger.debug("Setting up Telegram bot updater...")
-        self.updater: Updater = Updater(config['token'])
+        self.updater: Updater = Updater(config['token'], update_queue=update_queue)
 
         if isinstance(config.get('webhook'), dict):
             self.logger.debug("Setting up webhook...")
