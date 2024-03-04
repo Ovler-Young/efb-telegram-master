@@ -622,7 +622,7 @@ class MockSlaveChannel(SlaveChannel):
             raise EFBOperationNotSupported("Message is not found.")
 
         if status.reaction is None:
-            for idx, i in message.reactions.items():
+            for idx, i in await message.reactions.items():
                 message.reactions[idx] = [j for j in i if not isinstance(j, SelfChatMember)]
         else:
             if status.reaction not in message.reactions:

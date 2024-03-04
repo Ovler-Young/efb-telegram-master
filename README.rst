@@ -30,7 +30,7 @@ Bot API, ``python-telegram-bot``.
 Requirements
 ------------
 
--  Python >= 3.6
+-  Python >= 3.7
 -  EH Forwarder Bot >= 2.0.0
 -  ffmpeg
 -  libmagic

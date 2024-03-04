@@ -131,7 +131,7 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
 
     command: str = next(
         txt
-        for _, txt in message.get_entities_text(MessageEntityCode)
+        for _, txt in await message.get_entities_text(MessageEntityCode)
         if txt.startswith("/start ")
     )
     token = command[len("/start "):]
@@ -247,7 +247,7 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
     await message.buttons[0][0].click()  # choose chat
     message = await helper.wait_for_message(in_chats(command_chat) & has_button)  # operation panel
     url = None
-    # print("STIMULATE_LINK_CHAT_MESSAGE_DICT", message.to_dict())
+    # print("STIMULATE_LINK_CHAT_MESSAGE_DICT", await message.to_dict())
     for i in chain.from_iterable(message.buttons):
         if i.url:
             url = i.url
