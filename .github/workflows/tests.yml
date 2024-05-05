@@ -6,11 +6,13 @@ on:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
+      - '.github/workflows/tests.yml'
   pull_request:
     paths:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
+      - '.github/workflows/tests.yml'
 
 jobs:
   tests:
