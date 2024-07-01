@@ -6,7 +6,7 @@ from pkg_resources import resource_filename
 from typing import TYPE_CHECKING
 
 from language_tags import tags
-from telegram.ext.handler import Handler
+from telegram.ext import BaseHandler  as Handler
 from telegram import Update
 
 if TYPE_CHECKING:
@@ -58,5 +58,5 @@ class LocaleHandler(Handler):
                                                           fallback=True)
         return False
 
-    def handle_update(self, update, dispatcher, check_result, context=None):
+    def handle_update(self, update, application, check_result, context=None):
         pass

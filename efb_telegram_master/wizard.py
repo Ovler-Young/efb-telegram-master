@@ -9,10 +9,10 @@ from pkg_resources import resource_filename
 
 import cjkwrap
 from ruamel.yaml import YAML
-from telegram import Bot, TelegramError
-from telegram.ext.filters import Filters
-from telegram.ext import MessageHandler, Updater
-from telegram.utils.request import Request
+from telegram import Bot
+from telegram.ext import MessageHandler, filters, Application
+from telegram.request import Request
+from telegram.error import  TelegramError
 
 from ehforwarderbot import coordinator, utils
 from ehforwarderbot.types import ModuleID
@@ -59,7 +59,8 @@ class DataModel:
         self.data = {
             "token": "",
             "admins": [],
-            "flags": {}
+            "flags": {},
+            "proxy_url": None
         }
 
         self.building_default = True
@@ -111,32 +112,20 @@ class DataModel:
                 f.write("\n")
                 self.yaml.dump({"flags": self.data['flags']}, f)
                 f.write("\n")
-
                 f.write(_(
-                    # TRANSLATORS: This part of text mst be formatted in a monospaced font.and no line shall exceed the width of a 70-cell-wide terminal.
-                    "# [Network configurations]\n"
-                    "# Timeout tweaks, Proxy, etc.\n"
+                    "# [Proxy configuration]\n"
+                    "# Proxy URL for both API requests and getting updates.\n"
                     "# Refer to the project documentation for details.\n"
                     "#\n"
-                    "# https://etm.1a23.studio\n"
+                    "# https://docs.python-telegram-bot.org/en/stable/telegram.ext.applicationbuilder.html#telegram.ext.ApplicationBuilder.proxy\n"
                 ))
                 f.write("\n")
-                if self.data.get('request_kwargs'):
-                    self.yaml.dump(
-                        {"request_kwargs": self.data['request_kwargs']}, f)
+                if self.data.get('proxy_url'):
+                    self.yaml.dump({"proxy_url": self.data['proxy_url']}, f)
                 else:
                     f.write(
-                        "# request_kwargs:\n"
-                        "#     # HTTP Proxy\n"
-                        "#     proxy_url: http://127.0.0.1:80/\n"
-                        "#     # username: admin\n"
-                        "#     # password: password\n"
-                        "#\n"
-                        "#     # SOCKS5 proxy (Additional installations required)\n"
-                        "#     # proxy_url: socks5://127.0.0.1:1080/\n"
-                        "#     # urllib3_proxy_kwargs:\n"
-                        "#     #     username: admin\n"
-                        "#     #     password: password\n"
+                        "# proxy_url: http://USERNAME:PASSWORD@PROXY_HOST:PROXY_PORT\n"
+                        "# proxy_url: socks5://USERNAME:PASSWORD@PROXY_HOST:PROXY_PORT\n"
                     )
                 f.write("\n")
 
@@ -193,8 +182,6 @@ def input_bot_token(data: DataModel, default=None):
 def setup_proxy(data):
     if YesNo(prompt=_("Do you want to run ETM behind a proxy? "),
              prompt_prefix="[yN] ", default="n").launch():
-        if data.data.get('request_kwargs') is None:
-            data.data['request_kwargs'] = {}
         proxy_type = Bullet(prompt=_("Select proxy type"),
                             choices=['http', 'socks5']).launch()
         host = input(_("Proxy host (domain/IP): "))
@@ -205,12 +192,13 @@ def setup_proxy(data):
                  prompt_prefix="[yN] ", default="n").launch():
             username = input(_("Username: "))
             password = getpass(_("Password: "))
-        if proxy_type == 'http':
-            data.data['request_kwargs']['proxy_url'] = f"http://{host}:{port}/"
-            if username is not None and password is not None:
-                data.data['request_kwargs']['username'] = username
-                data.data['request_kwargs']['password'] = password
-        elif proxy_type == 'socks5':
+        proxy_url = f"{proxy_type}://"
+        if username and password:
+            proxy_url += f"{username}:{password}@"
+        proxy_url += f"{host}:{port}"
+
+        data.data['proxy_url'] = proxy_url
+        if proxy_type == 'socks5':
             try:
                 import socks
             except ModuleNotFoundError as e:
@@ -228,7 +216,7 @@ def setup_proxy(data):
                     "username": username,
                     "password": password
                 }
-        data.request = Request(**data.data['request_kwargs'])
+        data.data['proxy_url'] = proxy_url
 
 
 def setup_telegram_bot(data):
@@ -345,7 +333,7 @@ def input_admin_ids(default=None):
             return values
 
 
-def setup_admins(data):
+async def setup_admins(data):
     print()
     print_wrapped(_(
         "2. Set up Bot administrators\n"
@@ -367,13 +355,13 @@ def setup_admins(data):
         if answer == prompt_yes:
             print(_("Starting ID bot..."), end="", flush=True)
 
-            updater = Updater(token=data.data['token'],
+            updater = Application(token=data.data['token'],
                               request_kwargs=data.data.get(
                                   'request_kwargs', None),
-                              use_context=True)
-            updater.dispatcher.add_handler(
+                              )
+            updater.application.add_handler(
                 MessageHandler(
-                    Filters.all,
+                    filters.ALL,
                     lambda update, context:
                     update.effective_message.reply_text(
                         _("Your Telegram user ID is {id}.").format(
@@ -616,7 +604,7 @@ def prerequisites_check():
     print()
 
 
-def wizard(profile, instance_id):
+async def wizard(profile, instance_id):
     data = DataModel(profile, instance_id)
 
     prerequisites_check()
@@ -633,7 +621,7 @@ def wizard(profile, instance_id):
     setup_proxy(data)
     setup_telegram_bot(data)
     setup_telegram_bot_commands_list(data)
-    setup_admins(data)
+    await setup_admins(data)
     setup_experimental_flags(data)
     setup_network_configurations(data)
     setup_rpc(data)

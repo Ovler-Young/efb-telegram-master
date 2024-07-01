@@ -131,7 +131,7 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
 
     command: str = next(
         txt
-        for _, txt in message.get_entities_text(MessageEntityCode)
+        for _, txt in await message.get_entities_text(MessageEntityCode)
         if txt.startswith("/start ")
     )
     token = command[len("/start "):]

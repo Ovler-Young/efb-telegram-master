@@ -10,8 +10,9 @@ from typing import List, TYPE_CHECKING, Callable
 import telegram.constants
 import telegram.error
 from retrying import retry
-from telegram import Update, InputFile, User, File
-from telegram.ext import CallbackContext, Filters, MessageHandler, Updater, Dispatcher
+from telegram import Update, InputFile, User, File, Bot
+from telegram.ext import Application, ApplicationBuilder
+from telegram.ext import CallbackContext, filters, MessageHandler, Updater
 
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
@@ -31,7 +32,7 @@ class TelegramBotManager(LocaleMixin):
         me (telegram.User): Telegram User
         admins (List[int]): List of admin user IDs.
         updater (telegram.ext.Updater): Updater of the bot
-        dispatcher (telegram.ext.Dispatcher): Dispatcher of the updater
+        application (telegram.ext.Application): Application of the updater
     """
 
     webhook = False
@@ -143,7 +144,7 @@ class TelegramBotManager(LocaleMixin):
 
             return retry_on_chat_migration_wrap
 
-    def __init__(self, channel: 'TelegramChannel'):
+    async def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         config = self.channel.config
 
@@ -153,11 +154,24 @@ class TelegramBotManager(LocaleMixin):
             req_kwargs.update(conf_req_kwargs)
 
         self.logger.debug("Setting up Telegram bot updater...")
-        self.updater: Updater = Updater(config['token'],
-                                        base_url=channel.flag('api_base_url'),
-                                        base_file_url=channel.flag('api_base_file_url'),
-                                        request_kwargs=req_kwargs,
-                                        use_context=True)
+
+        builder = Application.builder()
+        builder.token(config['token'])
+
+        builder.read_timeout(15)
+        # builder.base_url(channel.flag('api_base_url'))
+        # builder.base_file_url(channel.flag('api_base_file_url'))
+        # builder.request_kwargs = req_kwargs
+        application = builder.build()
+
+        # self.updater: Updater = Updater(application) need update_queue
+        self.updater: Updater = Bot( token=config['token'],
+                                        # base_url=channel.flag('api_base_url'),
+                                        # base_file_url=channel.flag('api_base_file_url'),
+                                        # request_kwargs=req_kwargs
+                                        )
+        self.updater.application = application
+        initializestatus = await self.updater.initialize()
 
         if isinstance(config.get('webhook'), dict):
             self.logger.debug("Setting up webhook...")
@@ -170,15 +184,16 @@ class TelegramBotManager(LocaleMixin):
         self.me: User = me
         self.logger.debug("Connection to Telegram bot API is OK...")
         self.admins: List[int] = config['admins']
-        self.dispatcher: Dispatcher = self.updater.dispatcher
-        self.logger.debug("Adding base dispatchers...")
+        self.application: Application = self.updater.application
+        self.logger.debug("Adding base applications...")
         # New whitelist handler
-        whitelist_filter = ~Filters.user(user_id=self.admins)
-        self.dispatcher.add_handler(
+        whitelist_filter = ~filters.User(user_id=self.admins)
+        self.application.add_handler(
             MessageHandler(whitelist_filter, lambda update, context: ...))
-        self.dispatcher.add_handler(LocaleHandler(channel))
+        self.application.add_handler(LocaleHandler(channel))
         self.Decorators.enable_retry = channel.flag('retry_on_error')
-        self.logger.debug("Base dispatchers added...")
+        self.logger.debug("Base applications added...")
+
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
@@ -472,12 +487,12 @@ class TelegramBotManager(LocaleMixin):
     def get_me(self, *args, **kwargs):
         return self.updater.bot.get_me(*args, **kwargs)
 
-    def session_expired(self, update: Update, context: CallbackContext):
+    async def session_expired(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
         assert update.effective_message
         assert update.effective_chat
         if update.callback_query:
-            update.callback_query.answer()
+            await update.callback_query.answer()
         self.edit_message_text(text=self._("Session expired. Please try again. (SE01)"),
                                chat_id=update.effective_chat.id,
                                message_id=update.effective_message.message_id)
@@ -505,13 +520,13 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
-    def get_file(self, file_id: str) -> File:
-        return self.updater.bot.get_file(file_id)
+    async def get_file(self, file_id: str) -> File:
+        return await self.updater.bot.get_file(file_id)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
-    def delete_message(self, chat_id, message_id):
-        return self.updater.bot.delete_message(chat_id, message_id)
+    async def delete_message(self, chat_id, message_id):
+        return await self.updater.bot.delete_message(chat_id, message_id)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
@@ -570,9 +585,9 @@ class TelegramBotManager(LocaleMixin):
         """
         if self.webhook:
             start_webhook = self.channel.config['webhook']['start_webhook']
-            self.updater.start_webhook(**start_webhook)
+            self.application.run_webhook(**start_webhook)
         else:
-            self.updater.start_polling(timeout=10, drop_pending_updates=drop_pending_updates)
+            self.application.run_polling(timeout=10, drop_pending_updates=drop_pending_updates)
 
     def graceful_stop(self):
         """Gracefully stop the bot"""

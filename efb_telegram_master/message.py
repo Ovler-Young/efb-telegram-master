@@ -57,13 +57,13 @@ class ETMMsg(Message):
         self.type_telegram = type_telegram
         self.file_id = file_id
 
-    def _load_file(self):
+    async def _load_file(self):
         if self.file_id:
             # noinspection PyUnresolvedReferences
             bot = coordinator.master.bot_manager
 
             try:
-                file_meta = bot.get_file(self.file_id)
+                file_meta = await bot.get_file(self.file_id)
             except BadRequest as e:
                 logger.exception("Bad request while trying to get file metadata: %s", e)
                 return
@@ -125,9 +125,9 @@ class ETMMsg(Message):
 
         self.__initialized = True
 
-    def get_file(self) -> Optional[BinaryIO]:
+    async def get_file(self) -> Optional[BinaryIO]:
         if not self.__initialized:
-            self._load_file()
+            await self._load_file()
         return self.__file
 
     def set_file(self, value: Optional[BinaryIO]):
@@ -136,9 +136,9 @@ class ETMMsg(Message):
         self.__initialized = True
         self.__file = value
 
-    def get_path(self) -> Optional[str]:
+    async def get_path(self) -> Optional[str]:
         if not self.__initialized:
-            self._load_file()
+            await self._load_file()
         return self.__path
 
     def set_path(self, value: Optional[str]):
@@ -147,9 +147,9 @@ class ETMMsg(Message):
         self.__initialized = True
         self.__path = value
 
-    def get_filename(self) -> Optional[str]:
+    async def get_filename(self) -> Optional[str]:
         if not self.__initialized:
-            self._load_file()
+            await self._load_file()
         return self.__filename
 
     def set_filename(self, value: Optional[str]):

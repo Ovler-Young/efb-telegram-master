@@ -13,6 +13,9 @@
                 "PYTHONPATH": "${workspaceFolder}",
                 "PYTHONUTF8": "1",
             },
+            "args": [
+                "-v",
+            ],
         }
     ]
 }
