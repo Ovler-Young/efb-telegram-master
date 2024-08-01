@@ -4,6 +4,7 @@ import html
 import logging
 import mimetypes
 import time
+import asyncio
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
@@ -125,6 +126,7 @@ class TelegramChannel(MasterChannel):
         self.chat_manager: ChatObjectCacheManager = ChatObjectCacheManager(self)
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
         self.bot_manager: TelegramBotManager = TelegramBotManager(self)
+        asyncio.run(self.bot_manager.async_init(self))
         self.commands: CommandsManager = CommandsManager(self)
         self.chat_binding: ChatBindingManager = ChatBindingManager(self)
         self.slave_messages: SlaveMessageProcessor = SlaveMessageProcessor(self)
@@ -135,7 +137,7 @@ class TelegramChannel(MasterChannel):
                                           fallback=True)
 
         # Basic message handlers
-        non_edit_filter = filters.Update.MESSAGE | filters.Update.channel_post
+        non_edit_filter = filters.Update.MESSAGE # | filters.Update.channel_post # TODO: Add channel_post support
         self.bot_manager.application.add_handler(
             CommandHandler("start", self.start, filters=non_edit_filter))
         self.bot_manager.application.add_handler(

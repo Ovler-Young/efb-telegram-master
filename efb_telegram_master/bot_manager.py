@@ -144,8 +144,13 @@ class TelegramBotManager(LocaleMixin):
 
             return retry_on_chat_migration_wrap
 
-    async def __init__(self, channel: 'TelegramChannel'):
+    def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
+        self.logger = logging.getLogger(__name__)
+        self.webhook = False
+        self.application = None  # Initialize application as None
+
+    async def async_init(self, channel: 'TelegramChannel'):
         config = self.channel.config
 
         req_kwargs = {'read_timeout': 15}
@@ -159,18 +164,9 @@ class TelegramBotManager(LocaleMixin):
         builder.token(config['token'])
 
         builder.read_timeout(15)
-        # builder.base_url(channel.flag('api_base_url'))
-        # builder.base_file_url(channel.flag('api_base_file_url'))
-        # builder.request_kwargs = req_kwargs
-        application = builder.build()
+        self.application = builder.build()  # Assign application to self
 
-        # self.updater: Updater = Updater(application) need update_queue
-        self.updater: Updater = Bot( token=config['token'],
-                                        # base_url=channel.flag('api_base_url'),
-                                        # base_file_url=channel.flag('api_base_file_url'),
-                                        # request_kwargs=req_kwargs
-                                        )
-        self.updater.application = application
+        self.updater: Updater = Bot(token=config['token'])
         initializestatus = await self.updater.initialize()
 
         if isinstance(config.get('webhook'), dict):
@@ -179,12 +175,12 @@ class TelegramBotManager(LocaleMixin):
             self.logger.debug("Webhook is set...")
 
         self.logger.debug("Checking connection to Telegram bot API...")
-        me = self.updater.bot.get_me()
+        me =  self.updater.bot
         assert me, "Invalid bot credential provided."
         self.me: User = me
         self.logger.debug("Connection to Telegram bot API is OK...")
         self.admins: List[int] = config['admins']
-        self.application: Application = self.updater.application
+        # self.application: Application = self.application
         self.logger.debug("Adding base applications...")
         # New whitelist handler
         whitelist_filter = ~filters.User(user_id=self.admins)

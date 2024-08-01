@@ -92,15 +92,14 @@ class ChatBindingManager(LocaleMixin):
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
 
-    async def __init__(self, channel: 'TelegramChannel'):
+    def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
-
         # Link handler
-        non_edit_filter = filters.Update.MESSAGE | filters.Update.channel_post
-        await self.bot.application.add_handler(
+        non_edit_filter = filters.Update.MESSAGE # | filters.Update.CHANNEL_POST #TODO:CHANNEL_POST
+        self.bot.application.add_handler(
             CommandHandler("link", self.link_chat_show_list, filters=non_edit_filter))
         self.link_handler = ConversationHandler(
             entry_points=[],
@@ -113,10 +112,10 @@ class ChatBindingManager(LocaleMixin):
             per_chat=True,
             per_user=False
         )
-        await self.bot.application.add_handler(self.link_handler)
+        self.bot.application.add_handler(self.link_handler)
 
         # Chat head handler
-        await self.bot.application.add_handler(
+        self.bot.application.add_handler(
             CommandHandler("chat", self.start_chat_list, filters=non_edit_filter))
         self.chat_head_handler = ConversationHandler(
             entry_points=[],
@@ -128,10 +127,10 @@ class ChatBindingManager(LocaleMixin):
             per_chat=True,
             per_user=False
         )
-        await self.bot.application.add_handler(self.chat_head_handler)
+        self.bot.application.add_handler(self.chat_head_handler)
 
         # Unlink all
-        await self.bot.application.add_handler(
+        self.bot.application.add_handler(
             CommandHandler("unlink_all", self.unlink_all))
 
         # Recipient suggestion
@@ -144,12 +143,12 @@ class ChatBindingManager(LocaleMixin):
             per_user=False
         )
 
-        await self.bot.application.add_handler(self.suggestion_handler)
+        self.bot.application.add_handler(self.suggestion_handler)
 
         # Update group title and profile picture
-        await self.bot.application.add_handler(CommandHandler('update_info', self.update_group_info))
+        self.bot.application.add_handler(CommandHandler('update_info', self.update_group_info))
 
-        await self.bot.application.add_handler(
+        self.bot.application.add_handler(
             MessageHandler(filters.StatusUpdate.MIGRATE, self.chat_migration))
 
     async def pre_link_check(self, message: Message):

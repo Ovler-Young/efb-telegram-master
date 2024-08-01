@@ -61,25 +61,25 @@ class MasterMessageProcessor(LocaleMixin):
         TGMsgType.Dice: MsgType.Text,
     }
 
-    async def __init__(self, channel: 'TelegramChannel'):
+    def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
 
-        await self.bot.application.add_handler(CommandHandler("rm", self.delete_message))
+        self.bot.application.add_handler(CommandHandler("rm", self.delete_message))
 
-        await self.bot.application.add_handler(MessageHandler(
-            (filters.TEXT | filters.PHOTO | filters.STICKER | filters.DOCUMENT |
+        self.bot.application.add_handler(MessageHandler(
+            (filters.TEXT | filters.PHOTO | filters.Sticker.ALL | filters.Document.ALL |
              filters.VENUE | filters.LOCATION | filters.AUDIO | filters.VOICE |
-             filters.VIDEO | filters.CONTACT | filters.VIDEO_NOTE | filters.DICE) &
-            filters.UPDATE,
+             filters.VIDEO | filters.CONTACT | filters.VIDEO_NOTE |filters.Dice.ALL) &
+            filters.UpdateType.MESSAGE,
             self.enqueue_message
         ))
-        await self.bot.application.add_handler(MessageHandler(
+        self.bot.application.add_handler(MessageHandler(
             (filters.PASSPORT_DATA | filters.INVOICE | filters.GAME | filters.SUCCESSFUL_PAYMENT |
-             filters.POLL) & filters.UPDATE,
+             filters.POLL) & filters.UpdateType.MESSAGE,
             self.unsupported_message
         ))
         self.logger: logging.Logger = logging.getLogger(__name__)
