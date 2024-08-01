@@ -4,6 +4,7 @@ import html
 import io
 import logging
 import os
+import asyncio
 from functools import wraps
 from typing import List, TYPE_CHECKING, Callable
 
@@ -583,7 +584,12 @@ class TelegramBotManager(LocaleMixin):
             start_webhook = self.channel.config['webhook']['start_webhook']
             self.application.run_webhook(**start_webhook)
         else:
-            self.application.run_polling(timeout=10, drop_pending_updates=drop_pending_updates)
+            # Create a new event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Run the application in the event loop
+            loop.run_until_complete(self.application.run_polling(timeout=10, drop_pending_updates=drop_pending_updates))
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
