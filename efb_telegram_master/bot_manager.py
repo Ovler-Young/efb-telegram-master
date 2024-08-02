@@ -219,7 +219,7 @@ class TelegramBotManager(LocaleMixin):
         else:
             text = kwargs.pop('text')
         args = args[:1]
-        if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
+        if len(prefix + text + suffix) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode('utf-8'))
             full_message.seek(0)
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
