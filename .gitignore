@@ -126,3 +126,5 @@ fabric.properties
 readme_translations/locale
 
 .trunk
+output.md
+test.ps1
