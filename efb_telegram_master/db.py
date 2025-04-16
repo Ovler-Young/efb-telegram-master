@@ -55,6 +55,11 @@ class BaseModel(Model):
         database = database
 
 
+class TopicAssoc(BaseModel):
+    topic_chat_id = TextField()
+    message_thread_id = TextField()
+    slave_uid = TextField()
+
 class ChatAssoc(BaseModel):
     master_uid = TextField()
     slave_uid = TextField()
@@ -67,6 +72,8 @@ class MsgLog(BaseModel):
     """Editable message ID from Telegram if ``master_msg_id`` is not editable
     and a separate one is sent.
     """
+    master_message_thread_id = TextField(null=True)
+    """Message thread ID from Telegram"""
     slave_message_id = TextField()
     """Message from slave channel."""
     text = TextField()
@@ -184,7 +191,7 @@ class DatabaseManager:
         self.logger.debug("Database loaded.")
 
         self.logger.debug("Checking database migration...")
-        if not ChatAssoc.table_exists():
+        if not ChatAssoc.table_exists() or not TopicAssoc.table_exists():
             self._create()
         else:
             msg_log_columns = {i.name for i in database.get_columns("msglog")}
@@ -197,6 +204,8 @@ class DatabaseManager:
                 self._migrate(2)
             elif "file_unique_id" not in msg_log_columns:
                 self._migrate(3)
+            elif "master_message_thread_id" not in msg_log_columns:
+                self._migrate(4)
         self.logger.debug("Database migration finished...")
 
     def stop_worker(self):
@@ -207,7 +216,7 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo])
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc])
 
     @staticmethod
     def _migrate(i: int):
@@ -246,6 +255,12 @@ class DatabaseManager:
             # 2019NOV18
             migrate(
                 migrator.add_column("msglog", "file_unique_id", MsgLog.file_unique_id)
+            )
+        if i <= 4:
+            # Migration 4: Add column for message thread ID to message log table
+            # 2025APR12
+            migrate(
+                migrator.add_column("msglog", "master_message_thread_id", MsgLog.master_message_thread_id)
             )
 
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,
@@ -374,6 +389,83 @@ class DatabaseManager:
         except DoesNotExist:
             return []
 
+    def add_topic_assoc(self, message_thread_id: EFBChannelChatIDStr,
+                       slave_uid: EFBChannelChatIDStr, 
+                       topic_chat_id: int):
+        """
+        Add topic associations (topic links).
+        One Master channel with many Slave channel.
+
+        Args:
+            message_thread_id (str): thread UID in topic
+            slave_uid (str): Slave channel UID ("%(channel_id)s.%(chat_id)s")
+        """
+        return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
+
+    @staticmethod
+    def get_topic_thread_id(topic_chat_id: int,
+                       slave_uid: Optional[EFBChannelChatIDStr]
+                        ) -> int:
+        """
+        Get topic association (topic link) information.
+        Only one parameter is to be provided.
+
+        Args:
+            topic_chat_id (int): The topic UID
+            slave_uid (str): Slave channel UID ("%(channel_id)s.%(chat_id)s")
+
+        Returns:
+            The message thread_id
+        """
+        try:
+            assoc = TopicAssoc.select(TopicAssoc.message_thread_id)\
+                .where(TopicAssoc.slave_uid == slave_uid, TopicAssoc.topic_chat_id == topic_chat_id)\
+                .order_by(TopicAssoc.id.desc()).first()
+            if assoc:
+                return int(assoc.message_thread_id)
+        except DoesNotExist:
+            return None
+
+    @staticmethod
+    def get_topic_slave(topic_chat_id: int,
+                        message_thread_id: int
+                        ) -> Optional[EFBChannelChatIDStr]:
+        """
+        Get topic association (topic link) information.
+        Only one parameter is to be provided.
+
+        Args:
+            topic_chat_id (int): The topic UID
+            message_thread_id (int): The message thread ID
+
+        Returns:
+            Slave channel UID ("%(channel_id)s.%(chat_id)s")
+        """
+        try:
+            return TopicAssoc.select(TopicAssoc.slave_uid)\
+                .where(TopicAssoc.message_thread_id == message_thread_id, TopicAssoc.topic_chat_id == topic_chat_id).first().slave_uid
+        except DoesNotExist:
+            return None
+        except AttributeError: # Handle case where .slave_uid doesn't exist on the result
+            return None
+
+    @staticmethod
+    def remove_topic_assoc(topic_chat_id: int, slave_uid: Optional[EFBChannelChatIDStr] = None):
+        """
+        Remove topic association (topic link).
+
+        Args:
+            topic_chat_id (int): The topic group chat ID
+            slave_uid (str): Slave channel UID ("%(channel_id)s.%(chat_id)s")
+        """
+        try:
+            return TopicAssoc.delete().where(
+                (TopicAssoc.topic_chat_id == str(topic_chat_id)) &
+                (TopicAssoc.slave_uid == str(slave_uid))
+            ).execute()
+        except DoesNotExist:
+            return 0
+
     def add_or_update_message_log(self,
                                   msg: ETMMsg,
                                   master_message: Message,
@@ -402,6 +494,7 @@ class DatabaseManager:
 
         row.master_msg_id = master_msg_id
         row.master_msg_id_alt = master_msg_id_alt
+        row.master_message_thread_id = str(master_message.message_thread_id) if master_message.message_thread_id else None
         row.text = msg.text
         row.slave_origin_uid = chat_id_to_str(chat=msg.chat)
         row.slave_member_uid = chat_id_to_str(chat=msg.author)
