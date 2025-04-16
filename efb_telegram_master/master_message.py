@@ -158,9 +158,24 @@ class MasterMessageProcessor(LocaleMixin):
         if destination is None:
             destination = self.get_singly_linked_chat_id_str(update.effective_chat)
             if destination:
-                # if the chat is singly-linked
                 quote = message.reply_to_message is not None
                 self.logger.debug("[%s] Chat %s is singly-linked to %s", mid, message.chat, destination)
+
+        if destination is None:
+            thread_id = message.message_thread_id
+            if thread_id:
+                if TelegramChatID(update.effective_chat.id) == self.channel.topic_group:
+                    destination = self.db.get_topic_slave(message_thread_id=thread_id, topic_chat_id=self.channel.topic_group)
+                    if destination:
+                        quote = message.reply_to_message.message_id != message.reply_to_message.message_thread_id
+                        if not quote:
+                            message.reply_to_message = None
+                    else:
+                        self.logger.debug("[%s] Ignored message as it's a topic which wasn't created by this bot", mid)
+                        return
+                else:
+                    self.logger.debug("[%s] Ignored message as it's a invalid topic group.", mid)
+                    return
 
         if destination is None:  # not singly linked
             quote = False

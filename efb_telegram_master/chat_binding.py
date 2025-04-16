@@ -11,7 +11,7 @@ from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Patter
 import telegram  # lgtm [py/import-and-import-from]
 from PIL import Image
 from telegram import Update, Message, TelegramError, InlineKeyboardButton, ChatAction, InlineKeyboardMarkup, \
-    ParseMode
+    ParseMode, ForumTopic
 from telegram.error import BadRequest
 from telegram.ext import ConversationHandler, CommandHandler, CallbackQueryHandler, CallbackContext, Filters, \
     MessageHandler
@@ -475,7 +475,7 @@ class ChatBindingManager(LocaleMixin):
 
     def link_chat_exec(self, update: Update, context: CallbackContext) -> int:
         """
-        Action to link a chat. Triggered by callback message with status `Flags.EXEC_LINK`.
+        Action to link a chat. Triggered by callback message with status `Flags.LINK_EXEC`.
         """
         assert isinstance(update, Update)
         assert update.effective_chat
@@ -546,6 +546,7 @@ class ChatBindingManager(LocaleMixin):
         chat: ETMChatType = data.chats[0]
         chat_display_name = chat.full_name
         slave_channel, slave_chat_uid = chat.module_id, chat.uid
+        chat_uid = utils.chat_id_to_str(slave_channel, slave_chat_uid)
         try:
             coordinator.get_module_by_id(slave_channel)
         except NameError:
@@ -566,6 +567,28 @@ class ChatBindingManager(LocaleMixin):
         msg = self.bot.send_message(tg_chat_to_link, text=txt)
 
         chat.link(self.channel.channel_id, ChatID(str(tg_chat_to_link)), self.channel.flag("multiple_slave_chats"))
+        self.db.remove_topic_assoc(
+            slave_uid=chat_uid,
+        )
+
+        chat_id = utils.chat_id_to_str(self.channel.channel_id, ChatID(str(tg_chat_to_link)))
+        links = self.db.get_chat_assoc(master_uid=chat_id)
+        if len(links) > 1 and self.channel.topic_group:
+            try:
+                topic: ForumTopic = self.bot.create_forum_topic(
+                    chat_id=chat_id,
+                    name=chat.chat_title
+                )
+                thread_id = topic.message_thread_id
+                self.db.add_topic_assoc(
+                    topic_chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    slave_uid=chat_uid,
+                )
+                return thread_id
+            except telegram.error.BadRequest as e:
+                self.logger.error('Failed to create topic, Reason: %s', e)
+                return None
 
         txt = self._("Chat {0} is now linked.").format(chat_display_name)
         self.bot.edit_message_text(text=txt, chat_id=msg.chat.id, message_id=msg.message_id)
