@@ -415,23 +415,48 @@ class DatabaseManager:
             return None
 
     @staticmethod
-    def get_topic_slave(topic_chat_id: TelegramChatID,
-                        message_thread_id: TelegramTopicID
+    def get_topic_slave(topic_chat_id: TelegramTopicID,
+                        message_thread_id: Optional[EFBChannelChatIDStr] = None,
                         ) -> Optional[EFBChannelChatIDStr]:
         """
         Get topic association (topic link) information.
         Only one parameter is to be provided.
 
         Args:
-            topic_chat_id (TelegramChatID): The topic UID
+            topic_chat_id (TelegramTopicID): The topic UID
             message_thread_id (TelegramTopicID): The message thread ID
 
         Returns:
             Slave channel UID ("%(channel_id)s.%(chat_id)s")
         """
         try:
-            return TopicAssoc.select(TopicAssoc.slave_uid)\
-                .where(TopicAssoc.message_thread_id == message_thread_id, TopicAssoc.topic_chat_id == topic_chat_id).first().slave_uid
+            if message_thread_id:
+                return TopicAssoc.select(TopicAssoc.slave_uid)\
+                    .where(TopicAssoc.message_thread_id == message_thread_id, TopicAssoc.topic_chat_id == topic_chat_id).first().slave_uid
+            else:
+                return TopicAssoc.select(TopicAssoc.slave_uid)\
+                    .where(TopicAssoc.topic_chat_id == topic_chat_id).first().slave_uid
+        except DoesNotExist:
+            return None
+        except AttributeError:
+            return None
+
+    @staticmethod
+    def get_topic_slaves(topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
+        """
+        Get topic association (topic link) information.
+        Only one parameter is to be provided.
+
+        Args:
+            topic_chat_id (TelegramChatID): The topic UID
+
+        Returns:
+            List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]: A list of tuples containing slave channel UID and message thread ID
+        """
+        try:
+            query = TopicAssoc.select(TopicAssoc.slave_uid, TopicAssoc.message_thread_id)\
+                .where(TopicAssoc.topic_chat_id == topic_chat_id).order_by(TopicAssoc.id.desc())
+            return [(row.slave_uid, int(row.message_thread_id)) for row in query]
         except DoesNotExist:
             return None
         except AttributeError:
