@@ -5,8 +5,10 @@ import itertools
 import logging
 import os
 import tempfile
+import threading
 import traceback
 import urllib.parse
+from collections import defaultdict
 from pathlib import Path
 from typing import Tuple, Optional, TYPE_CHECKING, List, IO, Union
 
@@ -53,6 +55,7 @@ class SlaveMessageProcessor(LocaleMixin):
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
+        self._topic_creation_locks = defaultdict(threading.Lock)
 
     def is_silent(self, msg: Message) -> Optional[bool]:
         """Determine if a message shall be sent silently.
@@ -119,7 +122,21 @@ class SlaveMessageProcessor(LocaleMixin):
 
             self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
         except Exception as e:
-            self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
+            if isinstance(e, telegram.error.BadRequest) and e.message:
+                if "Topic" in e.message:
+                    try:
+                        self.bot.reopen_forum_topic(
+                            chat_id=tg_dest,
+                            message_thread_id=thread_id
+                        )
+                    except telegram.error.BadRequest as e:
+                        self.logger.error('Failed to reopen topic, Reason: %s', e)
+                        self.db.remove_topic_assoc(
+                            topic_chat_id=tg_dest,
+                            message_thread_id=thread_id,
+                        )
+            else:
+                self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
                               repr(msg), repr(e), traceback.format_exc())
         return msg
 
@@ -262,42 +279,39 @@ class SlaveMessageProcessor(LocaleMixin):
 
         # Generate chat text template & Decide type target
         tg_dest = TelegramChatID(self.channel.config['admins'][0])
-
-        if tg_chat and singly_linked:
+        
+        if tg_chat:
             tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
-        elif not isinstance(chat, SystemChat) and self.channel.topic_group:
-            tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]) if tg_chat else self.channel.topic_group)
-            thread_id = self.db.get_topic_thread_id(slave_uid=chat_uid)
-            if thread_id:
-                #TODO: Logic to reopen the topic if it was closed. Move to, when send message fails.
-                try:
-                    self.bot.reopen_forum_topic(
-                        chat_id=tg_dest,
-                        message_thread_id=thread_id
-                    )
-                except telegram.error.BadRequest as e:
-                    # expected behavior
-                    if e.message == "Topic_not_modified":
-                        pass
-                    else:
-                        self.logger.error('Failed to reopen topic, Reason: %s', e)
-                        thread_id = None
-            if not thread_id:
-                try:
-                    topic: ForumTopic = self.bot.create_forum_topic(
-                        chat_id=tg_dest,
-                        name=chat.chat_title
-                    )
-                    thread_id = topic.message_thread_id
-                    self.db.add_topic_assoc(
-                        topic_chat_id=tg_dest,
-                        message_thread_id=thread_id,
-                        slave_uid=chat_uid,
-                    )
-                except telegram.error.BadRequest as e:
-                    self.logger.error('Failed to create topic, Reason: %s', e)
-        else:
+        if self.channel.topic_group:
+            if not isinstance(chat, SystemChat):
+                tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]) if tg_chat else self.channel.topic_group)
+                master_chat_info = self.bot.get_chat_info(tg_dest)
+                if master_chat_info.is_forum:
+                    thread_id = self.db.get_topic_thread_id(slave_uid=chat_uid)
+                    if not thread_id:
+                        with self._topic_creation_locks[tg_dest]:
+                            thread_id = self.db.get_topic_thread_id(slave_uid=chat_uid)
+                            if not thread_id:
+                                try:
+                                    topic: ForumTopic = self.bot.create_forum_topic(
+                                        chat_id=tg_dest,
+                                        name=chat.chat_title
+                                    )
+                                    thread_id = topic.message_thread_id
+                                    self.db.add_topic_assoc(
+                                        topic_chat_id=tg_dest,
+                                        message_thread_id=thread_id,
+                                        slave_uid=chat_uid,
+                                    )
+                                except telegram.error.BadRequest as e:
+                                    self.logger.info('Failed to create topic, Reason: %s', e)
+                                    tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]) if tg_chat else self.channel.topic_group)
+                                    thread_id = None
+
+        if not tg_chat:
             singly_linked = False
+        if thread_id:
+            singly_linked = True
 
         msg_template = self.generate_message_template(msg, singly_linked)
         self.logger.debug("[%s] Message is sent to Telegram chat %s, with header \"%s\".",
