@@ -4,6 +4,7 @@ import html
 import io
 import logging
 import os
+import time
 from functools import wraps
 from typing import List, TYPE_CHECKING, Callable
 
@@ -45,11 +46,19 @@ class TelegramBotManager(LocaleMixin):
         @classmethod
         def exception_filter(cls, exception: Exception):
             cls.logger.exception("Exception: %s while sending request to Telegram server.", exception)
-            return isinstance(exception, telegram.error.TimedOut)
+            if isinstance(exception, telegram.error.TimedOut):
+                return True
+            elif isinstance(exception, telegram.error.RetryAfter):
+                # Sleep for the specified retry time plus a small buffer
+                retry_after = exception.retry_after + 1
+                cls.logger.warning("Rate limited by Telegram. Waiting %s seconds before retry.", retry_after)
+                time.sleep(retry_after)
+                return True
+            return False
 
         @classmethod
         def retry_on_timeout(cls, fn: Callable):
-            """Infinitely retry for timed-out exceptions."""
+            """Infinitely retry for timed-out and rate-limited exceptions."""
             if not cls.enable_retry:
                 return fn
             cls.logger.debug("Trying to call %s with infinite retry.", fn)

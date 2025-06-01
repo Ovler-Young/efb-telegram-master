@@ -498,9 +498,12 @@ e.g.:
 -   ``retry_on_error`` *(bool)* [Default: ``false``]
 
     Retry infinitely when an error occurred while sending request
-    to Telegram Bot API. Note that this may lead to repetitive
-    message delivery, as the respond of Telegram Bot API is
-    not reliable, and may not reflect the actual result.
+    to Telegram Bot API, including network timeouts and rate limiting.
+    When rate limited by Telegram, the bot will automatically wait for
+    the specified retry period before attempting to resend the message.
+    Note that this may lead to repetitive message delivery, as the 
+    respond of Telegram Bot API is not reliable, and may not reflect
+    the actual result.
 
 -   ``send_image_as_file`` *(bool)* [Default: ``false``]
 
