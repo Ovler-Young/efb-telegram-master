@@ -4,8 +4,11 @@ import html
 import io
 import logging
 import os
+import time
+import threading
+from collections import defaultdict, deque
 from functools import wraps
-from typing import List, TYPE_CHECKING, Callable
+from typing import List, TYPE_CHECKING, Callable, Optional
 
 import telegram.constants
 import telegram.error
@@ -55,6 +58,62 @@ class TelegramBotManager(LocaleMixin):
             cls.logger.debug("Trying to call %s with infinite retry.", fn)
             return retry(wait_exponential_multiplier=1e3, wait_exponential_max=180e3,
                          retry_on_exception=cls.exception_filter)(fn)
+
+        @classmethod
+        def rate_limit_decorator(cls, fn: Callable):
+            """Apply rate limiting to API calls."""
+            @wraps(fn)
+            def rate_limit_wrapper(self: 'TelegramBotManager', *args, **kwargs):
+                # Extract chat_id from arguments
+                chat_id = None
+
+                if args:
+                    chat_id = args[0]
+                elif 'chat_id' in kwargs:
+                    chat_id = kwargs['chat_id']
+
+                # Apply rate limiting
+                if chat_id:
+                    self._wait_for_rate_limit(chat_id)
+
+                return fn(self, *args, **kwargs)
+
+            return rate_limit_wrapper
+
+        @classmethod
+        def handle_rate_limit_error(cls, fn: Callable):
+            """Handle 429 rate limit errors with exponential backoff."""
+            @wraps(fn)
+            def rate_limit_error_handler(self: 'TelegramBotManager', *args, **kwargs):
+                max_retries = 3
+                base_delay = 1.0
+
+                for attempt in range(max_retries + 1):
+                    try:
+                        return fn(self, *args, **kwargs)
+                    except telegram.error.RetryAfter as e:
+                        if attempt >= max_retries:
+                            cls.logger.error(f"Max retries exceeded for rate limit error: {e}")
+                            raise
+
+                        retry_after = e.retry_after
+                        cls.logger.warning(f"Rate limit hit, waiting {retry_after}s before retry {attempt + 1}/{max_retries}")
+                        time.sleep(retry_after)
+                    except telegram.error.TelegramError as e:
+                        if "Too Many Requests" in str(e) or "429" in str(e):
+                            if attempt >= max_retries:
+                                cls.logger.error(f"Max retries exceeded for rate limit error: {e}")
+                                raise
+
+                            delay = base_delay * (2 ** attempt)  # Exponential backoff
+                            cls.logger.warning(f"Rate limit detected, waiting {delay}s before retry {attempt + 1}/{max_retries}")
+                            time.sleep(delay)
+                        else:
+                            raise
+
+                return fn(self, *args, **kwargs)
+
+            return rate_limit_error_handler
 
         @classmethod
         def caption_strip_class_on_failure(cls, fn: Callable):
@@ -171,6 +230,20 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Connection to Telegram bot API is OK...")
         self.admins: List[int] = config['admins']
         self.dispatcher: Dispatcher = self.updater.dispatcher
+
+        # Initialize sliding window rate limiting
+        self._rate_limit_lock = threading.Lock()
+        self._global_timestamps = deque()
+        self._chat_timestamps = defaultdict(deque)
+
+        # Rate limits based on Telegram API documentation
+        self.GLOBAL_LIMIT = 30    # messages per second
+        self.GLOBAL_WINDOW = 1.0
+        self.CHAT_LIMIT = 20      # messages per minute per chat
+        self.CHAT_WINDOW = 60.0
+
+        self.logger.debug("Rate limiter initialized...")
+
         self.logger.debug("Adding base dispatchers...")
         # New whitelist handler
         whitelist_filter = ~Filters.user(user_id=self.admins)
@@ -180,7 +253,60 @@ class TelegramBotManager(LocaleMixin):
         self.Decorators.enable_retry = channel.flag('retry_on_error')
         self.logger.debug("Base dispatchers added...")
 
+    def _cleanup_old_timestamps(self, timestamps: deque, window: float, current_time: float):
+        """Remove timestamps older than the time window."""
+        while timestamps and timestamps[0] <= current_time - window:
+            timestamps.popleft()
+
+    def _wait_for_rate_limit(self, chat_id: int):
+        """
+        Rate limiting using sliding window algorithm.
+        Allows burst sending up to the limit, then enforces waiting.
+        
+        Args:
+            chat_id: Telegram chat ID
+        """
+        with self._rate_limit_lock:
+            current_time = time.time()
+
+            # global rate limit
+            self._cleanup_old_timestamps(self._global_timestamps, self.GLOBAL_WINDOW, current_time)
+            if len(self._global_timestamps) >= self.GLOBAL_LIMIT:
+                # Need to wait until oldest request expires
+                sleep_time = self.GLOBAL_WINDOW - (current_time - self._global_timestamps[0])
+                if sleep_time > 0:
+                    self.logger.debug(f"Global rate limit reached, sleeping {sleep_time:.2f}s")
+                    time.sleep(sleep_time)
+                    current_time = time.time()
+                    self._cleanup_old_timestamps(self._global_timestamps, self.GLOBAL_WINDOW, current_time)
+
+            # chat-specific rate limit
+            chat_timestamps = self._chat_timestamps[chat_id]
+            self._cleanup_old_timestamps(chat_timestamps, self.CHAT_WINDOW, current_time)
+            if len(chat_timestamps) >= self.CHAT_LIMIT:
+                sleep_time = self.CHAT_WINDOW - (current_time - chat_timestamps[0])
+                if sleep_time > 0:
+                    self.logger.debug(f"Chat {chat_id} rate limit reached, sleeping {sleep_time:.2f}s")
+                    time.sleep(sleep_time)
+                    current_time = time.time()
+                    self._cleanup_old_timestamps(chat_timestamps, self.CHAT_WINDOW, current_time)
+
+            # Record this request
+            self._global_timestamps.append(current_time)
+            self._chat_timestamps[chat_id].append(current_time)
+
+            # Periodic cleanup to prevent memory leak
+            if len(self._chat_timestamps) > 50:
+                inactive_chats = [
+                    cid for cid, timestamps in self._chat_timestamps.items() 
+                    if not timestamps or (current_time - timestamps[-1] > self.CHAT_WINDOW)
+                ]
+                for cid in inactive_chats:
+                    del self._chat_timestamps[cid]
+
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_message(self, *args, prefix: str = '', suffix: str = '', **kwargs):
         """
@@ -231,6 +357,8 @@ class TelegramBotManager(LocaleMixin):
             return self._bot_send_message_fallback(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_text(self, prefix='', suffix='', **kwargs):
         """
@@ -311,7 +439,9 @@ class TelegramBotManager(LocaleMixin):
                 raise e
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_audio(self, *args, **kwargs):
         """
@@ -335,7 +465,9 @@ class TelegramBotManager(LocaleMixin):
             return self.updater.bot.send_document(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_voice(self, *args, **kwargs):
         """
@@ -359,7 +491,9 @@ class TelegramBotManager(LocaleMixin):
             return self.updater.bot.send_document(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_video(self, *args, **kwargs):
         """
@@ -383,7 +517,9 @@ class TelegramBotManager(LocaleMixin):
             return self.updater.bot.send_document(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_document(self, *args, **kwargs):
         """
@@ -402,7 +538,9 @@ class TelegramBotManager(LocaleMixin):
         return self.updater.bot.send_document(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_animation(self, *args, **kwargs):
         """
@@ -421,7 +559,9 @@ class TelegramBotManager(LocaleMixin):
         return self.updater.bot.send_animation(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_photo(self, *args, **kwargs):
         """
@@ -443,6 +583,8 @@ class TelegramBotManager(LocaleMixin):
             return self.updater.bot.send_document(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
         message_thread_id = kwargs.pop('message_thread_id', None)
@@ -451,26 +593,36 @@ class TelegramBotManager(LocaleMixin):
         return self.updater.bot.send_chat_action(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_reply_markup(self, *args, **kwargs):
         return self.updater.bot.edit_message_reply_markup(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_location(self, *args, **kwargs):
         return self.updater.bot.send_location(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_venue(self, *args, **kwargs):
         return self.updater.bot.send_venue(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_sticker(self, *args, **kwargs):
         return self.updater.bot.send_sticker(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def get_me(self, *args, **kwargs):
         return self.updater.bot.get_me(*args, **kwargs)
@@ -486,12 +638,15 @@ class TelegramBotManager(LocaleMixin):
                                message_id=update.effective_message.message_id)
 
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
         return self.updater.bot.edit_message_caption(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
         return self.updater.bot.edit_message_media(*args, **kwargs)
@@ -507,16 +662,19 @@ class TelegramBotManager(LocaleMixin):
                                  reply_to_message_id=update.effective_message.message_id)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def get_file(self, file_id: str) -> File:
         return self.updater.bot.get_file(file_id)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def delete_message(self, chat_id, message_id):
         return self.updater.bot.delete_message(chat_id, message_id)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def answer_callback_query(self, *args, prefix="", suffix="", text=None,
                               message_id=None, **kwargs):
@@ -547,46 +705,55 @@ class TelegramBotManager(LocaleMixin):
         )
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def get_chat_info(self, *args, **kwargs):
         return self.updater.bot.get_chat(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def create_forum_topic(self, *args, **kwargs) -> ForumTopic:
         return self.updater.bot.create_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def edit_forum_topic(self, *args, **kwargs):
         return self.updater.bot.edit_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def reopen_forum_topic(self, *args, **kwargs) -> bool:
         return self.updater.bot.reopen_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def set_chat_title(self, *args, **kwargs):
         return self.updater.bot.set_chat_title(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def set_chat_photo(self, *args, **kwargs):
         return self.updater.bot.set_chat_photo(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def set_chat_description(self, *args, **kwargs):
         return self.updater.bot.set_chat_description(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def forward_message(self, *args, **kwargs):
         return self.updater.bot.forward_message(*args, **kwargs)
 
     @Decorators.retry_on_timeout
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def copy_message(self, *args, **kwargs):
         return self.updater.bot.copy_message(*args, **kwargs)
