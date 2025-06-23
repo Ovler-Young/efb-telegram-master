@@ -622,6 +622,20 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
+    @Decorators.retry_on_chat_migration
+    def forward_message(self, *args, **kwargs):
+        return self.updater.bot.forward_message(*args, **kwargs)
+
+    @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.rate_limit_decorator
+    @Decorators.retry_on_chat_migration
+    def copy_message(self, *args, **kwargs):
+        return self.updater.bot.copy_message(*args, **kwargs)
+
+    @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def get_me(self, *args, **kwargs):
         return self.updater.bot.get_me(*args, **kwargs)
@@ -731,18 +745,6 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_chat_migration
     def set_chat_description(self, *args, **kwargs):
         return self.updater.bot.set_chat_description(*args, **kwargs)
-
-    @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
-    @Decorators.retry_on_chat_migration
-    def forward_message(self, *args, **kwargs):
-        return self.updater.bot.forward_message(*args, **kwargs)
-
-    @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
-    @Decorators.retry_on_chat_migration
-    def copy_message(self, *args, **kwargs):
-        return self.updater.bot.copy_message(*args, **kwargs)
 
     def polling(self, drop_pending_updates: bool = False):
         """
