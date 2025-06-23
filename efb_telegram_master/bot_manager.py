@@ -293,16 +293,15 @@ class TelegramBotManager(LocaleMixin):
             self._global_timestamps.append(actual_time)
             self._chat_timestamps[chat_id].append(actual_time)
 
-        # Sleep outside the lock to avoid blocking other threads
-        if sleep_time > 0:
             chat_count = len(self._chat_timestamps[chat_id])
             global_count = len(self._global_timestamps)
+
+        # Sleep outside the lock to avoid blocking other threads
+        if sleep_time > 0:
             self.logger.info(f"Rate limit reached, sleeping {sleep_time:.2f}s for chat {chat_id}. "
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
             time.sleep(sleep_time)
         else:
-            chat_count = len(self._chat_timestamps[chat_id])
-            global_count = len(self._global_timestamps)
             self.logger.info(f"Rate limit not reached for chat {chat_id}. "
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
 
