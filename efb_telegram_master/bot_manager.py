@@ -585,7 +585,6 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
         message_thread_id = kwargs.pop('message_thread_id', None)
@@ -623,7 +622,6 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def get_me(self, *args, **kwargs):
         return self.updater.bot.get_me(*args, **kwargs)
@@ -639,15 +637,12 @@ class TelegramBotManager(LocaleMixin):
                                message_id=update.effective_message.message_id)
 
     @Decorators.retry_on_timeout
-    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
         return self.updater.bot.edit_message_caption(*args, **kwargs)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
         return self.updater.bot.edit_message_media(*args, **kwargs)
@@ -663,19 +658,16 @@ class TelegramBotManager(LocaleMixin):
                                  reply_to_message_id=update.effective_message.message_id)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def get_file(self, file_id: str) -> File:
         return self.updater.bot.get_file(file_id)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def delete_message(self, chat_id, message_id):
         return self.updater.bot.delete_message(chat_id, message_id)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def answer_callback_query(self, *args, prefix="", suffix="", text=None,
                               message_id=None, **kwargs):
@@ -706,43 +698,36 @@ class TelegramBotManager(LocaleMixin):
         )
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def get_chat_info(self, *args, **kwargs):
         return self.updater.bot.get_chat(*args, **kwargs)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def create_forum_topic(self, *args, **kwargs) -> ForumTopic:
         return self.updater.bot.create_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def edit_forum_topic(self, *args, **kwargs):
         return self.updater.bot.edit_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def reopen_forum_topic(self, *args, **kwargs) -> bool:
         return self.updater.bot.reopen_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def set_chat_title(self, *args, **kwargs):
         return self.updater.bot.set_chat_title(*args, **kwargs)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def set_chat_photo(self, *args, **kwargs):
         return self.updater.bot.set_chat_photo(*args, **kwargs)
 
     @Decorators.retry_on_timeout
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def set_chat_description(self, *args, **kwargs):
         return self.updater.bot.set_chat_description(*args, **kwargs)
