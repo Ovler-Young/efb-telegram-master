@@ -8,7 +8,7 @@ import time
 import threading
 from collections import defaultdict, deque
 from functools import wraps
-from typing import List, TYPE_CHECKING, Callable, Optional
+from typing import List, TYPE_CHECKING, Callable
 
 import telegram.constants
 import telegram.error
@@ -74,7 +74,7 @@ class TelegramBotManager(LocaleMixin):
 
                 # Apply rate limiting
                 if chat_id:
-                    self._wait_for_rate_limit(chat_id)
+                    self._wait_for_rate_limit(chat_id)  # pylint: disable=protected-access
 
                 return fn(self, *args, **kwargs)
 
@@ -266,34 +266,25 @@ class TelegramBotManager(LocaleMixin):
         Args:
             chat_id: Telegram chat ID
         """
+        current_time = time.time()
+        sleep_time = 0
+        
         with self._rate_limit_lock:
-            current_time = time.time()
-
             # global rate limit
             self._cleanup_old_timestamps(self._global_timestamps, self.GLOBAL_WINDOW, current_time)
             if len(self._global_timestamps) >= self.GLOBAL_LIMIT:
-                # Need to wait until oldest request expires
-                sleep_time = self.GLOBAL_WINDOW - (current_time - self._global_timestamps[0])
-                if sleep_time > 0:
-                    self.logger.debug(f"Global rate limit reached, sleeping {sleep_time:.2f}s")
-                    time.sleep(sleep_time)
-                    current_time = time.time()
-                    self._cleanup_old_timestamps(self._global_timestamps, self.GLOBAL_WINDOW, current_time)
+                sleep_time = max(sleep_time, self.GLOBAL_WINDOW - (current_time - self._global_timestamps[0]))
 
             # chat-specific rate limit
             chat_timestamps = self._chat_timestamps[chat_id]
             self._cleanup_old_timestamps(chat_timestamps, self.CHAT_WINDOW, current_time)
             if len(chat_timestamps) >= self.CHAT_LIMIT:
-                sleep_time = self.CHAT_WINDOW - (current_time - chat_timestamps[0])
-                if sleep_time > 0:
-                    self.logger.debug(f"Chat {chat_id} rate limit reached, sleeping {sleep_time:.2f}s")
-                    time.sleep(sleep_time)
-                    current_time = time.time()
-                    self._cleanup_old_timestamps(chat_timestamps, self.CHAT_WINDOW, current_time)
+                sleep_time = max(sleep_time, self.CHAT_WINDOW - (current_time - chat_timestamps[0]))
 
-            # Record this request
-            self._global_timestamps.append(current_time)
-            self._chat_timestamps[chat_id].append(current_time)
+            # If no sleep needed, record the request and exit
+            if sleep_time <= 0:
+                self._global_timestamps.append(current_time)
+                self._chat_timestamps[chat_id].append(current_time)
 
             # Periodic cleanup to prevent memory leak
             if len(self._chat_timestamps) > 50:
@@ -303,6 +294,11 @@ class TelegramBotManager(LocaleMixin):
                 ]
                 for cid in inactive_chats:
                     del self._chat_timestamps[cid]
+
+        # Sleep outside the lock to avoid blocking other threads
+        if sleep_time > 0:
+            self.logger.debug(f"Rate limit reached, sleeping {sleep_time:.2f}s")
+            time.sleep(sleep_time)
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
