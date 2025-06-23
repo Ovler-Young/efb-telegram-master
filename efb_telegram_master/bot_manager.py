@@ -281,10 +281,8 @@ class TelegramBotManager(LocaleMixin):
             if len(chat_timestamps) >= self.CHAT_LIMIT:
                 sleep_time = max(sleep_time, self.CHAT_WINDOW - (current_time - chat_timestamps[0]))
 
-            # If no sleep needed, record the request and exit
-            if sleep_time <= 0:
-                self._global_timestamps.append(current_time)
-                self._chat_timestamps[chat_id].append(current_time)
+            self._global_timestamps.append(max(current_time, current_time + sleep_time))
+            self._chat_timestamps[chat_id].append(max(current_time, current_time + sleep_time))
 
             # Periodic cleanup to prevent memory leak
             if len(self._chat_timestamps) > 50:
