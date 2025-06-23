@@ -295,7 +295,7 @@ class TelegramBotManager(LocaleMixin):
 
         # Sleep outside the lock to avoid blocking other threads
         if sleep_time > 0:
-            self.logger.debug(f"Rate limit reached, sleeping {sleep_time:.2f}s")
+            self.logger.info(f"Rate limit reached, sleeping {sleep_time:.2f}s for chat {chat_id}")
             time.sleep(sleep_time)
 
     @Decorators.retry_on_timeout
