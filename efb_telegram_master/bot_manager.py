@@ -295,10 +295,16 @@ class TelegramBotManager(LocaleMixin):
 
         # Sleep outside the lock to avoid blocking other threads
         if sleep_time > 0:
-            self.logger.info(f"Rate limit reached, sleeping {sleep_time:.2f}s for chat {chat_id}. There are {len(self._chat_timestamps)} chats since last {self.CHAT_WINDOW} seconds.")
+            chat_count = len(self._chat_timestamps[chat_id])
+            global_count = len(self._global_timestamps)
+            self.logger.info(f"Rate limit reached, sleeping {sleep_time:.2f}s for chat {chat_id}. "
+                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
             time.sleep(sleep_time)
         else:
-            self.logger.info(f"Rate limit not reached for chat {chat_id}. There are {len(self._chat_timestamps)} chats since last {self.CHAT_WINDOW} seconds.")
+            chat_count = len(self._chat_timestamps[chat_id])
+            global_count = len(self._global_timestamps)
+            self.logger.info(f"Rate limit not reached for chat {chat_id}. "
+                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
