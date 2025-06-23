@@ -253,10 +253,17 @@ class TelegramBotManager(LocaleMixin):
         self.Decorators.enable_retry = channel.flag('retry_on_error')
         self.logger.debug("Base dispatchers added...")
 
-    def _cleanup_old_timestamps(self, timestamps: deque, window: float, current_time: float):
+    def _cleanup_old_timestamps(self):
         """Remove timestamps older than the time window."""
-        while timestamps and timestamps[0] <= current_time - window:
-            timestamps.popleft()
+        current_time = time.time()
+        # global rate limit
+        while self._global_timestamps and self._global_timestamps[0] <= current_time - self.GLOBAL_WINDOW:
+            self._global_timestamps.popleft()
+
+        # chat-specific rate limit
+        for chat_id, timestamps in self._chat_timestamps.items():
+            while timestamps and timestamps[0] <= current_time - self.CHAT_WINDOW:
+                timestamps.popleft()
 
     def _wait_for_rate_limit(self, chat_id: int):
         """
@@ -270,35 +277,28 @@ class TelegramBotManager(LocaleMixin):
         sleep_time = 0
         
         with self._rate_limit_lock:
+            self._cleanup_old_timestamps()
+            
             # global rate limit
-            self._cleanup_old_timestamps(self._global_timestamps, self.GLOBAL_WINDOW, current_time)
             if len(self._global_timestamps) >= self.GLOBAL_LIMIT:
                 sleep_time = max(sleep_time, self.GLOBAL_WINDOW - (current_time - self._global_timestamps[0]))
 
             # chat-specific rate limit
             chat_timestamps = self._chat_timestamps[chat_id]
-            self._cleanup_old_timestamps(chat_timestamps, self.CHAT_WINDOW, current_time)
             if len(chat_timestamps) >= self.CHAT_LIMIT:
                 sleep_time = max(sleep_time, self.CHAT_WINDOW - (current_time - chat_timestamps[0]))
 
-            self._global_timestamps.append(max(current_time, current_time + sleep_time))
-            self._chat_timestamps[chat_id].append(max(current_time, current_time + sleep_time))
-
-            # Periodic cleanup to prevent memory leak
-            if len(self._chat_timestamps) > 50:
-                inactive_chats = [
-                    cid for cid, timestamps in self._chat_timestamps.items() 
-                    if not timestamps or (current_time - timestamps[-1] > self.CHAT_WINDOW)
-                ]
-                for cid in inactive_chats:
-                    del self._chat_timestamps[cid]
+            # Record the actual time this request will be processed
+            actual_time = current_time + sleep_time
+            self._global_timestamps.append(actual_time)
+            self._chat_timestamps[chat_id].append(actual_time)
 
         # Sleep outside the lock to avoid blocking other threads
         if sleep_time > 0:
-            self.logger.info(f"Rate limit reached, sleeping {sleep_time:.2f}s for chat {chat_id}. There are {len(self._chat_timestamps)} chats in the rate limit.")
+            self.logger.info(f"Rate limit reached, sleeping {sleep_time:.2f}s for chat {chat_id}. There are {len(self._chat_timestamps)} chats since last {self.CHAT_WINDOW} seconds.")
             time.sleep(sleep_time)
         else:
-            self.logger.info(f"Rate limit not reached for chat {chat_id}")
+            self.logger.info(f"Rate limit not reached for chat {chat_id}. There are {len(self._chat_timestamps)} chats since last {self.CHAT_WINDOW} seconds.")
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
