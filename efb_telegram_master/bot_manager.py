@@ -280,12 +280,12 @@ class TelegramBotManager(LocaleMixin):
             self._cleanup_old_timestamps()
             
             # global rate limit
-            if len(self._global_timestamps) >= self.GLOBAL_LIMIT:
+            if len(self._global_timestamps) >= self.GLOBAL_LIMIT - 1:
                 sleep_time = max(sleep_time, self.GLOBAL_WINDOW - (current_time - self._global_timestamps[0]))
 
             # chat-specific rate limit
             chat_timestamps = self._chat_timestamps[chat_id]
-            if len(chat_timestamps) >= self.CHAT_LIMIT:
+            if len(chat_timestamps) >= self.CHAT_LIMIT - 1:
                 sleep_time = max(sleep_time, self.CHAT_WINDOW - (current_time - chat_timestamps[0]))
 
             # Record the actual time this request will be processed
