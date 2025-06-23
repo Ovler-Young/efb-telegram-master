@@ -301,8 +301,14 @@ class TelegramBotManager(LocaleMixin):
             self.logger.info(f"Rate limit reached, sleeping {sleep_time:.2f}s for chat {chat_id}. "
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
             time.sleep(sleep_time)
+            if chat_count % 100 == 0:
+                self.logger.warning(f"Chat {chat_id} is heavilly queued. "
+                                   f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
+            if chat_count % 1000 == 0:
+                self.logger.error(f"Chat {chat_id} is heavilly queued. "
+                                   f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
         else:
-            self.logger.info(f"Rate limit not reached for chat {chat_id}. "
+            self.logger.debug(f"Rate limit not reached for chat {chat_id}. "
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
 
     @Decorators.retry_on_timeout
