@@ -749,6 +749,11 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
+    def pin_chat_message(self, *args, **kwargs):
+        return self.updater.bot.pin_chat_message(*args, **kwargs)
+
+    @Decorators.retry_on_timeout
+    @Decorators.retry_on_chat_migration
     def set_chat_description(self, *args, **kwargs):
         return self.updater.bot.set_chat_description(*args, **kwargs)
 
