@@ -5,8 +5,6 @@ import logging
 import mimetypes
 import time
 import threading
-import io
-import tempfile
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
@@ -591,65 +589,13 @@ class TelegramChannel(MasterChannel):
                                       'Update %s caused error %s. Exception', update, error)
 
     def send_message(self, msg: EFBMessage) -> EFBMessage:
-        # Check for file attribute and copy to memory buffer if present
+        # Check if message has a file - if so, send synchronously to avoid file handle issues
         file_attr = getattr(msg, "file", None)
-        if file_attr and hasattr(file_attr, "read"):
-            try:
-                # Save current position
-                original_pos = file_attr.tell() if hasattr(file_attr, "tell") else 0
+        if file_attr is not None:
+            # Send file messages synchronously to avoid file handle issues
+            return self.slave_messages.send_message(msg)
 
-                # Read file into memory buffer
-                file_attr.seek(0)
-                file_bytes = file_attr.read()
-                buffer = io.BytesIO(file_bytes)
-
-                # Preserve filename and other attributes if possible
-                if hasattr(file_attr, "name"):
-                    buffer.name = file_attr.name
-
-                # Reset buffer position
-                buffer.seek(0)
-
-                # Replace with in-memory buffer
-                msg.file = buffer
-
-                # Also create a temporary file for path-based operations if needed
-                path_attr = getattr(msg, "path", None)
-                if path_attr:
-                    # Create a temporary file with the same content and proper cleanup
-                    # Use a suffix from the original filename if available
-                    original_name = getattr(file_attr, "name", path_attr)
-                    suffix = ""
-                    if isinstance(original_name, str) and "." in original_name:
-                        suffix = "." + original_name.split(".")[-1]
-
-                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                    try:
-                        temp_file.write(file_bytes)
-                        temp_file.flush()
-                        msg.path = temp_file.name
-
-                        # Store original cleanup method to be called by background thread
-                        def cleanup_temp_file():
-                            try:
-                                import os
-                                os.unlink(temp_file.name)
-                            except:
-                                pass
-                        msg._temp_file_cleanup = cleanup_temp_file
-                    finally:
-                        temp_file.close()
-
-                # Try to restore original file position (best effort)
-                try:
-                    file_attr.seek(original_pos)
-                except:
-                    pass
-
-            except Exception as e:
-                self.logger.warning("Failed to copy file to memory buffer: %s. Sending synchronously.", e)
-                # Fall back to synchronous sending if buffer copy fails
-                return self.slave_messages.send_message(msg)
+        # Send non-file messages asynchronously
 
         threading.Thread(target=self.slave_messages.send_message, args=(msg,), daemon=True).start()
         return msg
