@@ -601,8 +601,7 @@ class TelegramChannel(MasterChannel):
         return msg
 
     def send_status(self, status: Status):
-        threading.Thread(target=self.slave_messages.send_status, args=(status,), daemon=True).start()
-        return status
+        return self.slave_messages.send_status(status)
 
     def get_message_by_id(self, chat: Chat,
                           msg_id: MessageID) -> Optional[EFBMessage]:
