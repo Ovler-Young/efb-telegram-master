@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import time
 import threading
+import io
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
@@ -589,6 +590,39 @@ class TelegramChannel(MasterChannel):
                                       'Update %s caused error %s. Exception', update, error)
 
     def send_message(self, msg: EFBMessage) -> EFBMessage:
+        # Check for file attribute and copy to memory buffer if present
+        file_attr = getattr(msg, "file", None)
+        if file_attr and hasattr(file_attr, "read"):
+            try:
+                # Save current position
+                original_pos = file_attr.tell() if hasattr(file_attr, "tell") else 0
+
+                # Read file into memory buffer
+                file_attr.seek(0)
+                file_bytes = file_attr.read()
+                buffer = io.BytesIO(file_bytes)
+
+                # Preserve filename and other attributes if possible
+                if hasattr(file_attr, "name"):
+                    buffer.name = file_attr.name
+
+                # Reset buffer position
+                buffer.seek(0)
+
+                # Replace with in-memory buffer
+                msg.file = buffer
+
+                # Try to restore original file position (best effort)
+                try:
+                    file_attr.seek(original_pos)
+                except:
+                    pass
+
+            except Exception as e:
+                self.logger.warning("Failed to copy file to memory buffer: %s. Sending synchronously.", e)
+                # Fall back to synchronous sending if buffer copy fails
+                return self.slave_messages.send_message(msg)
+
         threading.Thread(target=self.slave_messages.send_message, args=(msg,), daemon=True).start()
         return msg
 
