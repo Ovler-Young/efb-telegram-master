@@ -4,6 +4,7 @@ import html
 import logging
 import mimetypes
 import time
+import threading
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
@@ -588,10 +589,12 @@ class TelegramChannel(MasterChannel):
                                       'Update %s caused error %s. Exception', update, error)
 
     def send_message(self, msg: EFBMessage) -> EFBMessage:
-        return self.slave_messages.send_message(msg)
+        threading.Thread(target=self.slave_messages.send_message, args=(msg,), daemon=True).start()
+        return msg
 
     def send_status(self, status: Status):
-        return self.slave_messages.send_status(status)
+        threading.Thread(target=self.slave_messages.send_status, args=(status,), daemon=True).start()
+        return status
 
     def get_message_by_id(self, chat: Chat,
                           msg_id: MessageID) -> Optional[EFBMessage]:
