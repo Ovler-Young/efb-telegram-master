@@ -137,6 +137,14 @@ class SlaveMessageProcessor(LocaleMixin):
             else:
                 self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
                               repr(msg), repr(e), traceback.format_exc())
+        finally:
+            # Always clean up temporary files if any were created during threading
+            cleanup_func = getattr(msg, '_temp_file_cleanup', None)
+            if cleanup_func and callable(cleanup_func):
+                try:
+                    cleanup_func()
+                except:
+                    pass
         return msg
 
     def dispatch_message(self, msg: Message, msg_template: str,
