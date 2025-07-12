@@ -80,10 +80,7 @@ class TelegramBotManager(LocaleMixin):
                 self.logger.info(f"[MERGE] Processing send_message for chat {chat_id}, text length: {len(str(text))}")
 
                 # Check if this is a pure text message (no attachments, buttons, etc.)
-                is_pure_text = not any(key in kwargs for key in [
-                    'reply_markup', 'photo', 'audio', 'document',
-                    'video', 'animation', 'voice', 'sticker'
-                ])
+                is_pure_text = True
 
                 # If not pure text, just call original function
                 if not is_pure_text:
