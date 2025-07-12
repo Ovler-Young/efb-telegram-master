@@ -8,7 +8,8 @@ import time
 import threading
 from collections import defaultdict, deque
 from functools import wraps
-from typing import List, TYPE_CHECKING, Callable
+from typing import List, TYPE_CHECKING, Callable, Optional, Dict, Tuple
+from datetime import datetime
 
 import telegram.constants
 import telegram.error
@@ -58,6 +59,60 @@ class TelegramBotManager(LocaleMixin):
             cls.logger.debug("Trying to call %s with infinite retry.", fn)
             return retry(wait_exponential_multiplier=1e3, wait_exponential_max=180e3,
                          retry_on_exception=cls.exception_filter)(fn)
+
+        @classmethod
+        def merge_decorator(cls, fn: Callable):
+            """Apply message merging to API calls."""
+            @wraps(fn)
+            def merge_wrapper(self: 'TelegramBotManager', *args, **kwargs):
+                # Extract method name
+                method_name = fn.__name__
+
+                # Only merge send_message calls
+                if method_name != 'send_message':
+                    return fn(self, *args, **kwargs)
+
+                # Extract parameters
+                chat_id = args[0] if args else kwargs.get('chat_id')
+                text = args[1] if len(args) > 1 else kwargs.get('text', '')
+                topic_id = kwargs.get('message_thread_id')
+
+                # Check if this is a pure text message (no attachments, buttons, etc.)
+                is_pure_text = not any(key in kwargs for key in [
+                    'reply_markup', 'photo', 'audio', 'document',
+                    'video', 'animation', 'voice', 'sticker'
+                ])
+
+                # If not pure text, just call original function
+                if not is_pure_text or not text:
+                    return fn(self, *args, **kwargs)
+
+                # Try rate limit with merging
+                merged_text = self._wait_for_rate_limit(chat_id, text, topic_id)
+
+                if merged_text:
+                    # Message was merged, send the merged version
+                    new_kwargs = kwargs.copy()
+                    if len(args) > 1:
+                        new_args = (args[0], merged_text) + args[2:]
+                    else:
+                        new_args = args
+                        new_kwargs['text'] = merged_text
+
+                    # Clear pending message since we're sending it now
+                    queue_key = (chat_id, topic_id)
+                    with self._pending_lock:
+                        self._pending_messages.pop(queue_key, None)
+
+                    # Call original function with merged text (bypassing merge_decorator)
+                    # We need to call the decorated chain excluding merge_decorator
+                    original_fn = fn  # fn is already the original send_message method
+                    return original_fn(self, *new_args, **new_kwargs)
+                else:
+                    # No merging happened, proceed normally
+                    return fn(self, *args, **kwargs)
+
+            return merge_wrapper
 
         @classmethod
         def rate_limit_decorator(cls, fn: Callable):
@@ -242,6 +297,10 @@ class TelegramBotManager(LocaleMixin):
         self.CHAT_LIMIT = 20      # messages per minute per chat
         self.CHAT_WINDOW = 60.0
 
+        # Message merging system
+        self._pending_messages: Dict[Tuple[int, Optional[int]], Dict] = {}
+        self._pending_lock = threading.Lock()
+
         self.logger.debug("Rate limiter initialized...")
 
         self.logger.debug("Adding base dispatchers...")
@@ -265,20 +324,22 @@ class TelegramBotManager(LocaleMixin):
             while timestamps and timestamps[0] <= current_time - self.CHAT_WINDOW:
                 timestamps.popleft()
 
-    def _wait_for_rate_limit(self, chat_id: int):
+    def _wait_for_rate_limit(self, chat_id: int, text: str = None, topic_id: Optional[int] = None):
         """
-        Rate limiting using sliding window algorithm.
-        Allows burst sending up to the limit, then enforces waiting.
-        
+        Rate limiting using sliding window algorithm with message merging.
+        Allows burst sending up to the limit, then enforces waiting with optional merging.
+
         Args:
             chat_id: Telegram chat ID
+            text: Message text for potential merging
+            topic_id: Topic ID for grouping
         """
         current_time = time.time()
         sleep_time = 0
-        
+
         with self._rate_limit_lock:
             self._cleanup_old_timestamps()
-            
+
             # global rate limit
             if len(self._global_timestamps) >= self.GLOBAL_LIMIT - 1:
                 sleep_time = max(sleep_time, self.GLOBAL_WINDOW - (current_time - self._global_timestamps[0]))
@@ -287,6 +348,34 @@ class TelegramBotManager(LocaleMixin):
             chat_timestamps = self._chat_timestamps[chat_id]
             if len(chat_timestamps) >= self.CHAT_LIMIT - 1:
                 sleep_time = max(sleep_time, self.CHAT_WINDOW - (current_time - chat_timestamps[0]))
+
+            # If we need to wait and this is a text message, try to merge
+            if sleep_time > 0 and text:
+                queue_key = (chat_id, topic_id)
+
+                with self._pending_lock:
+                    if queue_key in self._pending_messages:
+                        pending = self._pending_messages[queue_key]
+
+                        # Merge with existing pending message
+                        new_time = datetime.fromtimestamp(current_time).strftime('%H:%M:%S')
+
+                        merged_text = f"{pending['text']}\n{new_time}\n{text}"
+                        pending['text'] = merged_text
+                        pending['timestamp'] = current_time
+
+                        self.logger.debug(f"Merged message for chat {chat_id}, avoiding {sleep_time:.2f}s wait")
+                        # Return merged text, caller should handle this
+                        return merged_text
+                    else:
+                        # Add to pending for future merging
+                        # For first message, add timestamp
+                        first_time = datetime.fromtimestamp(current_time).strftime('%H:%M:%S')
+                        formatted_text = f"{first_time}\n{text}"
+                        self._pending_messages[queue_key] = {
+                            'text': formatted_text,
+                            'timestamp': current_time
+                        }
 
             # Record the actual time this request will be processed
             actual_time = current_time + sleep_time
@@ -311,8 +400,11 @@ class TelegramBotManager(LocaleMixin):
             self.logger.debug(f"Rate limit not reached for chat {chat_id}. "
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
 
+        return None  # No merging happened
+
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
+    @Decorators.merge_decorator
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_message(self, *args, prefix: str = '', suffix: str = '', **kwargs):
@@ -775,6 +867,12 @@ class TelegramBotManager(LocaleMixin):
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
+        # Clear pending messages (they will be lost, but that's acceptable during shutdown)
+        with self._pending_lock:
+            if self._pending_messages:
+                self.logger.info(f"Clearing {len(self._pending_messages)} pending merged messages during shutdown")
+                self._pending_messages.clear()
+        # Stop the updater
         self.updater.stop()
 
     def _detect_empty_file(self, file, chat, caption, prefix, suffix):
