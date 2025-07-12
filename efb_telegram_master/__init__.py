@@ -4,7 +4,6 @@ import html
 import logging
 import mimetypes
 import time
-import threading
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
@@ -589,16 +588,7 @@ class TelegramChannel(MasterChannel):
                                       'Update %s caused error %s. Exception', update, error)
 
     def send_message(self, msg: EFBMessage) -> EFBMessage:
-        # Check if message has a file - if so, send synchronously to avoid file handle issues
-        file_attr = getattr(msg, "file", None)
-        if file_attr is not None:
-            # Send file messages synchronously to avoid file handle issues
-            return self.slave_messages.send_message(msg)
-
-        # Send non-file messages asynchronously
-
-        threading.Thread(target=self.slave_messages.send_message, args=(msg,), daemon=True).start()
-        return msg
+        return self.slave_messages.send_message(msg)
 
     def send_status(self, status: Status):
         return self.slave_messages.send_status(status)
