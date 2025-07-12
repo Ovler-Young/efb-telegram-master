@@ -4,6 +4,7 @@ import html
 import itertools
 import logging
 import os
+import queue
 import tempfile
 import threading
 import traceback
@@ -55,6 +56,23 @@ class SlaveMessageProcessor(LocaleMixin):
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
+        self.send_queue = queue.Queue()
+        self.worker_thread = threading.Thread(target=self._send_worker, daemon=True,
+                                              name="ETMSlaveMessageProcessor")
+        self.worker_thread.start()
+
+    def _send_worker(self):
+        """Worker thread that sends messages from a queue."""
+        self.logger.debug("Sender worker thread started.")
+        while True:
+            try:
+                item = self.send_queue.get()
+                if isinstance(item, Message):
+                    self._process_message(item)
+                elif isinstance(item, Status):
+                    self._process_status(item)
+            except Exception:
+                self.logger.error("Exception in sender worker thread", exc_info=True)
 
     def is_silent(self, msg: Message) -> Optional[bool]:
         """Determine if a message shall be sent silently.
@@ -84,9 +102,18 @@ class SlaveMessageProcessor(LocaleMixin):
     def send_message(self, msg: Message) -> Message:
         """
         Process a message from slave channel and deliver it to the user.
+        This method is now a lightweight dispatcher that puts the message onto a queue
+        to be processed by a worker thread.
 
         Args:
             msg (Message): The message.
+        """
+        self.send_queue.put(msg)
+        return msg
+
+    def _process_message(self, msg: Message):
+        """
+        The actual message processing logic. This method is called by the worker thread.
         """
         try:
             xid = msg.uid
@@ -97,11 +124,11 @@ class SlaveMessageProcessor(LocaleMixin):
             silent = self.is_silent(msg)
             if silent is None:
                 self.logger.debug("[%s] Message is not delivered per silent settings.", xid)
-                return msg
+                return
 
             if tg_dest is None:
                 self.logger.debug("[%s] Sender of the message is muted.", xid)
-                return msg
+                return
 
             # When editing message
             old_msg_id: Optional[OldMsgID] = None
@@ -121,15 +148,15 @@ class SlaveMessageProcessor(LocaleMixin):
 
             self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
         except Exception as e:
-            if isinstance(e, telegram.error.BadRequest) and e.message:
+            if isinstance(e, telegram.error.BadRequest) and hasattr(e, 'message'):
                 if "Topic" in e.message:
                     try:
                         self.bot.reopen_forum_topic(
                             chat_id=tg_dest,
                             message_thread_id=thread_id
                         )
-                    except telegram.error.BadRequest as e:
-                        self.logger.error('Failed to reopen topic, Reason: %s', e)
+                    except telegram.error.BadRequest as e_reopen:
+                        self.logger.error('Failed to reopen topic, Reason: %s', e_reopen)
                         self.db.remove_topic_assoc(
                             topic_chat_id=tg_dest,
                             message_thread_id=thread_id,
@@ -137,7 +164,6 @@ class SlaveMessageProcessor(LocaleMixin):
             else:
                 self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
                               repr(msg), repr(e), traceback.format_exc())
-        return msg
 
     def dispatch_message(self, msg: Message, msg_template: str,
                          old_msg_id: Optional[OldMsgID],
@@ -993,50 +1019,67 @@ class SlaveMessageProcessor(LocaleMixin):
             self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_DOCUMENT, message_thread_id=thread_id)
 
     def send_status(self, status: Status):
-        if isinstance(status, ChatUpdates):
-            self.logger.debug("Received chat updates from channel %s", status.channel)
-            for i in status.removed_chats:
-                self.db.delete_slave_chat_info(status.channel.channel_id, i)
-                self.chat_manager.delete_chat_object(status.channel.channel_id, i)
-            for i in itertools.chain(status.new_chats, status.modified_chats):
-                chat = status.channel.get_chat(i)
+        if isinstance(status, (ChatUpdates, MemberUpdates)):
+            # These are local DB/cache operations, they can run synchronously.
+            if isinstance(status, ChatUpdates):
+                self.logger.debug("Received chat updates from channel %s", status.channel)
+                for i in status.removed_chats:
+                    self.db.delete_slave_chat_info(status.channel.channel_id, i)
+                    self.chat_manager.delete_chat_object(status.channel.channel_id, i)
+                for i in itertools.chain(status.new_chats, status.modified_chats):
+                    chat = status.channel.get_chat(i)
+                    self.chat_manager.update_chat_obj(chat, full_update=True)
+            elif isinstance(status, MemberUpdates):
+                self.logger.debug("Received member updates from channel %s about group %s",
+                                  status.channel, status.chat_id)
+                for i in status.removed_members:
+                    self.db.delete_slave_chat_info(status.channel.channel_id, i, status.chat_id)
+                self.chat_manager.delete_chat_members(status.channel.channel_id, status.chat_id, status.removed_members)
+                chat = status.channel.get_chat(status.chat_id)
                 self.chat_manager.update_chat_obj(chat, full_update=True)
-        elif isinstance(status, MemberUpdates):
-            self.logger.debug("Received member updates from channel %s about group %s",
-                              status.channel, status.chat_id)
-            for i in status.removed_members:
-                self.db.delete_slave_chat_info(status.channel.channel_id, i, status.chat_id)
-            self.chat_manager.delete_chat_members(status.channel.channel_id, status.chat_id, status.removed_members)
-            chat = status.channel.get_chat(status.chat_id)
-            self.chat_manager.update_chat_obj(chat, full_update=True)
-        elif isinstance(status, MessageRemoval):
+        elif isinstance(status, (MessageRemoval, MessageReactionsUpdate)):
+            # These involve network calls, so they must be queued.
+            self.send_queue.put(status)
+        else:
+            self.logger.error('Received an unsupported type of status: %s', status)
+
+    def _process_status(self, status: Status):
+        """
+        The actual status processing logic for statuses that require network calls.
+        This method is called by the worker thread.
+        """
+        if isinstance(status, MessageRemoval):
             self.logger.debug("Received message removal request from channel %s on message %s",
                               status.source_channel, status.message)
-            old_msg = self.db.get_msg_log(
-                slave_msg_id=status.message.uid,
-                slave_origin_uid=utils.chat_id_to_str(chat=status.message.chat))
-            if old_msg:
-                old_msg_id: OldMsgID = utils.message_id_str_to_id(old_msg.master_msg_id)
-                self.logger.debug("Found message to delete in Telegram: %s.%s",
-                                  *old_msg_id)
-                try:
-                    if not self.channel.flag('prevent_message_removal'):
-                        self.bot.delete_message(*old_msg_id)
-                        return
-                except TelegramError as e:
-                    self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
-                    pass
-                self.bot.send_message(chat_id=old_msg_id[0],
-                                      text=self._("Message is removed in remote chat."),
-                                      reply_to_message_id=old_msg_id[1],
-                                      disable_notification=True) # Probably silent notification
-            else:
-                self.logger.info('Was supposed to delete a message, '
-                                 'but it does not exist in database: %s', status)
+            self._process_message_removal(status)
         elif isinstance(status, MessageReactionsUpdate):
             self.update_reactions(status)
         else:
-            self.logger.error('Received an unsupported type of status: %s', status)
+            self.logger.error('Received an unsupported type of status in worker: %s', status)
+
+    def _process_message_removal(self, status: MessageRemoval):
+        """Process message removal status update. This method is intended to be called from the worker thread."""
+        old_msg = self.db.get_msg_log(
+            slave_msg_id=status.message.uid,
+            slave_origin_uid=utils.chat_id_to_str(chat=status.message.chat))
+        if old_msg:
+            old_msg_id: OldMsgID = utils.message_id_str_to_id(old_msg.master_msg_id)
+            self.logger.debug("Found message to delete in Telegram: %s.%s",
+                              *old_msg_id)
+            try:
+                if not self.channel.flag('prevent_message_removal'):
+                    self.bot.delete_message(*old_msg_id)
+                    return
+            except TelegramError as e:
+                self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
+                pass
+            self.bot.send_message(chat_id=old_msg_id[0],
+                                  text=self._("Message is removed in remote chat."),
+                                  reply_to_message_id=old_msg_id[1],
+                                  disable_notification=True)
+        else:
+            self.logger.info('Was supposed to delete a message, '
+                             'but it does not exist in database: %s', status)
 
     @staticmethod
     def build_reactions_footer(reactions: Reactions) -> str:
