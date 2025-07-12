@@ -77,6 +77,8 @@ class TelegramBotManager(LocaleMixin):
                 text = args[1] if len(args) > 1 else kwargs.get('text', '')
                 topic_id = kwargs.get('message_thread_id')
 
+                self.logger.info(f"[MERGE] Processing send_message for chat {chat_id}, text length: {len(str(text))}")
+
                 # Check if this is a pure text message (no attachments, buttons, etc.)
                 is_pure_text = not any(key in kwargs for key in [
                     'reply_markup', 'photo', 'audio', 'document',
@@ -84,13 +86,21 @@ class TelegramBotManager(LocaleMixin):
                 ])
 
                 # If not pure text, just call original function
-                if not is_pure_text or not text:
+                if not is_pure_text:
+                    self.logger.info(f"[MERGE] Not pure text message for chat {chat_id}, skipping merge. Has: {[k for k in kwargs.keys() if k in ['reply_markup', 'photo', 'audio', 'document', 'video', 'animation', 'voice', 'sticker']]}")
                     return fn(self, *args, **kwargs)
+
+                if not text:
+                    self.logger.info(f"[MERGE] Empty text for chat {chat_id}, skipping merge")
+                    return fn(self, *args, **kwargs)
+
+                self.logger.info(f"[MERGE] Pure text message for chat {chat_id}, checking rate limit")
 
                 # Try rate limit with merging
                 merged_text = self._wait_for_rate_limit(chat_id, text, topic_id)
 
                 if merged_text:
+                    self.logger.info(f"[MERGE] Message merged for chat {chat_id}, sending merged version")
                     # Message was merged, send the merged version
                     new_kwargs = kwargs.copy()
                     if len(args) > 1:
@@ -110,6 +120,7 @@ class TelegramBotManager(LocaleMixin):
                     return original_fn(self, *new_args, **new_kwargs)
                 else:
                     # No merging happened, proceed normally
+                    self.logger.info(f"[MERGE] No merge for chat {chat_id}, proceeding normally")
                     return fn(self, *args, **kwargs)
 
             return merge_wrapper
@@ -349,14 +360,18 @@ class TelegramBotManager(LocaleMixin):
             if len(chat_timestamps) >= self.CHAT_LIMIT - 1:
                 sleep_time = max(sleep_time, self.CHAT_WINDOW - (current_time - chat_timestamps[0]))
 
+            self.logger.info(f"[RATE_LIMIT] Sleep time calculated: {sleep_time:.2f}s for chat {chat_id}")
+
             # If we need to wait and this is a text message, try to merge
             if sleep_time > 0 and text:
+                self.logger.info(f"[RATE_LIMIT] Rate limit hit, attempting merge for chat {chat_id}")
                 queue_key = (chat_id, topic_id)
 
                 with self._pending_lock:
                     if queue_key in self._pending_messages:
                         pending = self._pending_messages[queue_key]
 
+                        self.logger.info(f"[RATE_LIMIT] Found pending message for {queue_key}, merging")
                         # Merge with existing pending message
                         new_time = datetime.fromtimestamp(current_time).strftime('%H:%M:%S')
 
@@ -364,10 +379,11 @@ class TelegramBotManager(LocaleMixin):
                         pending['text'] = merged_text
                         pending['timestamp'] = current_time
 
-                        self.logger.debug(f"Merged message for chat {chat_id}, avoiding {sleep_time:.2f}s wait")
+                        self.logger.info(f"[RATE_LIMIT] Merged message for chat {chat_id}, avoiding {sleep_time:.2f}s wait")
                         # Return merged text, caller should handle this
                         return merged_text
                     else:
+                        self.logger.info(f"[RATE_LIMIT] No pending message for {queue_key}, creating new pending")
                         # Add to pending for future merging
                         # For first message, add timestamp
                         first_time = datetime.fromtimestamp(current_time).strftime('%H:%M:%S')
@@ -376,6 +392,12 @@ class TelegramBotManager(LocaleMixin):
                             'text': formatted_text,
                             'timestamp': current_time
                         }
+                        self.logger.info(f"[RATE_LIMIT] Added message to pending for {queue_key}")
+            else:
+                if sleep_time > 0:
+                    self.logger.info(f"[RATE_LIMIT] Rate limit hit but no text provided for chat {chat_id}")
+                else:
+                    self.logger.info(f"[RATE_LIMIT] No rate limit for chat {chat_id}")
 
             # Record the actual time this request will be processed
             actual_time = current_time + sleep_time
@@ -405,7 +427,6 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.merge_decorator
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_message(self, *args, prefix: str = '', suffix: str = '', **kwargs):
         """
