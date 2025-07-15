@@ -86,7 +86,7 @@ class TelegramBotManager(LocaleMixin):
             @wraps(fn)
             def rate_limit_error_handler(self: 'TelegramBotManager', *args, **kwargs):
                 max_retries = 3
-                base_delay = 1.0
+                base_delay = 30.0
 
                 for attempt in range(max_retries + 1):
                     try:
@@ -107,6 +107,10 @@ class TelegramBotManager(LocaleMixin):
 
                             delay = base_delay * (2 ** attempt)  # Exponential backoff
                             cls.logger.warning(f"Rate limit detected, waiting {delay}s before retry {attempt + 1}/{max_retries}")
+                            if 'chat_id' in kwargs:
+                                chat_id = kwargs['chat_id']
+                                for timestamp in self._chat_timestamps[chat_id]:
+                                    timestamp += delay
                             time.sleep(delay)
                         else:
                             raise
@@ -269,16 +273,16 @@ class TelegramBotManager(LocaleMixin):
         """
         Rate limiting using sliding window algorithm.
         Allows burst sending up to the limit, then enforces waiting.
-        
+
         Args:
             chat_id: Telegram chat ID
         """
         current_time = time.time()
         sleep_time = 0
-        
+
         with self._rate_limit_lock:
             self._cleanup_old_timestamps()
-            
+
             # global rate limit
             if len(self._global_timestamps) >= self.GLOBAL_LIMIT - 1:
                 sleep_time = max(sleep_time, self.GLOBAL_WINDOW - (current_time - self._global_timestamps[0]))
