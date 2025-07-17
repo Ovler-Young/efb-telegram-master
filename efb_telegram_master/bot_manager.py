@@ -279,6 +279,7 @@ class TelegramBotManager(LocaleMixin):
         # Initialize delayed message queue system
         self._delayed_queue = []
         self._delayed_queue_lock = threading.Lock()
+        self._task_counter = 0  # Counter for tie-breaking in heapq
         self._delayed_worker_stop = threading.Event()
         self._pending_delayed_logs = {}  # Store pending database updates: task_id -> (etm_msg, old_msg_id)
         self._pending_logs_lock = threading.Lock()
@@ -418,7 +419,8 @@ class TelegramBotManager(LocaleMixin):
         )
 
         with self._delayed_queue_lock:
-            heapq.heappush(self._delayed_queue, (execute_time, task))
+            heapq.heappush(self._delayed_queue, (execute_time, self._task_counter, task))
+            self._task_counter += 1
 
         self.logger.debug(f"Scheduled delayed task {task_id} for chat {chat_id} in {delay_time:.2f}s")
         return task_id
@@ -437,7 +439,7 @@ class TelegramBotManager(LocaleMixin):
                 # Check for tasks ready to execute
                 with self._delayed_queue_lock:
                     while self._delayed_queue and self._delayed_queue[0][0] <= current_time:
-                        execute_time, task = heapq.heappop(self._delayed_queue)
+                        _, _, task = heapq.heappop(self._delayed_queue)
                         tasks_to_execute.append(task)
 
                 # Execute ready tasks outside of lock
