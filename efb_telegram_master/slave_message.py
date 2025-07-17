@@ -237,14 +237,30 @@ class SlaveMessageProcessor(LocaleMixin):
                 commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
             ))
 
-        self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
-                          xid, tg_msg.chat.id, tg_msg.message_id)
+        # Check if this is a delayed execution (mock message)
+        if hasattr(tg_msg, '_delayed_execution_pending') and tg_msg._delayed_execution_pending:
+            # This is a delayed execution - defer database logging
+            self.logger.debug("[%s] Message execution is delayed (task_id: %s), deferring database logging.",
+                             xid, getattr(tg_msg, 'task_id', 'unknown'))
 
-        etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
-        etm_msg.type_telegram = get_msg_type(tg_msg)
-        etm_msg.put_telegram_file(tg_msg)
-        self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id)
-        # self.logger.debug("[%s] Message inserted/updated to the database.", xid)
+            # Prepare ETM message for later database update
+            etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
+
+            # Register the delayed database update
+            if hasattr(tg_msg, 'task_id'):
+                self.bot.register_delayed_database_update(tg_msg.task_id, etm_msg, old_msg_id)
+            else:
+                self.logger.warning("[%s] Delayed message missing task_id, cannot register database update", xid)
+        else:
+            # Normal execution - log to database immediately
+            self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
+                              xid, tg_msg.chat.id, tg_msg.message_id)
+
+            etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
+            etm_msg.type_telegram = get_msg_type(tg_msg)
+            etm_msg.put_telegram_file(tg_msg)
+            self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id)
+            # self.logger.debug("[%s] Message inserted/updated to the database.", xid)
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
         """Get the Telegram destination of a message with its header.

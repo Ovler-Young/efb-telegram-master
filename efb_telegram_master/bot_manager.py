@@ -8,7 +8,8 @@ import time
 import threading
 from collections import defaultdict, deque
 from functools import wraps
-from typing import List, TYPE_CHECKING, Callable
+from typing import List, TYPE_CHECKING, Callable, NamedTuple
+import heapq
 
 import telegram.constants
 import telegram.error
@@ -18,6 +19,16 @@ from telegram.ext import CallbackContext, Filters, MessageHandler, Updater, Disp
 
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
+
+
+class DelayedTask(NamedTuple):
+    """Represents a delayed message task."""
+    execute_time: float  # When to execute (timestamp)
+    chat_id: int        # Target chat ID
+    function: Callable  # Function to execute
+    args: tuple        # Function arguments
+    kwargs: dict       # Function keyword arguments
+    task_id: str       # Unique task identifier
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -72,9 +83,31 @@ class TelegramBotManager(LocaleMixin):
                 elif 'chat_id' in kwargs:
                     chat_id = kwargs['chat_id']
 
-                # Apply rate limiting
+                # Calculate rate limiting delay
                 if chat_id:
-                    self._wait_for_rate_limit(chat_id)  # pylint: disable=protected-access
+                    delay_time, chat_count, global_count = self._calculate_rate_limit_delay(chat_id)  # pylint: disable=protected-access
+
+                    if delay_time > 0:
+                        # Schedule for delayed execution instead of blocking
+                        self.logger.debug(f"Scheduling message for chat {chat_id} with {delay_time:.2f}s delay")
+
+                        # Record the timestamp for rate limiting tracking
+                        self._record_rate_limit_timestamp(chat_id, delay_time)  # pylint: disable=protected-access
+
+                                                # Schedule the delayed execution using the new system
+                        task_id = self._schedule_delayed_task(  # pylint: disable=protected-access
+                            chat_id=chat_id,
+                            delay_time=delay_time,
+                            function=fn,
+                            args=(self,) + args,
+                            kwargs=kwargs
+                        )
+
+                        # Return a placeholder response to indicate message was scheduled
+                        placeholder = self._create_delayed_message_placeholder(chat_id, delay_time, task_id)  # pylint: disable=protected-access
+                        return placeholder
+                    else:
+                        self._record_rate_limit_timestamp(chat_id, 0)  # pylint: disable=protected-access
 
                 return fn(self, *args, **kwargs)
 
@@ -248,6 +281,20 @@ class TelegramBotManager(LocaleMixin):
 
         self.logger.debug("Rate limiter initialized...")
 
+        # Initialize delayed message queue system
+        self._delayed_queue = []
+        self._delayed_queue_lock = threading.Lock()
+        self._delayed_worker_stop = threading.Event()
+        self._pending_delayed_logs = {}  # Store pending database updates: task_id -> (etm_msg, old_msg_id)
+        self._pending_logs_lock = threading.Lock()
+        self._delayed_worker_thread = threading.Thread(
+            target=self._delayed_message_worker,
+            name="ETM delayed messages worker",
+            daemon=True
+        )
+        self._delayed_worker_thread.start()
+        self.logger.debug("Delayed message system initialized...")
+
         self.logger.debug("Adding base dispatchers...")
         # New whitelist handler
         whitelist_filter = ~Filters.user(user_id=self.admins)
@@ -269,13 +316,16 @@ class TelegramBotManager(LocaleMixin):
             while timestamps and timestamps[0] <= current_time - self.CHAT_WINDOW:
                 timestamps.popleft()
 
-    def _wait_for_rate_limit(self, chat_id: int):
+    def _calculate_rate_limit_delay(self, chat_id: int):
         """
-        Rate limiting using sliding window algorithm.
-        Allows burst sending up to the limit, then enforces waiting.
+        Calculate rate limiting delay using sliding window algorithm.
+        Returns delay time without blocking.
 
         Args:
             chat_id: Telegram chat ID
+
+        Returns:
+            tuple: (delay_time, chat_count, global_count) - delay in seconds, current queue counts
         """
         current_time = time.time()
         sleep_time = 0
@@ -292,28 +342,189 @@ class TelegramBotManager(LocaleMixin):
             if len(chat_timestamps) >= self.CHAT_LIMIT - 1:
                 sleep_time = max(sleep_time, self.CHAT_WINDOW - (current_time - chat_timestamps[0]))
 
-            # Record the actual time this request will be processed
-            actual_time = current_time + sleep_time
-            self._global_timestamps.append(actual_time)
-            self._chat_timestamps[chat_id].append(actual_time)
-
             chat_count = len(self._chat_timestamps[chat_id])
             global_count = len(self._global_timestamps)
 
-        # Sleep outside the lock to avoid blocking other threads
+        # Log rate limiting status but don't sleep
         if sleep_time > 0:
-            self.logger.info(f"Rate limit reached, sleeping {sleep_time:.2f}s for chat {chat_id}. "
+            self.logger.info(f"Rate limit reached, need to delay {sleep_time:.2f}s for chat {chat_id}. "
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
-            time.sleep(sleep_time)
             if chat_count % 100 == 0:
-                self.logger.warning(f"Chat {chat_id} is heavilly queued. "
+                self.logger.warning(f"Chat {chat_id} is heavily queued. "
                                    f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
             if chat_count % 1000 == 0:
-                self.logger.error(f"Chat {chat_id} is heavilly queued. "
+                self.logger.error(f"Chat {chat_id} is heavily queued. "
                                    f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
         else:
             self.logger.debug(f"Rate limit not reached for chat {chat_id}. "
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
+
+        return sleep_time, chat_count, global_count
+
+    def _record_rate_limit_timestamp(self, chat_id: int, delay_time: float):
+        """
+        Record the timestamp for rate limiting after message is scheduled.
+
+        Args:
+            chat_id: Telegram chat ID
+            delay_time: Delay time that was calculated
+        """
+        current_time = time.time()
+        actual_time = current_time + delay_time
+
+        with self._rate_limit_lock:
+            self._global_timestamps.append(actual_time)
+            self._chat_timestamps[chat_id].append(actual_time)
+
+    def _create_delayed_message_placeholder(self, chat_id: int, delay_time: float, task_id: str):
+        """
+        Create a placeholder message object for delayed execution.
+
+        Args:
+            chat_id: Telegram chat ID
+            delay_time: Delay time in seconds
+            task_id: Unique task identifier
+
+        Returns:
+            A mock message object indicating delayed execution
+        """
+        # Import here to avoid circular imports
+        from telegram import Message as TelegramMessage
+        from unittest.mock import Mock
+
+        # Create a mock message object that represents a delayed message
+        mock_msg = Mock(spec=TelegramMessage)
+        mock_msg.chat_id = chat_id
+        mock_msg.message_id = int(time.time() * 1000)  # Use timestamp as temp ID
+        mock_msg.date = int(time.time())
+        mock_msg.text = f"[Message scheduled for delivery in {delay_time:.2f}s due to rate limiting]"
+        mock_msg.is_delayed = True  # Custom attribute to mark as delayed
+        mock_msg.delay_time = delay_time
+        mock_msg.task_id = task_id  # Store task ID for tracking
+        mock_msg._delayed_execution_pending = True  # Flag for database logging
+
+        self.logger.debug(f"Created delayed message placeholder for chat {chat_id} with {delay_time:.2f}s delay")
+        return mock_msg
+
+    def _schedule_delayed_task(self, chat_id: int, delay_time: float, function: Callable,
+                              args: tuple, kwargs: dict) -> str:
+        """
+        Schedule a task for delayed execution.
+
+        Args:
+            chat_id: Telegram chat ID
+            delay_time: Delay in seconds
+            function: Function to execute
+            args: Function arguments
+            kwargs: Function keyword arguments
+
+        Returns:
+            Task ID for tracking
+        """
+        execute_time = time.time() + delay_time
+        task_id = f"{chat_id}_{execute_time}_{id(function)}"
+
+        task = DelayedTask(
+            execute_time=execute_time,
+            chat_id=chat_id,
+            function=function,
+            args=args,
+            kwargs=kwargs,
+            task_id=task_id
+        )
+
+        with self._delayed_queue_lock:
+            heapq.heappush(self._delayed_queue, (execute_time, task))
+
+        self.logger.debug(f"Scheduled delayed task {task_id} for chat {chat_id} in {delay_time:.2f}s")
+        return task_id
+
+    def _delayed_message_worker(self):
+        """
+        Worker thread that processes delayed messages.
+        """
+        self.logger.debug("Delayed message worker started")
+
+        while not self._delayed_worker_stop.is_set():
+            try:
+                current_time = time.time()
+                tasks_to_execute = []
+
+                # Check for tasks ready to execute
+                with self._delayed_queue_lock:
+                    while self._delayed_queue and self._delayed_queue[0][0] <= current_time:
+                        execute_time, task = heapq.heappop(self._delayed_queue)
+                        tasks_to_execute.append(task)
+
+                # Execute ready tasks outside of lock
+                for task in tasks_to_execute:
+                    try:
+                        self.logger.debug(f"Executing delayed task {task.task_id} for chat {task.chat_id}")
+                        result = task.function(*task.args, **task.kwargs)
+                        self.logger.debug(f"Delayed task {task.task_id} completed successfully")
+
+                        # Handle database update for delayed execution
+                        if result and hasattr(result, 'message_id'):
+                            self._handle_delayed_database_update(task.task_id, result)
+
+                    except Exception as e:
+                        self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
+
+                # Sleep for a short time to avoid busy waiting
+                time.sleep(0.1)
+
+            except Exception as e:
+                self.logger.exception(f"Error in delayed message worker: {e}")
+                time.sleep(1)  # Sleep longer on error to avoid spam
+
+        self.logger.debug("Delayed message worker stopped")
+
+    def register_delayed_database_update(self, task_id: str, etm_msg, old_msg_id=None):
+        """
+        Register a pending database update for a delayed task.
+
+        Args:
+            task_id: Task identifier from delayed execution
+            etm_msg: ETMMsg object to log
+            old_msg_id: Optional old message ID for updates
+        """
+        with self._pending_logs_lock:
+            self._pending_delayed_logs[task_id] = (etm_msg, old_msg_id)
+        self.logger.debug(f"Registered delayed database update for task {task_id}")
+
+    def _handle_delayed_database_update(self, task_id: str, real_tg_msg):
+        """
+        Handle database update when delayed task completes.
+
+        Args:
+            task_id: Task identifier
+            real_tg_msg: The real Telegram message that was sent
+        """
+        with self._pending_logs_lock:
+            if task_id in self._pending_delayed_logs:
+                etm_msg, old_msg_id = self._pending_delayed_logs.pop(task_id)
+
+                # Update the ETM message with real Telegram data
+                from .msg_type import get_msg_type
+                etm_msg.type_telegram = get_msg_type(real_tg_msg)
+                etm_msg.put_telegram_file(real_tg_msg)
+
+                # Update database with real message
+                from . import TelegramChannel
+                if hasattr(self, 'channel') and isinstance(self.channel, TelegramChannel):
+                    self.channel.db.add_or_update_message_log(etm_msg, real_tg_msg, old_msg_id)
+                    self.logger.debug(f"Updated database with real message for delayed task {task_id}")
+                else:
+                    self.logger.warning(f"Cannot update database - channel not available for task {task_id}")
+            else:
+                self.logger.warning(f"No pending database update found for task {task_id}")
+
+    def stop_delayed_worker(self):
+        """Stop the delayed message worker thread."""
+        if hasattr(self, '_delayed_worker_stop'):
+            self._delayed_worker_stop.set()
+        if hasattr(self, '_delayed_worker_thread') and self._delayed_worker_thread.is_alive():
+            self._delayed_worker_thread.join(timeout=5)
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
@@ -779,6 +990,9 @@ class TelegramBotManager(LocaleMixin):
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
+        # Stop the delayed message worker first
+        self.stop_delayed_worker()
+        # Then stop the updater
         self.updater.stop()
 
     def _detect_empty_file(self, file, chat, caption, prefix, suffix):
