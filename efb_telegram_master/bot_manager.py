@@ -790,7 +790,6 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.rate_limit_decorator
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
         message_thread_id = kwargs.pop('message_thread_id', None)
