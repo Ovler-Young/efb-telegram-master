@@ -9,16 +9,18 @@ import threading
 from collections import defaultdict, deque
 from functools import wraps
 from typing import List, TYPE_CHECKING, Callable, NamedTuple
+from unittest.mock import Mock
 import heapq
 
 import telegram.constants
 import telegram.error
 from retrying import retry
-from telegram import Update, InputFile, User, File, ForumTopic
+from telegram import Update, InputFile, User, File, ForumTopic, Message as TelegramMessage
 from telegram.ext import CallbackContext, Filters, MessageHandler, Updater, Dispatcher
 
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
+from .msg_type import get_msg_type
 
 
 class DelayedTask(NamedTuple):
@@ -373,9 +375,6 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             A mock message object indicating delayed execution
         """
-        # Import here to avoid circular imports
-        from telegram import Message as TelegramMessage
-        from unittest.mock import Mock
 
         # Create a mock message object that represents a delayed message
         mock_msg = Mock(spec=TelegramMessage)
@@ -491,17 +490,12 @@ class TelegramBotManager(LocaleMixin):
                 etm_msg, old_msg_id = self._pending_delayed_logs.pop(task_id)
 
                 # Update the ETM message with real Telegram data
-                from .msg_type import get_msg_type
                 etm_msg.type_telegram = get_msg_type(real_tg_msg)
                 etm_msg.put_telegram_file(real_tg_msg)
 
                 # Update database with real message
-                from . import TelegramChannel
-                if hasattr(self, 'channel') and isinstance(self.channel, TelegramChannel):
-                    self.channel.db.add_or_update_message_log(etm_msg, real_tg_msg, old_msg_id)
-                    self.logger.debug(f"Updated database with real message for delayed task {task_id}")
-                else:
-                    self.logger.warning(f"Cannot update database - channel not available for task {task_id}")
+                self.channel.db.add_or_update_message_log(etm_msg, real_tg_msg, old_msg_id)
+                self.logger.debug(f"Updated database with real message for delayed task {task_id}")
             else:
                 self.logger.warning(f"No pending database update found for task {task_id}")
 
