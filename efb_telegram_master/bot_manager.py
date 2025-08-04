@@ -334,14 +334,26 @@ class TelegramBotManager(LocaleMixin):
 
             # global rate limit
             if len(self._global_timestamps) >= self.GLOBAL_LIMIT - 2:
-                sleep_time = max(sleep_time, self.GLOBAL_WINDOW - (current_time - self._global_timestamps[-self.GLOBAL_LIMIT + 2]))
+                # Get the timestamp that is (GLOBAL_LIMIT - 2) positions from the end
+                # This represents when we can safely send the next message
+                safe_index = len(self._global_timestamps) - (self.GLOBAL_LIMIT - 2)
+                if safe_index >= 0 and safe_index < len(self._global_timestamps):
+                    reference_timestamp = self._global_timestamps[safe_index]
+                    next_available_time = reference_timestamp + self.GLOBAL_WINDOW
+                    sleep_time = max(sleep_time, next_available_time - current_time)
 
             # chat-specific rate limit
             chat_timestamps = self._chat_timestamps[chat_id]
             if len(chat_timestamps) >= self.CHAT_LIMIT - 2:
-                sleep_time = max(sleep_time, self.CHAT_WINDOW - (current_time - chat_timestamps[-self.CHAT_LIMIT + 2]))
+                # Get the timestamp that is (CHAT_LIMIT - 2) positions from the end
+                safe_index = len(chat_timestamps) - (self.CHAT_LIMIT - 2)
+                if safe_index >= 0 and safe_index < len(chat_timestamps):
+                    reference_timestamp = chat_timestamps[safe_index]
+                    next_available_time = reference_timestamp + self.CHAT_WINDOW
+                    sleep_time = max(sleep_time, next_available_time - current_time)
+
             # Record the actual time this request will be processed
-            actual_time = current_time + sleep_time
+            actual_time = current_time + max(sleep_time, 0)
             self._global_timestamps.append(actual_time)
             self._chat_timestamps[chat_id].append(actual_time)
 
