@@ -116,7 +116,7 @@ class TelegramBotManager(LocaleMixin):
             @wraps(fn)
             def rate_limit_error_handler(self: 'TelegramBotManager', *args, **kwargs):
                 max_retries = 3
-                base_delay = 30.0
+                base_delay = 60
 
                 for attempt in range(max_retries + 1):
                     try:
@@ -130,7 +130,7 @@ class TelegramBotManager(LocaleMixin):
                         cls.logger.warning(f"Rate limit hit, waiting {retry_after}s before retry {attempt + 1}/{max_retries}")
                         time.sleep(retry_after)
                     except telegram.error.TelegramError as e:
-                        if "Too Many Requests" in str(e) or "429" in str(e):
+                        if "Too Many Requests" in str(e) or "429" in str(e) or "Flood" in str(e):
                             if attempt >= max_retries:
                                 cls.logger.error(f"Max retries exceeded for rate limit error: {e}")
                                 raise
