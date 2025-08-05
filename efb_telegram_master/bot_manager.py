@@ -8,9 +8,10 @@ import time
 import threading
 from collections import defaultdict, deque
 from functools import wraps
-from typing import List, TYPE_CHECKING, Callable, NamedTuple
+from typing import List, TYPE_CHECKING, Callable, NamedTuple, Deque
 from unittest.mock import Mock
 import heapq
+import bisect
 
 import telegram.constants
 import telegram.error
@@ -268,8 +269,8 @@ class TelegramBotManager(LocaleMixin):
 
         # Initialize sliding window rate limiting
         self._rate_limit_lock = threading.Lock()
-        self._global_timestamps = deque()
-        self._chat_timestamps = defaultdict(deque)
+        self._global_timestamps: list[float] = []  # Sorted list for global timestamps
+        self._chat_timestamps: defaultdict[int, Deque[float]] = defaultdict(deque)
 
         # Rate limits based on Telegram API documentation
         self.GLOBAL_LIMIT = 30    # messages per second
@@ -280,11 +281,11 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Rate limiter initialized...")
 
         # Initialize delayed message queue system
-        self._delayed_queue = []
+        self._delayed_queue: list[tuple[float, int, DelayedTask]] = []
         self._delayed_queue_lock = threading.Lock()
         self._task_counter = 0  # Counter for tie-breaking in heapq
         self._delayed_worker_stop = threading.Event()
-        self._pending_delayed_logs = {}  # Store pending database updates: task_id -> (etm_msg, old_msg_id)
+        self._pending_delayed_logs: dict[str, tuple] = {}  # Store pending database updates: task_id -> (etm_msg, old_msg_id)
         self._pending_logs_lock = threading.Lock()
         self._delayed_worker_thread = threading.Thread(
             target=self._delayed_message_worker,
@@ -308,7 +309,7 @@ class TelegramBotManager(LocaleMixin):
         current_time = time.time()
         # global rate limit
         while self._global_timestamps and self._global_timestamps[0] <= current_time - self.GLOBAL_WINDOW:
-            self._global_timestamps.popleft()
+            self._global_timestamps.pop(0)
 
         # chat-specific rate limit
         for chat_id, timestamps in self._chat_timestamps.items():
@@ -327,37 +328,43 @@ class TelegramBotManager(LocaleMixin):
             tuple: (delay_time, chat_count, global_count) - delay in seconds, current queue counts
         """
         current_time = time.time()
-        sleep_time = 0
+        sleep_time = 0.0
 
         with self._rate_limit_lock:
             self._cleanup_old_timestamps()
 
-            # global rate limit
-            if len(self._global_timestamps) >= self.GLOBAL_LIMIT - 2:
-                # Get the timestamp that is (GLOBAL_LIMIT - 2) positions from the end
-                # This represents when we can safely send the next message
-                safe_index = len(self._global_timestamps) - (self.GLOBAL_LIMIT - 2)
-                if safe_index >= 0 and safe_index < len(self._global_timestamps):
-                    reference_timestamp = self._global_timestamps[safe_index]
-                    next_available_time = reference_timestamp + self.GLOBAL_WINDOW
-                    sleep_time = max(sleep_time, next_available_time - current_time)
-
-            # chat-specific rate limit
+            # --------------------------------------------------
+            # Chat-specific rate limit (FIFO – per-chat window)
+            # --------------------------------------------------
+            chat_delay = 0.0
             chat_timestamps = self._chat_timestamps[chat_id]
             if len(chat_timestamps) >= self.CHAT_LIMIT - 2:
-                # Get the timestamp that is (CHAT_LIMIT - 2) positions from the end
                 safe_index = len(chat_timestamps) - (self.CHAT_LIMIT - 2)
-                if safe_index >= 0 and safe_index < len(chat_timestamps):
-                    reference_timestamp = chat_timestamps[safe_index]
-                    next_available_time = reference_timestamp + self.CHAT_WINDOW
-                    sleep_time = max(sleep_time, next_available_time - current_time)
+                reference_timestamp = chat_timestamps[safe_index]
+                chat_delay = max(0.0, (reference_timestamp + self.CHAT_WINDOW) - current_time)
 
-            # Record the actual time this request will be processed
-            actual_time = current_time + max(sleep_time, 0)
-            self._global_timestamps.append(actual_time)
-            self._chat_timestamps[chat_id].append(actual_time)
+            # Earliest candidate time that satisfies chat limit
+            candidate_time = current_time + chat_delay
 
-            chat_count = len(self._chat_timestamps[chat_id])
+            # --------------------------------------------------
+            # Global limit – find the first slot that fits
+            # --------------------------------------------------
+            while True:
+                left_bound = candidate_time - self.GLOBAL_WINDOW
+                idx = bisect.bisect_left(self._global_timestamps, left_bound)
+                in_window = len(self._global_timestamps) - idx
+                if in_window < self.GLOBAL_LIMIT - 2:
+                    break
+                # Shift to just after the oldest entry in the current window
+                candidate_time = self._global_timestamps[idx] + self.GLOBAL_WINDOW
+
+            sleep_time = max(0.0, candidate_time - current_time)
+
+            # Record the scheduled time in both queues
+            bisect.insort(self._global_timestamps, candidate_time)
+            chat_timestamps.append(candidate_time)
+
+            chat_count = len(chat_timestamps)
             global_count = len(self._global_timestamps)
 
         # Log rate limiting status but don't sleep
