@@ -354,7 +354,7 @@ class TelegramBotManager(LocaleMixin):
             while True:
                 left_bound = candidate_time - self.GLOBAL_WINDOW
                 idx = bisect.bisect_left(self._global_timestamps, left_bound)
-                right_idx = bisect.bisect_right(self._global_timestamps, self._global_timestamps[idx] + self.GLOBAL_WINDOW)
+                right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
                 in_window = right_idx - idx
                 if in_window < self.GLOBAL_LIMIT - 2:
                     break
