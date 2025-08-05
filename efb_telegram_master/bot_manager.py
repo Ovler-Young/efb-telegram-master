@@ -375,11 +375,11 @@ class TelegramBotManager(LocaleMixin):
         # Log rate limiting status but don't sleep
         if sleep_time > 0:
             self.logger.info(f"Rate limit reached, need to delay {sleep_time:.2f}s for chat {chat_id}. "
-                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{idx}, Scan count: {scan_count}")
+                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {idx}/{self.GLOBAL_LIMIT}, Scan count: {scan_count}")
 
         else:
             self.logger.info(f"Rate limit not reached for chat {chat_id}. "
-                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{idx}, Scan count: {scan_count}")
+                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {idx}/{self.GLOBAL_LIMIT}, Scan count: {scan_count}")
 
         return sleep_time, chat_count, global_count
 
