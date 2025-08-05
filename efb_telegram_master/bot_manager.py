@@ -328,10 +328,10 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             tuple: (delay_time, chat_count, global_count) - delay in seconds, current queue counts
         """
-        current_time = time.time()
         sleep_time = 0.0
 
         with self._rate_limit_lock:
+            current_time = time.time()
             self._cleanup_old_timestamps()
 
             # --------------------------------------------------
