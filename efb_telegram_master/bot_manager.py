@@ -1,23 +1,25 @@
 # coding=utf-8
+import bisect
 import collections
+import heapq
 import html
 import io
 import logging
 import os
-import time
 import threading
+import time
 from collections import defaultdict, deque
 from functools import wraps
-from typing import List, TYPE_CHECKING, Callable, NamedTuple, Deque
+from turtle import right
+from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple
 from unittest.mock import Mock
-import heapq
-import bisect
 
 import telegram.constants
 import telegram.error
 from retrying import retry
-from telegram import Update, InputFile, User, File, ForumTopic, Message as TelegramMessage
-from telegram.ext import CallbackContext, Filters, MessageHandler, Updater, Dispatcher
+from telegram import File, ForumTopic, InputFile, Update, User
+from telegram import Message as TelegramMessage
+from telegram.ext import CallbackContext, Dispatcher, Filters, MessageHandler, Updater
 
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
@@ -349,14 +351,17 @@ class TelegramBotManager(LocaleMixin):
             # --------------------------------------------------
             # Global limit – find the first slot that fits
             # --------------------------------------------------
+            scan_count = 0
             while True:
                 left_bound = candidate_time - self.GLOBAL_WINDOW
                 idx = bisect.bisect_left(self._global_timestamps, left_bound)
-                in_window = len(self._global_timestamps) - idx
+                right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
+                in_window = right_idx - idx
                 if in_window < self.GLOBAL_LIMIT - 2:
                     break
                 # Shift to just after the oldest entry in the current window
                 candidate_time = self._global_timestamps[idx] + self.GLOBAL_WINDOW
+                scan_count += 1
 
             sleep_time = max(0.0, candidate_time - current_time)
 
@@ -370,16 +375,11 @@ class TelegramBotManager(LocaleMixin):
         # Log rate limiting status but don't sleep
         if sleep_time > 0:
             self.logger.info(f"Rate limit reached, need to delay {sleep_time:.2f}s for chat {chat_id}. "
-                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
-            if chat_count % 100 == 0:
-                self.logger.warning(f"Chat {chat_id} is heavily queued. "
-                                   f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
-            if chat_count % 1000 == 0:
-                self.logger.error(f"Chat {chat_id} is heavily queued. "
-                                   f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
+                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{idx}, Scan count: {scan_count}")
+
         else:
-            self.logger.debug(f"Rate limit not reached for chat {chat_id}. "
-                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{self.GLOBAL_LIMIT}")
+            self.logger.info(f"Rate limit not reached for chat {chat_id}. "
+                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {global_count}/{idx}, Scan count: {scan_count}")
 
         return sleep_time, chat_count, global_count
 
