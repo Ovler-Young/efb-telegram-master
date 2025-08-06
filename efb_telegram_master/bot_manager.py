@@ -10,7 +10,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple
+from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple, Tuple
 from unittest.mock import Mock
 
 import telegram.constants
@@ -154,7 +154,17 @@ class TelegramBotManager(LocaleMixin):
 
                         retry_after = e.retry_after
                         cls.logger.warning(f"Rate limit hit, waiting {retry_after}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
-                        time.sleep(retry_after)
+
+                        # Use interruptible sleep for rate limit waits
+                        if hasattr(self, '_delayed_worker_stop'):
+                            # Sleep in small chunks to allow for interruption during shutdown
+                            remaining = retry_after
+                            while remaining > 0 and not self._delayed_worker_stop.is_set():
+                                sleep_chunk = min(1.0, remaining)
+                                time.sleep(sleep_chunk)
+                                remaining -= sleep_chunk
+                        else:
+                            time.sleep(retry_after)
                     except telegram.error.TelegramError as e:
                         if "Too Many Requests" in str(e) or "429" in str(e) or "Flood" in str(e):
                             timestamp_info = get_timestamp_info()
@@ -167,7 +177,17 @@ class TelegramBotManager(LocaleMixin):
                             if chat_id and hasattr(self, '_chat_timestamps'):
                                 for timestamp in self._chat_timestamps[chat_id]:
                                     timestamp += delay
-                            time.sleep(delay)
+
+                            # Use interruptible sleep for rate limit waits
+                            if hasattr(self, '_delayed_worker_stop'):
+                                # Sleep in small chunks to allow for interruption during shutdown
+                                remaining = delay
+                                while remaining > 0 and not self._delayed_worker_stop.is_set():
+                                    sleep_chunk = min(1.0, remaining)
+                                    time.sleep(sleep_chunk)
+                                    remaining -= sleep_chunk
+                            else:
+                                time.sleep(delay)
                         else:
                             raise
 
@@ -305,7 +325,7 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Rate limiter initialized...")
 
         # Initialize delayed message queue system
-        self._delayed_queue: list[tuple[float, int, DelayedTask]] = []
+        self._delayed_queue: List[Tuple[float, int, DelayedTask]] = []
         self._delayed_queue_lock = threading.Lock()
         self._task_counter = 0  # Counter for tie-breaking in heapq
         self._delayed_worker_stop = threading.Event()
@@ -485,6 +505,10 @@ class TelegramBotManager(LocaleMixin):
 
                 # Execute ready tasks outside of lock
                 for task in tasks_to_execute:
+                    # Check if we should stop before executing each task
+                    if self._delayed_worker_stop.is_set():
+                        break
+
                     try:
                         self.logger.debug(f"Executing delayed task {task.task_id} for chat {task.chat_id}")
                         result = task.function(*task.args, **task.kwargs)
@@ -497,12 +521,14 @@ class TelegramBotManager(LocaleMixin):
                     except Exception as e:
                         self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
 
-                # Sleep for a short time to avoid busy waiting
-                time.sleep(0.1)
+                # Use event wait with timeout instead of sleep for faster shutdown response
+                if not self._delayed_worker_stop.wait(timeout=0.1):
+                    continue
 
             except Exception as e:
                 self.logger.exception(f"Error in delayed message worker: {e}")
-                time.sleep(1)  # Sleep longer on error to avoid spam
+                # Use event wait with timeout for error cases too
+                self._delayed_worker_stop.wait(timeout=1)
 
         self.logger.debug("Delayed message worker stopped")
 
@@ -543,10 +569,19 @@ class TelegramBotManager(LocaleMixin):
 
     def stop_delayed_worker(self):
         """Stop the delayed message worker thread."""
+        self.logger.debug("Stopping delayed message worker...")
+
         if hasattr(self, '_delayed_worker_stop'):
             self._delayed_worker_stop.set()
+
         if hasattr(self, '_delayed_worker_thread') and self._delayed_worker_thread.is_alive():
+            self.logger.debug("Waiting for delayed message worker to stop...")
             self._delayed_worker_thread.join(timeout=5)
+
+            if self._delayed_worker_thread.is_alive():
+                self.logger.warning("Delayed message worker did not stop gracefully within timeout")
+            else:
+                self.logger.debug("Delayed message worker stopped successfully")
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -1012,10 +1047,36 @@ class TelegramBotManager(LocaleMixin):
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
+        self.logger.info("Starting graceful shutdown...")
+
+        # Log pending tasks count before stopping
+        pending_count = 0
+        if hasattr(self, '_delayed_queue'):
+            with self._delayed_queue_lock:
+                pending_count = len(self._delayed_queue)
+
+        if pending_count > 0:
+            self.logger.info(f"Found {pending_count} pending delayed tasks")
+
         # Stop the delayed message worker first
         self.stop_delayed_worker()
+
         # Then stop the updater
+        self.logger.debug("Stopping Telegram updater...")
         self.updater.stop()
+        self.logger.info("Graceful shutdown completed")
+
+    def __del__(self):
+        """Ensure cleanup on object destruction"""
+        try:
+            if hasattr(self, '_delayed_worker_stop') and hasattr(self, '_delayed_worker_thread'):
+                if not self._delayed_worker_stop.is_set():
+                    self._delayed_worker_stop.set()
+                if self._delayed_worker_thread.is_alive():
+                    self._delayed_worker_thread.join(timeout=1)
+        except Exception:
+            # Don't raise exceptions in __del__
+            pass
 
     def _detect_empty_file(self, file, chat, caption, prefix, suffix):
         empty = True
