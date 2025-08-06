@@ -121,27 +121,50 @@ class TelegramBotManager(LocaleMixin):
                 if not cls.enable_retry:
                     return fn(self, *args, **kwargs)
 
+                # Extract chat_id from arguments for logging
+                chat_id = None
+                if args:
+                    chat_id = args[0]
+                elif 'chat_id' in kwargs:
+                    chat_id = kwargs['chat_id']
+
+                # Get recent timestamps for debugging
+                def get_timestamp_info():
+                    if not (chat_id and hasattr(self, '_chat_timestamps') and hasattr(self, '_global_timestamps')):
+                        return ""
+
+                    current_time = time.time()
+                    chat_timestamps = list(self._chat_timestamps.get(chat_id, []))
+                    global_timestamps = self._global_timestamps
+
+                    # Format recent timestamps relative to current time
+                    chat_info = [f"{ts - current_time:.3f}s" for ts in chat_timestamps]
+                    global_info = [f"{ts - current_time:.3f}s" for ts in global_timestamps]
+
+                    return f" [chat_recent: {chat_info}, global_recent: {global_info}]"
+
                 for attempt in range(max_retries + 1):
                     try:
                         return fn(self, *args, **kwargs)
                     except telegram.error.RetryAfter as e:
+                        timestamp_info = get_timestamp_info()
                         if attempt >= max_retries:
-                            cls.logger.error(f"Max retries exceeded for rate limit error: {e}")
+                            cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
                             raise
 
                         retry_after = e.retry_after
-                        cls.logger.warning(f"Rate limit hit, waiting {retry_after}s before retry {attempt + 1}/{max_retries}")
+                        cls.logger.warning(f"Rate limit hit, waiting {retry_after}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
                         time.sleep(retry_after)
                     except telegram.error.TelegramError as e:
                         if "Too Many Requests" in str(e) or "429" in str(e) or "Flood" in str(e):
+                            timestamp_info = get_timestamp_info()
                             if attempt >= max_retries:
-                                cls.logger.error(f"Max retries exceeded for rate limit error: {e}")
+                                cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
                                 raise
 
                             delay = 60
-                            cls.logger.warning(f"Rate limit detected, waiting {delay}s before retry {attempt + 1}/{max_retries}")
-                            if 'chat_id' in kwargs:
-                                chat_id = kwargs['chat_id']
+                            cls.logger.warning(f"Rate limit detected, waiting {delay}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
+                            if chat_id and hasattr(self, '_chat_timestamps'):
                                 for timestamp in self._chat_timestamps[chat_id]:
                                     timestamp += delay
                             time.sleep(delay)
