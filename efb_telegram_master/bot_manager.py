@@ -679,6 +679,10 @@ class TelegramBotManager(LocaleMixin):
             kwargs['text'] = prefix + text + suffix
             return self._bot_edit_message_text_fallback(**kwargs)
 
+    @Decorators.rate_limit_decorator
+    @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.retry_on_chat_migration
     def _bot_send_message_fallback(self, *args, **kwargs):
         """
         Remove ``parse_mode`` if the server fails to parse.
@@ -695,6 +699,10 @@ class TelegramBotManager(LocaleMixin):
             else:
                 raise e
 
+    @Decorators.rate_limit_decorator
+    @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
+    @Decorators.retry_on_chat_migration
     def _bot_edit_message_text_fallback(self, *args, **kwargs):
         """
         Remove ``parse_mode`` if the server fails to parse.
