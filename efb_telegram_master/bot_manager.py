@@ -1098,10 +1098,17 @@ class TelegramBotManager(LocaleMixin):
         if isinstance(file, str):
             empty = os.stat(file).st_size == 0
         elif hasattr(file, "seekable"):
-            if file.seekable():
-                file.seek(0, 2)
-                empty = file.tell() == 0
-                file.seek(0, 0)
+            try:
+                if hasattr(file, 'closed') and file.closed:
+                    empty = True
+                elif file.seekable():
+                    file.seek(0, 2)
+                    empty = file.tell() == 0
+                    file.seek(0, 0)
+                else:
+                    empty = True
+            except (ValueError, OSError):
+                empty = True
         elif isinstance(file, InputFile):
             empty = not bool(len(file.input_file_content))
         if empty:
