@@ -624,6 +624,13 @@ class TelegramBotManager(LocaleMixin):
                 filename += ".md"
             elif kwargs.get('parse_mode', '').lower() == 'html':
                 filename += ".html"
+                full_message_html = (
+                    "<html><head><meta charset='utf-8'></head>"
+                    "<body><pre style='white-space:pre-wrap'>" + (prefix + text + suffix) + "</pre></body></html>"
+                )
+                full_message.write(full_message_html.encode('utf-8'))
+                full_message.seek(0)
+                full_message.truncate()
             else:
                 filename += ".txt"
             self.updater.bot.send_document(args[0], full_message, filename=filename,
