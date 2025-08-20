@@ -622,7 +622,7 @@ class ChatBindingManager(LocaleMixin):
 
         # migrate history
         if is_relink:
-            self.send_history_link(chat_uid, tg_chat_to_link.id, int(msg.message_id), thread_id)
+            self.send_history_link(chat_uid, tg_chat_to_link.id, int(msg.chat.id), thread_id)
         else:
             try:
                 self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
