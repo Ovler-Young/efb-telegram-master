@@ -567,6 +567,7 @@ class ChatBindingManager(LocaleMixin):
         except KeyError:
             return update.message.reply_text(self._("Session expired or unknown parameter. (SE02)"))
         chat: ETMChatType = data.chats[0]
+        is_relink = chat.linked
         chat_display_name = chat.full_name
         slave_channel, slave_chat_uid = chat.module_id, chat.uid
         chat_uid = utils.chat_id_to_str(slave_channel, slave_chat_uid)
@@ -620,22 +621,72 @@ class ChatBindingManager(LocaleMixin):
         self.msg_storage.pop(storage_key, None)
 
         # migrate history
-        try:
-            self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
-        except Exception as e:
-            self.logger.warning("History migration failed for %s: %s", chat_display_name, e)
-            # Send a notice to user about failed migration
+        if is_relink:
+            self.send_history_link(chat_uid, tg_chat_to_link.id, thread_id)
+        else:
             try:
-                notice_kwargs = {
-                    'chat_id': tg_chat_to_link.id,
-                    'text': self._("⚠️ 历史消息迁移失败，但聊天绑定成功"),
-                    'disable_notification': True
-                }
-                if thread_id:
-                    notice_kwargs['message_thread_id'] = thread_id
-                self.bot.send_message(**notice_kwargs)
+                self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
+            except Exception as e:
+                self.logger.warning("History migration failed for %s: %s", chat_display_name, e)
+                # Send a notice to user about failed migration
+                try:
+                    notice_kwargs = {
+                        'chat_id': tg_chat_to_link.id,
+                        'text': self._("⚠️ 历史消息迁移失败，但聊天绑定成功"),
+                        'disable_notification': True
+                    }
+                    if thread_id:
+                        notice_kwargs['message_thread_id'] = thread_id
+                    self.bot.send_message(**notice_kwargs)
+                except Exception:
+                    pass  # Ignore if we can't send the notice
+
+    def send_history_link(self, slave_chat_id: EFBChannelChatIDStr,
+                           tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
+        """Send a message with a link to the chat history."""
+        try:
+            # We only need one message to get the original chat_id
+            recent_messages = self.db.get_recent_messages(slave_chat_id, limit=1)
+            if not recent_messages:
+                return
+
+            msg_log = recent_messages[0]
+            original_chat_id, original_msg_id = utils.message_id_str_to_id(msg_log.master_msg_id)
+
+            original_chat_id_int = int(original_chat_id)
+
+            try:
+
+                if str(original_chat_id_int).startswith("-100"):
+                    # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
+                    short_id = str(original_chat_id_int)[4:]
+                    link = f"https://t.me/c/{short_id}/{original_msg_id}"
+                elif str(original_chat_id_int).startswith("-"):
+                    # Regular group: use group link format
+                    link = f"https://t.me/{abs(original_chat_id_int)}/{original_msg_id}"
+                else:
+                    # Channel or user: fallback to /c/{id}/{msg_id}
+                    link = f"https://t.me/c/{original_chat_id_int}/{original_msg_id}"
             except Exception:
-                pass  # Ignore if we can't send the notice
+                link = None
+
+            if link:
+                text = self._("This chat was previously linked. History messages are not migrated. "
+                              "You can view previous messages here: {link}").format(link=link)
+            else:
+                text = self._("This chat was previously linked. History messages are not migrated.")
+
+            kwargs = {
+                'chat_id': tg_chat_id,
+                'text': text,
+                'disable_notification': True
+            }
+            if thread_id:
+                kwargs['message_thread_id'] = thread_id
+            self.bot.send_message(**kwargs)
+
+        except Exception as e:
+            self.logger.warning("Failed to send history link for %s: %s", slave_chat_id, e)
 
     def unlink_all(self, update: Update, context: CallbackContext):
         """
@@ -1020,9 +1071,9 @@ class ChatBindingManager(LocaleMixin):
     def _get_chat_info_and_picture(self, chat: ETMChatType, channel: Channel) -> Tuple[Optional[str], Optional[IO], Optional[IO]]:
         """
         Get chat description and picture with proper processing.
-        
+
         Returns:
-            Tuple[Optional[str], Optional[IO], Optional[IO]]: 
+            Tuple[Optional[str], Optional[IO], Optional[IO]]:
             (description, original_picture, resized_picture)
         """
         picture: Optional[IO] = None
@@ -1067,7 +1118,7 @@ class ChatBindingManager(LocaleMixin):
         """
         Update forum group info for multiple linked chats.
         Send a message with avatar and description in each topic and pin it.
-        
+
         Returns:
             Tuple[bool, str, int]: (success, message, updated_count)
         """
@@ -1094,7 +1145,7 @@ class ChatBindingManager(LocaleMixin):
                     updated_count += 1
             except Exception as e:
                 self.logger.warning(f"Failed to update topic {thread_id}: {e}")
-            
+
             time.sleep(30) # seems pinning message has a special rate limit but I didn't find the official documentation
 
         if updated_count > 0:
@@ -1294,12 +1345,12 @@ class ChatBindingManager(LocaleMixin):
     def migrate_chat_history(self, slave_chat_id: EFBChannelChatIDStr,
                            tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Migrate historical messages to the newly linked chat.
-        
+
         This method now runs in a background thread to avoid blocking the bot.
-        
+
         Args:
             slave_chat_id: The slave chat identifier
-            tg_chat_id: The Telegram chat ID to migrate messages to  
+            tg_chat_id: The Telegram chat ID to migrate messages to
             thread_id: Optional thread ID for forum groups
         """
         # Run migration in background thread to avoid blocking the bot
@@ -1314,10 +1365,10 @@ class ChatBindingManager(LocaleMixin):
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr,
                                        tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Background method that performs the actual migration work.
-        
+
         Args:
             slave_chat_id: The slave chat identifier
-            tg_chat_id: The Telegram chat ID to migrate messages to  
+            tg_chat_id: The Telegram chat ID to migrate messages to
             thread_id: Optional thread ID for forum groups
         """
         try:
@@ -1335,7 +1386,7 @@ class ChatBindingManager(LocaleMixin):
             for i, msg_log in enumerate(recent_messages):
                 # Check if message text is empty or doesn't exist
                 message_text = msg_log.text or ""
-                
+
                 # If text is empty or this is a media message, handle accordingly
                 if not message_text.strip() or (msg_log.media_type and msg_log.media_type != 'Text'):
                     # Send current text batch if it exists
@@ -1347,7 +1398,7 @@ class ChatBindingManager(LocaleMixin):
                             threading.Event().wait(4.0)
                         except Exception as e:
                             self.logger.warning("Failed to send text batch: %s", e)
-                    
+
                     # Forward the media message or empty text message
                     try:
                         self._forward_media_message(msg_log, tg_chat_id, thread_id)
@@ -1370,7 +1421,7 @@ class ChatBindingManager(LocaleMixin):
                     # Format message with author and timestamp
                     formatted_msg = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
                     expected_msg_length = len(formatted_msg)
-                    
+
                     # Check if adding this message would exceed the limit
                     if current_length + expected_msg_length > 4096 - 20:
                         # Send current batch if it exists
@@ -1381,7 +1432,7 @@ class ChatBindingManager(LocaleMixin):
                                 threading.Event().wait(4.0)
                             except Exception as e:
                                 self.logger.warning("Failed to send text batch: %s", e)
-                        
+
                         # Start new batch with current message
                         current_text_batch = [formatted_msg]
                         current_length = len(formatted_msg)
@@ -1403,10 +1454,10 @@ class ChatBindingManager(LocaleMixin):
     def _send_text_batch_background(self, text_batch: List[str], tg_chat_id: int,
                                    thread_id: Optional[TelegramTopicID] = None):
         """Send a batch of formatted text messages.
-        
+
         Args:
             text_batch: List of formatted text strings ready to send
-            tg_chat_id: The Telegram chat ID to send messages to  
+            tg_chat_id: The Telegram chat ID to send messages to
             thread_id: Optional thread ID for forum groups
         """
         if not text_batch:
