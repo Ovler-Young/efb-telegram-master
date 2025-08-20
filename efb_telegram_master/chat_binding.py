@@ -622,7 +622,7 @@ class ChatBindingManager(LocaleMixin):
 
         # migrate history
         if is_relink:
-            self.send_history_link(chat_uid, tg_chat_to_link.id, int(storage_key[0]), int(storage_key[1]), thread_id)
+            self.send_history_link(chat_uid, tg_chat_to_link.id, storage_key, thread_id)
         else:
             try:
                 self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
@@ -642,10 +642,11 @@ class ChatBindingManager(LocaleMixin):
                     pass  # Ignore if we can't send the notice
 
     def send_history_link(self, slave_chat_id: EFBChannelChatIDStr,
-                           tg_chat_id: int, original_chat_id: int, original_msg_id: int, thread_id: Optional[TelegramTopicID] = None):
+                           tg_chat_id: int, storage_key: Tuple[int, int], thread_id: Optional[TelegramTopicID] = None):
         """Send a message with a link to the chat history."""
         try:
-            original_chat_id_int = int(original_chat_id)
+            original_chat_id_int = int(storage_key[0])
+            original_msg_id = int(storage_key[1])
 
             if str(original_chat_id_int).startswith("-100"):
                 # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
