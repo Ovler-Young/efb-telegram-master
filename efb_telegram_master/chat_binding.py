@@ -601,14 +601,14 @@ class ChatBindingManager(LocaleMixin):
             if not thread_id:
                 msg.reply_text(
                     self._(
-                    "Failed to create topic for {name} in the group.\n"
-                    "Please make sure the bot has the right.\n"
-                    "You can send /init_topics to create again."
+                        "Failed to create topic for {name} in the group.\n"
+                        "Please make sure the bot has the right.\n"
+                        "You can send /init_topics to create again."
                     ).format(name=chat_display_name),
                     reply_to_message_id=msg.message_id)
             else:
                 try:
-                    self._update_single_topic_info(tg_chat_to_link, thread_id, chat_uid)
+                    self._update_single_topic_info(TelegramChatID(tg_chat_to_link.id), thread_id, chat_uid)
                 except Exception as e:
                     self.logger.warning("Auto update group info failed for %s: %s", chat_display_name, e)
 
