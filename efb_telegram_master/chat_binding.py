@@ -622,7 +622,7 @@ class ChatBindingManager(LocaleMixin):
 
         # migrate history
         if is_relink:
-            self.send_history_link(chat_uid, tg_chat_to_link.id, thread_id)
+            self.send_history_link(chat_uid, tg_chat_to_link.id, int(msg.message_id), thread_id)
         else:
             try:
                 self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
@@ -642,39 +642,39 @@ class ChatBindingManager(LocaleMixin):
                     pass  # Ignore if we can't send the notice
 
     def send_history_link(self, slave_chat_id: EFBChannelChatIDStr,
-                           tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
+                           tg_chat_id: int, original_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Send a message with a link to the chat history."""
         try:
-            # We only need one message to get the original chat_id
-            recent_messages = self.db.get_recent_messages(slave_chat_id, limit=1)
+            recent_messages = self.db.get_recent_messages(slave_chat_id, limit=5)
             if not recent_messages:
                 return
 
-            msg_log = recent_messages[0]
-            original_chat_id, original_msg_id = utils.message_id_str_to_id(msg_log.master_msg_id)
+            msg_log = None
+            for message in recent_messages:
+                if message and message.master_msg_id and not message.text.startswith('/'):
+                    msg_log = message
+                    break
+
+            if not msg_log:
+                return
+
+            _, original_msg_id = utils.message_id_str_to_id(msg_log.master_msg_id)
 
             original_chat_id_int = int(original_chat_id)
 
-            try:
-
-                if str(original_chat_id_int).startswith("-100"):
-                    # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
-                    short_id = str(original_chat_id_int)[4:]
-                    link = f"https://t.me/c/{short_id}/{original_msg_id}"
-                elif str(original_chat_id_int).startswith("-"):
-                    # Regular group: use group link format
-                    link = f"https://t.me/{abs(original_chat_id_int)}/{original_msg_id}"
-                else:
-                    # Channel or user: fallback to /c/{id}/{msg_id}
-                    link = f"https://t.me/c/{original_chat_id_int}/{original_msg_id}"
-            except Exception:
-                link = None
-
-            if link:
-                text = self._("This chat was previously linked. History messages are not migrated. "
-                              "You can view previous messages here: {link}").format(link=link)
+            if str(original_chat_id_int).startswith("-100"):
+                # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
+                short_id = str(original_chat_id_int)[4:]
+                link = f"https://t.me/c/{short_id}/{original_msg_id}"
+            elif str(original_chat_id_int).startswith("-"):
+                # Regular group: use group link format
+                link = f"https://t.me/{abs(original_chat_id_int)}/{original_msg_id}"
             else:
-                text = self._("This chat was previously linked. History messages are not migrated.")
+                # Channel or user: fallback to /c/{id}/{msg_id}
+                link = f"https://t.me/c/{original_chat_id_int}/{original_msg_id}"
+
+            text = self._("This chat was previously linked. History messages are not migrated. "
+                            "You can view previous messages here: {link}").format(link=link)
 
             kwargs = {
                 'chat_id': tg_chat_id,
