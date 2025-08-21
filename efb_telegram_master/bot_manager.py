@@ -88,7 +88,7 @@ class TelegramBotManager(LocaleMixin):
                     chat_id = kwargs['chat_id']
 
                 # if _delayed_worker_stop is set, we should not schedule new tasks
-                if self._delayed_worker_stop:
+                if self._delayed_worker_stop.is_set():
                     self.logger.warning(f"Delayed worker is stopped. Not scheduling new tasks for chat {chat_id}.")
                     return None
 
