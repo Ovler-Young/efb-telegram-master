@@ -87,6 +87,11 @@ class TelegramBotManager(LocaleMixin):
                 elif 'chat_id' in kwargs:
                     chat_id = kwargs['chat_id']
 
+                # if _delayed_worker_stop is set, we should not schedule new tasks
+                if self._delayed_worker_stop:
+                    self.logger.warning(f"Delayed worker is stopped. Not scheduling new tasks for chat {chat_id}.")
+                    return None
+
                 # Calculate rate limiting delay
                 if chat_id:
                     delay_time, chat_count, global_count = self._calculate_rate_limit_delay(chat_id)  # pylint: disable=protected-access
