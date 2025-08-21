@@ -425,7 +425,7 @@ class TelegramBotManager(LocaleMixin):
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {right_idx}/{self.GLOBAL_LIMIT}, Scan count: {scan_count}")
 
         else:
-            self.logger.info(f"Rate limit not reached for chat {chat_id}. "
+            self.logger.debug(f"Rate limit not reached for chat {chat_id}. "
                            f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {right_idx}/{self.GLOBAL_LIMIT}, Scan count: {scan_count}")
 
         return sleep_time, chat_count, global_count
