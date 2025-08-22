@@ -472,8 +472,8 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             Task ID for tracking
         """
-        execute_time = time.time() + delay_time
-        task_id = f"{chat_id}_{execute_time:.9f}_{id(function)}"
+        execute_time = time.time_ns() + delay_time * 1_000_000_000
+        task_id = f"{chat_id}_{execute_time}_{id(function)}"
 
         task = DelayedTask(
             execute_time=execute_time,
