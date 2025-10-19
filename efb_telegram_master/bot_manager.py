@@ -138,7 +138,7 @@ class TelegramBotManager(LocaleMixin):
                     if not (chat_id and hasattr(self, '_chat_timestamps') and hasattr(self, '_global_timestamps')):
                         return ""
 
-                    current_time = time.time()
+                    current_time = time.time_ns()
                     chat_timestamps = list(self._chat_timestamps.get(chat_id, []))
                     global_timestamps = self._global_timestamps
 
