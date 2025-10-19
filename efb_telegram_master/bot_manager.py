@@ -138,7 +138,7 @@ class TelegramBotManager(LocaleMixin):
                     if not (chat_id and hasattr(self, '_chat_timestamps') and hasattr(self, '_global_timestamps')):
                         return ""
 
-                    current_time = time.time_ns()
+                    current_time = time.time()
                     chat_timestamps = list(self._chat_timestamps.get(chat_id, []))
                     global_timestamps = self._global_timestamps
 
@@ -472,8 +472,8 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             Task ID for tracking
         """
-        execute_time = time.time_ns() + delay_time * 1_000_000_000
-        task_id = f"{chat_id}_{execute_time}_{id(function)}"
+        execute_time = time.time() + delay_time
+        task_id = f"{chat_id}_{time.time_ns() + delay_time * 1_000_000_000}_{id(function)}"
 
         task = DelayedTask(
             execute_time=execute_time,
