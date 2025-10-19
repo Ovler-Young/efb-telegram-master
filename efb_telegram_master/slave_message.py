@@ -1078,12 +1078,12 @@ class SlaveMessageProcessor(LocaleMixin):
         old_msg.edit = True # Mark as edit so dispatch knows it's an update
         old_msg.edit_media = False # Ensure media is not considered edited
 
-        msg_template, _ = self.get_slave_msg_dest(old_msg)
+        msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(old_msg)
         effective_msg = old_msg_db.master_msg_id_alt or old_msg_db.master_msg_id
         chat_id, msg_id = utils.message_id_str_to_id(effective_msg)
 
         # Go through the ordinary update process
-        self.dispatch_message(old_msg, msg_template, old_msg_id=(chat_id, msg_id), tg_dest=chat_id)
+        self.dispatch_message(old_msg, msg_template, old_msg_id=(chat_id, msg_id), tg_dest, thread_id)
 
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name
