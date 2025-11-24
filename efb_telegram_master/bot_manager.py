@@ -233,9 +233,10 @@ class TelegramBotManager(LocaleMixin):
 
                 file = args[1] if len(args) >= 2 else kwargs.get('file', None)
                 chat = args[0] if len(args) >= 1 else kwargs.get('chat_id', None)
+                message_thread_id = kwargs.get('message_thread_id', None)
 
                 if file:
-                    is_empty = self._detect_empty_file(file, chat, text, prefix, suffix)
+                    is_empty = self._detect_empty_file(file, chat, text, prefix, suffix, message_thread_id)
 
                     if is_empty:
                         return is_empty
@@ -1090,7 +1091,7 @@ class TelegramBotManager(LocaleMixin):
             # Don't raise exceptions in __del__
             pass
 
-    def _detect_empty_file(self, file, chat, caption, prefix, suffix):
+    def _detect_empty_file(self, file, chat, caption, prefix, suffix, message_thread_id=None):
         empty = True
         if isinstance(file, str):
             empty = os.stat(file).st_size == 0
@@ -1109,5 +1110,7 @@ class TelegramBotManager(LocaleMixin):
         elif isinstance(file, InputFile):
             empty = not bool(len(file.input_file_content))
         if empty:
-            return self.send_message(chat, prefix=self._("Empty attachment detected.") + prefix,
-                                     text=caption, suffix=suffix)
+            kwargs = {'prefix': self._("Empty attachment detected.") + prefix, 'text': caption, 'suffix': suffix}
+            if message_thread_id is not None:
+                kwargs['message_thread_id'] = message_thread_id
+            return self.send_message(chat, **kwargs)
