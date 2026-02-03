@@ -237,6 +237,12 @@ class SlaveMessageProcessor(LocaleMixin):
                 commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
             ))
 
+        # Check if message sending failed (tg_msg is None)
+        if tg_msg is None:
+            self.logger.warning("[%s] Message sending returned None, skipping database logging. "
+                               "This may happen during shutdown or when Telegram API is unavailable.", xid)
+            return
+
         # Check if this is a delayed execution (mock message)
         if hasattr(tg_msg, '_delayed_execution_pending') and tg_msg._delayed_execution_pending:
             # This is a delayed execution - defer database logging
