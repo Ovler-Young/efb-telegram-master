@@ -11,6 +11,8 @@ import time
 from collections import defaultdict, deque
 from functools import wraps
 from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple, Tuple
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 from unittest.mock import Mock
 
 import telegram.constants
@@ -1110,7 +1112,8 @@ class TelegramBotManager(LocaleMixin):
     def _detect_empty_file(self, file, chat, caption, prefix, suffix, message_thread_id=None):
         empty = True
         if isinstance(file, str):
-            empty = os.stat(file).st_size == 0
+            stat_path = url2pathname(urlparse(file).path) if file.startswith('file://') else file
+            empty = os.stat(stat_path).st_size == 0
         elif hasattr(file, "seekable"):
             try:
                 if hasattr(file, 'closed') and file.closed:
