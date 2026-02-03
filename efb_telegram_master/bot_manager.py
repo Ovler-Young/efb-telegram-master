@@ -268,6 +268,22 @@ class TelegramBotManager(LocaleMixin):
             return caption_affix
 
         @classmethod
+        def skip_on_rate_limit(cls, fn: Callable):
+            """Skip execution silently if messages are queued. For non-essential calls like typing indicators."""
+            @wraps(fn)
+            def skip_wrapper(self: 'TelegramBotManager', *args, **kwargs):
+                with self._delayed_queue_lock:
+                    if self._delayed_queue:
+                        return None
+
+                try:
+                    return fn(self, *args, **kwargs)
+                except telegram.error.RetryAfter:
+                    return None
+
+            return skip_wrapper
+
+        @classmethod
         def retry_on_chat_migration(cls, fn: Callable):
             @wraps(fn)
             def retry_on_chat_migration_wrap(self: 'TelegramBotManager', *args, **kwargs):
@@ -874,8 +890,8 @@ class TelegramBotManager(LocaleMixin):
         except telegram.error.BadRequest:
             return self.updater.bot.send_document(*args, **kwargs)
 
+    @Decorators.skip_on_rate_limit
     @Decorators.retry_on_timeout
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
         message_thread_id = kwargs.pop('message_thread_id', None)
