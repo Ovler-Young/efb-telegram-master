@@ -690,7 +690,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
                 try:
                     pic_img: Image = Image.open(msg.file)
-                    webp_img = tempfile.NamedTemporaryFile(suffix='.webp')
+                    webp_img = tempfile.NamedTemporaryFile(suffix='.webp', dir=utils.ExperimentalFlagsManager.get_temp_dir(self.channel))
                     pic_img.convert("RGBA").save(webp_img, 'webp')
                     webp_img.seek(0)
                     file = self.process_file_obj(webp_img, webp_img.name)
@@ -851,7 +851,7 @@ class SlaveMessageProcessor(LocaleMixin):
             # Sending new message (initial or fallback)
             if not old_msg_id: # Ensure we are in the 'send new' path
                 assert msg.file is not None
-                with tempfile.NamedTemporaryFile(suffix=".ogg") as f: # Ensure correct suffix for pydub
+                with tempfile.NamedTemporaryFile(suffix=".ogg", dir=utils.ExperimentalFlagsManager.get_temp_dir(self.channel)) as f: # Ensure correct suffix for pydub
                     try:
                         pydub.AudioSegment.from_file(msg.file).export(f.name, format="ogg", codec="libopus",
                                                                       parameters=['-vbr', 'on'])
@@ -1149,6 +1149,51 @@ class SlaveMessageProcessor(LocaleMixin):
         return None
 
     def process_file_obj(self, file: IO[bytes], path: Union[str, Path]) -> Union[IO[bytes], str]:
+        """Process file object for sending to Telegram.
+
+        When using local TDLIB API, files need to be accessible by the Docker container.
+        If local_tdlib_temp_dir is configured and the file is outside that directory,
+        the file will be copied to the shared directory first.
+
+        Args:
+            file: The file object
+            path: Path to the file
+
+        Returns:
+            file:// URI if using local TDLIB API, otherwise the file object
+        """
         if self.channel.flag("local_tdlib_api"):
-            return Path(path).absolute().as_uri()
+            abs_path = Path(path).absolute()
+            temp_dir = utils.ExperimentalFlagsManager.get_temp_dir(self.channel)
+
+            # If we have a shared temp dir configured, check if file needs to be copied
+            if temp_dir:
+                temp_dir_path = Path(temp_dir)
+                # Check if the file is already in the shared directory
+                try:
+                    abs_path.relative_to(temp_dir_path)
+                    # File is already in shared dir, use it directly
+                except ValueError:
+                    # File is outside shared dir, need to copy it
+                    import shutil
+                    import tempfile as tmp
+
+                    # Create a temp file in the shared directory with same extension
+                    suffix = abs_path.suffix or ''
+                    with tmp.NamedTemporaryFile(suffix=suffix, dir=temp_dir, delete=False) as dest:
+                        dest_path = dest.name
+
+                    # Copy file content
+                    file.seek(0)
+                    with open(dest_path, 'wb') as dest:
+                        shutil.copyfileobj(file, dest)
+
+                    # Set permissions to 644 so Docker container can read
+                    os.chmod(dest_path, 0o644)
+
+                    abs_path = Path(dest_path)
+                    self.logger.debug("Copied file from %s to shared temp dir: %s", path, dest_path)
+
+            return abs_path.as_uri()
         return file
+

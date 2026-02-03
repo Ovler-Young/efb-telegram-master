@@ -59,6 +59,27 @@ class ExperimentalFlagsManager(LocaleMixin):
         "topic_group": None,
     }
 
+    @staticmethod
+    def get_temp_dir(channel: 'TelegramChannel') -> Optional[str]:
+        """Get the temp directory for creating temporary files.
+
+        When using local TDLIB API with Docker, temp files need to be created
+        in a directory that is shared between the host and the container.
+
+        Extracts the directory path from api_base_file_url if configured.
+        For example: file:///var/lib/telegram-bot-api -> /var/lib/telegram-bot-api
+
+        Returns:
+            The temp directory path if local_tdlib_api and api_base_file_url are configured,
+            otherwise None (use system default).
+        """
+        if channel.flag("local_tdlib_api") and channel.flag("api_base_file_url"):
+            from urllib.parse import urlparse
+            parsed = urlparse(channel.flag("api_base_file_url"))
+            if parsed.scheme == "file" and parsed.path:
+                return parsed.path
+        return None
+
     def __init__(self, channel: 'TelegramChannel'):
         self.channel = channel
         self.config: Dict[str, Any] = ExperimentalFlagsManager.DEFAULT_VALUES.copy()
