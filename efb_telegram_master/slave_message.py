@@ -1178,8 +1178,24 @@ class SlaveMessageProcessor(LocaleMixin):
                     import shutil
                     import tempfile as tmp
 
-                    # Create a temp file in the shared directory with same extension
-                    suffix = abs_path.suffix or ''
+                    # Determine extension; guess from magic bytes if path has none
+                    suffix = abs_path.suffix
+                    if not suffix:
+                        file.seek(0)
+                        head = file.read(16)
+                        file.seek(0)
+                        if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+                            suffix = '.webp'
+                        elif head[:8] == b'\x89PNG\r\n\x1a\n':
+                            suffix = '.png'
+                        elif head[:2] == b'\xff\xd8':
+                            suffix = '.jpg'
+                        elif head[:6] in (b'GIF87a', b'GIF89a'):
+                            suffix = '.gif'
+                        elif head[4:8] == b'ftyp':
+                            suffix = '.mp4'
+                        elif head[:4] == b'OggS':
+                            suffix = '.ogg'
                     with tmp.NamedTemporaryFile(suffix=suffix, dir=temp_dir, delete=False) as dest:
                         dest_path = dest.name
 
