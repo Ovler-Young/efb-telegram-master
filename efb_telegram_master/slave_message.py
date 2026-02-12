@@ -515,7 +515,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     if edit_media:
                         assert msg.path
                         media: InputMedia
-                        file = self.process_file_obj(msg.file, msg.path)
+                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
                         if send_as_file:
                             media = InputMediaDocument(file)
                         else:
@@ -539,7 +539,7 @@ class SlaveMessageProcessor(LocaleMixin):
             # Sending new message (either initially or as fallback from edit)
             if send_as_file:
                 assert msg.path
-                file = self.process_file_obj(msg.file, msg.path)
+                file = self.process_file_obj(msg.file, msg.path, msg.filename)
                 return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
                                               caption=text, parse_mode="HTML", filename=msg.filename,
                                               reply_to_message_id=target_msg_id,
@@ -549,7 +549,7 @@ class SlaveMessageProcessor(LocaleMixin):
             else:
                 try:
                     assert msg.path
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     return self.bot.send_photo(tg_dest, file, prefix=msg_template, suffix=reactions,
                                                caption=text, parse_mode="HTML",
                                                reply_to_message_id=target_msg_id,
@@ -561,7 +561,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                       msg.uid, e)
                     assert msg.path
                     msg.file.seek(0) # Rewind file pointer
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
                                                   caption=text, parse_mode="HTML", filename=msg.filename,
                                                   reply_to_message_id=target_msg_id,
@@ -609,7 +609,7 @@ class SlaveMessageProcessor(LocaleMixin):
             if old_msg_id:
                 if edit_media:
                     assert msg.file and msg.path
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaAnimation(file),
                                                 reply_markup=reply_markup)
                     if not text:
@@ -620,7 +620,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                      caption=text, parse_mode="HTML")
             else:
                 assert msg.file and msg.path
-                file = self.process_file_obj(msg.file, msg.path)
+                file = self.process_file_obj(msg.file, msg.path, msg.filename)
                 anim_file: Union[IO[bytes], str] = file if isinstance(file, str) else InputFile(file, filename=msg.filename)
                 return self.bot.send_animation(tg_dest, anim_file,
                                                prefix=msg_template, suffix=reactions,
@@ -693,7 +693,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     webp_img = tempfile.NamedTemporaryFile(suffix='.webp', dir=utils.ExperimentalFlagsManager.get_temp_dir(self.channel))
                     pic_img.convert("RGBA").save(webp_img, 'webp')
                     webp_img.seek(0)
-                    file = self.process_file_obj(webp_img, webp_img.name)
+                    file = self.process_file_obj(webp_img, webp_img.name, msg.filename)
                     return self.bot.send_sticker(tg_dest, file, reply_markup=sticker_reply_markup,
                                                  message_thread_id=thread_id,
                                                  reply_to_message_id=target_msg_id,
@@ -701,7 +701,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 except IOError:
                     self.logger.warning("[%s] Failed to convert image to webp sticker, sending as document.", msg.uid)
                     assert msg.file and msg.path
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
                                                   message_thread_id=thread_id,
                                                   caption=msg.text, filename=msg.filename,
@@ -787,7 +787,7 @@ class SlaveMessageProcessor(LocaleMixin):
             if old_msg_id:
                 if edit_media:
                     assert msg.file is not None and msg.path is not None
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaDocument(file))
                     if not text:
                         return res
@@ -796,7 +796,7 @@ class SlaveMessageProcessor(LocaleMixin):
             assert msg.file is not None and msg.path is not None
             self.logger.debug("[%s] Uploading file %s (%s) as %s", msg.uid,
                               msg.file.name, msg.mime, file_name)
-            file = self.process_file_obj(msg.file, msg.path)
+            file = self.process_file_obj(msg.file, msg.path, file_name)
             return self.bot.send_document(tg_dest, file,
                                           prefix=msg_template, suffix=reactions,
                                           caption=text, parse_mode="HTML", filename=file_name,
@@ -856,7 +856,7 @@ class SlaveMessageProcessor(LocaleMixin):
                         pydub.AudioSegment.from_file(msg.file).export(f.name, format="ogg", codec="libopus",
                                                                       parameters=['-vbr', 'on'])
                         # process_file_obj might return URI or file object. send_voice expects content or path.
-                        processed_path = self.process_file_obj(f, f.name) # Get path/URI
+                        processed_path = self.process_file_obj(f, f.name, msg.filename) # Get path/URI
                         # Send using the path/URI
                         tg_msg = self.bot.send_voice(tg_dest, processed_path, prefix=msg_template, suffix=reactions,
                                                      caption=text, parse_mode="HTML",
@@ -947,7 +947,7 @@ class SlaveMessageProcessor(LocaleMixin):
             if old_msg_id:
                 if edit_media:
                     assert msg.file is not None and msg.path is not None
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaVideo(file),
                                                 reply_markup=reply_markup)
                     if not text:
@@ -955,7 +955,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
                                                      prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
             assert msg.file is not None and msg.path is not None
-            file = self.process_file_obj(msg.file, msg.path)
+            file = self.process_file_obj(msg.file, msg.path, msg.filename)
             return self.bot.send_video(tg_dest, file, prefix=msg_template, suffix=reactions,
                                        caption=text, parse_mode="HTML",
                                        reply_to_message_id=target_msg_id,
@@ -1148,7 +1148,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 size=size_str, max_size=max_size_str)
         return None
 
-    def process_file_obj(self, file: IO[bytes], path: Union[str, Path]) -> Union[IO[bytes], str]:
+    def process_file_obj(self, file: IO[bytes], path: Union[str, Path], filename: Optional[str] = None) -> Union[IO[bytes], str]:
         """Process file object for sending to Telegram.
 
         When using local TDLIB API, files need to be accessible by the Docker container.
@@ -1158,6 +1158,7 @@ class SlaveMessageProcessor(LocaleMixin):
         Args:
             file: The file object
             path: Path to the file
+            filename: Optional original filename to preserve when copying
 
         Returns:
             file:// URI if using local TDLIB API, otherwise the file object
@@ -1178,9 +1179,18 @@ class SlaveMessageProcessor(LocaleMixin):
                     import shutil
                     import tempfile as tmp
 
-                    # Determine extension; guess from magic bytes if path has none
-                    suffix = abs_path.suffix
+                    # Determine extension from filename or guess from magic bytes
+                    suffix = ''
+                    if filename:
+                        # Extract extension from original filename
+                        suffix = Path(filename).suffix
+
                     if not suffix:
+                        # Fall back to guessing from file path
+                        suffix = abs_path.suffix
+
+                    if not suffix:
+                        # Last resort: guess from magic bytes
                         file.seek(0)
                         head = file.read(16)
                         file.seek(0)
@@ -1196,8 +1206,23 @@ class SlaveMessageProcessor(LocaleMixin):
                             suffix = '.mp4'
                         elif head[:4] == b'OggS':
                             suffix = '.ogg'
-                    with tmp.NamedTemporaryFile(suffix=suffix, dir=temp_dir, delete=False) as dest:
-                        dest_path = dest.name
+                        elif head[:4] == b'%PDF':
+                            suffix = '.pdf'
+
+                    # Use original filename if provided, otherwise generate temp name
+                    if filename:
+                        # Sanitize filename to avoid path traversal
+                        safe_filename = os.path.basename(filename)
+                        dest_path = os.path.join(temp_dir, safe_filename)
+                        # If file already exists, add a unique suffix
+                        if os.path.exists(dest_path):
+                            import uuid
+                            name_parts = os.path.splitext(safe_filename)
+                            safe_filename = f"{name_parts[0]}_{uuid.uuid4().hex[:8]}{name_parts[1]}"
+                            dest_path = os.path.join(temp_dir, safe_filename)
+                    else:
+                        with tmp.NamedTemporaryFile(suffix=suffix, dir=temp_dir, delete=False) as dest:
+                            dest_path = dest.name
 
                     # Copy file content
                     file.seek(0)
@@ -1208,7 +1233,8 @@ class SlaveMessageProcessor(LocaleMixin):
                     os.chmod(dest_path, 0o644)
 
                     abs_path = Path(dest_path)
-                    self.logger.debug("Copied file from %s to shared temp dir: %s", path, dest_path)
+                    self.logger.debug("Copied file from %s to shared temp dir: %s (original filename: %s)",
+                                      path, dest_path, filename or "N/A")
 
             return abs_path.as_uri()
         return file
