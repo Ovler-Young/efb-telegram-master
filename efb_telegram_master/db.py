@@ -8,9 +8,10 @@ from contextlib import suppress
 from functools import partial
 from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING
 
-from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField
-from playhouse.sqliteq import SqliteQueueDatabase
-from playhouse.migrate import SqliteMigrator, migrate
+from pathlib import Path
+
+from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy
+from playhouse.migrate import migrate
 from telegram import Message
 from typing_extensions import TypedDict
 
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from . import TelegramChannel
     from .chat import ETMChatMember, ETMChatType
 
-database = SqliteQueueDatabase(None, autostart=False)
+database = DatabaseProxy()
 
 PickledDict = TypedDict('PickledDict', {
     "target": EFBChannelChatIDStr,
@@ -132,7 +133,8 @@ class MsgLog(BaseModel):
         # - ``substitutions``: ``Dict[Tuple[int, int], SlaveChatID]``
         # - ``reactions``: ``Dict[str, Collection[SlaveChatID]]``
         if self.pickle:
-            misc_data: PickledDict = pickle.loads(self.pickle)
+            pickle_data = bytes(self.pickle) if isinstance(self.pickle, memoryview) else self.pickle
+            misc_data: PickledDict = pickle.loads(pickle_data)
 
             if 'target' in misc_data and recur:
                 target_row = self.get_or_none(MsgLog.master_msg_id == misc_data['target'])
@@ -181,31 +183,64 @@ class DatabaseManager:
 
     def __init__(self, channel: 'TelegramChannel'):
         base_path = utils.get_data_path(channel.channel_id)
+        self._base_path = base_path
 
         self.logger.debug("Loading database...")
-        database.init(str(base_path / 'tgdata.db'))
-        database.start()
+        db_config = channel.config.get('database', {})
+        db_type = db_config.get('type', 'sqlite')
+
+        if db_type == 'postgresql':
+            from playhouse.pool import PooledPostgresqlExtDatabase
+            from playhouse.migrate import PostgresqlMigrator
+            actual_db = PooledPostgresqlExtDatabase(
+                db_config.get('database', 'efb_telegram'),
+                host=db_config.get('host', 'localhost'),
+                port=db_config.get('port', 5432),
+                user=db_config.get('user', 'postgres'),
+                password=db_config.get('password', ''),
+                max_connections=db_config.get('max_connections', 8),
+                stale_timeout=db_config.get('stale_timeout', 300),
+            )
+            self._migrator_cls = PostgresqlMigrator
+            self._is_sqlite = False
+        else:
+            from playhouse.sqliteq import SqliteQueueDatabase
+            from playhouse.migrate import SqliteMigrator
+            actual_db = SqliteQueueDatabase(
+                str(base_path / 'tgdata.db'),
+                autostart=False,
+            )
+            self._migrator_cls = SqliteMigrator
+            self._is_sqlite = True
+            actual_db.start()
+
+        database.initialize(actual_db)
         database.connect()
         self.logger.debug("Database loaded.")
 
         self.logger.debug("Checking database migration...")
-        if not ChatAssoc.table_exists() or not TopicAssoc.table_exists():
-            self._create()
+        if not self._is_sqlite:
+            # PostgreSQL backend
+            if not ChatAssoc.table_exists():
+                sqlite_path = Path(base_path / 'tgdata.db')
+                if sqlite_path.exists():
+                    self._migrate_from_sqlite(sqlite_path)
+                else:
+                    self._create()
+            else:
+                self._check_and_run_migrations()
         else:
-            msg_log_columns = {i.name for i in database.get_columns("msglog")}
-            slave_chat_info_columns = {i.name for i in database.get_columns("slavechatinfo")}
-            if "file_id" not in msg_log_columns:
-                self._migrate(0)
-            elif "pickle" not in msg_log_columns:
-                self._migrate(1)
-            elif "slave_chat_group_id" not in slave_chat_info_columns:
-                self._migrate(2)
-            elif "file_unique_id" not in msg_log_columns:
-                self._migrate(3)
+            # SQLite backend: original logic
+            if not ChatAssoc.table_exists() or not TopicAssoc.table_exists():
+                self._create()
+            else:
+                self._check_and_run_migrations()
         self.logger.debug("Database migration finished...")
 
     def stop_worker(self):
-        database.stop()
+        if self._is_sqlite:
+            database.obj.stop()
+        database.close()
 
     @staticmethod
     def _create():
@@ -214,15 +249,81 @@ class DatabaseManager:
         """
         database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc])
 
-    @staticmethod
-    def _migrate(i: int):
+    def _migrate_from_sqlite(self, sqlite_path: Path):
+        """Migrate data from existing SQLite database to PostgreSQL on first use."""
+        from playhouse.sqliteq import SqliteQueueDatabase
+        from peewee import chunked
+
+        self.logger.info("Detected existing SQLite database. Migrating to PostgreSQL...")
+
+        sqlite_db = SqliteQueueDatabase(str(sqlite_path), autostart=False)
+        sqlite_db.start()
+        sqlite_db.connect()
+
+        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog]
+        with sqlite_db.bind_ctx(models):
+            chat_assocs = list(ChatAssoc.select(
+                ChatAssoc.master_uid, ChatAssoc.slave_uid
+            ).dicts())
+            topic_assocs = list(TopicAssoc.select(
+                TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id, TopicAssoc.slave_uid
+            ).dicts())
+            slave_chat_infos = list(SlaveChatInfo.select(
+                SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_channel_emoji,
+                SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id,
+                SlaveChatInfo.slave_chat_name, SlaveChatInfo.slave_chat_alias,
+                SlaveChatInfo.slave_chat_type, SlaveChatInfo.pickle
+            ).dicts())
+            msg_logs = list(MsgLog.select().dicts())
+
+        sqlite_db.stop()
+        sqlite_db.close()
+
+        self._create()
+
+        with database.atomic():
+            for batch in chunked(chat_assocs, 500):
+                ChatAssoc.insert_many(batch).execute()
+            for batch in chunked(topic_assocs, 500):
+                TopicAssoc.insert_many(batch).execute()
+            for batch in chunked(slave_chat_infos, 500):
+                SlaveChatInfo.insert_many(batch).execute()
+            for batch in chunked(msg_logs, 500):
+                MsgLog.insert_many(batch).execute()
+
+        migrated_path = sqlite_path.with_suffix('.db.migrated')
+        sqlite_path.rename(migrated_path)
+
+        self.logger.info(
+            "Migration complete. %d chat assocs, %d topic assocs, "
+            "%d chat infos, %d messages migrated. "
+            "Original SQLite file renamed to %s",
+            len(chat_assocs), len(topic_assocs),
+            len(slave_chat_infos), len(msg_logs),
+            migrated_path
+        )
+
+    def _check_and_run_migrations(self):
+        """Check schema and run pending migrations."""
+        msg_log_columns = {i.name for i in database.get_columns("msglog")}
+        slave_chat_info_columns = {i.name for i in database.get_columns("slavechatinfo")}
+        if "file_id" not in msg_log_columns:
+            self._migrate(0)
+        elif "pickle" not in msg_log_columns:
+            self._migrate(1)
+        elif "slave_chat_group_id" not in slave_chat_info_columns:
+            self._migrate(2)
+        elif "file_unique_id" not in msg_log_columns:
+            self._migrate(3)
+
+    def _migrate(self, i: int):
         """
         Run migrations.
 
         Args:
             i: Migration ID
         """
-        migrator = SqliteMigrator(database)
+        migrator = self._migrator_cls(database.obj)
 
         if i <= 0:
             # Migration 0: Add media file ID and editable message ID

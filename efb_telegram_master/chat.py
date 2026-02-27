@@ -425,6 +425,8 @@ def copy_member(source: ChatMember, dest: ETMChatMember):
 
 
 def unpickle(data: bytes, db: 'DatabaseManager') -> ETMChatType:
+    if isinstance(data, memoryview):
+        data = bytes(data)
     obj = pickle.loads(data)
     obj.db = db
     return obj
