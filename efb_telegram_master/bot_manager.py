@@ -35,6 +35,7 @@ class DelayedTask(NamedTuple):
     args: tuple        # Function arguments
     kwargs: dict       # Function keyword arguments
     task_id: str       # Unique task identifier
+    cleanup_files: list = []  # Files to delete after task completes
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -102,13 +103,18 @@ class TelegramBotManager(LocaleMixin):
                         # Schedule for delayed execution instead of blocking
                         self.logger.debug(f"Scheduling message for chat {chat_id} with {delay_time:.2f}s delay")
 
+                        # Grab any pending cleanup files before scheduling
+                        cleanup_files = getattr(self._cleanup_tls, 'pending_cleanup', [])[:]  # pylint: disable=protected-access
+                        self._cleanup_tls.pending_cleanup = []  # pylint: disable=protected-access
+
                         # Schedule the delayed execution using the new system
                         task_id = self._schedule_delayed_task(  # pylint: disable=protected-access
                             chat_id=chat_id,
                             delay_time=delay_time,
                             function=fn,
                             args=(self,) + args,
-                            kwargs=kwargs
+                            kwargs=kwargs,
+                            cleanup_files=cleanup_files
                         )
 
                         # Return a placeholder response to indicate message was scheduled
@@ -346,6 +352,7 @@ class TelegramBotManager(LocaleMixin):
         self.CHAT_LIMIT = 20      # messages per minute per chat
         self.CHAT_WINDOW = 60.0
 
+        self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
         self.logger.debug("Rate limiter initialized...")
 
         # Initialize delayed message queue system
@@ -477,7 +484,7 @@ class TelegramBotManager(LocaleMixin):
         return mock_msg
 
     def _schedule_delayed_task(self, chat_id: int, delay_time: float, function: Callable,
-                              args: tuple, kwargs: dict) -> str:
+                              args: tuple, kwargs: dict, cleanup_files: list = None) -> str:
         """
         Schedule a task for delayed execution.
 
@@ -500,7 +507,8 @@ class TelegramBotManager(LocaleMixin):
             function=function,
             args=args,
             kwargs=kwargs,
-            task_id=task_id
+            task_id=task_id,
+            cleanup_files=cleanup_files or []
         )
 
         with self._delayed_queue_lock:
@@ -544,6 +552,14 @@ class TelegramBotManager(LocaleMixin):
 
                     except Exception as e:
                         self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
+                    finally:
+                        # Clean up temp files associated with this delayed task
+                        for path in task.cleanup_files:
+                            try:
+                                os.unlink(path)
+                                self.logger.debug("Cleaned up delayed task temp file: %s", path)
+                            except OSError as e:
+                                self.logger.warning("Failed to clean up delayed task temp file %s: %s", path, e)
 
                 # Use event wait with timeout instead of sleep for faster shutdown response
                 if not self._delayed_worker_stop.wait(timeout=0.1):

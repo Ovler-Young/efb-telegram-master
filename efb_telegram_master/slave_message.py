@@ -5,7 +5,6 @@ import itertools
 import logging
 import os
 import tempfile
-import threading
 import traceback
 import urllib.parse
 from collections import defaultdict
@@ -51,7 +50,6 @@ class SlaveMessageProcessor(LocaleMixin):
         self.channel: 'TelegramChannel' = channel
         self.bot: 'TelegramBotManager' = self.channel.bot_manager
         self.logger: logging.Logger = logging.getLogger(__name__)
-        self._tls = threading.local()  # Thread-local storage for per-send cleanup tracking
         self.flag: utils.ExperimentalFlagsManager = self.channel.flag
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
@@ -1244,21 +1242,25 @@ class SlaveMessageProcessor(LocaleMixin):
                                       path, dest_path, filename or "N/A")
 
                     # Track copied file for cleanup after send completes
-                    if not hasattr(self._tls, 'pending_cleanup'):
-                        self._tls.pending_cleanup = []
-                    self._tls.pending_cleanup.append(dest_path)
+                    # Store on bot_manager's thread-local so delayed task scheduling can pick them up
+                    tls = self.bot._cleanup_tls
+                    if not hasattr(tls, 'pending_cleanup'):
+                        tls.pending_cleanup = []
+                    tls.pending_cleanup.append(dest_path)
 
             return abs_path.as_uri()
         return file
 
     def _cleanup_pending_local_api_files(self):
-        """Delete temp files copied to shared dir for local Bot API sends in this thread."""
-        pending = getattr(self._tls, 'pending_cleanup', [])
+        """Delete temp files copied to shared dir for local Bot API sends in this thread.
+        Only cleans up files that were NOT already claimed by a delayed task."""
+        tls = self.bot._cleanup_tls
+        pending = getattr(tls, 'pending_cleanup', [])
         for path in pending:
             try:
                 os.unlink(path)
                 self.logger.debug("Cleaned up local API temp file: %s", path)
             except OSError as e:
                 self.logger.warning("Failed to clean up local API temp file %s: %s", path, e)
-        self._tls.pending_cleanup = []
+        tls.pending_cleanup = []
 
