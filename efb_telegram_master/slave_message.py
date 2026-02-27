@@ -51,6 +51,7 @@ class SlaveMessageProcessor(LocaleMixin):
         self.channel: 'TelegramChannel' = channel
         self.bot: 'TelegramBotManager' = self.channel.bot_manager
         self.logger: logging.Logger = logging.getLogger(__name__)
+        self._tls = threading.local()  # Thread-local storage for per-send cleanup tracking
         self.flag: utils.ExperimentalFlagsManager = self.channel.flag
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
@@ -571,6 +572,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_animation(self, msg: Message, tg_dest: TelegramChatID,
                                 thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -632,6 +634,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file is not None:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_sticker(self, msg: Message, tg_dest: TelegramChatID,
                               thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -714,6 +717,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file and not msg.file.closed:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     @staticmethod
     def build_chat_info_inline_keyboard(msg: Message, msg_template: str, reactions: str,
@@ -807,6 +811,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file is not None:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_voice(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -875,6 +880,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file is not None:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_location(self, msg: Message, tg_dest: TelegramChatID,
                                thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -965,6 +971,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file is not None:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_unsupported(self, msg: Message, tg_dest: TelegramChatID,
                                   thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -1236,6 +1243,22 @@ class SlaveMessageProcessor(LocaleMixin):
                     self.logger.debug("Copied file from %s to shared temp dir: %s (original filename: %s)",
                                       path, dest_path, filename or "N/A")
 
+                    # Track copied file for cleanup after send completes
+                    if not hasattr(self._tls, 'pending_cleanup'):
+                        self._tls.pending_cleanup = []
+                    self._tls.pending_cleanup.append(dest_path)
+
             return abs_path.as_uri()
         return file
+
+    def _cleanup_pending_local_api_files(self):
+        """Delete temp files copied to shared dir for local Bot API sends in this thread."""
+        pending = getattr(self._tls, 'pending_cleanup', [])
+        for path in pending:
+            try:
+                os.unlink(path)
+                self.logger.debug("Cleaned up local API temp file: %s", path)
+            except OSError as e:
+                self.logger.warning("Failed to clean up local API temp file %s: %s", path, e)
+        self._tls.pending_cleanup = []
 
