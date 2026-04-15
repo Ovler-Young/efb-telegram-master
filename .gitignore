@@ -126,3 +126,5 @@ fabric.properties
 readme_translations/locale
 CLAUDE.md
 .claude/settings.local.json
+
+.venv/
