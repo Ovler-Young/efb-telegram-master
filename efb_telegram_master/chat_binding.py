@@ -1213,9 +1213,20 @@ class ChatBindingManager(LocaleMixin):
         assert update.effective_message
 
         message = update.effective_message
-        if message.left_chat_member is not None and message.left_chat_member.id == self.bot.me.id:
+        if message.left_chat_member is None:
+            return
+
+        left_member_id = message.left_chat_member.id
+
+        # Check if main bot was removed
+        if left_member_id == self.bot.me.id:
             chat_id = ChatID(str(message.chat.id))
             self.db.remove_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, chat_id))
+            return
+
+        # Check if an auxiliary bot was removed
+        if self.bot.bot_pool:
+            self.bot.bot_pool.on_bot_left_chat(left_member_id, message.chat.id)
 
     def update_thread_info(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
@@ -1378,19 +1389,15 @@ class ChatBindingManager(LocaleMixin):
                     # Send current text batch if it exists
                     if current_text_batch:
                         try:
-                            self._send_text_batch_background(current_text_batch, tg_chat_id, thread_id)
+                            self._migration_send_text(tg_chat_id, current_text_batch, thread_id)
                             current_text_batch = []
                             current_length = 0
-                            threading.Event().wait(4.0)
                         except Exception as e:
                             self.logger.warning("Failed to send text batch: %s", e)
 
                     # Forward the media message or empty text message
                     try:
-                        self._forward_media_message(msg_log, tg_chat_id, thread_id)
-                        # Add delay after forwarding media
-                        if i < len(recent_messages) - 1:
-                            threading.Event().wait(4.0)
+                        self._migration_forward_media(msg_log, tg_chat_id, thread_id)
                     except Exception as e:
                         self.logger.warning("Failed to forward message %s: %s", msg_log.master_msg_id, e)
                 else:
@@ -1413,9 +1420,7 @@ class ChatBindingManager(LocaleMixin):
                         # Send current batch if it exists
                         if current_text_batch:
                             try:
-                                self._send_text_batch_background(current_text_batch, tg_chat_id, thread_id)
-                                # Add delay after sending text batch
-                                threading.Event().wait(4.0)
+                                self._migration_send_text(tg_chat_id, current_text_batch, thread_id)
                             except Exception as e:
                                 self.logger.warning("Failed to send text batch: %s", e)
 
@@ -1430,15 +1435,15 @@ class ChatBindingManager(LocaleMixin):
             # Send remaining text batch if exists
             if current_text_batch:
                 try:
-                    self._send_text_batch_background(current_text_batch, tg_chat_id, thread_id)
+                    self._migration_send_text(tg_chat_id, current_text_batch, thread_id)
                 except Exception as e:
                     self.logger.warning("Failed to send final text batch: %s", e)
 
         except Exception as e:
             self.logger.error("Error during history migration for %s: %s", slave_chat_id, e)
 
-    def _send_text_batch_background(self, text_batch: List[str], tg_chat_id: int,
-                                   thread_id: Optional[TelegramTopicID] = None):
+    def _migration_send_text(self, tg_chat_id: int, text_batch: List[str],
+                             thread_id: Optional[TelegramTopicID] = None):
         """Send a batch of formatted text messages.
 
         Args:
@@ -1450,47 +1455,56 @@ class ChatBindingManager(LocaleMixin):
             return
 
         combined_text = "".join(text_batch)
-
-        kwargs = {
+        kwargs: dict = {
             'chat_id': tg_chat_id,
             'text': combined_text,
             'parse_mode': 'Markdown',
             'disable_notification': True
         }
-
         if thread_id:
             kwargs['message_thread_id'] = thread_id
 
-        try:
-            self.bot.send_message(**kwargs)
-        except Exception as e:
-            self.logger.warning("Failed to send with Markdown, trying plain text: %s", e)
-            kwargs['parse_mode'] = None
-            kwargs['text'] = combined_text.replace('*', '').replace('`', '')
-            self.bot.send_message(**kwargs)
+        def _do_send(**extra):
+            kw = {**kwargs, **extra}
+            try:
+                self.bot.send_message(**kw)
+            except Exception:
+                kw['parse_mode'] = None
+                kw['text'] = combined_text.replace('*', '').replace('`', '')
+                self.bot.send_message(**kw)
 
-    def _forward_media_message(self, msg_log: MsgLog, tg_chat_id: int,
-                             thread_id: Optional[TelegramTopicID] = None):
-        """Forward(Actually copy for better user experience) a media message to the target chat."""
-        # Parse the original message ID
+        if self.bot.bot_pool:
+            self.bot.send_blocking_migration(tg_chat_id, _do_send, timeout=30.0)
+        else:
+            _do_send(_bypass_rate_limit=False)
+
+    def _migration_forward_media(self, msg_log, tg_chat_id: int,
+                                  thread_id: Optional[TelegramTopicID] = None):
+        """Wait for a slot, then forward a media message through the best available bot."""
         try:
+            # Parse the original message ID
             original_chat_id, original_msg_id = utils.message_id_str_to_id(msg_log.master_msg_id)
-
-            # Use copy_message to copy the media
-            kwargs = {
-                'chat_id': tg_chat_id,
-                'from_chat_id': original_chat_id,
-                'message_id': original_msg_id,
-                'disable_notification': True
-            }
-
-            if thread_id:
-                kwargs['message_thread_id'] = thread_id
-
-            self.bot.copy_message(**kwargs)
-
         except Exception as e:
-            self.logger.warning("Failed to forward media message %s: %s", msg_log.master_msg_id, e)
+            self.logger.warning("Failed to parse message ID %s: %s", msg_log.master_msg_id, e)
+            return
+
+        # Use copy_message to copy the media
+        kwargs: dict = {
+            'chat_id': tg_chat_id,
+            'from_chat_id': original_chat_id,
+            'message_id': original_msg_id,
+            'disable_notification': True
+        }
+        if thread_id:
+            kwargs['message_thread_id'] = thread_id
+
+        def _do_copy(**extra):
+            self.bot.copy_message(**{**kwargs, **extra})
+
+        if self.bot.bot_pool:
+            self.bot.send_blocking_migration(tg_chat_id, _do_copy, timeout=30.0)
+        else:
+            _do_copy(_bypass_rate_limit=False)
 
     @staticmethod
     def truncate_ellipsis(text: str, length: int) -> str:

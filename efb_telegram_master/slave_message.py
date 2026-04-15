@@ -55,6 +55,18 @@ class SlaveMessageProcessor(LocaleMixin):
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
 
+    def _get_edit_context(self, msg: Message):
+        """Get a context manager for routing edits through the correct bot.
+        Returns the bot_manager's _using_bot context manager if sender_bot_id is set,
+        otherwise returns a no-op context manager."""
+        from contextlib import nullcontext
+        _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+        if _sender_bot_id and self.bot.bot_pool:
+            aux_bot = self.bot.bot_pool.get_bot_by_id(_sender_bot_id)
+            if aux_bot and not aux_bot.disabled:
+                return self.bot._using_bot(aux_bot.bot)
+        return nullcontext()
+
     def is_silent(self, msg: Message) -> Optional[bool]:
         """Determine if a message shall be sent silently.
         Returns None if the message shall not be sent at all.
@@ -104,10 +116,12 @@ class SlaveMessageProcessor(LocaleMixin):
 
             # When editing message
             old_msg_id: Optional[OldMsgID] = None
+            _edit_sender_bot_id: Optional[str] = None
             if msg.edit:
                 old_msg = self.db.get_msg_log(slave_msg_id=msg.uid,
                                               slave_origin_uid=utils.chat_id_to_str(chat=msg.chat))
                 if old_msg:
+                    _edit_sender_bot_id = old_msg.sender_bot_id
 
                     if old_msg.master_msg_id_alt:
                         old_msg_id = utils.message_id_str_to_id(old_msg.master_msg_id_alt)
@@ -117,6 +131,11 @@ class SlaveMessageProcessor(LocaleMixin):
                     self.logger.info('[%s] Was supposed to edit this message, '
                                      'but it does not exist in database. Sending new message instead.',
                                      msg.uid)
+
+            # Store sender_bot_id for routing edits to the correct bot
+            if _edit_sender_bot_id:
+                msg.vendor_specific = msg.vendor_specific or {}
+                msg.vendor_specific['_sender_bot_id'] = _edit_sender_bot_id
 
             self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
         except Exception as e:
@@ -264,7 +283,12 @@ class SlaveMessageProcessor(LocaleMixin):
             etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
             etm_msg.type_telegram = get_msg_type(tg_msg)
             etm_msg.put_telegram_file(tg_msg)
-            self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id)
+
+            # Capture sender_bot_id annotated by rate_limit_decorator
+            sender_bot_id = getattr(tg_msg, '_sender_bot_id', None)
+
+            self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id,
+                                              sender_bot_id=sender_bot_id)
             # self.logger.debug("[%s] Message inserted/updated to the database.", xid)
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
@@ -376,6 +400,8 @@ class SlaveMessageProcessor(LocaleMixin):
 
         text = self.html_substitutions(msg)
 
+        _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+
         if not old_msg_id:
             tg_msg = self.bot.send_message(tg_dest,
                                            text=text, prefix=msg_template, suffix=reactions,
@@ -386,11 +412,14 @@ class SlaveMessageProcessor(LocaleMixin):
                                            disable_notification=silent)
         else:
             # Cannot change reply_to_message_id when editing a message
-            tg_msg = self.bot.edit_message_text(chat_id=old_msg_id[0],
-                                                message_id=old_msg_id[1],
-                                                text=text, prefix=msg_template, suffix=reactions,
-                                                parse_mode='HTML',
-                                                reply_markup=reply_markup)
+            edit_kwargs = dict(chat_id=old_msg_id[0],
+                               message_id=old_msg_id[1],
+                               text=text, prefix=msg_template, suffix=reactions,
+                               parse_mode='HTML',
+                               reply_markup=reply_markup)
+            if _sender_bot_id:
+                edit_kwargs['_sender_bot_id'] = _sender_bot_id
+            tg_msg = self.bot.edit_message_text(**edit_kwargs)
 
         self.logger.debug("[%s] Processed and sent as text message", msg.uid)
         return tg_msg
@@ -417,9 +446,13 @@ class SlaveMessageProcessor(LocaleMixin):
         if msg.text:
             text += "\n\n" + self.html_substitutions(msg)
         if old_msg_id:
-            return self.bot.edit_message_text(text=text, chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                              prefix=msg_template, suffix=reactions, parse_mode='HTML',
-                                              reply_markup=reply_markup)
+            _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+            edit_kwargs = dict(text=text, chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                               prefix=msg_template, suffix=reactions, parse_mode='HTML',
+                               reply_markup=reply_markup)
+            if _sender_bot_id:
+                edit_kwargs['_sender_bot_id'] = _sender_bot_id
+            return self.bot.edit_message_text(**edit_kwargs)
         else:
             return self.bot.send_message(chat_id=tg_dest,
                                          text=text,
@@ -511,21 +544,22 @@ class SlaveMessageProcessor(LocaleMixin):
 
             if old_msg_id:
                 try:
-                    if edit_media:
-                        assert msg.path
-                        media: InputMedia
-                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                        if send_as_file:
-                            media = InputMediaDocument(file)
-                        else:
-                            media = InputMediaPhoto(file)
-                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=media,
-                                                    reply_markup=reply_markup)
-                        if not text:
-                            return res
-                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                         reply_markup=reply_markup,
-                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                    with self._get_edit_context(msg):
+                        if edit_media:
+                            assert msg.path
+                            media: InputMedia
+                            file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                            if send_as_file:
+                                media = InputMediaDocument(file)
+                            else:
+                                media = InputMediaPhoto(file)
+                            res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=media,
+                                                        reply_markup=reply_markup)
+                            if not text:
+                                return res
+                        return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                             reply_markup=reply_markup,
+                                                             prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
                 except telegram.error.BadRequest as e:
                     self.logger.warning("[%s] Failed to edit media/caption (BadRequest: %s). Sending new message instead.", msg.uid, e)
                     # Send as a reply if cannot edit previous message.
@@ -607,17 +641,18 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                if edit_media:
-                    assert msg.file and msg.path
-                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaAnimation(file),
-                                                reply_markup=reply_markup)
-                    if not text:
-                        return res
-                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                     prefix=msg_template, suffix=reactions,
-                                                     reply_markup=reply_markup,
-                                                     caption=text, parse_mode="HTML")
+                with self._get_edit_context(msg):
+                    if edit_media:
+                        assert msg.file and msg.path
+                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaAnimation(file),
+                                                    reply_markup=reply_markup)
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                         prefix=msg_template, suffix=reactions,
+                                                         reply_markup=reply_markup,
+                                                         caption=text, parse_mode="HTML")
             else:
                 assert msg.file and msg.path
                 file = self.process_file_obj(msg.file, msg.path, msg.filename)
@@ -655,14 +690,18 @@ class SlaveMessageProcessor(LocaleMixin):
             if msg.edit_media and old_msg_id is not None:
                  if old_msg_id[0] == str(tg_dest):
                     target_msg_id = old_msg_id[1] # Set reply target to the message being "edited"
-                 old_msg_id = None # Force sending a new message
+                 old_msg_id = None  # Force sending new message below
 
             # If not editing media, but have old_msg_id, try editing reply_markup (e.g., for reactions)
             if old_msg_id and not msg.edit_media:
                 try:
+                    _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+                    edit_kwargs = dict(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                       reply_markup=sticker_reply_markup)
+                    if _sender_bot_id:
+                        edit_kwargs['_sender_bot_id'] = _sender_bot_id
                     # Editing reply markup doesn't involve thread_id
-                    return self.bot.edit_message_reply_markup(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                              reply_markup=sticker_reply_markup)
+                    return self.bot.edit_message_reply_markup(**edit_kwargs)
                 except TelegramError:
                     return self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1],
                                                  prefix=msg_template, text=msg.text, suffix=reactions,
@@ -787,14 +826,15 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                if edit_media:
-                    assert msg.file is not None and msg.path is not None
-                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaDocument(file))
-                    if not text:
-                        return res
-                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
-                                                     prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                with self._get_edit_context(msg):
+                    if edit_media:
+                        assert msg.file is not None and msg.path is not None
+                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaDocument(file))
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
+                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
             assert msg.file is not None and msg.path is not None
             self.logger.debug("[%s] Uploading file %s (%s) as %s", msg.uid,
                               msg.file.name, msg.mime, file_name)
@@ -846,11 +886,12 @@ class SlaveMessageProcessor(LocaleMixin):
                     msg_template += " " + self._("[Edited]")
                     if str(tg_dest) == old_msg_id[0]:
                         target_msg_id = target_msg_id or old_msg_id[1]
-                    old_msg_id = None # Force sending new message below
+                    old_msg_id = None
                 else:
-                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                         reply_markup=reply_markup, prefix=msg_template,
-                                                         suffix=reactions, caption=text, parse_mode="HTML")
+                    with self._get_edit_context(msg):
+                        return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                             reply_markup=reply_markup, prefix=msg_template,
+                                                             suffix=reactions, caption=text, parse_mode="HTML")
             # Sending new message (initial or fallback)
             if not old_msg_id: # Ensure we are in the 'send new' path
                 assert msg.file is not None
@@ -949,15 +990,16 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                if edit_media:
-                    assert msg.file is not None and msg.path is not None
-                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaVideo(file),
-                                                reply_markup=reply_markup)
-                    if not text:
-                        return res
-                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
-                                                     prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                with self._get_edit_context(msg):
+                    if edit_media:
+                        assert msg.file is not None and msg.path is not None
+                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaVideo(file),
+                                                    reply_markup=reply_markup)
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
+                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
             assert msg.file is not None and msg.path is not None
             file = self.process_file_obj(msg.file, msg.path, msg.filename)
             return self.bot.send_video(tg_dest, file, prefix=msg_template, suffix=reactions,
@@ -985,21 +1027,26 @@ class SlaveMessageProcessor(LocaleMixin):
         else:
             text = ""
 
+        _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+
         if not old_msg_id:
             tg_msg = self.bot.send_message(tg_dest,
                                            text=text, parse_mode="HTML",
                                            prefix=msg_template + " " + self._("(unsupported)"),
                                            suffix=reactions,
-                                           reply_to_message_id=target_msg_id, message_thread_id=thread_id, reply_markup=reply_markup,
+                                           reply_to_message_id=target_msg_id, message_thread_id=thread_id,                                            reply_markup=reply_markup,
                                            disable_notification=silent)
         else:
             # Cannot change reply_to_message_id or thread_id when editing a message
-            tg_msg = self.bot.edit_message_text(chat_id=old_msg_id[0],
-                                                message_id=old_msg_id[1],
-                                                text=text, parse_mode="HTML",
-                                                prefix=msg_template + " " + self._("(unsupported) [Edited]"), # Mark as edited
-                                                suffix=reactions,
-                                                reply_markup=reply_markup)
+            edit_kwargs = dict(chat_id=old_msg_id[0],
+                               message_id=old_msg_id[1],
+                               text=text, parse_mode="HTML",
+                               prefix=msg_template + " " + self._("(unsupported) [Edited]"),  # Mark as edited
+                               suffix=reactions,
+                               reply_markup=reply_markup)
+            if _sender_bot_id:
+                edit_kwargs['_sender_bot_id'] = _sender_bot_id
+            tg_msg = self.bot.edit_message_text(**edit_kwargs)
 
         self.logger.debug("[%s] Processed and sent as text message", msg.uid)
         return tg_msg
@@ -1048,7 +1095,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                   *old_msg_id)
                 try:
                     if not self.channel.flag('prevent_message_removal'):
-                        self.bot.delete_message(*old_msg_id)
+                        self.bot.delete_message(*old_msg_id,
+                                                _sender_bot_id=old_msg.sender_bot_id)
                         return
                 except TelegramError as e:
                     self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
@@ -1056,7 +1104,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.bot.send_message(chat_id=old_msg_id[0],
                                       text=self._("Message is removed in remote chat."),
                                       reply_to_message_id=old_msg_id[1],
-                                      disable_notification=True) # Probably silent notification
+                                      disable_notification=True)  # Probably silent notification
             else:
                 self.logger.info('Was supposed to delete a message, '
                                  'but it does not exist in database: %s', status)
@@ -1086,8 +1134,13 @@ class SlaveMessageProcessor(LocaleMixin):
 
         old_msg: ETMMsg = old_msg_db.build_etm_msg(chat_manager=self.chat_manager)
         old_msg.reactions = status.reactions
-        old_msg.edit = True # Mark as edit so dispatch knows it's an update
-        old_msg.edit_media = False # Ensure media is not considered edited
+        old_msg.edit = True  # Mark as edit so dispatch knows it's an update
+        old_msg.edit_media = False  # Ensure media is not considered edited
+
+        # Thread sender_bot_id for routing edits to the correct bot
+        if old_msg_db.sender_bot_id:
+            old_msg.vendor_specific = old_msg.vendor_specific or {}
+            old_msg.vendor_specific['_sender_bot_id'] = old_msg_db.sender_bot_id
 
         msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(old_msg)
         if tg_dest is None:
