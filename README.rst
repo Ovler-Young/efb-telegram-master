@@ -117,6 +117,27 @@ A sample config file can be as follows:
     ##################
     # Optional items #
     ##################
+    # [Auxiliary bots]
+    # Optional extra bot tokens for higher outbound throughput.
+    # Each auxiliary bot must be a distinct bot token, and should be added
+    # to groups where you expect high message volume.
+    # auxiliary_bots:
+    # - token: "111111:AUX_BOT_TOKEN_1"
+    # - token: "222222:AUX_BOT_TOKEN_2"
+
+    # [Database]
+    # Default: SQLite (tgdata.db under the profile directory).
+    # PostgreSQL is also supported.
+    # database:
+    #   type: postgresql
+    #   database: efb_telegram
+    #   host: localhost
+    #   port: 5432
+    #   user: postgres
+    #   password: ""
+    #   max_connections: 8
+    #   stale_timeout: 300
+
     # [Experimental Flags]
     # This section can be used to toggle experimental functionality.
     # These features may be changed or removed at any time.
@@ -129,6 +150,56 @@ A sample config file can be as follows:
     # [Network Configurations]
     # [RPC Interface]
     # Refer to relevant sections afterwards for details.
+
+Optional: Database backend (SQLite / PostgreSQL)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ETM stores chat bindings and message logs in a local database.
+
+- **Default**: SQLite (file ``tgdata.db`` under the profile directory).
+- **Optional**: PostgreSQL (recommended when you need better concurrency or
+  you already operate a PostgreSQL server).
+
+To use PostgreSQL, set the ``database`` section in ``config.yaml`` (see the
+sample above) and install the optional dependency set:
+
+.. code:: shell
+
+    pip install "efb-telegram-master[postgresql]"
+
+On first startup with PostgreSQL enabled, ETM can automatically import data
+from an existing SQLite database (if present) and rename the old SQLite file
+to ``tgdata.db.migrated`` as a backup.
+
+Database migrations (what to expect)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+ETM performs basic database migrations automatically on startup.
+Notable additions in this branch include:
+
+- **Forum topics associations** (for ``topic_group``): ETM stores a mapping
+  between a forum group's chat ID + a topic thread ID (``message_thread_id``)
+  and the linked remote chat.
+- **`sender_bot_id` in message logs**: when auxiliary bots are enabled, ETM
+  records which bot token sent each Telegram message so future edits/deletes
+  can be routed to the correct bot.
+
+Optional: Auxiliary bots (higher throughput)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If you run ETM in high-volume groups, you can configure ``auxiliary_bots`` to
+increase outbound throughput under Telegram rate limits. Auxiliary bots are
+used for sending only; edits/deletes will be routed to the bot that sent the
+original message.
+
+Notes:
+
+- Each auxiliary bot must be **added to the target groups** to send messages
+  there.
+- Tokens must be unique and must not duplicate the main ``token``.
+- Under heavy rate limiting, some outbound sends may be queued for delayed
+  execution; ETM will update message logs once the real Telegram message is
+  sent.
 
 Usage
 -----
@@ -186,6 +257,47 @@ Link/Relink” button. To manually link a remote chat:
 
 Also, you can send ``/unlink_all`` to a group to unlink all remote chats
 from it.
+
+What happens after linking (new link vs relink)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When you link a remote chat to a Telegram destination, ETM may perform some
+post-link actions:
+
+- **First-time link**: ETM will try to backfill recent history to the newly
+  linked destination in the background (so the new group/topic has context).
+- **Relink**: ETM does not re-migrate history. Instead, it sends a link to the
+  previous conversation history message so you can jump back if needed.
+
+At the moment, this history backfill behavior is **not configurable** (it is
+attempted on first-time link, and skipped on relink). If the background
+migration fails, ETM keeps the link and may send a short warning message.
+
+Forum topics mode (one topic per chat)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If your destination group is a forum-enabled supergroup, you can enable
+**one-topic-per-chat** delivery by setting ``topic_group``.
+
+Basic usage:
+
+- **Read / reply**: use the corresponding topic in the forum group. Replies
+  will be forwarded back to the linked remote chat.
+- **Check linkage**: send ``/info`` inside a topic to see what it is linked
+  to. Sending ``/info`` in the forum (outside topics) lists existing topic
+  links (if any).
+- **Initialize topics for existing links**: send ``/init_topics`` in the
+  forum group to create missing topics for already-linked chats.
+
+Notes:
+
+- Topics not created/managed by ETM are ignored (messages in unmanaged topics
+  won't be forwarded to any remote chat).
+- ETM will need permissions to manage topics and pin messages in the forum
+  group to keep topic info updated.
+- When a remote chat is linked to the configured ``topic_group``, ETM will
+  create (or reuse) a topic for it and route messages using
+  ``message_thread_id``.
 
 Also, if you want to link a chat which you just used, you can simply reply
 ``/link`` quoting a previous message from that chat without choosing from
@@ -567,7 +679,14 @@ e.g.:
 
 -   ``topic_group`` *(str)* [Default: ``null``]
 
-    Send message to this topic group, per chat per topic
+    Enable Telegram forum topics mode: send and receive messages in a
+    forum-enabled supergroup (topic group), **one topic per linked chat**.
+
+    - The value should be the Telegram chat ID of the forum supergroup
+      (commonly in the form ``-100...``).
+    - When enabled, ETM will store and use Telegram's ``message_thread_id``
+      to route messages between a topic and its linked remote chat.
+    - The id set here will be the default topic group for new chats.
 
 Network configuration: timeout tweaks
 -------------------------------------
@@ -688,6 +807,18 @@ Setup Webhook
 For details on how to setup a webhook, please visit this `wiki article`_.
 
 .. _wiki article: https://github.com/ehForwarderBot/efb-telegram-master/wiki/Setup-Webhook
+
+Development notes (CI and tooling)
+----------------------------------
+
+- **CI Python versions**: GitHub Actions workflows in this branch run tests on
+  Python 3.10+ (and use Python 3.10 for Crowdin tasks).
+- **Pre-commit on Windows**: the local version bump hook is disabled in this
+  branch as it is not compatible with Windows development environments.
+- **Media sending with local Bot API**: when ``local_tdlib_api`` is enabled,
+  ETM can copy files into a shared directory derived from ``api_base_file_url``
+  (when it is a ``file://`` URL) for better container/shared-filesystem
+  compatibility.
 
 License
 -------
