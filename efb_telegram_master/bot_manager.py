@@ -132,11 +132,13 @@ class TelegramBotManager(LocaleMixin):
                     return fn(self, *args, **kwargs)
 
                 # MODE 2: Pool routing (new sends pick best available bot)
+                # Only attempt aux bots when the main bot would impose a delay.
                 if chat_id and self.bot_pool:
                     # Skip pool for messages with callback keyboards (EC-4)
                     has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
                     if not has_callback:
-                        slot = self.bot_pool.acquire_send_slot(chat_id)
+                        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+                        slot = self.bot_pool.acquire_send_slot(chat_id) if main_delay > 0 else None
                         if slot is not None:
                             aux_bot, delay = slot
                             try:
