@@ -26,7 +26,6 @@ from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
 from .chat import ETMChatType, ETMGroupChat
 from .constants import Emoji, Flags
-from .db import MsgLog
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
@@ -58,6 +57,9 @@ class ChatListStorage:
         self.offset: int = offset
         self.update: Optional[Update] = None
         self.candidates: Optional[List[EFBChannelChatIDStr]] = None
+        # None = auto (backfill on first link, skip on relink)
+        # True = always backfill, False = never backfill
+        self.backfill_mode: Optional[bool] = None
 
     @property
     def length(self) -> int:
@@ -529,11 +531,16 @@ class ChatBindingManager(LocaleMixin):
         elif cmd == "manual_link":
             txt = self._("To link {chat_display_name} manually, please:\n\n"
                          "1. Add me to the Telegram Group you want to link to.\n"
-                         "2. Send the following code.\n\n"
-                         "<code>/start {code}</code>\n\n"
+                         "2. Send one of the following codes:\n\n"
+                         "<code>/start {code}</code>\n"
+                         "<code>/start {code} true</code>\n"
+                         "<code>/start {code} false</code>\n\n"
+                         "<i>* The second argument can override backfill behaviour:</i>\n"
+                         "<i>* true/on/1  -> always backfill</i>\n"
+                         "<i>* false/off/0 -> never backfill</i>\n"
                          "3. Then I would notify you if the chat is linked successfully.\n"
                          "\n"
-                         "<i>* To link a channel, send the code above to your channel, "
+                         "<i>* To link a channel, send one of the codes above to your channel, "
                          "and forward it to the bot. Note that the bot will not process any "
                          "message others sent in channels.</i>") \
                 .format(chat_display_name=html.escape(chat_display_name),
@@ -589,6 +596,17 @@ class ChatBindingManager(LocaleMixin):
         else:
             tg_chat_to_link = update.effective_chat
 
+        # Optional second argument can override backfill behaviour:
+        #   true/on/1  -> always backfill
+        #   false/off/0 -> never backfill
+        backfill_override: Optional[bool] = None
+        if len(args) >= 2:
+            flag = args[1].strip().lower()
+            if flag in ("true", "on", "yes", "1"):
+                backfill_override = True
+            elif flag in ("false", "off", "no", "0"):
+                backfill_override = False
+
         txt = self._('Trying to link chat {0}...').format(chat_display_name)
         msg = self.bot.send_message(tg_chat_to_link.id, text=txt)
 
@@ -620,28 +638,36 @@ class ChatBindingManager(LocaleMixin):
         self.bot.edit_message_text(chat_id=storage_key[0],
                                    message_id=storage_key[1],
                                    text=txt)
+        backfill_mode = data.backfill_mode  # None=auto, True=always, False=never
+        if backfill_override is not None:
+            backfill_mode = backfill_override
         self.msg_storage.pop(storage_key, None)
 
         # migrate history
-        if is_relink:
-            self.send_history_link(chat_uid, tg_chat_to_link.id, storage_key, thread_id)
-        else:
+        # auto:   backfill on first link, send history link on relink
+        # True:   always backfill (even on relink)
+        # False:  skip both (user opted out)
+        do_backfill = (backfill_mode is True) or (backfill_mode is None and not is_relink)
+        do_history_link = (backfill_mode is None and is_relink)
+
+        if do_backfill:
             try:
                 self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
             except Exception as e:
                 self.logger.warning("History migration failed for %s: %s", chat_display_name, e)
-                # Send a notice to user about failed migration
                 try:
                     notice_kwargs = {
                         'chat_id': tg_chat_to_link.id,
-                        'text': self._("⚠️ 历史消息迁移失败，但聊天绑定成功"),
+                        'text': self._("⚠️ History backfill failed, but the chat is linked."),
                         'disable_notification': True
                     }
                     if thread_id:
                         notice_kwargs['message_thread_id'] = thread_id
                     self.bot.send_message(**notice_kwargs)
                 except Exception:
-                    pass  # Ignore if we can't send the notice
+                    pass
+        elif do_history_link:
+            self.send_history_link(chat_uid, tg_chat_to_link.id, storage_key, thread_id)
 
     def send_history_link(self, slave_chat_id: EFBChannelChatIDStr,
                            tg_chat_id: int, storage_key: Tuple[int, int], thread_id: Optional[TelegramTopicID] = None):
