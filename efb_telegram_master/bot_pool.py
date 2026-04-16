@@ -154,11 +154,20 @@ class BotPool:
             if not bot_mentions:
                 return
 
+            str_id = str(chat_id)
+            if str_id.startswith("-100"):
+                chat_url = f"https://t.me/c/{str_id[4:]}"
+            else:
+                chat_url = f"tg://openmessage?chat_id={chat_id}"
+
             text = (
-                f"📊 Message rate is high in chat {chat_id}. "
+                f'📊 Message rate is high in <a href="{chat_url}">chat {chat_id}</a>. '
                 f"To reduce delay, please add {bot_mentions} to the group."
             )
-            self._bot_manager.updater.bot.send_message(admin_id, text)
+
+            self._bot_manager.updater.bot.send_message(
+                admin_id, text, parse_mode="HTML"
+            )
         except Exception as e:
             logger.warning("Failed to send auxiliary bot notification to admin: %s", e)
 
