@@ -511,19 +511,24 @@ class SlaveMessageProcessor(LocaleMixin):
             # 3. If the picture is too thin -- aspect ratio grater than IMG_SIZE_MAX_RATIO, send as file.
 
             try:
-                pic_img = Image.open(msg.path)
-                max_size = max(pic_img.size)
-                min_size = min(pic_img.size)
-                img_ratio = max_size / min_size
-
-                if min_size > self.IMG_MIN_SIZE:
-                    send_as_file = True
-                elif max_size > self.IMG_MAX_SIZE and img_ratio > self.IMG_SIZE_RATIO:
-                    send_as_file = True
-                elif img_ratio >= self.IMG_SIZE_MAX_RATIO:
-                    send_as_file = True
-                else:
+                if msg.path is None:
+                    # When we don't have a local file path (e.g. file-like only),
+                    # skip the heuristic and default to sending as photo.
                     send_as_file = False
+                else:
+                    pic_img = Image.open(msg.path)
+                    max_size = max(pic_img.size)
+                    min_size = min(pic_img.size)
+                    img_ratio = max_size / min_size
+
+                    if min_size > self.IMG_MIN_SIZE:
+                        send_as_file = True
+                    elif max_size > self.IMG_MAX_SIZE and img_ratio > self.IMG_SIZE_RATIO:
+                        send_as_file = True
+                    elif img_ratio >= self.IMG_SIZE_MAX_RATIO:
+                        send_as_file = True
+                    else:
+                        send_as_file = False
             except IOError:  # Ignore when the image cannot be properly identified.
                 send_as_file = False
 
@@ -729,7 +734,8 @@ class SlaveMessageProcessor(LocaleMixin):
                         return message
 
                 try:
-                    pic_img: Image = Image.open(msg.file)
+                    assert msg.file is not None
+                    pic_img: Image.Image = Image.open(msg.file)
                     webp_img = tempfile.NamedTemporaryFile(suffix='.webp', dir=utils.ExperimentalFlagsManager.get_temp_dir(self.channel))
                     pic_img.convert("RGBA").save(webp_img, 'webp')
                     webp_img.seek(0)

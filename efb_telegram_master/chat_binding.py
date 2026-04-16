@@ -1090,7 +1090,9 @@ class ChatBindingManager(LocaleMixin):
                 # resize
                 scale = self.TELEGRAM_MIN_PROFILE_PICTURE_SIZE / min(pic_img.size)
                 pic_resized = io.BytesIO()
-                pic_img.resize(tuple(map(lambda a: int(scale * a), pic_img.size)), Image.BICUBIC) \
+                resample_bicubic = getattr(getattr(Image, "Resampling", Image), "BICUBIC")
+                new_size = (int(scale * pic_img.size[0]), int(scale * pic_img.size[1]))
+                pic_img.resize(new_size, resample_bicubic) \
                     .save(pic_resized, 'PNG')
                 pic_resized.seek(0)
 
