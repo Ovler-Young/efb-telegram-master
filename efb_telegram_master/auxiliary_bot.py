@@ -161,6 +161,7 @@ class AuxiliaryBot:
         return the stale value while refreshing in the background. This avoids
         false "not a member" results when all bots' caches expire simultaneously.
         """
+        need_probe = False
         with self._membership_lock:
             entry = self._membership_cache.get(chat_id)
             if entry is not None:
@@ -169,9 +170,13 @@ class AuxiliaryBot:
                 age = time.time() - timestamp
                 if age < ttl:
                     return is_member
-                # Stale but exists: return stale value, refresh in background
-                self._start_membership_probe(chat_id)
-                return is_member
+                # Stale but exists: flag for background refresh, return stale value
+                need_probe = True
+                stale_value = is_member
+
+        if need_probe:
+            self._start_membership_probe(chat_id)
+            return stale_value
 
         # True cache miss (never seen): trigger background probe
         self._start_membership_probe(chat_id)
