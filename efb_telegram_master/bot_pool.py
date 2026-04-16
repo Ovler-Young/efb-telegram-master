@@ -49,15 +49,22 @@ class BotPool:
         except (TypeError, ValueError):
             return None
 
-    def acquire_send_slot(self, chat_id: int) -> Optional[Tuple[AuxiliaryBot, float]]:
+    def acquire_send_slot(self, chat_id: int, max_delay: float = float('inf')
+                          ) -> Optional[Tuple[AuxiliaryBot, float]]:
         """Atomically find the best available auxiliary bot for a chat.
 
-        Iterates aux bots confirmed as members of the chat, peeks their delay,
-        picks the one with delay=0 (or lowest delay), then reserves a slot.
+        Iterates aux bots confirmed as members of the chat, picks the one
+        with the lowest delay, then reserves a slot.
+
+        Args:
+            chat_id: Target Telegram chat.
+            max_delay: Upper bound on acceptable delay. Bots whose delay
+                       >= max_delay are skipped. Pass the main bot's delay
+                       so aux bots are only chosen when they're actually faster.
 
         Returns:
-            (AuxiliaryBot, delay) if an aux bot is available with delay=0,
-            None if all aux bots have delay > 0 or none are members.
+            (AuxiliaryBot, delay) if a suitable aux bot was found,
+            None if no aux bot beats max_delay or none are members.
         """
         with self._pool_lock:
             best_bot: Optional[AuxiliaryBot] = None
@@ -72,21 +79,16 @@ class BotPool:
                     continue
 
                 delay = aux_bot.peek_delay(chat_id)
-                if delay == 0.0:
-                    # Perfect candidate: no delay
-                    best_bot = aux_bot
-                    best_delay = 0.0
-                    break
-                elif delay < best_delay:
+                if delay < best_delay:
                     best_bot = aux_bot
                     best_delay = delay
+                    if delay == 0.0:
+                        break
 
-            if best_bot is not None and best_delay == 0.0:
+            if best_bot is not None and best_delay < max_delay:
                 best_bot.reserve_slot(chat_id)
-                return (best_bot, 0.0)
+                return (best_bot, best_delay)
 
-            # No aux bot available with zero delay;
-            # notify admin about bots not in the group
             if need_member_bots:
                 self._maybe_notify_admin(chat_id, need_member_bots)
 

@@ -138,10 +138,12 @@ class TelegramBotManager(LocaleMixin):
                     has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
                     if not has_callback:
                         main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
-                        slot = self.bot_pool.acquire_send_slot(chat_id) if main_delay > 0 else None
+                        slot = self.bot_pool.acquire_send_slot(chat_id, max_delay=main_delay) if main_delay > 0 else None
                         if slot is not None:
-                            aux_bot, delay = slot
+                            aux_bot, aux_delay = slot
                             try:
+                                if aux_delay > 0:
+                                    time.sleep(aux_delay)
                                 with self._using_bot(aux_bot.bot):
                                     result = fn(self, *args, **kwargs)
                                 if result and hasattr(result, '__dict__'):
@@ -543,21 +545,23 @@ class TelegramBotManager(LocaleMixin):
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            # Try aux bots first (higher aggregate throughput)
+            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+
+            # Try aux bots first if they can beat the main bot
             if self.bot_pool:
-                slot = self.bot_pool.acquire_send_slot(chat_id)
+                slot = self.bot_pool.acquire_send_slot(chat_id, max_delay=max(main_delay, 0.01))
                 if slot is not None:
-                    aux_bot, _ = slot
+                    aux_bot, aux_delay = slot
+                    if aux_delay > 0:
+                        time.sleep(aux_delay)
                     try:
                         with self._using_bot(aux_bot.bot):
                             return send_callable(_bypass_rate_limit=True)
                     except telegram.error.Unauthorized:
                         aux_bot.mark_disabled("Unauthorized during migration send")
                         self._notify_admin_disabled_bot(aux_bot)
-                        # Fall through and retry with another bot
 
-            # Try main bot (peek only to avoid wasting a slot)
-            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+            # Try main bot
             if main_delay == 0.0:
                 self._calculate_rate_limit_delay(chat_id)  # reserve
                 return send_callable(_bypass_rate_limit=True)
@@ -741,7 +745,7 @@ class TelegramBotManager(LocaleMixin):
                         result = None
                         routed_to_aux = False
                         if self.bot_pool and task.chat_id:
-                            slot = self.bot_pool.acquire_send_slot(task.chat_id)
+                            slot = self.bot_pool.acquire_send_slot(task.chat_id, max_delay=0.01)
                             if slot is not None:
                                 aux_bot, _ = slot
                                 try:
