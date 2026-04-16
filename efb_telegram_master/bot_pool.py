@@ -172,7 +172,7 @@ class BotPool:
         try:
             admin_id = self._bot_manager.admins[0]
             bot_links = ", ".join(
-                f'<a href="https://t.me/{b.username}?startgroup=true">@{b.username}</a>'
+                f'<code>@{b.username}</code>'
                 for b in bots if b.username
             )
             if not bot_links:
