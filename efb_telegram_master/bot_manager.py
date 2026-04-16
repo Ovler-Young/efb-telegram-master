@@ -623,12 +623,11 @@ class TelegramBotManager(LocaleMixin):
             scan_count = 0
             while True:
                 left_bound = candidate_time - self.GLOBAL_WINDOW
-                idx = bisect.bisect_left(self._global_timestamps, left_bound)
+                idx = bisect.bisect_right(self._global_timestamps, left_bound)
                 right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
                 in_window = right_idx - idx
                 if in_window < self.GLOBAL_LIMIT - 2:
                     break
-                # Shift to just after the oldest entry in the current window
                 candidate_time = self._global_timestamps[idx] + self.GLOBAL_WINDOW
                 scan_count += 1
 
