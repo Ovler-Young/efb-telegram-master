@@ -9,6 +9,7 @@ from typing import Optional, Dict, Tuple, TYPE_CHECKING
 
 import telegram
 import telegram.error
+from telegram.utils.request import Request
 
 if TYPE_CHECKING:
     pass
@@ -40,7 +41,8 @@ class AuxiliaryBot:
         if base_file_url:
             kwargs['base_file_url'] = base_file_url
         if request_kwargs:
-            kwargs['request_kwargs'] = request_kwargs
+            # Match telegram.ext.Updater: pass a Request instance, not request_kwargs (PTB 13.11+).
+            kwargs['request'] = Request(**request_kwargs)
 
         self.bot: telegram.Bot = telegram.Bot(token=token, **kwargs)
 
