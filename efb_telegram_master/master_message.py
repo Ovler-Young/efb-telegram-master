@@ -115,8 +115,23 @@ class MasterMessageProcessor(LocaleMixin):
     def stop_worker(self):
         if not self.message_worker_thread.is_alive():
             return
+        # Drain any pending messages to allow quick shutdown
+        drained_count = 0
+        while not self.message_queue.empty():
+            try:
+                self.message_queue.get_nowait()
+                self.message_queue.task_done()
+                drained_count += 1
+            except Exception:
+                break
+        if drained_count > 0:
+            self.logger.info("Drained %d pending messages from queue during shutdown", drained_count)
+        # Signal worker to stop
         self.message_queue.put(None)
-        self.message_worker_thread.join()
+        # Use timeout to avoid hanging indefinitely
+        self.message_worker_thread.join(timeout=5.0)
+        if self.message_worker_thread.is_alive():
+            self.logger.warning("Message worker thread did not stop within timeout, continuing anyway")
 
     def enqueue_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)

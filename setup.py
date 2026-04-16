@@ -68,6 +68,9 @@ setup(
             "lottie",
             "cairosvg",  # required by ``lottie`` to export GIF
         ],
+        "postgresql": [
+            "psycopg2-binary",
+        ],
     },
     entry_points={
         "ehforwarderbot.master": "blueset.telegram = efb_telegram_master:TelegramChannel",
