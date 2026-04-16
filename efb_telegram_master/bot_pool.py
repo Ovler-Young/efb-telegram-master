@@ -150,8 +150,11 @@ class BotPool:
         """Send a message to the first admin about adding aux bots to a group."""
         try:
             admin_id = self._bot_manager.admins[0]
-            bot_mentions = ", ".join(f"@{b.username}" for b in bots if b.username)
-            if not bot_mentions:
+            bot_links = ", ".join(
+                f'<a href="https://t.me/{b.username}?startgroup=true">@{b.username}</a>'
+                for b in bots if b.username
+            )
+            if not bot_links:
                 return
 
             str_id = str(chat_id)
@@ -162,7 +165,7 @@ class BotPool:
 
             text = (
                 f'📊 Message rate is high in <a href="{chat_url}">chat {chat_id}</a>. '
-                f"To reduce delay, please add {bot_mentions} to the group."
+                f"To reduce delay, please add {bot_links} to the group."
             )
 
             self._bot_manager.updater.bot.send_message(
