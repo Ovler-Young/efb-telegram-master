@@ -269,9 +269,16 @@ post-link actions:
 - **Relink**: ETM does not re-migrate history. Instead, it sends a link to the
   previous conversation history message so you can jump back if needed.
 
-At the moment, this history backfill behavior is **not configurable** (it is
-attempted on first-time link, and skipped on relink). If the background
-migration fails, ETM keeps the link and may send a short warning message.
+By default, ETM uses this behaviour automatically (backfill on first-time link,
+send a history link on relink). You can override it when using the manual
+``/start`` code:
+
+- ``/start <code>`` — default behaviour (auto).
+- ``/start <code> true`` — always backfill, even when relinking.
+- ``/start <code> false`` — never backfill (and skip the history-link message).
+
+If the background migration fails, ETM keeps the link and sends a short warning
+message.
 
 Forum topics mode (one topic per chat)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
