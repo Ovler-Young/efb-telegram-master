@@ -23,16 +23,14 @@ class BotPool:
     - Background membership probes
     """
 
-    NOTIFICATION_COOLDOWN = 3600.0  # 1 hour per (bot_id, chat_id) pair
-
     def __init__(self, aux_bots: List[AuxiliaryBot], bot_manager: 'TelegramBotManager'):
         self._bots: List[AuxiliaryBot] = aux_bots
         self._bot_by_id: Dict[int, AuxiliaryBot] = {b.bot_id: b for b in aux_bots}
         self._bot_manager = bot_manager
         self._pool_lock = threading.Lock()
 
-        # Notification throttle: (bot_id, chat_id) -> last_notification_timestamp
-        self._notification_timestamps: Dict[Tuple[int, int], float] = {}
+        # One notification per chat per process lifetime
+        self._notified_chats: set = set()
         self._notification_lock = threading.Lock()
 
         logger.info("BotPool initialized with %d auxiliary bot(s): %s",
@@ -155,31 +153,15 @@ class BotPool:
                         aux_bot.username, chat_id)
 
     def _maybe_notify_admin(self, chat_id: int, bots_not_in_chat: List[AuxiliaryBot]):
-        """Send throttled notification to admin about aux bots not in a group."""
-        now = time.time()
-        bots_to_notify: List[AuxiliaryBot] = []
-
+        """Send at most one notification per chat per process lifetime."""
         with self._notification_lock:
-            # Purge stale entries older than cooldown + 60s margin
-            cutoff = now - self.NOTIFICATION_COOLDOWN - 60.0
-            stale_keys = [k for k, ts in self._notification_timestamps.items() if ts < cutoff]
-            for k in stale_keys:
-                del self._notification_timestamps[k]
+            if chat_id in self._notified_chats:
+                return
+            self._notified_chats.add(chat_id)
 
-            for aux_bot in bots_not_in_chat:
-                key = (aux_bot.bot_id, chat_id)
-                last_notified = self._notification_timestamps.get(key, 0.0)
-                if now - last_notified >= self.NOTIFICATION_COOLDOWN:
-                    self._notification_timestamps[key] = now
-                    bots_to_notify.append(aux_bot)
-
-        if not bots_to_notify:
-            return
-
-        # Send notification in background to avoid blocking
         thread = threading.Thread(
             target=self._send_admin_notification,
-            args=(chat_id, bots_to_notify),
+            args=(chat_id, bots_not_in_chat),
             daemon=True,
             name=f"BotPoolNotify-{chat_id}"
         )
