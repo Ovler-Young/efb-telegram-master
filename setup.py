@@ -47,6 +47,7 @@ setup(
     tests_require=tests_require,
     install_requires=[
         "ehforwarderbot>=2.0.0",
+        "setuptools==81.0.0",
         "python-telegram-bot~=13.11",
         # python-telegram-bot 13.x still imports urllib3.contrib.appengine,
         # which was removed in urllib3 2.0+.
