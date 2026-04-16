@@ -102,6 +102,8 @@ class MsgLog(BaseModel):
     """
     sent_to = TextField()
     """Module ID of the message sent to."""
+    sender_bot_id = TextField(null=True)
+    """Telegram bot user ID that sent this message. NULL means the main bot."""
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
@@ -121,6 +123,7 @@ class MsgLog(BaseModel):
             mime=self.mime or None,
             file_id=self.file_id or None,
         )
+        msg.sender_bot_id = self.sender_bot_id
         with suppress(NameError):
             to_module = coordinator.get_module_by_id(self.sent_to)
             if isinstance(to_module, Channel):
@@ -315,6 +318,8 @@ class DatabaseManager:
             self._migrate(2)
         elif "file_unique_id" not in msg_log_columns:
             self._migrate(3)
+        elif "sender_bot_id" not in msg_log_columns:
+            self._migrate(4)
 
     def _migrate(self, i: int):
         """
@@ -352,6 +357,11 @@ class DatabaseManager:
             # 2019NOV18
             migrate(
                 migrator.add_column("msglog", "file_unique_id", MsgLog.file_unique_id)
+            )
+        if i <= 4:
+            # Migration 4: Add column for sender bot ID (multi-bot pool support)
+            migrate(
+                migrator.add_column("msglog", "sender_bot_id", MsgLog.sender_bot_id)
             )
 
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,
@@ -597,7 +607,8 @@ class DatabaseManager:
     def add_or_update_message_log(self,
                                   msg: ETMMsg,
                                   master_message: Message,
-                                  old_message_id: Optional[OldMsgID] = None):
+                                  old_message_id: Optional[OldMsgID] = None,
+                                  sender_bot_id: Optional[str] = None):
         """Add or update a message into the database."""
         master_msg_id = message_id_to_str(TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id))
         master_msg_id_alt = None
@@ -632,6 +643,7 @@ class DatabaseManager:
         row.file_id = msg.file_id
         row.file_unique_id = msg.file_unique_id
         row.mime = msg.mime
+        row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
         pickle_data = self.pickle_misc_msg(msg)
         if pickle_data:
             row.pickle = pickle_data

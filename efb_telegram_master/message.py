@@ -32,6 +32,8 @@ class ETMMsg(Message):
     """File ID from Telegram Bot API"""
     file_unique_id: Optional[str] = None
     """Unique file ID from Telegram Bot API"""
+    sender_bot_id: Optional[str] = None
+    """Telegram bot user ID that sent this message. None means the main bot."""
     type_telegram: TGMsgType
     """Type of message in Telegram Bot API"""
     chat: ETMChatType
@@ -60,13 +62,33 @@ class ETMMsg(Message):
     def _load_file(self):
         if self.file_id:
             # noinspection PyUnresolvedReferences
-            bot = coordinator.master.bot_manager
+            bot_manager = coordinator.master.bot_manager
+
+            # Route get_file through the correct bot based on sender_bot_id
+            file_bot = None
+            if self.sender_bot_id:
+                bot_pool = getattr(bot_manager, 'bot_pool', None)
+                if bot_pool:
+                    aux_bot = bot_pool.get_bot_by_id(self.sender_bot_id)
+                    if aux_bot and not aux_bot.disabled:
+                        file_bot = aux_bot.bot
 
             try:
-                file_meta = bot.get_file(self.file_id)
+                if file_bot:
+                    file_meta = file_bot.get_file(self.file_id)
+                else:
+                    file_meta = bot_manager.get_file(self.file_id)
             except BadRequest as e:
-                logger.exception("Bad request while trying to get file metadata: %s", e)
-                return
+                if file_bot:
+                    logger.warning("Failed to get file from aux bot, trying main bot: %s", e)
+                    try:
+                        file_meta = bot_manager.get_file(self.file_id)
+                    except BadRequest as e2:
+                        logger.exception("Bad request from main bot too: %s", e2)
+                        return
+                else:
+                    logger.exception("Bad request while trying to get file metadata: %s", e)
+                    return
             if not self.mime:
                 ext = os.path.splitext(file_meta.file_path)[1]
                 mime = mimetypes.guess_type(file_meta.file_path, strict=False)[0]

@@ -9,8 +9,9 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple, Tuple
+from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 from unittest.mock import Mock
@@ -18,10 +19,12 @@ from unittest.mock import Mock
 import telegram.constants
 import telegram.error
 from retrying import retry
-from telegram import File, ForumTopic, InputFile, Update, User
+from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
 from telegram import Message as TelegramMessage
 from telegram.ext import CallbackContext, Dispatcher, Filters, MessageHandler, Updater
 
+from .auxiliary_bot import AuxiliaryBot
+from .bot_pool import BotPool
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
@@ -41,6 +44,17 @@ if TYPE_CHECKING:
     from . import TelegramChannel
 
 MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
+
+
+def _has_callback_keyboard(reply_markup) -> bool:
+    """Check if a reply_markup contains InlineKeyboardButtons with callback_data."""
+    if not isinstance(reply_markup, InlineKeyboardMarkup):
+        return False
+    for row in reply_markup.inline_keyboard:
+        for button in row:
+            if button.callback_data and button.callback_data != "void":
+                return True
+    return False
 
 
 class TelegramBotManager(LocaleMixin):
@@ -79,12 +93,18 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def rate_limit_decorator(cls, fn: Callable):
-            """Apply rate limiting to API calls."""
+            """Apply rate limiting to API calls with two-mode routing for multi-bot pool."""
             @wraps(fn)
             def rate_limit_wrapper(self: 'TelegramBotManager', *args, **kwargs):
+                # Bypass: caller already reserved a slot and set _using_bot
+                if kwargs.pop('_bypass_rate_limit', False):
+                    return fn(self, *args, **kwargs)
+
+                # Pop the _sender_bot_id kwarg (used for forced routing on edits/deletes)
+                sender_bot_id = kwargs.pop('_sender_bot_id', None)
+
                 # Extract chat_id from arguments
                 chat_id = None
-
                 if args:
                     chat_id = args[0]
                 elif 'chat_id' in kwargs:
@@ -95,8 +115,49 @@ class TelegramBotManager(LocaleMixin):
                     self.logger.warning(f"Delayed worker is stopped. Not scheduling new tasks for chat {chat_id}.")
                     return None
 
-                # Calculate rate limiting delay
+                # MODE 1: Forced routing (edits/deletes must go to the specific bot that sent the original)
+                if sender_bot_id and self.bot_pool:
+                    aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
+                    if aux_bot and not aux_bot.disabled:
+                        try:
+                            with self._using_bot(aux_bot.bot):
+                                result = fn(self, *args, **kwargs)
+                            if result and hasattr(result, '__dict__'):
+                                result._sender_bot_id = str(sender_bot_id)
+                            return result
+                        except telegram.error.Unauthorized:
+                            aux_bot.mark_disabled("Unauthorized during forced-route API call")
+                            self._notify_admin_disabled_bot(aux_bot)
+                    # Fallback: sender bot unavailable, try main bot
+                    return fn(self, *args, **kwargs)
+
+                # MODE 2: Pool routing (new sends pick best available bot)
+                # Only attempt aux bots when the main bot would impose a delay.
+                if chat_id and self.bot_pool:
+                    # Skip pool for messages with callback keyboards (EC-4)
+                    has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
+                    if not has_callback:
+                        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+                        slot = self.bot_pool.acquire_send_slot(chat_id, max_delay=main_delay) if main_delay > 0 else None
+                        if slot is not None:
+                            aux_bot, aux_delay = slot
+                            try:
+                                if aux_delay > 0:
+                                    time.sleep(aux_delay)
+                                with self._using_bot(aux_bot.bot):
+                                    result = fn(self, *args, **kwargs)
+                                if result and hasattr(result, '__dict__'):
+                                    result._sender_bot_id = str(aux_bot.bot_id)
+                                self._record_aux_use(chat_id)
+                                return result
+                            except telegram.error.Unauthorized:
+                                aux_bot.mark_disabled("Unauthorized during pool-route API call")
+                                self._notify_admin_disabled_bot(aux_bot)
+                                # Fallback: continue to main bot path below
+
+                # Default: main bot with rate limit check and delayed queue
                 if chat_id:
+                    # Calculate rate limiting delay
                     delay_time, chat_count, global_count = self._calculate_rate_limit_delay(chat_id)  # pylint: disable=protected-access
 
                     if delay_time > 0:
@@ -263,7 +324,7 @@ class TelegramBotManager(LocaleMixin):
                     msg = fn(self, *args, **kwargs)
                     chat_id = kwargs.get("chat_id", args[0] if len(args) > 0 else "")
                     filename = "%s_%s.txt" % (chat_id, msg.message_id)
-                    self.updater.bot.send_document(chat_id, full_message,
+                    self._active_bot.send_document(chat_id, full_message,
                                                    filename=filename,
                                                    reply_to_message_id=msg.message_id,
                                                    caption=self._("Caption is truncated due to its length. "
@@ -277,12 +338,21 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def skip_on_rate_limit(cls, fn: Callable):
-            """Skip execution silently if messages are queued. For non-essential calls like typing indicators."""
+            """Skip execution silently if messages are queued or pool is in
+            high-volume mode for the target chat.
+            For non-essential calls like typing indicators."""
+            AUX_USE_RECENCY = 5.0  # seconds
+
             @wraps(fn)
             def skip_wrapper(self: 'TelegramBotManager', *args, **kwargs):
                 with self._delayed_queue_lock:
                     if self._delayed_queue:
                         return None
+
+                # Suppress when aux bots were recently used for this chat
+                chat_id = args[0] if args else kwargs.get('chat_id')
+                if chat_id and self._aux_recent_use.get(chat_id, 0) > time.time() - AUX_USE_RECENCY:
+                    return None
 
                 try:
                     return fn(self, *args, **kwargs)
@@ -353,7 +423,16 @@ class TelegramBotManager(LocaleMixin):
         self.CHAT_WINDOW = 60.0
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
+        self._tls = threading.local()  # Thread-local for bot override (_active_bot)
+        self._aux_recent_use: dict[int, float] = {}  # chat_id -> timestamp of last aux bot use
         self.logger.debug("Rate limiter initialized...")
+
+        # Initialize auxiliary bot pool
+        self.bot_pool: Optional[BotPool] = None
+        aux_configs = config.get('auxiliary_bots', [])
+        if aux_configs:
+            self._init_bot_pool(aux_configs, config, channel)
+        self.logger.debug("Bot pool initialization complete...")
 
         # Initialize delayed message queue system
         self._delayed_queue: List[Tuple[float, int, DelayedTask]] = []
@@ -379,6 +458,121 @@ class TelegramBotManager(LocaleMixin):
         self.Decorators.enable_retry = channel.flag('retry_on_error')
         self.logger.debug("Base dispatchers added...")
 
+    def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
+        """Initialize the auxiliary bot pool from config."""
+        req_kwargs = {'read_timeout': 15}
+        conf_req_kwargs = config.get('request_kwargs')
+        if isinstance(conf_req_kwargs, collections.abc.Mapping):
+            req_kwargs.update(conf_req_kwargs)
+
+        main_token = config['token']
+        seen_tokens = {main_token}
+        aux_bots: list = []
+
+        for entry in aux_configs:
+            if not isinstance(entry, dict) or not isinstance(entry.get('token'), str):
+                self.logger.warning("Invalid auxiliary_bots entry (missing token string), skipping: %s", entry)
+                continue
+            token = entry['token']
+            if token in seen_tokens:
+                self.logger.warning("Duplicate bot token in auxiliary_bots, skipping")
+                continue
+            seen_tokens.add(token)
+
+            aux_bot = AuxiliaryBot(
+                token=token,
+                request_kwargs=req_kwargs,
+                base_url=channel.flag('api_base_url') or None,
+                base_file_url=channel.flag('api_base_file_url') or None,
+                global_limit=self.GLOBAL_LIMIT,
+                global_window=self.GLOBAL_WINDOW,
+                chat_limit=self.CHAT_LIMIT,
+                chat_window=self.CHAT_WINDOW,
+            )
+            if aux_bot.initialize():
+                aux_bots.append(aux_bot)
+            else:
+                self.logger.error("Skipping auxiliary bot with invalid token")
+
+        if aux_bots:
+            self.bot_pool = BotPool(aux_bots, self)
+            self.logger.info("Initialized bot pool with %d auxiliary bot(s)", len(aux_bots))
+
+    @property
+    def _active_bot(self):
+        """Return the bot to use for the current send operation.
+        Thread-safe: each thread has its own override slot."""
+        return getattr(self._tls, 'override_bot', None) or self.updater.bot
+
+    @contextmanager
+    def _using_bot(self, bot):
+        """Context manager to temporarily route sends through a different bot."""
+        old = getattr(self._tls, 'override_bot', None)
+        self._tls.override_bot = bot
+        try:
+            yield
+        finally:
+            self._tls.override_bot = old
+
+    def _record_aux_use(self, chat_id: int):
+        """Record that an aux bot was used for a chat (for typing suppression)."""
+        self._aux_recent_use[chat_id] = time.time()
+
+    def _notify_admin_disabled_bot(self, aux_bot: AuxiliaryBot):
+        """Send one-shot notification to admin that an aux bot was disabled."""
+        def _notify():
+            try:
+                admin_id = self.admins[0]
+                self.updater.bot.send_message(
+                    admin_id,
+                    f"⚠️ Auxiliary bot @{aux_bot.username} (id={aux_bot.bot_id}) has been "
+                    f"disabled: {aux_bot._disable_reason}. Please check the token in config."
+                )
+            except Exception as e:
+                self.logger.warning("Failed to notify admin about disabled aux bot: %s", e)
+
+        threading.Thread(target=_notify, daemon=True, name="AuxBotDisabledNotify").start()
+
+    def send_blocking_migration(self, chat_id: int, send_callable: Callable,
+                                timeout: float = 60.0):
+        """Block until any bot (main or aux) has a free slot, then send through it.
+
+        The callable receives a single ``_bypass_rate_limit=True`` kwarg that
+        the caller must forward to the decorated send method so the decorator
+        skips its own routing/reservation.
+
+        Returns whatever the send_callable returns.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+
+            # Try aux bots first if they can beat the main bot
+            if self.bot_pool:
+                slot = self.bot_pool.acquire_send_slot(chat_id, max_delay=max(main_delay, 0.01))
+                if slot is not None:
+                    aux_bot, aux_delay = slot
+                    if aux_delay > 0:
+                        time.sleep(aux_delay)
+                    try:
+                        with self._using_bot(aux_bot.bot):
+                            return send_callable(_bypass_rate_limit=True)
+                    except telegram.error.Unauthorized:
+                        aux_bot.mark_disabled("Unauthorized during migration send")
+                        self._notify_admin_disabled_bot(aux_bot)
+
+            # Try main bot
+            if main_delay == 0.0:
+                self._calculate_rate_limit_delay(chat_id)  # reserve
+                return send_callable(_bypass_rate_limit=True)
+
+            time.sleep(0.2)
+
+        # Timeout fallback: reserve on main and send anyway
+        self.logger.warning("send_blocking_migration timed out for chat %d, sending on main bot", chat_id)
+        self._calculate_rate_limit_delay(chat_id)
+        return send_callable(_bypass_rate_limit=True)
+
     def _cleanup_old_timestamps(self):
         """Remove timestamps older than the time window."""
         current_time = time.time()
@@ -391,13 +585,15 @@ class TelegramBotManager(LocaleMixin):
             while timestamps and timestamps[0] <= current_time - self.CHAT_WINDOW:
                 timestamps.popleft()
 
-    def _calculate_rate_limit_delay(self, chat_id: int):
+    def _calculate_rate_limit_delay(self, chat_id: int, peek_only: bool = False):
         """
         Calculate rate limiting delay using sliding window algorithm.
-        This method is stateful and updates the timestamp queues.
 
         Args:
             chat_id: Telegram chat ID
+            peek_only: If True, compute delay without reserving a slot
+                (no insort/append). Used to check main-bot availability
+                before committing to a pool decision.
 
         Returns:
             tuple: (delay_time, chat_count, global_count) - delay in seconds, current queue counts
@@ -427,20 +623,20 @@ class TelegramBotManager(LocaleMixin):
             scan_count = 0
             while True:
                 left_bound = candidate_time - self.GLOBAL_WINDOW
-                idx = bisect.bisect_left(self._global_timestamps, left_bound)
+                idx = bisect.bisect_right(self._global_timestamps, left_bound)
                 right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
                 in_window = right_idx - idx
                 if in_window < self.GLOBAL_LIMIT - 2:
                     break
-                # Shift to just after the oldest entry in the current window
                 candidate_time = self._global_timestamps[idx] + self.GLOBAL_WINDOW
                 scan_count += 1
 
             sleep_time = max(0.0, candidate_time - current_time)
 
-            # Record the scheduled time in both queues
-            bisect.insort(self._global_timestamps, candidate_time)
-            chat_timestamps.append(candidate_time)
+            if not peek_only:
+                # Record the scheduled time in both queues
+                bisect.insort(self._global_timestamps, candidate_time)
+                chat_timestamps.append(candidate_time)
 
             chat_count = len(chat_timestamps)
             global_count = len(self._global_timestamps)
@@ -543,7 +739,28 @@ class TelegramBotManager(LocaleMixin):
 
                     try:
                         self.logger.debug(f"Executing delayed task {task.task_id} for chat {task.chat_id}")
-                        result = task.function(*task.args, **task.kwargs)
+
+                        # Re-check pool: if an aux bot has become available, route through it
+                        result = None
+                        routed_to_aux = False
+                        if self.bot_pool and task.chat_id:
+                            slot = self.bot_pool.acquire_send_slot(task.chat_id, max_delay=0.01)
+                            if slot is not None:
+                                aux_bot, _ = slot
+                                try:
+                                    with self._using_bot(aux_bot.bot):
+                                        result = task.function(*task.args, **task.kwargs)
+                                    if result and hasattr(result, '__dict__'):
+                                        result._sender_bot_id = str(aux_bot.bot_id)
+                                    self._record_aux_use(task.chat_id)
+                                    routed_to_aux = True
+                                    self.logger.debug(f"Delayed task {task.task_id} routed to aux bot @{aux_bot.username}")
+                                except telegram.error.Unauthorized:
+                                    aux_bot.mark_disabled("Unauthorized during delayed task")
+                                    self._notify_admin_disabled_bot(aux_bot)
+
+                        if not routed_to_aux:
+                            result = task.function(*task.args, **task.kwargs)
                         self.logger.debug(f"Delayed task {task.task_id} completed successfully")
 
                         # Handle database update for delayed execution
@@ -601,8 +818,12 @@ class TelegramBotManager(LocaleMixin):
                 etm_msg.type_telegram = get_msg_type(real_tg_msg)
                 etm_msg.put_telegram_file(real_tg_msg)
 
+                # Capture sender_bot_id from the real message (annotated by rate_limit_decorator)
+                sender_bot_id = getattr(real_tg_msg, '_sender_bot_id', None)
+
                 # Update database with real message
-                self.channel.db.add_or_update_message_log(etm_msg, real_tg_msg, old_msg_id)
+                self.channel.db.add_or_update_message_log(
+                    etm_msg, real_tg_msg, old_msg_id, sender_bot_id=sender_bot_id)
                 self.logger.debug(f"Updated database with real message for delayed task {task_id}")
             else:
                 self.logger.warning(f"No pending database update found for task {task_id}")
@@ -673,10 +894,10 @@ class TelegramBotManager(LocaleMixin):
                 full_message.truncate()
             else:
                 filename += ".txt"
-            self.updater.bot.send_document(args[0], full_message, filename=filename,
-                                           reply_to_message_id=msg.message_id,
-                                           caption=self._("Message is truncated due to its length. "
-                                                          "Full message is sent as attachment."))
+            self._active_bot.send_document(args[0], full_message, filename=filename,
+                                          reply_to_message_id=msg.message_id,
+                                          caption=self._("Message is truncated due to its length. "
+                                                         "Full message is sent as attachment."))
             return msg
         else:
             kwargs['text'] = prefix + text + suffix
@@ -716,11 +937,11 @@ class TelegramBotManager(LocaleMixin):
                 filename += ".html"
             else:
                 filename += ".txt"
-            self.updater.bot.send_document(kwargs['chat_id'], full_message,
-                                           filename=filename,
-                                           reply_to_message_id=msg.message_id,
-                                           caption=self._("Message is truncated due to its length. "
-                                                          "Full message is sent as attachment."))
+            self._active_bot.send_document(kwargs['chat_id'], full_message,
+                                          filename=filename,
+                                          reply_to_message_id=msg.message_id,
+                                          caption=self._("Message is truncated due to its length. "
+                                                         "Full message is sent as attachment."))
             return msg
         else:
             kwargs['text'] = prefix + text + suffix
@@ -734,11 +955,11 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message: The message sent
         """
         try:
-            return self.updater.bot.send_message(*args, **kwargs)
+            return self._active_bot.send_message(*args, **kwargs)
         except telegram.error.BadRequest as e:
             if e.message.lower().startswith("can't parse entities") and 'parse_mode' in kwargs:
                 kwargs.pop("parse_mode")
-                return self.updater.bot.send_message(*args, **kwargs)
+                return self._active_bot.send_message(*args, **kwargs)
             else:
                 raise e
 
@@ -750,17 +971,17 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message: The message sent
         """
         try:
-            return self.updater.bot.edit_message_text(*args, **kwargs)
+            return self._active_bot.edit_message_text(*args, **kwargs)
         except telegram.error.BadRequest as e:
             if e.message == "Message can't be edited":
                 kwargs['reply_to_message_id'] = kwargs.pop('message_id')
-                return self.updater.bot.send_message(*args, **kwargs)
+                return self._active_bot.send_message(*args, **kwargs)
             elif e.message == "message to edit not found":
                 kwargs.pop('message_id')
-                return self.updater.bot.send_message(*args, **kwargs)
+                return self._active_bot.send_message(*args, **kwargs)
             elif e.message.lower().startswith("can't parse entities") and 'parse_mode' in kwargs:
                 kwargs.pop("parse_mode")
-                return self.updater.bot.edit_message_text(*args, **kwargs)
+                return self._active_bot.edit_message_text(*args, **kwargs)
             else:
                 raise e
 
@@ -786,9 +1007,9 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message
         """
         try:
-            return self.updater.bot.send_audio(*args, **kwargs)
+            return self._active_bot.send_audio(*args, **kwargs)
         except telegram.error.BadRequest:
-            return self.updater.bot.send_document(*args, **kwargs)
+            return self._active_bot.send_document(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -812,9 +1033,9 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message
         """
         try:
-            return self.updater.bot.send_voice(*args, **kwargs)
+            return self._active_bot.send_voice(*args, **kwargs)
         except telegram.error.BadRequest:
-            return self.updater.bot.send_document(*args, **kwargs)
+            return self._active_bot.send_document(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -838,9 +1059,9 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message
         """
         try:
-            return self.updater.bot.send_video(*args, **kwargs)
+            return self._active_bot.send_video(*args, **kwargs)
         except telegram.error.BadRequest:
-            return self.updater.bot.send_document(*args, **kwargs)
+            return self._active_bot.send_document(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -861,7 +1082,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self.updater.bot.send_document(*args, **kwargs)
+        return self._active_bot.send_document(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -882,7 +1103,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self.updater.bot.send_animation(*args, **kwargs)
+        return self._active_bot.send_animation(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -904,9 +1125,9 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message
         """
         try:
-            return self.updater.bot.send_photo(*args, **kwargs)
+            return self._active_bot.send_photo(*args, **kwargs)
         except telegram.error.BadRequest:
-            return self.updater.bot.send_document(*args, **kwargs)
+            return self._active_bot.send_document(*args, **kwargs)
 
     @Decorators.skip_on_rate_limit
     @Decorators.retry_on_timeout
@@ -922,42 +1143,42 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_reply_markup(self, *args, **kwargs):
-        return self.updater.bot.edit_message_reply_markup(*args, **kwargs)
+        return self._active_bot.edit_message_reply_markup(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_location(self, *args, **kwargs):
-        return self.updater.bot.send_location(*args, **kwargs)
+        return self._active_bot.send_location(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_venue(self, *args, **kwargs):
-        return self.updater.bot.send_venue(*args, **kwargs)
+        return self._active_bot.send_venue(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_sticker(self, *args, **kwargs):
-        return self.updater.bot.send_sticker(*args, **kwargs)
+        return self._active_bot.send_sticker(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def forward_message(self, *args, **kwargs):
-        return self.updater.bot.forward_message(*args, **kwargs)
+        return self._active_bot.forward_message(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def copy_message(self, *args, **kwargs):
-        return self.updater.bot.copy_message(*args, **kwargs)
+        return self._active_bot.copy_message(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
@@ -979,12 +1200,12 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
-        return self.updater.bot.edit_message_caption(*args, **kwargs)
+        return self._active_bot.edit_message_caption(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
-        return self.updater.bot.edit_message_media(*args, **kwargs)
+        return self._active_bot.edit_message_media(*args, **kwargs)
 
     def reply_error(self, update, errmsg):
         """
@@ -999,12 +1220,22 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def get_file(self, file_id: str) -> File:
-        return self.updater.bot.get_file(file_id)
+        return self._active_bot.get_file(file_id)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
-    def delete_message(self, chat_id, message_id):
-        return self.updater.bot.delete_message(chat_id, message_id)
+    def delete_message(self, chat_id, message_id, _sender_bot_id=None):
+        if _sender_bot_id and self.bot_pool:
+            aux_bot = self.bot_pool.get_bot_by_id(_sender_bot_id)
+            if aux_bot and not aux_bot.disabled:
+                try:
+                    return aux_bot.bot.delete_message(chat_id, message_id)
+                except telegram.error.Unauthorized:
+                    aux_bot.mark_disabled("Unauthorized during delete_message")
+                    self._notify_admin_disabled_bot(aux_bot)
+                except telegram.error.BadRequest:
+                    pass  # Fall through to main bot
+        return self._active_bot.delete_message(chat_id, message_id)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
@@ -1107,6 +1338,10 @@ class TelegramBotManager(LocaleMixin):
 
         # Stop the delayed message worker first
         self.stop_delayed_worker()
+
+        # Shut down auxiliary bot pool
+        if self.bot_pool:
+            self.bot_pool.shutdown()
 
         # Then stop the updater
         self.logger.debug("Stopping Telegram updater...")
