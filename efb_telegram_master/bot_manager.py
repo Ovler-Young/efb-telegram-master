@@ -11,7 +11,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple, Optional, Tuple, cast
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 from unittest.mock import Mock
@@ -71,6 +71,23 @@ class TelegramBotManager(LocaleMixin):
 
     webhook = False
     logger = logging.getLogger(__name__)
+
+    # Type declarations for instance attributes assigned in __init__
+    updater: Updater
+    _bot: telegram.Bot
+    me: User
+    admins: List[int]
+    dispatcher: Dispatcher
+    bot_pool: Optional['BotPool']
+    _delayed_worker_stop: threading.Event
+    _delayed_queue_lock: threading.Lock
+    _delayed_queue: List[Tuple[float, int, 'DelayedTask']]
+    _cleanup_tls: threading.local
+    _tls: threading.local
+    _rate_limit_lock: threading.Lock
+    _global_timestamps: list[float]
+    _chat_timestamps: 'defaultdict[int, Deque[float]]'
+    _aux_recent_use: dict[int, float]
 
     class Decorators:
         logger = logging.getLogger(__name__)
@@ -404,12 +421,16 @@ class TelegramBotManager(LocaleMixin):
             self.logger.debug("Webhook is set...")
 
         self.logger.debug("Checking connection to Telegram bot API...")
-        me = self.updater.bot.get_me()
+        # Updater.__init__ uses __slots__ + @no_type_check, so mypy cannot
+        # determine the types of .bot / .dispatcher.  getattr returns Any,
+        # then cast narrows to the correct type.
+        self._bot = cast(telegram.Bot, getattr(self.updater, 'bot'))
+        me = self._bot.get_me()
         assert me, "Invalid bot credential provided."
-        self.me: User = me
+        self.me = me
         self.logger.debug("Connection to Telegram bot API is OK...")
-        self.admins: List[int] = config['admins']
-        self.dispatcher: Dispatcher = self.updater.dispatcher
+        self.admins = config['admins']
+        self.dispatcher = cast(Dispatcher, getattr(self.updater, 'dispatcher'))
 
         # Initialize sliding window rate limiting
         self._rate_limit_lock = threading.Lock()
@@ -502,7 +523,7 @@ class TelegramBotManager(LocaleMixin):
     def _active_bot(self):
         """Return the bot to use for the current send operation.
         Thread-safe: each thread has its own override slot."""
-        return getattr(self._tls, 'override_bot', None) or self.updater.bot
+        return getattr(self._tls, 'override_bot', None) or self._bot
 
     @contextmanager
     def _using_bot(self, bot):
@@ -523,7 +544,7 @@ class TelegramBotManager(LocaleMixin):
         def _notify():
             try:
                 admin_id = self.admins[0]
-                self.updater.bot.send_message(
+                self._bot.send_message(
                     admin_id,
                     f"⚠️ Auxiliary bot @{aux_bot.username} (id={aux_bot.bot_id}) has been "
                     f"disabled: {aux_bot._disable_reason}. Please check the token in config."
@@ -680,7 +701,7 @@ class TelegramBotManager(LocaleMixin):
         return mock_msg
 
     def _schedule_delayed_task(self, chat_id: int, delay_time: float, function: Callable,
-                              args: tuple, kwargs: dict, cleanup_files: list = None) -> str:
+                              args: tuple, kwargs: dict, cleanup_files: Optional[list] = None) -> str:
         """
         Schedule a task for delayed execution.
 
@@ -1135,7 +1156,7 @@ class TelegramBotManager(LocaleMixin):
         message_thread_id = kwargs.pop('message_thread_id', None)
         if message_thread_id != None:
             kwargs['api_kwargs'] = { "message_thread_id":  message_thread_id}
-        return self.updater.bot.send_chat_action(*args, **kwargs)
+        return self._bot.send_chat_action(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -1183,7 +1204,7 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def get_me(self, *args, **kwargs):
-        return self.updater.bot.get_me(*args, **kwargs)
+        return self._bot.get_me(*args, **kwargs)
 
     def session_expired(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
@@ -1241,7 +1262,7 @@ class TelegramBotManager(LocaleMixin):
     def answer_callback_query(self, *args, prefix="", suffix="", text=None,
                               message_id=None, **kwargs):
         if text is None:
-            return self.updater.bot.answer_callback_query(
+            return self._bot.answer_callback_query(
                 *args, **kwargs
             )
         prefix = (prefix and (prefix + "\n")) or prefix
@@ -1254,57 +1275,57 @@ class TelegramBotManager(LocaleMixin):
             full_message_buffer = io.StringIO(full_message)
             keep_size = MAX_CALLBACK_QUERY_ANSWER_LENGTH // 3
             truncated = full_message[:keep_size] + "…" + full_message[keep_size:]
-            result = self.updater.bot.answer_callback_query(*args, text=truncated, **kwargs)
+            result = self._bot.answer_callback_query(*args, text=truncated, **kwargs)
             filename = f"{chat_id}_{message_id}.txt"
-            self.updater.bot.send_document(args[0], full_message_buffer, filename,
+            self._bot.send_document(args[0], full_message_buffer, filename,
                                            reply_to_message_id=message_id,
                                            caption=self._("Response is truncated due to its length. "
                                                           "Full message is sent as attachment."))
             return result
         self.logger.debug(f"answer_callback_query({args}, {kwargs})")
-        return self.updater.bot.answer_callback_query(
+        return self._bot.answer_callback_query(
             *args, text=prefix + text + suffix, **kwargs
         )
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def get_chat_info(self, *args, **kwargs):
-        return self.updater.bot.get_chat(*args, **kwargs)
+        return self._bot.get_chat(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def create_forum_topic(self, *args, **kwargs) -> ForumTopic:
-        return self.updater.bot.create_forum_topic(*args, **kwargs)
+        return self._bot.create_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def edit_forum_topic(self, *args, **kwargs):
-        return self.updater.bot.edit_forum_topic(*args, **kwargs)
+        return self._bot.edit_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def reopen_forum_topic(self, *args, **kwargs) -> bool:
-        return self.updater.bot.reopen_forum_topic(*args, **kwargs)
+        return self._bot.reopen_forum_topic(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def set_chat_title(self, *args, **kwargs):
-        return self.updater.bot.set_chat_title(*args, **kwargs)
+        return self._bot.set_chat_title(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def set_chat_photo(self, *args, **kwargs):
-        return self.updater.bot.set_chat_photo(*args, **kwargs)
+        return self._bot.set_chat_photo(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def pin_chat_message(self, *args, **kwargs):
-        return self.updater.bot.pin_chat_message(*args, **kwargs)
+        return self._bot.pin_chat_message(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def set_chat_description(self, *args, **kwargs):
-        return self.updater.bot.set_chat_description(*args, **kwargs)
+        return self._bot.set_chat_description(*args, **kwargs)
 
     def polling(self, drop_pending_updates: bool = False):
         """

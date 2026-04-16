@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Optional, Dict, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import telegram
 import telegram.error
@@ -35,13 +35,12 @@ class AuxiliaryBot:
                  global_window: float = 1.0,
                  chat_limit: int = 20,
                  chat_window: float = 60.0):
-        kwargs = {}
+        kwargs: Dict[str, Any] = {}
         if base_url:
             kwargs['base_url'] = base_url
         if base_file_url:
             kwargs['base_file_url'] = base_file_url
         if request_kwargs:
-            # Match telegram.ext.Updater: pass a Request instance, not request_kwargs (PTB 13.11+).
             kwargs['request'] = Request(**request_kwargs)
 
         self.bot: telegram.Bot = telegram.Bot(token=token, **kwargs)

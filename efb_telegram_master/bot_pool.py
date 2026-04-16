@@ -189,18 +189,19 @@ class BotPool:
                 f"To reduce delay, please add {bot_links} to the group."
             )
 
-            self._bot_manager.updater.bot.send_message(
-                admin_id, text, parse_mode="HTML"
+            self._bot_manager.send_message(
+                admin_id, text=text, parse_mode="HTML"
             )
         except Exception as e:
             logger.warning("Failed to send auxiliary bot notification to admin: %s", e)
 
     def get_pool_stats(self) -> Dict:
         """Return per-bot status for monitoring/debugging."""
-        stats = {
+        bot_list: list[Dict] = []
+        stats: Dict = {
             'total_bots': len(self._bots),
             'active_bots': sum(1 for b in self._bots if not b.disabled),
-            'bots': []
+            'bots': bot_list
         }
         for bot in self._bots:
             bot_stats = {

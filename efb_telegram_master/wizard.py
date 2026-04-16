@@ -181,7 +181,10 @@ def input_bot_token(data: DataModel, default=None):
                 continue
         else:
             try:
-                Bot(ans, request=data.request).get_me()
+                bot_kwargs: dict = {"token": ans}
+                if data.request is not None:
+                    bot_kwargs["request"] = data.request
+                Bot(**bot_kwargs).get_me()
             except TelegramError as e:
                 print_wrapped(str(e))
                 print()
@@ -303,7 +306,10 @@ def setup_telegram_bot_commands_list(data):
 
     if answer == prompt_yes:
         print(_("Updating commands list..."), end="", flush=True)
-        Bot(data.data['token'], request=data.request).set_my_commands(
+        bot_kwargs: dict = {"token": data.data['token']}
+        if data.request is not None:
+            bot_kwargs["request"] = data.request
+        Bot(**bot_kwargs).set_my_commands(
             [
                 ("help", _("Show commands list.")),
                 ("link", _("Link a remote chat to a group.")),
