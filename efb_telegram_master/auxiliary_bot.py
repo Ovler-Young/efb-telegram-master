@@ -155,16 +155,25 @@ class AuxiliaryBot:
 
     def check_membership(self, chat_id: int) -> bool:
         """Return cached membership status. On cache miss, trigger a
-        background probe and return False (non-blocking)."""
+        background probe and return False (non-blocking).
+
+        Uses stale-while-revalidate: if cached value exists but is expired,
+        return the stale value while refreshing in the background. This avoids
+        false "not a member" results when all bots' caches expire simultaneously.
+        """
         with self._membership_lock:
             entry = self._membership_cache.get(chat_id)
             if entry is not None:
                 is_member, timestamp = entry
                 ttl = self.MEMBERSHIP_TTL_MEMBER if is_member else self.MEMBERSHIP_TTL_NOT_MEMBER
-                if time.time() - timestamp < ttl:
+                age = time.time() - timestamp
+                if age < ttl:
                     return is_member
+                # Stale but exists: return stale value, refresh in background
+                self._start_membership_probe(chat_id)
+                return is_member
 
-        # Cache miss or expired: trigger background probe
+        # True cache miss (never seen): trigger background probe
         self._start_membership_probe(chat_id)
         return False
 
