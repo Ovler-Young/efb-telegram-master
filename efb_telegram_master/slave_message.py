@@ -5,7 +5,6 @@ import itertools
 import logging
 import os
 import tempfile
-import threading
 import traceback
 import urllib.parse
 from collections import defaultdict
@@ -56,6 +55,18 @@ class SlaveMessageProcessor(LocaleMixin):
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
 
+    def _get_edit_context(self, msg: Message):
+        """Get a context manager for routing edits through the correct bot.
+        Returns the bot_manager's _using_bot context manager if sender_bot_id is set,
+        otherwise returns a no-op context manager."""
+        from contextlib import nullcontext
+        _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+        if _sender_bot_id and self.bot.bot_pool:
+            aux_bot = self.bot.bot_pool.get_bot_by_id(_sender_bot_id)
+            if aux_bot and not aux_bot.disabled:
+                return self.bot._using_bot(aux_bot.bot)
+        return nullcontext()
+
     def is_silent(self, msg: Message) -> Optional[bool]:
         """Determine if a message shall be sent silently.
         Returns None if the message shall not be sent at all.
@@ -105,10 +116,12 @@ class SlaveMessageProcessor(LocaleMixin):
 
             # When editing message
             old_msg_id: Optional[OldMsgID] = None
+            _edit_sender_bot_id: Optional[str] = None
             if msg.edit:
                 old_msg = self.db.get_msg_log(slave_msg_id=msg.uid,
                                               slave_origin_uid=utils.chat_id_to_str(chat=msg.chat))
                 if old_msg:
+                    _edit_sender_bot_id = old_msg.sender_bot_id
 
                     if old_msg.master_msg_id_alt:
                         old_msg_id = utils.message_id_str_to_id(old_msg.master_msg_id_alt)
@@ -118,6 +131,11 @@ class SlaveMessageProcessor(LocaleMixin):
                     self.logger.info('[%s] Was supposed to edit this message, '
                                      'but it does not exist in database. Sending new message instead.',
                                      msg.uid)
+
+            # Store sender_bot_id for routing edits to the correct bot
+            if _edit_sender_bot_id:
+                msg.vendor_specific = msg.vendor_specific or {}
+                msg.vendor_specific['_sender_bot_id'] = _edit_sender_bot_id
 
             self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
         except Exception as e:
@@ -237,14 +255,41 @@ class SlaveMessageProcessor(LocaleMixin):
                 commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
             ))
 
-        self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
-                          xid, tg_msg.chat.id, tg_msg.message_id)
+        # Check if message sending failed (tg_msg is None)
+        if tg_msg is None:
+            self.logger.warning("[%s] Message sending returned None, skipping database logging. "
+                               "This may happen during shutdown or when Telegram API is unavailable.", xid)
+            return
 
-        etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
-        etm_msg.type_telegram = get_msg_type(tg_msg)
-        etm_msg.put_telegram_file(tg_msg)
-        self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id)
-        # self.logger.debug("[%s] Message inserted/updated to the database.", xid)
+        # Check if this is a delayed execution (mock message)
+        if hasattr(tg_msg, '_delayed_execution_pending') and tg_msg._delayed_execution_pending:
+            # This is a delayed execution - defer database logging
+            self.logger.debug("[%s] Message execution is delayed (task_id: %s), deferring database logging.",
+                             xid, getattr(tg_msg, 'task_id', 'unknown'))
+
+            # Prepare ETM message for later database update
+            etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
+
+            # Register the delayed database update
+            if hasattr(tg_msg, 'task_id'):
+                self.bot.register_delayed_database_update(tg_msg.task_id, etm_msg, old_msg_id)
+            else:
+                self.logger.warning("[%s] Delayed message missing task_id, cannot register database update", xid)
+        else:
+            # Normal execution - log to database immediately
+            self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
+                              xid, tg_msg.chat.id, tg_msg.message_id)
+
+            etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
+            etm_msg.type_telegram = get_msg_type(tg_msg)
+            etm_msg.put_telegram_file(tg_msg)
+
+            # Capture sender_bot_id annotated by rate_limit_decorator
+            sender_bot_id = getattr(tg_msg, '_sender_bot_id', None)
+
+            self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id,
+                                              sender_bot_id=sender_bot_id)
+            # self.logger.debug("[%s] Message inserted/updated to the database.", xid)
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
         """Get the Telegram destination of a message with its header.
@@ -355,6 +400,8 @@ class SlaveMessageProcessor(LocaleMixin):
 
         text = self.html_substitutions(msg)
 
+        _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+
         if not old_msg_id:
             tg_msg = self.bot.send_message(tg_dest,
                                            text=text, prefix=msg_template, suffix=reactions,
@@ -365,11 +412,14 @@ class SlaveMessageProcessor(LocaleMixin):
                                            disable_notification=silent)
         else:
             # Cannot change reply_to_message_id when editing a message
-            tg_msg = self.bot.edit_message_text(chat_id=old_msg_id[0],
-                                                message_id=old_msg_id[1],
-                                                text=text, prefix=msg_template, suffix=reactions,
-                                                parse_mode='HTML',
-                                                reply_markup=reply_markup)
+            edit_kwargs = dict(chat_id=old_msg_id[0],
+                               message_id=old_msg_id[1],
+                               text=text, prefix=msg_template, suffix=reactions,
+                               parse_mode='HTML',
+                               reply_markup=reply_markup)
+            if _sender_bot_id:
+                edit_kwargs['_sender_bot_id'] = _sender_bot_id
+            tg_msg = self.bot.edit_message_text(**edit_kwargs)
 
         self.logger.debug("[%s] Processed and sent as text message", msg.uid)
         return tg_msg
@@ -396,9 +446,13 @@ class SlaveMessageProcessor(LocaleMixin):
         if msg.text:
             text += "\n\n" + self.html_substitutions(msg)
         if old_msg_id:
-            return self.bot.edit_message_text(text=text, chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                              prefix=msg_template, suffix=reactions, parse_mode='HTML',
-                                              reply_markup=reply_markup)
+            _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+            edit_kwargs = dict(text=text, chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                               prefix=msg_template, suffix=reactions, parse_mode='HTML',
+                               reply_markup=reply_markup)
+            if _sender_bot_id:
+                edit_kwargs['_sender_bot_id'] = _sender_bot_id
+            return self.bot.edit_message_text(**edit_kwargs)
         else:
             return self.bot.send_message(chat_id=tg_dest,
                                          text=text,
@@ -490,21 +544,22 @@ class SlaveMessageProcessor(LocaleMixin):
 
             if old_msg_id:
                 try:
-                    if edit_media:
-                        assert msg.path
-                        media: InputMedia
-                        file = self.process_file_obj(msg.file, msg.path)
-                        if send_as_file:
-                            media = InputMediaDocument(file)
-                        else:
-                            media = InputMediaPhoto(file)
-                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=media,
-                                                    reply_markup=reply_markup)
-                        if not text:
-                            return res
-                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                         reply_markup=reply_markup,
-                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                    with self._get_edit_context(msg):
+                        if edit_media:
+                            assert msg.path
+                            media: InputMedia
+                            file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                            if send_as_file:
+                                media = InputMediaDocument(file)
+                            else:
+                                media = InputMediaPhoto(file)
+                            res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=media,
+                                                        reply_markup=reply_markup)
+                            if not text:
+                                return res
+                        return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                             reply_markup=reply_markup,
+                                                             prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
                 except telegram.error.BadRequest as e:
                     self.logger.warning("[%s] Failed to edit media/caption (BadRequest: %s). Sending new message instead.", msg.uid, e)
                     # Send as a reply if cannot edit previous message.
@@ -517,7 +572,7 @@ class SlaveMessageProcessor(LocaleMixin):
             # Sending new message (either initially or as fallback from edit)
             if send_as_file:
                 assert msg.path
-                file = self.process_file_obj(msg.file, msg.path)
+                file = self.process_file_obj(msg.file, msg.path, msg.filename)
                 return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
                                               caption=text, parse_mode="HTML", filename=msg.filename,
                                               reply_to_message_id=target_msg_id,
@@ -527,7 +582,7 @@ class SlaveMessageProcessor(LocaleMixin):
             else:
                 try:
                     assert msg.path
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     return self.bot.send_photo(tg_dest, file, prefix=msg_template, suffix=reactions,
                                                caption=text, parse_mode="HTML",
                                                reply_to_message_id=target_msg_id,
@@ -539,7 +594,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                       msg.uid, e)
                     assert msg.path
                     msg.file.seek(0) # Rewind file pointer
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
                                                   caption=text, parse_mode="HTML", filename=msg.filename,
                                                   reply_to_message_id=target_msg_id,
@@ -549,6 +604,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_animation(self, msg: Message, tg_dest: TelegramChatID,
                                 thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -585,22 +641,23 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                if edit_media:
-                    assert msg.file and msg.path
-                    file = self.process_file_obj(msg.file, msg.path)
-                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaAnimation(file),
-                                                reply_markup=reply_markup)
-                    if not text:
-                        return res
-                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                     prefix=msg_template, suffix=reactions,
-                                                     reply_markup=reply_markup,
-                                                     caption=text, parse_mode="HTML")
+                with self._get_edit_context(msg):
+                    if edit_media:
+                        assert msg.file and msg.path
+                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaAnimation(file),
+                                                    reply_markup=reply_markup)
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                         prefix=msg_template, suffix=reactions,
+                                                         reply_markup=reply_markup,
+                                                         caption=text, parse_mode="HTML")
             else:
                 assert msg.file and msg.path
-                file = self.process_file_obj(msg.file, msg.path)
-                file_: Union[IO[bytes], bytes] = open(file, 'rb') if isinstance(file, str) else file
-                return self.bot.send_animation(tg_dest, InputFile(file_, filename=msg.filename),
+                file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                anim_file: Union[IO[bytes], str] = file if isinstance(file, str) else InputFile(file, filename=msg.filename)
+                return self.bot.send_animation(tg_dest, anim_file,
                                                prefix=msg_template, suffix=reactions,
                                                caption=text, parse_mode="HTML",
                                                reply_to_message_id=target_msg_id,
@@ -610,6 +667,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file is not None:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_sticker(self, msg: Message, tg_dest: TelegramChatID,
                               thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -632,14 +690,18 @@ class SlaveMessageProcessor(LocaleMixin):
             if msg.edit_media and old_msg_id is not None:
                  if old_msg_id[0] == str(tg_dest):
                     target_msg_id = old_msg_id[1] # Set reply target to the message being "edited"
-                 old_msg_id = None # Force sending a new message
+                 old_msg_id = None  # Force sending new message below
 
             # If not editing media, but have old_msg_id, try editing reply_markup (e.g., for reactions)
             if old_msg_id and not msg.edit_media:
                 try:
+                    _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+                    edit_kwargs = dict(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                       reply_markup=sticker_reply_markup)
+                    if _sender_bot_id:
+                        edit_kwargs['_sender_bot_id'] = _sender_bot_id
                     # Editing reply markup doesn't involve thread_id
-                    return self.bot.edit_message_reply_markup(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                              reply_markup=sticker_reply_markup)
+                    return self.bot.edit_message_reply_markup(**edit_kwargs)
                 except TelegramError:
                     return self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1],
                                                  prefix=msg_template, text=msg.text, suffix=reactions,
@@ -668,10 +730,10 @@ class SlaveMessageProcessor(LocaleMixin):
 
                 try:
                     pic_img: Image = Image.open(msg.file)
-                    webp_img = tempfile.NamedTemporaryFile(suffix='.webp')
+                    webp_img = tempfile.NamedTemporaryFile(suffix='.webp', dir=utils.ExperimentalFlagsManager.get_temp_dir(self.channel))
                     pic_img.convert("RGBA").save(webp_img, 'webp')
                     webp_img.seek(0)
-                    file = self.process_file_obj(webp_img, webp_img.name)
+                    file = self.process_file_obj(webp_img, webp_img.name, msg.filename)
                     return self.bot.send_sticker(tg_dest, file, reply_markup=sticker_reply_markup,
                                                  message_thread_id=thread_id,
                                                  reply_to_message_id=target_msg_id,
@@ -679,7 +741,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 except IOError:
                     self.logger.warning("[%s] Failed to convert image to webp sticker, sending as document.", msg.uid)
                     assert msg.file and msg.path
-                    file = self.process_file_obj(msg.file, msg.path)
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
                                                   message_thread_id=thread_id,
                                                   caption=msg.text, filename=msg.filename,
@@ -692,6 +754,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file and not msg.file.closed:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     @staticmethod
     def build_chat_info_inline_keyboard(msg: Message, msg_template: str, reactions: str,
@@ -763,18 +826,19 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                if edit_media:
-                    assert msg.file is not None and msg.path is not None
-                    file = self.process_file_obj(msg.file, msg.path)
-                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaDocument(file))
-                    if not text:
-                        return res
-                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
-                                                     prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                with self._get_edit_context(msg):
+                    if edit_media:
+                        assert msg.file is not None and msg.path is not None
+                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaDocument(file))
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
+                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
             assert msg.file is not None and msg.path is not None
             self.logger.debug("[%s] Uploading file %s (%s) as %s", msg.uid,
                               msg.file.name, msg.mime, file_name)
-            file = self.process_file_obj(msg.file, msg.path)
+            file = self.process_file_obj(msg.file, msg.path, file_name)
             return self.bot.send_document(tg_dest, file,
                                           prefix=msg_template, suffix=reactions,
                                           caption=text, parse_mode="HTML", filename=file_name,
@@ -785,6 +849,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file is not None:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_voice(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -821,20 +886,21 @@ class SlaveMessageProcessor(LocaleMixin):
                     msg_template += " " + self._("[Edited]")
                     if str(tg_dest) == old_msg_id[0]:
                         target_msg_id = target_msg_id or old_msg_id[1]
-                    old_msg_id = None # Force sending new message below
+                    old_msg_id = None
                 else:
-                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                         reply_markup=reply_markup, prefix=msg_template,
-                                                         suffix=reactions, caption=text, parse_mode="HTML")
+                    with self._get_edit_context(msg):
+                        return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                             reply_markup=reply_markup, prefix=msg_template,
+                                                             suffix=reactions, caption=text, parse_mode="HTML")
             # Sending new message (initial or fallback)
             if not old_msg_id: # Ensure we are in the 'send new' path
                 assert msg.file is not None
-                with tempfile.NamedTemporaryFile(suffix=".ogg") as f: # Ensure correct suffix for pydub
+                with tempfile.NamedTemporaryFile(suffix=".ogg", dir=utils.ExperimentalFlagsManager.get_temp_dir(self.channel)) as f: # Ensure correct suffix for pydub
                     try:
                         pydub.AudioSegment.from_file(msg.file).export(f.name, format="ogg", codec="libopus",
                                                                       parameters=['-vbr', 'on'])
                         # process_file_obj might return URI or file object. send_voice expects content or path.
-                        processed_path = self.process_file_obj(f, f.name) # Get path/URI
+                        processed_path = self.process_file_obj(f, f.name, msg.filename) # Get path/URI
                         # Send using the path/URI
                         tg_msg = self.bot.send_voice(tg_dest, processed_path, prefix=msg_template, suffix=reactions,
                                                      caption=text, parse_mode="HTML",
@@ -853,6 +919,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file is not None:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_location(self, msg: Message, tg_dest: TelegramChatID,
                                thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -923,17 +990,18 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                if edit_media:
-                    assert msg.file is not None and msg.path is not None
-                    file = self.process_file_obj(msg.file, msg.path)
-                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaVideo(file),
-                                                reply_markup=reply_markup)
-                    if not text:
-                        return res
-                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
-                                                     prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                with self._get_edit_context(msg):
+                    if edit_media:
+                        assert msg.file is not None and msg.path is not None
+                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaVideo(file),
+                                                    reply_markup=reply_markup)
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
+                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
             assert msg.file is not None and msg.path is not None
-            file = self.process_file_obj(msg.file, msg.path)
+            file = self.process_file_obj(msg.file, msg.path, msg.filename)
             return self.bot.send_video(tg_dest, file, prefix=msg_template, suffix=reactions,
                                        caption=text, parse_mode="HTML",
                                        reply_to_message_id=target_msg_id,
@@ -943,6 +1011,7 @@ class SlaveMessageProcessor(LocaleMixin):
         finally:
             if msg.file is not None:
                 msg.file.close()
+            self._cleanup_pending_local_api_files()
 
     def slave_message_unsupported(self, msg: Message, tg_dest: TelegramChatID,
                                   thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -958,21 +1027,26 @@ class SlaveMessageProcessor(LocaleMixin):
         else:
             text = ""
 
+        _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
+
         if not old_msg_id:
             tg_msg = self.bot.send_message(tg_dest,
                                            text=text, parse_mode="HTML",
                                            prefix=msg_template + " " + self._("(unsupported)"),
                                            suffix=reactions,
-                                           reply_to_message_id=target_msg_id, message_thread_id=thread_id, reply_markup=reply_markup,
+                                           reply_to_message_id=target_msg_id, message_thread_id=thread_id,                                            reply_markup=reply_markup,
                                            disable_notification=silent)
         else:
             # Cannot change reply_to_message_id or thread_id when editing a message
-            tg_msg = self.bot.edit_message_text(chat_id=old_msg_id[0],
-                                                message_id=old_msg_id[1],
-                                                text=text, parse_mode="HTML",
-                                                prefix=msg_template + " " + self._("(unsupported) [Edited]"), # Mark as edited
-                                                suffix=reactions,
-                                                reply_markup=reply_markup)
+            edit_kwargs = dict(chat_id=old_msg_id[0],
+                               message_id=old_msg_id[1],
+                               text=text, parse_mode="HTML",
+                               prefix=msg_template + " " + self._("(unsupported) [Edited]"),  # Mark as edited
+                               suffix=reactions,
+                               reply_markup=reply_markup)
+            if _sender_bot_id:
+                edit_kwargs['_sender_bot_id'] = _sender_bot_id
+            tg_msg = self.bot.edit_message_text(**edit_kwargs)
 
         self.logger.debug("[%s] Processed and sent as text message", msg.uid)
         return tg_msg
@@ -1021,7 +1095,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                   *old_msg_id)
                 try:
                     if not self.channel.flag('prevent_message_removal'):
-                        self.bot.delete_message(*old_msg_id)
+                        self.bot.delete_message(*old_msg_id,
+                                                _sender_bot_id=old_msg.sender_bot_id)
                         return
                 except TelegramError as e:
                     self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
@@ -1029,7 +1104,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.bot.send_message(chat_id=old_msg_id[0],
                                       text=self._("Message is removed in remote chat."),
                                       reply_to_message_id=old_msg_id[1],
-                                      disable_notification=True) # Probably silent notification
+                                      disable_notification=True)  # Probably silent notification
             else:
                 self.logger.info('Was supposed to delete a message, '
                                  'but it does not exist in database: %s', status)
@@ -1059,15 +1134,25 @@ class SlaveMessageProcessor(LocaleMixin):
 
         old_msg: ETMMsg = old_msg_db.build_etm_msg(chat_manager=self.chat_manager)
         old_msg.reactions = status.reactions
-        old_msg.edit = True # Mark as edit so dispatch knows it's an update
-        old_msg.edit_media = False # Ensure media is not considered edited
+        old_msg.edit = True  # Mark as edit so dispatch knows it's an update
+        old_msg.edit_media = False  # Ensure media is not considered edited
 
-        msg_template, _ = self.get_slave_msg_dest(old_msg)
+        # Thread sender_bot_id for routing edits to the correct bot
+        if old_msg_db.sender_bot_id:
+            old_msg.vendor_specific = old_msg.vendor_specific or {}
+            old_msg.vendor_specific['_sender_bot_id'] = old_msg_db.sender_bot_id
+
+        msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(old_msg)
+        if tg_dest is None:
+            self.logger.error('Cannot update reactions for message %s from %s: destination not found.',
+                              status.msg_id, status.chat)
+            return
+
         effective_msg = old_msg_db.master_msg_id_alt or old_msg_db.master_msg_id
         chat_id, msg_id = utils.message_id_str_to_id(effective_msg)
 
         # Go through the ordinary update process
-        self.dispatch_message(old_msg, msg_template, old_msg_id=(chat_id, msg_id), tg_dest=chat_id)
+        self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
 
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name
@@ -1121,7 +1206,114 @@ class SlaveMessageProcessor(LocaleMixin):
                 size=size_str, max_size=max_size_str)
         return None
 
-    def process_file_obj(self, file: IO[bytes], path: Union[str, Path]) -> Union[IO[bytes], str]:
+    def process_file_obj(self, file: IO[bytes], path: Union[str, Path], filename: Optional[str] = None) -> Union[IO[bytes], str]:
+        """Process file object for sending to Telegram.
+
+        When using local TDLIB API, files need to be accessible by the Docker container.
+        If local_tdlib_temp_dir is configured and the file is outside that directory,
+        the file will be copied to the shared directory first.
+
+        Args:
+            file: The file object
+            path: Path to the file
+            filename: Optional original filename to preserve when copying
+
+        Returns:
+            file:// URI if using local TDLIB API, otherwise the file object
+        """
         if self.channel.flag("local_tdlib_api"):
-            return Path(path).absolute().as_uri()
+            abs_path = Path(path).absolute()
+            temp_dir = utils.ExperimentalFlagsManager.get_temp_dir(self.channel)
+
+            # If we have a shared temp dir configured, check if file needs to be copied
+            if temp_dir:
+                temp_dir_path = Path(temp_dir)
+                # Check if the file is already in the shared directory
+                try:
+                    abs_path.relative_to(temp_dir_path)
+                    # File is already in shared dir, use it directly
+                except ValueError:
+                    # File is outside shared dir, need to copy it
+                    import shutil
+                    import tempfile as tmp
+
+                    # Determine extension from filename or guess from magic bytes
+                    suffix = ''
+                    if filename:
+                        # Extract extension from original filename
+                        suffix = Path(filename).suffix
+
+                    if not suffix:
+                        # Fall back to guessing from file path
+                        suffix = abs_path.suffix
+
+                    if not suffix:
+                        # Last resort: guess from magic bytes
+                        file.seek(0)
+                        head = file.read(16)
+                        file.seek(0)
+                        if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+                            suffix = '.webp'
+                        elif head[:8] == b'\x89PNG\r\n\x1a\n':
+                            suffix = '.png'
+                        elif head[:2] == b'\xff\xd8':
+                            suffix = '.jpg'
+                        elif head[:6] in (b'GIF87a', b'GIF89a'):
+                            suffix = '.gif'
+                        elif head[4:8] == b'ftyp':
+                            suffix = '.mp4'
+                        elif head[:4] == b'OggS':
+                            suffix = '.ogg'
+                        elif head[:4] == b'%PDF':
+                            suffix = '.pdf'
+
+                    # Use original filename if provided, otherwise generate temp name
+                    if filename:
+                        # Sanitize filename to avoid path traversal
+                        safe_filename = os.path.basename(filename)
+                        dest_path = os.path.join(temp_dir, safe_filename)
+                        # If file already exists, add a unique suffix
+                        if os.path.exists(dest_path):
+                            import uuid
+                            name_parts = os.path.splitext(safe_filename)
+                            safe_filename = f"{name_parts[0]}_{uuid.uuid4().hex[:8]}{name_parts[1]}"
+                            dest_path = os.path.join(temp_dir, safe_filename)
+                    else:
+                        with tmp.NamedTemporaryFile(suffix=suffix, dir=temp_dir, delete=False) as dest:
+                            dest_path = dest.name
+
+                    # Copy file content
+                    file.seek(0)
+                    with open(dest_path, 'wb') as dest:
+                        shutil.copyfileobj(file, dest)
+
+                    # Set permissions to 644 so Docker container can read
+                    os.chmod(dest_path, 0o644)
+
+                    abs_path = Path(dest_path)
+                    self.logger.debug("Copied file from %s to shared temp dir: %s (original filename: %s)",
+                                      path, dest_path, filename or "N/A")
+
+                    # Track copied file for cleanup after send completes
+                    # Store on bot_manager's thread-local so delayed task scheduling can pick them up
+                    tls = self.bot._cleanup_tls
+                    if not hasattr(tls, 'pending_cleanup'):
+                        tls.pending_cleanup = []
+                    tls.pending_cleanup.append(dest_path)
+
+            return abs_path.as_uri()
         return file
+
+    def _cleanup_pending_local_api_files(self):
+        """Delete temp files copied to shared dir for local Bot API sends in this thread.
+        Only cleans up files that were NOT already claimed by a delayed task."""
+        tls = self.bot._cleanup_tls
+        pending = getattr(tls, 'pending_cleanup', [])
+        for path in pending:
+            try:
+                os.unlink(path)
+                self.logger.debug("Cleaned up local API temp file: %s", path)
+            except OSError as e:
+                self.logger.warning("Failed to clean up local API temp file %s: %s", path, e)
+        tls.pending_cleanup = []
+

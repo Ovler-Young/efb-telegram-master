@@ -195,6 +195,22 @@ class TelegramChannel(MasterChannel):
                     raise ValueError(self._('Admin ID is expected to be an int, but {data} is found.')
                                      .format(data=data['admins'][i]))
 
+            # Validate auxiliary_bots config
+            aux_bots = data.get('auxiliary_bots', [])
+            if aux_bots:
+                if not isinstance(aux_bots, list):
+                    raise ValueError(self._('auxiliary_bots must be a list.'))
+                main_token = data['token']
+                seen_tokens = {main_token}
+                for idx, entry in enumerate(aux_bots):
+                    if not isinstance(entry, dict) or not isinstance(entry.get('token'), str):
+                        raise ValueError(
+                            self._('auxiliary_bots[{idx}] must have a "token" string.').format(idx=idx))
+                    if entry['token'] in seen_tokens:
+                        raise ValueError(
+                            self._('Duplicate token found in auxiliary_bots[{idx}].').format(idx=idx))
+                    seen_tokens.add(entry['token'])
+
             self.config = data.copy()
 
     def info(self, update: Update, context: CallbackContext):

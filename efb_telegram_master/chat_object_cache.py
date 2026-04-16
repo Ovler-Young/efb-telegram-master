@@ -37,7 +37,7 @@ class ChatObjectCacheManager:
                 self.logger.debug("Loading chats from '%s'...", channel_id)
                 chats = module.get_chats()
             except Exception:
-                self.logger.exception("Error occurred while getting chats from %. "
+                self.logger.exception("Error occurred while getting chats from %s. "
                                       "ETM will report no chat from this channel until further noticed.", channel_id)
                 continue
             self.logger.debug("Found %s chats from '%s'.", len(chats), channel_id)
