@@ -221,7 +221,7 @@ class TelegramChannel(MasterChannel):
         assert isinstance(update, Update)
         assert isinstance(update.effective_message, Message)
         if update.effective_message.chat.type != telegram.Chat.PRIVATE:  # Group message
-            if update.effective_chat.is_forum:
+            if update.effective_chat and update.effective_chat.is_forum:
                 msg = self.info_topic(update)
             else:
                 msg = self.info_group(update)
@@ -242,25 +242,25 @@ class TelegramChannel(MasterChannel):
         assert isinstance(update, Update)
         assert isinstance(update.effective_message, Message)
 
-        links = self.db.get_topic_slaves(topic_chat_id=update.effective_message.chat_id)
+        topic_links = self.db.get_topic_slaves(topic_chat_id=TelegramChatID(update.effective_message.chat_id))
         thread_id = update.effective_message.message_thread_id
+        chat_ids: List[EFBChannelChatIDStr] = []
         if thread_id:
-            chat = None
-            for (dest, topic_id) in links:
-                if topic_id == thread_id:
-                    chat = dest
-                    break
-            if chat is None:
+            if topic_links:
+                for (dest, topic_id) in topic_links:
+                    if topic_id == thread_id:
+                        chat_ids = [dest]
+                        break
+            if not chat_ids:
                 return "This chat is not managed by this bot"
-            else:
-                links = [chat]
         else:
-            links = [c for c, t in links]
+            if topic_links:
+                chat_ids = [c for c, t in topic_links]
 
         msg = self._("The topic {topic_name} ({topic_id}) is linked to:").format(
             topic_name=update.effective_message.chat.title,
             topic_id=update.effective_message.chat_id)
-        msg += self.build_link_chats_info_str(links)
+        msg += self.build_link_chats_info_str(chat_ids)
         return msg
 
     def info_general(self):

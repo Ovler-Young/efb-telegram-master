@@ -237,17 +237,17 @@ class ChatBindingManager(LocaleMixin):
                 if topic:
                     slave_origin_uid = self.db.get_topic_slave(
                         topic_chat_id=TelegramChatID(message.chat_id),
-                        message_thread_id=topic
+                        message_thread_id=TelegramTopicID(topic)
                     )
                     if slave_origin_uid:
                         channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_origin_uid)
-                        chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
-                        tg_chat_id = TelegramChatID(message.chat_id)
-                        tg_msg_id = TelegramMessageID(message.reply_text(self._("Processing...")).message_id)
-                        storage_id: Tuple[TelegramChatID, TelegramMessageID] = (tg_chat_id, tg_msg_id)
-                        self.link_handler.conversations[storage_id] = Flags.LINK_EXEC
-                        self.msg_storage[storage_id] = ChatListStorage([chat])
-                        return self.build_link_action_message(chat, tg_chat_id, tg_msg_id)
+                        topic_chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
+                        topic_tg_chat_id = TelegramChatID(message.chat_id)
+                        topic_tg_msg_id = TelegramMessageID(message.reply_text(self._("Processing...")).message_id)
+                        topic_storage_id: Tuple[TelegramChatID, TelegramMessageID] = (topic_tg_chat_id, topic_tg_msg_id)
+                        self.link_handler.conversations[topic_storage_id] = Flags.LINK_EXEC
+                        self.msg_storage[topic_storage_id] = ChatListStorage([topic_chat])
+                        return self.build_link_action_message(topic_chat, topic_tg_chat_id, topic_tg_msg_id)
 
         if message.chat.type != telegram.Chat.PRIVATE:
             links = self.db.get_chat_assoc(
@@ -984,7 +984,7 @@ class ChatBindingManager(LocaleMixin):
             try:
                 current_thread_id = update.effective_message.message_thread_id
                 success, message, updated_count = self._update_forum_group_info(
-                    TelegramChatID(tg_chat.id), current_thread_id
+                    TelegramChatID(tg_chat.id), TelegramTopicID(current_thread_id) if current_thread_id else None
                 )
                 if success:
                     update.effective_message.reply_text(message)
@@ -1056,7 +1056,7 @@ class ChatBindingManager(LocaleMixin):
             if pic_resized and getattr(pic_resized, 'close', None):
                 pic_resized.close()
 
-    def _get_chat_info_and_picture(self, chat: ETMChatType, channel: Channel) -> Tuple[Optional[str], Optional[IO], Optional[IO]]:
+    def _get_chat_info_and_picture(self, chat: ETMChatType, channel: SlaveChannel) -> Tuple[Optional[str], Optional[IO], Optional[IO]]:
         """
         Get chat description and picture with proper processing.
 
@@ -1150,7 +1150,7 @@ class ChatBindingManager(LocaleMixin):
         picture = None
         pic_resized = None
         try:
-            channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
+            channel_id, chat_uid, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(slave_uid))
             if channel_id not in coordinator.slaves:
                 self.logger.warning(f"Channel linked ({channel_id}) is not found.")
                 return False
@@ -1252,7 +1252,7 @@ class ChatBindingManager(LocaleMixin):
             return self.bot.reply_error(update, self._("No topic found."))
         slave_origin_uid = self.db.get_topic_slave(
             topic_chat_id=TelegramChatID(update.effective_message.chat_id),
-            message_thread_id=thread_id
+            message_thread_id=TelegramTopicID(thread_id) if thread_id else None
         )
         if not slave_origin_uid:
             return self.bot.reply_error(update, self._("This topic is not managed by this bot. Update failed"))
@@ -1301,7 +1301,7 @@ class ChatBindingManager(LocaleMixin):
         for i in chats:
             self.create_topic(slave_uid=i, telegram_chat_id=TelegramChatID(message.chat.id))
 
-    def create_topic(self, slave_uid: EFBChannelChatIDStr, telegram_chat_id: TelegramChatID) -> TelegramTopicID:
+    def create_topic(self, slave_uid: EFBChannelChatIDStr, telegram_chat_id: TelegramChatID) -> Optional[TelegramTopicID]:
         thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
         if not thread_id:
             with self._topic_mutex:
@@ -1391,7 +1391,7 @@ class ChatBindingManager(LocaleMixin):
             self.logger.info("Migrating %s historical messages for chat %s", len(recent_messages), slave_chat_id)
 
             # Process messages in chronological order with mixed approach
-            current_text_batch = []
+            current_text_batch: list[str] = []
             current_length = 0
 
             for i, msg_log in enumerate(recent_messages):

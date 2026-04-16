@@ -146,8 +146,8 @@ class SlaveMessageProcessor(LocaleMixin):
                             chat_id=tg_dest,
                             message_thread_id=thread_id
                         )
-                    except telegram.error.BadRequest as e:
-                        self.logger.error('Failed to reopen topic, Reason: %s', e)
+                    except telegram.error.BadRequest as reopen_err:
+                        self.logger.error('Failed to reopen topic, Reason: %s', reopen_err)
                         self.db.remove_topic_assoc(
                             topic_chat_id=tg_dest,
                             message_thread_id=thread_id,
@@ -375,7 +375,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                           old_msg_id: OldMsgID = None,
+                           old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
                            reply_markup: Optional[ReplyMarkup] = None,
                            silent: bool = False) -> telegram.Message:
@@ -426,7 +426,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_link(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                           old_msg_id: OldMsgID = None,
+                           old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
                            reply_markup: Optional[ReplyMarkup] = None,
                            silent: bool = False) -> telegram.Message:
@@ -475,7 +475,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_image(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                            old_msg_id: OldMsgID = None,
+                            old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
                             reply_markup: Optional[ReplyMarkup] = None,
                             silent: bool = False) -> telegram.Message:
@@ -608,10 +608,10 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_animation(self, msg: Message, tg_dest: TelegramChatID,
                                 thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                                old_msg_id: OldMsgID = None,
+                                old_msg_id: Optional[OldMsgID] = None,
                                 target_msg_id: Optional[TelegramMessageID] = None,
                                 reply_markup: Optional[ReplyMarkup] = None,
-                                silent: bool = None) -> telegram.Message:
+                                silent: Optional[bool] = None) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO, message_thread_id=thread_id) # UPLOAD_VIDEO_NOTE might be better?
 
         self.logger.debug("[%s] Message is an Animation; Path: %s; MIME: %s", msg.uid, msg.path, msg.mime)
@@ -656,7 +656,7 @@ class SlaveMessageProcessor(LocaleMixin):
             else:
                 assert msg.file and msg.path
                 file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                anim_file: Union[IO[bytes], str] = file if isinstance(file, str) else InputFile(file, filename=msg.filename)
+                anim_file = file if isinstance(file, str) else InputFile(file, filename=msg.filename or "")
                 return self.bot.send_animation(tg_dest, anim_file,
                                                prefix=msg_template, suffix=reactions,
                                                caption=text, parse_mode="HTML",
@@ -671,7 +671,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_sticker(self, msg: Message, tg_dest: TelegramChatID,
                               thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                              old_msg_id: OldMsgID = None,
+                              old_msg_id: Optional[OldMsgID] = None,
                               target_msg_id: Optional[TelegramMessageID] = None,
                               reply_markup: Optional[InlineKeyboardMarkup] = None,
                               silent: bool = False) -> telegram.Message:
@@ -778,7 +778,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_file(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                           old_msg_id: OldMsgID = None,
+                           old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
                            reply_markup: Optional[ReplyMarkup] = None,
                            silent: bool = False) -> telegram.Message:
@@ -853,7 +853,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_voice(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                            old_msg_id: OldMsgID = None,
+                            old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
                             reply_markup: Optional[ReplyMarkup] = None,
                             silent: bool = False) -> telegram.Message:
@@ -915,7 +915,7 @@ class SlaveMessageProcessor(LocaleMixin):
                         return self.slave_message_file(msg, tg_dest, thread_id, msg_template, reactions,
                                                        old_msg_id=None, # Ensure it sends as new
                                                        target_msg_id=target_msg_id, reply_markup=reply_markup, silent=silent)
-            return tg_msg
+            raise RuntimeError("Unreachable: voice message send path not entered")
         finally:
             if msg.file is not None:
                 msg.file.close()
@@ -923,7 +923,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_location(self, msg: Message, tg_dest: TelegramChatID,
                                thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                               old_msg_id: OldMsgID = None,
+                               old_msg_id: Optional[OldMsgID] = None,
                                target_msg_id: Optional[TelegramMessageID] = None,
                                reply_markup: Optional[InlineKeyboardMarkup] = None,
                                silent: bool = False) -> telegram.Message:
@@ -955,7 +955,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_video(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                            old_msg_id: OldMsgID = None,
+                            old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
                             reply_markup: Optional[ReplyMarkup] = None,
                             silent: bool = False) -> telegram.Message:
@@ -1015,7 +1015,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def slave_message_unsupported(self, msg: Message, tg_dest: TelegramChatID,
                                   thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                                  old_msg_id: OldMsgID = None,
+                                  old_msg_id: Optional[OldMsgID] = None,
                                   target_msg_id: Optional[TelegramMessageID] = None,
                                   reply_markup: Optional[ReplyMarkup] = None,
                                   silent: bool = False) -> telegram.Message:

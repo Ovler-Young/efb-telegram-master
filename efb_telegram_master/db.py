@@ -505,7 +505,7 @@ class DatabaseManager:
         return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
 
     @staticmethod
-    def get_topic_thread_id(slave_uid: EFBChannelChatIDStr, topic_chat_id: TelegramChatID=None) -> Optional[TelegramTopicID]:
+    def get_topic_thread_id(slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
         """
         Get topic association (topic link) information.
         Only one parameter is to be provided.
@@ -529,7 +529,8 @@ class DatabaseManager:
             if assoc:
                 return TelegramTopicID(int(assoc.message_thread_id))
         except DoesNotExist:
-            return None
+            pass
+        return None
 
     @staticmethod
     def get_topic_slave(topic_chat_id: TelegramChatID,
@@ -573,7 +574,7 @@ class DatabaseManager:
         try:
             query = TopicAssoc.select(TopicAssoc.slave_uid, TopicAssoc.message_thread_id)\
                 .where(TopicAssoc.topic_chat_id == topic_chat_id).order_by(TopicAssoc.id.desc())
-            return [(row.slave_uid, int(row.message_thread_id)) for row in query]
+            return [(EFBChannelChatIDStr(row.slave_uid), TelegramTopicID(int(row.message_thread_id))) for row in query]
         except DoesNotExist:
             return None
         except AttributeError:
@@ -581,7 +582,7 @@ class DatabaseManager:
 
     @staticmethod
     def remove_topic_assoc(topic_chat_id: Optional[TelegramChatID] = None,
-                           message_thread_id: Optional[EFBChannelChatIDStr] = None,
+                           message_thread_id: Optional[TelegramTopicID] = None,
                            slave_uid: Optional[EFBChannelChatIDStr] = None):
         """
         Remove topic association (topic link).

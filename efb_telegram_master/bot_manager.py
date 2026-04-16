@@ -680,7 +680,7 @@ class TelegramBotManager(LocaleMixin):
         return mock_msg
 
     def _schedule_delayed_task(self, chat_id: int, delay_time: float, function: Callable,
-                              args: tuple, kwargs: dict, cleanup_files: list = None) -> str:
+                              args: tuple, kwargs: dict, cleanup_files: Optional[list] = None) -> str:
         """
         Schedule a task for delayed execution.
 

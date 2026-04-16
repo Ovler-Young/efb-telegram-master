@@ -176,7 +176,7 @@ class MasterMessageProcessor(LocaleMixin):
                 quote = message.reply_to_message is not None
                 self.logger.debug("[%s] Chat %s is singly-linked to %s", mid, message.chat, destination)
                 if message.chat.is_forum:
-                    ideal_thread_id = self.db.get_topic_thread_id(slave_uid=destination, topic_chat_id=update.effective_chat.id)
+                    ideal_thread_id = self.db.get_topic_thread_id(slave_uid=destination, topic_chat_id=TelegramChatID(update.effective_chat.id))
                     if ideal_thread_id and ideal_thread_id != message.message_thread_id:
                         self.logger.debug("[%s] Chat %s is singly-linked to %s, but the thread ID is not matching.", mid, message.chat, destination)
                         destination = None
@@ -185,16 +185,16 @@ class MasterMessageProcessor(LocaleMixin):
 
         if destination is None:
             if message.chat.is_forum:
-                topic_destinations = self.db.get_topic_slaves(topic_chat_id=message.chat.id)
+                topic_destinations = self.db.get_topic_slaves(topic_chat_id=TelegramChatID(message.chat.id))
                 thread_id = message.message_thread_id
-                if thread_id:
+                if thread_id and topic_destinations:
                     for (dest, topic_id) in topic_destinations:
                         if topic_id == thread_id:
                             self.logger.debug("[%s] Chat %s is singly-linked to %s in topic %s", mid, message.chat, dest, topic_id)
                             destination = dest
                             quote = message.reply_to_message.message_id != message.reply_to_message.message_thread_id
                             if not quote:
-                                message.reply_to_message = None
+                                message.reply_to_message = None  # type: ignore[assignment]
                             break
                     if destination is None:
                         self.logger.debug("[%s] Ignored message as it's a topic which wasn't created by this bot", mid)
@@ -202,7 +202,7 @@ class MasterMessageProcessor(LocaleMixin):
                 else:
                     self.logger.debug("[%s] Chat %s is a forum, but no thread ID is found.", mid, message.chat)
                     destinations = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id))))
-                    if len(destinations) == len(topic_destinations):
+                    if topic_destinations is not None and len(destinations) == len(topic_destinations):
                         self.logger.debug("[%s] Chat %s is a forum, and all destinations are in topics. The new message is not in any topic, so ignore it.", mid, message.chat)
                         return
 

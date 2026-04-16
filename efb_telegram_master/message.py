@@ -43,18 +43,17 @@ class ETMMsg(Message):
     __path = None
     __filename = None
 
-    def __init__(self, attributes: Optional[MessageAttribute] = None, author: ChatMember = None, chat: Chat = None,
-                 commands: Optional[MessageCommands] = None, deliver_to: Channel = None, edit: bool = False,
+    def __init__(self, attributes: Optional[MessageAttribute] = None, author: Optional[ChatMember] = None,
+                 chat: Optional[Chat] = None,
+                 commands: Optional[MessageCommands] = None, deliver_to: Optional[Channel] = None, edit: bool = False,
                  edit_media: bool = False, file: Optional[BinaryIO] = None, filename: Optional[str] = None,
                  is_system: bool = False, mime: Optional[str] = None, path: Optional[Path] = None,
-                 reactions: Reactions = None, substitutions: Optional[Substitutions] = None,
+                 reactions: Optional[Reactions] = None, substitutions: Optional[Substitutions] = None,
                  target: 'Optional[Message]' = None, text: str = "", type: MsgType = MsgType.Unsupported,
-                 uid: Optional[MessageID] = None, vendor_specific: Dict[str, Any] = None,
+                 uid: Optional[MessageID] = None, vendor_specific: Optional[Dict[str, Any]] = None,
                  type_telegram: TGMsgType = TGMsgType.System, file_id: Optional[str] = None):
-        super().__init__(attributes=attributes, chat=chat, author=author, commands=commands, deliver_to=deliver_to,
-                         edit=edit, edit_media=edit_media, file=file, filename=filename, is_system=is_system, mime=mime,
-                         path=path, reactions=reactions, substitutions=substitutions, target=target, text=text,
-                         type=type, uid=uid, vendor_specific=vendor_specific)
+        # ehforwarderbot.Message doesn't annotate these as Optional, but handles None at runtime
+        super().__init__(attributes=attributes, chat=chat, author=author, commands=commands, deliver_to=deliver_to, edit=edit, edit_media=edit_media, file=file, filename=filename, is_system=is_system, mime=mime, path=path, reactions=reactions, substitutions=substitutions, target=target, text=text, type=type, uid=uid, vendor_specific=vendor_specific)  # type: ignore[arg-type]
         self.__initialized = False
         self.type_telegram = type_telegram
         self.file_id = file_id

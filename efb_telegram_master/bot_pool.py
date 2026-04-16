@@ -197,7 +197,8 @@ class BotPool:
 
     def get_pool_stats(self) -> Dict:
         """Return per-bot status for monitoring/debugging."""
-        stats = {
+        bot_list: list[Dict] = []
+        stats: Dict = {
             'total_bots': len(self._bots),
             'active_bots': sum(1 for b in self._bots if not b.disabled),
             'bots': []
