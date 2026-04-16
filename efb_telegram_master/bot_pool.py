@@ -56,6 +56,9 @@ class BotPool:
         Iterates aux bots confirmed as members of the chat, picks the one
         with the lowest delay, then reserves a slot.
 
+        For bots whose membership is unknown (first encounter / cold start),
+        a synchronous probe is performed so they can participate immediately.
+
         Args:
             chat_id: Target Telegram chat.
             max_delay: Upper bound on acceptable delay. Bots whose delay
@@ -69,13 +72,19 @@ class BotPool:
         with self._pool_lock:
             best_bot: Optional[AuxiliaryBot] = None
             best_delay = float('inf')
-            need_member_bots: List[AuxiliaryBot] = []
+            confirmed_non_member_bots: List[AuxiliaryBot] = []
+            unknown_bots: List[AuxiliaryBot] = []
 
             for aux_bot in self._bots:
                 if aux_bot.disabled:
                     continue
-                if not aux_bot.check_membership(chat_id):
-                    need_member_bots.append(aux_bot)
+
+                status = aux_bot.check_membership_tri(chat_id)
+                if status is None:
+                    unknown_bots.append(aux_bot)
+                    continue
+                if status is False:
+                    confirmed_non_member_bots.append(aux_bot)
                     continue
 
                 delay = aux_bot.peek_delay(chat_id)
@@ -85,12 +94,25 @@ class BotPool:
                     if delay == 0.0:
                         break
 
+            # Cold start: synchronously resolve unknown bots so they can help now
+            if best_bot is None and unknown_bots:
+                for aux_bot in unknown_bots:
+                    if aux_bot.check_membership_sync(chat_id, timeout=3.0):
+                        delay = aux_bot.peek_delay(chat_id)
+                        if delay < best_delay:
+                            best_bot = aux_bot
+                            best_delay = delay
+                            if delay == 0.0:
+                                break
+                    else:
+                        confirmed_non_member_bots.append(aux_bot)
+
             if best_bot is not None and best_delay < max_delay:
                 best_bot.reserve_slot(chat_id)
                 return (best_bot, best_delay)
 
-            if need_member_bots:
-                self._maybe_notify_admin(chat_id, need_member_bots)
+            if confirmed_non_member_bots:
+                self._maybe_notify_admin(chat_id, confirmed_non_member_bots)
 
             return None
 

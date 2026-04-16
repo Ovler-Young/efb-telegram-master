@@ -153,6 +153,11 @@ class AuxiliaryBot:
             chat_timestamps.append(candidate_time)
             return delay
 
+    # Tri-state membership results
+    MEMBERSHIP_MEMBER = True
+    MEMBERSHIP_NOT_MEMBER = False
+    MEMBERSHIP_UNKNOWN = None
+
     def check_membership(self, chat_id: int) -> bool:
         """Return cached membership status. On cache miss, trigger a
         background probe and return False (non-blocking).
@@ -161,6 +166,16 @@ class AuxiliaryBot:
         return the stale value while refreshing in the background. This avoids
         false "not a member" results when all bots' caches expire simultaneously.
         """
+        result = self.check_membership_tri(chat_id)
+        if result is None:
+            return False
+        return result
+
+    def check_membership_tri(self, chat_id: int):
+        """Tri-state membership check: True (member), False (confirmed not member),
+        None (unknown / probe in progress).
+        """
+        stale_value = None
         need_probe = False
         with self._membership_lock:
             entry = self._membership_cache.get(chat_id)
@@ -170,7 +185,6 @@ class AuxiliaryBot:
                 age = time.time() - timestamp
                 if age < ttl:
                     return is_member
-                # Stale but exists: flag for background refresh, return stale value
                 need_probe = True
                 stale_value = is_member
 
@@ -178,8 +192,35 @@ class AuxiliaryBot:
             self._start_membership_probe(chat_id)
             return stale_value
 
-        # True cache miss (never seen): trigger background probe
         self._start_membership_probe(chat_id)
+        return None
+
+    def check_membership_sync(self, chat_id: int, timeout: float = 5.0) -> bool:
+        """Blocking membership check. Waits for a pending probe to finish,
+        or runs one synchronously if no cache entry exists."""
+        with self._membership_lock:
+            entry = self._membership_cache.get(chat_id)
+            if entry is not None:
+                is_member, timestamp = entry
+                ttl = self.MEMBERSHIP_TTL_MEMBER if is_member else self.MEMBERSHIP_TTL_NOT_MEMBER
+                if time.time() - timestamp < ttl:
+                    return is_member
+
+        # Trigger probe if not already running
+        self._start_membership_probe(chat_id)
+
+        # Wait for the probe to finish
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._membership_lock:
+                if chat_id not in self._pending_probes:
+                    entry = self._membership_cache.get(chat_id)
+                    if entry is not None:
+                        return entry[0]
+                    return False
+            time.sleep(0.05)
+
+        logger.warning("Membership sync check timed out for bot %d in chat %d", self.bot_id, chat_id)
         return False
 
     def update_membership(self, chat_id: int, is_member: bool):
