@@ -875,7 +875,6 @@ class TelegramBotManager(LocaleMixin):
         args = args[:1]
         if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode('utf-8'))
-            full_message.seek(0)
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
             msg = self._bot_send_message_fallback(args[0], text=truncated, **kwargs)
             filename = "%s_%s" % (args[0], msg.message_id)
@@ -889,9 +888,9 @@ class TelegramBotManager(LocaleMixin):
                     "<html><head><meta charset='utf-8'></head>"
                     "<body><pre style='white-space:pre-wrap'>" + (prefix + text + suffix) + "</pre></body></html>"
                 )
-                full_message.write(full_message_html.encode('utf-8'))
-                full_message.seek(0)
-                full_message.truncate()
+                # Replace the attachment payload with HTML-wrapped content.
+                # (Previous logic did seek(0) then truncate(), which empties the buffer.)
+                full_message = io.BytesIO(full_message_html.encode('utf-8'))
             else:
                 filename += ".txt"
             self._active_bot.send_document(args[0], full_message, filename=filename,
