@@ -127,6 +127,12 @@ class BotPool:
         bots_to_notify: List[AuxiliaryBot] = []
 
         with self._notification_lock:
+            # Purge stale entries older than cooldown + 60s margin
+            cutoff = now - self.NOTIFICATION_COOLDOWN - 60.0
+            stale_keys = [k for k, ts in self._notification_timestamps.items() if ts < cutoff]
+            for k in stale_keys:
+                del self._notification_timestamps[k]
+
             for aux_bot in bots_not_in_chat:
                 key = (aux_bot.bot_id, chat_id)
                 last_notified = self._notification_timestamps.get(key, 0.0)
