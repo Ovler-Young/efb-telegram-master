@@ -113,6 +113,15 @@ class BotPool:
             time.sleep(0.2)
         return None
 
+    def on_bots_joined_chat(self, bot_ids: list, chat_id: int):
+        """Update membership cache when aux bots are added to a group."""
+        for bot_id in bot_ids:
+            aux_bot = self.get_bot_by_id(bot_id)
+            if aux_bot:
+                aux_bot.update_membership(chat_id, True)
+                logger.info("Auxiliary bot @%s added to chat %d, membership cache updated",
+                            aux_bot.username, chat_id)
+
     def on_bot_left_chat(self, bot_id: int, chat_id: int):
         """Update membership cache when an aux bot is removed from a group."""
         aux_bot = self.get_bot_by_id(bot_id)

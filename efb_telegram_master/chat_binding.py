@@ -157,6 +157,8 @@ class ChatBindingManager(LocaleMixin):
         self.bot.dispatcher.add_handler(
             MessageHandler(Filters.status_update.migrate, self.chat_migration))
         self.bot.dispatcher.add_handler(
+            MessageHandler(Filters.status_update.new_chat_members, self.chat_joined))
+        self.bot.dispatcher.add_handler(
             MessageHandler(Filters.status_update.left_chat_member, self.chat_left))
 
     def pre_link_check(self, message: Message):
@@ -1204,6 +1206,18 @@ class ChatBindingManager(LocaleMixin):
                 picture.close()
             if pic_resized and getattr(pic_resized, 'close', None):
                 pic_resized.close()
+
+    def chat_joined(self, update: Update, context: CallbackContext):
+        """Triggered when new members join a chat. Updates aux bot membership cache."""
+        assert isinstance(update, Update)
+        assert update.effective_message
+
+        message = update.effective_message
+        if not message.new_chat_members or not self.bot.bot_pool:
+            return
+
+        joined_ids = [m.id for m in message.new_chat_members]
+        self.bot.bot_pool.on_bots_joined_chat(joined_ids, message.chat.id)
 
     def chat_left(self, update: Update, context: CallbackContext):
         """Triggered by any message update with either
