@@ -189,8 +189,8 @@ class BotPool:
                 f"To reduce delay, please add {bot_links} to the group."
             )
 
-            self._bot_manager.updater.bot.send_message(
-                admin_id, text, parse_mode="HTML"
+            self._bot_manager.send_message(
+                admin_id, text=text, parse_mode="HTML"
             )
         except Exception as e:
             logger.warning("Failed to send auxiliary bot notification to admin: %s", e)
