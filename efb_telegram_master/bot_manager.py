@@ -1135,7 +1135,7 @@ class TelegramBotManager(LocaleMixin):
         message_thread_id = kwargs.pop('message_thread_id', None)
         if message_thread_id != None:
             kwargs['api_kwargs'] = { "message_thread_id":  message_thread_id}
-        return self.updater.bot.send_chat_action(*args, **kwargs)
+        return self._bot.send_chat_action(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout

@@ -91,11 +91,11 @@ class TelegramChannel(MasterChannel):
     # RPC server
     rpc_server: Optional[SimpleXMLRPCServer] = None
 
-    def __init__(self, instance_id: InstanceID = None):
+    def __init__(self, instance_id: Optional[InstanceID] = None):
         """
         Initialization.
         """
-        super().__init__(instance_id)
+        super().__init__(instance_id)  # type: ignore[arg-type]  # upstream Channel.__init__ accepts None but isn't annotated as Optional
 
         # Check PIL support for WebP
         Image.init()

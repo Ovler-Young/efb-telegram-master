@@ -65,7 +65,7 @@ class ETMChatMember(ETMBaseChatMixin, ChatMember):
     chat_type_name = "ChatMember"
 
     def __init__(self, db: 'DatabaseManager', chat: 'Chat', *, name: str = "", alias: Optional[str] = None,
-                 uid: ChatID = ChatID(""), vendor_specific: Dict[str, Any] = None, description: str = "",
+                 uid: ChatID = ChatID(""), vendor_specific: Optional[Dict[str, Any]] = None, description: str = "",
                  middleware: Optional[Middleware] = None):
         super().__init__(db, chat, name=name, alias=alias, uid=uid, vendor_specific=vendor_specific,
                          description=description, middleware=middleware)
@@ -75,7 +75,7 @@ class ETMSelfChatMember(ETMChatMember, SelfChatMember):
     chat_type_name = "SelfChatMember"
 
     def __init__(self, db: 'DatabaseManager', chat: 'Chat', *, name: str = "", alias: Optional[str] = None,
-                 uid: ChatID = ChatID(""), vendor_specific: Dict[str, Any] = None, description: str = "",
+                 uid: ChatID = ChatID(""), vendor_specific: Optional[Dict[str, Any]] = None, description: str = "",
                  middleware: Optional[Middleware] = None):
         super().__init__(db, chat, name=name, alias=alias, uid=uid, vendor_specific=vendor_specific,
                          description=description, middleware=middleware)
@@ -85,7 +85,7 @@ class ETMSystemChatMember(ETMChatMember, SystemChatMember):
     chat_type_name = "SystemChatMember"
 
     def __init__(self, db: 'DatabaseManager', chat: 'Chat', *, name: str = "", alias: Optional[str] = None,
-                 uid: ChatID = ChatID(""), vendor_specific: Dict[str, Any] = None, description: str = "",
+                 uid: ChatID = ChatID(""), vendor_specific: Optional[Dict[str, Any]] = None, description: str = "",
                  middleware: Optional[Middleware] = None):
         super().__init__(db, chat, name=name, alias=alias, uid=uid, vendor_specific=vendor_specific,
                          description=description, middleware=middleware)
@@ -242,7 +242,7 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
         return s
 
     def add_member(self, name: str, uid: ChatID, alias: Optional[str] = None,  # type: ignore
-                   vendor_specific: Dict[str, Any] = None, id='',
+                   vendor_specific: Optional[Dict[str, Any]] = None, id='',
                    description: str = "", middleware: Optional[Middleware] = None) -> ETMChatMember:
         # TODO: remove deprecated ID
         assert not id, f"id is {id!r}"
@@ -254,7 +254,7 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
 
     # type: ignore
     def add_system_member(self, name: str = "", alias: Optional[str] = None, uid: ChatID = ChatID(""),  # type: ignore
-                          vendor_specific: Dict[str, Any] = None, description: str = "", id='',
+                          vendor_specific: Optional[Dict[str, Any]] = None, description: str = "", id='',
                           middleware: Optional[Middleware] = None) -> ETMSystemChatMember:
         # TODO: remove deprecated ID
         assert not id, f"id is {id!r}"
@@ -265,7 +265,7 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
         return member
 
     def make_system_member(self, name: str = "", alias: Optional[str] = None, id: ChatID = ChatID(""),
-                           uid: ChatID = ChatID(""), vendor_specific: Dict[str, Any] = None, description: str = "",
+                           uid: ChatID = ChatID(""), vendor_specific: Optional[Dict[str, Any]] = None, description: str = "",
                            middleware: Optional[Middleware] = None) -> ETMSystemChatMember:
         # TODO: remove deprecated ID
         assert not id, f"id is {id!r}"
@@ -285,7 +285,7 @@ class ETMPrivateChat(ETMChatMixin, PrivateChat):
     def __init__(self, db: 'DatabaseManager', *, channel: Optional[SlaveChannel] = None,
                  middleware: Optional[Middleware] = None,
                  module_name: str = "", channel_emoji: str = "", module_id: ModuleID = ModuleID(""), name: str = "",
-                 alias: Optional[str] = None, uid: ChatID = ChatID(""), vendor_specific: Dict[str, Any] = None,
+                 alias: Optional[str] = None, uid: ChatID = ChatID(""), vendor_specific: Optional[Dict[str, Any]] = None,
                  description: str = "", notification: ChatNotificationState = ChatNotificationState.ALL,
                  with_self: bool = True, other_is_self: bool = False):
         super().__init__(db, channel=channel, middleware=middleware, module_name=module_name,
@@ -304,7 +304,7 @@ class ETMSystemChat(ETMChatMixin, SystemChat):
     def __init__(self, db: 'DatabaseManager', *, channel: Optional[SlaveChannel] = None,
                  middleware: Optional[Middleware] = None,
                  module_name: str = "", channel_emoji: str = "", module_id: ModuleID = ModuleID(""), name: str = "",
-                 alias: Optional[str] = None, uid: ChatID = ChatID(""), vendor_specific: Dict[str, Any] = None,
+                 alias: Optional[str] = None, uid: ChatID = ChatID(""), vendor_specific: Optional[Dict[str, Any]] = None,
                  description: str = "", notification: ChatNotificationState = ChatNotificationState.ALL,
                  with_self: bool = True):
         super().__init__(db, channel=channel, middleware=middleware, module_name=module_name,
@@ -320,7 +320,7 @@ class ETMGroupChat(ETMChatMixin, GroupChat):
     def __init__(self, db: 'DatabaseManager', *, channel: Optional[SlaveChannel] = None,
                  middleware: Optional[Middleware] = None,
                  module_name: str = "", channel_emoji: str = "", module_id: ModuleID = ModuleID(""), name: str = "",
-                 alias: Optional[str] = None, uid: ChatID = ChatID(""), vendor_specific: Dict[str, Any] = None,
+                 alias: Optional[str] = None, uid: ChatID = ChatID(""), vendor_specific: Optional[Dict[str, Any]] = None,
                  description: str = "", notification: ChatNotificationState = ChatNotificationState.ALL,
                  with_self: bool = True):
         super().__init__(db, channel=channel, middleware=middleware, module_name=module_name,

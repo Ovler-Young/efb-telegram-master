@@ -201,7 +201,7 @@ class BotPool:
         stats: Dict = {
             'total_bots': len(self._bots),
             'active_bots': sum(1 for b in self._bots if not b.disabled),
-            'bots': []
+            'bots': bot_list
         }
         for bot in self._bots:
             bot_stats = {
