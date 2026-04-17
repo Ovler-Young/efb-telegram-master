@@ -11,6 +11,12 @@ from ..bot import get_user_session
 
 pytest.register_assert_rewrite("tests.integration.utils")
 
+# All async integration tests must share the same session-scoped event loop
+# that the Telethon client connects on (see helper_wrap fixture below).
+# Without this, each test function would run on its own fresh loop, causing
+# Telethon to raise "event loop must not change after connection".
+pytestmark = pytest.mark.asyncio(loop_scope="session")
+
 
 @pytest.fixture(scope="session")
 def user_session_info():
