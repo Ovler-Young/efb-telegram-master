@@ -51,8 +51,7 @@ def filter_chats(bot_id, bot_groups, bot_channels) -> Set[int]:
 
 
 @pytest.fixture(scope="session")
-async def helper_wrap(event_loop, user_session, api_id, api_hash, bot_id,
-                      filter_chats) -> TelegramIntegrationTestHelper:
+async def helper_wrap(event_loop, user_session, api_id, api_hash, bot_id, filter_chats) -> TelegramIntegrationTestHelper:
     async with TelegramIntegrationTestHelper(
             user_session, api_id, api_hash, event_loop, bot_id,
             chats=filter_chats
