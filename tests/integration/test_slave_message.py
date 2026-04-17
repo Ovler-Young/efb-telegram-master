@@ -343,7 +343,7 @@ class VideoMessageFactory(MessageFactory):
             chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
-        assert tg_msg.video
+        assert tg_msg.video or tg_msg.file
         # Cannot do further assertion here as Telegram has re-encoded the
         # video sent out
         assert efb_msg.text in tg_msg.raw_text

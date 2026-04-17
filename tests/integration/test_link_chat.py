@@ -264,11 +264,28 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
 
 async def test_group_chat_migration(client, helper, channel, slave, bot_id):
     slave_chats = slave.chats_by_chat_type["PrivateChat"]
-    response = await client(CreateChatRequest(users=[bot_id], title=f"Chat upgrade test {uuid4()}"))
-    chat: TelethonChat = response.chats[0]
+    title = f"Chat upgrade test {uuid4()}"
+    response = await client(CreateChatRequest(users=[bot_id], title=title))
+    if getattr(response, "chats", None):
+        chat: TelethonChat = response.chats[0]
+    elif getattr(response, "updates", None) and getattr(response.updates, "chats", None):
+        chat: TelethonChat = response.updates.chats[0]
+    else:
+        chat = await client.get_entity(title)
     with link_chats(channel, slave_chats, get_peer_id(chat)):
         mega_chat_response = await client(MigrateChatRequest(chat_id=chat.id))
-        mega_chat: TelethonChat = mega_chat_response.chats[1]
+        if getattr(mega_chat_response, "chats", None):
+            mega_chat: TelethonChat = next(
+                c for c in mega_chat_response.chats
+                if getattr(c, "id", None) != chat.id
+            )
+        elif getattr(mega_chat_response, "updates", None) and getattr(mega_chat_response.updates, "chats", None):
+            mega_chat = next(
+                c for c in mega_chat_response.updates.chats
+                if getattr(c, "id", None) != chat.id
+            )
+        else:
+            mega_chat = await client.get_entity(get_peer_id(chat))
 
         await asyncio.sleep(10)
 

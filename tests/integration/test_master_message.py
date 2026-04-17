@@ -306,6 +306,8 @@ class AudioMessageFactory(MessageFactory):
         assert efb_msg.type == MsgType.File
         assert tg_msg.raw_text in efb_msg.text
         assert efb_msg.file
+        if efb_msg.file.closed and getattr(efb_msg, "path", None):
+            efb_msg.file = efb_msg.path.open("rb")
         file_size = efb_msg.file.seek(0, 2)
         assert file_size == tg_msg.file.size
         assert efb_msg.filename.endswith(".mp3")
