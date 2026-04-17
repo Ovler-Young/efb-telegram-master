@@ -53,6 +53,7 @@ setup(
         # Python 3.13 removes the stdlib 'imghdr' module (PEP 594). Some deps
         # (including python-telegram-bot 13.x) still import it.
         "standard-imghdr; python_version>='3.13'",
+        "audioop-lts; python_version>='3.13'",
         "python-magic",
         "ffmpeg-python",
         "peewee",
