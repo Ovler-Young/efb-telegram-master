@@ -11,11 +11,13 @@ from ..bot import get_user_session
 
 pytest.register_assert_rewrite("tests.integration.utils")
 
-# All async integration tests must share the same session-scoped event loop
-# that the Telethon client connects on (see helper_wrap fixture below).
-# Without this, each test function would run on its own fresh loop, causing
-# Telethon to raise "event loop must not change after connection".
-pytestmark = pytest.mark.asyncio(loop_scope="session")
+
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create an instance of the default event loop for all test cases."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
 
 
 @pytest.fixture(scope="session")
@@ -49,10 +51,10 @@ def filter_chats(bot_id, bot_groups, bot_channels) -> Set[int]:
 
 
 @pytest.fixture(scope="session")
-async def helper_wrap(user_session, api_id, api_hash, bot_id, filter_chats) -> TelegramIntegrationTestHelper:
-    loop = asyncio.get_running_loop()
+async def helper_wrap(event_loop, user_session, api_id, api_hash, bot_id,
+                      filter_chats) -> TelegramIntegrationTestHelper:
     async with TelegramIntegrationTestHelper(
-            user_session, api_id, api_hash, loop, bot_id,
+            user_session, api_id, api_hash, event_loop, bot_id,
             chats=filter_chats
     ) as helper:
         yield helper
