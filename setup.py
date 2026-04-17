@@ -49,12 +49,11 @@ setup(
         "ehforwarderbot>=2.0.0",
         "setuptools==81.0.0",
         "python-telegram-bot~=13.15",
-        # python-telegram-bot 13.x still imports urllib3.contrib.appengine,
-        # which was removed in urllib3 2.0+.
-        "urllib3<2",
+        "urllib3<2", # used by python-telegram-bot 13.x
         # Python 3.13 removes the stdlib 'imghdr' module (PEP 594). Some deps
         # (including python-telegram-bot 13.x) still import it.
         "standard-imghdr; python_version>='3.13'",
+        "audioop-lts; python_version>='3.13'",
         "python-magic",
         "ffmpeg-python",
         "peewee",
