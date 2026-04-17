@@ -79,7 +79,7 @@ async def rate_limit_delay():
     Add a small delay between integration tests to reduce flakiness.
     """
     yield
-    await asyncio.sleep(3)
+    await asyncio.sleep(6)
 
 
 @pytest.fixture(scope="module")
