@@ -13,14 +13,6 @@ pytest.register_assert_rewrite("tests.integration.utils")
 
 
 @pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for all test cases."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="session")
 def user_session_info():
     return get_user_session()
 
@@ -51,9 +43,10 @@ def filter_chats(bot_id, bot_groups, bot_channels) -> Set[int]:
 
 
 @pytest.fixture(scope="session")
-async def helper_wrap(event_loop, user_session, api_id, api_hash, bot_id, filter_chats) -> TelegramIntegrationTestHelper:
+async def helper_wrap(user_session, api_id, api_hash, bot_id, filter_chats) -> TelegramIntegrationTestHelper:
+    loop = asyncio.get_running_loop()
     async with TelegramIntegrationTestHelper(
-            user_session, api_id, api_hash, event_loop, bot_id,
+            user_session, api_id, api_hash, loop, bot_id,
             chats=filter_chats
     ) as helper:
         yield helper
