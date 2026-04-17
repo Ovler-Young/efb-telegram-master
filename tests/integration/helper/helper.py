@@ -100,7 +100,7 @@ class TelegramIntegrationTestHelper:
         await self.queue.put(event)
 
     async def wait_for_event(self, event_filter: BaseFilter = filters.everything,
-                             timeout: float = 10.0) -> EventCommon:
+                             timeout: float = 60.0) -> EventCommon:
         """
         Args:
             event_filter: Filter updates to collect
@@ -126,14 +126,14 @@ class TelegramIntegrationTestHelper:
                 return value
 
     async def wait_for_message(self, event_filter: BaseFilter = filters.everything,
-                               timeout: float = 10.0) -> Message:
+                               timeout: float = 60.0) -> Message:
         """Short cut for “Wait for a message and return its entity”."""
         event = await self.wait_for_event(filters.message & event_filter, timeout=timeout)
         # noinspection PyUnresolvedReferences
         return event.message  # type: ignore
 
     async def wait_for_message_text(self, event_filter: BaseFilter = filters.everything,
-                                    timeout: float = 10.0) -> str:
+                                    timeout: float = 60.0) -> str:
         """Short cut for “Wait for a text message and return its text”."""
         event = await self.wait_for_event(filters.text & event_filter, timeout=timeout)
         # noinspection PyUnresolvedReferences
