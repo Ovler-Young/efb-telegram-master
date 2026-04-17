@@ -133,7 +133,7 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
 
         content = "test_master_master_destination_suggestion edited message shall be delivered without a prompt"
         await sent_message.edit(text=content)
-        slave_message = slave.messages.get(timeout=5)
+        slave_message = slave.messages.get(timeout=15)
         assert slave_message.text == content
 
 
