@@ -41,20 +41,22 @@ def api_hash(user_session_info) -> str:
 
 
 @pytest.fixture(scope="session")
-def filter_chats(bot_id, bot_groups, bot_channels) -> Set[int]:
+def filter_chats(bot_id, bot_groups, bot_channels, bot_topic_group) -> Set[int]:
     """Only receive updates from the following chats"""
     chats = set()
     chats.add(bot_id)
     chats = chats.union(bot_groups)
     chats = chats.union(bot_channels)
+    if bot_topic_group is not None:
+        chats.add(bot_topic_group)
     return chats
 
 
 @pytest.fixture(scope="session")
 async def helper_wrap(event_loop, user_session, api_id, api_hash, bot_id,
-                      filter_chats) -> TelegramIntegrationTestHelper:
+                      filter_chats, aux_bot_ids) -> TelegramIntegrationTestHelper:
     async with TelegramIntegrationTestHelper(
-            user_session, api_id, api_hash, event_loop, bot_id,
+            user_session, api_id, api_hash, event_loop, [bot_id, *aux_bot_ids],
             chats=filter_chats
     ) as helper:
         yield helper

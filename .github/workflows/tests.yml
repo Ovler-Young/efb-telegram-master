@@ -12,6 +12,12 @@ on:
       - 'tests/**.py'
       - 'setup.py'
   workflow_dispatch:
+    inputs:
+      run_postgres_tests:
+        description: "Run optional PostgreSQL-backed test job"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   tests:
@@ -45,6 +51,9 @@ jobs:
         ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
         GROUPS: ${{ secrets.TELEGRAM_GROUPS }}
         CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
+        TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
+        AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
+        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
         USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -57,8 +66,52 @@ jobs:
         ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
         GROUPS: ${{ secrets.TELEGRAM_GROUPS }}
         CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
+        TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
+        AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
+        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
         USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       run: |
         pytest -vv -r a -l --color=yes --mode=both
+
+  postgres-tests:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_postgres_tests }}
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: efb_telegram
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d efb_telegram"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+    - uses: actions/checkout@v1
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install '.[tests,tgs]'
+    - name: Install binary dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y ffmpeg libmagic-dev libwebp-dev
+    - name: Run PostgreSQL-focused tests
+      env:
+        TEST_POSTGRES_HOST: 127.0.0.1
+        TEST_POSTGRES_PORT: "5432"
+        TEST_POSTGRES_DB: efb_telegram
+        TEST_POSTGRES_USER: postgres
+        TEST_POSTGRES_PASSWORD: postgres
+      run: |
+        pytest -vv -r a -l --color=yes --mode=unit tests/unit/test_db_migrations.py

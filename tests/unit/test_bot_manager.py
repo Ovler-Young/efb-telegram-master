@@ -1,9 +1,14 @@
 import string
 import random
+import threading
 from typing import IO, Iterator, BinaryIO
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
+import telegram.error
+
+from efb_telegram_master.bot_manager import TelegramBotManager
 
 
 def test_text_prefix_suffix(channel, bot_admin):
@@ -105,3 +110,125 @@ def test_malformed_html_caption(channel, bot_admin, image):
         caption='<b>Bold and <i>italics</i> text</b> and <abbr title="unknown tag to Telegram">UTTT</abbr> and an <a href="https://example.com">incomplete link</a',
         parse_mode="html"
     )
+
+
+def test_rate_limit_decorator_forced_routes_to_sender_bot():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+    aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False)
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
+        _using_bot=lambda bot: SimpleNamespace(__enter__=lambda *a: None, __exit__=lambda *a: None),
+        logger=Mock(),
+    )
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    manager._using_bot = lambda bot: DummyContext()
+
+    result = decorated(manager, 123, _sender_bot_id="777")
+
+    assert result._sender_bot_id == "777"
+    manager.bot_pool.get_bot_by_id.assert_called_once_with("777")
+
+
+def test_rate_limit_decorator_falls_back_to_main_bot_when_sender_missing():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=None)),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123, _sender_bot_id="777")
+
+    assert result.chat_id == 123
+
+
+def test_rate_limit_decorator_routes_new_send_through_aux_pool():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+    aux_bot = SimpleNamespace(bot=object(), bot_id=999, disabled=False)
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=(aux_bot, 0.0))),
+        _calculate_rate_limit_delay=Mock(return_value=(1.0, 0, 0)),
+        _using_bot=lambda bot: DummyContext(),
+        _record_aux_use=Mock(),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123)
+
+    assert result._sender_bot_id == "999"
+    manager.bot_pool.acquire_send_slot.assert_called_once_with(123, max_delay=1.0)
+    manager._record_aux_use.assert_called_once_with(123)
+
+
+def test_rate_limit_decorator_schedules_delayed_task_when_main_bot_is_limited():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        bot_pool=None,
+        _calculate_rate_limit_delay=Mock(return_value=(5.0, 1, 1)),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _schedule_delayed_task=Mock(return_value="task-1"),
+        _create_delayed_message_placeholder=Mock(return_value=SimpleNamespace(is_delayed=True, task_id="task-1")),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123)
+
+    assert result.is_delayed is True
+    manager._schedule_delayed_task.assert_called_once()
+    manager._create_delayed_message_placeholder.assert_called_once_with(123, 5.0, "task-1")
+
+
+def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_disabled():
+    attempts = {"count": 0}
+
+    def flaky(self, chat_id):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise telegram.error.RetryAfter(1)
+        return "ok"
+
+    handler = TelegramBotManager.Decorators.handle_rate_limit_error(flaky)
+    manager = SimpleNamespace(_delayed_worker_stop=threading.Event(), logger=Mock())
+    TelegramBotManager.Decorators.enable_retry = False
+
+    with patch("efb_telegram_master.bot_manager.time.sleep") as sleep:
+        result = handler(manager, 123)
+
+    assert result == "ok"
+    assert attempts["count"] == 2
+    sleep.assert_called()
+
+
+def test_graceful_stop_stops_worker_pool_and_updater():
+    manager = SimpleNamespace(
+        logger=Mock(),
+        _delayed_queue=[("when", 0, "task")],
+        _delayed_queue_lock=threading.Lock(),
+        stop_delayed_worker=Mock(),
+        bot_pool=SimpleNamespace(shutdown=Mock()),
+        updater=SimpleNamespace(stop=Mock()),
+    )
+
+    TelegramBotManager.graceful_stop(manager)
+
+    manager.stop_delayed_worker.assert_called_once()
+    manager.bot_pool.shutdown.assert_called_once()
+    manager.updater.stop.assert_called_once()

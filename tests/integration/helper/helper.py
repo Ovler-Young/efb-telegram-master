@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from asyncio import QueueEmpty
-from typing import Tuple, Optional, Dict, Iterable
+from typing import Tuple, Optional, Dict, Iterable, Sequence, Union
 
 from telethon import TelegramClient
 from telethon.events import NewMessage, UserUpdate, MessageDeleted, MessageEdited, ChatAction
@@ -21,7 +21,7 @@ class TelegramIntegrationTestHelper:
     def __init__(self,
                  session: str, api_id: int, api_hash: str,
                  loop: asyncio.AbstractEventLoop,
-                 bot_id: int,
+                 bot_id: Union[int, Sequence[int]],
                  chats: Iterable[int] = tuple()):
         """
         Need to create a client with API key, hash, and a session file
@@ -60,8 +60,9 @@ class TelegramIntegrationTestHelper:
 
         self.chats = list(map(abs, chats))
         self.client.parse_mode = "html"
+        bot_ids = [bot_id] if isinstance(bot_id, int) else list(bot_id)
         self.client.add_event_handler(self.new_message_handler,
-                                      NewMessage(chats=self.chats, incoming=True, from_users=[bot_id]))
+                                      NewMessage(chats=self.chats, incoming=True, from_users=bot_ids))
         # self.client.add_event_handler(self.new_message_handler,
         #                               NewMessage(incoming=True))
         self.client.add_event_handler(self.deleted_message_handler, MessageDeleted())
