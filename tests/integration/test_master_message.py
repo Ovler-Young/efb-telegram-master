@@ -429,7 +429,17 @@ class DiceMessageFactory(MessageFactory):
 
 @mark.parametrize("factory", [
     TextMessageFactory(), LocationMessageFactory(),
-    LiveLocationMessageFactory(), ContactMessageFactory(),
+    param(
+        LiveLocationMessageFactory(),
+        marks=mark.xfail(
+            reason=(
+                "Telethon _get_response_message: Telegram returns UpdateEditChannelMessage for "
+                "live-location sendMedia in supergroups; Telethon expects EditMessageRequest.id "
+                "(AttributeError on SendMediaRequest)."
+            ),
+        ),
+    ),
+    ContactMessageFactory(),
     StickerMessageFactory(),
     DocumentMessageFactory(),
     PhotoMessageFactory(),
