@@ -108,8 +108,13 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
     slave.messages.get(timeout=5)
     slave.messages.task_done()
 
+    # Patch only chat_destination_cache's time module. Global patch("time.time") breaks
+    # Telethon MTProto (message IDs / server sync) and drops the next test's updates.
     time_now = time.time()
-    with patch("time.time", MagicMock(return_value=time_now + 24 * 60 * 60)):  # one day later
+    with patch(
+        "efb_telegram_master.chat_destination_cache.time.time",
+        MagicMock(return_value=time_now + 24 * 60 * 60),
+    ):  # one day later (cache expiry only)
         content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
         await client.send_message(bot_id, content)
         message = await helper.wait_for_message(in_chats(bot_id) & text)  # Error message
