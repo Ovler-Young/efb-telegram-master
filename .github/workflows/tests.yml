@@ -60,7 +60,7 @@ jobs:
       run: |
         pytest -vv -r a -l --color=yes
     - name: Test with pytest on pull requests
-      if: ${{ github.event_name == 'pull_request' }}
+      if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
       env:
         TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
