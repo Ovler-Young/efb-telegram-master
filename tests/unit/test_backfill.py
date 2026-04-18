@@ -22,7 +22,7 @@ def _build_link_update(chat_id, *, is_forum=False):
 
 
 def _store_link_session(channel, chat, storage_key, backfill_mode=None):
-    storage = ChatListStorage([chat])
+    storage = ChatListStorage([channel.chat_manager.update_chat_obj(chat)])
     storage.backfill_mode = backfill_mode
     channel.chat_binding.msg_storage[storage_key] = storage
 

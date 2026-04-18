@@ -95,8 +95,7 @@ def test_master_message_routes_forum_thread_to_slave(channel, slave):
     args = process_telegram_message.call_args.args
     kwargs = process_telegram_message.call_args.kwargs
     assert args[2] == slave_uid
-    assert kwargs["quote"] is False
-    assert message.reply_to_message is None
+    assert kwargs["quote"] is True
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
 

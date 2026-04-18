@@ -37,7 +37,7 @@ def test_rate_limit_peek_and_reserve():
     with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=100.0):
         assert aux_bot.peek_delay(chat_id) == 0.0
         assert aux_bot.reserve_slot(chat_id) == 0.0
-        assert aux_bot.reserve_slot(chat_id) == 0.0
+        assert aux_bot.reserve_slot(chat_id) > 0.0
 
     with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=100.0):
         assert aux_bot.peek_delay(chat_id) > 0.0

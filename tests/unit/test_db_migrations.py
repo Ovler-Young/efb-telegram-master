@@ -62,24 +62,20 @@ def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):
 
 def test_build_etm_msg_restores_sender_bot_id(channel, slave):
     chat = slave.chat_with_alias
-    chat_uid = utils.chat_id_to_str(chat=chat)
-    row = MsgLog.create(
-        master_msg_id="4444.5555",
-        master_msg_id_alt=None,
-        slave_message_id="restored-message",
+    etm_msg = ETMMsg(
+        uid=MessageID("restored-message"),
+        chat=channel.chat_manager.update_chat_obj(chat),
+        author=channel.chat_manager.get_or_enrol_member(chat, chat.other),
         text="restored",
-        slave_origin_uid=chat_uid,
-        slave_member_uid=chat_uid,
-        media_type=TGMsgType.Text.value,
-        mime=None,
-        file_id=None,
-        file_unique_id=None,
-        msg_type=MsgType.Text.value,
-        sent_to=channel.channel_id,
-        sender_bot_id="888",
-        time=datetime.now(),
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=channel,
     )
+    master_message = SimpleNamespace(chat_id=4444, message_id=5555)
+    channel.db.add_or_update_message_log(etm_msg, master_message, sender_bot_id="888")
 
+    row = channel.db.get_msg_log(master_msg_id="4444.5555")
+    assert row is not None
     restored = row.build_etm_msg(channel.chat_manager)
     assert restored.sender_bot_id == "888"
 
