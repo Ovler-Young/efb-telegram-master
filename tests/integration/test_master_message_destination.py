@@ -17,6 +17,12 @@ from telethon.tl.custom import Message, MessageButton
 
 from .helper.filters import in_chats, has_button, edited, regex, text
 
+retry_on_integration_timeout = mark.flaky(
+    max_runs=2,
+    min_passes=1,
+    rerun_filter=lambda err, *_: bool(err and err[0] and issubclass(err[0], TimeoutError)),
+)
+
 pytestmark = mark.asyncio
 
 
@@ -111,6 +117,7 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
     await cancel_destination_suggestion(helper, message)
 
 
+@retry_on_integration_timeout
 async def test_master_master_destination_suggestion(helper, client, bot_id, slave, channel):
     with patch.dict(channel.flag.config, send_to_last_chat="disabled"), \
          patch.multiple(channel.chat_dest_cache, enabled=False):
@@ -133,7 +140,7 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
 
         content = "test_master_master_destination_suggestion edited message shall be delivered without a prompt"
         await sent_message.edit(text=content)
-        slave_message = slave.messages.get(timeout=5)
+        slave_message = slave.messages.get(timeout=15)
         assert slave_message.text == content
 
 

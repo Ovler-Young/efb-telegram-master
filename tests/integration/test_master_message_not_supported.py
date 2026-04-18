@@ -7,7 +7,7 @@ from pytest import mark
 from telethon.tl.custom import Message, InlineResults
 from telethon.tl.functions.messages import GetStickerSetRequest, GetInlineBotResultsRequest
 from telethon.tl.types import InputStickerSetAnimatedEmoji, Document, PollAnswer, \
-    InputMediaPoll, Poll
+    InputMediaPoll, Poll, TextWithEntities
 from telethon.tl.types.messages import StickerSet
 
 from .utils import link_chats
@@ -17,7 +17,7 @@ pytestmark = mark.asyncio
 
 async def test_master_msg_animated_sticker(helper, client, bot_group, slave, channel):
     # Get animated sticker document
-    animated_sticker_set: StickerSet = await client(GetStickerSetRequest(InputStickerSetAnimatedEmoji()))
+    animated_sticker_set: StickerSet = await client(GetStickerSetRequest(InputStickerSetAnimatedEmoji(), hash=0))
     sticker: Document = animated_sticker_set.documents[-1]
     assert sticker.mime_type == "application/x-tgsticker"
 
@@ -56,11 +56,12 @@ def _build_poll(question: str, *answers: str, closed: Optional[bool] = None,
     https://github.com/pyrogram/pyrogram/blob/develop/pyrogram/client/methods/messages/send_poll.py
     https://github.com/pyrogram/pyrogram/blob/develop/pyrogram/client/methods/messages/stop_poll.py"""
     return InputMediaPoll(Poll(
-        id=id, question=question, answers=[
-            PollAnswer(text=i, option=bytes([idx]))
+        id=id, question=TextWithEntities(text=question, entities=[]), answers=[
+            PollAnswer(text=TextWithEntities(text=i, entities=[]), option=bytes([idx]))
             for idx, i in enumerate(answers)
         ],
-        closed=closed
+        closed=closed,
+        hash=0
     ))
 
 

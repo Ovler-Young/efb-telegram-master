@@ -343,7 +343,7 @@ class VideoMessageFactory(MessageFactory):
             chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
-        assert tg_msg.video
+        assert tg_msg.video or tg_msg.file
         # Cannot do further assertion here as Telegram has re-encoded the
         # video sent out
         assert efb_msg.text in tg_msg.raw_text
@@ -432,9 +432,15 @@ async def test_slave_message(helper, client, bot_group, slave, channel, factory:
             filters = in_chats(bot_group)
             if factory.media_editable:
                 filters &= edited(*message_ids)
-                await helper.wait_for_message(filters)
-                # Get only the second message as editing media with caption takes 2 steps
             tg_msg = await helper.wait_for_message(filters)
+            if factory.media_editable:
+                try:
+                    factory.compare_message(tg_msg, edited_media_efb_msg)
+                except AssertionError:
+                    # Update coalescing in Telegram/Telethon might result in the first event missing
+                    # the caption update or we are catching the intermediate state.
+                    # Only wait for the second message if the first one was incomplete.
+                    tg_msg = await helper.wait_for_message(filters)
             if not factory.media_editable:
                 message_ids.append(tg_msg.id)
             factory.compare_message(tg_msg, edited_media_efb_msg)

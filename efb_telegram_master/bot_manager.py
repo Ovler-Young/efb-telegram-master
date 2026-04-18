@@ -205,12 +205,14 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def handle_rate_limit_error(cls, fn: Callable):
-            """Handle 429 rate limit errors with exponential backoff."""
+            """Handle Telegram flood limits.
+
+            ``RetryAfter`` is always retried (honours ``retry_after`` seconds from Telegram).
+            Broader heuristic retries for other rate-limit signals require ``retry_on_error``.
+            """
             @wraps(fn)
             def rate_limit_error_handler(self: 'TelegramBotManager', *args, **kwargs):
                 max_retries = 3
-                if not cls.enable_retry:
-                    return fn(self, *args, **kwargs)
 
                 # Extract chat_id from arguments for logging
                 chat_id = None
@@ -257,6 +259,8 @@ class TelegramBotManager(LocaleMixin):
                         else:
                             time.sleep(retry_after)
                     except telegram.error.TelegramError as e:
+                        if not cls.enable_retry:
+                            raise
                         if "Too Many Requests" in str(e) or "429" in str(e) or "Flood" in str(e):
                             timestamp_info = get_timestamp_info()
                             if attempt >= max_retries:

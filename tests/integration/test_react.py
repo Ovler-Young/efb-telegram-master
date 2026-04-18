@@ -11,7 +11,7 @@ pytestmark = mark.asyncio
 
 async def test_react_help(helper, client, bot_id):
     await client.send_message(bot_id, "/react")
-    content = await helper.wait_for_message_text(in_chats(bot_id))
+    content = await helper.wait_for_message_text(in_chats(bot_id) & regex(r"/react"))
     assert "/react" in content, f"{content!r} is not a help message for /react."
 
 

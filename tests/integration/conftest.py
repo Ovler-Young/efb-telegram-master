@@ -72,6 +72,16 @@ async def helper(helper_wrap, slave) -> TelegramIntegrationTestHelper:
     yield helper_wrap
 
 
+@pytest.fixture(scope="function", autouse=True)
+async def rate_limit_delay():
+    """
+    Telegram Bot API rate limits are easy to hit in CI.
+    Add a small delay between integration tests to reduce flakiness.
+    """
+    yield
+    await asyncio.sleep(6)
+
+
 @pytest.fixture(scope="module")
 def poll_bot(channel):
     logging.root.setLevel(logging.DEBUG)

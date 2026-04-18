@@ -1,3 +1,5 @@
+import asyncio
+
 from pytest import mark
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
@@ -71,6 +73,8 @@ async def test_update_info_group_user(helper, client, bot_group, channel, slave,
             await helper.wait_for_event(in_chats(bot_group) & new_photo)
 
         if chat_type == "GroupChat":
+            # Telegram may take a short moment to propagate the updated description.
+            await asyncio.sleep(2)
             # Get group description
             bot_group_t, peer_type = resolve_id(bot_group)
             if peer_type == PeerChannel:
