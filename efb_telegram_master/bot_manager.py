@@ -67,6 +67,18 @@ class ReplyTarget(Protocol):
     message_id: int
 
 
+def _ensure_ptb_job_queue_timezone_compatibility() -> None:
+    """Bridge PTB 22's UTC default to APScheduler 3.x's pytz-only timezone handling."""
+    try:
+        import pytz
+        from telegram.ext import _jobqueue as ptb_jobqueue
+    except ImportError:
+        return
+
+    if not hasattr(ptb_jobqueue.UTC, "localize") or not hasattr(ptb_jobqueue.UTC, "normalize"):
+        ptb_jobqueue.UTC = pytz.utc
+
+
 class AsyncTelegramRuntime:
     """Thread-safe bridge into the PTB 22 event loop."""
 
@@ -613,9 +625,12 @@ class TelegramBotManager(LocaleMixin):
         self._runtime = AsyncTelegramRuntime(self.logger)
         self._async_bot = self._build_bot(request=request, get_updates_request=get_updates_request)
         self._bot = SyncBotFacade(self._async_bot, self._runtime)
+        _ensure_ptb_job_queue_timezone_compatibility()
         self.application = (
             Application.builder()
             .bot(self._async_bot)
+            # This channel does not use PTB's JobQueue features.
+            .job_queue(None)
             .post_init(self._post_init)
             .post_shutdown(self._post_shutdown)
             .build()
