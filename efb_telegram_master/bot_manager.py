@@ -790,11 +790,16 @@ class TelegramBotManager(LocaleMixin):
         )
 
     async def _post_init(self, application: Application):
+        self.logger.error(
+            "[TRACE bm=%s] _post_init bound loop %r",
+            id(self),
+            asyncio.get_running_loop(),
+        )
         self._runtime.bind_loop(asyncio.get_running_loop())
-        for aux_bot in self.bot_pool.bots if self.bot_pool else []:
+        for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
             aux_bot.bind_runtime(self._runtime)
         self._shutdown_complete_event.clear()
-        self.logger.debug("Telegram runtime loop is ready.")
+
 
     async def _post_shutdown(self, application: Application):
         self._runtime.clear_loop()
@@ -850,6 +855,9 @@ class TelegramBotManager(LocaleMixin):
                 updater = self.application.updater
                 if updater is not None and updater.running:
                     await updater.stop()
+                for task in asyncio.all_tasks() - {asyncio.current_task()}:
+                    task.cancel()
+                await asyncio.sleep(0)
             except Exception:
                 self.logger.exception("Error during updater.stop")
 
@@ -1915,6 +1923,13 @@ class TelegramBotManager(LocaleMixin):
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
+        rt = getattr(self, "_runtime", None)
+        self.logger.error(
+            "[TRACE bm=%s] graceful_stop called; manual_evt=%r runtime_ready=%r",
+            id(self),
+            getattr(self, "_manual_polling_stop_event", None),
+            rt is not None and rt._ready.is_set(),
+        )
         self.logger.info("Starting graceful shutdown...")
 
         # Log pending tasks count before stopping
@@ -1975,6 +1990,8 @@ class TelegramBotManager(LocaleMixin):
         if hasattr(self, '_runtime'):
             if getattr(self._runtime, '_owns_loop_thread', False):
                 self._runtime.shutdown()
+            else:
+                self._runtime.clear_loop()
         self.logger.info("Graceful shutdown completed")
 
     def __del__(self):

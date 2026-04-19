@@ -244,6 +244,7 @@ def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
             _ready=SimpleNamespace(is_set=Mock(return_value=True)),
             call=Mock(),
             call_soon=Mock(return_value=True),
+            clear_loop=Mock(),
             shutdown=Mock(),
             _owns_loop_thread=False,
         ),
@@ -257,6 +258,7 @@ def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
     manager._runtime.call.assert_called_once_with(shutdown_coro, timeout=30)
     manager._runtime.call_soon.assert_not_called()
     manager.application.stop_running.assert_not_called()
+    manager._runtime.clear_loop.assert_called_once()
     manager._runtime.shutdown.assert_not_called()
 
 
@@ -276,6 +278,7 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
             _ready=SimpleNamespace(is_set=Mock(return_value=False)),
             call=Mock(),
             call_soon=Mock(return_value=False),
+            clear_loop=Mock(),
             shutdown=Mock(),
             _owns_loop_thread=False,
         ),
@@ -288,6 +291,7 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
     manager._runtime.call.assert_not_called()
     manager._runtime.call_soon.assert_called_once_with(manager.application.stop_running)
     manager.application.stop_running.assert_called_once()
+    manager._runtime.clear_loop.assert_called_once()
     manager._runtime.shutdown.assert_not_called()
 
 

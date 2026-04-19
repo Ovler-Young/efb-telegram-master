@@ -671,6 +671,9 @@ class TelegramChannel(MasterChannel):
                                                cache_time=180)
 
     def stop_polling(self):
+        if getattr(self, "_stop_polling_called", False):
+            return
+        self._stop_polling_called = True
         self.logger.debug("Gracefully stopping %s (%s).", self.channel_name, self.channel_id)
         self.rpc_utilities.shutdown()
         self.bot_manager.graceful_stop()
