@@ -1,6 +1,5 @@
 # coding=utf-8
 
-import asyncio
 import bisect
 import logging
 import threading
@@ -23,18 +22,20 @@ T = TypeVar("T")
 
 
 @overload
-def _resolve_bot_result(result: Coroutine[Any, Any, T]) -> T:
+def _resolve_bot_result(result: Coroutine[Any, Any, T], runtime: 'AsyncTelegramRuntime') -> T:
     ...
 
 
 @overload
-def _resolve_bot_result(result: T) -> T:
+def _resolve_bot_result(result: T, runtime: Optional['AsyncTelegramRuntime']) -> T:
     ...
 
 
-def _resolve_bot_result(result: object) -> object:
+def _resolve_bot_result(result: object, runtime: Optional['AsyncTelegramRuntime']) -> object:
     if isawaitable(result):
-        return asyncio.run(cast(Coroutine[Any, Any, object], result))
+        if runtime is None:
+            raise RuntimeError("Auxiliary bot runtime is not bound.")
+        return runtime.call(cast(Coroutine[Any, Any, object], result))
     return result
 
 
@@ -139,7 +140,7 @@ class AuxiliaryBot:
         Returns True on success, False on failure (bot is disabled).
         """
         try:
-            me: telegram.User = _resolve_bot_result(self.async_bot.get_me())
+            me: telegram.User = cast(telegram.User, _resolve_bot_result(self.async_bot.get_me(), self._runtime))
             self.bot_id = me.id
             self.username = me.username or ""
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)
@@ -318,7 +319,7 @@ class AuxiliaryBot:
         try:
             member: telegram.ChatMember = cast(
                 telegram.ChatMember,
-                _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id)),
+                _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id), self._runtime),
             )
             is_member = member.status in ('member', 'administrator', 'creator', 'restricted')
             self.update_membership(chat_id, is_member)

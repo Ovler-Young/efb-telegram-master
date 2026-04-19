@@ -619,7 +619,11 @@ class MasterMessageProcessor(LocaleMixin):
             ).format(error=e))
         if not self.channel.flag('prevent_message_removal'):
             try:
-                self.bot.delete_message(reply.chat_id, reply.message_id)
+                self.bot.delete_message(
+                    reply.chat_id,
+                    reply.message_id,
+                    _sender_bot_id=msg_log.sender_bot_id,
+                )
             except TelegramError:
                 sync_reply_text(self.bot, reply, self._("Message is removed in remote chat."))
         else:

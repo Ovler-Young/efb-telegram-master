@@ -61,13 +61,13 @@ class MessageFactory(ABC):
         """Issue an edit of the message if applicable.
 
         Returns the edited message, or none if no edit is needed."""
-        return
+        return None
 
     async def edit_message_media(self, client: TelegramClient, message: Message) -> Optional[Message]:
         """Issue a media edit of the message if applicable.
 
         Returns the edited message, or none if no edit is needed."""
-        return
+        return None
 
     async def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         """Finalize the message before discarding if needed."""
@@ -306,7 +306,9 @@ class AudioMessageFactory(MessageFactory):
         assert efb_msg.type == MsgType.File
         assert tg_msg.raw_text in efb_msg.text
         assert efb_msg.file
-        if efb_msg.file.closed and getattr(efb_msg, "path", None):
+        assert efb_msg.filename is not None
+        if efb_msg.file.closed:
+            assert efb_msg.path is not None
             efb_msg.file = efb_msg.path.open("rb")
         file_size = efb_msg.file.seek(0, 2)
         assert file_size == tg_msg.file.size
@@ -341,6 +343,7 @@ class VideoMessageFactory(MessageFactory):
         assert efb_msg.type == MsgType.Video
         assert tg_msg.raw_text == efb_msg.text
         assert efb_msg.file
+        assert efb_msg.filename is not None
         file_size = efb_msg.file.seek(0, 2)
         assert file_size == tg_msg.file.size
         assert efb_msg.filename.endswith(".mp4")
@@ -392,6 +395,7 @@ class AnimationMessageFactory(MessageFactory):
         assert efb_msg.type == MsgType.Animation
         assert tg_msg.raw_text == efb_msg.text
         assert efb_msg.file
+        assert efb_msg.filename is not None
         assert efb_msg.file.seek(0, 2)
         # Cannot compare file size due to format conversion
         assert efb_msg.filename.endswith(".gif")

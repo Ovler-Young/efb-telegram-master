@@ -95,7 +95,7 @@ class ETMMsg(Message):
                 ext = mimetypes.guess_extension(self.mime, strict=False)
                 mime = self.mime
             file = tempfile.NamedTemporaryFile(suffix=ext)
-            file_meta.download(out=file)
+            bot_manager._runtime.call(file_meta.download_to_memory(out=file))
             file.seek(0)
 
             if not mime:

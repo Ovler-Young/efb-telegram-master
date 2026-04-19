@@ -135,8 +135,9 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
         if txt.startswith("/start ")
     )
     token = command[len("/start "):]
-
-    assert token == re.search(r"\?startgroup=(.+)", url).groups()[0], "URL token matches manual token"
+    match = re.search(r"\?startgroup=(.+)", url)
+    assert match is not None
+    assert token == match.group(1), "URL token matches manual token"
 
     # Link chat_0 to bot_group
     await client.send_message(bot_group, command)
@@ -252,7 +253,10 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
         if i.url:
             url = i.url
             break
-    token = re.search(r"\?startgroup=(.+)", url).groups()[0]
+    assert url is not None
+    match = re.search(r"\?startgroup=(.+)", url)
+    assert match is not None
+    token = match.group(1)
     command = f"/start {token}"
     if dest_channel:
         message = await client.send_message(dest_channel, command)

@@ -619,9 +619,11 @@ class TelegramBotManager(LocaleMixin):
             self.logger.debug("Webhook is set...")
 
         self.logger.debug("Checking connection to Telegram bot API...")
-        me = asyncio.run(
-            self._build_bot(request=self._build_request(), get_updates_request=self._build_request()).get_me()
+        validation_bot = self._build_bot(
+            request=self._build_request(),
+            get_updates_request=self._build_request(),
         )
+        me = self._runtime.call(validation_bot.get_me())
         assert me, "Invalid bot credential provided."
         self.me = me
         self.logger.debug("Connection to Telegram bot API is OK...")
@@ -657,6 +659,7 @@ class TelegramBotManager(LocaleMixin):
         self._task_counter = 0  # Counter for tie-breaking in heapq
         self._delayed_worker_stop = threading.Event()
         self._pending_delayed_logs: dict[str, tuple] = {}  # Store pending database updates: task_id -> (etm_msg, old_msg_id)
+        self._completed_delayed_results: dict[str, tuple[TelegramMessage, Optional[str]]] = {}
         self._pending_logs_lock = threading.Lock()
         self._delayed_worker_thread = threading.Thread(
             target=self._delayed_message_worker,
@@ -895,6 +898,7 @@ class TelegramBotManager(LocaleMixin):
                 chat_limit=self.CHAT_LIMIT,
                 chat_window=self.CHAT_WINDOW,
             )
+            aux_bot.bind_runtime(self._runtime)
             if aux_bot.initialize():
                 aux_bots.append(aux_bot)
             else:
@@ -1140,6 +1144,8 @@ class TelegramBotManager(LocaleMixin):
                     if self._delayed_worker_stop.is_set():
                         break
 
+                    should_cleanup = True
+                    sender_bot_id: Optional[str] = None
                     try:
                         self.logger.debug(f"Executing delayed task {task.task_id} for chat {task.chat_id}")
 
@@ -1150,6 +1156,7 @@ class TelegramBotManager(LocaleMixin):
                         if sender_bot_id is None and delay_time <= 0:
                             delay_time, _, _ = self._calculate_rate_limit_delay(task.chat_id)
                         if delay_time > 0:
+                            should_cleanup = False
                             self._requeue_delayed_task(task, delay_time)
                             continue
 
@@ -1163,16 +1170,54 @@ class TelegramBotManager(LocaleMixin):
                         if result and hasattr(result, 'message_id'):
                             self._handle_delayed_database_update(task.task_id, result, sender_bot_id=sender_bot_id)
 
+                    except telegram.error.RetryAfter as e:
+                        should_cleanup = False
+                        retry_after_value = e.retry_after
+                        retry_after = (
+                            retry_after_value.total_seconds()
+                            if isinstance(retry_after_value, timedelta)
+                            else float(retry_after_value)
+                        )
+                        self.logger.warning(
+                            "Rate limit hit while executing delayed task %s, retrying in %.2fs",
+                            task.task_id,
+                            retry_after,
+                        )
+                        self._requeue_delayed_task(task, retry_after)
+                    except (telegram.error.TimedOut, telegram.error.NetworkError) as e:
+                        should_cleanup = False
+                        self.logger.warning(
+                            "Transient error while executing delayed task %s, retrying: %s",
+                            task.task_id,
+                            e,
+                        )
+                        self._requeue_delayed_task(task, 1.0)
+                    except telegram.error.Forbidden as e:
+                        if sender_bot_id and self.bot_pool:
+                            aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
+                            if aux_bot:
+                                aux_bot.mark_disabled("Forbidden during delayed task execution")
+                                self._notify_admin_disabled_bot(aux_bot)
+                                should_cleanup = False
+                                self.logger.warning(
+                                    "Aux bot %s failed delayed task %s with Forbidden, retrying with sender reselection.",
+                                    sender_bot_id,
+                                    task.task_id,
+                                )
+                                self._requeue_delayed_task(task, 0.0)
+                                continue
+                        self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
                     except Exception as e:
                         self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
                     finally:
-                        # Clean up temp files associated with this delayed task
-                        for path in task.cleanup_files:
-                            try:
-                                os.unlink(path)
-                                self.logger.debug("Cleaned up delayed task temp file: %s", path)
-                            except OSError as e:
-                                self.logger.warning("Failed to clean up delayed task temp file %s: %s", path, e)
+                        if should_cleanup:
+                            # Clean up temp files associated with this delayed task
+                            for path in task.cleanup_files:
+                                try:
+                                    os.unlink(path)
+                                    self.logger.debug("Cleaned up delayed task temp file: %s", path)
+                                except OSError as e:
+                                    self.logger.warning("Failed to clean up delayed task temp file %s: %s", path, e)
 
                 # Use event wait with timeout instead of sleep for faster shutdown response
                 if not self._delayed_worker_stop.wait(timeout=0.1):
@@ -1185,6 +1230,23 @@ class TelegramBotManager(LocaleMixin):
 
         self.logger.debug("Delayed message worker stopped")
 
+    def _finalize_delayed_database_update(
+        self,
+        etm_msg,
+        old_msg_id,
+        real_tg_msg: TelegramMessage,
+        *,
+        sender_bot_id: Optional[str] = None,
+    ):
+        etm_msg.type_telegram = get_msg_type(real_tg_msg)
+        etm_msg.put_telegram_file(real_tg_msg)
+        self.channel.db.add_or_update_message_log(
+            etm_msg,
+            real_tg_msg,
+            old_msg_id,
+            sender_bot_id=sender_bot_id,
+        )
+
     def register_delayed_database_update(self, task_id: str, etm_msg, old_msg_id=None):
         """
         Register a pending database update for a delayed task.
@@ -1194,9 +1256,22 @@ class TelegramBotManager(LocaleMixin):
             etm_msg: ETMMsg object to log
             old_msg_id: Optional old message ID for updates
         """
+        completed_result: Optional[tuple[TelegramMessage, Optional[str]]]
         with self._pending_logs_lock:
-            self._pending_delayed_logs[task_id] = (etm_msg, old_msg_id)
-        self.logger.debug(f"Registered delayed database update for task {task_id}")
+            completed_result = self._completed_delayed_results.pop(task_id, None)
+            if completed_result is None:
+                self._pending_delayed_logs[task_id] = (etm_msg, old_msg_id)
+                self.logger.debug(f"Registered delayed database update for task {task_id}")
+                return
+
+        real_tg_msg, sender_bot_id = completed_result
+        self.logger.debug(f"Finalizing already-completed delayed task {task_id}")
+        self._finalize_delayed_database_update(
+            etm_msg,
+            old_msg_id,
+            real_tg_msg,
+            sender_bot_id=sender_bot_id,
+        )
 
     def _handle_delayed_database_update(
         self,
@@ -1212,20 +1287,22 @@ class TelegramBotManager(LocaleMixin):
             task_id: Task identifier
             real_tg_msg: The real Telegram message that was sent
         """
+        pending_update = None
         with self._pending_logs_lock:
-            if task_id in self._pending_delayed_logs:
-                etm_msg, old_msg_id = self._pending_delayed_logs.pop(task_id)
+            pending_update = self._pending_delayed_logs.pop(task_id, None)
+            if pending_update is None:
+                self._completed_delayed_results[task_id] = (real_tg_msg, sender_bot_id)
+                self.logger.debug(f"Stored delayed result for task {task_id} until database registration is ready")
+                return
 
-                # Update the ETM message with real Telegram data
-                etm_msg.type_telegram = get_msg_type(real_tg_msg)
-                etm_msg.put_telegram_file(real_tg_msg)
-
-                # Update database with real message
-                self.channel.db.add_or_update_message_log(
-                    etm_msg, real_tg_msg, old_msg_id, sender_bot_id=sender_bot_id)
-                self.logger.debug(f"Updated database with real message for delayed task {task_id}")
-            else:
-                self.logger.warning(f"No pending database update found for task {task_id}")
+        etm_msg, old_msg_id = pending_update
+        self._finalize_delayed_database_update(
+            etm_msg,
+            old_msg_id,
+            real_tg_msg,
+            sender_bot_id=sender_bot_id,
+        )
+        self.logger.debug(f"Updated database with real message for delayed task {task_id}")
 
     def stop_delayed_worker(self):
         """Stop the delayed message worker thread."""

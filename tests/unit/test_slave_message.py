@@ -2,6 +2,7 @@ from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 from ehforwarderbot import Message, Chat
+from ehforwarderbot.chat import ChatMember
 from ehforwarderbot.types import ReactionName
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_message import SlaveMessageProcessor
@@ -57,7 +58,7 @@ def group_member(slave):
     return slave.group.members[0]
 
 
-def build_dummy_message(chat: Chat, author: Chat) -> Message:
+def build_dummy_message(chat: Chat, author: ChatMember) -> Message:
     message = Message()
     message.chat = chat
     message.author = author
@@ -65,7 +66,7 @@ def build_dummy_message(chat: Chat, author: Chat) -> Message:
 
 
 def test_slave_message_generate_common_private(generate_message_template, private):
-    message = build_dummy_message(private, private)
+    message = build_dummy_message(private, private.other)
     header = generate_message_template(message, False)
     assert private.name in header
     assert private.alias in header
@@ -84,7 +85,7 @@ def test_slave_message_generate_common_private_self(generate_message_template, p
 
 
 def test_slave_message_generate_common_linked(generate_message_template, private):
-    message = build_dummy_message(private, private)
+    message = build_dummy_message(private, private.other)
     header = generate_message_template(message, True)
     assert not header
 
@@ -154,14 +155,14 @@ def keyboard_to_sequence(markup: InlineKeyboardMarkup) -> str:
 
 
 def test_build_inline_keyboard_empty(build_inline_keyboard, private):
-    msg = build_dummy_message(private, private)
+    msg = build_dummy_message(private, private.other)
     keyboard = build_inline_keyboard(msg, "", "", None)
     seq = keyboard_to_sequence(keyboard)
     assert seq == '[]'
 
 
 def test_build_inline_keyboard_full(build_inline_keyboard, private):
-    msg = build_dummy_message(private, private)
+    msg = build_dummy_message(private, private.other)
     msg.text = "__text__"
     keyboard = build_inline_keyboard(msg, "__template__", "__reactions__", None)
     seq = keyboard_to_sequence(keyboard)
@@ -171,7 +172,7 @@ def test_build_inline_keyboard_full(build_inline_keyboard, private):
 
 
 def test_build_inline_keyboard_existing_buttons(build_inline_keyboard, private):
-    msg = build_dummy_message(private, private)
+    msg = build_dummy_message(private, private.other)
     msg.text = "__text__"
     markup = InlineKeyboardMarkup.from_row([
         InlineKeyboardButton("__button_a__"),
