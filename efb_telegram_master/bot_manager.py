@@ -797,6 +797,22 @@ class TelegramBotManager(LocaleMixin):
         self._runtime.clear_loop()
         self.logger.debug("Telegram runtime loop is cleared.")
 
+    async def _shutdown_ptb_application(self):
+        updater = self.application.updater
+        if updater and updater.running:
+            await updater.stop()
+
+        if self.application.running:
+            await self.application.stop()
+            post_stop = self.application.post_stop
+            if post_stop:
+                await post_stop(self.application)
+
+        await self.application.shutdown()
+
+        loop = asyncio.get_running_loop()
+        loop.call_soon(loop.stop)
+
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             return await asyncio.to_thread(callback, *args, **kwargs)
@@ -1845,14 +1861,23 @@ class TelegramBotManager(LocaleMixin):
         # Then stop the PTB application loop
         self.logger.debug("Stopping Telegram application...")
         if hasattr(self, 'application'):
-            stop_requested = False
-            if hasattr(self, '_runtime'):
-                stop_requested = self._runtime.call_soon(self.application.stop_running)
-            if not stop_requested:
+            application_stopped = False
+            if hasattr(self, '_runtime') and self._runtime._ready.is_set():
                 try:
-                    self.application.stop_running()
-                except RuntimeError as exc:
-                    self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
+                    self._runtime.call(self._shutdown_ptb_application(), timeout=30)
+                    application_stopped = True
+                except Exception as exc:
+                    self.logger.warning("PTB shutdown coroutine did not complete cleanly: %s", exc)
+
+            if not application_stopped:
+                stop_requested = False
+                if hasattr(self, '_runtime'):
+                    stop_requested = self._runtime.call_soon(self.application.stop_running)
+                if not stop_requested:
+                    try:
+                        self.application.stop_running()
+                    except RuntimeError as exc:
+                        self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
         if hasattr(self, '_runtime'):
             if getattr(self._runtime, '_owns_loop_thread', False):
                 self._runtime.shutdown()

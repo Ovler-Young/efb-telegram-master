@@ -1,9 +1,10 @@
+import asyncio
 import string
 import random
 import threading
 from typing import IO, Iterator, BinaryIO
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import telegram.error
@@ -226,7 +227,8 @@ def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_dis
     sleep.assert_called()
 
 
-def test_graceful_stop_requests_application_stop_on_runtime_loop():
+def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
+    shutdown_coro = "shutdown-coro"
     manager = SimpleNamespace(
         logger=Mock(),
         _delayed_queue=[("when", 0, "task")],
@@ -234,14 +236,23 @@ def test_graceful_stop_requests_application_stop_on_runtime_loop():
         stop_delayed_worker=Mock(),
         bot_pool=SimpleNamespace(shutdown=Mock()),
         application=SimpleNamespace(stop_running=Mock()),
-        _runtime=SimpleNamespace(call_soon=Mock(return_value=True), shutdown=Mock(), _owns_loop_thread=False),
+        _shutdown_ptb_application=Mock(return_value=shutdown_coro),
+        _runtime=SimpleNamespace(
+            _ready=SimpleNamespace(is_set=Mock(return_value=True)),
+            call=Mock(),
+            call_soon=Mock(return_value=True),
+            shutdown=Mock(),
+            _owns_loop_thread=False,
+        ),
     )
 
     TelegramBotManager.graceful_stop(manager)
 
     manager.stop_delayed_worker.assert_called_once()
     manager.bot_pool.shutdown.assert_called_once()
-    manager._runtime.call_soon.assert_called_once_with(manager.application.stop_running)
+    manager._shutdown_ptb_application.assert_called_once_with()
+    manager._runtime.call.assert_called_once_with(shutdown_coro, timeout=30)
+    manager._runtime.call_soon.assert_not_called()
     manager.application.stop_running.assert_not_called()
     manager._runtime.shutdown.assert_not_called()
 
@@ -254,15 +265,47 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
         stop_delayed_worker=Mock(),
         bot_pool=None,
         application=SimpleNamespace(stop_running=Mock()),
-        _runtime=SimpleNamespace(call_soon=Mock(return_value=False), shutdown=Mock(), _owns_loop_thread=False),
+        _shutdown_ptb_application=Mock(),
+        _runtime=SimpleNamespace(
+            _ready=SimpleNamespace(is_set=Mock(return_value=False)),
+            call=Mock(),
+            call_soon=Mock(return_value=False),
+            shutdown=Mock(),
+            _owns_loop_thread=False,
+        ),
     )
 
     TelegramBotManager.graceful_stop(manager)
 
     manager.stop_delayed_worker.assert_called_once()
+    manager._shutdown_ptb_application.assert_not_called()
+    manager._runtime.call.assert_not_called()
     manager._runtime.call_soon.assert_called_once_with(manager.application.stop_running)
     manager.application.stop_running.assert_called_once()
     manager._runtime.shutdown.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ptb_application_stops_ptb_components_and_loop():
+    post_stop = AsyncMock()
+    application = SimpleNamespace(
+        updater=SimpleNamespace(running=True, stop=AsyncMock()),
+        running=True,
+        stop=AsyncMock(),
+        shutdown=AsyncMock(),
+        post_stop=post_stop,
+    )
+    manager = SimpleNamespace(application=application)
+    loop = asyncio.get_running_loop()
+
+    with patch.object(loop, "call_soon") as call_soon:
+        await TelegramBotManager._shutdown_ptb_application(manager)
+
+    application.updater.stop.assert_awaited_once_with()
+    application.stop.assert_awaited_once_with()
+    post_stop.assert_awaited_once_with(application)
+    application.shutdown.assert_awaited_once_with()
+    call_soon.assert_called_once_with(loop.stop)
 
 
 def test_polling_passes_custom_timeout_to_run_polling():
