@@ -800,9 +800,20 @@ class TelegramBotManager(LocaleMixin):
     async def _shutdown_ptb_application(self):
         # Signal PTB's run_polling / run_webhook to exit via Application.stop_running().
         # PTB then runs stop / shutdown / loop close inside run_polling's finally block.
-        # Manual updater.stop / application.stop / shutdown plus loop.stop() while
-        # __run_forever still awaits __stop_running_marker can hang cleanup past join timeout.
+        #
+        # Important: stop_running() returns immediately, but the Updater may still have an
+        # in-flight getUpdates long poll. If the next test starts polling with the same
+        # token before that connection closes, Telegram returns HTTP 409 (conflict).
         self.application.stop_running()
+
+        updater = self.application.updater
+        if updater is None:
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15
+        while getattr(updater, "running", False) and loop.time() < deadline:
+            await asyncio.sleep(0.1)
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:

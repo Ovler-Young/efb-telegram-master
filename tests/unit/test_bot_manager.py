@@ -285,13 +285,28 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_ptb_application_requests_stop_running():
-    application = SimpleNamespace(stop_running=Mock())
+async def test_shutdown_ptb_application_signals_stop_running_and_waits_for_updater():
+    running = {"value": True}
+
+    class DummyUpdater:
+        @property
+        def running(self):
+            return running["value"]
+
+    def fake_stop_running():
+        # Simulate PTB flipping updater.running to False shortly after stop_running.
+        running["value"] = False
+
+    application = SimpleNamespace(
+        stop_running=Mock(side_effect=fake_stop_running),
+        updater=DummyUpdater(),
+    )
     manager = SimpleNamespace(application=application)
 
     await TelegramBotManager._shutdown_ptb_application(manager)
 
     application.stop_running.assert_called_once_with()
+    assert running["value"] is False
 
 
 def test_polling_passes_custom_timeout_to_run_polling():
