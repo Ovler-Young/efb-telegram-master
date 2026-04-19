@@ -651,6 +651,7 @@ class TelegramBotManager(LocaleMixin):
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
         self._tls = threading.local()  # Thread-local for bot override (_active_bot)
+        self._shutdown_complete_event = threading.Event()
         self._aux_recent_use: dict[int, float] = {}  # chat_id -> timestamp of last aux bot use
         self.logger.debug("Rate limiter initialized...")
 
@@ -791,29 +792,16 @@ class TelegramBotManager(LocaleMixin):
         self._runtime.bind_loop(asyncio.get_running_loop())
         for aux_bot in self.bot_pool.bots if self.bot_pool else []:
             aux_bot.bind_runtime(self._runtime)
+        self._shutdown_complete_event.clear()
         self.logger.debug("Telegram runtime loop is ready.")
 
     async def _post_shutdown(self, application: Application):
         self._runtime.clear_loop()
-        self.logger.debug("Telegram runtime loop is cleared.")
+        self._shutdown_complete_event.set()
+        self.logger.debug("Telegram runtime loop is cleared; shutdown complete.")
 
     async def _shutdown_ptb_application(self):
-        # Signal PTB's run_polling / run_webhook to exit via Application.stop_running().
-        # PTB then runs stop / shutdown / loop close inside run_polling's finally block.
-        #
-        # Important: stop_running() returns immediately, but the Updater may still have an
-        # in-flight getUpdates long poll. If the next test starts polling with the same
-        # token before that connection closes, Telegram returns HTTP 409 (conflict).
         self.application.stop_running()
-
-        updater = self.application.updater
-        if updater is None:
-            return
-
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 15
-        while getattr(updater, "running", False) and loop.time() < deadline:
-            await asyncio.sleep(0.1)
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -1880,6 +1868,13 @@ class TelegramBotManager(LocaleMixin):
                         self.application.stop_running()
                     except RuntimeError as exc:
                         self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
+
+            if hasattr(self, "_shutdown_complete_event"):
+                if not self._shutdown_complete_event.wait(timeout=30):
+                    self.logger.warning(
+                        "Telegram post_shutdown hook did not fire within 30s; "
+                        "the next polling instance may see a Conflict from Telegram."
+                    )
         if hasattr(self, '_runtime'):
             if getattr(self._runtime, '_owns_loop_thread', False):
                 self._runtime.shutdown()

@@ -228,6 +228,8 @@ def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_dis
 
 def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
     shutdown_coro = "shutdown-coro"
+    shutdown_complete_event = threading.Event()
+    shutdown_complete_event.set()
     manager = SimpleNamespace(
         logger=Mock(),
         _delayed_queue=[("when", 0, "task")],
@@ -236,6 +238,7 @@ def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
         bot_pool=SimpleNamespace(shutdown=Mock()),
         application=SimpleNamespace(stop_running=Mock()),
         _shutdown_ptb_application=Mock(return_value=shutdown_coro),
+        _shutdown_complete_event=shutdown_complete_event,
         _runtime=SimpleNamespace(
             _ready=SimpleNamespace(is_set=Mock(return_value=True)),
             call=Mock(),
@@ -257,6 +260,8 @@ def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
 
 
 def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
+    shutdown_complete_event = threading.Event()
+    shutdown_complete_event.set()
     manager = SimpleNamespace(
         logger=Mock(),
         _delayed_queue=[],
@@ -265,6 +270,7 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
         bot_pool=None,
         application=SimpleNamespace(stop_running=Mock()),
         _shutdown_ptb_application=Mock(),
+        _shutdown_complete_event=shutdown_complete_event,
         _runtime=SimpleNamespace(
             _ready=SimpleNamespace(is_set=Mock(return_value=False)),
             call=Mock(),
@@ -285,28 +291,13 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_ptb_application_signals_stop_running_and_waits_for_updater():
-    running = {"value": True}
-
-    class DummyUpdater:
-        @property
-        def running(self):
-            return running["value"]
-
-    def fake_stop_running():
-        # Simulate PTB flipping updater.running to False shortly after stop_running.
-        running["value"] = False
-
-    application = SimpleNamespace(
-        stop_running=Mock(side_effect=fake_stop_running),
-        updater=DummyUpdater(),
-    )
+async def test_shutdown_ptb_application_signals_stop_running():
+    application = SimpleNamespace(stop_running=Mock())
     manager = SimpleNamespace(application=application)
 
     await TelegramBotManager._shutdown_ptb_application(manager)
 
     application.stop_running.assert_called_once_with()
-    assert running["value"] is False
 
 
 def test_polling_passes_custom_timeout_to_run_polling():
