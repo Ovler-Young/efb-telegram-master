@@ -1,7 +1,10 @@
+import asyncio
 import shutil
+import threading
 from getpass import getpass
 from gettext import translation
 from typing import Optional
+from urllib.parse import quote, urlparse, urlunparse
 
 from PIL import Image, WebPImagePlugin
 from bullet import YesNo, Numbers, Bullet
@@ -9,10 +12,9 @@ from pkg_resources import resource_filename
 
 import cjkwrap
 from ruamel.yaml import YAML
-from telegram import Bot, TelegramError
-from telegram.ext.filters import Filters
-from telegram.ext import MessageHandler, Updater
-from telegram.utils.request import Request
+from telegram import Bot
+from telegram.error import TelegramError
+from telegram.request import HTTPXRequest
 
 from ehforwarderbot import coordinator, utils
 from ehforwarderbot.types import ModuleID
@@ -36,7 +38,7 @@ ngettext = translator.ngettext
 
 class DataModel:
     data: dict
-    request: Optional[Request] = None
+    request: Optional[HTTPXRequest] = None
     building_default = False
 
     def __init__(self, profile: str, instance_id: str):
@@ -54,6 +56,8 @@ class DataModel:
             self.build_default_config()
         else:
             self.data = self.yaml.load(self.config_path.open())
+            if self.data.get('request_kwargs'):
+                self.request = HTTPXRequest(**normalize_request_kwargs(self.data['request_kwargs']))
 
     def build_default_config(self):
         self.data = {
@@ -167,6 +171,73 @@ class DataModel:
                 self.yaml.dump(self.data, f)
 
 
+def normalize_request_kwargs(request_kwargs: Optional[dict]) -> dict:
+    if not isinstance(request_kwargs, dict):
+        return {}
+
+    normalized = dict(request_kwargs)
+    proxy = normalized.pop("proxy", None) or normalized.pop("proxy_url", None)
+    username = normalized.pop("username", None)
+    password = normalized.pop("password", None)
+    urllib3_proxy_kwargs = normalized.pop("urllib3_proxy_kwargs", None) or {}
+
+    if proxy:
+        parsed = urlparse(proxy)
+        auth_user = username or urllib3_proxy_kwargs.get("username")
+        auth_password = password or urllib3_proxy_kwargs.get("password")
+        if auth_user is not None:
+            auth = quote(str(auth_user), safe="")
+            if auth_password is not None:
+                auth += ":" + quote(str(auth_password), safe="")
+            host = parsed.hostname or parsed.netloc
+            auth_netloc = f"{auth}@{host}"
+            if parsed.port:
+                auth_netloc += f":{parsed.port}"
+            proxy = urlunparse(
+                (
+                    parsed.scheme,
+                    auth_netloc,
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        normalized["proxy"] = proxy
+    return normalized
+
+
+def build_bot(data: DataModel, token: Optional[str] = None) -> Bot:
+    bot_kwargs: dict = {"token": token or data.data["token"]}
+    if data.request is not None:
+        bot_kwargs["request"] = data.request
+    return Bot(**bot_kwargs)
+
+
+async def _id_bot_loop(bot: Bot, stop_event: threading.Event):
+    offset = None
+    while not stop_event.is_set():
+        updates = await bot.get_updates(offset=offset, timeout=5)
+        for update in updates:
+            offset = update.update_id + 1
+            if update.effective_message and update.effective_user:
+                await bot.send_message(
+                    chat_id=update.effective_message.chat_id,
+                    text=_("Your Telegram user ID is {id}.").format(id=update.effective_user.id),
+                )
+
+
+def start_id_bot(data: DataModel):
+    stop_event = threading.Event()
+
+    def runner():
+        asyncio.run(_id_bot_loop(build_bot(data), stop_event))
+
+    thread = threading.Thread(target=runner, daemon=True, name="ETMWizardIDBot")
+    thread.start()
+    return stop_event, thread
+
+
 def input_bot_token(data: DataModel, default=None):
     prompt = _("Your Telegram Bot token: ")
     if default:
@@ -181,10 +252,7 @@ def input_bot_token(data: DataModel, default=None):
                 continue
         else:
             try:
-                bot_kwargs: dict = {"token": ans}
-                if data.request is not None:
-                    bot_kwargs["request"] = data.request
-                Bot(**bot_kwargs).get_me()
+                asyncio.run(build_bot(data, ans).get_me())
             except TelegramError as e:
                 print_wrapped(str(e))
                 print()
@@ -231,7 +299,7 @@ def setup_proxy(data):
                     "username": username,
                     "password": password
                 }
-        data.request = Request(**data.data['request_kwargs'])
+        data.request = HTTPXRequest(**normalize_request_kwargs(data.data['request_kwargs']))
 
 
 def setup_telegram_bot(data):
@@ -306,10 +374,7 @@ def setup_telegram_bot_commands_list(data):
 
     if answer == prompt_yes:
         print(_("Updating commands list..."), end="", flush=True)
-        bot_kwargs: dict = {"token": data.data['token']}
-        if data.request is not None:
-            bot_kwargs["request"] = data.request
-        Bot(**bot_kwargs).set_my_commands(
+        asyncio.run(build_bot(data).set_my_commands(
             [
                 ("help", _("Show commands list.")),
                 ("link", _("Link a remote chat to a group.")),
@@ -321,7 +386,7 @@ def setup_telegram_bot_commands_list(data):
                 ("react", _("Send a reaction to a message, or show a list of reactors.")),
                 ("rm", _("Remove a message from its remote chat.")),
             ]
-        )
+        ))
 
         print(_("OK"))
         print()
@@ -372,23 +437,7 @@ def setup_admins(data):
 
         if answer == prompt_yes:
             print(_("Starting ID bot..."), end="", flush=True)
-
-            updater = Updater(token=data.data['token'],
-                              request_kwargs=data.data.get(
-                                  'request_kwargs', None),
-                              use_context=True)
-            updater.dispatcher.add_handler(
-                MessageHandler(
-                    Filters.all,
-                    lambda update, context:
-                    update.effective_message.reply_text(
-                        _("Your Telegram user ID is {id}.").format(
-                            id=update.effective_user.id
-                        )
-                    )
-                )
-            )
-            updater.start_polling()
+            stop_event, id_bot_thread = start_id_bot(data)
 
             print(_("OK"))
             print()
@@ -402,7 +451,8 @@ def setup_admins(data):
             data.data['admins'] = input_admin_ids(default=data.data['admins'])
             print()
             print(_("Stopping ID bot..."), end="", flush=True)
-            updater.stop()
+            stop_event.set()
+            id_bot_thread.join(timeout=10.0)
             print(_("OK"))
         else:
             data.data['admins'] = input_admin_ids(default=data.data['admins'])

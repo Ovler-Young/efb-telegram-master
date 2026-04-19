@@ -20,9 +20,9 @@ def test_initialize_sets_identity():
     assert aux_bot.disabled is False
 
 
-def test_initialize_disables_bot_on_unauthorized():
+def test_initialize_disables_bot_on_forbidden():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
-        bot_cls.return_value.get_me.side_effect = telegram.error.Unauthorized("bad token")
+        bot_cls.return_value.get_me.side_effect = telegram.error.Forbidden("bad token")
         aux_bot = AuxiliaryBot("123:token")
 
     assert aux_bot.initialize() is False

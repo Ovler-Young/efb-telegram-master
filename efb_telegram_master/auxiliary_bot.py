@@ -1,20 +1,28 @@
 # coding=utf-8
 
+import asyncio
 import bisect
 import logging
 import threading
 import time
 from collections import defaultdict, deque
+from inspect import isawaitable
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import telegram
 import telegram.error
-from telegram.utils.request import Request
+from telegram.request import HTTPXRequest
 
 if TYPE_CHECKING:
-    pass
+    from .bot_manager import AsyncTelegramRuntime
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_bot_result(result: Any):
+    if isawaitable(result):
+        return asyncio.run(result)
+    return result
 
 
 class AuxiliaryBot:
@@ -35,21 +43,23 @@ class AuxiliaryBot:
                  global_window: float = 1.0,
                  chat_limit: int = 20,
                  chat_window: float = 60.0):
-        kwargs: Dict[str, Any] = {}
+        self._token = token
+        self._request_kwargs = dict(request_kwargs or {})
+        self._base_kwargs: Dict[str, Any] = {}
         if base_url:
-            kwargs['base_url'] = base_url
+            self._base_kwargs['base_url'] = base_url
         if base_file_url:
-            kwargs['base_file_url'] = base_file_url
-        if request_kwargs:
-            kwargs['request'] = Request(**request_kwargs)
+            self._base_kwargs['base_file_url'] = base_file_url
 
-        self.bot: telegram.Bot = telegram.Bot(token=token, **kwargs)
+        self.async_bot: telegram.Bot = self._create_bot()
+        self.bot: Any = self.async_bot
 
         # Identity (populated by initialize())
         self.bot_id: int = 0
         self.username: str = ""
         self.disabled: bool = False
         self._disable_reason: str = ""
+        self._runtime: Optional['AsyncTelegramRuntime'] = None
 
         # Rate limiting (same structure as TelegramBotManager)
         self._rate_limit_lock = threading.Lock()
@@ -65,17 +75,25 @@ class AuxiliaryBot:
         self._membership_lock = threading.Lock()
         self._pending_probes: set = set()
 
+    def _create_bot(self) -> telegram.Bot:
+        kwargs: Dict[str, Any] = {"token": self._token, **self._base_kwargs}
+        if self._request_kwargs:
+            kwargs['request'] = HTTPXRequest(**self._request_kwargs)
+            kwargs['get_updates_request'] = HTTPXRequest(**self._request_kwargs)
+        return telegram.Bot(**kwargs)
+
     def initialize(self) -> bool:
         """Call get_me() to validate token and cache identity.
         Returns True on success, False on failure (bot is disabled).
         """
         try:
-            me = self.bot.get_me()
+            validation_bot = self.async_bot if not isinstance(self.async_bot, telegram.Bot) else self._create_bot()
+            me = _resolve_bot_result(validation_bot.get_me())
             self.bot_id = me.id
             self.username = me.username or ""
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)
             return True
-        except telegram.error.Unauthorized as e:
+        except telegram.error.Forbidden as e:
             self.disabled = True
             self._disable_reason = str(e)
             logger.error("Failed to initialize auxiliary bot: %s", e)
@@ -247,15 +265,15 @@ class AuxiliaryBot:
     def _probe_membership(self, chat_id: int):
         """Background probe: call get_chat_member and update cache."""
         try:
-            member = self.bot.get_chat_member(chat_id, self.bot_id)
+            member = _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id))
             is_member = member.status in ('member', 'administrator', 'creator', 'restricted')
             self.update_membership(chat_id, is_member)
             logger.debug("Membership probe for bot %d in chat %d: %s (status=%s)",
                          self.bot_id, chat_id, is_member, member.status)
-        except telegram.error.Unauthorized:
+        except telegram.error.Forbidden:
             self.disabled = True
-            self._disable_reason = "Unauthorized during membership probe"
-            logger.error("Auxiliary bot %d got Unauthorized during membership probe", self.bot_id)
+            self._disable_reason = "Forbidden during membership probe"
+            logger.error("Auxiliary bot %d got Forbidden during membership probe", self.bot_id)
         except telegram.error.BadRequest as e:
             self.update_membership(chat_id, False)
             logger.debug("Membership probe for bot %d in chat %d failed: %s", self.bot_id, chat_id, e)
@@ -276,6 +294,13 @@ class AuxiliaryBot:
         self.disabled = True
         self._disable_reason = reason
         logger.error("Auxiliary bot @%s (id=%d) disabled: %s", self.username, self.bot_id, reason)
+
+    def bind_runtime(self, runtime: 'AsyncTelegramRuntime'):
+        """Bind the runtime-backed sync facade used by the rest of ETM."""
+        from .bot_manager import SyncBotFacade
+
+        self._runtime = runtime
+        self.bot = SyncBotFacade(self.async_bot, runtime)
 
     def __repr__(self):
         return f"AuxiliaryBot(@{self.username}, id={self.bot_id}, disabled={self.disabled})"

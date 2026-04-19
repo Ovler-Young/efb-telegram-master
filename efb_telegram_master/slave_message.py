@@ -9,7 +9,7 @@ import traceback
 import urllib.parse
 from collections import defaultdict
 from pathlib import Path
-from typing import Tuple, Optional, TYPE_CHECKING, List, IO, Union
+from typing import Any, Tuple, Optional, TYPE_CHECKING, List, IO, Union
 
 import humanize
 import pydub
@@ -18,8 +18,10 @@ import telegram.constants
 import telegram.error
 import telegram.ext
 from PIL import Image
-from telegram import InputFile, ChatAction, InputMediaPhoto, InputMediaDocument, InputMediaVideo, InputMediaAnimation, \
-    InlineKeyboardMarkup, InlineKeyboardButton, ReplyMarkup, TelegramError, InputMedia
+from telegram import InputFile, InputMediaPhoto, InputMediaDocument, InputMediaVideo, InputMediaAnimation, \
+    InlineKeyboardMarkup, InlineKeyboardButton, InputMedia
+from telegram.constants import ChatAction
+from telegram.error import TelegramError
 
 from ehforwarderbot import Message, Status, coordinator
 from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
@@ -285,7 +287,7 @@ class SlaveMessageProcessor(LocaleMixin):
             etm_msg.put_telegram_file(tg_msg)
 
             # Capture sender_bot_id annotated by rate_limit_decorator
-            sender_bot_id = getattr(tg_msg, '_sender_bot_id', None)
+            sender_bot_id = getattr(tg_msg, 'sender_bot_id', None)
 
             self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id,
                                               sender_bot_id=sender_bot_id)
@@ -377,7 +379,7 @@ class SlaveMessageProcessor(LocaleMixin):
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                            old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
-                           reply_markup: Optional[ReplyMarkup] = None,
+                           reply_markup: Optional[Any] = None,
                            silent: bool = False) -> telegram.Message:
         """
         Send message as text to Telegram.
@@ -409,7 +411,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                            reply_to_message_id=target_msg_id,
                                            message_thread_id=thread_id,
                                            reply_markup=reply_markup,
-                                           disable_notification=silent)
+                                           disable_notification=silent,
+                                           _send_mode='eventual')
         else:
             # Cannot change reply_to_message_id when editing a message
             edit_kwargs = dict(chat_id=old_msg_id[0],
@@ -428,7 +431,7 @@ class SlaveMessageProcessor(LocaleMixin):
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                            old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
-                           reply_markup: Optional[ReplyMarkup] = None,
+                           reply_markup: Optional[Any] = None,
                            silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.TYPING, message_thread_id=thread_id)
 
@@ -461,7 +464,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                          reply_to_message_id=target_msg_id,
                                          message_thread_id=thread_id,
                                          reply_markup=reply_markup,
-                                         disable_notification=silent)
+                                         disable_notification=silent,
+                                         _send_mode='eventual')
 
     # Parameters to decide when to pictures as files
     IMG_MIN_SIZE = 1600
@@ -477,7 +481,7 @@ class SlaveMessageProcessor(LocaleMixin):
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                             old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
-                            reply_markup: Optional[ReplyMarkup] = None,
+                            reply_markup: Optional[Any] = None,
                             silent: bool = False) -> telegram.Message:
         assert msg.file
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO, message_thread_id=thread_id)
@@ -615,7 +619,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                 thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                                 old_msg_id: Optional[OldMsgID] = None,
                                 target_msg_id: Optional[TelegramMessageID] = None,
-                                reply_markup: Optional[ReplyMarkup] = None,
+                                reply_markup: Optional[Any] = None,
                                 silent: Optional[bool] = None) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO, message_thread_id=thread_id) # UPLOAD_VIDEO_NOTE might be better?
 
@@ -778,15 +782,15 @@ class SlaveMessageProcessor(LocaleMixin):
         if reactions:
             description.append([InlineKeyboardButton(reactions, callback_data="void")])
         effective_reply_markup = reply_markup if isinstance(reply_markup, InlineKeyboardMarkup) else InlineKeyboardMarkup([])
-        effective_reply_markup.inline_keyboard = description + effective_reply_markup.inline_keyboard
-        return effective_reply_markup
+        existing_rows = [list(row) for row in effective_reply_markup.inline_keyboard]
+        return InlineKeyboardMarkup(description + existing_rows)
 
 
     def slave_message_file(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                            old_msg_id: Optional[OldMsgID] = None,
                            target_msg_id: Optional[TelegramMessageID] = None,
-                           reply_markup: Optional[ReplyMarkup] = None,
+                           reply_markup: Optional[Any] = None,
                            silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_DOCUMENT, message_thread_id=thread_id)
 
@@ -861,7 +865,7 @@ class SlaveMessageProcessor(LocaleMixin):
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                             old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
-                            reply_markup: Optional[ReplyMarkup] = None,
+                            reply_markup: Optional[Any] = None,
                             silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.RECORD_AUDIO, message_thread_id=thread_id)
         if msg.text:
@@ -963,7 +967,7 @@ class SlaveMessageProcessor(LocaleMixin):
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                             old_msg_id: Optional[OldMsgID] = None,
                             target_msg_id: Optional[TelegramMessageID] = None,
-                            reply_markup: Optional[ReplyMarkup] = None,
+                            reply_markup: Optional[Any] = None,
                             silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_VIDEO, message_thread_id=thread_id)
         if msg.text:
@@ -1023,7 +1027,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                   thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                                   old_msg_id: Optional[OldMsgID] = None,
                                   target_msg_id: Optional[TelegramMessageID] = None,
-                                  reply_markup: Optional[ReplyMarkup] = None,
+                                  reply_markup: Optional[Any] = None,
                                   silent: bool = False) -> telegram.Message:
         self.logger.debug("[%s] Sending as an unsupported message.", msg.uid)
         # Note: send_chat_action for unsupported might need adjustment if PTB changes behavior
@@ -1204,9 +1208,9 @@ class SlaveMessageProcessor(LocaleMixin):
         file.seek(0, 2)
         file_size = file.tell()
         file.seek(0)
-        if not self.channel.flag("local_tdlib_api") and file_size > telegram.constants.MAX_FILESIZE_UPLOAD:
+        if not self.channel.flag("local_tdlib_api") and file_size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD:
             size_str = humanize.naturalsize(file_size)
-            max_size_str = humanize.naturalsize(telegram.constants.MAX_FILESIZE_UPLOAD)
+            max_size_str = humanize.naturalsize(telegram.constants.FileSizeLimit.FILESIZE_UPLOAD)
             return self._(
                 "Attachment is too large ({size}). Maximum allowed by Telegram Bot API is {max_size}. (AT02)").format(
                 size=size_str, max_size=max_size_str)

@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 import telegram.error
 
-from efb_telegram_master.bot_manager import TelegramBotManager
+from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
 
 
 def test_text_prefix_suffix(channel, bot_admin):
@@ -119,6 +119,9 @@ def test_rate_limit_decorator_forced_routes_to_sender_bot():
         _delayed_worker_stop=threading.Event(),
         bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
         _using_bot=lambda bot: SimpleNamespace(__enter__=lambda *a: None, __exit__=lambda *a: None),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
         logger=Mock(),
     )
 
@@ -133,7 +136,7 @@ def test_rate_limit_decorator_forced_routes_to_sender_bot():
 
     result = decorated(manager, 123, _sender_bot_id="777")
 
-    assert result._sender_bot_id == "777"
+    assert result.sender_bot_id == "777"
     manager.bot_pool.get_bot_by_id.assert_called_once_with("777")
 
 
@@ -142,6 +145,9 @@ def test_rate_limit_decorator_falls_back_to_main_bot_when_sender_missing():
     manager = SimpleNamespace(
         _delayed_worker_stop=threading.Event(),
         bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=None)),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
         logger=Mock(),
     )
 
@@ -163,37 +169,40 @@ def test_rate_limit_decorator_routes_new_send_through_aux_pool():
 
     manager = SimpleNamespace(
         _delayed_worker_stop=threading.Event(),
-        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=(aux_bot, 0.0))),
+        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
         _calculate_rate_limit_delay=Mock(return_value=(1.0, 0, 0)),
+        _select_sender=Mock(return_value=(aux_bot.bot, "999", 0.0)),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
         _using_bot=lambda bot: DummyContext(),
         _record_aux_use=Mock(),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
         logger=Mock(),
     )
 
     result = decorated(manager, 123)
 
-    assert result._sender_bot_id == "999"
-    manager.bot_pool.acquire_send_slot.assert_called_once_with(123, max_delay=1.0)
+    assert result.sender_bot_id == "999"
+    manager._select_sender.assert_called_once_with(123, has_callback=False)
     manager._record_aux_use.assert_called_once_with(123)
 
 
-def test_rate_limit_decorator_schedules_delayed_task_when_main_bot_is_limited():
+def test_rate_limit_decorator_eventual_mode_schedules_delayed_task():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+    scheduled = SimpleNamespace(queued=True, task_id="task-1")
     manager = SimpleNamespace(
         _delayed_worker_stop=threading.Event(),
         bot_pool=None,
-        _calculate_rate_limit_delay=Mock(return_value=(5.0, 1, 1)),
         _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _schedule_delayed_task=Mock(return_value="task-1"),
-        _create_delayed_message_placeholder=Mock(return_value=SimpleNamespace(is_delayed=True, task_id="task-1")),
+        _schedule_eventual_send=Mock(return_value=scheduled),
         logger=Mock(),
     )
 
-    result = decorated(manager, 123)
+    result = decorated(manager, 123, _send_mode="eventual")
 
-    assert result.is_delayed is True
-    manager._schedule_delayed_task.assert_called_once()
-    manager._create_delayed_message_placeholder.assert_called_once_with(123, 5.0, "task-1")
+    assert result is scheduled
+    manager._schedule_eventual_send.assert_called_once()
 
 
 def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_disabled():
@@ -217,18 +226,20 @@ def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_dis
     sleep.assert_called()
 
 
-def test_graceful_stop_stops_worker_pool_and_updater():
+def test_graceful_stop_stops_worker_pool_and_application():
     manager = SimpleNamespace(
         logger=Mock(),
         _delayed_queue=[("when", 0, "task")],
         _delayed_queue_lock=threading.Lock(),
         stop_delayed_worker=Mock(),
         bot_pool=SimpleNamespace(shutdown=Mock()),
-        updater=SimpleNamespace(stop=Mock()),
+        application=SimpleNamespace(stop_running=Mock()),
+        _runtime=SimpleNamespace(shutdown=Mock()),
     )
 
     TelegramBotManager.graceful_stop(manager)
 
     manager.stop_delayed_worker.assert_called_once()
     manager.bot_pool.shutdown.assert_called_once()
-    manager.updater.stop.assert_called_once()
+    manager.application.stop_running.assert_called_once()
+    manager._runtime.shutdown.assert_called_once()

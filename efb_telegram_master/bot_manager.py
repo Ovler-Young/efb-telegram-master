@@ -1,4 +1,5 @@
 # coding=utf-8
+import asyncio
 import bisect
 import collections
 import heapq
@@ -10,9 +11,10 @@ import threading
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Deque, List, NamedTuple, Optional, Tuple, cast
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Callable, Deque, List, NamedTuple, Optional, Tuple, cast
+from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import url2pathname
 from unittest.mock import Mock
 
@@ -21,13 +23,14 @@ import telegram.error
 from retrying import retry
 from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
 from telegram import Message as TelegramMessage
-from telegram.ext import CallbackContext, Dispatcher, Filters, MessageHandler, Updater
+from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
+from telegram.request import HTTPXRequest
 
 from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
-from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
+from .ptb_compat import Filters
 
 
 class DelayedTask(NamedTuple):
@@ -44,6 +47,174 @@ if TYPE_CHECKING:
     from . import TelegramChannel
 
 MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
+
+
+class AsyncTelegramRuntime:
+    """Thread-safe bridge into the PTB 22 event loop."""
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ready = threading.Event()
+        self._loop_thread_id: Optional[int] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._owns_loop_thread = False
+        self._lock = threading.Lock()
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop, *, owns_thread: bool = False):
+        old_loop = None
+        old_thread = None
+        with self._lock:
+            if self._loop is loop:
+                self._loop_thread_id = threading.get_ident()
+                self._loop_thread = threading.current_thread()
+                self._owns_loop_thread = owns_thread
+                self._ready.set()
+                return
+            if self._owns_loop_thread and self._loop is not None:
+                old_loop = self._loop
+                old_thread = self._loop_thread
+            self._loop = loop
+            self._loop_thread_id = threading.get_ident()
+            self._loop_thread = threading.current_thread()
+            self._owns_loop_thread = owns_thread
+            self._ready.set()
+        if old_loop is not None and old_thread is not None and old_thread.ident != threading.get_ident():
+            old_loop.call_soon_threadsafe(old_loop.stop)
+            old_thread.join(timeout=5)
+
+    def clear_loop(self):
+        with self._lock:
+            self._loop = None
+            self._loop_thread_id = None
+            self._loop_thread = None
+            self._owns_loop_thread = False
+            self._ready.clear()
+
+    def _ensure_background_loop(self):
+        with self._lock:
+            if self._ready.is_set() and self._loop is not None:
+                return
+            if self._loop_thread is not None and self._loop_thread.is_alive():
+                return
+
+            started = threading.Event()
+
+            def runner():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self.bind_loop(loop, owns_thread=True)
+                started.set()
+                try:
+                    loop.run_forever()
+                finally:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    loop.close()
+                    self.clear_loop()
+
+            self._loop_thread = threading.Thread(
+                target=runner,
+                daemon=True,
+                name="ETMAsyncTelegramRuntime",
+            )
+            self._loop_thread.start()
+
+        if not started.wait(timeout=30):
+            raise RuntimeError("Failed to start Telegram runtime loop thread.")
+
+    def shutdown(self):
+        loop = None
+        thread = None
+        with self._lock:
+            if self._owns_loop_thread and self._loop is not None:
+                loop = self._loop
+                thread = self._loop_thread
+        if loop is not None:
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread.ident != threading.get_ident():
+            thread.join(timeout=5)
+        if loop is None:
+            self.clear_loop()
+
+    def call(self, coroutine: Any, timeout: Optional[float] = None):
+        if not self._ready.wait(timeout=0):
+            self.logger.debug("Telegram runtime is not ready; starting the background runtime loop.")
+            self._ensure_background_loop()
+        if self._loop is None:
+            self._ensure_background_loop()
+        if self._loop is None:
+            raise RuntimeError("Telegram runtime loop is unavailable.")
+        if threading.get_ident() == self._loop_thread_id:
+            raise RuntimeError("Synchronous bot wrapper invoked from the PTB event loop thread.")
+        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result(timeout)
+
+
+class SyncBotFacade:
+    """Expose PTB 22 async Bot methods through synchronous wrappers."""
+
+    def __init__(self, bot: telegram.Bot, runtime: AsyncTelegramRuntime):
+        self._bot = bot
+        self._runtime = runtime
+
+    def __getattr__(self, item: str):
+        attr = getattr(self._bot, item)
+        if not callable(attr):
+            return attr
+
+        def wrapper(*args, **kwargs):
+            return self._runtime.call(attr(*args, **kwargs))
+
+        return wrapper
+
+
+@dataclass
+class QueuedSendPlaceholder:
+    chat_id: int
+    message_id: int
+    date: int
+    text: str
+    task_id: str
+    is_delayed: bool = True
+    delay_time: float = 0.0
+    _delayed_execution_pending: bool = True
+    sender_bot_id: Optional[str] = None
+
+    def __post_init__(self):
+        self.chat = Mock()
+        self.chat.id = self.chat_id
+
+
+@dataclass
+class SendReceipt:
+    message: Any
+    sender_bot_id: Optional[str] = None
+    queued: bool = False
+    task_id: Optional[str] = None
+    manager: Optional["TelegramBotManager"] = None
+
+    def __getattr__(self, item: str):
+        return getattr(self.message, item)
+
+    def __bool__(self):
+        return self.message is not None
+
+    def reply_text(self, text: str, **kwargs):
+        if self.manager is None:
+            raise RuntimeError("SendReceipt is detached from TelegramBotManager.")
+        return self.manager.send_message(
+            self.message.chat.id,
+            text=text,
+            reply_to_message_id=self.message.message_id,
+            **kwargs,
+        )
+
+    def reply_html(self, text: str, **kwargs):
+        kwargs.setdefault("parse_mode", "HTML")
+        return self.reply_text(text, **kwargs)
 
 
 def _has_callback_keyboard(reply_markup) -> bool:
@@ -73,11 +244,12 @@ class TelegramBotManager(LocaleMixin):
     logger = logging.getLogger(__name__)
 
     # Type declarations for instance attributes assigned in __init__
-    updater: Updater
-    _bot: telegram.Bot
-    me: User
+    application: Application
+    _bot: SyncBotFacade
+    _async_bot: telegram.Bot
+    me: Optional[User]
     admins: List[int]
-    dispatcher: Dispatcher
+    dispatcher: Application
     bot_pool: Optional['BotPool']
     _delayed_worker_stop: threading.Event
     _delayed_queue_lock: threading.Lock
@@ -110,17 +282,16 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def rate_limit_decorator(cls, fn: Callable):
-            """Apply rate limiting to API calls with two-mode routing for multi-bot pool."""
+            """Apply rate limiting and sender routing for outbound API calls."""
             @wraps(fn)
             def rate_limit_wrapper(self: 'TelegramBotManager', *args, **kwargs):
                 # Bypass: caller already reserved a slot and set _using_bot
                 if kwargs.pop('_bypass_rate_limit', False):
                     return fn(self, *args, **kwargs)
 
-                # Pop the _sender_bot_id kwarg (used for forced routing on edits/deletes)
                 sender_bot_id = kwargs.pop('_sender_bot_id', None)
+                send_mode = kwargs.pop('_send_mode', 'blocking')
 
-                # Extract chat_id from arguments
                 chat_id = None
                 if args:
                     chat_id = args[0]
@@ -132,74 +303,52 @@ class TelegramBotManager(LocaleMixin):
                     self.logger.warning(f"Delayed worker is stopped. Not scheduling new tasks for chat {chat_id}.")
                     return None
 
-                # MODE 1: Forced routing (edits/deletes must go to the specific bot that sent the original)
                 if sender_bot_id and self.bot_pool:
                     aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
                     if aux_bot and not aux_bot.disabled:
                         try:
                             with self._using_bot(aux_bot.bot):
                                 result = fn(self, *args, **kwargs)
-                            if result and hasattr(result, '__dict__'):
-                                result._sender_bot_id = str(sender_bot_id)
-                            return result
-                        except telegram.error.Unauthorized:
-                            aux_bot.mark_disabled("Unauthorized during forced-route API call")
+                            return self._make_send_receipt(result, sender_bot_id=str(sender_bot_id))
+                        except telegram.error.Forbidden:
+                            aux_bot.mark_disabled("Forbidden during forced-route API call")
                             self._notify_admin_disabled_bot(aux_bot)
-                    # Fallback: sender bot unavailable, try main bot
-                    return fn(self, *args, **kwargs)
+                    return self._make_send_receipt(fn(self, *args, **kwargs))
 
-                # MODE 2: Pool routing (new sends pick best available bot)
-                # Only attempt aux bots when the main bot would impose a delay.
-                if chat_id and self.bot_pool:
-                    # Skip pool for messages with callback keyboards (EC-4)
-                    has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
-                    if not has_callback:
-                        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
-                        slot = self.bot_pool.acquire_send_slot(chat_id, max_delay=main_delay) if main_delay > 0 else None
-                        if slot is not None:
-                            aux_bot, aux_delay = slot
-                            try:
-                                if aux_delay > 0:
-                                    time.sleep(aux_delay)
-                                with self._using_bot(aux_bot.bot):
-                                    result = fn(self, *args, **kwargs)
-                                if result and hasattr(result, '__dict__'):
-                                    result._sender_bot_id = str(aux_bot.bot_id)
-                                self._record_aux_use(chat_id)
-                                return result
-                            except telegram.error.Unauthorized:
-                                aux_bot.mark_disabled("Unauthorized during pool-route API call")
-                                self._notify_admin_disabled_bot(aux_bot)
-                                # Fallback: continue to main bot path below
-
-                # Default: main bot with rate limit check and delayed queue
                 if chat_id:
-                    # Calculate rate limiting delay
-                    delay_time, chat_count, global_count = self._calculate_rate_limit_delay(chat_id)  # pylint: disable=protected-access
+                    has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
+                    cleanup_files = getattr(self._cleanup_tls, 'pending_cleanup', [])[:]
+                    self._cleanup_tls.pending_cleanup = []
 
-                    if delay_time > 0:
-                        # Schedule for delayed execution instead of blocking
-                        self.logger.debug(f"Scheduling message for chat {chat_id} with {delay_time:.2f}s delay")
-
-                        # Grab any pending cleanup files before scheduling
-                        cleanup_files = getattr(self._cleanup_tls, 'pending_cleanup', [])[:]  # pylint: disable=protected-access
-                        self._cleanup_tls.pending_cleanup = []  # pylint: disable=protected-access
-
-                        # Schedule the delayed execution using the new system
-                        task_id = self._schedule_delayed_task(  # pylint: disable=protected-access
-                            chat_id=chat_id,
-                            delay_time=delay_time,
-                            function=fn,
-                            args=(self,) + args,
-                            kwargs=kwargs,
-                            cleanup_files=cleanup_files
+                    if send_mode == 'eventual':
+                        return self._schedule_eventual_send(
+                            chat_id,
+                            fn,
+                            (self,) + args,
+                            kwargs,
+                            cleanup_files=cleanup_files,
                         )
 
-                        # Return a placeholder response to indicate message was scheduled
-                        placeholder = self._create_delayed_message_placeholder(chat_id, delay_time, task_id)  # pylint: disable=protected-access
-                        return placeholder
+                    bot, chosen_sender_bot_id, delay_time = self._select_sender(chat_id, has_callback=has_callback)
+                    if chosen_sender_bot_id is None:
+                        delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
+                    if delay_time > 0:
+                        time.sleep(delay_time)
+                    try:
+                        with self._using_bot(bot):
+                            result = fn(self, *args, **kwargs)
+                        if chosen_sender_bot_id is not None:
+                            self._record_aux_use(chat_id)
+                        return self._make_send_receipt(result, sender_bot_id=chosen_sender_bot_id)
+                    except telegram.error.Forbidden:
+                        if chosen_sender_bot_id and self.bot_pool:
+                            aux_bot = self.bot_pool.get_bot_by_id(chosen_sender_bot_id)
+                            if aux_bot:
+                                aux_bot.mark_disabled("Forbidden during pool-route API call")
+                                self._notify_admin_disabled_bot(aux_bot)
+                        raise
 
-                return fn(self, *args, **kwargs)
+                return self._make_send_receipt(fn(self, *args, **kwargs))
 
             return rate_limit_wrapper
 
@@ -338,7 +487,7 @@ class TelegramBotManager(LocaleMixin):
                     prefix = html.escape(prefix)
                     suffix = html.escape(suffix)
 
-                if len(prefix + text + suffix) >= telegram.constants.MAX_CAPTION_LENGTH:
+                if len(prefix + text + suffix) >= telegram.constants.MessageLimit.CAPTION_LENGTH:
                     full_message = io.StringIO(prefix + text + suffix)
                     truncated = prefix + text[:100] + "\n…\n" + text[-100:] + suffix
                     kwargs['caption'] = truncated
@@ -407,17 +556,37 @@ class TelegramBotManager(LocaleMixin):
         self.channel: 'TelegramChannel' = channel
         config = self.channel.config
 
-        req_kwargs = {'read_timeout': 15}
+        req_kwargs = {'read_timeout': 15.0}
         conf_req_kwargs = config.get('request_kwargs')
         if isinstance(conf_req_kwargs, collections.abc.Mapping):
             req_kwargs.update(conf_req_kwargs)
+        request_kwargs = self._normalize_request_kwargs(req_kwargs)
+        self._request_kwargs = dict(request_kwargs)
+        self._bot_identity_kwargs: dict[str, Any] = {"token": config['token']}
 
-        self.logger.debug("Setting up Telegram bot updater...")
-        self.updater: Updater = Updater(config['token'],
-                                        base_url=channel.flag('api_base_url'),
-                                        base_file_url=channel.flag('api_base_file_url'),
-                                        request_kwargs=req_kwargs,
-                                        use_context=True)
+        self.logger.debug("Setting up Telegram application and sync runtime...")
+        bot_kwargs: dict[str, Any] = dict(self._bot_identity_kwargs)
+        if channel.flag('api_base_url'):
+            self._bot_identity_kwargs["base_url"] = channel.flag('api_base_url')
+            bot_kwargs["base_url"] = self._bot_identity_kwargs["base_url"]
+        if channel.flag('api_base_file_url'):
+            self._bot_identity_kwargs["base_file_url"] = channel.flag('api_base_file_url')
+            bot_kwargs["base_file_url"] = self._bot_identity_kwargs["base_file_url"]
+        request = HTTPXRequest(**self._request_kwargs)
+        get_updates_request = HTTPXRequest(**self._request_kwargs)
+        bot_kwargs["request"] = request
+        bot_kwargs["get_updates_request"] = get_updates_request
+
+        self._runtime = AsyncTelegramRuntime(self.logger)
+        self._async_bot = telegram.Bot(**bot_kwargs)
+        self._bot = SyncBotFacade(self._async_bot, self._runtime)
+        self.application = (
+            Application.builder()
+            .bot(self._async_bot)
+            .post_init(self._post_init)
+            .post_shutdown(self._post_shutdown)
+            .build()
+        )
 
         if isinstance(config.get('webhook'), dict):
             self.logger.debug("Setting up webhook...")
@@ -425,16 +594,17 @@ class TelegramBotManager(LocaleMixin):
             self.logger.debug("Webhook is set...")
 
         self.logger.debug("Checking connection to Telegram bot API...")
-        # Updater.__init__ uses __slots__ + @no_type_check, so mypy cannot
-        # determine the types of .bot / .dispatcher.  getattr returns Any,
-        # then cast narrows to the correct type.
-        self._bot = cast(telegram.Bot, getattr(self.updater, 'bot'))
-        me = self._bot.get_me()
+        validation_kwargs = {
+            **self._bot_identity_kwargs,
+            "request": HTTPXRequest(**self._request_kwargs),
+            "get_updates_request": HTTPXRequest(**self._request_kwargs),
+        }
+        me = asyncio.run(telegram.Bot(**validation_kwargs).get_me())
         assert me, "Invalid bot credential provided."
         self.me = me
         self.logger.debug("Connection to Telegram bot API is OK...")
         self.admins = config['admins']
-        self.dispatcher = cast(Dispatcher, getattr(self.updater, 'dispatcher'))
+        self.dispatcher = self.application
 
         # Initialize sliding window rate limiting
         self._rate_limit_lock = threading.Lock()
@@ -475,20 +645,150 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Delayed message system initialized...")
 
         self.logger.debug("Adding base dispatchers...")
-        # New whitelist handler
-        whitelist_filter = ~Filters.user(user_id=self.admins)
-        self.dispatcher.add_handler(
-            MessageHandler(whitelist_filter, lambda update, context: ...))
-        self.dispatcher.add_handler(LocaleHandler(channel))
+        self._add_base_dispatchers()
         self.Decorators.enable_retry = channel.flag('retry_on_error')
         self.logger.debug("Base dispatchers added...")
 
+    @staticmethod
+    def _normalize_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Translate ETM's legacy PTB 13 request settings to PTB 22 HTTPXRequest kwargs."""
+        normalized: dict[str, Any] = {}
+        allowed = {
+            "read_timeout",
+            "write_timeout",
+            "connect_timeout",
+            "pool_timeout",
+            "media_write_timeout",
+            "http_version",
+            "socket_options",
+            "httpx_kwargs",
+            "connection_pool_size",
+        }
+        for key in allowed:
+            if key in request_kwargs:
+                normalized[key] = request_kwargs[key]
+
+        proxy = request_kwargs.get("proxy") or request_kwargs.get("proxy_url")
+        username = request_kwargs.get("username")
+        password = request_kwargs.get("password")
+        proxy_auth = request_kwargs.get("urllib3_proxy_kwargs") or {}
+        if username is None:
+            username = proxy_auth.get("username")
+        if password is None:
+            password = proxy_auth.get("password")
+        if proxy:
+            parsed = urlparse(str(proxy))
+            if username and password and "@" not in parsed.netloc:
+                auth_netloc = f"{quote(str(username))}:{quote(str(password))}@{parsed.hostname or ''}"
+                if parsed.port:
+                    auth_netloc += f":{parsed.port}"
+                proxy = urlunparse(
+                    (
+                        parsed.scheme,
+                        auth_netloc,
+                        parsed.path,
+                        parsed.params,
+                        parsed.query,
+                        parsed.fragment,
+                    )
+                )
+            normalized["proxy"] = proxy
+        return normalized
+
+    async def _post_init(self, application: Application):
+        self._runtime.bind_loop(asyncio.get_running_loop())
+        for aux_bot in self.bot_pool.bots if self.bot_pool else []:
+            aux_bot.bind_runtime(self._runtime)
+        self.logger.debug("Telegram runtime loop is ready.")
+
+    async def _post_shutdown(self, application: Application):
+        self._runtime.clear_loop()
+        self.logger.debug("Telegram runtime loop is cleared.")
+
+    def as_async_callback(self, callback: Callable[..., Any]):
+        async def wrapper(update, context):
+            return await asyncio.to_thread(callback, update, context)
+
+        return wrapper
+
+    def _add_base_dispatchers(self):
+        whitelist_filter = ~Filters.user(user_id=self.admins)
+        self.dispatcher.add_handler(
+            MessageHandler(whitelist_filter, self.as_async_callback(lambda update, context: None))
+        )
+        self.dispatcher.add_handler(
+            TypeHandler(Update, self.as_async_callback(self.channel.update_locale))
+        )
+
+    def _make_send_receipt(
+        self,
+        message: Any,
+        sender_bot_id: Optional[str] = None,
+        *,
+        queued: bool = False,
+        task_id: Optional[str] = None,
+    ) -> SendReceipt:
+        return SendReceipt(
+            message=message,
+            sender_bot_id=sender_bot_id,
+            queued=queued,
+            task_id=task_id,
+            manager=self,
+        )
+
+    def _schedule_eventual_send(
+        self,
+        chat_id: int,
+        function: Callable,
+        args: tuple,
+        kwargs: dict,
+        *,
+        cleanup_files: Optional[list] = None,
+        delay_time: float = 0.0,
+    ) -> SendReceipt:
+        task_id = self._schedule_delayed_task(
+            chat_id=chat_id,
+            delay_time=delay_time,
+            function=function,
+            args=args,
+            kwargs=kwargs,
+            cleanup_files=cleanup_files,
+        )
+        placeholder = self._create_delayed_message_placeholder(chat_id, delay_time, task_id)
+        return self._make_send_receipt(placeholder, queued=True, task_id=task_id)
+
+    def _select_sender(self, chat_id: int, *, has_callback: bool = False):
+        """Choose the earliest sender using the current main/aux heuristics."""
+        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+        if self.bot_pool and not has_callback:
+            slot = self.bot_pool.acquire_send_slot(chat_id, max_delay=main_delay if main_delay > 0 else 0.0)
+            if slot is not None:
+                aux_bot, aux_delay = slot
+                return aux_bot.bot, str(aux_bot.bot_id), aux_delay
+        return self._bot, None, main_delay
+
+    def _requeue_delayed_task(self, task: DelayedTask, delay_time: float):
+        execute_time = time.time() + delay_time
+        updated_task = DelayedTask(
+            execute_time=execute_time,
+            chat_id=task.chat_id,
+            function=task.function,
+            args=task.args,
+            kwargs=task.kwargs,
+            task_id=task.task_id,
+            cleanup_files=task.cleanup_files,
+        )
+        with self._delayed_queue_lock:
+            heapq.heappush(self._delayed_queue, (execute_time, self._task_counter, updated_task))
+            self._task_counter += 1
+
     def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
         """Initialize the auxiliary bot pool from config."""
-        req_kwargs = {'read_timeout': 15}
+        req_kwargs = {'read_timeout': 15.0}
         conf_req_kwargs = config.get('request_kwargs')
         if isinstance(conf_req_kwargs, collections.abc.Mapping):
             req_kwargs.update(conf_req_kwargs)
+        request_kwargs = self._normalize_request_kwargs(req_kwargs)
 
         main_token = config['token']
         seen_tokens = {main_token}
@@ -506,7 +806,7 @@ class TelegramBotManager(LocaleMixin):
 
             aux_bot = AuxiliaryBot(
                 token=token,
-                request_kwargs=req_kwargs,
+                request_kwargs=request_kwargs,
                 base_url=channel.flag('api_base_url') or None,
                 base_file_url=channel.flag('api_base_file_url') or None,
                 global_limit=self.GLOBAL_LIMIT,
@@ -582,8 +882,8 @@ class TelegramBotManager(LocaleMixin):
                     try:
                         with self._using_bot(aux_bot.bot):
                             return send_callable(_bypass_rate_limit=True)
-                    except telegram.error.Unauthorized:
-                        aux_bot.mark_disabled("Unauthorized during migration send")
+                    except telegram.error.Forbidden:
+                        aux_bot.mark_disabled("Forbidden during migration send")
                         self._notify_admin_disabled_bot(aux_bot)
 
             # Try main bot
@@ -690,19 +990,16 @@ class TelegramBotManager(LocaleMixin):
             A mock message object indicating delayed execution
         """
 
-        # Create a mock message object that represents a delayed message
-        mock_msg = Mock(spec=TelegramMessage)
-        mock_msg.chat_id = chat_id
-        mock_msg.message_id = int(time.time() * 1000)  # Use timestamp as temp ID
-        mock_msg.date = int(time.time())
-        mock_msg.text = f"[Message scheduled for delivery in {delay_time:.2f}s due to rate limiting]"
-        mock_msg.is_delayed = True  # Custom attribute to mark as delayed
-        mock_msg.delay_time = delay_time
-        mock_msg.task_id = task_id  # Store task ID for tracking
-        mock_msg._delayed_execution_pending = True  # Flag for database logging
-
+        placeholder = QueuedSendPlaceholder(
+            chat_id=chat_id,
+            message_id=int(time.time() * 1000),
+            date=int(time.time()),
+            text=f"[Message scheduled for delivery in {delay_time:.2f}s due to rate limiting]",
+            task_id=task_id,
+            delay_time=delay_time,
+        )
         self.logger.debug(f"Created delayed message placeholder for chat {chat_id} with {delay_time:.2f}s delay")
-        return mock_msg
+        return placeholder
 
     def _schedule_delayed_task(self, chat_id: int, delay_time: float, function: Callable,
                               args: tuple, kwargs: dict, cleanup_files: Optional[list] = None) -> str:
@@ -765,32 +1062,25 @@ class TelegramBotManager(LocaleMixin):
                     try:
                         self.logger.debug(f"Executing delayed task {task.task_id} for chat {task.chat_id}")
 
-                        # Re-check pool: if an aux bot has become available, route through it
-                        result = None
-                        routed_to_aux = False
-                        if self.bot_pool and task.chat_id:
-                            slot = self.bot_pool.acquire_send_slot(task.chat_id, max_delay=0.01)
-                            if slot is not None:
-                                aux_bot, _ = slot
-                                try:
-                                    with self._using_bot(aux_bot.bot):
-                                        result = task.function(*task.args, **task.kwargs)
-                                    if result and hasattr(result, '__dict__'):
-                                        result._sender_bot_id = str(aux_bot.bot_id)
-                                    self._record_aux_use(task.chat_id)
-                                    routed_to_aux = True
-                                    self.logger.debug(f"Delayed task {task.task_id} routed to aux bot @{aux_bot.username}")
-                                except telegram.error.Unauthorized:
-                                    aux_bot.mark_disabled("Unauthorized during delayed task")
-                                    self._notify_admin_disabled_bot(aux_bot)
+                        sender_bot, sender_bot_id, delay_time = self._select_sender(
+                            task.chat_id,
+                            has_callback=_has_callback_keyboard(task.kwargs.get('reply_markup')),
+                        )
+                        if sender_bot_id is None and delay_time <= 0:
+                            delay_time, _, _ = self._calculate_rate_limit_delay(task.chat_id)
+                        if delay_time > 0:
+                            self._requeue_delayed_task(task, delay_time)
+                            continue
 
-                        if not routed_to_aux:
+                        with self._using_bot(sender_bot):
                             result = task.function(*task.args, **task.kwargs)
+                        if sender_bot_id is not None:
+                            self._record_aux_use(task.chat_id)
                         self.logger.debug(f"Delayed task {task.task_id} completed successfully")
 
                         # Handle database update for delayed execution
                         if result and hasattr(result, 'message_id'):
-                            self._handle_delayed_database_update(task.task_id, result)
+                            self._handle_delayed_database_update(task.task_id, result, sender_bot_id=sender_bot_id)
 
                     except Exception as e:
                         self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
@@ -827,7 +1117,13 @@ class TelegramBotManager(LocaleMixin):
             self._pending_delayed_logs[task_id] = (etm_msg, old_msg_id)
         self.logger.debug(f"Registered delayed database update for task {task_id}")
 
-    def _handle_delayed_database_update(self, task_id: str, real_tg_msg):
+    def _handle_delayed_database_update(
+        self,
+        task_id: str,
+        real_tg_msg,
+        *,
+        sender_bot_id: Optional[str] = None,
+    ):
         """
         Handle database update when delayed task completes.
 
@@ -842,9 +1138,6 @@ class TelegramBotManager(LocaleMixin):
                 # Update the ETM message with real Telegram data
                 etm_msg.type_telegram = get_msg_type(real_tg_msg)
                 etm_msg.put_telegram_file(real_tg_msg)
-
-                # Capture sender_bot_id from the real message (annotated by rate_limit_decorator)
-                sender_bot_id = getattr(real_tg_msg, '_sender_bot_id', None)
 
                 # Update database with real message
                 self.channel.db.add_or_update_message_log(
@@ -898,7 +1191,7 @@ class TelegramBotManager(LocaleMixin):
         else:
             text = kwargs.pop('text')
         args = args[:1]
-        if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
+        if len(prefix + text + suffix) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode('utf-8'))
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
             msg = self._bot_send_message_fallback(args[0], text=truncated, **kwargs)
@@ -950,7 +1243,7 @@ class TelegramBotManager(LocaleMixin):
             prefix = html.escape(prefix)
             suffix = html.escape(suffix)
         text = kwargs.pop('text', '')
-        if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
+        if len(prefix + text + suffix) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode())
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
             msg = self._bot_edit_message_text_fallback(text=truncated, **kwargs)
@@ -1215,7 +1508,7 @@ class TelegramBotManager(LocaleMixin):
         assert update.effective_message
         assert update.effective_chat
         if update.callback_query:
-            update.callback_query.answer()
+            self.answer_callback_query(update.callback_query.id)
         self.edit_message_text(text=self._("Session expired. Please try again. (SE01)"),
                                chat_id=update.effective_chat.id,
                                message_id=update.effective_message.message_id)
@@ -1254,8 +1547,8 @@ class TelegramBotManager(LocaleMixin):
             if aux_bot and not aux_bot.disabled:
                 try:
                     return aux_bot.bot.delete_message(chat_id, message_id)
-                except telegram.error.Unauthorized:
-                    aux_bot.mark_disabled("Unauthorized during delete_message")
+                except telegram.error.Forbidden:
+                    aux_bot.mark_disabled("Forbidden during delete_message")
                     self._notify_admin_disabled_bot(aux_bot)
                 except telegram.error.BadRequest:
                     pass  # Fall through to main bot
@@ -1281,10 +1574,15 @@ class TelegramBotManager(LocaleMixin):
             truncated = full_message[:keep_size] + "…" + full_message[keep_size:]
             result = self._bot.answer_callback_query(*args, text=truncated, **kwargs)
             filename = f"{chat_id}_{message_id}.txt"
-            self._bot.send_document(args[0], full_message_buffer, filename,
-                                           reply_to_message_id=message_id,
-                                           caption=self._("Response is truncated due to its length. "
-                                                          "Full message is sent as attachment."))
+            if chat_id is not None:
+                self._bot.send_document(
+                    chat_id,
+                    full_message_buffer,
+                    filename,
+                    reply_to_message_id=message_id,
+                    caption=self._("Response is truncated due to its length. "
+                                   "Full message is sent as attachment."),
+                )
             return result
         self.logger.debug(f"answer_callback_query({args}, {kwargs})")
         return self._bot.answer_callback_query(
@@ -1333,8 +1631,8 @@ class TelegramBotManager(LocaleMixin):
 
     def polling(self, drop_pending_updates: bool = False):
         """
-        Poll message from Telegram Bot API. Can be used to extend for web hook.
-        This method must NOT be blocking.
+        Poll message from Telegram Bot API.
+        This method is blocking and is expected to run inside EFB's master poll thread.
 
         Args:
             drop_pending_updates: Whether to clean any pending updates on
@@ -1343,9 +1641,19 @@ class TelegramBotManager(LocaleMixin):
         """
         if self.webhook:
             start_webhook = self.channel.config['webhook']['start_webhook']
-            self.updater.start_webhook(**start_webhook)
+            self.application.run_webhook(
+                **start_webhook,
+                drop_pending_updates=drop_pending_updates,
+                close_loop=True,
+                stop_signals=None,
+            )
         else:
-            self.updater.start_polling(timeout=10, drop_pending_updates=drop_pending_updates)
+            self.application.run_polling(
+                timeout=10,
+                drop_pending_updates=drop_pending_updates,
+                close_loop=True,
+                stop_signals=None,
+            )
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
@@ -1367,9 +1675,12 @@ class TelegramBotManager(LocaleMixin):
         if self.bot_pool:
             self.bot_pool.shutdown()
 
-        # Then stop the updater
-        self.logger.debug("Stopping Telegram updater...")
-        self.updater.stop()
+        # Then stop the PTB application loop
+        self.logger.debug("Stopping Telegram application...")
+        if hasattr(self, 'application'):
+            self.application.stop_running()
+        if hasattr(self, '_runtime'):
+            self._runtime.shutdown()
         self.logger.info("Graceful shutdown completed")
 
     def __del__(self):
