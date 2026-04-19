@@ -158,6 +158,14 @@ class AsyncTelegramRuntime:
         if loop is None:
             self.clear_loop()
 
+    def call_soon(self, callback: Callable[..., object], *args: object) -> bool:
+        with self._lock:
+            loop = self._loop
+        if loop is None:
+            return False
+        loop.call_soon_threadsafe(callback, *args)
+        return True
+
     def call(self, coroutine: Coroutine[object, object, T], timeout: Optional[float] = None) -> T:
         if not self._ready.wait(timeout=0):
             self.logger.debug("Telegram runtime is not ready; starting the background runtime loop.")
@@ -1836,9 +1844,17 @@ class TelegramBotManager(LocaleMixin):
         # Then stop the PTB application loop
         self.logger.debug("Stopping Telegram application...")
         if hasattr(self, 'application'):
-            self.application.stop_running()
+            stop_requested = False
+            if hasattr(self, '_runtime'):
+                stop_requested = self._runtime.call_soon(self.application.stop_running)
+            if not stop_requested:
+                try:
+                    self.application.stop_running()
+                except RuntimeError as exc:
+                    self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
         if hasattr(self, '_runtime'):
-            self._runtime.shutdown()
+            if getattr(self._runtime, '_owns_loop_thread', False):
+                self._runtime.shutdown()
         self.logger.info("Graceful shutdown completed")
 
     def __del__(self):

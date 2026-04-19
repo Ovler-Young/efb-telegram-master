@@ -226,7 +226,7 @@ def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_dis
     sleep.assert_called()
 
 
-def test_graceful_stop_stops_worker_pool_and_application():
+def test_graceful_stop_requests_application_stop_on_runtime_loop():
     manager = SimpleNamespace(
         logger=Mock(),
         _delayed_queue=[("when", 0, "task")],
@@ -234,12 +234,32 @@ def test_graceful_stop_stops_worker_pool_and_application():
         stop_delayed_worker=Mock(),
         bot_pool=SimpleNamespace(shutdown=Mock()),
         application=SimpleNamespace(stop_running=Mock()),
-        _runtime=SimpleNamespace(shutdown=Mock()),
+        _runtime=SimpleNamespace(call_soon=Mock(return_value=True), shutdown=Mock(), _owns_loop_thread=False),
     )
 
     TelegramBotManager.graceful_stop(manager)
 
     manager.stop_delayed_worker.assert_called_once()
     manager.bot_pool.shutdown.assert_called_once()
+    manager._runtime.call_soon.assert_called_once_with(manager.application.stop_running)
+    manager.application.stop_running.assert_not_called()
+    manager._runtime.shutdown.assert_not_called()
+
+
+def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
+    manager = SimpleNamespace(
+        logger=Mock(),
+        _delayed_queue=[],
+        _delayed_queue_lock=threading.Lock(),
+        stop_delayed_worker=Mock(),
+        bot_pool=None,
+        application=SimpleNamespace(stop_running=Mock()),
+        _runtime=SimpleNamespace(call_soon=Mock(return_value=False), shutdown=Mock(), _owns_loop_thread=False),
+    )
+
+    TelegramBotManager.graceful_stop(manager)
+
+    manager.stop_delayed_worker.assert_called_once()
+    manager._runtime.call_soon.assert_called_once_with(manager.application.stop_running)
     manager.application.stop_running.assert_called_once()
-    manager._runtime.shutdown.assert_called_once()
+    manager._runtime.shutdown.assert_not_called()
