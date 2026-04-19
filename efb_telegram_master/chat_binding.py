@@ -16,7 +16,7 @@ from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ConversationHandler, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler
-from telegram.ext.utils.types import ConversationDict
+from telegram.ext._utils.types import ConversationDict
 
 from ehforwarderbot import coordinator, Channel, MsgType
 from ehforwarderbot.channel import SlaveChannel

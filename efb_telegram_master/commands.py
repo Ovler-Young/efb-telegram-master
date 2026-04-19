@@ -5,7 +5,7 @@ from typing import Tuple, Dict, TYPE_CHECKING, List, Any, Union, Optional, cast
 
 from telegram import Message, Update
 from telegram.ext import CommandHandler, ConversationHandler, CallbackQueryHandler, MessageHandler, CallbackContext
-from telegram.ext.utils.types import ConversationDict
+from telegram.ext._utils.types import ConversationDict
 
 from ehforwarderbot import coordinator, Channel, Middleware
 from ehforwarderbot.channel import SlaveChannel
