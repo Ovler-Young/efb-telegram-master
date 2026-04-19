@@ -6,10 +6,15 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(scope="module")
-def poll_bot(channel_with_auxiliary_bots):
-    channel_with_auxiliary_bots.bot_manager.polling(drop_pending_updates=True)
+def poll_bot(channel_with_auxiliary_bots, poll_bot_factory):
+    polling_thread, polling_errors = poll_bot_factory(channel_with_auxiliary_bots)
     yield channel_with_auxiliary_bots.bot_manager
     channel_with_auxiliary_bots.bot_manager.graceful_stop()
+    polling_thread.join(timeout=10)
+    if polling_thread.is_alive():
+        raise RuntimeError("Telegram bot polling thread did not stop in time.")
+    if polling_errors:
+        raise polling_errors[0]
 
 
 @pytest.fixture(scope="function")
