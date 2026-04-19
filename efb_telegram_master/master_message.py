@@ -201,13 +201,17 @@ class MasterMessageProcessor(LocaleMixin):
                 thread_id = message.message_thread_id
                 if thread_id and topic_destinations:
                     for (dest, topic_id) in topic_destinations:
-                        if topic_id == thread_id:
-                            self.logger.debug("[%s] Chat %s is singly-linked to %s in topic %s", mid, message.chat, dest, topic_id)
-                            destination = dest
-                            quote = message.reply_to_message.message_id != message.reply_to_message.message_thread_id
-                            if not quote:
-                                message.reply_to_message = None  # type: ignore[assignment]
-                            break
+                         if topic_id == thread_id:
+                             self.logger.debug("[%s] Chat %s is singly-linked to %s in topic %s", mid, message.chat, dest, topic_id)
+                             destination = dest
+                             reply_to_message = message.reply_to_message
+                             quote = (
+                                 reply_to_message is not None
+                                 and reply_to_message.message_id != reply_to_message.message_thread_id
+                             )
+                             if reply_to_message is not None and not quote:
+                                 message.reply_to_message = None  # type: ignore[assignment]
+                             break
                     if destination is None:
                         self.logger.debug("[%s] Ignored message as it's a topic which wasn't created by this bot", mid)
                         return

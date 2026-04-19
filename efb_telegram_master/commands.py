@@ -1,10 +1,11 @@
 # coding=utf-8
 import html
 import logging
-from typing import Tuple, Dict, TYPE_CHECKING, List, Any, Union, Optional
+from typing import Tuple, Dict, TYPE_CHECKING, List, Any, Union, Optional, cast
 
 from telegram import Message, Update
 from telegram.ext import CommandHandler, ConversationHandler, CallbackQueryHandler, MessageHandler, CallbackContext
+from telegram.ext.utils.types import ConversationDict
 
 from ehforwarderbot import coordinator, Channel, Middleware
 from ehforwarderbot.channel import SlaveChannel
@@ -71,7 +72,8 @@ class CommandsManager(LocaleMixin):
 
     def register_command(self, message: Message, commands: ETMCommandMsgStorage):
         message_identifier = (message.chat.id, message.message_id)
-        self.command_conv.conversations[message_identifier] = Flags.COMMAND_PENDING
+        conversations = cast(ConversationDict, getattr(self.command_conv, "conversations"))
+        conversations[cast(Tuple[int, ...], message_identifier)] = Flags.COMMAND_PENDING
         self.msg_storage[message_identifier] = commands
 
     def command_exec(self, update: Update, context: CallbackContext) -> Optional[int]:

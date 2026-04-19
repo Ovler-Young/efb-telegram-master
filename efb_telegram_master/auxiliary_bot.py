@@ -7,7 +7,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from inspect import isawaitable
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Coroutine, Dict, Optional, Tuple, TYPE_CHECKING, cast
 
 import telegram
 import telegram.error
@@ -18,10 +18,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-def _resolve_bot_result(result: Any):
+def _resolve_bot_result(result: object) -> Any:
     if isawaitable(result):
-        return asyncio.run(result)
+        return asyncio.run(cast(Coroutine[Any, Any, Any], result))
     return result
 
 
@@ -88,7 +87,7 @@ class AuxiliaryBot:
         """
         try:
             validation_bot = self.async_bot if not isinstance(self.async_bot, telegram.Bot) else self._create_bot()
-            me = _resolve_bot_result(validation_bot.get_me())
+            me: telegram.User = cast(telegram.User, _resolve_bot_result(validation_bot.get_me()))
             self.bot_id = me.id
             self.username = me.username or ""
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)
@@ -265,7 +264,10 @@ class AuxiliaryBot:
     def _probe_membership(self, chat_id: int):
         """Background probe: call get_chat_member and update cache."""
         try:
-            member = _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id))
+            member: telegram.ChatMember = cast(
+                telegram.ChatMember,
+                _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id)),
+            )
             is_member = member.status in ('member', 'administrator', 'creator', 'restricted')
             self.update_membership(chat_id, is_member)
             logger.debug("Membership probe for bot %d in chat %d: %s (status=%s)",

@@ -12,6 +12,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Deque, List, NamedTuple, Optional, Tuple, cast
 from urllib.parse import quote, urlparse, urlunparse
@@ -394,17 +395,21 @@ class TelegramBotManager(LocaleMixin):
                             cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
                             raise
 
-                        retry_after = e.retry_after
+                        retry_after_value = e.retry_after
+                        if isinstance(retry_after_value, timedelta):
+                            retry_after = retry_after_value.total_seconds()
+                        else:
+                            retry_after = float(retry_after_value)
                         cls.logger.warning(f"Rate limit hit, waiting {retry_after}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
 
                         # Use interruptible sleep for rate limit waits
                         if hasattr(self, '_delayed_worker_stop'):
                             # Sleep in small chunks to allow for interruption during shutdown
-                            remaining = retry_after
-                            while remaining > 0 and not self._delayed_worker_stop.is_set():
-                                sleep_chunk = min(1.0, remaining)
+                            remaining_seconds = retry_after
+                            while remaining_seconds > 0 and not self._delayed_worker_stop.is_set():
+                                sleep_chunk = min(1.0, remaining_seconds)
                                 time.sleep(sleep_chunk)
-                                remaining -= sleep_chunk
+                                remaining_seconds -= sleep_chunk
                         else:
                             time.sleep(retry_after)
                     except telegram.error.TelegramError as e:
@@ -425,11 +430,11 @@ class TelegramBotManager(LocaleMixin):
                             # Use interruptible sleep for rate limit waits
                             if hasattr(self, '_delayed_worker_stop'):
                                 # Sleep in small chunks to allow for interruption during shutdown
-                                remaining = delay
-                                while remaining > 0 and not self._delayed_worker_stop.is_set():
-                                    sleep_chunk = min(1.0, remaining)
+                                remaining_seconds = float(delay)
+                                while remaining_seconds > 0 and not self._delayed_worker_stop.is_set():
+                                    sleep_chunk = min(1.0, remaining_seconds)
                                     time.sleep(sleep_chunk)
-                                    remaining -= sleep_chunk
+                                    remaining_seconds -= sleep_chunk
                             else:
                                 time.sleep(delay)
                         else:

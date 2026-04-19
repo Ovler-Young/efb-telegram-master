@@ -867,7 +867,7 @@ class SlaveMessageProcessor(LocaleMixin):
                             target_msg_id: Optional[TelegramMessageID] = None,
                             reply_markup: Optional[Any] = None,
                             silent: bool = False) -> telegram.Message:
-        self.bot.send_chat_action(tg_dest, ChatAction.RECORD_AUDIO, message_thread_id=thread_id)
+        self.bot.send_chat_action(tg_dest, ChatAction.RECORD_VOICE, message_thread_id=thread_id)
         if msg.text:
             text = self.html_substitutions(msg)
         else:
@@ -1068,7 +1068,7 @@ class SlaveMessageProcessor(LocaleMixin):
         if attributes.status_type is StatusAttribute.Types.TYPING:
             self.bot.send_chat_action(tg_dest, ChatAction.TYPING, message_thread_id=thread_id)
         elif attributes.status_type is StatusAttribute.Types.UPLOADING_VOICE:
-            self.bot.send_chat_action(tg_dest, ChatAction.RECORD_AUDIO, message_thread_id=thread_id)
+            self.bot.send_chat_action(tg_dest, ChatAction.RECORD_VOICE, message_thread_id=thread_id)
         elif attributes.status_type is StatusAttribute.Types.UPLOADING_IMAGE:
             self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO, message_thread_id=thread_id)
         elif attributes.status_type is StatusAttribute.Types.UPLOADING_VIDEO:

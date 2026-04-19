@@ -8,7 +8,7 @@ import urllib.parse
 import threading
 import time
 from contextlib import suppress
-from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Pattern
+from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Pattern, cast
 
 import telegram  # lgtm [py/import-and-import-from]
 from PIL import Image
@@ -16,6 +16,7 @@ from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ConversationHandler, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler
+from telegram.ext.utils.types import ConversationDict
 
 from ehforwarderbot import coordinator, Channel, MsgType
 from ehforwarderbot.channel import SlaveChannel
@@ -163,6 +164,18 @@ class ChatBindingManager(LocaleMixin):
         self.bot.dispatcher.add_handler(
             MessageHandler(Filters.status_update.left_chat_member, self.bot.as_async_callback(self.chat_left)))
 
+    @staticmethod
+    def _set_conversation_state(handler: ConversationHandler, key: Tuple[int, ...], state: object) -> None:
+        conversations = cast(ConversationDict, getattr(handler, "conversations"))
+        conversations[key] = state
+
+    def _get_bot_user(self) -> telegram.User:
+        bot_user = self.bot.me
+        if bot_user is None:
+            bot_user = self.bot.get_me()
+            self.bot.me = bot_user
+        return bot_user
+
     def pre_link_check(self, message: Message):
         """Check if the bot would work properly in a linked group.
         If potential error is found, reply error messages to the user.
@@ -177,16 +190,18 @@ class ChatBindingManager(LocaleMixin):
         # Assuming user will not revert the settings back.
 
         # Refresh bot status if any of the settings is not enabled.
-        if not self.bot.me.can_join_groups or not self.bot.me.can_read_all_group_messages:
-            self.bot.me = self.bot.get_me()
+        bot_user = self._get_bot_user()
+        if not bot_user.can_join_groups or not bot_user.can_read_all_group_messages:
+            bot_user = self.bot.get_me()
+            self.bot.me = bot_user
 
-        if not self.bot.me.can_join_groups:
+        if not bot_user.can_join_groups:
             err_msg.append(self._(
                 "This bot cannot join groups. "
                 "Chat linking might not work properly. "
                 "Please enable this setting with @BotFather."
             ))
-        if not self.bot.me.can_read_all_group_messages:
+        if not bot_user.can_read_all_group_messages:
             err_msg.append(self._(
                 "This bot cannot read all messages in a group chat. "
                 "Message delivery in linked groups might not work properly. "
@@ -231,7 +246,7 @@ class ChatBindingManager(LocaleMixin):
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing...")).message_id)
                 storage_id: Tuple[TelegramChatID, TelegramMessageID] = (tg_chat_id, tg_msg_id)
-                self.link_handler.conversations[storage_id] = Flags.LINK_EXEC
+                self._set_conversation_state(self.link_handler, storage_id, Flags.LINK_EXEC)
                 self.msg_storage[storage_id] = ChatListStorage([chat])
                 return self.build_link_action_message(chat, tg_chat_id, tg_msg_id)
             if message.message_thread_id:
@@ -247,7 +262,7 @@ class ChatBindingManager(LocaleMixin):
                         topic_tg_chat_id = TelegramChatID(message.chat_id)
                         topic_tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing...")).message_id)
                         topic_storage_id: Tuple[TelegramChatID, TelegramMessageID] = (topic_tg_chat_id, topic_tg_msg_id)
-                        self.link_handler.conversations[topic_storage_id] = Flags.LINK_EXEC
+                        self._set_conversation_state(self.link_handler, topic_storage_id, Flags.LINK_EXEC)
                         self.msg_storage[topic_storage_id] = ChatListStorage([topic_chat])
                         return self.build_link_action_message(topic_chat, topic_tg_chat_id, topic_tg_msg_id)
 
@@ -414,7 +429,7 @@ class ChatBindingManager(LocaleMixin):
         self.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=msg_text,
                                    reply_markup=InlineKeyboardMarkup(chat_btn_list))
 
-        self.link_handler.conversations[(chat_id, message_id)] = Flags.LINK_CONFIRM
+        self._set_conversation_state(self.link_handler, (chat_id, message_id), Flags.LINK_CONFIRM)
 
         return Flags.LINK_CONFIRM
 
@@ -479,7 +494,9 @@ class ChatBindingManager(LocaleMixin):
             txt += self._("\nThis chat has already linked to Telegram.")
         txt += self._("\nWhat would you like to do?\n\n"
                       "<i>* If the link button doesn't work for you, please try to link manually.</i>")
-        link_url = f"https://telegram.me/{self.bot.me.username}?" \
+        bot_username = self._get_bot_user().username
+        assert bot_username is not None
+        link_url = f"https://telegram.me/{bot_username}?" \
                    f"startgroup={urllib.parse.quote(utils.b64en(utils.message_id_to_str(tg_chat_id, tg_msg_id)))}"
         self.logger.debug("Telegram start trigger for linking chat: %s", link_url)
         if chat.linked:
@@ -839,7 +856,7 @@ class ChatBindingManager(LocaleMixin):
                                    message_id=message_id,
                                    reply_markup=InlineKeyboardMarkup(chat_btn_list))
 
-        self.chat_head_handler.conversations[(chat_id, message_id)] = Flags.CHAT_HEAD_CONFIRM
+        self._set_conversation_state(self.chat_head_handler, (chat_id, message_id), Flags.CHAT_HEAD_CONFIRM)
 
     def make_chat_head(self, update: Update, context: CallbackContext) -> int:
         """
@@ -917,7 +934,7 @@ class ChatBindingManager(LocaleMixin):
                                                "or choose a recipient:\n\nLegend:\n") + "\n".join(legends),
                                    chat_id=chat_id, message_id=message_id,
                                    reply_markup=InlineKeyboardMarkup(buttons))
-        self.suggestion_handler.conversations[storage_id] = Flags.SUGGEST_RECIPIENTS
+        self._set_conversation_state(self.suggestion_handler, storage_id, Flags.SUGGEST_RECIPIENTS)
 
     def suggested_recipient(self, update: Update, context: CallbackContext):
         """Send the message to selected recipient among all suggested when a
@@ -1260,7 +1277,7 @@ class ChatBindingManager(LocaleMixin):
         left_member_id = message.left_chat_member.id
 
         # Check if main bot was removed
-        if left_member_id == self.bot.me.id:
+        if left_member_id == self._get_bot_user().id:
             chat_id = ChatID(str(message.chat.id))
             self.db.remove_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, chat_id))
             return

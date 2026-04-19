@@ -7,9 +7,8 @@ import os
 import subprocess
 import sys
 from io import BytesIO
-from shutil import copyfileobj
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
 
 import ffmpeg
 import telegram
@@ -184,6 +183,14 @@ def chat_id_str_to_id(s: EFBChannelChatIDStr) -> Tuple[ModuleID, ChatID, Optiona
     return channel_id, chat_uid, group_id
 
 
+def _copy_binary_stream(src: BinaryIO, dst: BinaryIO, chunk_size: int = 64 * 1024) -> None:
+    while True:
+        chunk = src.read(chunk_size)
+        if not chunk:
+            break
+        dst.write(chunk)
+
+
 def export_gif(animation, fp, dpi=96, skip_frames=5):
     """ Fork of lottie.exporters.gif.export_gif
     Adapted from jqqqqqqqqqq/UnifiedMessageRelay
@@ -264,7 +271,7 @@ if os.name == "nt":
         p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE)
         assert p.stdin
-        copyfileobj(p.stdin, stream)
+        _copy_binary_stream(cast(BinaryIO, stream), cast(BinaryIO, p.stdin))
         out, err = p.communicate()
         if p.returncode != 0:
             raise ffmpeg.Error('ffprobe', out, err)
@@ -295,7 +302,7 @@ if os.name == "nt":
         # safe.
         p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert p.stdin
-        copyfileobj(file, p.stdin)
+        _copy_binary_stream(cast(BinaryIO, file), cast(BinaryIO, p.stdin))
         p.stdin.close()
 
         # Raise exception if error occurs, just like ffmpeg-python.
@@ -305,7 +312,7 @@ if os.name == "nt":
             raise ffmpeg.Error('ffmpeg', "", err)
 
         assert p.stdout
-        copyfileobj(p.stdout, gif_file)
+        _copy_binary_stream(cast(BinaryIO, p.stdout), cast(BinaryIO, gif_file))
         file.close()
         gif_file.seek(0)
         return gif_file
