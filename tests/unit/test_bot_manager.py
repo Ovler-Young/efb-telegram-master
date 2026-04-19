@@ -1,7 +1,8 @@
+import asyncio
 import string
 import random
 import threading
-from typing import IO, Iterator, BinaryIO
+from typing import Iterator, BinaryIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -300,17 +301,31 @@ async def test_shutdown_ptb_application_signals_stop_running():
     application.stop_running.assert_called_once_with()
 
 
-def test_polling_passes_custom_timeout_to_run_polling():
-    manager = SimpleNamespace(
-        webhook=False,
-        application=SimpleNamespace(run_polling=Mock()),
-    )
+def test_polling_passes_custom_timeout_to_manual_lifecycle():
+    recorded: dict[str, object] = {}
 
-    TelegramBotManager.polling(manager, drop_pending_updates=True, timeout=1)
+    async def recording_lifecycle(self, *, drop_pending_updates, timeout):
+        recorded["drop_pending_updates"] = drop_pending_updates
+        recorded["timeout"] = timeout
 
-    manager.application.run_polling.assert_called_once_with(
-        timeout=1,
-        drop_pending_updates=True,
-        close_loop=True,
-        stop_signals=None,
-    )
+    def run_coro(coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    with patch.object(TelegramBotManager, "_run_application_lifecycle", recording_lifecycle):
+        with patch("efb_telegram_master.bot_manager.asyncio.run", side_effect=run_coro):
+            manager = SimpleNamespace(
+                webhook=False,
+                application=object(),
+                logger=Mock(),
+                _shutdown_complete_event=threading.Event(),
+                _manual_polling_stop_event=None,
+            )
+
+            TelegramBotManager.polling(manager, drop_pending_updates=True, timeout=1)
+
+    assert recorded["drop_pending_updates"] is True
+    assert recorded["timeout"] == 1

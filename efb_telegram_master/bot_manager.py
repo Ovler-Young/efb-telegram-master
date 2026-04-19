@@ -652,6 +652,7 @@ class TelegramBotManager(LocaleMixin):
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
         self._tls = threading.local()  # Thread-local for bot override (_active_bot)
         self._shutdown_complete_event = threading.Event()
+        self._manual_polling_stop_event: Optional[asyncio.Event] = None
         self._aux_recent_use: dict[int, float] = {}  # chat_id -> timestamp of last aux bot use
         self.logger.debug("Rate limiter initialized...")
 
@@ -802,6 +803,80 @@ class TelegramBotManager(LocaleMixin):
 
     async def _shutdown_ptb_application(self):
         self.application.stop_running()
+
+    async def _run_application_lifecycle(
+        self,
+        *,
+        drop_pending_updates: bool,
+        timeout: int | timedelta,
+    ) -> None:
+        """Own the asyncio loop for polling (replaces ``run_polling``).
+
+        Matches PTB 22 ``Application.run_polling`` ordering: initialize → post_init →
+        ``updater.start_polling`` → ``start`` → wait → ``updater.stop`` → ``stop`` →
+        ``post_stop`` → ``shutdown`` → ``post_shutdown``. Teardown runs in ``finally`` so
+        ``await application.shutdown()`` (HTTPX close) completes before this coroutine returns.
+        """
+        self._manual_polling_stop_event = asyncio.Event()
+        try:
+            await self.application.initialize()
+            post_init = self.application.post_init
+            if post_init:
+                await post_init(self.application)
+
+            updater = self.application.updater
+            if updater is None:
+                raise RuntimeError("Application.run_polling requires an Updater.")
+
+            def error_callback(exc: telegram.error.TelegramError) -> None:
+                self.application.create_task(
+                    self.application.process_error(error=exc, update=None)
+                )
+
+            await updater.start_polling(
+                poll_interval=0.0,
+                timeout=timeout,
+                bootstrap_retries=0,
+                allowed_updates=None,
+                drop_pending_updates=drop_pending_updates,
+                error_callback=error_callback,
+            )
+            await self.application.start()
+            self.logger.debug("Application started; awaiting stop signal")
+            await self._manual_polling_stop_event.wait()
+            self.logger.debug("Stop signal received; tearing down")
+        finally:
+            try:
+                updater = self.application.updater
+                if updater is not None and updater.running:
+                    await updater.stop()
+            except Exception:
+                self.logger.exception("Error during updater.stop")
+
+            try:
+                if self.application.running:
+                    await self.application.stop()
+            except Exception:
+                self.logger.exception("Error during application.stop")
+
+            try:
+                post_stop = self.application.post_stop
+                if post_stop:
+                    await post_stop(self.application)
+            except Exception:
+                self.logger.exception("Error during post_stop")
+
+            try:
+                await self.application.shutdown()
+            except Exception:
+                self.logger.exception("Error during application.shutdown")
+
+            try:
+                post_shutdown = self.application.post_shutdown
+                if post_shutdown:
+                    await post_shutdown(self.application)
+            except Exception:
+                self.logger.exception("Error during post_shutdown")
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -1821,12 +1896,22 @@ class TelegramBotManager(LocaleMixin):
                 stop_signals=None,
             )
         else:
-            self.application.run_polling(
-                timeout=timeout,
-                drop_pending_updates=drop_pending_updates,
-                close_loop=True,
-                stop_signals=None,
-            )
+            try:
+                asyncio.run(
+                    TelegramBotManager._run_application_lifecycle(
+                        self,
+                        drop_pending_updates=drop_pending_updates,
+                        timeout=timeout,
+                    )
+                )
+            except BaseException:
+                self.logger.exception("Polling thread crashed")
+                raise
+            finally:
+                self._manual_polling_stop_event = None
+                shutdown_done = getattr(self, "_shutdown_complete_event", None)
+                if shutdown_done is not None and not shutdown_done.is_set():
+                    shutdown_done.set()
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
@@ -1851,23 +1936,35 @@ class TelegramBotManager(LocaleMixin):
         # Then stop the PTB application loop
         self.logger.debug("Stopping Telegram application...")
         if hasattr(self, 'application'):
-            application_stopped = False
-            if hasattr(self, '_runtime') and self._runtime._ready.is_set():
-                try:
-                    self._runtime.call(self._shutdown_ptb_application(), timeout=30)
-                    application_stopped = True
-                except Exception as exc:
-                    self.logger.warning("PTB shutdown coroutine did not complete cleanly: %s", exc)
+            manual_evt = getattr(self, "_manual_polling_stop_event", None)
+            if manual_evt is not None:
 
-            if not application_stopped:
-                stop_requested = False
-                if hasattr(self, '_runtime'):
-                    stop_requested = self._runtime.call_soon(self.application.stop_running)
-                if not stop_requested:
+                def _signal_manual_stop() -> None:
+                    manual_evt.set()
+
+                if hasattr(self, '_runtime') and not self._runtime.call_soon(_signal_manual_stop):
+                    self.logger.warning(
+                        "Could not schedule polling stop on runtime loop; "
+                        "Telegram polling thread may not exit cleanly."
+                    )
+            else:
+                application_stopped = False
+                if hasattr(self, '_runtime') and self._runtime._ready.is_set():
                     try:
-                        self.application.stop_running()
-                    except RuntimeError as exc:
-                        self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
+                        self._runtime.call(self._shutdown_ptb_application(), timeout=30)
+                        application_stopped = True
+                    except Exception as exc:
+                        self.logger.warning("PTB shutdown coroutine did not complete cleanly: %s", exc)
+
+                if not application_stopped:
+                    stop_requested = False
+                    if hasattr(self, '_runtime'):
+                        stop_requested = self._runtime.call_soon(self.application.stop_running)
+                    if not stop_requested:
+                        try:
+                            self.application.stop_running()
+                        except RuntimeError as exc:
+                            self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
 
             if hasattr(self, "_shutdown_complete_event"):
                 if not self._shutdown_complete_event.wait(timeout=30):
