@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Deque, List, NamedTuple, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Callable, Collection, Coroutine, Deque, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import url2pathname
 from unittest.mock import Mock
@@ -48,6 +48,23 @@ if TYPE_CHECKING:
     from . import TelegramChannel
 
 MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
+P = ParamSpec("P")
+T = TypeVar("T")
+BotMethod: TypeAlias = Callable[..., object]
+
+
+class SyncBotProtocol(Protocol):
+    def __getattr__(self, item: str) -> BotMethod:
+        ...
+
+
+class ChatIdentifier(Protocol):
+    id: int
+
+
+class ReplyTarget(Protocol):
+    chat: ChatIdentifier
+    message_id: int
 
 
 class AsyncTelegramRuntime:
@@ -141,7 +158,7 @@ class AsyncTelegramRuntime:
         if loop is None:
             self.clear_loop()
 
-    def call(self, coroutine: Any, timeout: Optional[float] = None):
+    def call(self, coroutine: Coroutine[object, object, T], timeout: Optional[float] = None) -> T:
         if not self._ready.wait(timeout=0):
             self.logger.debug("Telegram runtime is not ready; starting the background runtime loop.")
             self._ensure_background_loop()
@@ -161,13 +178,13 @@ class SyncBotFacade:
         self._bot = bot
         self._runtime = runtime
 
-    def __getattr__(self, item: str):
+    def __getattr__(self, item: str) -> BotMethod:
         attr = getattr(self._bot, item)
         if not callable(attr):
-            return attr
+            raise AttributeError(f"{type(self._bot).__name__}.{item} is not callable")
 
-        def wrapper(*args, **kwargs):
-            return self._runtime.call(attr(*args, **kwargs))
+        def wrapper(*args: object, **kwargs: object) -> object:
+            return self._runtime.call(cast(Coroutine[object, object, object], attr(*args, **kwargs)))
 
         return wrapper
 
@@ -191,7 +208,7 @@ class QueuedSendPlaceholder:
 
 @dataclass
 class SendReceipt:
-    message: Any
+    message: object
     sender_bot_id: Optional[str] = None
     queued: bool = False
     task_id: Optional[str] = None
@@ -203,13 +220,21 @@ class SendReceipt:
     def __bool__(self):
         return self.message is not None
 
+    @property
+    def chat(self) -> ChatIdentifier:
+        return cast(ReplyTarget, self.message).chat
+
+    @property
+    def message_id(self) -> int:
+        return cast(ReplyTarget, self.message).message_id
+
     def reply_text(self, text: str, **kwargs):
         if self.manager is None:
             raise RuntimeError("SendReceipt is detached from TelegramBotManager.")
         return self.manager.send_message(
-            self.message.chat.id,
+            self.chat.id,
             text=text,
-            reply_to_message_id=self.message.message_id,
+            reply_to_message_id=self.message_id,
             **kwargs,
         )
 
@@ -246,7 +271,7 @@ class TelegramBotManager(LocaleMixin):
 
     # Type declarations for instance attributes assigned in __init__
     application: Application
-    _bot: SyncBotFacade
+    _bot: SyncBotProtocol
     _async_bot: telegram.Bot
     me: Optional[User]
     admins: List[int]
@@ -567,23 +592,18 @@ class TelegramBotManager(LocaleMixin):
             req_kwargs.update(conf_req_kwargs)
         request_kwargs = self._normalize_request_kwargs(req_kwargs)
         self._request_kwargs = dict(request_kwargs)
-        self._bot_identity_kwargs: dict[str, Any] = {"token": config['token']}
+        self._bot_identity_kwargs: dict[str, str] = {"token": config['token']}
 
         self.logger.debug("Setting up Telegram application and sync runtime...")
-        bot_kwargs: dict[str, Any] = dict(self._bot_identity_kwargs)
         if channel.flag('api_base_url'):
             self._bot_identity_kwargs["base_url"] = channel.flag('api_base_url')
-            bot_kwargs["base_url"] = self._bot_identity_kwargs["base_url"]
         if channel.flag('api_base_file_url'):
             self._bot_identity_kwargs["base_file_url"] = channel.flag('api_base_file_url')
-            bot_kwargs["base_file_url"] = self._bot_identity_kwargs["base_file_url"]
-        request = HTTPXRequest(**self._request_kwargs)
-        get_updates_request = HTTPXRequest(**self._request_kwargs)
-        bot_kwargs["request"] = request
-        bot_kwargs["get_updates_request"] = get_updates_request
+        request = self._build_request()
+        get_updates_request = self._build_request()
 
         self._runtime = AsyncTelegramRuntime(self.logger)
-        self._async_bot = telegram.Bot(**bot_kwargs)
+        self._async_bot = self._build_bot(request=request, get_updates_request=get_updates_request)
         self._bot = SyncBotFacade(self._async_bot, self._runtime)
         self.application = (
             Application.builder()
@@ -599,12 +619,9 @@ class TelegramBotManager(LocaleMixin):
             self.logger.debug("Webhook is set...")
 
         self.logger.debug("Checking connection to Telegram bot API...")
-        validation_kwargs = {
-            **self._bot_identity_kwargs,
-            "request": HTTPXRequest(**self._request_kwargs),
-            "get_updates_request": HTTPXRequest(**self._request_kwargs),
-        }
-        me = asyncio.run(telegram.Bot(**validation_kwargs).get_me())
+        me = asyncio.run(
+            self._build_bot(request=self._build_request(), get_updates_request=self._build_request()).get_me()
+        )
         assert me, "Invalid bot credential provided."
         self.me = me
         self.logger.debug("Connection to Telegram bot API is OK...")
@@ -655,9 +672,9 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Base dispatchers added...")
 
     @staticmethod
-    def _normalize_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_request_kwargs(request_kwargs: Mapping[str, object]) -> dict[str, object]:
         """Translate ETM's legacy PTB 13 request settings to PTB 22 HTTPXRequest kwargs."""
-        normalized: dict[str, Any] = {}
+        normalized: dict[str, object] = {}
         allowed = {
             "read_timeout",
             "write_timeout",
@@ -676,7 +693,8 @@ class TelegramBotManager(LocaleMixin):
         proxy = request_kwargs.get("proxy") or request_kwargs.get("proxy_url")
         username = request_kwargs.get("username")
         password = request_kwargs.get("password")
-        proxy_auth = request_kwargs.get("urllib3_proxy_kwargs") or {}
+        proxy_auth_raw = request_kwargs.get("urllib3_proxy_kwargs")
+        proxy_auth = proxy_auth_raw if isinstance(proxy_auth_raw, Mapping) else {}
         if username is None:
             username = proxy_auth.get("username")
         if password is None:
@@ -700,6 +718,64 @@ class TelegramBotManager(LocaleMixin):
             normalized["proxy"] = proxy
         return normalized
 
+    def _build_request(self) -> HTTPXRequest:
+        socket_options = self._request_kwargs.get("socket_options")
+        http_version = self._request_kwargs.get("http_version")
+        httpx_kwargs = self._request_kwargs.get("httpx_kwargs")
+        proxy = self._request_kwargs.get("proxy")
+        return HTTPXRequest(
+            connection_pool_size=cast(int, self._request_kwargs.get("connection_pool_size", 1)),
+            read_timeout=cast(Optional[float], self._request_kwargs.get("read_timeout")),
+            write_timeout=cast(Optional[float], self._request_kwargs.get("write_timeout")),
+            connect_timeout=cast(Optional[float], self._request_kwargs.get("connect_timeout")),
+            pool_timeout=cast(Optional[float], self._request_kwargs.get("pool_timeout")),
+            media_write_timeout=cast(Optional[float], self._request_kwargs.get("media_write_timeout")),
+            http_version=cast(Literal["1.1", "2.0", "2"], http_version or "1.1"),
+            socket_options=cast(
+                Optional[
+                    Collection[
+                        tuple[int, int, int]
+                        | tuple[int, int, bytes | bytearray]
+                        | tuple[int, int, None, int]
+                    ]
+                ],
+                socket_options,
+            ),
+            proxy=cast(Optional[str], proxy),
+            httpx_kwargs=cast(Optional[dict[str, object]], httpx_kwargs),
+        )
+
+    def _build_bot(self, *, request: HTTPXRequest, get_updates_request: HTTPXRequest) -> telegram.Bot:
+        base_url = self._bot_identity_kwargs.get("base_url")
+        base_file_url = self._bot_identity_kwargs.get("base_file_url")
+        if base_url is not None and base_file_url is not None:
+            return telegram.Bot(
+                token=self._bot_identity_kwargs["token"],
+                base_url=base_url,
+                base_file_url=base_file_url,
+                request=request,
+                get_updates_request=get_updates_request,
+            )
+        if base_url is not None:
+            return telegram.Bot(
+                token=self._bot_identity_kwargs["token"],
+                base_url=base_url,
+                request=request,
+                get_updates_request=get_updates_request,
+            )
+        if base_file_url is not None:
+            return telegram.Bot(
+                token=self._bot_identity_kwargs["token"],
+                base_file_url=base_file_url,
+                request=request,
+                get_updates_request=get_updates_request,
+            )
+        return telegram.Bot(
+            token=self._bot_identity_kwargs["token"],
+            request=request,
+            get_updates_request=get_updates_request,
+        )
+
     async def _post_init(self, application: Application):
         self._runtime.bind_loop(asyncio.get_running_loop())
         for aux_bot in self.bot_pool.bots if self.bot_pool else []:
@@ -710,9 +786,9 @@ class TelegramBotManager(LocaleMixin):
         self._runtime.clear_loop()
         self.logger.debug("Telegram runtime loop is cleared.")
 
-    def as_async_callback(self, callback: Callable[..., Any]):
-        async def wrapper(update, context):
-            return await asyncio.to_thread(callback, update, context)
+    def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            return await asyncio.to_thread(callback, *args, **kwargs)
 
         return wrapper
 
@@ -727,7 +803,7 @@ class TelegramBotManager(LocaleMixin):
 
     def _make_send_receipt(
         self,
-        message: Any,
+        message: object,
         sender_bot_id: Optional[str] = None,
         *,
         queued: bool = False,
@@ -832,10 +908,10 @@ class TelegramBotManager(LocaleMixin):
     def _active_bot(self):
         """Return the bot to use for the current send operation.
         Thread-safe: each thread has its own override slot."""
-        return getattr(self._tls, 'override_bot', None) or self._bot
+        return cast(SyncBotProtocol, getattr(self._tls, 'override_bot', None) or self._bot)
 
     @contextmanager
-    def _using_bot(self, bot):
+    def _using_bot(self, bot: object):
         """Context manager to temporarily route sends through a different bot."""
         old = getattr(self._tls, 'override_bot', None)
         self._tls.override_bot = bot
@@ -1542,7 +1618,7 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def get_file(self, file_id: str) -> File:
-        return self._active_bot.get_file(file_id)
+        return cast(File, self._active_bot.get_file(file_id))
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
@@ -1602,7 +1678,7 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def create_forum_topic(self, *args, **kwargs) -> ForumTopic:
-        return self._bot.create_forum_topic(*args, **kwargs)
+        return cast(ForumTopic, self._bot.create_forum_topic(*args, **kwargs))
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
@@ -1612,7 +1688,7 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def reopen_forum_topic(self, *args, **kwargs) -> bool:
-        return self._bot.reopen_forum_topic(*args, **kwargs)
+        return cast(bool, self._bot.reopen_forum_topic(*args, **kwargs))
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration

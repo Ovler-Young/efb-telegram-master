@@ -1,10 +1,23 @@
 import asyncio
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Collection, Coroutine
 from functools import wraps
-from typing import Any, Optional
+from typing import ParamSpec, Protocol, TypeAlias, TypeVar
 
-from telegram import Message, MessageOriginChannel
+from telegram import Chat, Message, MessageOriginChannel
 from telegram.ext import filters
+
+FilterUserId: TypeAlias = int | Collection[int] | None
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+class MessageIdentifier(Protocol):
+    message_id: int
+
+
+class SupportsSendMessage(Protocol):
+    def send_message(self, chat_id: int, text: str, **kwargs: object) -> MessageIdentifier:
+        ...
 
 
 class _UpdateFilters:
@@ -47,7 +60,7 @@ class _FiltersCompat:
         return filters.Regex(pattern)
 
     @staticmethod
-    def user(*, user_id: Any):
+    def user(*, user_id: FilterUserId):
         return filters.User(user_id=user_id)
 
 
@@ -55,18 +68,18 @@ Filters = _FiltersCompat()
 
 
 def threaded_callback(
-    callback: Callable[..., Any],
-) -> Callable[..., Coroutine[Any, Any, Any]]:
+    callback: Callable[P, T],
+) -> Callable[P, Coroutine[None, None, T]]:
     """Run a synchronous PTB callback in a worker thread."""
 
     @wraps(callback)
-    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
         return await asyncio.to_thread(callback, *args, **kwargs)
 
     return wrapper
 
 
-def get_forwarded_chat(message: Message) -> Optional[Any]:
+def get_forwarded_chat(message: Message) -> Chat | None:
     """Return the forwarded chat across PTB 13 and PTB 20+ message models."""
     chat = getattr(message, "forward_from_chat", None)
     if chat is not None:
@@ -78,12 +91,26 @@ def get_forwarded_chat(message: Message) -> Optional[Any]:
     return None
 
 
-def sync_reply_text(bot_manager: Any, message: Message, text: str, *, quote: bool = False, **kwargs: Any):
+def sync_reply_text(
+    bot_manager: SupportsSendMessage,
+    message: Message,
+    text: str,
+    *,
+    quote: bool = False,
+    **kwargs: object,
+) -> MessageIdentifier:
     if quote:
         kwargs.setdefault("reply_to_message_id", message.message_id)
     return bot_manager.send_message(message.chat.id, text=text, **kwargs)
 
 
-def sync_reply_html(bot_manager: Any, message: Message, text: str, *, quote: bool = False, **kwargs: Any):
+def sync_reply_html(
+    bot_manager: SupportsSendMessage,
+    message: Message,
+    text: str,
+    *,
+    quote: bool = False,
+    **kwargs: object,
+) -> MessageIdentifier:
     kwargs.setdefault("parse_mode", "HTML")
     return sync_reply_text(bot_manager, message, text, quote=quote, **kwargs)

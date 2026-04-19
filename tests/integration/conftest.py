@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections.abc import AsyncGenerator
 from typing import Set
 
 import pytest
@@ -10,14 +11,6 @@ from .helper.helper import TelegramIntegrationTestHelper
 from ..bot import get_user_session
 
 pytest.register_assert_rewrite("tests.integration.utils")
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for all test cases."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest.fixture(scope="session")
@@ -53,17 +46,18 @@ def filter_chats(bot_id, bot_groups, bot_channels, bot_topic_group) -> Set[int]:
 
 
 @pytest.fixture(scope="session")
-async def helper_wrap(event_loop, user_session, api_id, api_hash, bot_id,
-                      filter_chats, aux_bot_ids) -> TelegramIntegrationTestHelper:
+async def helper_wrap(user_session, api_id, api_hash, bot_id,
+                      filter_chats, aux_bot_ids) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
+    loop = asyncio.get_running_loop()
     async with TelegramIntegrationTestHelper(
-            user_session, api_id, api_hash, event_loop, [bot_id, *aux_bot_ids],
+            user_session, api_id, api_hash, loop, [bot_id, *aux_bot_ids],
             chats=filter_chats
     ) as helper:
         yield helper
 
 
 @pytest.fixture(scope="function")
-async def helper(helper_wrap, slave) -> TelegramIntegrationTestHelper:
+async def helper(helper_wrap, slave) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
     """Clean the message queue before each test."""
     helper_wrap.clear_queue()
     assert helper_wrap.queue.empty()
@@ -95,5 +89,5 @@ def poll_bot(channel):
 
 
 @pytest.fixture(scope="session")
-async def client(helper_wrap) -> TelegramClient:
+async def client(helper_wrap) -> AsyncGenerator[TelegramClient, None]:
     yield helper_wrap.client

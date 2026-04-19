@@ -6,21 +6,35 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Coroutine
 from inspect import isawaitable
-from typing import Any, Coroutine, Dict, Optional, Tuple, TYPE_CHECKING, cast
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, TypeVar, cast, overload, Literal
 
 import telegram
 import telegram.error
 from telegram.request import HTTPXRequest
 
 if TYPE_CHECKING:
-    from .bot_manager import AsyncTelegramRuntime
+    from .bot_manager import AsyncTelegramRuntime, SyncBotFacade
 
 logger = logging.getLogger(__name__)
 
-def _resolve_bot_result(result: object) -> Any:
+T = TypeVar("T")
+
+
+@overload
+def _resolve_bot_result(result: Coroutine[Any, Any, T]) -> T:
+    ...
+
+
+@overload
+def _resolve_bot_result(result: T) -> T:
+    ...
+
+
+def _resolve_bot_result(result: object) -> object:
     if isawaitable(result):
-        return asyncio.run(cast(Coroutine[Any, Any, Any], result))
+        return asyncio.run(cast(Coroutine[Any, Any, object], result))
     return result
 
 
@@ -44,14 +58,14 @@ class AuxiliaryBot:
                  chat_window: float = 60.0):
         self._token = token
         self._request_kwargs = dict(request_kwargs or {})
-        self._base_kwargs: Dict[str, Any] = {}
+        self._base_kwargs: Dict[str, str] = {}
         if base_url:
             self._base_kwargs['base_url'] = base_url
         if base_file_url:
             self._base_kwargs['base_file_url'] = base_file_url
 
         self.async_bot: telegram.Bot = self._create_bot()
-        self.bot: Any = self.async_bot
+        self.bot: telegram.Bot | 'SyncBotFacade' = self.async_bot
 
         # Identity (populated by initialize())
         self.bot_id: int = 0
@@ -75,19 +89,57 @@ class AuxiliaryBot:
         self._pending_probes: set = set()
 
     def _create_bot(self) -> telegram.Bot:
-        kwargs: Dict[str, Any] = {"token": self._token, **self._base_kwargs}
-        if self._request_kwargs:
-            kwargs['request'] = HTTPXRequest(**self._request_kwargs)
-            kwargs['get_updates_request'] = HTTPXRequest(**self._request_kwargs)
-        return telegram.Bot(**kwargs)
+        request = self._build_request() if self._request_kwargs else None
+        get_updates_request = self._build_request() if self._request_kwargs else None
+        base_url = self._base_kwargs.get('base_url')
+        base_file_url = self._base_kwargs.get('base_file_url')
+        if base_url is not None and base_file_url is not None:
+            return telegram.Bot(
+                token=self._token,
+                base_url=base_url,
+                base_file_url=base_file_url,
+                request=request,
+                get_updates_request=get_updates_request,
+            )
+        if base_url is not None:
+            return telegram.Bot(
+                token=self._token,
+                base_url=base_url,
+                request=request,
+                get_updates_request=get_updates_request,
+            )
+        if base_file_url is not None:
+            return telegram.Bot(
+                token=self._token,
+                base_file_url=base_file_url,
+                request=request,
+                get_updates_request=get_updates_request,
+            )
+        return telegram.Bot(
+            token=self._token,
+            request=request,
+            get_updates_request=get_updates_request,
+        )
+
+    def _build_request(self) -> HTTPXRequest:
+        return HTTPXRequest(
+            read_timeout=cast(Optional[float], self._request_kwargs.get('read_timeout')),
+            write_timeout=cast(Optional[float], self._request_kwargs.get('write_timeout')),
+            connect_timeout=cast(Optional[float], self._request_kwargs.get('connect_timeout')),
+            pool_timeout=cast(Optional[float], self._request_kwargs.get('pool_timeout')),
+            media_write_timeout=cast(Optional[float], self._request_kwargs.get('media_write_timeout')),
+            connection_pool_size=cast(int, self._request_kwargs.get('connection_pool_size', 1)),
+            proxy=cast(Optional[str], self._request_kwargs.get('proxy')),
+            httpx_kwargs=cast(Optional[dict[str, object]], self._request_kwargs.get('httpx_kwargs')),
+            http_version=cast(Literal['1.1', '2.0', '2'], self._request_kwargs.get('http_version') or '1.1'),
+        )
 
     def initialize(self) -> bool:
         """Call get_me() to validate token and cache identity.
         Returns True on success, False on failure (bot is disabled).
         """
         try:
-            validation_bot = self.async_bot if not isinstance(self.async_bot, telegram.Bot) else self._create_bot()
-            me: telegram.User = cast(telegram.User, _resolve_bot_result(validation_bot.get_me()))
+            me: telegram.User = _resolve_bot_result(self.async_bot.get_me())
             self.bot_id = me.id
             self.username = me.username or ""
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)

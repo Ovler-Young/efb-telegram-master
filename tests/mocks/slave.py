@@ -22,6 +22,7 @@ from ehforwarderbot.utils import extra
 
 _T = TypeVar("_T")
 ChatTypeName = Literal['PrivateChat', 'GroupChat', 'SystemChat']
+ReactionMode = Literal["accept", "reject_one", "reject_all"]
 
 
 class MockSlaveChannel(SlaveChannel):
@@ -120,11 +121,11 @@ class MockSlaveChannel(SlaveChannel):
 
         self.messages: "Queue[Message]" = Queue()
         self.statuses: "Queue[Status]" = Queue()
-        self.messages_sent: Dict[str, Message] = dict()
+        self.messages_sent: Dict[MessageID, Message] = dict()
 
         # flags
         self.message_removal_possible: bool = True
-        self.accept_message_reactions: str = "accept"
+        self.accept_message_reactions: ReactionMode = "accept"
 
         # chat/member changes
         self.chat_to_toggle: PrivateChat = self.get_chat(self.CHAT_ID_FORMAT.format(hash=hash("I")))
@@ -263,7 +264,7 @@ class MockSlaveChannel(SlaveChannel):
         self.logger.debug("Received message: %r", msg)
         self.messages.put(msg)
         msg.uid = MessageID(str(uuid4()))
-        self.messages_sent[msg.uid] = msg
+        self._store_message(msg)
         return msg
 
     def stop_polling(self):
@@ -278,9 +279,11 @@ class MockSlaveChannel(SlaveChannel):
     def get_chats(self) -> List[Chat]:
         return self.chats.copy()
 
-    def get_chat_picture(self, chat: Chat) -> Optional[BinaryIO]:
-        if self.__picture_dict.get(chat.uid):
-            return open(f'tests/mocks/{self.__picture_dict[chat.uid]}', 'rb')
+    def get_chat_picture(self, chat: Chat) -> BinaryIO:
+        avatar = self.__picture_dict.get(chat.uid)
+        if avatar:
+            return open(f'tests/mocks/{avatar}', 'rb')
+        raise EFBOperationNotSupported("This chat has no profile picture.")
 
     # endregion [Necessities]
 
@@ -320,12 +323,23 @@ class MockSlaveChannel(SlaveChannel):
     def echo(self, args):
         return args
 
+    @staticmethod
+    def _require_author(author: Optional[ChatMember]) -> ChatMember:
+        if author is None:
+            raise ValueError("A chat member author is required for mock messages.")
+        return author
+
+    def _store_message(self, message: Message) -> None:
+        if message.uid is None:
+            raise ValueError("Mock messages must have a MessageID before storing them.")
+        self.messages_sent[message.uid] = message
+
     # region [Reactions]
 
     def build_reactions(self, group: Chat) -> Reactions:
         possible_reactions = self.suggested_reactions[:-1] + [None]
         chats = group.members
-        reactions: Dict[ReactionName, List[Chat]] = {}
+        reactions: Dict[ReactionName, List[ChatMember]] = {}
         for i in chats:
             reaction = random.choice(possible_reactions)
             if reaction is None:
@@ -339,6 +353,7 @@ class MockSlaveChannel(SlaveChannel):
     def send_reactions_update(self, message: Message) -> MessageReactionsUpdate:
         reactions = self.build_reactions(message.chat)
         message.reactions = reactions
+        assert message.uid is not None
         status = MessageReactionsUpdate(
             chat=message.chat,
             msg_id=message.uid,
@@ -371,8 +386,14 @@ class MockSlaveChannel(SlaveChannel):
     def build_substitutions(text: str, chat: Chat) -> Substitutions:
         size = len(text)
         a_0, a_1, b_0, b_1 = sorted(random.sample(range(size + 1), k=4))
-        a = chat.self
-        b = getattr(chat, 'other', random.choice(chat.members))
+        self_member = chat.self
+        assert self_member is not None
+        a: Chat | ChatMember = self_member
+        if isinstance(chat, GroupChat):
+            b = random.choice(chat.members)
+        else:
+            assert isinstance(chat, (PrivateChat, SystemChat))
+            b = chat.other
         if random.randrange(2) == 1:  # randomly swap a and b
             a, b = b, a
         return Substitutions({
@@ -402,8 +423,8 @@ class MockSlaveChannel(SlaveChannel):
 
         Returns the message sent.
         """
-        author = author or chat.self
-        uid = f"__msg_id_{uuid4()}__"
+        author = self._require_author(author or chat.self)
+        uid = MessageID(f"__msg_id_{uuid4()}__")
         msg_type = MsgType.Unsupported if unsupported else MsgType.Text
         message = Message(
             chat=chat,
@@ -417,7 +438,7 @@ class MockSlaveChannel(SlaveChannel):
         message = self.attach_message_properties(message, reactions, commands, substitution)
 
         coordinator.send_message(message)
-        self.messages_sent[uid] = message
+        self._store_message(message)
 
         return message
 
@@ -426,7 +447,7 @@ class MockSlaveChannel(SlaveChannel):
         message.edit = True
         message.text = f"Edited {message.type.name} message {message.uid} @ {time.time_ns()}"
         message = self.attach_message_properties(message, reactions, commands, substitution)
-        self.messages_sent[message.uid] = message
+        self._store_message(message)
         coordinator.send_message(message)
         return message
 
@@ -436,8 +457,8 @@ class MockSlaveChannel(SlaveChannel):
                           reactions: bool = False,
                           commands: bool = False,
                           substitution: bool = False) -> Message:
-        author = author or chat.self
-        uid = f"__msg_id_{uuid4()}__"
+        author = self._require_author(author or chat.self)
+        uid = MessageID(f"__msg_id_{uuid4()}__")
         message = Message(
             chat=chat, author=author,
             type=MsgType.Link,
@@ -451,7 +472,7 @@ class MockSlaveChannel(SlaveChannel):
             deliver_to=coordinator.master
         )
         message = self.attach_message_properties(message, reactions, commands, substitution)
-        self.messages_sent[uid] = message
+        self._store_message(message)
         coordinator.send_message(message)
         return message
 
@@ -468,7 +489,7 @@ class MockSlaveChannel(SlaveChannel):
             url="https://efb.1a23.studio/#edited"
         )
         message = self.attach_message_properties(message, reactions, commands, substitution)
-        self.messages_sent[message.uid] = message
+        self._store_message(message)
         coordinator.send_message(message)
         return message
 
@@ -478,8 +499,8 @@ class MockSlaveChannel(SlaveChannel):
                               reactions: bool = False,
                               commands: bool = False,
                               substitution: bool = False) -> Message:
-        author = author or chat.self
-        uid = f"__msg_id_{uuid4()}__"
+        author = self._require_author(author or chat.self)
+        uid = MessageID(f"__msg_id_{uuid4()}__")
         message = Message(
             chat=chat, author=author,
             type=MsgType.Location,
@@ -492,7 +513,7 @@ class MockSlaveChannel(SlaveChannel):
             deliver_to=coordinator.master
         )
         message = self.attach_message_properties(message, reactions, commands, substitution)
-        self.messages_sent[uid] = message
+        self._store_message(message)
         coordinator.send_message(message)
         return message
 
@@ -507,7 +528,7 @@ class MockSlaveChannel(SlaveChannel):
             longitude=random.uniform(0.0, 90.0)
         )
         message = self.attach_message_properties(message, reactions, commands, substitution)
-        self.messages_sent[message.uid] = message
+        self._store_message(message)
         coordinator.send_message(message)
         return message
 
@@ -521,8 +542,8 @@ class MockSlaveChannel(SlaveChannel):
                                reactions: bool = False,
                                commands: bool = False,
                                substitution: bool = False) -> Message:
-        author = author or chat.self
-        uid = f"__msg_id_{uuid4()}__"
+        author = self._require_author(author or chat.self)
+        uid = MessageID(f"__msg_id_{uuid4()}__")
         message = Message(
             chat=chat, author=author,
             type=msg_type, target=target, uid=uid,
@@ -532,7 +553,7 @@ class MockSlaveChannel(SlaveChannel):
             deliver_to=coordinator.master
         )
         message = self.attach_message_properties(message, reactions, commands, substitution)
-        self.messages_sent[uid] = message
+        self._store_message(message)
         coordinator.send_message(message)
         return message
 
@@ -544,7 +565,7 @@ class MockSlaveChannel(SlaveChannel):
         message.edit = True
         message.edit_media = False
         message = self.attach_message_properties(message, reactions, commands, substitution)
-        self.messages_sent[message.uid] = message
+        self._store_message(message)
         coordinator.send_message(message)
         return message
 
@@ -562,7 +583,7 @@ class MockSlaveChannel(SlaveChannel):
         message.path = file_path
         message.mime = mime
         message = self.attach_message_properties(message, reactions, commands, substitution)
-        self.messages_sent[message.uid] = message
+        self._store_message(message)
         coordinator.send_message(message)
         return message
 
@@ -575,8 +596,8 @@ class MockSlaveChannel(SlaveChannel):
 
         Returns the message sent.
         """
-        author = author or chat.self
-        uid = f"__msg_id_{uuid4()}__"
+        author = self._require_author(author or chat.self)
+        uid = MessageID(f"__msg_id_{uuid4()}__")
         message = Message(
             chat=chat,
             author=author,
@@ -589,7 +610,7 @@ class MockSlaveChannel(SlaveChannel):
         )
 
         coordinator.send_message(message)
-        self.messages_sent[uid] = message
+        self._store_message(message)
 
         return message
 
@@ -617,26 +638,35 @@ class MockSlaveChannel(SlaveChannel):
             raise EFBMessageReactionNotPossible("Message reaction is rejected by flag.")
         if self.accept_message_reactions == "reject_all":
             raise EFBOperationNotSupported("All message reactions are rejected by flag.")
-        message = self.messages_sent.get(status.msg_id)
+        message = self.messages_sent.get(MessageID(status.msg_id))
         if message is None:
             raise EFBOperationNotSupported("Message is not found.")
 
         if status.reaction is None:
-            for idx, i in message.reactions.items():
-                message.reactions[idx] = [j for j in i if not isinstance(j, SelfChatMember)]
+            updated_reactions: Dict[ReactionName, List[ChatMember]] = {
+                idx: [member for member in members if not isinstance(member, SelfChatMember)]
+                for idx, members in (message.reactions or {}).items()
+            }
         else:
-            if status.reaction not in message.reactions:
-                message.reactions[status.reaction] = []
-            message.reactions[status.reaction].append(message.chat.self)
+            updated_reactions = {
+                idx: list(members)
+                for idx, members in (message.reactions or {}).items()
+            }
+            self_member = message.chat.self
+            assert self_member is not None
+            updated_reactions.setdefault(ReactionName(status.reaction), []).append(self_member)
+
+        message.reactions = updated_reactions
+        assert message.uid is not None
 
         coordinator.send_status(MessageReactionsUpdate(
             chat=message.chat,
             msg_id=message.uid,
-            reactions=message.reactions
+            reactions=updated_reactions
         ))
 
     @contextmanager
-    def set_react_to_message(self, value: bool):
+    def set_react_to_message(self, value: ReactionMode):
         """
         Set reaction response status.
 
