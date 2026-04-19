@@ -271,10 +271,10 @@ def test_polling_passes_custom_timeout_to_run_polling():
         application=SimpleNamespace(run_polling=Mock()),
     )
 
-    TelegramBotManager.polling(manager, drop_pending_updates=True, timeout=1.0)
+    TelegramBotManager.polling(manager, drop_pending_updates=True, timeout=1)
 
     manager.application.run_polling.assert_called_once_with(
-        timeout=1.0,
+        timeout=1,
         drop_pending_updates=True,
         close_loop=True,
         stop_signals=None,
