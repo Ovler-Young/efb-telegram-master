@@ -1,6 +1,7 @@
 import re
 from io import BytesIO
 
+import pytest
 from pytest import raises
 
 from efb_telegram_master.utils import b64de, b64en, message_id_to_str, \
@@ -46,6 +47,11 @@ def test_chat_id_str_conversion():
 
 
 def test_convert_tgs_to_gif():
+    try:
+        from lottie.exporters.cairo import export_png  # noqa: F401
+    except Exception as exc:  # pragma: no cover - environment dependent optional backend
+        pytest.skip(f"TGS raster backend is unavailable in this environment: {exc}")
+
     out = BytesIO()
     with open('tests/mocks/AnimatedSticker.tgs', 'rb') as f:
         assert convert_tgs_to_gif(f, out), "conversion outcome"
