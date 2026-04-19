@@ -1795,7 +1795,7 @@ class TelegramBotManager(LocaleMixin):
     def set_chat_description(self, *args, **kwargs):
         return self._bot.set_chat_description(*args, **kwargs)
 
-    def polling(self, drop_pending_updates: bool = False):
+    def polling(self, drop_pending_updates: bool = False, timeout: float | timedelta = 10.0):
         """
         Poll message from Telegram Bot API.
         This method is blocking and is expected to run inside EFB's master poll thread.
@@ -1804,6 +1804,7 @@ class TelegramBotManager(LocaleMixin):
             drop_pending_updates: Whether to clean any pending updates on
                 Telegram servers before actually starting to poll.
                 Default is False.
+            timeout: Long-poll timeout for ``getUpdates``.
         """
         if self.webhook:
             start_webhook = self.channel.config['webhook']['start_webhook']
@@ -1815,7 +1816,7 @@ class TelegramBotManager(LocaleMixin):
             )
         else:
             self.application.run_polling(
-                timeout=10,
+                timeout=timeout,
                 drop_pending_updates=drop_pending_updates,
                 close_loop=True,
                 stop_signals=None,

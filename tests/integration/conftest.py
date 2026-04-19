@@ -124,7 +124,8 @@ def poll_bot_factory():
 
             def runner():
                 try:
-                    channel.bot_manager.polling(drop_pending_updates=True)
+                    # Keep long polling short in tests so teardown can release the slot quickly.
+                    channel.bot_manager.polling(drop_pending_updates=True, timeout=1.0)
                 except BaseException as exc:  # pragma: no cover - test bootstrap path
                     polling_errors.append(exc)
 

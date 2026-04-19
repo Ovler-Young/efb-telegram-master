@@ -263,3 +263,19 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
     manager._runtime.call_soon.assert_called_once_with(manager.application.stop_running)
     manager.application.stop_running.assert_called_once()
     manager._runtime.shutdown.assert_not_called()
+
+
+def test_polling_passes_custom_timeout_to_run_polling():
+    manager = SimpleNamespace(
+        webhook=False,
+        application=SimpleNamespace(run_polling=Mock()),
+    )
+
+    TelegramBotManager.polling(manager, drop_pending_updates=True, timeout=1.0)
+
+    manager.application.run_polling.assert_called_once_with(
+        timeout=1.0,
+        drop_pending_updates=True,
+        close_loop=True,
+        stop_signals=None,
+    )
