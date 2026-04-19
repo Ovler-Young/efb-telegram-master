@@ -81,46 +81,90 @@ async def rate_limit_delay():
 
 @pytest.fixture(scope="session")
 def poll_bot_factory():
+    state = {
+        "channel": None,
+        "thread": None,
+        "errors": None,
+        "lock": threading.Lock(),
+    }
+
+    def stop(expected_channel=None):
+        channel = state["channel"]
+        polling_thread = state["thread"]
+        polling_errors = state["errors"]
+
+        if channel is None or polling_thread is None:
+            return
+        if expected_channel is not None and channel is not expected_channel:
+            return
+
+        channel.bot_manager.graceful_stop()
+        polling_thread.join(timeout=30)
+        if polling_thread.is_alive():
+            raise RuntimeError("Telegram bot polling thread did not stop in time.")
+
+        state["channel"] = None
+        state["thread"] = None
+        state["errors"] = None
+
+        # Telegram may take a moment to release the previous long-poll slot.
+        time.sleep(2)
+
+        if polling_errors:
+            raise polling_errors[0]
+
     def start(channel):
-        polling_errors = []
+        with state["lock"]:
+            if state["channel"] is channel and state["thread"] is not None:
+                return
 
-        def runner():
-            try:
-                channel.bot_manager.polling(drop_pending_updates=True)
-            except BaseException as exc:  # pragma: no cover - test bootstrap path
-                polling_errors.append(exc)
+            stop()
 
-        polling_thread = threading.Thread(
-            target=runner,
-            name=f"pytest-poll-bot-{channel.channel_id}",
-            daemon=True,
-        )
-        polling_thread.start()
+            polling_errors = []
 
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if polling_errors:
-                raise polling_errors[0]
-            if channel.bot_manager._runtime._ready.wait(timeout=0.1):
-                time.sleep(1)
-                return polling_thread, polling_errors
+            def runner():
+                try:
+                    channel.bot_manager.polling(drop_pending_updates=True)
+                except BaseException as exc:  # pragma: no cover - test bootstrap path
+                    polling_errors.append(exc)
 
-        raise RuntimeError("Telegram bot polling did not become ready in time.")
+            polling_thread = threading.Thread(
+                target=runner,
+                name=f"pytest-poll-bot-{channel.channel_id}",
+                daemon=True,
+            )
+            polling_thread.start()
 
-    return start
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if polling_errors:
+                    raise polling_errors[0]
+                if channel.bot_manager._runtime._ready.wait(timeout=0.1):
+                    time.sleep(1)
+                    state["channel"] = channel
+                    state["thread"] = polling_thread
+                    state["errors"] = polling_errors
+                    return
+
+            raise RuntimeError("Telegram bot polling did not become ready in time.")
+
+    class PollBotFactory:
+        def start(self, channel):
+            start(channel)
+
+        def stop(self, channel=None):
+            with state["lock"]:
+                stop(channel)
+
+    return PollBotFactory()
 
 
 @pytest.fixture(scope="module")
 def poll_bot(channel, poll_bot_factory):
     logging.root.setLevel(logging.DEBUG)
-    polling_thread, polling_errors = poll_bot_factory(channel)
+    poll_bot_factory.start(channel)
     yield channel.bot_manager
-    channel.bot_manager.graceful_stop()
-    polling_thread.join(timeout=10)
-    if polling_thread.is_alive():
-        raise RuntimeError("Telegram bot polling thread did not stop in time.")
-    if polling_errors:
-        raise polling_errors[0]
+    poll_bot_factory.stop(channel)
 
 
 @pytest.fixture(scope="session")
