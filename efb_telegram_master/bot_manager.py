@@ -798,20 +798,11 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Telegram runtime loop is cleared.")
 
     async def _shutdown_ptb_application(self):
-        updater = self.application.updater
-        if updater and updater.running:
-            await updater.stop()
-
-        if self.application.running:
-            await self.application.stop()
-            post_stop = self.application.post_stop
-            if post_stop:
-                await post_stop(self.application)
-
-        await self.application.shutdown()
-
-        loop = asyncio.get_running_loop()
-        loop.call_soon(loop.stop)
+        # Signal PTB's run_polling / run_webhook to exit via Application.stop_running().
+        # PTB then runs stop / shutdown / loop close inside run_polling's finally block.
+        # Manual updater.stop / application.stop / shutdown plus loop.stop() while
+        # __run_forever still awaits __stop_running_marker can hang cleanup past join timeout.
+        self.application.stop_running()
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:

@@ -98,14 +98,18 @@ def poll_bot_factory():
         if expected_channel is not None and channel is not expected_channel:
             return
 
-        channel.bot_manager.graceful_stop()
-        polling_thread.join(timeout=30)
-        if polling_thread.is_alive():
-            raise RuntimeError("Telegram bot polling thread did not stop in time.")
+        still_alive = False
+        try:
+            channel.bot_manager.graceful_stop()
+            polling_thread.join(timeout=30)
+            still_alive = polling_thread.is_alive()
+        finally:
+            state["channel"] = None
+            state["thread"] = None
+            state["errors"] = None
 
-        state["channel"] = None
-        state["thread"] = None
-        state["errors"] = None
+        if still_alive:
+            raise RuntimeError("Telegram bot polling thread did not stop in time.")
 
         # Telegram may take a moment to release the previous long-poll slot.
         time.sleep(2)

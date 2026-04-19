@@ -1,10 +1,9 @@
-import asyncio
 import string
 import random
 import threading
 from typing import IO, Iterator, BinaryIO
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 import telegram.error
@@ -286,26 +285,13 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_ptb_application_stops_ptb_components_and_loop():
-    post_stop = AsyncMock()
-    application = SimpleNamespace(
-        updater=SimpleNamespace(running=True, stop=AsyncMock()),
-        running=True,
-        stop=AsyncMock(),
-        shutdown=AsyncMock(),
-        post_stop=post_stop,
-    )
+async def test_shutdown_ptb_application_requests_stop_running():
+    application = SimpleNamespace(stop_running=Mock())
     manager = SimpleNamespace(application=application)
-    loop = asyncio.get_running_loop()
 
-    with patch.object(loop, "call_soon") as call_soon:
-        await TelegramBotManager._shutdown_ptb_application(manager)
+    await TelegramBotManager._shutdown_ptb_application(manager)
 
-    application.updater.stop.assert_awaited_once_with()
-    application.stop.assert_awaited_once_with()
-    post_stop.assert_awaited_once_with(application)
-    application.shutdown.assert_awaited_once_with()
-    call_soon.assert_called_once_with(loop.stop)
+    application.stop_running.assert_called_once_with()
 
 
 def test_polling_passes_custom_timeout_to_run_polling():
