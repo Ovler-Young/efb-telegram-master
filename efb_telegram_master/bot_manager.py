@@ -837,12 +837,15 @@ class TelegramBotManager(LocaleMixin):
         ``post_stop`` → ``shutdown`` → ``post_shutdown``. Teardown runs in ``finally`` so
         ``await application.shutdown()`` (HTTPX close) completes before this coroutine returns.
         """
-        self._manual_polling_stop_event = asyncio.Event()
+        # Publish the stop event only after ``post_init`` binds the runtime loop.
+        stop_event = asyncio.Event()
         try:
             await self.application.initialize()
             post_init = self.application.post_init
             if post_init:
                 await post_init(self.application)
+
+            self._manual_polling_stop_event = stop_event
 
             updater = self.application.updater
             if updater is None:
@@ -863,9 +866,10 @@ class TelegramBotManager(LocaleMixin):
             )
             await self.application.start()
             self.logger.debug("Application started; awaiting stop signal")
-            await self._manual_polling_stop_event.wait()
+            await stop_event.wait()
             self.logger.debug("Stop signal received; tearing down")
         finally:
+            self._manual_polling_stop_event = None
             try:
                 updater = self.application.updater
                 if updater is not None and updater.running:
@@ -1968,15 +1972,32 @@ class TelegramBotManager(LocaleMixin):
         if hasattr(self, 'application'):
             manual_evt = getattr(self, "_manual_polling_stop_event", None)
             if manual_evt is not None:
-
                 def _signal_manual_stop() -> None:
                     manual_evt.set()
 
-                if hasattr(self, '_runtime') and not self._runtime.call_soon(_signal_manual_stop):
+                stop_requested = False
+                if hasattr(self, '_runtime'):
+                    stop_requested = self._runtime.call_soon(_signal_manual_stop)
+
+                if not stop_requested:
+                    manual_evt_loop = getattr(manual_evt, "_loop", None)
+                    if manual_evt_loop is not None and manual_evt_loop.is_running():
+                        manual_evt_loop.call_soon_threadsafe(_signal_manual_stop)
+                        stop_requested = True
+
+                if not stop_requested:
                     self.logger.warning(
                         "Could not schedule polling stop on runtime loop; "
-                        "Telegram polling thread may not exit cleanly."
+                        "falling back to direct stop signalling."
                     )
+                    try:
+                        self.application.stop_running()
+                    except RuntimeError as exc:
+                        self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
+                    try:
+                        manual_evt.set()
+                    except Exception:
+                        self.logger.debug("Failed to set manual polling stop event directly.", exc_info=True)
             else:
                 application_stopped = False
                 if hasattr(self, '_runtime') and self._runtime._ready.is_set():

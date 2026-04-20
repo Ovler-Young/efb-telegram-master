@@ -295,6 +295,43 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
     manager._runtime.shutdown.assert_not_called()
 
 
+def test_graceful_stop_signals_manual_event_on_event_loop_when_runtime_loop_missing():
+    shutdown_complete_event = threading.Event()
+    shutdown_complete_event.set()
+    manual_evt_loop = SimpleNamespace(
+        is_running=Mock(return_value=True),
+        call_soon_threadsafe=Mock(),
+    )
+    manual_evt = SimpleNamespace(set=Mock(), _loop=manual_evt_loop)
+    manager = SimpleNamespace(
+        logger=Mock(),
+        _delayed_queue=[],
+        _delayed_queue_lock=threading.Lock(),
+        stop_delayed_worker=Mock(),
+        bot_pool=None,
+        application=SimpleNamespace(stop_running=Mock()),
+        _shutdown_complete_event=shutdown_complete_event,
+        _manual_polling_stop_event=manual_evt,
+        _runtime=SimpleNamespace(
+            _ready=SimpleNamespace(is_set=Mock(return_value=False)),
+            call=Mock(),
+            call_soon=Mock(return_value=False),
+            clear_loop=Mock(),
+            shutdown=Mock(),
+            _owns_loop_thread=False,
+        ),
+    )
+
+    TelegramBotManager.graceful_stop(manager)
+
+    manager._runtime.call_soon.assert_called_once()
+    manual_evt_loop.call_soon_threadsafe.assert_called_once()
+    manager.application.stop_running.assert_not_called()
+    manual_evt.set.assert_not_called()
+    manager._runtime.clear_loop.assert_called_once()
+    manager._runtime.shutdown.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_shutdown_ptb_application_signals_stop_running():
     application = SimpleNamespace(stop_running=Mock())
@@ -333,3 +370,81 @@ def test_polling_passes_custom_timeout_to_manual_lifecycle():
 
     assert recorded["drop_pending_updates"] is True
     assert recorded["timeout"] == 1
+
+
+def test_run_application_lifecycle_publishes_manual_stop_event_after_post_init():
+    observed: list[tuple[str, object]] = []
+
+    class FakeUpdater:
+        def __init__(self):
+            self.running = False
+
+        async def start_polling(self, **kwargs):
+            observed.append(("start_polling", manager._manual_polling_stop_event is not None))
+            self.running = True
+            assert manager._manual_polling_stop_event is not None
+            manager._manual_polling_stop_event.set()
+
+        async def stop(self):
+            observed.append(("updater_stop", True))
+            self.running = False
+
+    async def initialize():
+        observed.append(("initialize", manager._manual_polling_stop_event))
+
+    async def post_init(_application):
+        observed.append(("post_init", manager._manual_polling_stop_event))
+
+    async def start():
+        observed.append(("start", manager._manual_polling_stop_event is not None))
+        application.running = True
+
+    async def stop():
+        observed.append(("stop", True))
+        application.running = False
+
+    async def shutdown():
+        observed.append(("shutdown", True))
+
+    async def post_shutdown(_application):
+        observed.append(("post_shutdown", manager._manual_polling_stop_event))
+
+    updater = FakeUpdater()
+    application = SimpleNamespace(
+        initialize=initialize,
+        post_init=post_init,
+        updater=updater,
+        create_task=lambda coro: None,
+        process_error=Mock(),
+        start=start,
+        running=False,
+        stop=stop,
+        post_stop=None,
+        shutdown=shutdown,
+        post_shutdown=post_shutdown,
+    )
+    manager = SimpleNamespace(
+        application=application,
+        logger=Mock(),
+        _manual_polling_stop_event=None,
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(
+            TelegramBotManager._run_application_lifecycle(
+                manager,
+                drop_pending_updates=False,
+                timeout=1,
+            )
+        )
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    assert observed[0] == ("initialize", None)
+    assert observed[1] == ("post_init", None)
+    assert ("start_polling", True) in observed
+    assert ("start", True) in observed
+    assert manager._manual_polling_stop_event is None
