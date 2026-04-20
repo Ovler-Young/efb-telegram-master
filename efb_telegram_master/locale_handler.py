@@ -5,9 +5,10 @@ import logging
 from typing import TYPE_CHECKING
 
 from language_tags import tags
-from pkg_resources import resource_filename
 from telegram import Update
 from telegram.ext import BaseHandler
+
+from .paths import LOCALE_DIR
 
 if TYPE_CHECKING:
     from telegram.ext import Application, CallbackContext
@@ -56,7 +57,7 @@ class LocaleHandler(BaseHandler):
         self.logger.info("Updating locale to %s", locale)
         self.channel.translator = gettext.translation(
             "efb_telegram_master",
-            resource_filename('efb_telegram_master', 'locale'),
+            str(LOCALE_DIR),
             languages=[locale, 'C'],
             fallback=True,
         )

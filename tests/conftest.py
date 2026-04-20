@@ -11,12 +11,12 @@ os.environ.setdefault("PTB_TIMEDELTA", "1")
 
 from telegram.error import NetworkError, TimedOut
 
-import ehforwarderbot.utils
 import ehforwarderbot.coordinator
 
 from .mocks.slave import MockSlaveChannel
 from .bot import get_bot
 from efb_telegram_master import TelegramChannel
+from efb_telegram_master.paths import get_config_path
 
 pytestmark = [pytest.mark.xfail(raises=TimedOut), pytest.mark.xfail(raises=NetworkError)]
 
@@ -106,7 +106,7 @@ def load_test_coordinator(tmp_path_factory, monkey_class, channel_config) -> Mod
     tmp_path = tmp_path_factory.mktemp("etm_test")
     monkey_class.setenv("EFB_DATA_PATH", str(tmp_path))
 
-    config_path = ehforwarderbot.utils.get_config_path()
+    config_path = get_config_path()
     dump_config(config_path, {
         "master_channel": TelegramChannel.channel_id,
         "slave_channels": ["tests.mocks.slave"],
@@ -115,7 +115,7 @@ def load_test_coordinator(tmp_path_factory, monkey_class, channel_config) -> Mod
 
     ehforwarderbot.coordinator.add_channel(MockSlaveChannel())
 
-    channel_config_path = ehforwarderbot.utils.get_config_path(TelegramChannel.channel_id)
+    channel_config_path = get_config_path(TelegramChannel.channel_id)
     dump_config(channel_config_path, channel_config)
 
     ehforwarderbot.coordinator.add_channel(TelegramChannel())

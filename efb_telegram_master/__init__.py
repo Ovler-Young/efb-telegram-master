@@ -3,6 +3,7 @@
 import html
 import logging
 import mimetypes
+import os
 import time
 import gettext
 from gettext import NullTranslations, translation
@@ -14,7 +15,6 @@ import telegram.constants
 import telegram.error
 from language_tags import tags
 from PIL import Image, WebPImagePlugin
-from pkg_resources import resource_filename
 from ruamel.yaml import YAML
 from telegram import Update, Message
 from telegram.constants import ChatType
@@ -22,7 +22,6 @@ from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext
 
 import ehforwarderbot  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, coordinator
-from ehforwarderbot import utils as efb_utils
 from ehforwarderbot.channel import MasterChannel
 from ehforwarderbot.message import Message as EFBMessage
 from ehforwarderbot.chat import Chat
@@ -42,6 +41,7 @@ from .commands import CommandsManager
 from .db import DatabaseManager
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
+from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .rpc_utils import RPCUtilities
 from .slave_message import SlaveMessageProcessor
@@ -88,7 +88,7 @@ class TelegramChannel(MasterChannel):
 
     # Translator
     translator: NullTranslations = translation("efb_telegram_master",
-                                               resource_filename('efb_telegram_master', 'locale'),
+                                               os.fspath(LOCALE_DIR),
                                                fallback=True)
     locale: Optional[str] = None
 
@@ -136,7 +136,7 @@ class TelegramChannel(MasterChannel):
 
         if not self.flag('auto_locale'):
             self.translator = translation("efb_telegram_master",
-                                          resource_filename('efb_telegram_master', 'locale'),
+                                          os.fspath(LOCALE_DIR),
                                           fallback=True)
 
         # Basic message handlers
@@ -177,7 +177,7 @@ class TelegramChannel(MasterChannel):
 
         Configuration file is in YAML format.
         """
-        config_path = efb_utils.get_config_path(self.channel_id)
+        config_path = get_config_path(self.channel_id)
         if not config_path.exists():
             raise FileNotFoundError(self._("Config File does not exist. ({path})").format(path=config_path))
         with config_path.open() as f:
@@ -390,7 +390,7 @@ class TelegramChannel(MasterChannel):
         self.logger.info("Updating locale to %s", locale)
         self.translator = gettext.translation(
             "efb_telegram_master",
-            resource_filename('efb_telegram_master', 'locale'),
+            os.fspath(LOCALE_DIR),
             languages=[locale, 'C'],
             fallback=True,
         )

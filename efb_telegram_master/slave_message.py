@@ -12,11 +12,9 @@ from pathlib import Path
 from typing import Tuple, Optional, TYPE_CHECKING, List, IO, Union
 
 import humanize
-import pydub
 import telegram  # lgtm [py/import-and-import-from]
 import telegram.constants
 import telegram.error
-import telegram.ext
 from PIL import Image
 from telegram import InputFile, InputMediaPhoto, InputMediaDocument, InputMediaVideo, InputMediaAnimation, \
     InlineKeyboardMarkup, InlineKeyboardButton, InputMedia
@@ -919,6 +917,8 @@ class SlaveMessageProcessor(LocaleMixin):
             # Sending new message (initial or fallback)
             if not old_msg_id: # Ensure we are in the 'send new' path
                 assert msg.file is not None
+                import pydub
+
                 with tempfile.NamedTemporaryFile(suffix=".ogg", dir=utils.ExperimentalFlagsManager.get_temp_dir(self.channel)) as f: # Ensure correct suffix for pydub
                     try:
                         pydub.AudioSegment.from_file(msg.file).export(f.name, format="ogg", codec="libopus",

@@ -8,7 +8,6 @@ from urllib.parse import quote, urlparse, urlunparse
 
 from PIL import Image, WebPImagePlugin
 from bullet import YesNo, Numbers, Bullet
-from pkg_resources import resource_filename
 
 import cjkwrap
 from ruamel.yaml import YAML
@@ -16,10 +15,11 @@ from telegram import Bot
 from telegram.error import TelegramError
 from telegram.request import HTTPXRequest
 
-from ehforwarderbot import coordinator, utils
+from ehforwarderbot import coordinator
 from ehforwarderbot.types import ModuleID
 
 from . import TelegramChannel
+from .paths import LOCALE_DIR, get_config_path
 
 
 def print_wrapped(text):
@@ -29,7 +29,7 @@ def print_wrapped(text):
 
 
 translator = translation("efb_telegram_master",
-                         resource_filename('efb_telegram_master', 'locale'),
+                         str(LOCALE_DIR),
                          fallback=True)
 
 _ = translator.gettext
@@ -50,7 +50,7 @@ class DataModel:
 
         if instance_id:
             self.channel_id = ModuleID(self.channel_id + "#" + instance_id)
-        self.config_path = utils.get_config_path(self.channel_id)
+        self.config_path = get_config_path(self.channel_id)
         self.yaml = YAML()
         if not self.config_path.exists():
             self.build_default_config()

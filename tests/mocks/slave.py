@@ -18,11 +18,20 @@ from ehforwarderbot.message import MessageCommands, MessageCommand, StatusAttrib
 from ehforwarderbot.status import MessageRemoval, ReactToMessage, MessageReactionsUpdate, ChatUpdates, \
     MemberUpdates
 from ehforwarderbot.types import ModuleID, ChatID, MessageID, ReactionName, Reactions
-from ehforwarderbot.utils import extra
 
 _T = TypeVar("_T")
 ChatTypeName = Literal['PrivateChat', 'GroupChat', 'SystemChat']
 ReactionMode = Literal["accept", "reject_one", "reject_all"]
+
+
+def extra(name: str, desc: str):
+    def attr_dec(fn):
+        setattr(fn, "extra_fn", True)
+        setattr(fn, "name", name)
+        setattr(fn, "desc", desc)
+        return fn
+
+    return attr_dec
 
 
 class MockSlaveChannel(SlaveChannel):

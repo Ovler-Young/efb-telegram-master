@@ -25,6 +25,7 @@ from retrying import retry
 from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
 from telegram import Message as TelegramMessage
 from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
+from telegram.ext import _applicationbuilder as ptb_applicationbuilder
 from telegram.request import HTTPXRequest
 
 from .auxiliary_bot import AuxiliaryBot
@@ -67,16 +68,11 @@ class ReplyTarget(Protocol):
     message_id: int
 
 
-def _ensure_ptb_job_queue_timezone_compatibility() -> None:
-    """Bridge PTB 22's UTC default to APScheduler 3.x's pytz-only timezone handling."""
-    try:
-        import pytz
-        from telegram.ext import _jobqueue as ptb_jobqueue
-    except ImportError:
-        return
+class _UnusedJobQueueStub:
+    """Prevent PTB from eagerly instantiating an unused JobQueue during builder setup."""
 
-    if not hasattr(ptb_jobqueue.UTC, "localize") or not hasattr(ptb_jobqueue.UTC, "normalize"):
-        ptb_jobqueue.UTC = pytz.utc
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
 
 
 class AsyncTelegramRuntime:
@@ -625,16 +621,20 @@ class TelegramBotManager(LocaleMixin):
         self._runtime = AsyncTelegramRuntime(self.logger)
         self._async_bot = self._build_bot(request=request, get_updates_request=get_updates_request)
         self._bot = SyncBotFacade(self._async_bot, self._runtime)
-        _ensure_ptb_job_queue_timezone_compatibility()
-        self.application = (
-            Application.builder()
-            .bot(self._async_bot)
-            # This channel does not use PTB's JobQueue features.
-            .job_queue(None)
-            .post_init(self._post_init)
-            .post_shutdown(self._post_shutdown)
-            .build()
-        )
+        original_job_queue = ptb_applicationbuilder.JobQueue
+        ptb_applicationbuilder.JobQueue = _UnusedJobQueueStub
+        try:
+            self.application = (
+                Application.builder()
+                .bot(self._async_bot)
+                # This channel does not use PTB's JobQueue features.
+                .job_queue(None)
+                .post_init(self._post_init)
+                .post_shutdown(self._post_shutdown)
+                .build()
+            )
+        finally:
+            ptb_applicationbuilder.JobQueue = original_job_queue
 
         if isinstance(config.get('webhook'), dict):
             self.logger.debug("Setting up webhook...")
