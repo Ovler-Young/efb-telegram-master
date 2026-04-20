@@ -17,7 +17,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Callable, Collection, Coroutine, Deque, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import url2pathname
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import telegram.constants
 import telegram.error
@@ -638,9 +638,7 @@ class TelegramBotManager(LocaleMixin):
         self._runtime = AsyncTelegramRuntime(self.logger)
         self._async_bot = self._build_bot(request=request, get_updates_request=get_updates_request)
         self._bot = SyncBotFacade(self._async_bot, self._runtime)
-        original_job_queue = ptb_applicationbuilder.JobQueue
-        ptb_applicationbuilder.JobQueue = _UnusedJobQueueStub
-        try:
+        with patch.object(ptb_applicationbuilder, "JobQueue", _UnusedJobQueueStub):
             self.application = (
                 Application.builder()
                 .bot(self._async_bot)
@@ -650,8 +648,6 @@ class TelegramBotManager(LocaleMixin):
                 .post_shutdown(self._post_shutdown)
                 .build()
             )
-        finally:
-            ptb_applicationbuilder.JobQueue = original_job_queue
 
         if isinstance(config.get('webhook'), dict):
             self.logger.debug("Setting up webhook...")
