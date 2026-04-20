@@ -144,10 +144,7 @@ typing = _Typing()
 
 class _Message(BaseFilter):
     def filter(self, event: EventCommon):
-        return isinstance(event, NewMessage.Event)
-        # or isinstance(event, MessageEdited.Event)
-        # Not needed for now as MessageEdited.Event is a subclass of
-        # NewMessage.Event
+        return isinstance(event, (NewMessage.Event, MessageEdited.Event))
 
     def __repr__(self):
         return "Message"

@@ -10,6 +10,7 @@ import pytest
 import telegram.error
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
+from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 
 
 def test_text_prefix_suffix(channel, bot_admin):
@@ -225,6 +226,58 @@ def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_dis
     assert result == "ok"
     assert attempts["count"] == 2
     sleep.assert_called()
+
+
+def test_async_runtime_call_waits_for_bound_loop_before_falling_back():
+    runtime = AsyncTelegramRuntime(Mock())
+    runtime._ready = Mock()
+    runtime._ready.wait.return_value = True
+    runtime._loop = object()
+    runtime._loop_thread_id = -1
+    runtime._ensure_background_loop = Mock()
+    future = Mock()
+    future.result.return_value = "ok"
+    coroutine = object()
+
+    with patch("efb_telegram_master.bot_manager.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
+        result = runtime.call(coroutine, timeout=7)
+
+    assert result == "ok"
+    runtime._ready.wait.assert_called_once_with(timeout=2.0)
+    runtime._ensure_background_loop.assert_not_called()
+    runner.assert_called_once_with(coroutine, runtime._loop)
+    future.result.assert_called_once_with(7)
+
+
+def test_async_runtime_call_falls_back_to_background_loop_after_wait_timeout():
+    runtime = AsyncTelegramRuntime(Mock())
+    runtime._ready = Mock()
+    runtime._ready.wait.return_value = False
+    background_loop = object()
+    runtime._loop = None
+    runtime._loop_thread_id = None
+
+    def ensure_background_loop():
+        runtime._loop = background_loop
+        runtime._loop_thread_id = -1
+
+    runtime._ensure_background_loop = Mock(side_effect=ensure_background_loop)
+    future = Mock()
+    future.result.return_value = "ok"
+    coroutine = object()
+
+    with patch("efb_telegram_master.bot_manager.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
+        result = runtime.call(coroutine)
+
+    assert result == "ok"
+    runtime._ready.wait.assert_called_once_with(timeout=2.0)
+    runtime._ensure_background_loop.assert_called_once_with()
+    runtime.logger.debug.assert_called_once_with(
+        "Telegram runtime is not ready after %.1fs; starting the background runtime loop.",
+        2.0,
+    )
+    runner.assert_called_once_with(coroutine, background_loop)
+    future.result.assert_called_once_with(None)
 
 
 def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():

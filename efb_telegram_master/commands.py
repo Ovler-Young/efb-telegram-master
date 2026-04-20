@@ -72,7 +72,10 @@ class CommandsManager(LocaleMixin):
 
     def register_command(self, message: Message, commands: ETMCommandMsgStorage):
         message_identifier = (message.chat.id, message.message_id)
-        conversations = cast(ConversationDict, getattr(self.command_conv, "conversations"))
+        conversations = getattr(self.command_conv, "_conversations", None)
+        if conversations is None:
+            conversations = getattr(self.command_conv, "conversations")
+        conversations = cast(ConversationDict, conversations)
         conversations[cast(Tuple[int, ...], message_identifier)] = Flags.COMMAND_PENDING
         self.msg_storage[message_identifier] = commands
 

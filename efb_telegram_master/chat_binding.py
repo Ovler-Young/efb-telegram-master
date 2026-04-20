@@ -166,7 +166,10 @@ class ChatBindingManager(LocaleMixin):
 
     @staticmethod
     def _set_conversation_state(handler: ConversationHandler, key: Tuple[int, ...], state: object) -> None:
-        conversations = cast(ConversationDict, getattr(handler, "conversations"))
+        conversations = getattr(handler, "_conversations", None)
+        if conversations is None:
+            conversations = getattr(handler, "conversations")
+        conversations = cast(ConversationDict, conversations)
         conversations[key] = state
 
     def _get_bot_user(self) -> telegram.User:

@@ -9,6 +9,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -110,6 +111,11 @@ class AsyncTelegramRuntime:
             old_thread.join(timeout=5)
 
     def clear_loop(self):
+        self.logger.debug(
+            "[TRACE runtime=%s] clear_loop called\n%s",
+            id(self),
+            "".join(traceback.format_stack(limit=12)),
+        )
         with self._lock:
             self._loop = None
             self._loop_thread_id = None
@@ -175,16 +181,26 @@ class AsyncTelegramRuntime:
         return True
 
     def call(self, coroutine: Coroutine[object, object, T], timeout: Optional[float] = None) -> T:
-        if not self._ready.wait(timeout=0):
-            self.logger.debug("Telegram runtime is not ready; starting the background runtime loop.")
+        startup_wait_timeout = 2.0
+        if not self._ready.wait(timeout=startup_wait_timeout):
+            self.logger.debug(
+                "Telegram runtime is not ready after %.1fs; starting the background runtime loop.",
+                startup_wait_timeout,
+            )
             self._ensure_background_loop()
-        if self._loop is None:
+        with self._lock:
+            loop = self._loop
+            loop_thread_id = self._loop_thread_id
+        if loop is None:
             self._ensure_background_loop()
-        if self._loop is None:
+            with self._lock:
+                loop = self._loop
+                loop_thread_id = self._loop_thread_id
+        if loop is None:
             raise RuntimeError("Telegram runtime loop is unavailable.")
-        if threading.get_ident() == self._loop_thread_id:
+        if threading.get_ident() == loop_thread_id:
             raise RuntimeError("Synchronous bot wrapper invoked from the PTB event loop thread.")
-        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result(timeout)
+        return asyncio.run_coroutine_threadsafe(coroutine, loop).result(timeout)
 
 
 class SyncBotFacade:
