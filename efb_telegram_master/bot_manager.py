@@ -916,8 +916,12 @@ class TelegramBotManager(LocaleMixin):
         self.dispatcher.add_handler(
             MessageHandler(whitelist_filter, self.as_async_callback(lambda update, context: None))
         )
+        # Register update_locale in a negative group so it runs BEFORE group 0
+        # handlers and does NOT block them. PTB 22 runs one matching handler
+        # per group; group 0 is the default and is where commands live.
         self.dispatcher.add_handler(
-            TypeHandler(Update, self.as_async_callback(self.channel.update_locale))
+            TypeHandler(Update, self.as_async_callback(self.channel.update_locale)),
+            group=-1,
         )
 
     def _make_send_receipt(
