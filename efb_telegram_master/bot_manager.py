@@ -9,7 +9,6 @@ import logging
 import os
 import threading
 import time
-import traceback
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -110,13 +109,15 @@ class AsyncTelegramRuntime:
             old_loop.call_soon_threadsafe(old_loop.stop)
             old_thread.join(timeout=5)
 
-    def clear_loop(self):
-        self.logger.debug(
-            "[TRACE runtime=%s] clear_loop called\n%s",
-            id(self),
-            "".join(traceback.format_stack(limit=12)),
-        )
+    def clear_loop(self, expected_loop: Optional[asyncio.AbstractEventLoop] = None):
         with self._lock:
+            if expected_loop is not None and self._loop is not expected_loop:
+                self.logger.debug(
+                    "Skipping clear_loop for stale loop %r; runtime is bound to %r.",
+                    expected_loop,
+                    self._loop,
+                )
+                return
             self._loop = None
             self._loop_thread_id = None
             self._loop_thread = None
@@ -146,7 +147,7 @@ class AsyncTelegramRuntime:
                     if pending:
                         loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                     loop.close()
-                    self.clear_loop()
+                    self.clear_loop(loop)
 
             self._loop_thread = threading.Thread(
                 target=runner,
@@ -821,11 +822,6 @@ class TelegramBotManager(LocaleMixin):
         )
 
     async def _post_init(self, application: Application):
-        self.logger.error(
-            "[TRACE bm=%s] _post_init bound loop %r",
-            id(self),
-            asyncio.get_running_loop(),
-        )
         self._runtime.bind_loop(asyncio.get_running_loop())
         for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
             aux_bot.bind_runtime(self._runtime)
@@ -1962,13 +1958,6 @@ class TelegramBotManager(LocaleMixin):
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
-        rt = getattr(self, "_runtime", None)
-        self.logger.error(
-            "[TRACE bm=%s] graceful_stop called; manual_evt=%r runtime_ready=%r",
-            id(self),
-            getattr(self, "_manual_polling_stop_event", None),
-            rt is not None and rt._ready.is_set(),
-        )
         self.logger.info("Starting graceful shutdown...")
 
         # Log pending tasks count before stopping

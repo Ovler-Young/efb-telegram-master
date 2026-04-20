@@ -6,6 +6,7 @@ import mimetypes
 import os
 import time
 import gettext
+import shlex
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
@@ -402,13 +403,14 @@ class TelegramChannel(MasterChannel):
         assert isinstance(update, Update)
         assert isinstance(update.effective_message, telegram.Message)
         assert isinstance(update.effective_chat, telegram.Chat)
-        if context.args:  # Group binding command
+        command_args = self._resolve_command_args(update.effective_message.text, context.args)
+        if command_args:  # Group binding command
             forwarded_chat = get_forwarded_chat(update.effective_message)
             if (update.effective_message.chat.type != ChatType.PRIVATE and update.effective_chat.id != self.topic_group) or \
                     (forwarded_chat and
                      forwarded_chat.type == ChatType.CHANNEL and
                      forwarded_chat.id != self.topic_group):
-                self.chat_binding.link_chat(update, context.args)
+                self.chat_binding.link_chat(update, command_args)
             else:
                 self.bot_manager.send_message(update.effective_chat.id,
                                               self._('You cannot link remote chats to here. Please try again.'))
@@ -416,6 +418,19 @@ class TelegramChannel(MasterChannel):
             txt = self._("This is EFB Telegram Master Channel.\n\n"
                          "To learn more, please visit https://etm.1a23.studio .")
             self.bot_manager.send_message(update.effective_chat.id, txt)
+
+    @staticmethod
+    def _resolve_command_args(message_text: Optional[str], parsed_args: Optional[List[str]]) -> List[str]:
+        args = list(parsed_args or [])
+        if not message_text:
+            return args
+        try:
+            raw_args = shlex.split(message_text)[1:]
+        except ValueError:
+            raw_args = message_text.split()[1:]
+        if len(raw_args) > len(args):
+            return raw_args
+        return args
 
     def react(self, update: Update, context: CallbackContext):
         """React to a message."""

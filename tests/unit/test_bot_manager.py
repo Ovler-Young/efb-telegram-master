@@ -280,6 +280,24 @@ def test_async_runtime_call_falls_back_to_background_loop_after_wait_timeout():
     future.result.assert_called_once_with(None)
 
 
+def test_async_runtime_stale_loop_clear_does_not_remove_rebound_loop():
+    runtime = AsyncTelegramRuntime(Mock())
+    current_loop = object()
+    stale_loop = object()
+
+    runtime._loop = current_loop
+    runtime._loop_thread_id = -1
+    runtime._loop_thread = Mock()
+    runtime._owns_loop_thread = False
+    runtime._ready.set()
+
+    runtime.clear_loop(stale_loop)
+
+    assert runtime._loop is current_loop
+    assert runtime._loop_thread_id == -1
+    assert runtime._ready.is_set()
+
+
 def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
     shutdown_coro = "shutdown-coro"
     shutdown_complete_event = threading.Event()

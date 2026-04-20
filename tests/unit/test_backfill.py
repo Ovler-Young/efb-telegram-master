@@ -2,8 +2,10 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import telegram
 from telegram import Update
 
+from efb_telegram_master import TelegramChannel
 from ehforwarderbot.types import ChatID
 
 from efb_telegram_master import utils
@@ -104,6 +106,34 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
     migrate_chat_history.assert_called_once()
     send_history_link.assert_not_called()
     _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_resolve_command_args_falls_back_to_raw_message_text():
+    args = TelegramChannel._resolve_command_args("/start token true", ["token"])
+
+    assert args == ["token", "true"]
+
+
+def test_start_uses_raw_message_args_for_link_chat(channel):
+    update = Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1,
+                "text": "/start token true",
+                "chat": {"id": -1001, "type": "supergroup", "title": "Test Group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Tester"},
+            },
+        },
+        channel.bot_manager._async_bot,
+    )
+    context = SimpleNamespace(args=["token"])
+
+    with patch.object(channel.chat_binding, "link_chat") as link_chat:
+        channel.start(update, context)
+
+    link_chat.assert_called_once_with(update, ["token", "true"])
 
 
 def test_migrate_chat_history_batches_text_and_forwards_media(channel):
