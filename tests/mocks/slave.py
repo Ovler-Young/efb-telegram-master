@@ -426,7 +426,8 @@ class MockSlaveChannel(SlaveChannel):
                           reactions: bool = False,
                           commands: bool = False,
                           substitution: bool = False,
-                          unsupported: bool = False) -> Message:
+                          unsupported: bool = False,
+                          text: Optional[str] = None) -> Message:
         """Send a text message to master channel.
         Leave author blank to use “self” of the chat.
 
@@ -441,7 +442,7 @@ class MockSlaveChannel(SlaveChannel):
             type=msg_type,
             target=target,
             uid=uid,
-            text=f"Content of {msg_type.name} message with ID {uid}",
+            text=text or f"Content of {msg_type.name} message with ID {uid}",
             deliver_to=coordinator.master
         )
         message = self.attach_message_properties(message, reactions, commands, substitution)

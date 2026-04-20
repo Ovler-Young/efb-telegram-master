@@ -4,6 +4,7 @@ import html
 import io
 import logging
 import re
+import shlex
 import urllib.parse
 import threading
 import time
@@ -588,8 +589,18 @@ class ChatBindingManager(LocaleMixin):
         assert update.effective_chat
         assert args
 
+        resolved_args = list(args)
+        message_text = update.effective_message.text
+        if isinstance(message_text, str) and message_text:
+            try:
+                raw_args = shlex.split(message_text)[1:]
+            except ValueError:
+                raw_args = message_text.split()[1:]
+            if len(raw_args) > len(resolved_args):
+                resolved_args = raw_args
+
         try:
-            msg_id = utils.message_id_str_to_id(TgChatMsgIDStr(utils.b64de(args[0])))
+            msg_id = utils.message_id_str_to_id(TgChatMsgIDStr(utils.b64de(resolved_args[0])))
             storage_key = (TelegramChatID(int(msg_id[0])), TelegramMessageID(int(msg_id[1])))
             data = self.msg_storage[storage_key]
         except KeyError:
@@ -619,8 +630,8 @@ class ChatBindingManager(LocaleMixin):
         #   true/on/1  -> always backfill
         #   false/off/0 -> never backfill
         backfill_override: Optional[bool] = None
-        if len(args) >= 2:
-            flag = args[1].strip().lower()
+        if len(resolved_args) >= 2:
+            flag = resolved_args[1].strip().lower()
             if flag in ("true", "on", "yes", "1"):
                 backfill_override = True
             elif flag in ("false", "off", "no", "0"):
