@@ -48,12 +48,12 @@ def test_rate_limit_peek_and_reserve():
         aux_bot = AuxiliaryBot("123:token", global_limit=3, global_window=10.0, chat_limit=3, chat_window=10.0)
 
     chat_id = 100
-    with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=100.0):
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
         assert aux_bot.peek_delay(chat_id) == 0.0
         assert aux_bot.reserve_slot(chat_id) == 0.0
         assert aux_bot.reserve_slot(chat_id) > 0.0
 
-    with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=100.0):
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
         assert aux_bot.peek_delay(chat_id) > 0.0
 
 

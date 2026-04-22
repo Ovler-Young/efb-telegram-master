@@ -1,10 +1,8 @@
 # coding=utf-8
 
-import bisect
 import logging
 import threading
 import time
-from collections import defaultdict, deque
 from collections.abc import Coroutine
 from inspect import isawaitable
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, TypeVar, cast, overload, Literal
@@ -75,14 +73,14 @@ class AuxiliaryBot:
         self._disable_reason: str = ""
         self._runtime: Optional['AsyncTelegramRuntime'] = None
 
-        # Rate limiting (same structure as TelegramBotManager)
-        self._rate_limit_lock = threading.Lock()
-        self._global_timestamps: list = []
-        self._chat_timestamps: defaultdict = defaultdict(deque)
-        self.GLOBAL_LIMIT = global_limit
-        self.GLOBAL_WINDOW = global_window
-        self.CHAT_LIMIT = chat_limit
-        self.CHAT_WINDOW = chat_window
+        # Rate limiting — delegates to shared SlidingWindowRateLimiter
+        from .rate_limiter import SlidingWindowRateLimiter
+        self._rate_limiter = SlidingWindowRateLimiter(
+            global_limit=global_limit,
+            global_window=global_window,
+            chat_limit=chat_limit,
+            chat_window=chat_window,
+        )
 
         # Membership cache: chat_id -> (is_member, timestamp)
         self._membership_cache: Dict[int, Tuple[bool, float]] = {}
@@ -157,73 +155,13 @@ class AuxiliaryBot:
             logger.error("Failed to initialize auxiliary bot: %s", e)
             return False
 
-    def _cleanup_old_timestamps(self):
-        """Remove timestamps older than the time window (called under lock)."""
-        current_time = time.time()
-        while self._global_timestamps and self._global_timestamps[0] <= current_time - self.GLOBAL_WINDOW:
-            self._global_timestamps.pop(0)
-        for _chat_id, timestamps in self._chat_timestamps.items():
-            while timestamps and timestamps[0] <= current_time - self.CHAT_WINDOW:
-                timestamps.popleft()
-
     def peek_delay(self, chat_id: int) -> float:
         """Check rate limit delay without reserving a slot. Thread-safe."""
-        with self._rate_limit_lock:
-            current_time = time.time()
-            self._cleanup_old_timestamps()
-
-            # Chat-specific check
-            chat_delay = 0.0
-            chat_timestamps = self._chat_timestamps[chat_id]
-            if len(chat_timestamps) >= self.CHAT_LIMIT - 2:
-                safe_index = len(chat_timestamps) - (self.CHAT_LIMIT - 2)
-                reference_timestamp = chat_timestamps[safe_index]
-                chat_delay = max(0.0, (reference_timestamp + self.CHAT_WINDOW) - current_time)
-
-            candidate_time = current_time + chat_delay
-
-            # Global limit check — use bisect_right for left bound so the
-            # window is half-open (left_bound, candidate_time], preventing an
-            # infinite loop when timestamps cluster on the boundary.
-            while True:
-                left_bound = candidate_time - self.GLOBAL_WINDOW
-                idx = bisect.bisect_right(self._global_timestamps, left_bound)
-                right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
-                in_window = right_idx - idx
-                if in_window < self.GLOBAL_LIMIT - 2:
-                    break
-                candidate_time = self._global_timestamps[idx] + self.GLOBAL_WINDOW
-
-            return max(0.0, candidate_time - current_time)
+        return self._rate_limiter.peek_delay(chat_id)
 
     def reserve_slot(self, chat_id: int) -> float:
         """Reserve a send slot and return the delay. Thread-safe."""
-        with self._rate_limit_lock:
-            current_time = time.time()
-            self._cleanup_old_timestamps()
-
-            chat_delay = 0.0
-            chat_timestamps = self._chat_timestamps[chat_id]
-            if len(chat_timestamps) >= self.CHAT_LIMIT - 2:
-                safe_index = len(chat_timestamps) - (self.CHAT_LIMIT - 2)
-                reference_timestamp = chat_timestamps[safe_index]
-                chat_delay = max(0.0, (reference_timestamp + self.CHAT_WINDOW) - current_time)
-
-            candidate_time = current_time + chat_delay
-
-            while True:
-                left_bound = candidate_time - self.GLOBAL_WINDOW
-                idx = bisect.bisect_right(self._global_timestamps, left_bound)
-                right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
-                in_window = right_idx - idx
-                if in_window < self.GLOBAL_LIMIT - 2:
-                    break
-                candidate_time = self._global_timestamps[idx] + self.GLOBAL_WINDOW
-
-            delay = max(0.0, candidate_time - current_time)
-            bisect.insort(self._global_timestamps, candidate_time)
-            chat_timestamps.append(candidate_time)
-            return delay
+        return self._rate_limiter.reserve_slot(chat_id)
 
     # Tri-state membership results
     MEMBERSHIP_MEMBER = True

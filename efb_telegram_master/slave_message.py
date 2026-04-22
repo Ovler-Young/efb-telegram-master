@@ -277,20 +277,21 @@ class SlaveMessageProcessor(LocaleMixin):
             else:
                 self.logger.warning("[%s] Delayed message missing task_id, cannot register database update", xid)
         else:
-            # Normal execution - log to database immediately
+            # Normal (blocking) execution — send already succeeded,
+            # hand off DB write asynchronously so the calling thread is
+            # not blocked by local I/O, and failures are retried instead
+            # of silently dropped.
             self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
                               xid, tg_msg.chat.id, tg_msg.message_id)
 
             etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
-            etm_msg.type_telegram = get_msg_type(tg_msg)
-            etm_msg.put_telegram_file(tg_msg)
 
             # Capture sender_bot_id annotated by rate_limit_decorator
             sender_bot_id = getattr(tg_msg, 'sender_bot_id', None)
 
-            self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id,
-                                              sender_bot_id=sender_bot_id)
-            # self.logger.debug("[%s] Message inserted/updated to the database.", xid)
+            self.bot.submit_async_db_write(
+                etm_msg, tg_msg, old_msg_id, sender_bot_id=sender_bot_id,
+            )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
         """Get the Telegram destination of a message with its header.

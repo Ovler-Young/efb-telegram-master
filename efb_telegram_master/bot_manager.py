@@ -1,15 +1,12 @@
 # coding=utf-8
 import asyncio
-import bisect
 import collections
-import heapq
 import html
 import io
 import logging
 import os
 import threading
 import time
-from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -43,6 +40,7 @@ class DelayedTask(NamedTuple):
     args: tuple        # Function arguments
     kwargs: dict       # Function keyword arguments
     task_id: str       # Unique task identifier
+    arrival_seq: int = 0  # Monotonic arrival order; preserved across requeues
     cleanup_files: list = []  # Files to delete after task completes
 
 if TYPE_CHECKING:
@@ -311,13 +309,9 @@ class TelegramBotManager(LocaleMixin):
     dispatcher: Application
     bot_pool: Optional['BotPool']
     _delayed_worker_stop: threading.Event
-    _delayed_queue_lock: threading.Lock
-    _delayed_queue: List[Tuple[float, int, 'DelayedTask']]
+    _chat_queues_lock: threading.Lock
     _cleanup_tls: threading.local
     _tls: threading.local
-    _rate_limit_lock: threading.Lock
-    _global_timestamps: list[float]
-    _chat_timestamps: 'defaultdict[int, Deque[float]]'
     _aux_recent_use: dict[int, float]
 
     class Decorators:
@@ -431,18 +425,10 @@ class TelegramBotManager(LocaleMixin):
 
                 # Get recent timestamps for debugging
                 def get_timestamp_info():
-                    if not (chat_id and hasattr(self, '_chat_timestamps') and hasattr(self, '_global_timestamps')):
+                    if not (chat_id and hasattr(self, '_rate_limiter')):
                         return ""
-
-                    current_time = time.time()
-                    chat_timestamps = list(self._chat_timestamps.get(chat_id, []))
-                    global_timestamps = self._global_timestamps
-
-                    # Format recent timestamps relative to current time
-                    chat_info = [f"{ts - current_time:.3f}s" for ts in chat_timestamps]
-                    global_info = [f"{ts - current_time:.3f}s" for ts in global_timestamps]
-
-                    return f" [chat_recent: {chat_info}, global_recent: {global_info}]"
+                    chat_count, global_count = self._rate_limiter.get_counts(chat_id)
+                    return f" [chat: {chat_count}/{self.CHAT_LIMIT}, global: {global_count}/{self.GLOBAL_LIMIT}]"
 
                 for attempt in range(max_retries + 1):
                     try:
@@ -481,9 +467,6 @@ class TelegramBotManager(LocaleMixin):
 
                             delay = 60
                             cls.logger.warning(f"Rate limit detected, waiting {delay}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
-                            if chat_id and hasattr(self, '_chat_timestamps'):
-                                for timestamp in self._chat_timestamps[chat_id]:
-                                    timestamp += delay
 
                             # Use interruptible sleep for rate limit waits
                             if hasattr(self, '_delayed_worker_stop'):
@@ -578,8 +561,8 @@ class TelegramBotManager(LocaleMixin):
 
             @wraps(fn)
             def skip_wrapper(self: 'TelegramBotManager', *args, **kwargs):
-                with self._delayed_queue_lock:
-                    if self._delayed_queue:
+                with self._chat_queues_lock:
+                    if any(self._chat_queues.values()) or self._chat_in_flight:
                         return None
 
                 # Suppress when aux bots were recently used for this chat
@@ -666,16 +649,18 @@ class TelegramBotManager(LocaleMixin):
         self.admins = config['admins']
         self.dispatcher = self.application
 
-        # Initialize sliding window rate limiting
-        self._rate_limit_lock = threading.Lock()
-        self._global_timestamps: list[float] = []  # Sorted list for global timestamps
-        self._chat_timestamps: defaultdict[int, Deque[float]] = defaultdict(deque)
-
-        # Rate limits based on Telegram API documentation
+        # Initialize sliding window rate limiting — shared implementation
+        from .rate_limiter import SlidingWindowRateLimiter
         self.GLOBAL_LIMIT = 30    # messages per second
         self.GLOBAL_WINDOW = 1.0
         self.CHAT_LIMIT = 20      # messages per minute per chat
         self.CHAT_WINDOW = 60.0
+        self._rate_limiter = SlidingWindowRateLimiter(
+            global_limit=self.GLOBAL_LIMIT,
+            global_window=self.GLOBAL_WINDOW,
+            chat_limit=self.CHAT_LIMIT,
+            chat_window=self.CHAT_WINDOW,
+        )
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
         self._tls = threading.local()  # Thread-local for bot override (_active_bot)
@@ -691,14 +676,47 @@ class TelegramBotManager(LocaleMixin):
             self._init_bot_pool(aux_configs, config, channel)
         self.logger.debug("Bot pool initialization complete...")
 
-        # Initialize delayed message queue system
-        self._delayed_queue: List[Tuple[float, int, DelayedTask]] = []
-        self._delayed_queue_lock = threading.Lock()
-        self._task_counter = 0  # Counter for tie-breaking in heapq
+        # ── Outbound send pipeline ────────────────────────────────────
+        # Per-chat FIFO queues + thread pool for concurrent dispatch.
+        # Same chat_id: sends are serial (ordering guarantee).
+        # Different chat_ids: sends run in parallel threads.
+        from collections import deque as _deque
+        from concurrent.futures import ThreadPoolExecutor, Future
+
+        self._chat_queues: dict[int, _deque[DelayedTask]] = {}
+        self._chat_queues_lock = threading.Lock()
+        self._tasks_scheduled = 0  # monotonic counter for diagnostics
         self._delayed_worker_stop = threading.Event()
-        self._pending_delayed_logs: dict[str, tuple] = {}  # Store pending database updates: task_id -> (etm_msg, old_msg_id)
-        self._completed_delayed_results: dict[str, tuple[TelegramMessage, Optional[str]]] = {}
+
+        # Per-chat concurrency tracking
+        self._chat_in_flight: dict[int, tuple] = {}  # chat_id -> (Future, task, sender_bot_id)
+        self._chat_frozen_until: dict[int, float] = {}  # chat_id -> when ALL bots are rate-limited
+        self._bot_chat_frozen_until: dict[tuple, float] = {}  # (bot_id|None, chat_id) -> RetryAfter deadline
+
+        # Per-chat send interval (200ms safety gap)
+        self._last_send_by_chat: dict[int, float] = {}
+        self.CHAT_SEND_INTERVAL = 0.2  # seconds
+
+        # Thread pool for non-blocking sends
+        self._send_executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="ETM-send",
+        )
+
+        # Rendezvous dicts for delayed DB updates — with timestamps for TTL cleanup
+        # task_id -> (etm_msg, old_msg_id, registered_at)
+        self._pending_delayed_logs: dict[str, tuple] = {}
+        # task_id -> (real_tg_msg, sender_bot_id, completed_at)
+        self._completed_delayed_results: dict[str, tuple] = {}
         self._pending_logs_lock = threading.Lock()
+        self._rendezvous_ttl = 600.0          # 10 minutes
+        self._rendezvous_cleanup_interval = 300.0  # 5 minutes
+        self._last_rendezvous_cleanup = time.time()
+
+        # DB write retry queue
+        self._db_retry_queue: list[tuple] = []
+        self._db_retry_lock = threading.Lock()
+        self._db_max_retries = 5
+
         self._delayed_worker_thread = threading.Thread(
             target=self._delayed_message_worker,
             name="ETM delayed messages worker",
@@ -979,20 +997,56 @@ class TelegramBotManager(LocaleMixin):
                 return aux_bot.bot, str(aux_bot.bot_id), aux_delay
         return self._bot, None, main_delay
 
+    def _select_unfrozen_sender(self, chat_id: int, *, has_callback: bool = False, now: float = 0.0):
+        """Like _select_sender, but skips bots frozen by Telegram RetryAfter.
+
+        Returns (bot, bot_id, delay) or (None, None, soonest_unfreeze_delay)
+        when every candidate is frozen.
+        """
+        now = now or time.time()
+
+        # ── Try aux bots first (skip frozen ones) ──
+        if self.bot_pool and not has_callback:
+            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+            max_delay = main_delay if main_delay > 0 else 0.0
+
+            for aux_bot_obj in self.bot_pool.bots:
+                if aux_bot_obj.disabled:
+                    continue
+                bot_id_str = str(aux_bot_obj.bot_id)
+                frozen_until = self._bot_chat_frozen_until.get((bot_id_str, chat_id), 0.0)
+                if frozen_until > now:
+                    continue  # this aux bot is RetryAfter-frozen for this chat
+                delay = aux_bot_obj.peek_delay(chat_id)
+                if delay < max_delay or max_delay == 0.0:
+                    aux_bot_obj.reserve_slot(chat_id)
+                    return aux_bot_obj.bot, bot_id_str, delay
+
+        # ── Try main bot ──
+        main_frozen = self._bot_chat_frozen_until.get((None, chat_id), 0.0)
+        if main_frozen <= now:
+            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+            if main_delay <= 0:
+                self._calculate_rate_limit_delay(chat_id)  # reserve
+                return self._bot, None, 0.0
+            # Main bot available but rate-limited — return its delay
+            return self._bot, None, main_delay
+
+        # ── All bots frozen ──
+        # Find earliest unfreeze time so the caller knows when to retry
+        soonest = float('inf')
+        for key, until in self._bot_chat_frozen_until.items():
+            if key[1] == chat_id and until > now:
+                soonest = min(soonest, until - now)
+        return None, None, soonest if soonest != float('inf') else 0.5
+
     def _requeue_delayed_task(self, task: DelayedTask, delay_time: float):
-        execute_time = time.time() + delay_time
-        updated_task = DelayedTask(
-            execute_time=execute_time,
-            chat_id=task.chat_id,
-            function=task.function,
-            args=task.args,
-            kwargs=task.kwargs,
-            task_id=task.task_id,
-            cleanup_files=task.cleanup_files,
-        )
-        with self._delayed_queue_lock:
-            heapq.heappush(self._delayed_queue, (execute_time, self._task_counter, updated_task))
-            self._task_counter += 1
+        """Put a task back at the front of its chat queue and freeze that chat."""
+        with self._chat_queues_lock:
+            q = self._chat_queues.setdefault(task.chat_id, collections.deque())
+            q.appendleft(task)
+        if delay_time > 0:
+            self._chat_frozen_until[task.chat_id] = time.time() + delay_time
 
     def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
         """Initialize the auxiliary bot pool from config."""
@@ -1111,82 +1165,34 @@ class TelegramBotManager(LocaleMixin):
         self._calculate_rate_limit_delay(chat_id)
         return send_callable(_bypass_rate_limit=True)
 
-    def _cleanup_old_timestamps(self):
-        """Remove timestamps older than the time window."""
-        current_time = time.time()
-        # global rate limit
-        while self._global_timestamps and self._global_timestamps[0] <= current_time - self.GLOBAL_WINDOW:
-            self._global_timestamps.pop(0)
-
-        # chat-specific rate limit
-        for chat_id, timestamps in self._chat_timestamps.items():
-            while timestamps and timestamps[0] <= current_time - self.CHAT_WINDOW:
-                timestamps.popleft()
-
     def _calculate_rate_limit_delay(self, chat_id: int, peek_only: bool = False):
         """
-        Calculate rate limiting delay using sliding window algorithm.
+        Calculate rate limiting delay using the shared sliding window limiter.
 
         Args:
             chat_id: Telegram chat ID
-            peek_only: If True, compute delay without reserving a slot
-                (no insort/append). Used to check main-bot availability
-                before committing to a pool decision.
+            peek_only: If True, compute delay without reserving a slot.
 
         Returns:
-            tuple: (delay_time, chat_count, global_count) - delay in seconds, current queue counts
+            tuple: (delay_time, chat_count, global_count)
         """
-        sleep_time = 0.0
-
-        with self._rate_limit_lock:
-            current_time = time.time()
-            self._cleanup_old_timestamps()
-
-            # --------------------------------------------------
-            # Chat-specific rate limit (FIFO – per-chat window)
-            # --------------------------------------------------
-            chat_delay = 0.0
-            chat_timestamps = self._chat_timestamps[chat_id]
-            if len(chat_timestamps) >= self.CHAT_LIMIT - 2:
-                safe_index = len(chat_timestamps) - (self.CHAT_LIMIT - 2)
-                reference_timestamp = chat_timestamps[safe_index]
-                chat_delay = max(0.0, (reference_timestamp + self.CHAT_WINDOW) - current_time)
-
-            # Earliest candidate time that satisfies chat limit
-            candidate_time = current_time + chat_delay
-
-            # --------------------------------------------------
-            # Global limit – find the first slot that fits
-            # --------------------------------------------------
-            scan_count = 0
-            while True:
-                left_bound = candidate_time - self.GLOBAL_WINDOW
-                idx = bisect.bisect_right(self._global_timestamps, left_bound)
-                right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
-                in_window = right_idx - idx
-                if in_window < self.GLOBAL_LIMIT - 2:
-                    break
-                candidate_time = self._global_timestamps[idx] + self.GLOBAL_WINDOW
-                scan_count += 1
-
-            sleep_time = max(0.0, candidate_time - current_time)
-
-            if not peek_only:
-                # Record the scheduled time in both queues
-                bisect.insort(self._global_timestamps, candidate_time)
-                chat_timestamps.append(candidate_time)
-
-            chat_count = len(chat_timestamps)
-            global_count = len(self._global_timestamps)
-
-        # Log rate limiting status but don't sleep
-        if sleep_time > 0:
-            self.logger.info(f"Rate limit reached, need to delay {sleep_time:.2f}s for chat {chat_id}. "
-                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {right_idx}/{self.GLOBAL_LIMIT}, Scan count: {scan_count}")
-
+        if peek_only:
+            sleep_time = self._rate_limiter.peek_delay(chat_id)
         else:
-            self.logger.debug(f"Rate limit not reached for chat {chat_id}. "
-                           f"Chat: {chat_count}/{self.CHAT_LIMIT}, Global: {right_idx}/{self.GLOBAL_LIMIT}, Scan count: {scan_count}")
+            sleep_time = self._rate_limiter.reserve_slot(chat_id)
+
+        chat_count, global_count = self._rate_limiter.get_counts(chat_id)
+
+        if sleep_time > 0:
+            self.logger.info(
+                "Rate limit reached, need to delay %.2fs for chat %d. Chat: %d/%d, Global: %d/%d",
+                sleep_time, chat_id, chat_count, self.CHAT_LIMIT, global_count, self.GLOBAL_LIMIT,
+            )
+        else:
+            self.logger.debug(
+                "Rate limit not reached for chat %d. Chat: %d/%d, Global: %d/%d",
+                chat_id, chat_count, self.CHAT_LIMIT, global_count, self.GLOBAL_LIMIT,
+            )
 
         return sleep_time, chat_count, global_count
 
@@ -1216,24 +1222,11 @@ class TelegramBotManager(LocaleMixin):
 
     def _schedule_delayed_task(self, chat_id: int, delay_time: float, function: Callable,
                               args: tuple, kwargs: dict, cleanup_files: Optional[list] = None) -> str:
-        """
-        Schedule a task for delayed execution.
-
-        Args:
-            chat_id: Telegram chat ID
-            delay_time: Delay in seconds
-            function: Function to execute
-            args: Function arguments
-            kwargs: Function keyword arguments
-
-        Returns:
-            Task ID for tracking
-        """
-        execute_time = time.time() + delay_time
-        task_id = f"{chat_id}_{str(time.time_ns() + delay_time * 1_000_000_000)}_{id(function)}"
+        """Append a task to the per-chat FIFO queue."""
+        task_id = f"{chat_id}_{str(time.time_ns())}_{id(function)}"
 
         task = DelayedTask(
-            execute_time=execute_time,
+            execute_time=time.time() + delay_time,
             chat_id=chat_id,
             function=function,
             args=args,
@@ -1242,121 +1235,202 @@ class TelegramBotManager(LocaleMixin):
             cleanup_files=cleanup_files or []
         )
 
-        with self._delayed_queue_lock:
-            heapq.heappush(self._delayed_queue, (execute_time, self._task_counter, task))
-            self._task_counter += 1
+        with self._chat_queues_lock:
+            q = self._chat_queues.setdefault(chat_id, collections.deque())
+            q.append(task)
+            self._tasks_scheduled += 1
+
+        if delay_time > 0:
+            self._chat_frozen_until[chat_id] = max(
+                self._chat_frozen_until.get(chat_id, 0.0),
+                time.time() + delay_time,
+            )
 
         self.logger.debug(f"Scheduled delayed task {task_id} for chat {chat_id} in {delay_time:.2f}s")
         return task_id
 
+    # ── Async-dispatch delayed message worker ──────────────────────
+
     def _delayed_message_worker(self):
-        """
-        Worker thread that processes delayed messages.
+        """Worker thread: dispatch sends to a thread pool.
+
+        Same chat_id → serial (one in-flight at a time, preserves order).
+        Different chat_ids → parallel (thread pool).
+        The worker thread itself never blocks on HTTP; it only orchestrates.
         """
         self.logger.debug("Delayed message worker started")
 
         while not self._delayed_worker_stop.is_set():
             try:
-                current_time = time.time()
-                tasks_to_execute = []
+                now = time.time()
 
-                # Check for tasks ready to execute
-                with self._delayed_queue_lock:
-                    while self._delayed_queue and self._delayed_queue[0][0] <= current_time:
-                        _, _, task = heapq.heappop(self._delayed_queue)
-                        tasks_to_execute.append(task)
+                # ── 1. Harvest completed sends ──
+                self._harvest_completed_sends()
 
-                # Execute ready tasks outside of lock
-                for task in tasks_to_execute:
-                    # Check if we should stop before executing each task
+                # ── 2. Dispatch ready tasks ──
+                with self._chat_queues_lock:
+                    dispatchable_chats = [
+                        cid for cid, q in self._chat_queues.items()
+                        if q and cid not in self._chat_in_flight
+                    ]
+
+                for chat_id in dispatchable_chats:
                     if self._delayed_worker_stop.is_set():
                         break
 
-                    should_cleanup = True
-                    sender_bot_id: Optional[str] = None
-                    try:
-                        self.logger.debug(f"Executing delayed task {task.task_id} for chat {task.chat_id}")
+                    # Frozen (RetryAfter / rate limit)?
+                    if self._chat_frozen_until.get(chat_id, 0.0) > now:
+                        continue
 
-                        sender_bot, sender_bot_id, delay_time = self._select_sender(
-                            task.chat_id,
-                            has_callback=_has_callback_keyboard(task.kwargs.get('reply_markup')),
-                        )
-                        if sender_bot_id is None and delay_time <= 0:
-                            delay_time, _, _ = self._calculate_rate_limit_delay(task.chat_id)
-                        if delay_time > 0:
-                            should_cleanup = False
-                            self._requeue_delayed_task(task, delay_time)
+                    # Per-chat 200ms interval
+                    last_sent = self._last_send_by_chat.get(chat_id, 0.0)
+                    if now - last_sent < self.CHAT_SEND_INTERVAL:
+                        continue
+
+                    # Peek at front task
+                    with self._chat_queues_lock:
+                        q = self._chat_queues.get(chat_id)
+                        if not q:
                             continue
+                        task = q[0]
+                        if task.execute_time > now:
+                            continue
+                        task = q.popleft()
 
-                        with self._using_bot(sender_bot):
-                            result = task.function(*task.args, **task.kwargs)
-                        if sender_bot_id is not None:
-                            self._record_aux_use(task.chat_id)
-                        self.logger.debug(f"Delayed task {task.task_id} completed successfully")
+                    # Select sender, skipping (bot, chat) pairs frozen by RetryAfter
+                    sender_bot, sender_bot_id, delay_time = self._select_unfrozen_sender(
+                        task.chat_id,
+                        has_callback=_has_callback_keyboard(task.kwargs.get('reply_markup')),
+                        now=now,
+                    )
+                    if sender_bot is None:
+                        # Every bot is frozen or rate-limited for this chat — put task back
+                        self._requeue_delayed_task(task, delay_time if delay_time > 0 else 0.5)
+                        continue
+                    if delay_time > 0:
+                        self._requeue_delayed_task(task, delay_time)
+                        continue
 
-                        # Handle database update for delayed execution
-                        if result and hasattr(result, 'message_id'):
-                            self._handle_delayed_database_update(task.task_id, result, sender_bot_id=sender_bot_id)
+                    # Submit to thread pool — non-blocking
+                    self._dispatch_send(task, sender_bot, sender_bot_id)
 
-                    except telegram.error.RetryAfter as e:
-                        should_cleanup = False
-                        retry_after_value = e.retry_after
-                        retry_after = (
-                            retry_after_value.total_seconds()
-                            if isinstance(retry_after_value, timedelta)
-                            else float(retry_after_value)
-                        )
-                        self.logger.warning(
-                            "Rate limit hit while executing delayed task %s, retrying in %.2fs",
-                            task.task_id,
-                            retry_after,
-                        )
-                        self._requeue_delayed_task(task, retry_after)
-                    except (telegram.error.TimedOut, telegram.error.NetworkError) as e:
-                        should_cleanup = False
-                        self.logger.warning(
-                            "Transient error while executing delayed task %s, retrying: %s",
-                            task.task_id,
-                            e,
-                        )
-                        self._requeue_delayed_task(task, 1.0)
-                    except telegram.error.Forbidden as e:
-                        if sender_bot_id and self.bot_pool:
-                            aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
-                            if aux_bot:
-                                aux_bot.mark_disabled("Forbidden during delayed task execution")
-                                self._notify_admin_disabled_bot(aux_bot)
-                                should_cleanup = False
-                                self.logger.warning(
-                                    "Aux bot %s failed delayed task %s with Forbidden, retrying with sender reselection.",
-                                    sender_bot_id,
-                                    task.task_id,
-                                )
-                                self._requeue_delayed_task(task, 0.0)
-                                continue
-                        self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
-                    except Exception as e:
-                        self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
-                    finally:
-                        if should_cleanup:
-                            # Clean up temp files associated with this delayed task
-                            for path in task.cleanup_files:
-                                try:
-                                    os.unlink(path)
-                                    self.logger.debug("Cleaned up delayed task temp file: %s", path)
-                                except OSError as e:
-                                    self.logger.warning("Failed to clean up delayed task temp file %s: %s", path, e)
+                # ── 3. Housekeeping ──
+                self._process_db_retry_queue()
 
-                # Use event wait with timeout instead of sleep for faster shutdown response
-                if not self._delayed_worker_stop.wait(timeout=0.1):
-                    continue
+                # Purge expired freeze entries
+                if self._bot_chat_frozen_until:
+                    expired = [k for k, v in self._bot_chat_frozen_until.items() if v <= now]
+                    for k in expired:
+                        del self._bot_chat_frozen_until[k]
+                if self._chat_frozen_until:
+                    expired = [k for k, v in self._chat_frozen_until.items() if v <= now]
+                    for k in expired:
+                        del self._chat_frozen_until[k]
+
+                if now - self._last_rendezvous_cleanup > self._rendezvous_cleanup_interval:
+                    self._cleanup_stale_rendezvous()
+                    self._last_rendezvous_cleanup = now
+
+                self._delayed_worker_stop.wait(timeout=0.05)
 
             except Exception as e:
                 self.logger.exception(f"Error in delayed message worker: {e}")
-                # Use event wait with timeout for error cases too
                 self._delayed_worker_stop.wait(timeout=1)
 
+        # Shutdown: wait for in-flight sends to finish
+        for chat_id, (future, task, _bot_id) in list(self._chat_in_flight.items()):
+            try:
+                future.result(timeout=10)
+            except Exception:
+                pass
+        self._send_executor.shutdown(wait=False)
         self.logger.debug("Delayed message worker stopped")
+
+    def _dispatch_send(self, task: DelayedTask, sender_bot, sender_bot_id: Optional[str]):
+        """Submit a send operation to the thread pool."""
+
+        def _do_send():
+            with self._using_bot(sender_bot):
+                return task.function(*task.args, **task.kwargs)
+
+        future = self._send_executor.submit(_do_send)
+        self._chat_in_flight[task.chat_id] = (future, task, sender_bot_id)
+
+    def _harvest_completed_sends(self):
+        """Check all in-flight futures; handle success / errors."""
+        completed = [(cid, ft) for cid, ft in self._chat_in_flight.items() if ft[0].done()]
+
+        for chat_id, (future, task, sender_bot_id) in completed:
+            del self._chat_in_flight[chat_id]
+            should_cleanup = True
+
+            try:
+                result = future.result()  # already done, won't block
+
+                if sender_bot_id is not None:
+                    self._record_aux_use(task.chat_id)
+
+                self._last_send_by_chat[task.chat_id] = time.time()
+                self.logger.debug(f"Delayed task {task.task_id} completed successfully")
+
+                if result and hasattr(result, 'message_id'):
+                    self._handle_delayed_database_update(
+                        task.task_id, result, sender_bot_id=sender_bot_id,
+                    )
+
+            except telegram.error.RetryAfter as e:
+                should_cleanup = False
+                retry_after_value = e.retry_after
+                retry_after = (
+                    retry_after_value.total_seconds()
+                    if isinstance(retry_after_value, timedelta)
+                    else float(retry_after_value)
+                )
+                self.logger.warning(
+                    "RetryAfter for bot %s in chat %d (task %s): %.2fs — other bots can still send",
+                    sender_bot_id or "main", chat_id, task.task_id, retry_after,
+                )
+                # Freeze only THIS bot for THIS chat; other bots remain available
+                self._bot_chat_frozen_until[(sender_bot_id, chat_id)] = time.time() + retry_after
+                # Put task back at front — next dispatch will try a different bot
+                with self._chat_queues_lock:
+                    q = self._chat_queues.setdefault(chat_id, collections.deque())
+                    q.appendleft(task)
+
+            except (telegram.error.TimedOut, telegram.error.NetworkError) as e:
+                should_cleanup = False
+                self.logger.warning(
+                    "Transient error for delayed task %s, retrying: %s",
+                    task.task_id, e,
+                )
+                self._requeue_delayed_task(task, 1.0)
+
+            except telegram.error.Forbidden as e:
+                if sender_bot_id and self.bot_pool:
+                    aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
+                    if aux_bot:
+                        aux_bot.mark_disabled("Forbidden during delayed task execution")
+                        self._notify_admin_disabled_bot(aux_bot)
+                        should_cleanup = False
+                        self.logger.warning(
+                            "Aux bot %s failed task %s with Forbidden, retrying.",
+                            sender_bot_id, task.task_id,
+                        )
+                        self._requeue_delayed_task(task, 0.0)
+                        continue
+                self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
+
+            except Exception as e:
+                self.logger.exception(f"Error executing delayed task {task.task_id}: {e}")
+
+            finally:
+                if should_cleanup:
+                    for path in task.cleanup_files:
+                        try:
+                            os.unlink(path)
+                            self.logger.debug("Cleaned up delayed task temp file: %s", path)
+                        except OSError as e:
+                            self.logger.warning("Failed to clean up temp file %s: %s", path, e)
 
     def _finalize_delayed_database_update(
         self,
@@ -1366,13 +1440,121 @@ class TelegramBotManager(LocaleMixin):
         *,
         sender_bot_id: Optional[str] = None,
     ):
-        etm_msg.type_telegram = get_msg_type(real_tg_msg)
-        etm_msg.put_telegram_file(real_tg_msg)
-        self.channel.db.add_or_update_message_log(
-            etm_msg,
-            real_tg_msg,
-            old_msg_id,
-            sender_bot_id=sender_bot_id,
+        """Write the send result to the database.
+
+        On failure the write is pushed to a retry queue instead of being
+        silently dropped — a lost mapping would cause subsequent edits /
+        deletes to create duplicate messages.
+        """
+        try:
+            etm_msg.type_telegram = get_msg_type(real_tg_msg)
+            etm_msg.put_telegram_file(real_tg_msg)
+            self.channel.db.add_or_update_message_log(
+                etm_msg,
+                real_tg_msg,
+                old_msg_id,
+                sender_bot_id=sender_bot_id,
+            )
+        except Exception as e:
+            self.logger.warning(
+                "DB write failed for tg_msg %s, queuing for retry: %s",
+                getattr(real_tg_msg, 'message_id', '?'),
+                e,
+            )
+            self._enqueue_db_retry(etm_msg, old_msg_id, real_tg_msg, sender_bot_id)
+
+    def _enqueue_db_retry(self, etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt: int = 0):
+        """Push a failed DB write into the retry queue with exponential back-off."""
+        next_retry_at = time.time() + min(2 ** attempt, 30)  # cap at 30 s
+        with self._db_retry_lock:
+            self._db_retry_queue.append(
+                (etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt + 1, next_retry_at)
+            )
+
+    def _process_db_retry_queue(self):
+        """Process pending DB-write retries.  Called from the worker loop."""
+        if not self._db_retry_queue:
+            return
+
+        current_time = time.time()
+        still_pending: list[tuple] = []
+
+        with self._db_retry_lock:
+            items = self._db_retry_queue[:]
+            self._db_retry_queue.clear()
+
+        for etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt, next_retry_at in items:
+            if current_time < next_retry_at:
+                still_pending.append((etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt, next_retry_at))
+                continue
+            try:
+                self.channel.db.add_or_update_message_log(
+                    etm_msg,
+                    real_tg_msg,
+                    old_msg_id,
+                    sender_bot_id=sender_bot_id,
+                )
+                self.logger.info(
+                    "DB retry succeeded for tg_msg %s (attempt %d)",
+                    getattr(real_tg_msg, 'message_id', '?'),
+                    attempt,
+                )
+            except Exception as e:
+                if attempt >= self._db_max_retries:
+                    self.logger.error(
+                        "DB write permanently failed after %d attempts for tg_msg %s: %s",
+                        attempt,
+                        getattr(real_tg_msg, 'message_id', '?'),
+                        e,
+                    )
+                else:
+                    self.logger.warning(
+                        "DB retry %d failed for tg_msg %s, will retry: %s",
+                        attempt,
+                        getattr(real_tg_msg, 'message_id', '?'),
+                        e,
+                    )
+                    self._enqueue_db_retry(etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt)
+
+        if still_pending:
+            with self._db_retry_lock:
+                self._db_retry_queue.extend(still_pending)
+
+    def _cleanup_stale_rendezvous(self):
+        """Remove rendezvous entries that were never paired within the TTL."""
+        cutoff = time.time() - self._rendezvous_ttl
+        with self._pending_logs_lock:
+            stale_logs = [
+                tid for tid, entry in self._pending_delayed_logs.items()
+                if len(entry) >= 3 and entry[2] < cutoff
+            ]
+            for tid in stale_logs:
+                del self._pending_delayed_logs[tid]
+                self.logger.warning("Rendezvous TTL: dropped stale pending log for task %s", tid)
+
+            stale_results = [
+                tid for tid, entry in self._completed_delayed_results.items()
+                if len(entry) >= 3 and entry[2] < cutoff
+            ]
+            for tid in stale_results:
+                del self._completed_delayed_results[tid]
+                self.logger.warning("Rendezvous TTL: dropped stale completed result for task %s", tid)
+
+    def submit_async_db_write(
+        self,
+        etm_msg,
+        real_tg_msg: TelegramMessage,
+        old_msg_id=None,
+        *,
+        sender_bot_id: Optional[str] = None,
+    ):
+        """Fire-and-forget database write, usable from both blocking and eventual paths.
+
+        Failures are caught and routed to the retry queue — callers should
+        NEVER re-send to Telegram on a DB-write error.
+        """
+        self._finalize_delayed_database_update(
+            etm_msg, old_msg_id, real_tg_msg, sender_bot_id=sender_bot_id,
         )
 
     def register_delayed_database_update(self, task_id: str, etm_msg, old_msg_id=None):
@@ -1384,15 +1566,15 @@ class TelegramBotManager(LocaleMixin):
             etm_msg: ETMMsg object to log
             old_msg_id: Optional old message ID for updates
         """
-        completed_result: Optional[tuple[TelegramMessage, Optional[str]]]
+        completed_result: Optional[tuple]
         with self._pending_logs_lock:
             completed_result = self._completed_delayed_results.pop(task_id, None)
             if completed_result is None:
-                self._pending_delayed_logs[task_id] = (etm_msg, old_msg_id)
+                self._pending_delayed_logs[task_id] = (etm_msg, old_msg_id, time.time())
                 self.logger.debug(f"Registered delayed database update for task {task_id}")
                 return
 
-        real_tg_msg, sender_bot_id = completed_result
+        real_tg_msg, sender_bot_id = completed_result[0], completed_result[1]
         self.logger.debug(f"Finalizing already-completed delayed task {task_id}")
         self._finalize_delayed_database_update(
             etm_msg,
@@ -1419,11 +1601,11 @@ class TelegramBotManager(LocaleMixin):
         with self._pending_logs_lock:
             pending_update = self._pending_delayed_logs.pop(task_id, None)
             if pending_update is None:
-                self._completed_delayed_results[task_id] = (real_tg_msg, sender_bot_id)
+                self._completed_delayed_results[task_id] = (real_tg_msg, sender_bot_id, time.time())
                 self.logger.debug(f"Stored delayed result for task {task_id} until database registration is ready")
                 return
 
-        etm_msg, old_msg_id = pending_update
+        etm_msg, old_msg_id = pending_update[0], pending_update[1]
         self._finalize_delayed_database_update(
             etm_msg,
             old_msg_id,
@@ -1447,6 +1629,11 @@ class TelegramBotManager(LocaleMixin):
                 self.logger.warning("Delayed message worker did not stop gracefully within timeout")
             else:
                 self.logger.debug("Delayed message worker stopped successfully")
+
+        # Drain any remaining DB retries before shutdown
+        if hasattr(self, '_db_retry_queue') and self._db_retry_queue:
+            self.logger.info("Processing %d remaining DB retries at shutdown...", len(self._db_retry_queue))
+            self._process_db_retry_queue()
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -1958,9 +2145,10 @@ class TelegramBotManager(LocaleMixin):
 
         # Log pending tasks count before stopping
         pending_count = 0
-        if hasattr(self, '_delayed_queue'):
-            with self._delayed_queue_lock:
-                pending_count = len(self._delayed_queue)
+        if hasattr(self, '_chat_queues'):
+            with self._chat_queues_lock:
+                pending_count = sum(len(q) for q in self._chat_queues.values())
+            pending_count += len(self._chat_in_flight)
 
         if pending_count > 0:
             self.logger.info(f"Found {pending_count} pending delayed tasks")

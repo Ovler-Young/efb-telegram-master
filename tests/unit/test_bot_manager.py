@@ -304,8 +304,8 @@ def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
     shutdown_complete_event.set()
     manager = SimpleNamespace(
         logger=Mock(),
-        _delayed_queue=[("when", 0, "task")],
-        _delayed_queue_lock=threading.Lock(),
+        _chat_queues={"mock": ["task"]},
+        _chat_queues_lock=threading.Lock(), _chat_in_flight={},
         stop_delayed_worker=Mock(),
         bot_pool=SimpleNamespace(shutdown=Mock()),
         application=SimpleNamespace(stop_running=Mock()),
@@ -338,8 +338,8 @@ def test_graceful_stop_falls_back_to_direct_stop_when_runtime_loop_missing():
     shutdown_complete_event.set()
     manager = SimpleNamespace(
         logger=Mock(),
-        _delayed_queue=[],
-        _delayed_queue_lock=threading.Lock(),
+        _chat_queues={},
+        _chat_queues_lock=threading.Lock(), _chat_in_flight={},
         stop_delayed_worker=Mock(),
         bot_pool=None,
         application=SimpleNamespace(stop_running=Mock()),
@@ -376,8 +376,8 @@ def test_graceful_stop_signals_manual_event_on_event_loop_when_runtime_loop_miss
     manual_evt = SimpleNamespace(set=Mock(), _loop=manual_evt_loop)
     manager = SimpleNamespace(
         logger=Mock(),
-        _delayed_queue=[],
-        _delayed_queue_lock=threading.Lock(),
+        _chat_queues={},
+        _chat_queues_lock=threading.Lock(), _chat_in_flight={},
         stop_delayed_worker=Mock(),
         bot_pool=None,
         application=SimpleNamespace(stop_running=Mock()),
@@ -519,3 +519,245 @@ def test_run_application_lifecycle_publishes_manual_stop_event_after_post_init()
     assert ("start_polling", True) in observed
     assert ("start", True) in observed
     assert manager._manual_polling_stop_event is None
+
+# ── Tests for outbound pipeline refactoring ─────────────────────────
+
+
+# --- Per-chat FIFO ordering ---
+
+def test_schedule_appends_to_per_chat_fifo():
+    """Tasks for the same chat_id must be appended in FIFO order."""
+    import collections as _collections
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    mgr = SimpleNamespace(
+        _chat_queues={},
+        _chat_queues_lock=threading.Lock(),
+        _chat_frozen_until={},
+        _tasks_scheduled=0,
+        logger=Mock(),
+    )
+
+    TelegramBotManager._schedule_delayed_task(
+        mgr, chat_id=100, delay_time=0, function=lambda: None,
+        args=(), kwargs={}, cleanup_files=[],
+    )
+    TelegramBotManager._schedule_delayed_task(
+        mgr, chat_id=100, delay_time=0, function=lambda: None,
+        args=(), kwargs={}, cleanup_files=[],
+    )
+
+    q = mgr._chat_queues[100]
+    assert len(q) == 2
+    assert q[0].task_id != q[1].task_id  # distinct tasks
+    assert mgr._tasks_scheduled == 2
+
+
+def test_requeue_prepends_to_chat_fifo():
+    """_requeue_delayed_task must put the task at the FRONT of its chat queue."""
+    import collections as _collections
+    from efb_telegram_master.bot_manager import DelayedTask, TelegramBotManager
+
+    existing_task = DelayedTask(
+        execute_time=1.0, chat_id=100, function=lambda: "existing",
+        args=(), kwargs={}, task_id="t2",
+    )
+
+    mgr = SimpleNamespace(
+        _chat_queues={100: _collections.deque([existing_task])},
+        _chat_queues_lock=threading.Lock(),
+        _chat_frozen_until={},
+        logger=Mock(),
+    )
+
+    retry_task = DelayedTask(
+        execute_time=0.0, chat_id=100, function=lambda: "retry",
+        args=(), kwargs={}, task_id="t1",
+    )
+
+    with patch("efb_telegram_master.bot_manager.time.time", return_value=10.0):
+        TelegramBotManager._requeue_delayed_task(mgr, retry_task, 2.0)
+
+    q = mgr._chat_queues[100]
+    assert len(q) == 2
+    assert q[0].task_id == "t1"  # retry task at front
+    assert q[1].task_id == "t2"  # existing task behind it
+    assert mgr._chat_frozen_until[100] == 12.0
+
+
+def test_different_chats_dispatch_concurrently():
+    """Tasks for different chat_ids can be in-flight simultaneously."""
+    import collections as _collections
+    from concurrent.futures import Future
+    from efb_telegram_master.bot_manager import DelayedTask
+
+    # Simulate: chat 100 already has a send in-flight,
+    # chat 200 should still be dispatchable.
+    pending_future = Future()
+    in_flight = {100: (pending_future, "task", None)}
+
+    chat_queues = {
+        100: _collections.deque([DelayedTask(0, 100, lambda: None, (), {}, "t1")]),
+        200: _collections.deque([DelayedTask(0, 200, lambda: None, (), {}, "t2")]),
+    }
+
+    # chat 100 is blocked (in_flight), chat 200 is free
+    dispatchable = [cid for cid, q in chat_queues.items() if q and cid not in in_flight]
+    assert 100 not in dispatchable
+    assert 200 in dispatchable
+
+
+# --- DB retry queue ---
+
+def test_finalize_db_update_enqueues_on_failure():
+    """DB write failure must push to retry queue, not crash."""
+    from efb_telegram_master.bot_manager import TelegramBotManager
+    from efb_telegram_master.msg_type import get_msg_type
+
+    db_mock = Mock()
+    db_mock.add_or_update_message_log = Mock(side_effect=Exception("DB down"))
+
+    mgr = SimpleNamespace(
+        channel=SimpleNamespace(db=db_mock),
+        _db_retry_queue=[],
+        _db_retry_lock=threading.Lock(),
+        logger=Mock(),
+    )
+
+    etm_msg = Mock()
+    real_tg_msg = Mock()
+    real_tg_msg.message_id = 999
+
+    with patch("efb_telegram_master.bot_manager.get_msg_type", return_value="text"):
+        TelegramBotManager._finalize_delayed_database_update(
+            mgr, etm_msg, None, real_tg_msg, sender_bot_id=None,
+        )
+
+    assert len(mgr._db_retry_queue) == 1
+    entry = mgr._db_retry_queue[0]
+    assert entry[4] == 1  # attempt count
+
+
+def test_process_db_retry_queue_succeeds_on_retry():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    db_mock = Mock()
+    db_mock.add_or_update_message_log = Mock()  # succeeds now
+
+    etm_msg = Mock()
+    real_tg_msg = Mock()
+    real_tg_msg.message_id = 999
+
+    mgr = SimpleNamespace(
+        channel=SimpleNamespace(db=db_mock),
+        _db_retry_queue=[(etm_msg, None, real_tg_msg, None, 1, 0.0)],
+        _db_retry_lock=threading.Lock(),
+        _db_max_retries=5,
+        logger=Mock(),
+    )
+
+    TelegramBotManager._process_db_retry_queue(mgr)
+
+    db_mock.add_or_update_message_log.assert_called_once()
+    assert len(mgr._db_retry_queue) == 0
+
+
+def test_process_db_retry_queue_gives_up_after_max_retries():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    db_mock = Mock()
+    db_mock.add_or_update_message_log = Mock(side_effect=Exception("still down"))
+
+    etm_msg = Mock()
+    real_tg_msg = Mock()
+    real_tg_msg.message_id = 999
+
+    mgr = SimpleNamespace(
+        channel=SimpleNamespace(db=db_mock),
+        _db_retry_queue=[(etm_msg, None, real_tg_msg, None, 5, 0.0)],
+        _db_retry_lock=threading.Lock(),
+        _db_max_retries=5,
+        logger=Mock(),
+    )
+
+    TelegramBotManager._process_db_retry_queue(mgr)
+
+    # Should NOT re-enqueue — max retries exceeded
+    assert len(mgr._db_retry_queue) == 0
+    mgr.logger.error.assert_called()
+
+
+# --- Rendezvous TTL cleanup ---
+
+def test_cleanup_stale_rendezvous_removes_old_entries():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+    import time as _time
+
+    mgr = SimpleNamespace(
+        _pending_delayed_logs={"old_task": (Mock(), None, 1.0)},       # registered_at = 1.0
+        _completed_delayed_results={"old_result": (Mock(), None, 2.0)},  # completed_at = 2.0
+        _pending_logs_lock=threading.Lock(),
+        _rendezvous_ttl=600.0,
+        logger=Mock(),
+    )
+
+    with patch("efb_telegram_master.bot_manager.time.time", return_value=700.0):
+        TelegramBotManager._cleanup_stale_rendezvous(mgr)
+
+    assert "old_task" not in mgr._pending_delayed_logs
+    assert "old_result" not in mgr._completed_delayed_results
+
+
+def test_cleanup_stale_rendezvous_keeps_fresh_entries():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    mgr = SimpleNamespace(
+        _pending_delayed_logs={"fresh": (Mock(), None, 100.0)},
+        _completed_delayed_results={},
+        _pending_logs_lock=threading.Lock(),
+        _rendezvous_ttl=600.0,
+        logger=Mock(),
+    )
+
+    with patch("efb_telegram_master.bot_manager.time.time", return_value=200.0):
+        TelegramBotManager._cleanup_stale_rendezvous(mgr)
+
+    assert "fresh" in mgr._pending_delayed_logs
+
+
+# --- Rendezvous dicts store timestamps ---
+
+def test_register_delayed_database_update_stores_timestamp():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    mgr = SimpleNamespace(
+        _pending_delayed_logs={},
+        _completed_delayed_results={},
+        _pending_logs_lock=threading.Lock(),
+        logger=Mock(),
+    )
+
+    with patch("efb_telegram_master.bot_manager.time.time", return_value=42.0):
+        TelegramBotManager.register_delayed_database_update(mgr, "task-1", Mock(), None)
+
+    entry = mgr._pending_delayed_logs["task-1"]
+    assert len(entry) == 3
+    assert entry[2] == 42.0  # registered_at timestamp
+
+
+def test_handle_delayed_database_update_stores_timestamp():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    mgr = SimpleNamespace(
+        _pending_delayed_logs={},
+        _completed_delayed_results={},
+        _pending_logs_lock=threading.Lock(),
+        logger=Mock(),
+    )
+
+    with patch("efb_telegram_master.bot_manager.time.time", return_value=55.0):
+        TelegramBotManager._handle_delayed_database_update(mgr, "task-2", Mock(), sender_bot_id="bot1")
+
+    entry = mgr._completed_delayed_results["task-2"]
+    assert len(entry) == 3
+    assert entry[2] == 55.0  # completed_at timestamp
