@@ -140,7 +140,8 @@ class AuxiliaryBot:
         Returns True on success, False on failure (bot is disabled).
         """
         try:
-            me: telegram.User = cast(telegram.User, _resolve_bot_result(self.async_bot.get_me(), self._runtime))
+            validation_bot = self._create_bot()
+            me: telegram.User = cast(telegram.User, _resolve_bot_result(validation_bot.get_me(), self._runtime))
             self.bot_id = me.id
             self.username = me.username or ""
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)

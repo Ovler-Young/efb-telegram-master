@@ -8,25 +8,39 @@ from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 
 
 def test_initialize_sets_identity():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls, \
+         patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):
         bot = bot_cls.return_value
-        bot.get_me.return_value = SimpleNamespace(id=123, username="auxbot")
+        bot.get_me = Mock(return_value=SimpleNamespace(id=123, username="auxbot"))
 
         aux_bot = AuxiliaryBot("123:token")
+        assert aux_bot.initialize() is True
+        assert aux_bot.bot_id == 123
+        assert aux_bot.username == "auxbot"
+        assert aux_bot.disabled is False
 
-    assert aux_bot.initialize() is True
-    assert aux_bot.bot_id == 123
-    assert aux_bot.username == "auxbot"
-    assert aux_bot.disabled is False
+
+def test_initialize_uses_separate_validation_bot():
+    primary_bot = Mock()
+    validation_bot = Mock()
+    primary_bot.get_me = Mock()
+    validation_bot.get_me = Mock(return_value=SimpleNamespace(id=123, username="auxbot"))
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot", side_effect=[primary_bot, validation_bot]), \
+         patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):
+        aux_bot = AuxiliaryBot("123:token")
+        assert aux_bot.initialize() is True
+        primary_bot.get_me.assert_not_called()
+        validation_bot.get_me.assert_called_once_with()
 
 
 def test_initialize_disables_bot_on_forbidden():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
-        bot_cls.return_value.get_me.side_effect = telegram.error.Forbidden("bad token")
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls, \
+         patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):
+        bot_cls.return_value.get_me = Mock(side_effect=telegram.error.Forbidden("bad token"))
         aux_bot = AuxiliaryBot("123:token")
-
-    assert aux_bot.initialize() is False
-    assert aux_bot.disabled is True
+        assert aux_bot.initialize() is False
+        assert aux_bot.disabled is True
 
 
 def test_rate_limit_peek_and_reserve():

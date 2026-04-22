@@ -7,8 +7,11 @@ from typing import List, Sequence, Set
 from uuid import uuid4
 
 import pytest
-from telethon.tl.functions.messages import CreateChatRequest
-from telethon.tl.types import Chat as TelethonChat
+import telegram.error
+from telethon.errors import UserAlreadyParticipantError
+from telethon.tl.functions.channels import InviteToChannelRequest
+from telethon.tl.functions.messages import AddChatUserRequest
+from telethon.tl.types import Channel, Chat as TelethonChat
 from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
@@ -106,17 +109,33 @@ async def _wait_for_messages_with_prefix(client, chat_id: int, prefix: str, *,
     raise AssertionError(f"Timed out waiting for {minimum} migrated messages with prefix {prefix!r}")
 
 
-async def _create_temp_group(client, user_ids: Sequence[int] | int, title: str) -> int:
+async def _ensure_users_in_group(client, group_id: int, user_ids: Sequence[int] | int):
     users = [user_ids] if isinstance(user_ids, int) else list(user_ids)
-    response = await client(CreateChatRequest(users=users, title=title))
-    if getattr(response, "chats", None):
-        chat = response.chats[0]
-    elif getattr(response, "updates", None) and getattr(response.updates, "chats", None):
-        chat = response.updates.chats[0]
-    else:
-        chat = await client.get_entity(title)
+    if not users:
+        return
+
+    chat = await client.get_entity(group_id)
+    participant_ids = set()
+    async for participant in client.iter_participants(chat):
+        participant_ids.add(get_peer_id(participant))
+
+    missing_user_ids = [user_id for user_id in users if user_id not in participant_ids]
+    if not missing_user_ids:
+        return
+
+    if isinstance(chat, Channel):
+        try:
+            await client(InviteToChannelRequest(channel=chat, users=missing_user_ids))
+        except UserAlreadyParticipantError:
+            pass
+        return
+
     assert isinstance(chat, TelethonChat)
-    return get_peer_id(chat)
+    for user_id in missing_user_ids:
+        try:
+            await client(AddChatUserRequest(chat_id=chat.id, user_id=user_id, fwd_limit=0))
+        except UserAlreadyParticipantError:
+            pass
 
 
 def _start_mock_stream(slave, chat, prefix: str, *, expected_count: int = STREAM_MESSAGE_COUNT):
@@ -165,11 +184,20 @@ async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id:
     assert pool is not None
 
     working_bot_ids = []
+    statuses = []
     for aux_bot in pool.bots:
-        if await asyncio.to_thread(aux_bot.check_membership_sync, telegram_chat_id, 15.0):
+        try:
+            probe_bot = aux_bot._create_bot()
+            member = await probe_bot.get_chat_member(telegram_chat_id, aux_bot.bot_id)
+        except telegram.error.TelegramError as exc:
+            statuses.append(f"{aux_bot.bot_id}:error={type(exc).__name__}:{exc}")
+            continue
+
+        statuses.append(f"{aux_bot.bot_id}:status={member.status}")
+        if member.status in ("member", "administrator", "creator", "restricted"):
             working_bot_ids.append(aux_bot.bot_id)
 
-    return working_bot_ids
+    return working_bot_ids, statuses
 
 
 async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, *,
@@ -281,18 +309,19 @@ async def _wait_for_migrated_stream_indices(client, chat_id: int, prefix: str, e
 async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_bots, helper, client, bot_id,
                                                          bot_group, bot_topic_group, aux_bot_ids,
                                                          slave_with_auxiliary_bots):
-    # Prefer the pre-configured test group; if aux bots are not members, fall back to a temporary group.
+    if bot_topic_group is None:
+        pytest.skip("TOPIC_GROUP is required for backfill history relink coverage.")
+
     source_group_id = bot_group
-    working_aux_bot_ids = await _require_aux_membership(channel_with_auxiliary_bots, source_group_id)
+    await _ensure_users_in_group(client, source_group_id, aux_bot_ids)
+    working_aux_bot_ids, membership_statuses = await _require_aux_membership(
+        channel_with_auxiliary_bots, source_group_id
+    )
     if not working_aux_bot_ids:
-        source_group_id = await _create_temp_group(
-            client,
-            [bot_id, *aux_bot_ids],
-            f"Aux stream source {uuid4()}",
+        pytest.skip(
+            f"No auxiliary bots are members of configured test group {source_group_id}; "
+            f"probes={membership_statuses}"
         )
-        working_aux_bot_ids = await _require_aux_membership(channel_with_auxiliary_bots, source_group_id)
-        if not working_aux_bot_ids:
-            pytest.skip(f"No auxiliary bots are members of test group {source_group_id}")
 
     chat = slave_with_auxiliary_bots.chat_with_alias
     slave_uid = etm_utils.chat_id_to_str(chat=chat)
@@ -353,7 +382,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     # ---- Relink/migration checks (same stream history) ----
 
-    target_group_id = await _create_temp_group(client, bot_id, f"Backfill true {uuid4()}")
+    target_group_id = bot_topic_group
     try:
         relink_true_message = await _link_chat(client, helper, bot_id, chat.uid, target_group_id, flag="true")
         await _wait_for_migrated_stream_indices(
@@ -370,18 +399,16 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             for message in recent_messages
         ), "Relink with true should migrate history instead of sending the history-link notice."
 
-        # Relink false -> topic group, if configured (skips both migration and history-link notice).
-        if bot_topic_group is not None:
-            relink_false_message = await _link_chat(client, helper, bot_id, chat.uid, bot_topic_group, flag="false")
-            await asyncio.sleep(10)
-            recent_topic_messages = await _messages_since_id(client, bot_topic_group, relink_false_message.id)
-            assert not any(prefix in (message.raw_text or "") for message in recent_topic_messages), (
-                "Relink with false should skip migrating historical messages."
-            )
-            assert not any(
-                "History messages are not migrated" in (message.raw_text or "")
-                for message in recent_topic_messages
-            ), "Relink with false should skip both history migration and the history-link notice."
+        relink_false_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, flag="false")
+        await asyncio.sleep(10)
+        recent_source_messages = await _messages_since_id(client, source_group_id, relink_false_message.id)
+        assert not any(prefix in (message.raw_text or "") for message in recent_source_messages), (
+            "Relink with false should skip migrating historical messages."
+        )
+        assert not any(
+            "History messages are not migrated" in (message.raw_text or "")
+            for message in recent_source_messages
+        ), "Relink with false should skip both history migration and the history-link notice."
     finally:
         # Keep cached chat state consistent across tests.
         etm_chat.unlink()
