@@ -1004,28 +1004,23 @@ class TelegramBotManager(LocaleMixin):
         when every candidate is frozen.
         """
         now = now or time.time()
+        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
 
         # ── Try aux bots first (skip frozen ones) ──
         if self.bot_pool and not has_callback:
-            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
-            max_delay = main_delay if main_delay > 0 else 0.0
-
-            for aux_bot_obj in self.bot_pool.bots:
-                if aux_bot_obj.disabled:
-                    continue
-                bot_id_str = str(aux_bot_obj.bot_id)
-                frozen_until = self._bot_chat_frozen_until.get((bot_id_str, chat_id), 0.0)
-                if frozen_until > now:
-                    continue  # this aux bot is RetryAfter-frozen for this chat
-                delay = aux_bot_obj.peek_delay(chat_id)
-                if delay < max_delay or max_delay == 0.0:
-                    aux_bot_obj.reserve_slot(chat_id)
-                    return aux_bot_obj.bot, bot_id_str, delay
+            max_delay = max(main_delay, 0.01)
+            slot = self.bot_pool.acquire_send_slot(
+                chat_id,
+                max_delay=max_delay,
+                skip_bot=lambda aux_bot: self._bot_chat_frozen_until.get((str(aux_bot.bot_id), chat_id), 0.0) > now,
+            )
+            if slot is not None:
+                aux_bot_obj, aux_delay = slot
+                return aux_bot_obj.bot, str(aux_bot_obj.bot_id), aux_delay
 
         # ── Try main bot ──
         main_frozen = self._bot_chat_frozen_until.get((None, chat_id), 0.0)
         if main_frozen <= now:
-            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
             if main_delay <= 0:
                 self._calculate_rate_limit_delay(chat_id)  # reserve
                 return self._bot, None, 0.0
@@ -1461,7 +1456,9 @@ class TelegramBotManager(LocaleMixin):
                 getattr(real_tg_msg, 'message_id', '?'),
                 e,
             )
-            self._enqueue_db_retry(etm_msg, old_msg_id, real_tg_msg, sender_bot_id)
+            TelegramBotManager._enqueue_db_retry(
+                self, etm_msg, old_msg_id, real_tg_msg, sender_bot_id
+            )
 
     def _enqueue_db_retry(self, etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt: int = 0):
         """Push a failed DB write into the retry queue with exponential back-off."""
@@ -1514,7 +1511,9 @@ class TelegramBotManager(LocaleMixin):
                         getattr(real_tg_msg, 'message_id', '?'),
                         e,
                     )
-                    self._enqueue_db_retry(etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt)
+                    TelegramBotManager._enqueue_db_retry(
+                        self, etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt
+                    )
 
         if still_pending:
             with self._db_retry_lock:

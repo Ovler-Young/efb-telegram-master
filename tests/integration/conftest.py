@@ -46,7 +46,7 @@ def filter_chats(bot_id, bot_groups, bot_channels, bot_topic_group) -> Set[int]:
     return chats
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def helper_wrap(user_session, api_id, api_hash, bot_id,
                       filter_chats, aux_bot_ids) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
     loop = asyncio.get_running_loop()
@@ -172,6 +172,6 @@ def poll_bot(channel, poll_bot_factory):
     poll_bot_factory.stop(channel)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def client(helper_wrap) -> AsyncGenerator[TelegramClient, None]:
     yield helper_wrap.client

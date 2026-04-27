@@ -29,6 +29,34 @@ def test_acquire_send_slot_picks_lowest_delay_bot():
     bot_b.reserve_slot.assert_called_once_with(100)
 
 
+def test_acquire_send_slot_rotates_equal_delay_bots_per_chat():
+    bot_a = _make_aux_bot(1, delay=0.0)
+    bot_b = _make_aux_bot(2, delay=0.0)
+    pool = BotPool([bot_a, bot_b], SimpleNamespace(admins=[1], send_message=Mock()))
+
+    first = pool.acquire_send_slot(100, max_delay=1.0)
+    second = pool.acquire_send_slot(100, max_delay=1.0)
+    third = pool.acquire_send_slot(100, max_delay=1.0)
+
+    assert first == (bot_a, 0.0)
+    assert second == (bot_b, 0.0)
+    assert third == (bot_a, 0.0)
+    bot_a.reserve_slot.assert_called_with(100)
+    bot_b.reserve_slot.assert_called_once_with(100)
+
+
+def test_acquire_send_slot_skips_frozen_bots_before_selecting():
+    bot_a = _make_aux_bot(1, delay=0.0)
+    bot_b = _make_aux_bot(2, delay=0.0)
+    pool = BotPool([bot_a, bot_b], SimpleNamespace(admins=[1], send_message=Mock()))
+
+    selected = pool.acquire_send_slot(100, max_delay=1.0, skip_bot=lambda bot: bot.bot_id == 1)
+
+    assert selected == (bot_b, 0.0)
+    bot_a.reserve_slot.assert_not_called()
+    bot_b.reserve_slot.assert_called_once_with(100)
+
+
 def test_acquire_send_slot_skips_disabled_and_respects_max_delay():
     disabled_bot = _make_aux_bot(1, disabled=True, delay=0.0)
     slow_bot = _make_aux_bot(2, delay=5.0)

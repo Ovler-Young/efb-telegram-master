@@ -3,7 +3,7 @@
 import logging
 import threading
 import time
-from typing import Optional, List, Dict, Tuple, TYPE_CHECKING
+from typing import Optional, List, Dict, Tuple, TYPE_CHECKING, Callable
 
 from .auxiliary_bot import AuxiliaryBot
 
@@ -28,6 +28,7 @@ class BotPool:
         self._bot_by_id: Dict[int, AuxiliaryBot] = {b.bot_id: b for b in aux_bots}
         self._bot_manager = bot_manager
         self._pool_lock = threading.Lock()
+        self._round_robin_cursor_by_chat: Dict[int, int] = {}
 
         # One notification per chat per process lifetime
         self._notified_chats: set = set()
@@ -47,7 +48,24 @@ class BotPool:
         except (TypeError, ValueError):
             return None
 
-    def acquire_send_slot(self, chat_id: int, max_delay: float = float('inf')
+    def _ordered_bots_for_chat(self, chat_id: int) -> List[AuxiliaryBot]:
+        """Return bots in a chat-specific round-robin order."""
+        if not self._bots:
+            return []
+
+        start = self._round_robin_cursor_by_chat.get(chat_id, 0) % len(self._bots)
+        return self._bots[start:] + self._bots[:start]
+
+    def _advance_round_robin_cursor(self, chat_id: int, selected_bot: AuxiliaryBot):
+        """Advance the chat cursor so the next tie starts after *selected_bot*."""
+        try:
+            selected_index = self._bots.index(selected_bot)
+        except ValueError:
+            return
+        self._round_robin_cursor_by_chat[chat_id] = (selected_index + 1) % len(self._bots)
+
+    def acquire_send_slot(self, chat_id: int, max_delay: float = float('inf'),
+                          skip_bot: Optional[Callable[[AuxiliaryBot], bool]] = None
                           ) -> Optional[Tuple[AuxiliaryBot, float]]:
         """Atomically find the best available auxiliary bot for a chat.
 
@@ -72,9 +90,10 @@ class BotPool:
             best_delay = float('inf')
             confirmed_non_member_bots: List[AuxiliaryBot] = []
             unknown_bots: List[AuxiliaryBot] = []
+            ordered_bots = self._ordered_bots_for_chat(chat_id)
 
-            for aux_bot in self._bots:
-                if aux_bot.disabled:
+            for aux_bot in ordered_bots:
+                if aux_bot.disabled or (skip_bot is not None and skip_bot(aux_bot)):
                     continue
 
                 status = aux_bot.check_membership_tri(chat_id)
@@ -95,6 +114,8 @@ class BotPool:
             # Cold start: synchronously resolve unknown bots so they can help now
             if best_bot is None and unknown_bots:
                 for aux_bot in unknown_bots:
+                    if skip_bot is not None and skip_bot(aux_bot):
+                        continue
                     if aux_bot.check_membership_sync(chat_id, timeout=3.0):
                         delay = aux_bot.peek_delay(chat_id)
                         if delay < best_delay:
@@ -107,6 +128,7 @@ class BotPool:
 
             if best_bot is not None and best_delay < max_delay:
                 best_bot.reserve_slot(chat_id)
+                self._advance_round_robin_cursor(chat_id, best_bot)
                 return (best_bot, best_delay)
 
             if confirmed_non_member_bots:
