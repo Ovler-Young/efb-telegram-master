@@ -30,6 +30,7 @@ from .bot_pool import BotPool
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
 from .ptb_compat import Filters
+from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
 class DelayedTask(NamedTuple):
@@ -344,6 +345,8 @@ class TelegramBotManager(LocaleMixin):
 
                 sender_bot_id = kwargs.pop('_sender_bot_id', None)
                 send_mode = kwargs.pop('_send_mode', 'blocking')
+                force_sender_known = False
+                forced_sender_bot_id = None
 
                 chat_id = None
                 if args:
@@ -355,6 +358,25 @@ class TelegramBotManager(LocaleMixin):
                 if self._delayed_worker_stop.is_set():
                     self.logger.warning(f"Delayed worker is stopped. Not scheduling new tasks for chat {chat_id}.")
                     return None
+
+                reply_to_message_id = kwargs.get('reply_to_message_id')
+                if sender_bot_id is None and chat_id and reply_to_message_id and hasattr(self, 'channel'):
+                    try:
+                        target_log = self.channel.db.get_msg_log(
+                            master_msg_id=message_id_to_str(
+                                TelegramChatID(int(chat_id)),
+                                TelegramMessageID(int(reply_to_message_id)),
+                            )
+                        )
+                    except Exception as e:
+                        self.logger.debug(
+                            "Failed to resolve reply target sender for %s.%s: %s",
+                            chat_id, reply_to_message_id, e,
+                        )
+                    else:
+                        if target_log is not None:
+                            force_sender_known = True
+                            forced_sender_bot_id = target_log.sender_bot_id
 
                 if sender_bot_id and self.bot_pool:
                     aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
@@ -374,6 +396,10 @@ class TelegramBotManager(LocaleMixin):
                     self._cleanup_tls.pending_cleanup = []
 
                     if send_mode == 'eventual':
+                        if force_sender_known:
+                            kwargs = dict(kwargs)
+                            kwargs['_force_sender_known'] = True
+                            kwargs['_force_sender_bot_id'] = forced_sender_bot_id
                         return self._schedule_eventual_send(
                             chat_id,
                             fn,
@@ -382,7 +408,12 @@ class TelegramBotManager(LocaleMixin):
                             cleanup_files=cleanup_files,
                         )
 
-                    bot, chosen_sender_bot_id, delay_time = self._select_sender(chat_id, has_callback=has_callback)
+                    if force_sender_known:
+                        bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
+                            chat_id, forced_sender_bot_id,
+                        )
+                    else:
+                        bot, chosen_sender_bot_id, delay_time = self._select_sender(chat_id, has_callback=has_callback)
                     if chosen_sender_bot_id is None:
                         delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
                     if delay_time > 0:
@@ -1002,6 +1033,19 @@ class TelegramBotManager(LocaleMixin):
                 return aux_bot.bot, str(aux_bot.bot_id), aux_delay
         return self._bot, None, main_delay
 
+    def _select_forced_sender(self, chat_id: int, sender_bot_id: Optional[str]):
+        """Select the bot that sent the reply target message."""
+        if sender_bot_id and self.bot_pool:
+            aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
+            if aux_bot and not aux_bot.disabled:
+                return aux_bot.bot, str(sender_bot_id), 0.0
+            self.logger.warning(
+                "Reply target sender bot %s is unavailable for chat %s; falling back to main bot.",
+                sender_bot_id, chat_id,
+            )
+        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+        return self._bot, None, main_delay
+
     def _select_unfrozen_sender(self, chat_id: int, *, has_callback: bool = False, now: float = 0.0):
         """Like _select_sender, but skips bots frozen by Telegram RetryAfter.
 
@@ -1039,6 +1083,30 @@ class TelegramBotManager(LocaleMixin):
             if key[1] == chat_id and until > now:
                 soonest = min(soonest, until - now)
         return None, None, soonest if soonest != float('inf') else 0.5
+
+    def _select_forced_unfrozen_sender(self, chat_id: int, sender_bot_id: Optional[str], *, now: float = 0.0):
+        """Select the reply target's sender bot, respecting RetryAfter freezes."""
+        now = now or time.time()
+        if sender_bot_id and self.bot_pool:
+            frozen_until = self._bot_chat_frozen_until.get((str(sender_bot_id), chat_id), 0.0)
+            if frozen_until > now:
+                return None, None, frozen_until - now
+            aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
+            if aux_bot and not aux_bot.disabled:
+                return aux_bot.bot, str(sender_bot_id), 0.0
+            self.logger.warning(
+                "Reply target sender bot %s is unavailable for delayed chat %s; falling back to main bot.",
+                sender_bot_id, chat_id,
+            )
+
+        main_frozen = self._bot_chat_frozen_until.get((None, chat_id), 0.0)
+        if main_frozen > now:
+            return None, None, main_frozen - now
+        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+        if main_delay > 0:
+            return self._bot, None, main_delay
+        self._calculate_rate_limit_delay(chat_id)
+        return self._bot, None, 0.0
 
     def _requeue_delayed_task(self, task: DelayedTask, delay_time: float):
         """Put a task back at the front of its chat queue and freeze that chat."""
@@ -1299,11 +1367,18 @@ class TelegramBotManager(LocaleMixin):
                         task = q.popleft()
 
                     # Select sender, skipping (bot, chat) pairs frozen by RetryAfter
-                    sender_bot, sender_bot_id, delay_time = self._select_unfrozen_sender(
-                        task.chat_id,
-                        has_callback=_has_callback_keyboard(task.kwargs.get('reply_markup')),
-                        now=now,
-                    )
+                    if task.kwargs.get('_force_sender_known'):
+                        sender_bot, sender_bot_id, delay_time = self._select_forced_unfrozen_sender(
+                            task.chat_id,
+                            task.kwargs.get('_force_sender_bot_id'),
+                            now=now,
+                        )
+                    else:
+                        sender_bot, sender_bot_id, delay_time = self._select_unfrozen_sender(
+                            task.chat_id,
+                            has_callback=_has_callback_keyboard(task.kwargs.get('reply_markup')),
+                            now=now,
+                        )
                     if sender_bot is None:
                         # Every bot is frozen or rate-limited for this chat — put task back
                         self._requeue_delayed_task(task, delay_time if delay_time > 0 else 0.5)
@@ -1351,8 +1426,11 @@ class TelegramBotManager(LocaleMixin):
         """Submit a send operation to the thread pool."""
 
         def _do_send():
+            send_kwargs = dict(task.kwargs)
+            send_kwargs.pop('_force_sender_known', None)
+            send_kwargs.pop('_force_sender_bot_id', None)
             with self._using_bot(sender_bot):
-                return task.function(*task.args, **task.kwargs)
+                return task.function(*task.args, **send_kwargs)
 
         future = self._send_executor.submit(_do_send)
         self._chat_in_flight[task.chat_id] = (future, task, sender_bot_id)
