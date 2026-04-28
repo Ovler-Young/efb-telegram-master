@@ -8,6 +8,7 @@ from ehforwarderbot.types import ChatID
 
 from efb_telegram_master import utils
 from efb_telegram_master.chat_binding import ChatListStorage
+from efb_telegram_master.ptb_compat import sync_reply_text
 from efb_telegram_master.utils import TelegramChatID, TelegramTopicID, TelegramMessageID
 
 
@@ -134,6 +135,19 @@ def test_master_message_ignores_forum_topic_auto_reply_without_mutating_message(
     assert kwargs["quote"] is False
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_sync_reply_text_keeps_forum_topic_thread():
+    bot = Mock()
+    bot.send_message.return_value = Mock(message_id=2)
+    message = Mock()
+    message.chat.id = -100123
+    message.message_id = 1
+    message.message_thread_id = 456
+
+    sync_reply_text(bot, message, "Processing...")
+
+    bot.send_message.assert_called_once_with(-100123, text="Processing...", message_thread_id=456)
 
 
 def test_master_message_ignores_unknown_forum_thread(channel, slave):

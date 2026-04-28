@@ -99,6 +99,9 @@ def sync_reply_text(
     quote: bool = False,
     **kwargs: object,
 ) -> MessageIdentifier:
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is not None:
+        kwargs.setdefault("message_thread_id", thread_id)
     if quote:
         kwargs.setdefault("reply_to_message_id", message.message_id)
     return bot_manager.send_message(message.chat.id, text=text, **kwargs)
