@@ -209,8 +209,6 @@ class MasterMessageProcessor(LocaleMixin):
                                  reply_to_message is not None
                                  and reply_to_message.message_id != reply_to_message.message_thread_id
                              )
-                             if reply_to_message is not None and not quote:
-                                 message.reply_to_message = None  # type: ignore[assignment]
                              break
                     if destination is None:
                         self.logger.debug("[%s] Ignored message as it's a topic which wasn't created by this bot", mid)
