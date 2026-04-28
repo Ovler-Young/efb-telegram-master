@@ -1398,6 +1398,16 @@ class TelegramBotManager(LocaleMixin):
                     q = self._chat_queues.setdefault(chat_id, collections.deque())
                     q.appendleft(task)
 
+            except telegram.error.BadRequest as e:
+                self.logger.warning(
+                    "Non-retryable BadRequest for delayed task %s, dropping: %s "
+                    "(chat_id=%s, reply_to_message_id=%s, message_thread_id=%s, method=%s)",
+                    task.task_id, e, task.chat_id,
+                    task.kwargs.get("reply_to_message_id"),
+                    task.kwargs.get("message_thread_id"),
+                    getattr(task.function, "__name__", repr(task.function)),
+                )
+
             except (telegram.error.TimedOut, telegram.error.NetworkError) as e:
                 should_cleanup = False
                 self.logger.warning(
