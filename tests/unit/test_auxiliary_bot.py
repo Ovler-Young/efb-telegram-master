@@ -34,6 +34,25 @@ def test_initialize_uses_separate_validation_bot():
         validation_bot.get_me.assert_called_once_with()
 
 
+def test_local_mode_is_passed_to_primary_and_validation_bots():
+    primary_bot = Mock()
+    validation_bot = Mock()
+    validation_bot.get_me = Mock(return_value=SimpleNamespace(id=123, username="auxbot"))
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot", side_effect=[primary_bot, validation_bot]) as bot_cls, \
+         patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):
+        aux_bot = AuxiliaryBot(
+            "123:token",
+            base_url="http://localhost:8081/bot",
+            base_file_url="file:///var/lib/telegram-bot-api",
+            local_mode=True,
+        )
+        assert aux_bot.initialize() is True
+
+    assert bot_cls.call_args_list[0].kwargs["local_mode"] is True
+    assert bot_cls.call_args_list[1].kwargs["local_mode"] is True
+
+
 def test_initialize_disables_bot_on_forbidden():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls, \
          patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):

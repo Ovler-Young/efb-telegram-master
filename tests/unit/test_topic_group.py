@@ -11,6 +11,19 @@ from efb_telegram_master.chat_binding import ChatListStorage
 from efb_telegram_master.utils import TelegramChatID, TelegramTopicID, TelegramMessageID
 
 
+class _ReadOnlyReplyMessage:
+    def __init__(self, reply_to_message):
+        self.chat = SimpleNamespace(id=0, is_forum=True)
+        self.message_id = reply_to_message.message_thread_id + 1
+        self.message_thread_id = reply_to_message.message_thread_id
+        self._reply_to_message = reply_to_message
+        self.to_dict = Mock(return_value={})
+
+    @property
+    def reply_to_message(self):
+        return self._reply_to_message
+
+
 def _build_slave_message(slave, chat=None, author=None):
     chat = chat or slave.chat_with_alias
     author = author or chat.self
@@ -96,6 +109,29 @@ def test_master_message_routes_forum_thread_to_slave(channel, slave):
     kwargs = process_telegram_message.call_args.kwargs
     assert args[2] == slave_uid
     assert kwargs["quote"] is True
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_master_message_ignores_forum_topic_auto_reply_without_mutating_message(channel, slave):
+    topic_chat_id = TelegramChatID(80009)
+    thread_id = TelegramTopicID(80010)
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+
+    reply_to_topic_starter = Mock(message_id=int(thread_id), message_thread_id=int(thread_id))
+    message = _ReadOnlyReplyMessage(reply_to_topic_starter)
+    message.chat.id = int(topic_chat_id)
+
+    update = Update(update_id=3, message=message)
+
+    with patch.object(channel.master_messages, "process_telegram_message") as process_telegram_message:
+        channel.master_messages.msg(update, None)
+
+    process_telegram_message.assert_called_once()
+    kwargs = process_telegram_message.call_args.kwargs
+    assert kwargs["quote"] is False
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
 

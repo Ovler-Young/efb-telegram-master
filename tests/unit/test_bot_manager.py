@@ -158,6 +158,30 @@ def test_rate_limit_decorator_falls_back_to_main_bot_when_sender_missing():
     assert result.chat_id == 123
 
 
+def test_build_bot_passes_local_mode_when_enabled():
+    manager = object.__new__(TelegramBotManager)
+    manager._bot_identity_kwargs = {
+        "token": "123:token",
+        "base_url": "http://localhost:8081/bot",
+        "base_file_url": "file:///var/lib/telegram-bot-api",
+    }
+    manager._local_mode = True
+    request = Mock()
+    get_updates_request = Mock()
+
+    with patch("efb_telegram_master.bot_manager.telegram.Bot") as bot_cls:
+        manager._build_bot(request=request, get_updates_request=get_updates_request)
+
+    bot_cls.assert_called_once_with(
+        token="123:token",
+        base_url="http://localhost:8081/bot",
+        base_file_url="file:///var/lib/telegram-bot-api",
+        local_mode=True,
+        request=request,
+        get_updates_request=get_updates_request,
+    )
+
+
 def test_rate_limit_decorator_routes_new_send_through_aux_pool():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
     aux_bot = SimpleNamespace(bot=object(), bot_id=999, disabled=False)
@@ -186,8 +210,76 @@ def test_rate_limit_decorator_routes_new_send_through_aux_pool():
     result = decorated(manager, 123)
 
     assert result.sender_bot_id == "999"
-    manager._select_sender.assert_called_once_with(123, has_callback=False)
+    manager._select_sender.assert_called_once_with(123, has_callback=False, message_thread_id=None)
     manager._record_aux_use.assert_called_once_with(123)
+
+
+def test_rate_limit_decorator_routes_reply_to_target_sender_bot():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
+    aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False)
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id="777")))),
+        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _select_forced_sender=Mock(return_value=(aux_bot.bot, "777", 0.0)),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _using_bot=lambda bot: DummyContext(),
+        _record_aux_use=Mock(),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123, reply_to_message_id=456)
+
+    assert result.sender_bot_id == "777"
+    manager.channel.db.get_msg_log.assert_called_once_with(master_msg_id="123.456")
+    manager._select_forced_sender.assert_called_once_with(123, "777")
+
+
+def test_rate_limit_decorator_routes_reply_to_main_bot():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    manager = SimpleNamespace(
+        _bot=object(),
+        _delayed_worker_stop=threading.Event(),
+        channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id=None)))),
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock()),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _select_sender=Mock(),
+        _select_forced_sender=Mock(return_value=(object(), None, 0.0)),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _using_bot=lambda bot: DummyContext(),
+        _record_aux_use=Mock(),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123, reply_to_message_id=456)
+
+    assert result.sender_bot_id is None
+    manager._select_forced_sender.assert_called_once_with(123, None)
+    manager._select_sender.assert_not_called()
+    manager.bot_pool.acquire_send_slot.assert_not_called()
 
 
 def test_rate_limit_decorator_eventual_mode_schedules_delayed_task():
@@ -205,6 +297,94 @@ def test_rate_limit_decorator_eventual_mode_schedules_delayed_task():
 
     assert result is scheduled
     manager._schedule_eventual_send.assert_called_once()
+
+
+def test_rate_limit_decorator_eventual_reply_preserves_target_sender():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+    scheduled = SimpleNamespace(queued=True, task_id="task-1")
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id=None)))),
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock()),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _schedule_eventual_send=Mock(return_value=scheduled),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123, reply_to_message_id=456, _send_mode="eventual")
+
+    assert result is scheduled
+    scheduled_kwargs = manager._schedule_eventual_send.call_args.args[3]
+    assert scheduled_kwargs["reply_to_message_id"] == 456
+    assert scheduled_kwargs["_force_sender_known"] is True
+    assert scheduled_kwargs["_force_sender_bot_id"] is None
+
+
+def test_select_sender_passes_topic_affinity_key_to_bot_pool():
+    chat_id = -1002608436807
+    aux_bot = SimpleNamespace(bot=object(), bot_id=777)
+    manager = SimpleNamespace(
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=(aux_bot, 0.0))),
+        _calculate_rate_limit_delay=Mock(return_value=(1.0, 0, 0)),
+        _bot=object(),
+    )
+
+    bot, sender_bot_id, delay = TelegramBotManager._select_sender(
+        manager,
+        chat_id,
+        message_thread_id=1007,
+    )
+
+    assert bot is aux_bot.bot
+    assert sender_bot_id == "777"
+    assert delay == 0.0
+    manager.bot_pool.acquire_send_slot.assert_called_once_with(
+        chat_id,
+        max_delay=1.0,
+        affinity_key=(chat_id, 1007),
+    )
+
+
+def test_select_sender_passes_none_topic_affinity_key_to_bot_pool():
+    chat_id = -1002608436807
+    aux_bot = SimpleNamespace(bot=object(), bot_id=777)
+    manager = SimpleNamespace(
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=(aux_bot, 0.0))),
+        _calculate_rate_limit_delay=Mock(return_value=(1.0, 0, 0)),
+        _bot=object(),
+    )
+
+    TelegramBotManager._select_sender(manager, chat_id)
+
+    manager.bot_pool.acquire_send_slot.assert_called_once_with(
+        chat_id,
+        max_delay=1.0,
+        affinity_key=(chat_id, None),
+    )
+
+
+def test_select_unfrozen_sender_passes_topic_affinity_key_to_bot_pool():
+    chat_id = -1002608436807
+    aux_bot = SimpleNamespace(bot=object(), bot_id=777)
+    manager = SimpleNamespace(
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=(aux_bot, 0.0))),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _bot_chat_frozen_until={},
+        _bot=object(),
+    )
+
+    TelegramBotManager._select_unfrozen_sender(
+        manager,
+        chat_id,
+        message_thread_id=1007,
+        now=10.0,
+    )
+
+    call = manager.bot_pool.acquire_send_slot.call_args
+    assert call.args == (chat_id,)
+    assert call.kwargs["max_delay"] == 0.01
+    assert call.kwargs["affinity_key"] == (chat_id, 1007)
+    assert callable(call.kwargs["skip_bot"])
 
 
 def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_disabled():
@@ -583,6 +763,39 @@ def test_requeue_prepends_to_chat_fifo():
     assert q[0].task_id == "t1"  # retry task at front
     assert q[1].task_id == "t2"  # existing task behind it
     assert mgr._chat_frozen_until[100] == 12.0
+
+
+def test_harvest_completed_sends_does_not_retry_bad_request():
+    """BadRequest is not transient, even though PTB makes it a NetworkError."""
+    from concurrent.futures import Future
+    from efb_telegram_master.bot_manager import DelayedTask, TelegramBotManager
+
+    task = DelayedTask(
+        execute_time=0.0, chat_id=100, function=lambda: None,
+        args=(), kwargs={"reply_to_message_id": 321, "message_thread_id": 654}, task_id="t1",
+    )
+    future = Future()
+    future.set_exception(telegram.error.BadRequest("Message to be replied not found"))
+    mgr = SimpleNamespace(
+        _chat_in_flight={100: (future, task, None)},
+        logger=Mock(),
+        _requeue_delayed_task=Mock(),
+    )
+
+    TelegramBotManager._harvest_completed_sends(mgr)
+
+    assert mgr._chat_in_flight == {}
+    mgr._requeue_delayed_task.assert_not_called()
+    mgr.logger.warning.assert_called_once_with(
+        "Non-retryable BadRequest for delayed task %s, dropping: %s "
+        "(chat_id=%s, reply_to_message_id=%s, message_thread_id=%s, method=%s)",
+        "t1",
+        future.exception(),
+        100,
+        321,
+        654,
+        task.function.__name__,
+    )
 
 
 def test_different_chats_dispatch_concurrently():
