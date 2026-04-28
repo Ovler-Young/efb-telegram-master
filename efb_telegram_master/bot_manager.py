@@ -408,12 +408,17 @@ class TelegramBotManager(LocaleMixin):
                             cleanup_files=cleanup_files,
                         )
 
+                    message_thread_id = kwargs.get('message_thread_id')
                     if force_sender_known:
                         bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
                             chat_id, forced_sender_bot_id,
                         )
                     else:
-                        bot, chosen_sender_bot_id, delay_time = self._select_sender(chat_id, has_callback=has_callback)
+                        bot, chosen_sender_bot_id, delay_time = self._select_sender(
+                            chat_id,
+                            has_callback=has_callback,
+                            message_thread_id=message_thread_id,
+                        )
                     if chosen_sender_bot_id is None:
                         delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
                     if delay_time > 0:
@@ -1023,11 +1028,15 @@ class TelegramBotManager(LocaleMixin):
         placeholder = self._create_delayed_message_placeholder(chat_id, delay_time, task_id)
         return self._make_send_receipt(placeholder, queued=True, task_id=task_id)
 
-    def _select_sender(self, chat_id: int, *, has_callback: bool = False):
+    def _select_sender(self, chat_id: int, *, has_callback: bool = False, message_thread_id: Optional[int] = None):
         """Choose the earliest sender using the current main/aux heuristics."""
         main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
         if self.bot_pool and not has_callback:
-            slot = self.bot_pool.acquire_send_slot(chat_id, max_delay=main_delay if main_delay > 0 else 0.0)
+            slot = self.bot_pool.acquire_send_slot(
+                chat_id,
+                max_delay=main_delay if main_delay > 0 else 0.0,
+                affinity_key=(chat_id, message_thread_id),
+            )
             if slot is not None:
                 aux_bot, aux_delay = slot
                 return aux_bot.bot, str(aux_bot.bot_id), aux_delay
@@ -1046,7 +1055,8 @@ class TelegramBotManager(LocaleMixin):
         main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
         return self._bot, None, main_delay
 
-    def _select_unfrozen_sender(self, chat_id: int, *, has_callback: bool = False, now: float = 0.0):
+    def _select_unfrozen_sender(self, chat_id: int, *, has_callback: bool = False,
+                                message_thread_id: Optional[int] = None, now: float = 0.0):
         """Like _select_sender, but skips bots frozen by Telegram RetryAfter.
 
         Returns (bot, bot_id, delay) or (None, None, soonest_unfreeze_delay)
@@ -1062,6 +1072,7 @@ class TelegramBotManager(LocaleMixin):
                 chat_id,
                 max_delay=max_delay,
                 skip_bot=lambda aux_bot: self._bot_chat_frozen_until.get((str(aux_bot.bot_id), chat_id), 0.0) > now,
+                affinity_key=(chat_id, message_thread_id),
             )
             if slot is not None:
                 aux_bot_obj, aux_delay = slot
@@ -1377,6 +1388,7 @@ class TelegramBotManager(LocaleMixin):
                         sender_bot, sender_bot_id, delay_time = self._select_unfrozen_sender(
                             task.chat_id,
                             has_callback=_has_callback_keyboard(task.kwargs.get('reply_markup')),
+                            message_thread_id=task.kwargs.get('message_thread_id'),
                             now=now,
                         )
                     if sender_bot is None:
