@@ -615,6 +615,7 @@ class TelegramBotManager(LocaleMixin):
             self._bot_identity_kwargs["base_url"] = channel.flag('api_base_url')
         if channel.flag('api_base_file_url'):
             self._bot_identity_kwargs["base_file_url"] = channel.flag('api_base_file_url')
+        self._local_mode = bool(channel.flag('local_tdlib_api'))
         request = self._build_request()
         get_updates_request = self._build_request()
 
@@ -812,6 +813,7 @@ class TelegramBotManager(LocaleMixin):
                 token=self._bot_identity_kwargs["token"],
                 base_url=base_url,
                 base_file_url=base_file_url,
+                local_mode=self._local_mode,
                 request=request,
                 get_updates_request=get_updates_request,
             )
@@ -819,6 +821,7 @@ class TelegramBotManager(LocaleMixin):
             return telegram.Bot(
                 token=self._bot_identity_kwargs["token"],
                 base_url=base_url,
+                local_mode=self._local_mode,
                 request=request,
                 get_updates_request=get_updates_request,
             )
@@ -826,11 +829,13 @@ class TelegramBotManager(LocaleMixin):
             return telegram.Bot(
                 token=self._bot_identity_kwargs["token"],
                 base_file_url=base_file_url,
+                local_mode=self._local_mode,
                 request=request,
                 get_updates_request=get_updates_request,
             )
         return telegram.Bot(
             token=self._bot_identity_kwargs["token"],
+            local_mode=self._local_mode,
             request=request,
             get_updates_request=get_updates_request,
         )
@@ -1070,6 +1075,7 @@ class TelegramBotManager(LocaleMixin):
                 request_kwargs=request_kwargs,
                 base_url=channel.flag('api_base_url') or None,
                 base_file_url=channel.flag('api_base_file_url') or None,
+                local_mode=self._local_mode,
                 global_limit=self.GLOBAL_LIMIT,
                 global_window=self.GLOBAL_WINDOW,
                 chat_limit=self.CHAT_LIMIT,

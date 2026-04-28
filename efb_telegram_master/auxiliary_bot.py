@@ -51,6 +51,7 @@ class AuxiliaryBot:
                  request_kwargs: Optional[dict] = None,
                  base_url: Optional[str] = None,
                  base_file_url: Optional[str] = None,
+                 local_mode: bool = False,
                  global_limit: int = 30,
                  global_window: float = 1.0,
                  chat_limit: int = 20,
@@ -62,6 +63,7 @@ class AuxiliaryBot:
             self._base_kwargs['base_url'] = base_url
         if base_file_url:
             self._base_kwargs['base_file_url'] = base_file_url
+        self._local_mode = local_mode
 
         self.async_bot: telegram.Bot = self._create_bot()
         self.bot: telegram.Bot | 'SyncBotFacade' = self.async_bot
@@ -97,6 +99,7 @@ class AuxiliaryBot:
                 token=self._token,
                 base_url=base_url,
                 base_file_url=base_file_url,
+                local_mode=self._local_mode,
                 request=request,
                 get_updates_request=get_updates_request,
             )
@@ -104,6 +107,7 @@ class AuxiliaryBot:
             return telegram.Bot(
                 token=self._token,
                 base_url=base_url,
+                local_mode=self._local_mode,
                 request=request,
                 get_updates_request=get_updates_request,
             )
@@ -111,11 +115,13 @@ class AuxiliaryBot:
             return telegram.Bot(
                 token=self._token,
                 base_file_url=base_file_url,
+                local_mode=self._local_mode,
                 request=request,
                 get_updates_request=get_updates_request,
             )
         return telegram.Bot(
             token=self._token,
+            local_mode=self._local_mode,
             request=request,
             get_updates_request=get_updates_request,
         )
