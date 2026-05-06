@@ -84,7 +84,7 @@ class BotPool:
             return None
 
         delay = aux_bot.peek_delay(chat_id)
-        if delay != 0.0 or delay >= max_delay:
+        if delay > max_delay:
             return None
         if aux_bot.get_chat_send_count(chat_id) >= self._half_chat_capacity():
             return None
@@ -95,6 +95,8 @@ class BotPool:
     def acquire_send_slot(self, chat_id: int, max_delay: float = float('inf'),
                           skip_bot: Optional[Callable[[AuxiliaryBot], bool]] = None,
                           affinity_key: Optional[Hashable] = None,
+                          *,
+                          notify_admin: bool = True,
                           ) -> Optional[Tuple[AuxiliaryBot, float]]:
         """Atomically find the best available auxiliary bot for a chat.
 
@@ -162,14 +164,17 @@ class BotPool:
                     else:
                         confirmed_non_member_bots.append(aux_bot)
 
-            if best_bot is not None and best_delay < max_delay:
+            if best_bot is not None and best_delay <= max_delay:
                 best_bot.reserve_slot(chat_id)
                 self._advance_round_robin_cursor(chat_id, best_bot)
                 if affinity_key is not None:
                     self._affinity_bot_by_key[affinity_key] = best_bot.bot_id
                 return (best_bot, best_delay)
 
-            if confirmed_non_member_bots:
+            # Suggest adding aux bots only when the caller is actually delayed.
+            # Selection budget (max_delay) may include a small epsilon for fairness,
+            # so notification should be controlled by the caller.
+            if confirmed_non_member_bots and notify_admin:
                 self._maybe_notify_admin(chat_id, confirmed_non_member_bots)
 
             return None

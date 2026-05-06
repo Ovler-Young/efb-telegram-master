@@ -1036,6 +1036,7 @@ class TelegramBotManager(LocaleMixin):
                 chat_id,
                 max_delay=main_delay if main_delay > 0 else 0.0,
                 affinity_key=(chat_id, message_thread_id),
+                notify_admin=(main_delay > 0),
             )
             if slot is not None:
                 aux_bot, aux_delay = slot
@@ -1067,12 +1068,15 @@ class TelegramBotManager(LocaleMixin):
 
         # ── Try aux bots first (skip frozen ones) ──
         if self.bot_pool and not has_callback:
+            # Allow aux bots to participate even when main bot isn't delayed,
+            # but only notify admin when the main bot is actually rate-limited.
             max_delay = max(main_delay, 0.01)
             slot = self.bot_pool.acquire_send_slot(
                 chat_id,
                 max_delay=max_delay,
                 skip_bot=lambda aux_bot: self._bot_chat_frozen_until.get((str(aux_bot.bot_id), chat_id), 0.0) > now,
                 affinity_key=(chat_id, message_thread_id),
+                notify_admin=(main_delay > 0),
             )
             if slot is not None:
                 aux_bot_obj, aux_delay = slot
