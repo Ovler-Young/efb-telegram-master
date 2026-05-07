@@ -345,6 +345,7 @@ class TelegramBotManager(LocaleMixin):
 
                 sender_bot_id = kwargs.pop('_sender_bot_id', None)
                 send_mode = kwargs.pop('_send_mode', 'blocking')
+                force_main_bot = kwargs.pop('_force_main_bot', False)
                 force_sender_known = False
                 forced_sender_bot_id = None
 
@@ -386,8 +387,13 @@ class TelegramBotManager(LocaleMixin):
                                 result = fn(self, *args, **kwargs)
                             return self._make_send_receipt(result, sender_bot_id=str(sender_bot_id))
                         except telegram.error.Forbidden:
-                            aux_bot.mark_disabled("Forbidden during forced-route API call")
-                            self._notify_admin_disabled_bot(aux_bot)
+                            if chat_id is not None:
+                                aux_bot.update_membership(int(chat_id), False)
+                            self.logger.warning(
+                                "Auxiliary bot %s got Forbidden in chat %s during forced-route API call; "
+                                "marking it as non-member for this chat.",
+                                sender_bot_id, chat_id,
+                            )
                     return self._make_send_receipt(fn(self, *args, **kwargs))
 
                 if chat_id:
@@ -409,7 +415,9 @@ class TelegramBotManager(LocaleMixin):
                         )
 
                     message_thread_id = kwargs.get('message_thread_id')
-                    if force_sender_known:
+                    if force_main_bot:
+                        bot, chosen_sender_bot_id, delay_time = self._bot, None, 0.0
+                    elif force_sender_known:
                         bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
                             chat_id, forced_sender_bot_id,
                         )
@@ -433,8 +441,16 @@ class TelegramBotManager(LocaleMixin):
                         if chosen_sender_bot_id and self.bot_pool:
                             aux_bot = self.bot_pool.get_bot_by_id(chosen_sender_bot_id)
                             if aux_bot:
-                                aux_bot.mark_disabled("Forbidden during pool-route API call")
-                                self._notify_admin_disabled_bot(aux_bot)
+                                aux_bot.update_membership(int(chat_id), False)
+                                self.logger.warning(
+                                    "Auxiliary bot %s got Forbidden in chat %s during pool-route API call; "
+                                    "marking it as non-member for this chat and retrying with main bot.",
+                                    chosen_sender_bot_id, chat_id,
+                                )
+                                delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
+                                if delay_time > 0:
+                                    time.sleep(delay_time)
+                                return self._make_send_receipt(fn(self, *args, **kwargs))
                         raise
 
                 return self._make_send_receipt(fn(self, *args, **kwargs))
@@ -1234,8 +1250,12 @@ class TelegramBotManager(LocaleMixin):
                         with self._using_bot(aux_bot.bot):
                             return send_callable(_bypass_rate_limit=True)
                     except telegram.error.Forbidden:
-                        aux_bot.mark_disabled("Forbidden during migration send")
-                        self._notify_admin_disabled_bot(aux_bot)
+                        aux_bot.update_membership(chat_id, False)
+                        self.logger.warning(
+                            "Auxiliary bot %s got Forbidden in chat %s during migration send; "
+                            "marking it as non-member for this chat.",
+                            aux_bot.bot_id, chat_id,
+                        )
 
             # Try main bot
             if main_delay == 0.0:
@@ -1514,12 +1534,12 @@ class TelegramBotManager(LocaleMixin):
                 if sender_bot_id and self.bot_pool:
                     aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
                     if aux_bot:
-                        aux_bot.mark_disabled("Forbidden during delayed task execution")
-                        self._notify_admin_disabled_bot(aux_bot)
+                        aux_bot.update_membership(chat_id, False)
                         should_cleanup = False
                         self.logger.warning(
-                            "Aux bot %s failed task %s with Forbidden, retrying.",
-                            sender_bot_id, task.task_id,
+                            "Aux bot %s got Forbidden in chat %s for delayed task %s; "
+                            "marking it as non-member for this chat and retrying.",
+                            sender_bot_id, chat_id, task.task_id,
                         )
                         self._requeue_delayed_task(task, 0.0)
                         continue
@@ -2130,8 +2150,12 @@ class TelegramBotManager(LocaleMixin):
                 try:
                     return aux_bot.bot.delete_message(chat_id, message_id)
                 except telegram.error.Forbidden:
-                    aux_bot.mark_disabled("Forbidden during delete_message")
-                    self._notify_admin_disabled_bot(aux_bot)
+                    aux_bot.update_membership(chat_id, False)
+                    self.logger.warning(
+                        "Auxiliary bot %s got Forbidden in chat %s during delete_message; "
+                        "marking it as non-member for this chat.",
+                        _sender_bot_id, chat_id,
+                    )
                 except telegram.error.BadRequest:
                     pass  # Fall through to main bot
         return self._active_bot.delete_message(chat_id, message_id)

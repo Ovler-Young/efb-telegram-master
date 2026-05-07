@@ -276,9 +276,8 @@ class AuxiliaryBot:
             logger.debug("Membership probe for bot %d in chat %d: %s (status=%s)",
                          self.bot_id, chat_id, is_member, member.status)
         except telegram.error.Forbidden:
-            self.disabled = True
-            self._disable_reason = "Forbidden during membership probe"
-            logger.error("Auxiliary bot %d got Forbidden during membership probe", self.bot_id)
+            self.update_membership(chat_id, False)
+            logger.warning("Membership probe for bot %d in chat %d got Forbidden", self.bot_id, chat_id)
         except telegram.error.BadRequest as e:
             self.update_membership(chat_id, False)
             logger.debug("Membership probe for bot %d in chat %d failed: %s", self.bot_id, chat_id, e)

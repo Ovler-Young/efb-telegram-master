@@ -135,6 +135,19 @@ def test_probe_membership_marks_non_member_on_bad_request():
     assert aux_bot.check_membership(4000) is False
 
 
+def test_probe_membership_forbidden_marks_non_member_without_disabling():
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
+        bot = bot_cls.return_value
+        bot.get_chat_member.side_effect = telegram.error.Forbidden("bot was kicked")
+        aux_bot = AuxiliaryBot("123:token")
+        aux_bot.bot_id = 123
+
+    aux_bot._probe_membership(4000)
+
+    assert aux_bot.check_membership(4000) is False
+    assert aux_bot.disabled is False
+
+
 def test_mark_disabled_sets_reason():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token")

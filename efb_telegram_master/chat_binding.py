@@ -248,7 +248,9 @@ class ChatBindingManager(LocaleMixin):
                 channel_id, chat_id, _ = utils.chat_id_str_to_id(msg_log.slave_origin_uid)
                 chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                 tg_chat_id = TelegramChatID(message.chat_id)
-                tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing...")).message_id)
+                tg_msg_id = TelegramMessageID(
+                    sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id
+                )
                 storage_id: Tuple[TelegramChatID, TelegramMessageID] = (tg_chat_id, tg_msg_id)
                 self._set_conversation_state(self.link_handler, storage_id, Flags.LINK_EXEC)
                 self.msg_storage[storage_id] = ChatListStorage([chat])
@@ -264,7 +266,9 @@ class ChatBindingManager(LocaleMixin):
                         channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_origin_uid)
                         topic_chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                         topic_tg_chat_id = TelegramChatID(message.chat_id)
-                        topic_tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing...")).message_id)
+                        topic_tg_msg_id = TelegramMessageID(
+                            sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id
+                        )
                         topic_storage_id: Tuple[TelegramChatID, TelegramMessageID] = (topic_tg_chat_id, topic_tg_msg_id)
                         self._set_conversation_state(self.link_handler, topic_storage_id, Flags.LINK_EXEC)
                         self.msg_storage[topic_storage_id] = ChatListStorage([topic_chat])
@@ -414,7 +418,7 @@ class ChatBindingManager(LocaleMixin):
         """
 
         if message_id is None:
-            message_id = self.bot.send_message(chat_id, self._("Processing...")).message_id
+            message_id = self.bot.send_message(chat_id, self._("Processing..."), _force_main_bot=True).message_id
         self.bot.send_chat_action(chat_id, ChatAction.TYPING)
         if chats:
             msg_text = self._("This Telegram group is currently linked with...")
@@ -817,7 +821,7 @@ class ChatBindingManager(LocaleMixin):
             chats: Specified list of chats to start a chat head.
         """
         if message_id is None:
-            message_id = self.bot.send_message(chat_id, text=self._("Processing...")).message_id
+            message_id = self.bot.send_message(chat_id, text=self._("Processing..."), _force_main_bot=True).message_id
         self.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
         if chats and len(chats):

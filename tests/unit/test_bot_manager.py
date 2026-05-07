@@ -214,6 +214,80 @@ def test_rate_limit_decorator_routes_new_send_through_aux_pool():
     manager._record_aux_use.assert_called_once_with(123)
 
 
+def test_rate_limit_decorator_force_main_bot_skips_aux_pool():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    manager = SimpleNamespace(
+        _bot=object(),
+        _delayed_worker_stop=threading.Event(),
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock()),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _select_sender=Mock(),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _using_bot=lambda bot: DummyContext(),
+        _record_aux_use=Mock(),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123, _force_main_bot=True)
+
+    assert result.sender_bot_id is None
+    manager._select_sender.assert_not_called()
+    manager.bot_pool.acquire_send_slot.assert_not_called()
+    manager._record_aux_use.assert_not_called()
+
+
+def test_rate_limit_decorator_pool_route_forbidden_marks_chat_non_member_and_retries_main():
+    calls = []
+
+    def send(self, chat_id):
+        calls.append(chat_id)
+        if len(calls) == 1:
+            raise telegram.error.Forbidden("bot was kicked")
+        return SimpleNamespace(chat_id=chat_id)
+
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(send)
+    aux_bot = SimpleNamespace(bot=object(), bot_id=999, disabled=False, update_membership=Mock())
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _select_sender=Mock(return_value=(aux_bot.bot, "999", 0.0)),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _using_bot=lambda bot: DummyContext(),
+        _record_aux_use=Mock(),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123)
+
+    assert result.sender_bot_id is None
+    assert len(calls) == 2
+    aux_bot.update_membership.assert_called_once_with(123, False)
+    assert aux_bot.disabled is False
+
+
 def test_rate_limit_decorator_routes_reply_to_target_sender_bot():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
     aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False)
@@ -342,6 +416,7 @@ def test_select_sender_passes_topic_affinity_key_to_bot_pool():
         chat_id,
         max_delay=1.0,
         affinity_key=(chat_id, 1007),
+        notify_admin=True,
     )
 
 
@@ -360,6 +435,29 @@ def test_select_sender_passes_none_topic_affinity_key_to_bot_pool():
         chat_id,
         max_delay=1.0,
         affinity_key=(chat_id, None),
+        notify_admin=True,
+    )
+
+
+def test_select_sender_does_not_notify_or_use_aux_when_main_has_no_delay():
+    chat_id = -1002608436807
+    main_bot = object()
+    manager = SimpleNamespace(
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=None)),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _bot=main_bot,
+    )
+
+    bot, sender_bot_id, delay = TelegramBotManager._select_sender(manager, chat_id)
+
+    assert bot is main_bot
+    assert sender_bot_id is None
+    assert delay == 0.0
+    manager.bot_pool.acquire_send_slot.assert_called_once_with(
+        chat_id,
+        max_delay=0.0,
+        affinity_key=(chat_id, None),
+        notify_admin=False,
     )
 
 

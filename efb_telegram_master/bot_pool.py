@@ -84,7 +84,7 @@ class BotPool:
             return None
 
         delay = aux_bot.peek_delay(chat_id)
-        if delay > max_delay:
+        if delay != 0.0 or delay >= max_delay:
             return None
         if aux_bot.get_chat_send_count(chat_id) >= self._half_chat_capacity():
             return None
@@ -164,7 +164,7 @@ class BotPool:
                     else:
                         confirmed_non_member_bots.append(aux_bot)
 
-            if best_bot is not None and best_delay <= max_delay:
+            if best_bot is not None and best_delay < max_delay:
                 best_bot.reserve_slot(chat_id)
                 self._advance_round_robin_cursor(chat_id, best_bot)
                 if affinity_key is not None:
