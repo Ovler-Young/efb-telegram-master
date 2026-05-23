@@ -428,9 +428,10 @@ class TelegramBotManager(LocaleMixin):
                             force_sender_known = True
                             forced_sender_bot_id = target_log.sender_bot_id
 
-                if sender_bot_id and self.bot_pool and not has_callback:
+                if sender_bot_id and self.bot_pool and not has_callback and chat_id is not None:
+                    chat_id_int = int(chat_id)
                     bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
-                        chat_id, sender_bot_id,
+                        chat_id_int, sender_bot_id,
                     )
                     if delay_time > 0:
                         time.sleep(delay_time)
@@ -440,10 +441,9 @@ class TelegramBotManager(LocaleMixin):
                                 result = fn(self, *args, **kwargs)
                             return self._make_send_receipt(result, sender_bot_id=chosen_sender_bot_id)
                         except telegram.error.Forbidden:
-                            if chat_id is not None:
-                                aux_bot = self.bot_pool.get_bot_by_id(chosen_sender_bot_id)
-                                if aux_bot:
-                                    aux_bot.update_membership(int(chat_id), False)
+                            aux_bot = self.bot_pool.get_bot_by_id(chosen_sender_bot_id)
+                            if aux_bot:
+                                aux_bot.update_membership(chat_id_int, False)
                             self.logger.warning(
                                 "Auxiliary bot %s got Forbidden in chat %s during forced-route API call; "
                                 "marking it as non-member for this chat.",
@@ -455,16 +455,14 @@ class TelegramBotManager(LocaleMixin):
                             "falling back to main bot.",
                             sender_bot_id, chat_id,
                         )
-                        if chat_id is not None:
-                            self._calculate_rate_limit_delay(chat_id)
+                        self._calculate_rate_limit_delay(chat_id_int)
                         return self._make_send_receipt(fn(self, *args, **kwargs))
-                    if chat_id is not None:
-                        aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
-                        if aux_bot:
-                            aux_bot.update_membership(int(chat_id), False)
-                        delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
-                        if delay_time > 0:
-                            time.sleep(delay_time)
+                    aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
+                    if aux_bot:
+                        aux_bot.update_membership(chat_id_int, False)
+                    delay_time, _, _ = self._calculate_rate_limit_delay(chat_id_int)
+                    if delay_time > 0:
+                        time.sleep(delay_time)
                     return self._make_send_receipt(fn(self, *args, **kwargs))
 
                 if chat_id:
