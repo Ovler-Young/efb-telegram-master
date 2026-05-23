@@ -333,7 +333,11 @@ class SlaveMessageProcessor(LocaleMixin):
                 tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]) if tg_chat else self.channel.topic_group)
                 master_chat_info = self.bot.get_chat_info(tg_dest)
                 if master_chat_info.is_forum:
+                    existing_thread_id = self.db.get_topic_thread_id(slave_uid=chat_uid, topic_chat_id=tg_dest)
                     thread_id = self.channel.chat_binding.create_topic(slave_uid=chat_uid, telegram_chat_id=tg_dest)
+                    if thread_id is not None and existing_thread_id is None:
+                        msg.vendor_specific = msg.vendor_specific or {}
+                        msg.vendor_specific['_force_send_mode'] = 'blocking'
 
         if not tg_chat:
             singly_linked = False
@@ -379,7 +383,10 @@ class SlaveMessageProcessor(LocaleMixin):
     def _send_mode(msg: Message,
                    old_msg_id: Optional[OldMsgID],
                    thread_id: Optional[TelegramTopicID] = None) -> str:
-        if old_msg_id is not None or msg.commands or thread_id is not None:
+        force_send_mode = (msg.vendor_specific or {}).get('_force_send_mode')
+        if force_send_mode in {'blocking', 'eventual'}:
+            return force_send_mode
+        if old_msg_id is not None or msg.commands:
             return 'blocking'
         return 'eventual'
 
