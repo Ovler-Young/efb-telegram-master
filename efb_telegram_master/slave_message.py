@@ -1161,6 +1161,23 @@ class SlaveMessageProcessor(LocaleMixin):
             return ""
         return result
 
+    @staticmethod
+    def _reaction_target_message_id(old_msg: ETMMsg, old_msg_db) -> str:
+        """Choose which Telegram message should surface a reaction update.
+
+        Most slave-originated text/link messages should edit the primary
+        Telegram message. Messages mirrored from Telegram user input keep the
+        original user message as the primary record and use ``master_msg_id_alt``
+        for the editable bot reply, so reactions must target the alternate
+        message when it exists.
+        """
+        if old_msg_db.master_msg_id_alt:
+            if old_msg.deliver_to and old_msg.deliver_to.channel_id == old_msg.chat.module_id:
+                return old_msg_db.master_msg_id_alt
+        if old_msg.type in (MsgType.Text, MsgType.Link):
+            return old_msg_db.master_msg_id or old_msg_db.master_msg_id_alt
+        return old_msg_db.master_msg_id_alt or old_msg_db.master_msg_id
+
     def update_reactions(self, status: MessageReactionsUpdate):
         """Update reactions to a Telegram message."""
         old_msg_db = self.db.get_msg_log(slave_msg_id=status.msg_id,
@@ -1186,14 +1203,7 @@ class SlaveMessageProcessor(LocaleMixin):
                               status.msg_id, status.chat)
             return
 
-        # Text-like messages are expected to surface reaction updates through
-        # edits on the primary message body, which is what integration tests
-        # and downstream callers observe. Media messages still prefer the
-        # alternate record when available.
-        if old_msg.type in (MsgType.Text, MsgType.Link):
-            effective_msg = old_msg_db.master_msg_id or old_msg_db.master_msg_id_alt
-        else:
-            effective_msg = old_msg_db.master_msg_id_alt or old_msg_db.master_msg_id
+        effective_msg = self._reaction_target_message_id(old_msg, old_msg_db)
         chat_id, msg_id = utils.message_id_str_to_id(effective_msg)
 
         # Go through the ordinary update process

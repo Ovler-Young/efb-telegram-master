@@ -1,7 +1,9 @@
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from types import SimpleNamespace
 
 from ehforwarderbot import Message, Chat
+from ehforwarderbot.constants import MsgType
 from ehforwarderbot.chat import ChatMember
 from ehforwarderbot.types import ReactionName
 from efb_telegram_master.constants import Emoji
@@ -185,3 +187,35 @@ def test_build_inline_keyboard_existing_buttons(build_inline_keyboard, private):
     assert "__text__" in seq
     assert "__template__" in seq
     assert "__reactions__" in seq
+
+
+def test_reaction_target_prefers_primary_message_for_slave_origin_text():
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="blueset.telegram"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt="100.11",
+    )
+
+    effective = SlaveMessageProcessor._reaction_target_message_id(old_msg, old_msg_db)
+
+    assert effective == "100.10"
+
+
+def test_reaction_target_prefers_alt_message_for_telegram_origin_text():
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt="100.11",
+    )
+
+    effective = SlaveMessageProcessor._reaction_target_message_id(old_msg, old_msg_db)
+
+    assert effective == "100.11"

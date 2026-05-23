@@ -84,6 +84,8 @@ class ExperimentalFlagsManager(LocaleMixin):
         self.channel = channel
         self.config: Dict[str, Any] = ExperimentalFlagsManager.DEFAULT_VALUES.copy()
         self.config.update(channel.config.get('flags', dict()) or dict())
+        if self.config.get("topic_group") is None and channel.config.get("topic_group") is not None:
+            self.config["topic_group"] = channel.config["topic_group"]
 
     def __call__(self, flag_key: str) -> Any:
         if flag_key not in self.config:

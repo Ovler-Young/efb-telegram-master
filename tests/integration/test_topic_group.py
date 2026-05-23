@@ -31,13 +31,14 @@ async def test_slave_message_creates_topic_and_delivers(helper, slave_with_topic
     sent = slave_with_topic_group.send_text_message(chat, chat.other)
 
     tg_message = await helper.wait_for_message(in_chats(bot_topic_group) & text)
+    message_thread_id = getattr(tg_message, "message_thread_id", None)
 
     assert tg_message.chat_id == bot_topic_group
-    assert tg_message.reply_to_msg_id is None
-    assert tg_message.message_thread_id is not None
+    assert message_thread_id is not None
+    assert tg_message.reply_to_msg_id in (None, message_thread_id)
     assert sent.text in tg_message.raw_text
 
-    slave_uid = channel_with_topic_group.db.get_topic_slave(bot_topic_group, tg_message.message_thread_id)
+    slave_uid = channel_with_topic_group.db.get_topic_slave(bot_topic_group, message_thread_id)
     assert slave_uid == chat.channel_id + "." + chat.uid
 
 

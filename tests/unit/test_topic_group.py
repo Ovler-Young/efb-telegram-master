@@ -69,6 +69,15 @@ def test_get_slave_msg_dest_uses_topic_group(channel, slave):
     )
 
 
+def test_flag_manager_reads_top_level_topic_group(channel):
+    channel.config["topic_group"] = 34567
+    channel.config["flags"] = {}
+
+    flag = utils.ExperimentalFlagsManager(channel)
+
+    assert flag("topic_group") == 34567
+
+
 def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(50005)
