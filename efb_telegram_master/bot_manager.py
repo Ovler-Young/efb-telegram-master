@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -200,7 +201,12 @@ class AsyncTelegramRuntime:
             raise RuntimeError("Telegram runtime loop is unavailable.")
         if threading.get_ident() == loop_thread_id:
             raise RuntimeError("Synchronous bot wrapper invoked from the PTB event loop thread.")
-        return asyncio.run_coroutine_threadsafe(coroutine, loop).result(timeout)
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        try:
+            return future.result(timeout)
+        except FutureTimeoutError:
+            future.cancel()
+            raise
 
 
 class SyncBotFacade:

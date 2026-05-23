@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 logger = logging.Logger(__name__)
 
+FILE_DOWNLOAD_TIMEOUT = 120
+
 __all__ = ['ETMMsg']
 
 
@@ -95,7 +97,10 @@ class ETMMsg(Message):
                 ext = mimetypes.guess_extension(self.mime, strict=False)
                 mime = self.mime
             file = tempfile.NamedTemporaryFile(suffix=ext)
-            bot_manager._runtime.call(file_meta.download_to_memory(out=file))
+            bot_manager._runtime.call(
+                file_meta.download_to_memory(out=file),
+                timeout=FILE_DOWNLOAD_TIMEOUT,
+            )
             file.seek(0)
 
             if not mime:

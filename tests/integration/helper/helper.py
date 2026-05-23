@@ -17,6 +17,9 @@ from .filters import BaseFilter
 from .utils import parse_socks5_link
 
 
+CLIENT_START_TIMEOUT = 60
+
+
 class TelegramIntegrationTestHelper:
     def __init__(self,
                  session: str, api_id: int, api_hash: str,
@@ -143,13 +146,28 @@ class TelegramIntegrationTestHelper:
     # Context management
     # ------------------
 
-    async def __aenter__(self) -> 'TelegramIntegrationTestHelper':
-        await self.client.connect()
+    async def _startup_step(self, phase: str, operation):
+        try:
+            return await asyncio.wait_for(operation, timeout=CLIENT_START_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Telegram integration helper timed out during {phase} after "
+                f"{CLIENT_START_TIMEOUT} seconds"
+            ) from exc
 
-        # Issue a high level command to start receiving message
-        await self.client.get_me()
-        # Fill the entity cache
-        await self.client.get_dialogs()
+    async def __aenter__(self) -> 'TelegramIntegrationTestHelper':
+        try:
+            await self._startup_step("client connect", self.client.connect())
+
+            # Issue a high level command to start receiving message
+            await self._startup_step("client get_me", self.client.get_me())
+            # Fill the entity cache
+            await self._startup_step("client get_dialogs", self.client.get_dialogs())
+        except BaseException:
+            if self.client.is_connected():
+                await self.client.disconnect()
+                await self.client.disconnected
+            raise
 
         return self
 

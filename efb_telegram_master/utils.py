@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
 from io import BytesIO
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
@@ -23,6 +22,8 @@ from .locale_mixin import LocaleMixin
 
 if TYPE_CHECKING:
     from . import TelegramChannel
+
+FFMPEG_TIMEOUT = 60
 
 
 TelegramChatID = NewType('TelegramChatID', int)
@@ -191,6 +192,68 @@ def _copy_binary_stream(src: BinaryIO, dst: BinaryIO, chunk_size: int = 64 * 102
         dst.write(chunk)
 
 
+def _run_ffmpeg_command(args, *, input_data: Optional[bytes] = None) -> bytes:
+    try:
+        completed = subprocess.run(
+            args,
+            input=input_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=FFMPEG_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"ffmpeg command timed out after {FFMPEG_TIMEOUT} seconds") from exc
+    if completed.returncode != 0:
+        raise ffmpeg.Error(args[0], completed.stdout, completed.stderr)
+    return cast(bytes, completed.stdout)
+
+
+def _write_stream_to_process(stream: IO[bytes], process: subprocess.Popen) -> None:
+    assert process.stdin
+    try:
+        _copy_binary_stream(cast(BinaryIO, stream), cast(BinaryIO, process.stdin))
+    except Exception:
+        process.kill()
+        raise
+    finally:
+        process.stdin.close()
+
+
+def _read_process_stream(stream: IO[bytes], output: BytesIO) -> None:
+    _copy_binary_stream(cast(BinaryIO, stream), output)
+
+
+def _run_ffmpeg_stream_command(args, input_stream: IO[bytes]) -> bytes:
+    process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout = BytesIO()
+    stderr = BytesIO()
+    try:
+        from threading import Thread
+
+        assert process.stdout
+        assert process.stderr
+        writer = Thread(target=_write_stream_to_process, args=(input_stream, process), daemon=True)
+        stdout_reader = Thread(target=_read_process_stream, args=(process.stdout, stdout), daemon=True)
+        stderr_reader = Thread(target=_read_process_stream, args=(process.stderr, stderr), daemon=True)
+        writer.start()
+        stdout_reader.start()
+        stderr_reader.start()
+        process.wait(timeout=FFMPEG_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        raise TimeoutError(f"ffmpeg command timed out after {FFMPEG_TIMEOUT} seconds") from exc
+    writer.join(timeout=1)
+    stdout_reader.join(timeout=1)
+    stderr_reader.join(timeout=1)
+    out = stdout.getvalue()
+    err = stderr.getvalue()
+    if process.returncode != 0:
+        raise ffmpeg.Error(args[0], out, err)
+    return out
+
+
 def export_gif(animation, fp, dpi=96, skip_frames=5):
     """ Fork of lottie.exporters.gif.export_gif
     Adapted from jqqqqqqqqqq/UnifiedMessageRelay
@@ -268,13 +331,7 @@ if os.name == "nt":
         args += convert_kwargs_to_cmd_line_args(kwargs)
         args += ["-"]
 
-        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
-        assert p.stdin
-        _copy_binary_stream(cast(BinaryIO, stream), cast(BinaryIO, p.stdin))
-        out, err = p.communicate()
-        if p.returncode != 0:
-            raise ffmpeg.Error('ffprobe', out, err)
+        out = _run_ffmpeg_stream_command(args, stream)
         return json.loads(out.decode('utf-8'))
 
 
@@ -300,19 +357,7 @@ if os.name == "nt":
         # using standard IO interface. Not sure if that would work on Windows.
         # Using the most classic buffer and copy via IO interface just to play
         # safe.
-        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        assert p.stdin
-        _copy_binary_stream(cast(BinaryIO, file), cast(BinaryIO, p.stdin))
-        p.stdin.close()
-
-        # Raise exception if error occurs, just like ffmpeg-python.
-        if p.returncode != 0 and p.stderr:
-            err = p.stderr.read().decode()
-            print(err, file=sys.stderr)
-            raise ffmpeg.Error('ffmpeg', "", err)
-
-        assert p.stdout
-        _copy_binary_stream(cast(BinaryIO, p.stdout), cast(BinaryIO, gif_file))
+        gif_file.write(_run_ffmpeg_stream_command(args, file))
         file.close()
         gif_file.seek(0)
         return gif_file
@@ -322,13 +367,14 @@ else:
         """Convert Telegram GIF to real GIF, the non-NT way."""
         gif_file = NamedTemporaryFile(suffix='.gif')
         file.seek(0)
-        metadata = ffmpeg.probe(file.name)
+        metadata = ffmpeg.probe(file.name, timeout=FFMPEG_TIMEOUT)
         stream = ffmpeg.input(file.name)
         if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
             # Workaround: Compress GIF for slave channel `blueset.wechat`
             # TODO: Move this logic to `blueset.wechat` in the future
             stream = stream.filter("scale", 600, -2)
-        stream.output(gif_file.name).overwrite_output().run()
+        args = stream.output(gif_file.name).overwrite_output().compile()
+        _run_ffmpeg_command(args)
         file.close()
         gif_file.seek(0)
         return gif_file
