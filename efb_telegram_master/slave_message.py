@@ -1162,7 +1162,7 @@ class SlaveMessageProcessor(LocaleMixin):
         return result
 
     @staticmethod
-    def _reaction_target_message_id(old_msg: ETMMsg, old_msg_db) -> str:
+    def _reaction_target_message_id(old_msg: ETMMsg, old_msg_db) -> utils.TgChatMsgIDStr:
         """Choose which Telegram message should surface a reaction update.
 
         Most slave-originated text/link messages should edit the primary
