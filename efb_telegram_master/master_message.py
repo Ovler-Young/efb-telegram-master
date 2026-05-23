@@ -70,18 +70,23 @@ class MasterMessageProcessor(LocaleMixin):
 
         self.bot.dispatcher.add_handler(CommandHandler("rm", self.bot.as_async_callback(self.delete_message)))
 
-        non_edit_filter = Filters.update.message | Filters.update.channel_post
+        message_update_filter = (
+            Filters.update.message
+            | Filters.update.channel_post
+            | Filters.update.edited_message
+            | Filters.update.edited_channel_post
+        )
 
         self.bot.dispatcher.add_handler(MessageHandler(
             (Filters.text | Filters.photo | Filters.sticker | Filters.document |
              Filters.venue | Filters.location | Filters.audio | Filters.voice |
-             Filters.video | Filters.contact | Filters.video_note | Filters.dice) &
-            non_edit_filter,
+             Filters.video | Filters.animation | Filters.contact | Filters.video_note |
+             Filters.dice) & message_update_filter,
             self.bot.as_async_callback(self.enqueue_message)
         ))
         self.bot.dispatcher.add_handler(MessageHandler(
             (Filters.passport_data | Filters.invoice | Filters.game | Filters.successful_payment |
-             Filters.poll) & non_edit_filter,
+             Filters.poll) & message_update_filter,
             self.bot.as_async_callback(self.unsupported_message)
         ))
         self.logger: logging.Logger = logging.getLogger(__name__)

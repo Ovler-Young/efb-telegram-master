@@ -270,7 +270,10 @@ class MockSlaveChannel(SlaveChannel):
         self.statuses.put(status)
 
     def send_message(self, msg: Message) -> Message:
-        self.logger.debug("Received message: %r", msg)
+        self.logger.debug(
+            "Received message: uid=%r type=%r chat=%r edit=%r edit_media=%r",
+            msg.uid, msg.type, getattr(msg.chat, "uid", None), msg.edit, msg.edit_media,
+        )
         self.messages.put(msg)
         msg.uid = MessageID(str(uuid4()))
         self._store_message(msg)

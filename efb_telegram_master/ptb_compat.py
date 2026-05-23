@@ -44,6 +44,7 @@ class _FiltersCompat:
     audio = filters.AUDIO
     voice = filters.VOICE
     video = filters.VIDEO
+    animation = filters.ANIMATION
     contact = filters.CONTACT
     video_note = filters.VIDEO_NOTE
     dice = filters.Dice.ALL
