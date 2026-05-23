@@ -653,13 +653,15 @@ class ChatBindingManager(LocaleMixin):
         if tg_chat_to_link.is_forum:
             thread_id = self.create_topic(slave_uid=chat_uid, telegram_chat_id=TelegramChatID(tg_chat_to_link.id))
             if not thread_id:
-                msg.reply_text(
+                self.bot.send_message(
+                    msg.chat.id,
                     self._(
                         "Failed to create topic for {name} in the group.\n"
                         "Please make sure the bot has the right.\n"
                         "You can send /init_topics to create again."
                     ).format(name=chat_display_name),
                     reply_to_message_id=msg.message_id)
+                thread_id = None
             else:
                 try:
                     self._update_single_topic_info(TelegramChatID(tg_chat_to_link.id), thread_id, chat_uid)

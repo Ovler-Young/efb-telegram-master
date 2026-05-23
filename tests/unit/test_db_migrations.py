@@ -10,7 +10,7 @@ from ehforwarderbot import Message, MsgType
 from ehforwarderbot.types import MessageID
 
 from efb_telegram_master import utils
-from efb_telegram_master.db import MsgLog, TopicAssoc
+from efb_telegram_master.db import ChatAssoc, MsgLog, TopicAssoc
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
@@ -35,6 +35,40 @@ def test_topic_assoc_table_exists_and_round_trips(channel, slave):
     assert isinstance(assoc, TopicAssoc)
     assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == thread_id
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_create_missing_tables_preserves_existing_chat_assoc(channel):
+    channel.db.add_chat_assoc("master-existing", "slave-existing", multiple_slave=True)
+    TopicAssoc.drop_table(safe=True)
+
+    channel.db._create_missing_tables()
+
+    assert TopicAssoc.table_exists()
+    assert ChatAssoc.get_or_none(ChatAssoc.master_uid == "master-existing") is not None
+    channel.db.remove_chat_assoc(master_uid="master-existing")
+
+
+def test_topic_assoc_is_replaced_for_same_slave_and_thread(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    topic_chat_id = TelegramChatID(33333)
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, TelegramTopicID(44444), slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, TelegramTopicID(55555), slave_uid)
+
+    assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(55555)
+    rows = list(TopicAssoc.select().where(TopicAssoc.slave_uid == slave_uid))
+    assert len(rows) == 1
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_remove_chat_assoc_removes_topic_assoc(channel):
+    channel.db.add_chat_assoc("master-topic-cleanup", "slave-topic-cleanup", multiple_slave=True)
+    channel.db.add_topic_assoc(TelegramChatID(66666), TelegramTopicID(77777), "slave-topic-cleanup")
+
+    channel.db.remove_chat_assoc(master_uid="master-topic-cleanup")
+
+    assert channel.db.get_topic_thread_id("slave-topic-cleanup", TelegramChatID(66666)) is None
 
 
 def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):

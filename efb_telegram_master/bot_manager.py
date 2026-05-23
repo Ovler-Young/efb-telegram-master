@@ -286,6 +286,54 @@ def _has_callback_keyboard(reply_markup) -> bool:
     return False
 
 
+def _clone_file_argument(value):
+    """Copy file-like send arguments so delayed tasks don't depend on caller-owned handles."""
+    if isinstance(value, InputFile):
+        return InputFile(io.BytesIO(value.input_file_content), filename=value.filename)
+    if hasattr(value, 'read') and hasattr(value, 'seek'):
+        current_pos = None
+        try:
+            current_pos = value.tell()
+        except (AttributeError, OSError):
+            pass
+        try:
+            value.seek(0)
+            data = value.read()
+        finally:
+            if current_pos is not None:
+                try:
+                    value.seek(current_pos)
+                except OSError:
+                    pass
+        return io.BytesIO(data)
+    return value
+
+
+def _clone_media_argument(value):
+    """Copy Telegram media objects that wrap caller-owned file handles."""
+    if not hasattr(value, 'media'):
+        return value
+    kwargs = {
+        'caption': getattr(value, 'caption', None),
+        'parse_mode': getattr(value, 'parse_mode', None),
+        'caption_entities': getattr(value, 'caption_entities', None),
+    }
+    optional_attrs = (
+        'filename', 'has_spoiler', 'show_caption_above_media',
+        'disable_content_type_detection', 'thumbnail', 'width', 'height',
+        'duration', 'supports_streaming', 'performer', 'title', 'api_kwargs',
+    )
+    for attr in optional_attrs:
+        if hasattr(value, attr):
+            attr_value = getattr(value, attr)
+            if attr_value:
+                kwargs[attr] = _clone_file_argument(attr_value) if attr == 'thumbnail' else attr_value
+    try:
+        return value.__class__(_clone_file_argument(value.media), **kwargs)
+    except TypeError:
+        return value
+
+
 class TelegramBotManager(LocaleMixin):
     """
     This is a wrapper of Telegram's message sending and editing methods.
@@ -354,6 +402,7 @@ class TelegramBotManager(LocaleMixin):
                     chat_id = args[0]
                 elif 'chat_id' in kwargs:
                     chat_id = kwargs['chat_id']
+                has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
 
                 # if _delayed_worker_stop is set, we should not schedule new tasks
                 if self._delayed_worker_stop.is_set():
@@ -379,30 +428,51 @@ class TelegramBotManager(LocaleMixin):
                             force_sender_known = True
                             forced_sender_bot_id = target_log.sender_bot_id
 
-                if sender_bot_id and self.bot_pool:
-                    aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
-                    if aux_bot and not aux_bot.disabled:
+                if sender_bot_id and self.bot_pool and not has_callback:
+                    bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
+                        chat_id, sender_bot_id,
+                    )
+                    if delay_time > 0:
+                        time.sleep(delay_time)
+                    if chosen_sender_bot_id:
                         try:
-                            with self._using_bot(aux_bot.bot):
+                            with self._using_bot(bot):
                                 result = fn(self, *args, **kwargs)
-                            return self._make_send_receipt(result, sender_bot_id=str(sender_bot_id))
+                            return self._make_send_receipt(result, sender_bot_id=chosen_sender_bot_id)
                         except telegram.error.Forbidden:
                             if chat_id is not None:
-                                aux_bot.update_membership(int(chat_id), False)
+                                aux_bot = self.bot_pool.get_bot_by_id(chosen_sender_bot_id)
+                                if aux_bot:
+                                    aux_bot.update_membership(int(chat_id), False)
                             self.logger.warning(
                                 "Auxiliary bot %s got Forbidden in chat %s during forced-route API call; "
                                 "marking it as non-member for this chat.",
-                                sender_bot_id, chat_id,
+                                chosen_sender_bot_id, chat_id,
                             )
+                    else:
+                        self.logger.warning(
+                            "Auxiliary bot %s is unavailable for forced-route API call in chat %s; "
+                            "falling back to main bot.",
+                            sender_bot_id, chat_id,
+                        )
+                        if chat_id is not None:
+                            self._calculate_rate_limit_delay(chat_id)
+                        return self._make_send_receipt(fn(self, *args, **kwargs))
+                    if chat_id is not None:
+                        aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
+                        if aux_bot:
+                            aux_bot.update_membership(int(chat_id), False)
+                        delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
+                        if delay_time > 0:
+                            time.sleep(delay_time)
                     return self._make_send_receipt(fn(self, *args, **kwargs))
 
                 if chat_id:
-                    has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
                     cleanup_files = getattr(self._cleanup_tls, 'pending_cleanup', [])[:]
                     self._cleanup_tls.pending_cleanup = []
 
                     if send_mode == 'eventual':
-                        if force_sender_known:
+                        if force_sender_known and not has_callback:
                             kwargs = dict(kwargs)
                             kwargs['_force_sender_known'] = True
                             kwargs['_force_sender_bot_id'] = forced_sender_bot_id
@@ -415,7 +485,7 @@ class TelegramBotManager(LocaleMixin):
                         )
 
                     message_thread_id = kwargs.get('message_thread_id')
-                    if force_main_bot:
+                    if force_main_bot or has_callback:
                         bot, chosen_sender_bot_id, delay_time = self._bot, None, 0.0
                     elif force_sender_known:
                         bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
@@ -467,6 +537,7 @@ class TelegramBotManager(LocaleMixin):
             @wraps(fn)
             def rate_limit_error_handler(self: 'TelegramBotManager', *args, **kwargs):
                 max_retries = 3
+                skip_rate_limit_retry = kwargs.pop('_skip_rate_limit_retry', False)
 
                 # Extract chat_id from arguments for logging
                 chat_id = None
@@ -486,6 +557,8 @@ class TelegramBotManager(LocaleMixin):
                     try:
                         return fn(self, *args, **kwargs)
                     except telegram.error.RetryAfter as e:
+                        if skip_rate_limit_retry:
+                            raise
                         timestamp_info = get_timestamp_info()
                         if attempt >= max_retries:
                             cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
@@ -512,6 +585,8 @@ class TelegramBotManager(LocaleMixin):
                         if not cls.enable_retry:
                             raise
                         if "Too Many Requests" in str(e) or "429" in str(e) or "Flood" in str(e):
+                            if skip_rate_limit_retry:
+                                raise
                             timestamp_info = get_timestamp_info()
                             if attempt >= max_retries:
                                 cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
@@ -1033,6 +1108,15 @@ class TelegramBotManager(LocaleMixin):
         cleanup_files: Optional[list] = None,
         delay_time: float = 0.0,
     ) -> SendReceipt:
+        kwargs = dict(kwargs)
+        for key in ('photo', 'document', 'video', 'animation', 'audio', 'voice', 'sticker'):
+            if key in kwargs:
+                kwargs[key] = _clone_file_argument(kwargs[key])
+        if 'media' in kwargs:
+            kwargs['media'] = _clone_media_argument(kwargs['media'])
+        if len(args) >= 3:
+            args = args[:2] + (_clone_file_argument(args[2]),) + args[3:]
+
         task_id = self._schedule_delayed_task(
             chat_id=chat_id,
             delay_time=delay_time,
@@ -1047,10 +1131,12 @@ class TelegramBotManager(LocaleMixin):
     def _select_sender(self, chat_id: int, *, has_callback: bool = False, message_thread_id: Optional[int] = None):
         """Choose the earliest sender using the current main/aux heuristics."""
         main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+        if main_delay <= 0:
+            return self._bot, None, main_delay
         if self.bot_pool and not has_callback:
             slot = self.bot_pool.acquire_send_slot(
                 chat_id,
-                max_delay=main_delay if main_delay > 0 else 0.0,
+                max_delay=main_delay,
                 affinity_key=(chat_id, message_thread_id),
                 notify_admin=(main_delay > 0),
             )
@@ -1064,7 +1150,8 @@ class TelegramBotManager(LocaleMixin):
         if sender_bot_id and self.bot_pool:
             aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
             if aux_bot and not aux_bot.disabled:
-                return aux_bot.bot, str(sender_bot_id), 0.0
+                delay = aux_bot.reserve_slot(chat_id)
+                return aux_bot.bot, str(sender_bot_id), delay
             self.logger.warning(
                 "Reply target sender bot %s is unavailable for chat %s; falling back to main bot.",
                 sender_bot_id, chat_id,
@@ -1124,7 +1211,8 @@ class TelegramBotManager(LocaleMixin):
                 return None, None, frozen_until - now
             aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
             if aux_bot and not aux_bot.disabled:
-                return aux_bot.bot, str(sender_bot_id), 0.0
+                delay = aux_bot.reserve_slot(chat_id)
+                return aux_bot.bot, str(sender_bot_id), delay
             self.logger.warning(
                 "Reply target sender bot %s is unavailable for delayed chat %s; falling back to main bot.",
                 sender_bot_id, chat_id,
@@ -1465,6 +1553,7 @@ class TelegramBotManager(LocaleMixin):
             send_kwargs = dict(task.kwargs)
             send_kwargs.pop('_force_sender_known', None)
             send_kwargs.pop('_force_sender_bot_id', None)
+            send_kwargs['_skip_rate_limit_retry'] = True
             with self._using_bot(sender_bot):
                 return task.function(*task.args, **send_kwargs)
 

@@ -1,4 +1,5 @@
 import asyncio
+import io
 import string
 import random
 import threading
@@ -8,8 +9,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 import telegram.error
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
+from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager, _clone_file_argument
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 
 
@@ -120,6 +122,7 @@ def test_rate_limit_decorator_forced_routes_to_sender_bot():
     manager = SimpleNamespace(
         _delayed_worker_stop=threading.Event(),
         bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
+        _select_forced_sender=Mock(return_value=(aux_bot.bot, "777", 0.0)),
         _using_bot=lambda bot: SimpleNamespace(__enter__=lambda *a: None, __exit__=lambda *a: None),
         _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
             message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
@@ -139,7 +142,7 @@ def test_rate_limit_decorator_forced_routes_to_sender_bot():
     result = decorated(manager, 123, _sender_bot_id="777")
 
     assert result.sender_bot_id == "777"
-    manager.bot_pool.get_bot_by_id.assert_called_once_with("777")
+    manager._select_forced_sender.assert_called_once_with(123, "777")
 
 
 def test_rate_limit_decorator_falls_back_to_main_bot_when_sender_missing():
@@ -147,6 +150,8 @@ def test_rate_limit_decorator_falls_back_to_main_bot_when_sender_missing():
     manager = SimpleNamespace(
         _delayed_worker_stop=threading.Event(),
         bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=None)),
+        _select_forced_sender=Mock(return_value=(object(), None, 0.0)),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
         _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
             message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
         ),
@@ -321,6 +326,43 @@ def test_rate_limit_decorator_routes_reply_to_target_sender_bot():
     manager._select_forced_sender.assert_called_once_with(123, "777")
 
 
+def test_rate_limit_decorator_callback_keyboard_uses_main_bot_even_when_reply_target_was_aux():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
+    main_bot = object()
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    manager = SimpleNamespace(
+        _bot=main_bot,
+        _delayed_worker_stop=threading.Event(),
+        channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id="777")))),
+        bot_pool=SimpleNamespace(get_bot_by_id=Mock()),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _select_sender=Mock(),
+        _select_forced_sender=Mock(),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _using_bot=Mock(return_value=DummyContext()),
+        _record_aux_use=Mock(),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
+        logger=Mock(),
+    )
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Open", callback_data="cb")]])
+
+    result = decorated(manager, 123, reply_to_message_id=456, reply_markup=reply_markup)
+
+    assert result.sender_bot_id is None
+    manager._select_forced_sender.assert_not_called()
+    manager._select_sender.assert_not_called()
+    manager._using_bot.assert_called_once_with(main_bot)
+
+
 def test_rate_limit_decorator_routes_reply_to_main_bot():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
 
@@ -453,12 +495,60 @@ def test_select_sender_does_not_notify_or_use_aux_when_main_has_no_delay():
     assert bot is main_bot
     assert sender_bot_id is None
     assert delay == 0.0
-    manager.bot_pool.acquire_send_slot.assert_called_once_with(
-        chat_id,
-        max_delay=0.0,
-        affinity_key=(chat_id, None),
-        notify_admin=False,
+    manager.bot_pool.acquire_send_slot.assert_not_called()
+
+
+def test_select_forced_sender_reserves_aux_slot():
+    chat_id = -1002608436807
+    aux_bot = SimpleNamespace(
+        bot=object(),
+        bot_id=777,
+        disabled=False,
+        reserve_slot=Mock(return_value=2.5),
     )
+    manager = SimpleNamespace(
+        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _bot=object(),
+        logger=Mock(),
+    )
+
+    bot, sender_bot_id, delay = TelegramBotManager._select_forced_sender(manager, chat_id, "777")
+
+    assert bot is aux_bot.bot
+    assert sender_bot_id == "777"
+    assert delay == 2.5
+    aux_bot.reserve_slot.assert_called_once_with(chat_id)
+
+
+def test_rate_limit_decorator_forced_sender_fallback_reserves_main_slot():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
+    calls = []
+
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=None)),
+        _select_forced_sender=Mock(return_value=(object(), None, 3.0)),
+        _calculate_rate_limit_delay=Mock(side_effect=lambda chat_id: calls.append(chat_id) or (0.0, 0, 0)),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123, _sender_bot_id="777")
+
+    assert result.chat_id == 123
+    assert calls == [123]
+
+
+def test_clone_file_argument_keeps_delayed_send_readable_after_original_closes():
+    original = io.BytesIO(b"queued-media")
+
+    cloned = _clone_file_argument(original)
+    original.close()
+
+    assert cloned.read() == b"queued-media"
 
 
 def test_select_unfrozen_sender_passes_topic_affinity_key_to_bot_pool():

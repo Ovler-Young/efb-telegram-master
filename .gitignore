@@ -128,3 +128,4 @@ CLAUDE.md
 .claude/settings.local.json
 
 .venv/
+AGENTS.md

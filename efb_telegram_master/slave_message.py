@@ -579,7 +579,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     self.logger.warning("[%s] Failed to edit media/caption (BadRequest: %s). Sending new message instead.", msg.uid, e)
                     # Send as a reply if cannot edit previous message.
                     # Check if the target is within the same chat_id (thread_id doesn't matter for this check)
-                    if old_msg_id[0] == str(tg_dest):
+                    if old_msg_id[0] == tg_dest:
                         target_msg_id = target_msg_id or old_msg_id[1] # Reply to the original message
                     msg.file.seek(0)
                     # Fall through to send a new message
@@ -1119,7 +1119,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 slave_msg_id=status.message.uid,
                 slave_origin_uid=utils.chat_id_to_str(chat=status.message.chat))
             if old_msg:
-                old_msg_id: OldMsgID = utils.message_id_str_to_id(old_msg.master_msg_id)
+                old_msg_id: OldMsgID = utils.message_id_str_to_id(old_msg.master_msg_id_alt or old_msg.master_msg_id)
                 self.logger.debug("Found message to delete in Telegram: %s.%s",
                                   *old_msg_id)
                 try:
