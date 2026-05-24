@@ -5,6 +5,7 @@ import itertools
 import logging
 import os
 import tempfile
+import time
 import traceback
 import urllib.parse
 from collections import defaultdict
@@ -46,6 +47,9 @@ if TYPE_CHECKING:
 
 class SlaveMessageProcessor(LocaleMixin):
     """Process messages as Message objects from slave channels."""
+
+    REACTION_DB_WAIT_TIMEOUT = 2.0
+    REACTION_DB_WAIT_INTERVAL = 0.05
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
@@ -1180,11 +1184,17 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def update_reactions(self, status: MessageReactionsUpdate):
         """Update reactions to a Telegram message."""
+        slave_origin_uid = utils.chat_id_to_str(chat=status.chat)
         old_msg_db = self.db.get_msg_log(slave_msg_id=status.msg_id,
-                                         slave_origin_uid=utils.chat_id_to_str(chat=status.chat))
+                                         slave_origin_uid=slave_origin_uid)
+        deadline = time.monotonic() + self.REACTION_DB_WAIT_TIMEOUT
+        while old_msg_db is None and time.monotonic() < deadline:
+            time.sleep(self.REACTION_DB_WAIT_INTERVAL)
+            old_msg_db = self.db.get_msg_log(slave_msg_id=status.msg_id,
+                                             slave_origin_uid=slave_origin_uid)
         if old_msg_db is None:
-            self.logger.exception('Trying to update reactions of message, but message is not found in database. '
-                                  'Message ID %s from %s, status: %s.', status.msg_id, status.chat, status.reactions)
+            self.logger.error('Trying to update reactions of message, but message is not found in database. '
+                              'Message ID %s from %s, status: %s.', status.msg_id, status.chat, status.reactions)
             return
 
         old_msg: ETMMsg = old_msg_db.build_etm_msg(chat_manager=self.chat_manager)
