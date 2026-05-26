@@ -684,16 +684,40 @@ e.g.:
     Enable this option if the bot API is running in ``--local`` mode and
     is using the same file system with ETM.
 
--   ``topic_group`` *(str)* [Default: ``null``]
+-   ``topic_group`` *(int/dict)* [Default: ``null``]
 
     Enable Telegram forum topics mode: send and receive messages in a
     forum-enabled supergroup (topic group), **one topic per linked chat**.
 
-    - The value should be the Telegram chat ID of the forum supergroup
-      (commonly in the form ``-100...``).
+    Can be configured as:
+    
+    1. **Single chat ID** (all chat types go to one group):
+
+       .. code:: yaml
+
+           flags:
+               topic_group: -1001234567890
+
+    2. **Dictionary** (different chat types go to different groups):
+
+       .. code:: yaml
+
+           flags:
+               topic_group:
+                   1: -1002564525716  # 微信（私聊）
+                   2: -1003954649710  # 微信-群
+                   3: -1001234567892  # 微信-系统
+                   4: -1001364178352  # 微信-公众号
+
+       Dictionary key definitions:
+       - 1: Private chat (friend)
+       - 2: Group chat
+       - 3: System chat
+       - 4: Official account (MP)
+
     - When enabled, ETM will store and use Telegram's ``message_thread_id``
       to route messages between a topic and its linked remote chat.
-    - The id set here will be the default topic group for new chats.
+    - The id(s) set here will be the default topic group(s) for new chats.
 
 Network configuration: timeout tweaks
 -------------------------------------

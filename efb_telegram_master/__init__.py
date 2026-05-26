@@ -128,7 +128,8 @@ class TelegramChannel(MasterChannel):
         self.commands: CommandsManager = CommandsManager(self)
         self.chat_binding: ChatBindingManager = ChatBindingManager(self)
         self.slave_messages: SlaveMessageProcessor = SlaveMessageProcessor(self)
-        self.topic_group: Optional[TelegramChatID] = TelegramChatID(self.flag('topic_group'))
+        # topic_group can be either a single integer or a list
+        self.topic_group = self.flag('topic_group')
 
         if not self.flag('auto_locale'):
             self.translator = translation("efb_telegram_master",
@@ -372,11 +373,28 @@ class TelegramChannel(MasterChannel):
         assert isinstance(update.effective_message, telegram.Message)
         assert isinstance(update.effective_chat, telegram.Chat)
         if context.args:  # Group binding command
-            if (update.effective_message.chat.type != telegram.Chat.PRIVATE and update.effective_chat.id != self.topic_group) or \
+            # Check if topic_group is a single value or dict
+            is_topic_group = False
+            if self.topic_group is not None:
+                if isinstance(self.topic_group, dict):
+                    is_topic_group = update.effective_chat.id in self.topic_group.values()
+                else:
+                    is_topic_group = update.effective_chat.id == self.topic_group
+            if (update.effective_message.chat.type != telegram.Chat.PRIVATE and not is_topic_group) or \
                     (update.effective_message.forward_from_chat and
-                     update.effective_message.forward_from_chat.type == telegram.Chat.CHANNEL and
-                     update.effective_message.forward_from_chat.id != self.topic_group):
-                self.chat_binding.link_chat(update, context.args)
+                     update.effective_message.forward_from_chat.type == telegram.Chat.CHANNEL):
+                # Check if forwarded channel is in topic_group (dict or single)
+                forward_is_topic = False
+                if update.effective_message.forward_from_chat:
+                    if isinstance(self.topic_group, dict):
+                        forward_is_topic = update.effective_message.forward_from_chat.id in self.topic_group.values()
+                    else:
+                        forward_is_topic = update.effective_message.forward_from_chat.id == self.topic_group
+                if not forward_is_topic:
+                    self.chat_binding.link_chat(update, context.args)
+                else:
+                    self.bot_manager.send_message(update.effective_chat.id,
+                                                  self._('You cannot link remote chats to here. Please try again.'))
             else:
                 self.bot_manager.send_message(update.effective_chat.id,
                                               self._('You cannot link remote chats to here. Please try again.'))
