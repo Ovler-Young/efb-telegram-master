@@ -1,7 +1,10 @@
 from types import SimpleNamespace
+import io
 from unittest.mock import Mock, patch
 
+from PIL import Image
 from telegram import Update
+from telegram.error import BadRequest
 
 from ehforwarderbot import Message
 from ehforwarderbot.types import ChatID
@@ -34,6 +37,21 @@ def _build_slave_message(slave, chat=None, author=None):
     msg.author = author
     msg.text = "topic group text"
     return msg
+
+
+def _png_bytes(color=(255, 0, 0, 255)):
+    out = io.BytesIO()
+    Image.new("RGBA", (64, 64), color).save(out, "PNG")
+    out.seek(0)
+    return out
+
+
+def _sticker_set(name, stickers):
+    return SimpleNamespace(name=name, title=name, stickers=stickers)
+
+
+def _sticker(emoji, custom_emoji_id):
+    return SimpleNamespace(emoji=emoji, custom_emoji_id=custom_emoji_id)
 
 
 def test_topic_assoc_crud(channel, slave):
@@ -94,6 +112,167 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(60006)
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_create_topic_uses_configured_custom_emoji_id(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    topic_chat_id = TelegramChatID(61005)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.config["topic_icons"] = {
+        "custom_emoji_ids": {
+            slave_uid: "emoji-configured",
+        },
+    }
+
+    forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(61006))
+    with patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
+        result = channel.chat_binding.create_topic(slave_uid, topic_chat_id)
+
+    assert result == TelegramTopicID(61006)
+    create_forum_topic.assert_called_once_with(
+        chat_id=topic_chat_id,
+        name=channel.chat_manager.get_chat(slave.chat_with_alias.module_id, slave.chat_with_alias.uid).chat_title,
+        icon_custom_emoji_id="emoji-configured",
+    )
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.config.pop("topic_icons", None)
+
+
+def test_topic_icon_set_name_keeps_bot_username_suffix(channel):
+    channel.config["topic_icons"] = {
+        "sticker_set_name": "etm_topic_icons",
+    }
+
+    with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")):
+        base_name = channel.chat_binding._get_topic_icon_set_base_name()
+        next_name = channel.chat_binding._build_topic_icon_set_name(base_name, 2)
+
+    assert base_name == "etm_topic_icons"
+    assert next_name == "etm_topic_icons_2_by_testbot"
+    channel.config.pop("topic_icons", None)
+
+
+def test_topic_icon_adds_to_existing_set_without_guessing_by_emoji(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    channel.config["topic_icons"] = {
+        "sync_avatar_to_custom_emoji": True,
+        "sticker_set_name": "etm_topic_icons",
+        "owner_user_id": 99,
+    }
+    existing_set = _sticker_set("etm_topic_icons_by_testbot", [_sticker("😀", "emoji-existing")])
+    updated_set = _sticker_set("etm_topic_icons_by_testbot", [
+        _sticker("😀", "emoji-existing"),
+        _sticker(channel.chat_binding._topic_icon_emoji_name(slave_uid), "emoji-added"),
+    ])
+
+    with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
+         patch.object(
+             channel.bot_manager,
+             "get_sticker_set",
+             side_effect=[existing_set, updated_set],
+         ) as get_sticker_set, \
+         patch.object(channel.bot_manager, "add_sticker_to_set") as add_sticker_to_set, \
+         patch.object(channel.bot_manager, "create_new_sticker_set") as create_new_sticker_set:
+        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+
+    assert custom_emoji_id == "emoji-added"
+    assert get_sticker_set.call_args_list[-1].args == ("etm_topic_icons_by_testbot",)
+    add_sticker_to_set.assert_called_once()
+    create_new_sticker_set.assert_not_called()
+    channel.config.pop("topic_icons", None)
+
+
+def test_topic_icon_creates_next_set_when_existing_sets_are_full(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    channel.config["topic_icons"] = {
+        "sync_avatar_to_custom_emoji": True,
+        "sticker_set_name": "etm_topic_icons",
+        "owner_user_id": 99,
+    }
+    full_set = _sticker_set(
+        "etm_topic_icons_by_testbot",
+        [_sticker("😀", f"full-{i}") for i in range(channel.chat_binding.TELEGRAM_CUSTOM_EMOJI_SET_LIMIT)],
+    )
+    created_set = _sticker_set(
+        "etm_topic_icons_2_by_testbot",
+        [_sticker(channel.chat_binding._topic_icon_emoji_name(slave_uid), "emoji-created")],
+    )
+    get_sticker_set = Mock(side_effect=[full_set, BadRequest("Sticker set not found"), created_set])
+
+    with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
+         patch.object(channel.bot_manager, "get_sticker_set", get_sticker_set), \
+         patch.object(channel.bot_manager, "create_new_sticker_set", return_value=True) as create_new_sticker_set:
+        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+
+    assert custom_emoji_id == "emoji-created"
+    create_new_sticker_set.assert_called_once()
+    assert create_new_sticker_set.call_args.kwargs["name"] == "etm_topic_icons_2_by_testbot"
+    assert create_new_sticker_set.call_args.kwargs["user_id"] == 99
+    assert create_new_sticker_set.call_args.kwargs["sticker_type"] == "custom_emoji"
+    assert create_new_sticker_set.call_args.kwargs["stickers"][0].format == "static"
+    channel.config.pop("topic_icons", None)
+
+
+def test_sync_topic_icons_updates_existing_topic_with_avatar_custom_emoji(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    topic_chat_id = TelegramChatID(62005)
+    thread_id = TelegramTopicID(62006)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+    channel.config["topic_icons"] = {
+        "sync_avatar_to_custom_emoji": True,
+        "sticker_set_name": "etm_topic_icons_by_testbot",
+    }
+    sent_message = SimpleNamespace(message_id=123)
+
+    with patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji", return_value="emoji-avatar"), \
+         patch.object(channel.bot_manager, "edit_forum_topic", return_value=True) as edit_forum_topic, \
+         patch.object(channel.bot_manager, "send_photo", return_value=sent_message), \
+         patch.object(channel.bot_manager, "pin_chat_message"), \
+         patch("time.sleep"):
+        success, _, count = channel.chat_binding._update_forum_group_info(
+            topic_chat_id,
+            sync_topic_icons=True,
+        )
+
+    assert success is True
+    assert count == 1
+    edit_forum_topic.assert_called_once()
+    assert edit_forum_topic.call_args.kwargs["icon_custom_emoji_id"] == "emoji-avatar"
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.config.pop("topic_icons", None)
+
+
+def test_update_topic_info_does_not_clear_existing_icon_when_sync_fails(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    topic_chat_id = TelegramChatID(63005)
+    thread_id = TelegramTopicID(63006)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+    channel.config["topic_icons"] = {
+        "sync_avatar_to_custom_emoji": True,
+        "sticker_set_name": "etm_topic_icons",
+    }
+    sent_message = SimpleNamespace(message_id=123)
+
+    with patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji", return_value=None), \
+         patch.object(channel.bot_manager, "edit_forum_topic", return_value=True) as edit_forum_topic, \
+         patch.object(channel.bot_manager, "send_photo", return_value=sent_message), \
+         patch.object(channel.bot_manager, "pin_chat_message"), \
+         patch("time.sleep"):
+        success, _, count = channel.chat_binding._update_forum_group_info(
+            topic_chat_id,
+            sync_topic_icons=True,
+        )
+
+    assert success is True
+    assert count == 1
+    assert "icon_custom_emoji_id" not in edit_forum_topic.call_args.kwargs
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.config.pop("topic_icons", None)
 
 
 def test_master_message_routes_forum_thread_to_slave(channel, slave):

@@ -695,6 +695,39 @@ e.g.:
       to route messages between a topic and its linked remote chat.
     - The id set here will be the default topic group for new chats.
 
+-   ``topic_icons`` *(dict)* [Default: ``{}``]
+
+    Configure custom emoji icons for forum topics.
+
+    - ``sync_avatar_to_custom_emoji``: when ``true``, ``/sync_topic_icons``
+      converts linked remote chat avatars into Telegram custom emoji stickers
+      in reusable sticker sets and applies them to all existing topic bindings.
+      This depends on Telegram accepting generated custom emoji as forum topic
+      icons for the bot account; run the optional live smoke test with
+      ``TEST_PREMIUM_TOPIC_CUSTOM_EMOJI=1`` in a Premium-owner environment
+      before relying on it in production.
+    - ``sticker_set_name``: base sticker set name used for generated custom
+      emoji. ETM appends ``_by_<bot_username>`` when it is not already present.
+      When one set reaches Telegram's 200-sticker limit, ETM adds ``_<n>``
+      before the bot username suffix.
+    - ``owner_user_id``: optional Telegram user ID that owns generated sticker
+      sets. Defaults to the first configured admin.
+    - ``custom_emoji_ids``: optional mapping from ETM slave chat UID to an
+      existing ``custom_emoji_id``. These IDs are used before generated avatar
+      emoji, and are the only reliable way to reuse an already-created custom
+      emoji for the same chat across runs.
+
+    Example:
+
+    .. code:: yaml
+
+       topic_icons:
+           sync_avatar_to_custom_emoji: true
+           sticker_set_name: etm_topic_icons
+           owner_user_id: 102938475
+           custom_emoji_ids:
+               blueset.telegram:example-chat: "5368324170671202286"
+
 Network configuration: timeout tweaks
 -------------------------------------
 

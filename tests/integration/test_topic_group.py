@@ -1,4 +1,5 @@
 import re
+import os
 from queue import Empty
 
 import pytest
@@ -69,3 +70,44 @@ async def test_reply_inside_topic_routes_back_to_slave(helper, client, slave_wit
 
     assert slave_message.chat.uid == chat.uid
     assert slave_message.text == "topic reply integration"
+
+
+def test_bot_api_accepts_generated_custom_emoji_for_topic_icon(channel_with_topic_group, slave_with_topic_group,
+                                                              bot_topic_group):
+    if os.getenv("TEST_PREMIUM_TOPIC_CUSTOM_EMOJI") != "1":
+        pytest.skip("Set TEST_PREMIUM_TOPIC_CUSTOM_EMOJI=1 to run this live Bot API capability check.")
+
+    chat = slave_with_topic_group.chat_with_alias
+    slave_uid = utils.chat_id_to_str(chat=chat)
+    manager = channel_with_topic_group.chat_binding
+    old_topic_icons = channel_with_topic_group.config.get("topic_icons")
+    base_name = os.getenv("TEST_TOPIC_CUSTOM_EMOJI_SET", "etm_topic_icon_live")
+    try:
+        channel_with_topic_group.config["topic_icons"] = {
+            "sync_avatar_to_custom_emoji": True,
+            "sticker_set_name": base_name,
+        }
+        topic = channel_with_topic_group.bot_manager.create_forum_topic(
+            chat_id=bot_topic_group,
+            name="ETM custom emoji smoke",
+        )
+        picture = slave_with_topic_group.get_chat_picture(chat)
+        custom_emoji_id = manager._get_or_create_topic_icon_custom_emoji(slave_uid, picture)
+
+        assert custom_emoji_id
+        assert channel_with_topic_group.bot_manager.edit_forum_topic(
+            chat_id=bot_topic_group,
+            message_thread_id=topic.message_thread_id,
+            name="ETM custom emoji smoke",
+            icon_custom_emoji_id=custom_emoji_id,
+        )
+    finally:
+        if "topic" in locals():
+            channel_with_topic_group.bot_manager.delete_forum_topic(
+                chat_id=bot_topic_group,
+                message_thread_id=topic.message_thread_id,
+            )
+        if old_topic_icons is None:
+            channel_with_topic_group.config.pop("topic_icons", None)
+        else:
+            channel_with_topic_group.config["topic_icons"] = old_topic_icons

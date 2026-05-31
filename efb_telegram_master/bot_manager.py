@@ -20,7 +20,7 @@ from unittest.mock import Mock, patch
 import telegram.constants
 import telegram.error
 from retrying import retry
-from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
+from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, StickerSet, Update, User
 from telegram import Message as TelegramMessage
 from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
 from telegram.ext import _applicationbuilder as ptb_applicationbuilder
@@ -2307,6 +2307,31 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_chat_migration
     def reopen_forum_topic(self, *args, **kwargs) -> bool:
         return cast(bool, self._bot.reopen_forum_topic(*args, **kwargs))
+
+    @Decorators.retry_on_timeout
+    @Decorators.retry_on_chat_migration
+    def delete_forum_topic(self, *args, **kwargs) -> bool:
+        return cast(bool, self._bot.delete_forum_topic(*args, **kwargs))
+
+    @Decorators.retry_on_timeout
+    def create_new_sticker_set(self, *args, **kwargs) -> bool:
+        return cast(bool, self._bot.create_new_sticker_set(*args, **kwargs))
+
+    @Decorators.retry_on_timeout
+    def add_sticker_to_set(self, *args, **kwargs) -> bool:
+        return cast(bool, self._bot.add_sticker_to_set(*args, **kwargs))
+
+    @Decorators.retry_on_timeout
+    def get_sticker_set(self, *args, **kwargs) -> StickerSet:
+        return cast(StickerSet, self._bot.get_sticker_set(*args, **kwargs))
+
+    @Decorators.retry_on_timeout
+    def get_forum_topic_icon_stickers(self, *args, **kwargs):
+        return self._bot.get_forum_topic_icon_stickers(*args, **kwargs)
+
+    @Decorators.retry_on_timeout
+    def delete_sticker_from_set(self, *args, **kwargs) -> bool:
+        return cast(bool, self._bot.delete_sticker_from_set(*args, **kwargs))
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
