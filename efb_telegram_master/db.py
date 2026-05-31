@@ -7,7 +7,6 @@ import time
 from contextlib import suppress
 from functools import partial
 from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING
-
 from pathlib import Path
 
 from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy
@@ -60,6 +59,7 @@ class TopicAssoc(BaseModel):
     topic_chat_id = TextField()
     message_thread_id = TextField()
     slave_uid = TextField()
+
 
 class ChatAssoc(BaseModel):
     master_uid = TextField()

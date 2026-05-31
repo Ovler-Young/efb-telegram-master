@@ -56,9 +56,7 @@ class SlidingWindowRateLimiter:
         self._global_timestamps: list[float] = []
         self._chat_timestamps: Dict[int, deque] = defaultdict(deque)
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def peek_delay(self, chat_id: int) -> float:
         """Return the delay (seconds) before a send to *chat_id* is allowed.
@@ -88,9 +86,7 @@ class SlidingWindowRateLimiter:
             self._cleanup()
             return len(self._chat_timestamps[chat_id]), len(self._global_timestamps)
 
-    # ------------------------------------------------------------------
     # Internals
-    # ------------------------------------------------------------------
 
     def _compute_delay(self, chat_id: int) -> float:
         """Delay computation shared by peek / reserve (caller holds lock)."""
@@ -100,7 +96,7 @@ class SlidingWindowRateLimiter:
         effective_chat_limit = self.chat_limit - self._margin
         effective_global_limit = self.global_limit - self._margin
 
-        # ── Per-chat window ──
+        # Per-chat window
         chat_delay = 0.0
         chat_ts = self._chat_timestamps[chat_id]
         if len(chat_ts) >= effective_chat_limit:
@@ -109,7 +105,7 @@ class SlidingWindowRateLimiter:
 
         candidate_time = current_time + chat_delay
 
-        # ── Global window ──
+        # Global window
         while True:
             left_bound = candidate_time - self.global_window
             idx = bisect.bisect_right(self._global_timestamps, left_bound)

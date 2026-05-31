@@ -144,6 +144,8 @@ typing = _Typing()
 
 class _Message(BaseFilter):
     def filter(self, event: EventCommon):
+        # MessageEdited.Event is a subclass of NewMessage.Event in some Telethon versions,
+        # but list both event classes so the intended coverage is explicit.
         return isinstance(event, (NewMessage.Event, MessageEdited.Event))
 
     def __repr__(self):
