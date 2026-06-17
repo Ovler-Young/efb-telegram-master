@@ -39,6 +39,7 @@ class DelayedTask(NamedTuple):
     kwargs: dict       # Function keyword arguments
     task_id: str       # Unique task identifier
     cleanup_files: list = []  # Files to delete after task completes
+    allow_aux_routing: bool = True  # Whether delayed execution may switch to an auxiliary bot
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -113,6 +114,8 @@ class TelegramBotManager(LocaleMixin):
             """Apply rate limiting to API calls with two-mode routing for multi-bot pool."""
             @wraps(fn)
             def rate_limit_wrapper(self: 'TelegramBotManager', *args, **kwargs):
+                is_edit_method = fn.__name__.startswith('edit_message_')
+
                 # Bypass: caller already reserved a slot and set _using_bot
                 if kwargs.pop('_bypass_rate_limit', False):
                     return fn(self, *args, **kwargs)
@@ -137,6 +140,10 @@ class TelegramBotManager(LocaleMixin):
                     aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
                     if aux_bot and not aux_bot.disabled:
                         try:
+                            if chat_id:
+                                delay_time = aux_bot.reserve_slot(chat_id)
+                                if delay_time > 0:
+                                    time.sleep(delay_time)
                             with self._using_bot(aux_bot.bot):
                                 result = fn(self, *args, **kwargs)
                             if result and hasattr(result, '__dict__'):
@@ -146,11 +153,15 @@ class TelegramBotManager(LocaleMixin):
                             aux_bot.mark_disabled("Unauthorized during forced-route API call")
                             self._notify_admin_disabled_bot(aux_bot)
                     # Fallback: sender bot unavailable, try main bot
+                    if chat_id:
+                        delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
+                        if delay_time > 0:
+                            time.sleep(delay_time)
                     return fn(self, *args, **kwargs)
 
                 # MODE 2: Pool routing (new sends pick best available bot)
                 # Only attempt aux bots when the main bot would impose a delay.
-                if chat_id and self.bot_pool:
+                if chat_id and self.bot_pool and not is_edit_method:
                     # Skip pool for messages with callback keyboards (EC-4)
                     has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
                     if not has_callback:
@@ -192,7 +203,8 @@ class TelegramBotManager(LocaleMixin):
                             function=fn,
                             args=(self,) + args,
                             kwargs=kwargs,
-                            cleanup_files=cleanup_files
+                            cleanup_files=cleanup_files,
+                            allow_aux_routing=not is_edit_method
                         )
 
                         # Return a placeholder response to indicate message was scheduled
@@ -705,7 +717,8 @@ class TelegramBotManager(LocaleMixin):
         return mock_msg
 
     def _schedule_delayed_task(self, chat_id: int, delay_time: float, function: Callable,
-                              args: tuple, kwargs: dict, cleanup_files: Optional[list] = None) -> str:
+                              args: tuple, kwargs: dict, cleanup_files: Optional[list] = None,
+                              allow_aux_routing: bool = True) -> str:
         """
         Schedule a task for delayed execution.
 
@@ -715,6 +728,7 @@ class TelegramBotManager(LocaleMixin):
             function: Function to execute
             args: Function arguments
             kwargs: Function keyword arguments
+            allow_aux_routing: If True, delayed execution may switch to an auxiliary bot.
 
         Returns:
             Task ID for tracking
@@ -729,7 +743,8 @@ class TelegramBotManager(LocaleMixin):
             args=args,
             kwargs=kwargs,
             task_id=task_id,
-            cleanup_files=cleanup_files or []
+            cleanup_files=cleanup_files or [],
+            allow_aux_routing=allow_aux_routing
         )
 
         with self._delayed_queue_lock:
@@ -768,7 +783,7 @@ class TelegramBotManager(LocaleMixin):
                         # Re-check pool: if an aux bot has become available, route through it
                         result = None
                         routed_to_aux = False
-                        if self.bot_pool and task.chat_id:
+                        if task.allow_aux_routing and self.bot_pool and task.chat_id:
                             slot = self.bot_pool.acquire_send_slot(task.chat_id, max_delay=0.01)
                             if slot is not None:
                                 aux_bot, _ = slot
@@ -1220,12 +1235,14 @@ class TelegramBotManager(LocaleMixin):
                                chat_id=update.effective_chat.id,
                                message_id=update.effective_message.message_id)
 
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
         return self._active_bot.edit_message_caption(*args, **kwargs)
 
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
