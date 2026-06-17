@@ -9,15 +9,15 @@ from pkg_resources import resource_filename
 
 import cjkwrap
 from ruamel.yaml import YAML
-from telegram import Bot, TelegramError
-from telegram.ext.filters import Filters
-from telegram.ext import MessageHandler, Updater
-from telegram.utils.request import Request
+from telegram import Bot
+from telegram.error import TelegramError
+from telegram.ext import filters
 
 from ehforwarderbot import coordinator, utils
 from ehforwarderbot.types import ModuleID
 
 from . import TelegramChannel
+from .ptb_compat import MessageHandler, build_application, build_request, run_sync
 
 
 def print_wrapped(text):
@@ -184,7 +184,7 @@ def input_bot_token(data: DataModel, default=None):
                 bot_kwargs: dict = {"token": ans}
                 if data.request is not None:
                     bot_kwargs["request"] = data.request
-                Bot(**bot_kwargs).get_me()
+                run_sync(Bot(**bot_kwargs).get_me())
             except TelegramError as e:
                 print_wrapped(str(e))
                 print()
@@ -231,7 +231,7 @@ def setup_proxy(data):
                     "username": username,
                     "password": password
                 }
-        data.request = Request(**data.data['request_kwargs'])
+        data.request = build_request(data.data['request_kwargs'])
 
 
 def setup_telegram_bot(data):
@@ -309,7 +309,7 @@ def setup_telegram_bot_commands_list(data):
         bot_kwargs: dict = {"token": data.data['token']}
         if data.request is not None:
             bot_kwargs["request"] = data.request
-        Bot(**bot_kwargs).set_my_commands(
+        run_sync(Bot(**bot_kwargs).set_my_commands(
             [
                 ("help", _("Show commands list.")),
                 ("link", _("Link a remote chat to a group.")),
@@ -321,7 +321,7 @@ def setup_telegram_bot_commands_list(data):
                 ("react", _("Send a reaction to a message, or show a list of reactors.")),
                 ("rm", _("Remove a message from its remote chat.")),
             ]
-        )
+        ))
 
         print(_("OK"))
         print()
@@ -373,13 +373,11 @@ def setup_admins(data):
         if answer == prompt_yes:
             print(_("Starting ID bot..."), end="", flush=True)
 
-            updater = Updater(token=data.data['token'],
-                              request_kwargs=data.data.get(
-                                  'request_kwargs', None),
-                              use_context=True)
+            updater = build_application(data.data['token'],
+                                        request_kwargs=data.data.get('request_kwargs', None))
             updater.dispatcher.add_handler(
                 MessageHandler(
-                    Filters.all,
+                    filters.ALL,
                     lambda update, context:
                     update.effective_message.reply_text(
                         _("Your Telegram user ID is {id}.").format(

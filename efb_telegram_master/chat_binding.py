@@ -12,11 +12,10 @@ from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Patter
 
 import telegram  # lgtm [py/import-and-import-from]
 from PIL import Image
-from telegram import Update, Message, TelegramError, InlineKeyboardButton, ChatAction, InlineKeyboardMarkup, \
-    ParseMode
-from telegram.error import BadRequest
-from telegram.ext import ConversationHandler, CommandHandler, CallbackQueryHandler, CallbackContext, Filters, \
-    MessageHandler
+from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import CallbackContext, ConversationHandler, filters
 
 from ehforwarderbot import coordinator, Channel, MsgType
 from ehforwarderbot.channel import SlaveChannel
@@ -29,6 +28,7 @@ from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
+from .ptb_compat import CallbackQueryHandler, CommandHandler, MessageHandler
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, TelegramTopicID
 
 if TYPE_CHECKING:
@@ -105,7 +105,7 @@ class ChatBindingManager(LocaleMixin):
         self._topic_mutex = threading.Lock()
 
         # Link handler
-        non_edit_filter = Filters.update.message | Filters.update.channel_post
+        non_edit_filter = filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POSTS
         self.bot.dispatcher.add_handler(
             CommandHandler("link", self.link_chat_show_list, filters=non_edit_filter))
         self.link_handler = ConversationHandler(
@@ -157,11 +157,11 @@ class ChatBindingManager(LocaleMixin):
         self.bot.dispatcher.add_handler(CommandHandler('init_topics', self.topic_migration))
 
         self.bot.dispatcher.add_handler(
-            MessageHandler(Filters.status_update.migrate, self.chat_migration))
+            MessageHandler(filters.StatusUpdate.MIGRATE, self.chat_migration))
         self.bot.dispatcher.add_handler(
-            MessageHandler(Filters.status_update.new_chat_members, self.chat_joined))
+            MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.chat_joined))
         self.bot.dispatcher.add_handler(
-            MessageHandler(Filters.status_update.left_chat_member, self.chat_left))
+            MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, self.chat_left))
 
     def pre_link_check(self, message: Message):
         """Check if the bot would work properly in a linked group.

@@ -8,7 +8,7 @@ from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 
 
 def test_initialize_sets_identity():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
+    with patch("efb_telegram_master.ptb_compat.telegram.Bot") as bot_cls:
         bot = bot_cls.return_value
         bot.get_me.return_value = SimpleNamespace(id=123, username="auxbot")
 
@@ -21,8 +21,8 @@ def test_initialize_sets_identity():
 
 
 def test_initialize_disables_bot_on_unauthorized():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
-        bot_cls.return_value.get_me.side_effect = telegram.error.Unauthorized("bad token")
+    with patch("efb_telegram_master.ptb_compat.telegram.Bot") as bot_cls:
+        bot_cls.return_value.get_me.side_effect = telegram.error.Forbidden("bad token")
         aux_bot = AuxiliaryBot("123:token")
 
     assert aux_bot.initialize() is False
@@ -30,7 +30,7 @@ def test_initialize_disables_bot_on_unauthorized():
 
 
 def test_rate_limit_peek_and_reserve():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.ptb_compat.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token", global_limit=3, global_window=10.0, chat_limit=3, chat_window=10.0)
 
     chat_id = 100
@@ -44,7 +44,7 @@ def test_rate_limit_peek_and_reserve():
 
 
 def test_check_membership_tri_starts_probe_for_unknown():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.ptb_compat.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token")
 
     with patch.object(aux_bot, "_start_membership_probe") as start_probe:
@@ -54,7 +54,7 @@ def test_check_membership_tri_starts_probe_for_unknown():
 
 
 def test_check_membership_tri_returns_stale_value_while_refreshing():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.ptb_compat.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token")
 
     with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0):
@@ -68,7 +68,7 @@ def test_check_membership_tri_returns_stale_value_while_refreshing():
 
 
 def test_check_membership_sync_waits_for_probe_completion():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.ptb_compat.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token")
 
     state = {"pending": True, "sleep_calls": 0}
@@ -92,7 +92,7 @@ def test_check_membership_sync_waits_for_probe_completion():
 
 
 def test_probe_membership_marks_non_member_on_bad_request():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
+    with patch("efb_telegram_master.ptb_compat.telegram.Bot") as bot_cls:
         bot = bot_cls.return_value
         bot.get_chat_member.side_effect = telegram.error.BadRequest("not found")
         aux_bot = AuxiliaryBot("123:token")
@@ -103,7 +103,7 @@ def test_probe_membership_marks_non_member_on_bad_request():
 
 
 def test_mark_disabled_sets_reason():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.ptb_compat.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token")
 
     aux_bot.mark_disabled("rate limit")

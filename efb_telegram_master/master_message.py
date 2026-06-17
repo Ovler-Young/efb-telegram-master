@@ -7,10 +7,11 @@ from threading import Thread
 from typing import Optional, TYPE_CHECKING, Tuple, Any
 
 import humanize
-from telegram import Update, Message, Chat, TelegramError, Contact, File
+from telegram import Update, Message, Chat, Contact, File
 from telegram.constants import MAX_FILESIZE_DOWNLOAD
-from telegram.ext import MessageHandler, Filters, CallbackContext, CommandHandler
-from telegram.utils.helpers import escape_markdown
+from telegram.error import TelegramError
+from telegram.ext import CallbackContext, filters
+from telegram.helpers import escape_markdown
 
 from ehforwarderbot import coordinator
 from ehforwarderbot.constants import MsgType
@@ -24,6 +25,7 @@ from .chat_destination_cache import ChatDestinationCache
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType, get_msg_type
+from .ptb_compat import CommandHandler, MessageHandler
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 
 if TYPE_CHECKING:
@@ -69,15 +71,15 @@ class MasterMessageProcessor(LocaleMixin):
         self.bot.dispatcher.add_handler(CommandHandler("rm", self.delete_message))
 
         self.bot.dispatcher.add_handler(MessageHandler(
-            (Filters.text | Filters.photo | Filters.sticker | Filters.document |
-             Filters.venue | Filters.location | Filters.audio | Filters.voice |
-             Filters.video | Filters.contact | Filters.video_note | Filters.dice) &
-            Filters.update,
+            (filters.TEXT | filters.PHOTO | filters.Sticker.ALL | filters.Document.ALL |
+             filters.VENUE | filters.LOCATION | filters.AUDIO | filters.VOICE |
+             filters.VIDEO | filters.CONTACT | filters.VIDEO_NOTE | filters.Dice.ALL) &
+            filters.UpdateType.MESSAGE,
             self.enqueue_message
         ))
         self.bot.dispatcher.add_handler(MessageHandler(
-            (Filters.passport_data | Filters.invoice | Filters.game | Filters.successful_payment |
-             Filters.poll) & Filters.update,
+            (filters.PASSPORT_DATA | filters.INVOICE | filters.GAME | filters.SUCCESSFUL_PAYMENT |
+             filters.POLL) & filters.UpdateType.MESSAGE,
             self.unsupported_message
         ))
         self.logger: logging.Logger = logging.getLogger(__name__)

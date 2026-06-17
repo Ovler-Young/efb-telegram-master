@@ -5,11 +5,12 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, Optional, Tuple, TYPE_CHECKING
 
 import telegram
 import telegram.error
-from telegram.utils.request import Request
+
+from .ptb_compat import SyncTelegramBot, build_bot, forbidden_errors
 
 if TYPE_CHECKING:
     pass
@@ -35,15 +36,10 @@ class AuxiliaryBot:
                  global_window: float = 1.0,
                  chat_limit: int = 20,
                  chat_window: float = 60.0):
-        kwargs: Dict[str, Any] = {}
-        if base_url:
-            kwargs['base_url'] = base_url
-        if base_file_url:
-            kwargs['base_file_url'] = base_file_url
-        if request_kwargs:
-            kwargs['request'] = Request(**request_kwargs)
-
-        self.bot: telegram.Bot = telegram.Bot(token=token, **kwargs)
+        self.bot: SyncTelegramBot = build_bot(token=token,
+                                              base_url=base_url,
+                                              base_file_url=base_file_url,
+                                              request_kwargs=request_kwargs)
 
         # Identity (populated by initialize())
         self.bot_id: int = 0
@@ -75,7 +71,7 @@ class AuxiliaryBot:
             self.username = me.username or ""
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)
             return True
-        except telegram.error.Unauthorized as e:
+        except forbidden_errors() as e:
             self.disabled = True
             self._disable_reason = str(e)
             logger.error("Failed to initialize auxiliary bot: %s", e)
@@ -252,7 +248,7 @@ class AuxiliaryBot:
             self.update_membership(chat_id, is_member)
             logger.debug("Membership probe for bot %d in chat %d: %s (status=%s)",
                          self.bot_id, chat_id, is_member, member.status)
-        except telegram.error.Unauthorized:
+        except forbidden_errors():
             self.disabled = True
             self._disable_reason = "Unauthorized during membership probe"
             logger.error("Auxiliary bot %d got Unauthorized during membership probe", self.bot_id)

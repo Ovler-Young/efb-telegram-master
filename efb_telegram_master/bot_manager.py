@@ -21,13 +21,14 @@ import telegram.error
 from retrying import retry
 from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
 from telegram import Message as TelegramMessage
-from telegram.ext import CallbackContext, Dispatcher, Filters, MessageHandler, Updater
+from telegram.ext import CallbackContext, filters
 
 from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
+from .ptb_compat import MessageHandler, SyncApplication, SyncTelegramBot, build_application, forbidden_errors
 
 
 class DelayedTask(NamedTuple):
@@ -65,19 +66,19 @@ class TelegramBotManager(LocaleMixin):
     Attributes:
         me (telegram.User): Telegram User
         admins (List[int]): List of admin user IDs.
-        updater (telegram.ext.Updater): Updater of the bot
-        dispatcher (telegram.ext.Dispatcher): Dispatcher of the updater
+        updater (telegram.ext.Application): Telegram bot application
+        dispatcher (telegram.ext.Application): Application handler registry
     """
 
     webhook = False
     logger = logging.getLogger(__name__)
 
     # Type declarations for instance attributes assigned in __init__
-    updater: Updater
-    _bot: telegram.Bot
+    updater: SyncApplication
+    _bot: SyncTelegramBot
     me: User
     admins: List[int]
-    dispatcher: Dispatcher
+    dispatcher: SyncApplication
     bot_pool: Optional['BotPool']
     _delayed_worker_stop: threading.Event
     _delayed_queue_lock: threading.Lock
@@ -142,7 +143,7 @@ class TelegramBotManager(LocaleMixin):
                             if result and hasattr(result, '__dict__'):
                                 result._sender_bot_id = str(sender_bot_id)
                             return result
-                        except telegram.error.Unauthorized:
+                        except forbidden_errors():
                             aux_bot.mark_disabled("Unauthorized during forced-route API call")
                             self._notify_admin_disabled_bot(aux_bot)
                     # Fallback: sender bot unavailable, try main bot
@@ -167,7 +168,7 @@ class TelegramBotManager(LocaleMixin):
                                     result._sender_bot_id = str(aux_bot.bot_id)
                                 self._record_aux_use(chat_id)
                                 return result
-                            except telegram.error.Unauthorized:
+                            except forbidden_errors():
                                 aux_bot.mark_disabled("Unauthorized during pool-route API call")
                                 self._notify_admin_disabled_bot(aux_bot)
                                 # Fallback: continue to main bot path below
@@ -413,11 +414,10 @@ class TelegramBotManager(LocaleMixin):
             req_kwargs.update(conf_req_kwargs)
 
         self.logger.debug("Setting up Telegram bot updater...")
-        self.updater: Updater = Updater(config['token'],
-                                        base_url=channel.flag('api_base_url'),
-                                        base_file_url=channel.flag('api_base_file_url'),
-                                        request_kwargs=req_kwargs,
-                                        use_context=True)
+        self.updater = build_application(config['token'],
+                                         base_url=channel.flag('api_base_url'),
+                                         base_file_url=channel.flag('api_base_file_url'),
+                                         request_kwargs=req_kwargs)
 
         if isinstance(config.get('webhook'), dict):
             self.logger.debug("Setting up webhook...")
@@ -425,16 +425,13 @@ class TelegramBotManager(LocaleMixin):
             self.logger.debug("Webhook is set...")
 
         self.logger.debug("Checking connection to Telegram bot API...")
-        # Updater.__init__ uses __slots__ + @no_type_check, so mypy cannot
-        # determine the types of .bot / .dispatcher.  getattr returns Any,
-        # then cast narrows to the correct type.
-        self._bot = cast(telegram.Bot, getattr(self.updater, 'bot'))
+        self._bot = cast(SyncTelegramBot, getattr(self.updater, 'bot'))
         me = self._bot.get_me()
         assert me, "Invalid bot credential provided."
         self.me = me
         self.logger.debug("Connection to Telegram bot API is OK...")
         self.admins = config['admins']
-        self.dispatcher = cast(Dispatcher, getattr(self.updater, 'dispatcher'))
+        self.dispatcher = cast(SyncApplication, getattr(self.updater, 'dispatcher'))
 
         # Initialize sliding window rate limiting
         self._rate_limit_lock = threading.Lock()
@@ -476,7 +473,7 @@ class TelegramBotManager(LocaleMixin):
 
         self.logger.debug("Adding base dispatchers...")
         # New whitelist handler
-        whitelist_filter = ~Filters.user(user_id=self.admins)
+        whitelist_filter = ~filters.User(user_id=self.admins)
         self.dispatcher.add_handler(
             MessageHandler(whitelist_filter, lambda update, context: ...))
         self.dispatcher.add_handler(LocaleHandler(channel))
@@ -582,7 +579,7 @@ class TelegramBotManager(LocaleMixin):
                     try:
                         with self._using_bot(aux_bot.bot):
                             return send_callable(_bypass_rate_limit=True)
-                    except telegram.error.Unauthorized:
+                    except forbidden_errors():
                         aux_bot.mark_disabled("Unauthorized during migration send")
                         self._notify_admin_disabled_bot(aux_bot)
 
@@ -780,7 +777,7 @@ class TelegramBotManager(LocaleMixin):
                                     self._record_aux_use(task.chat_id)
                                     routed_to_aux = True
                                     self.logger.debug(f"Delayed task {task.task_id} routed to aux bot @{aux_bot.username}")
-                                except telegram.error.Unauthorized:
+                                except forbidden_errors():
                                     aux_bot.mark_disabled("Unauthorized during delayed task")
                                     self._notify_admin_disabled_bot(aux_bot)
 
@@ -1254,7 +1251,7 @@ class TelegramBotManager(LocaleMixin):
             if aux_bot and not aux_bot.disabled:
                 try:
                     return aux_bot.bot.delete_message(chat_id, message_id)
-                except telegram.error.Unauthorized:
+                except forbidden_errors():
                     aux_bot.mark_disabled("Unauthorized during delete_message")
                     self._notify_admin_disabled_bot(aux_bot)
                 except telegram.error.BadRequest:

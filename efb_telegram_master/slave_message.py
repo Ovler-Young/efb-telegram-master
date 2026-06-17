@@ -18,8 +18,9 @@ import telegram.constants
 import telegram.error
 import telegram.ext
 from PIL import Image
-from telegram import InputFile, ChatAction, InputMediaPhoto, InputMediaDocument, InputMediaVideo, InputMediaAnimation, \
+from telegram import InputFile, InputMediaPhoto, InputMediaDocument, InputMediaVideo, InputMediaAnimation, \
     InlineKeyboardMarkup, InlineKeyboardButton, ReplyMarkup, TelegramError, InputMedia
+from telegram.constants import ChatAction
 
 from ehforwarderbot import Message, Status, coordinator
 from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
@@ -1322,4 +1323,3 @@ class SlaveMessageProcessor(LocaleMixin):
             except OSError as e:
                 self.logger.warning("Failed to clean up local API temp file %s: %s", path, e)
         tls.pending_cleanup = []
-

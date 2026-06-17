@@ -18,6 +18,7 @@ from . import utils
 from .chat import ETMChatType, ETMChatMember
 from .chat_object_cache import ChatObjectCacheManager
 from .msg_type import TGMsgType
+from .ptb_compat import run_sync
 
 if TYPE_CHECKING:
     pass
@@ -95,7 +96,7 @@ class ETMMsg(Message):
                 ext = mimetypes.guess_extension(self.mime, strict=False)
                 mime = self.mime
             file = tempfile.NamedTemporaryFile(suffix=ext)
-            file_meta.download(out=file)
+            run_sync(file_meta.download_to_drive(custom_path=file.name))
             file.seek(0)
 
             if not mime:

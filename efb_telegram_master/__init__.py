@@ -15,7 +15,7 @@ from PIL import Image, WebPImagePlugin
 from pkg_resources import resource_filename
 from ruamel.yaml import YAML
 from telegram import Update, Message
-from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext, Filters
+from telegram.ext import CallbackContext, filters
 
 import ehforwarderbot  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, coordinator
@@ -42,6 +42,7 @@ from .message import ETMMsg
 from .rpc_utils import RPCUtilities
 from .slave_message import SlaveMessageProcessor
 from .utils import ExperimentalFlagsManager, EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
+from .ptb_compat import CallbackQueryHandler, CommandHandler, forbidden_errors
 
 
 class TelegramChannel(MasterChannel):
@@ -136,7 +137,7 @@ class TelegramChannel(MasterChannel):
                                           fallback=True)
 
         # Basic message handlers
-        non_edit_filter = Filters.update.message | Filters.update.channel_post
+        non_edit_filter = filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POSTS
         self.bot_manager.dispatcher.add_handler(
             CommandHandler("start", self.start, filters=non_edit_filter))
         self.bot_manager.dispatcher.add_handler(
@@ -529,7 +530,7 @@ class TelegramChannel(MasterChannel):
         # noinspection PyBroadException
         try:
             raise error
-        except telegram.error.Unauthorized:
+        except forbidden_errors():
             self.logger.error("The bot is not authorised to send update:\n%s\n%s", str(update), str(error))
         except telegram.error.BadRequest as e:
             assert isinstance(update, Update)
