@@ -139,19 +139,40 @@ class SlaveMessageProcessor(LocaleMixin):
 
             self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
         except Exception as e:
-            if isinstance(e, telegram.error.BadRequest) and e.message:
-                if "Topic" in e.message:
-                    try:
-                        self.bot.reopen_forum_topic(
-                            chat_id=tg_dest,
-                            message_thread_id=thread_id
-                        )
-                    except telegram.error.BadRequest as reopen_err:
-                        self.logger.error('Failed to reopen topic, Reason: %s', reopen_err)
-                        self.db.remove_topic_assoc(
-                            topic_chat_id=tg_dest,
-                            message_thread_id=thread_id,
-                        )
+            if isinstance(e, telegram.error.BadRequest) and e.message and \
+                    ("Topic" in e.message or "thread" in e.message.lower()):
+                # Topic might be closed or deleted. Try to reopen first (works for closed topics).
+                topic_recovered = False
+                try:
+                    self.bot.reopen_forum_topic(
+                        chat_id=tg_dest,
+                        message_thread_id=thread_id
+                    )
+                    topic_recovered = True
+                except telegram.error.BadRequest as reopen_err:
+                    # Reopen failed — topic was deleted, not just closed.
+                    # Remove the stale DB record so a new topic can be created.
+                    self.logger.warning('Topic %s in chat %s was deleted. Removing stale association and retrying. '
+                                        'Reopen error: %s', thread_id, tg_dest, reopen_err)
+                    self.db.remove_topic_assoc(
+                        topic_chat_id=tg_dest,
+                        message_thread_id=thread_id,
+                    )
+
+                # Retry: either the topic was reopened, or the stale record was removed
+                # so get_slave_msg_dest will create a fresh topic.
+                try:
+                    if topic_recovered:
+                        # Topic was merely closed and is now reopened — retry with the same thread_id
+                        self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
+                    else:
+                        # Topic was deleted — re-resolve destination (will auto-create a new topic)
+                        msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(msg)
+                        if tg_dest is not None:
+                            self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
+                except Exception as retry_err:
+                    self.logger.error("Failed to deliver message after topic recovery.\nMessage: %s\n%s\n%s",
+                                      repr(msg), repr(retry_err), traceback.format_exc())
             else:
                 self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
                               repr(msg), repr(e), traceback.format_exc())
