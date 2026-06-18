@@ -1107,6 +1107,14 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.logger.debug("Found message to delete in Telegram: %s.%s",
                                   *old_msg_id)
                 try:
+                    # Get sender name from DB to preserve it in the edited message
+                    sender_prefix = ""
+                    try:
+                        etm_msg = old_msg.build_etm_msg(self.chat_manager)
+                        sender_prefix = f"{etm_msg.author.long_name}:"
+                    except Exception:
+                        pass
+
                     original_text = html.escape(old_msg.text or '')
                     new_text = f"<del>{original_text}</del>\n[已撤回]" if original_text else "[已撤回]"
                     
@@ -1115,6 +1123,7 @@ class SlaveMessageProcessor(LocaleMixin):
                             chat_id=old_msg_id[0], 
                             message_id=old_msg_id[1], 
                             caption=new_text,
+                            prefix=sender_prefix,
                             parse_mode="HTML"
                         )
                     else:
@@ -1122,6 +1131,7 @@ class SlaveMessageProcessor(LocaleMixin):
                             chat_id=old_msg_id[0], 
                             message_id=old_msg_id[1], 
                             text=new_text,
+                            prefix=sender_prefix,
                             parse_mode="HTML"
                         )
                     return
