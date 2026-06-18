@@ -368,10 +368,17 @@ class SlaveMessageProcessor(LocaleMixin):
                     t += '</code>'
                 prev = i[1]
             t += html.escape(text[prev:])
-            return t
         elif text:
-            return html.escape(text)
-        return text
+            t = html.escape(text)
+        else:
+            t = text
+
+        if t:
+            import re
+            quote_match = re.match(r'^「(.+?)」\n-[\- ]{10,40}\n(.*)$', t, flags=re.DOTALL)
+            if quote_match:
+                t = f"<blockquote>{quote_match.group(1)}</blockquote>\n{quote_match.group(2)}"
+        return t
 
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
