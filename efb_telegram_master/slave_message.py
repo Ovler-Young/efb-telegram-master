@@ -210,6 +210,34 @@ class SlaveMessageProcessor(LocaleMixin):
                 else:
                     target_msg_id = target_msg[1]
 
+        # Fallback: If msg.target was not set (no EFB-level reply), but the message
+        # text contains a WeChat-style quote block (「...」\n---\n...), try to find
+        # the original message in the database by fuzzy-matching the quoted text.
+        if target_msg_id is None and not isinstance(msg.target, Message) and msg.text:
+            import re
+            quote_match = re.match(r'^「(.+?)」\n-[\- ]{10,40}\n', msg.text, flags=re.DOTALL)
+            if quote_match:
+                quoted_text = quote_match.group(1)
+                slave_chat_uid = utils.chat_id_to_str(chat=msg.chat)
+                self.logger.debug("[%s] Text quote block detected, attempting fuzzy match: '%.50s...'",
+                                  msg.uid, quoted_text)
+                log = self.db.find_msg_by_quote_text(
+                    slave_origin_uid=slave_chat_uid,
+                    quote_text=quoted_text,
+                    limit=200
+                )
+                if log:
+                    target_msg = utils.message_id_str_to_id(log.master_msg_id)
+                    if target_msg and target_msg[0] == int(tg_dest):
+                        target_msg_id = TelegramMessageID(target_msg[1])
+                        self.logger.debug("[%s] Fuzzy quote match found: tg_msg_id=%s",
+                                          msg.uid, target_msg_id)
+                    else:
+                        self.logger.debug("[%s] Fuzzy quote match found but in different chat, skipping.",
+                                          msg.uid)
+                else:
+                    self.logger.debug("[%s] No fuzzy quote match found in database.", msg.uid)
+
         # Generate basic reply markup
         commands: Optional[List[MessageCommand]] = None
         reply_markup: Optional[InlineKeyboardMarkup] = None

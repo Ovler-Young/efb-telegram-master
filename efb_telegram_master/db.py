@@ -682,6 +682,47 @@ class DatabaseManager:
             return None
 
     @staticmethod
+    def find_msg_by_quote_text(slave_origin_uid: 'EFBChannelChatIDStr',
+                               quote_text: str,
+                               limit: int = 200) -> Optional['MsgLog']:
+        """Find a message in the database by matching quoted text content.
+
+        Searches the most recent `limit` messages from the same slave chat
+        whose `text` field starts with or contains the given quote_text.
+
+        Args:
+            slave_origin_uid: The slave chat identifier string to scope the search.
+            quote_text: The quoted text extracted from the WeChat「」format.
+            limit: Maximum number of recent messages to search (default 200).
+
+        Returns:
+            Optional[MsgLog]: The best matching message log entry, or None.
+        """
+        if not quote_text or not quote_text.strip():
+            return None
+
+        # Strip HTML entities that may have been escaped
+        clean_text = quote_text.strip()
+
+        try:
+            # Search recent messages from the same slave chat,
+            # ordered by time descending (most recent first).
+            # We use LIKE with the quote text to find messages whose text
+            # starts with the quoted content.
+            candidates = (MsgLog.select()
+                          .where(MsgLog.slave_origin_uid == slave_origin_uid)
+                          .order_by(MsgLog.time.desc())
+                          .limit(limit))
+
+            for candidate in candidates:
+                if candidate.text and clean_text in candidate.text:
+                    return candidate
+
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
     def delete_msg_log(master_msg_id: Optional[TgChatMsgIDStr] = None,
                        slave_msg_id: Optional[EFBChannelChatIDStr] = None,
                        slave_origin_uid: Optional[EFBChannelChatIDStr] = None):
