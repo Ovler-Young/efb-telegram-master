@@ -377,7 +377,7 @@ class SlaveMessageProcessor(LocaleMixin):
             import re
             quote_match = re.match(r'^「(.+?)」\n-[\- ]{10,40}\n(.*)$', t, flags=re.DOTALL)
             if quote_match:
-                t = f"<blockquote>{quote_match.group(1)}</blockquote>\n{quote_match.group(2)}"
+                t = f"💬 <code>{quote_match.group(1)}</code>\n{quote_match.group(2)}"
         return t
 
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
