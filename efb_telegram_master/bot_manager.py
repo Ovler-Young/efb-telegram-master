@@ -96,7 +96,7 @@ class TelegramBotManager(LocaleMixin):
     @classmethod
     def _format_affix(cls, prefix: str = '', suffix: str = '', parse_mode=None) -> Tuple[str, str]:
         if cls._is_html_parse_mode(parse_mode):
-            prefix = (prefix and (f"<pre>{html.escape(prefix.strip())}</pre>\n")) or prefix
+            prefix = (prefix and (f"<b>{html.escape(prefix.strip())}</b>\n")) or prefix
             suffix = (suffix and ("\n" + html.escape(suffix.strip()))) or suffix
         else:
             prefix = (prefix and (prefix.rstrip() + "\n")) or prefix
