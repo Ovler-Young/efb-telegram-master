@@ -231,13 +231,12 @@ class DatabaseManager:
                 else:
                     self._create()
             else:
-                self._check_and_run_migrations()
+                self._create()  # create_tables is safe for existing tables
+            self._check_and_run_migrations()
         else:
             # SQLite backend: original logic
-            if not ChatAssoc.table_exists() or not TopicAssoc.table_exists():
-                self._create()
-            else:
-                self._check_and_run_migrations()
+            self._create()  # create_tables is safe for existing tables
+            self._check_and_run_migrations()
         self.logger.debug("Database migration finished...")
 
     def stop_worker(self):
