@@ -89,6 +89,29 @@ class TelegramBotManager(LocaleMixin):
     _chat_timestamps: 'defaultdict[int, Deque[float]]'
     _aux_recent_use: dict[int, float]
 
+    @staticmethod
+    def _is_html_parse_mode(parse_mode) -> bool:
+        return str(parse_mode or '').lower() == "html"
+
+    @classmethod
+    def _format_affix(cls, prefix: str = '', suffix: str = '', parse_mode=None) -> Tuple[str, str]:
+        if cls._is_html_parse_mode(parse_mode):
+            prefix = (prefix and (f"<blockquote>{html.escape(prefix.strip())}</blockquote>\n")) or prefix
+            suffix = (suffix and ("\n" + html.escape(suffix.strip()))) or suffix
+        else:
+            prefix = (prefix and (prefix.rstrip() + "\n")) or prefix
+            suffix = (suffix and ("\n" + suffix.lstrip())) or suffix
+        return prefix, suffix
+
+    @classmethod
+    def _message_file_buffer(cls, text: str, parse_mode=None) -> io.BytesIO:
+        if cls._is_html_parse_mode(parse_mode):
+            text = (
+                "<html><head><meta charset='utf-8'></head>"
+                "<body><pre style='white-space:pre-wrap'>" + text + "</pre></body></html>"
+            )
+        return io.BytesIO(text.encode('utf-8'))
+
     class Decorators:
         logger = logging.getLogger(__name__)
 
@@ -331,12 +354,7 @@ class TelegramBotManager(LocaleMixin):
                     if is_empty:
                         return is_empty
 
-                if str(kwargs.get('parse_mode', '')).lower() == "html":
-                    prefix = (prefix and (f"<blockquote>{html.escape(prefix.strip())}</blockquote>\n")) or prefix
-                    suffix = (suffix and ("\n" + html.escape(suffix.strip()))) or suffix
-                else:
-                    prefix = (prefix and (prefix.rstrip() + "\n")) or prefix
-                    suffix = (suffix and ("\n" + suffix.lstrip())) or suffix
+                prefix, suffix = self._format_affix(prefix, suffix, kwargs.get('parse_mode', ''))
 
                 if len(prefix + text + suffix) >= telegram.constants.MAX_CAPTION_LENGTH:
                     full_message = io.StringIO(prefix + text + suffix)
@@ -887,12 +905,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = (prefix and (f"<blockquote>{html.escape(prefix.strip())}</blockquote>\n")) or prefix
-            suffix = (suffix and ("\n" + html.escape(suffix.strip()))) or suffix
-        else:
-            prefix = (prefix and (prefix.rstrip() + "\n")) or prefix
-            suffix = (suffix and ("\n" + suffix.lstrip())) or suffix
+        prefix, suffix = self._format_affix(prefix, suffix, kwargs.get('parse_mode', ''))
         text: str
         if args[1:]:
             text = args[1]
@@ -900,7 +913,7 @@ class TelegramBotManager(LocaleMixin):
             text = kwargs.pop('text')
         args = args[:1]
         if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
-            full_message = io.BytesIO((prefix + text + suffix).encode('utf-8'))
+            full_message = self._message_file_buffer(prefix + text + suffix, kwargs.get('parse_mode', ''))
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
             msg = self._bot_send_message_fallback(args[0], text=truncated, **kwargs)
             filename = "%s_%s" % (args[0], msg.message_id)
@@ -908,15 +921,8 @@ class TelegramBotManager(LocaleMixin):
                 filename += ".txt"
             elif kwargs.get('parse_mode', '').lower() == 'markdown':
                 filename += ".md"
-            elif kwargs.get('parse_mode', '').lower() == 'html':
+            elif self._is_html_parse_mode(kwargs.get('parse_mode', '')):
                 filename += ".html"
-                full_message_html = (
-                    "<html><head><meta charset='utf-8'></head>"
-                    "<body><pre style='white-space:pre-wrap'>" + (prefix + text + suffix) + "</pre></body></html>"
-                )
-                # Replace the attachment payload with HTML-wrapped content.
-                # (Previous logic did seek(0) then truncate(), which empties the buffer.)
-                full_message = io.BytesIO(full_message_html.encode('utf-8'))
             else:
                 filename += ".txt"
             self._active_bot.send_document(args[0], full_message, filename=filename,
@@ -945,21 +951,16 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = (prefix and (f"<blockquote>{html.escape(prefix.strip())}</blockquote>\n")) or prefix
-            suffix = (suffix and ("\n" + html.escape(suffix.strip()))) or suffix
-        else:
-            prefix = (prefix and (prefix.rstrip() + "\n")) or prefix
-            suffix = (suffix and ("\n" + suffix.lstrip())) or suffix
+        prefix, suffix = self._format_affix(prefix, suffix, kwargs.get('parse_mode', ''))
         text = kwargs.pop('text', '')
         if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
-            full_message = io.BytesIO((prefix + text + suffix).encode())
+            full_message = self._message_file_buffer(prefix + text + suffix, kwargs.get('parse_mode', ''))
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
             msg = self._bot_edit_message_text_fallback(text=truncated, **kwargs)
             filename = "%s_%s" % (kwargs['chat_id'], msg.message_id)
             if kwargs.get('parse_mode', '').lower() == 'markdown':
                 filename += ".md"
-            elif kwargs.get('parse_mode', '').lower() == 'html':
+            elif self._is_html_parse_mode(kwargs.get('parse_mode', '')):
                 filename += ".html"
             else:
                 filename += ".txt"
