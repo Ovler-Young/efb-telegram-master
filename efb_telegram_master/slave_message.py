@@ -1116,7 +1116,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     original_text = html.escape(old_msg.text or '')
                     new_text = f"<del>{original_text}</del>\n[已撤回]" if original_text else "[已撤回]"
                     
-                    if old_msg.media_type and old_msg.media_type != 'text':
+                    if old_msg.media_type and old_msg.media_type not in ('Text', 'text'):
                         self.bot.edit_message_caption(
                             chat_id=old_msg_id[0], 
                             message_id=old_msg_id[1], 
