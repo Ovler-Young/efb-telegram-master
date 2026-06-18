@@ -204,6 +204,17 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
                f"{self.display_name}"
 
     @property
+    def topic_title(self) -> str:
+        """Chat title used for forum topic names in topic_group.
+
+        Same as chat_title but without channel_emoji and chat_type_emoji
+        prefixes, so that Telegram auto-generates a cleaner topic icon
+        from the first character of the actual chat name.
+        """
+        non_default_instance_flag = "*" if "#" in self.module_id else ""
+        return f"{non_default_instance_flag}{self.display_name}"
+
+    @property
     def last_message_time(self) -> datetime:
         """Time of the last recorded message from this chat.
         Returns ``datetime.min`` when no recorded message is found.
