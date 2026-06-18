@@ -1108,7 +1108,8 @@ class SlaveMessageProcessor(LocaleMixin):
                     self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
                     pass
                 self.bot.send_message(chat_id=old_msg_id[0],
-                                      text=self._("Message is removed in remote chat."),
+                                      text=f"<blockquote>🚫 {self._('Message is removed in remote chat.')}</blockquote>",
+                                      parse_mode="HTML",
                                       reply_to_message_id=old_msg_id[1],
                                       disable_notification=True)  # Probably silent notification
             else:
