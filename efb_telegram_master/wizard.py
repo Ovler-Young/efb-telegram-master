@@ -12,6 +12,7 @@ from ruamel.yaml import YAML
 from telegram import Bot
 from telegram.error import TelegramError
 from telegram.ext import filters
+from telegram.request import HTTPXRequest
 
 from ehforwarderbot import coordinator, utils
 from ehforwarderbot.types import ModuleID
@@ -36,7 +37,7 @@ ngettext = translator.ngettext
 
 class DataModel:
     data: dict
-    request: Optional[Request] = None
+    request: Optional[HTTPXRequest] = None
     building_default = False
 
     def __init__(self, profile: str, instance_id: str):

@@ -42,7 +42,7 @@ from .message import ETMMsg
 from .rpc_utils import RPCUtilities
 from .slave_message import SlaveMessageProcessor
 from .utils import ExperimentalFlagsManager, EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
-from .ptb_compat import CallbackQueryHandler, CommandHandler, forbidden_errors
+from .ptb_compat import CallbackQueryHandler, CommandHandler, forbidden_errors, forwarded_from_chat, sync_message, sync_update
 
 
 class TelegramChannel(MasterChannel):
@@ -220,23 +220,25 @@ class TelegramChannel(MasterChannel):
         Triggered by `/info`.
         """
         assert isinstance(update, Update)
+        update = sync_update(update)
         assert isinstance(update.effective_message, Message)
+        message = sync_message(update.effective_message)
         if update.effective_message.chat.type != telegram.Chat.PRIVATE:  # Group message
             if update.effective_chat and update.effective_chat.is_forum:
                 msg = self.info_topic(update)
             else:
                 msg = self.info_group(update)
-        elif update.effective_message.forward_from_chat and \
-                update.effective_message.forward_from_chat.type == 'channel':  # Forwarded channel command.
+        elif (forwarded_chat := forwarded_from_chat(update.effective_message)) and \
+                forwarded_chat.type == 'channel':  # Forwarded channel command.
             msg = self.info_channel(update)
         else:  # Talking to the bot.
             msg = self.info_general()
 
         if len(msg) > 4095:
             for x in range(0, len(msg), 4095):
-                update.effective_message.reply_text(msg[x:x+4095])
+                message.reply_text(msg[x:x+4095])
         else:
-            update.effective_message.reply_text(msg)
+            message.reply_text(msg)
 
     def info_topic(self, update: Update):
         """Generate string for chat linking info of a topic."""
@@ -302,7 +304,8 @@ class TelegramChannel(MasterChannel):
 
     def info_channel(self, update):
         """Generate string for chat linking info of a channel."""
-        chat = update.effective_message.forward_from_chat
+        chat = forwarded_from_chat(update.effective_message)
+        assert chat
         links = self.db.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, chat.id))
         if links:  # Linked chat
             # TRANSLATORS: ‘channel’ here refers to a Telegram channel.
@@ -370,13 +373,15 @@ class TelegramChannel(MasterChannel):
         Process bot command `/start`.
         """
         assert isinstance(update, Update)
+        update = sync_update(update)
         assert isinstance(update.effective_message, telegram.Message)
         assert isinstance(update.effective_chat, telegram.Chat)
         if context.args:  # Group binding command
+            forwarded_chat = forwarded_from_chat(update.effective_message)
             if (update.effective_message.chat.type != telegram.Chat.PRIVATE and update.effective_chat.id != self.topic_group) or \
-                    (update.effective_message.forward_from_chat and
-                     update.effective_message.forward_from_chat.type == telegram.Chat.CHANNEL and
-                     update.effective_message.forward_from_chat.id != self.topic_group):
+                    (forwarded_chat and
+                     forwarded_chat.type == telegram.Chat.CHANNEL and
+                     forwarded_chat.id != self.topic_group):
                 self.chat_binding.link_chat(update, context.args)
             else:
                 self.bot_manager.send_message(update.effective_chat.id,
@@ -389,8 +394,9 @@ class TelegramChannel(MasterChannel):
     def react(self, update: Update, context: CallbackContext):
         """React to a message."""
         assert isinstance(update, Update)
+        update = sync_update(update)
         assert isinstance(update.effective_message, Message)
-        message: Message = update.effective_message
+        message = sync_message(update.effective_message)
 
         reaction = None
         args = message.text and message.text.split(' ', 1)
@@ -474,6 +480,7 @@ class TelegramChannel(MasterChannel):
 
     def help(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
+        update = sync_update(update)
         assert isinstance(update.message, Message)
         txt = self._("EFB Telegram Master Channel\n"
                      "/link\n"
@@ -497,7 +504,7 @@ class TelegramChannel(MasterChannel):
                      "    Remove the quoted message from its remote chat.\n"
                      "/help\n"
                      "    Print this command list.")
-        update.message.reply_text(txt)
+        sync_message(update.message).reply_text(txt)
 
     def poll(self):
         """
@@ -549,11 +556,13 @@ class TelegramChannel(MasterChannel):
                               "Number of network error occurred since last startup: %s\n%s\nUpdate: %s",
                               self.timeout_count, str(error), str(update))
             if isinstance(update, Update) and isinstance(update.message, Message):
-                update.message.reply_text(self._("This message is not processed due to poor internet environment "
-                                                 "of the server.\n"
-                                                 "<code>{code}</code>").format(code=html.escape(str(error))),
-                                          quote=True,
-                                          parse_mode="HTML")
+                sync_error_update = sync_update(update)
+                sync_message(sync_error_update.message).reply_text(
+                    self._("This message is not processed due to poor internet environment "
+                           "of the server.\n"
+                           "<code>{code}</code>").format(code=html.escape(str(error))),
+                    quote=True,
+                    parse_mode="HTML")
 
             timeout_interval = self.flag('network_error_prompt_interval')
             if timeout_interval > 0 and self.timeout_count % timeout_interval == 0:

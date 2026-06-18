@@ -20,6 +20,7 @@ import telegram.constants
 import telegram.error
 from retrying import retry
 from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
+from telegram.constants import MessageLimit
 from telegram import Message as TelegramMessage
 from telegram.ext import CallbackContext, filters
 
@@ -28,7 +29,7 @@ from .bot_pool import BotPool
 from .locale_handler import LocaleHandler
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
-from .ptb_compat import MessageHandler, SyncApplication, SyncTelegramBot, build_application, forbidden_errors
+from .ptb_compat import MessageHandler, SyncApplication, SyncTelegramBot, build_application, forbidden_errors, sync_callback_query
 
 
 class DelayedTask(NamedTuple):
@@ -247,18 +248,19 @@ class TelegramBotManager(LocaleMixin):
                             raise
 
                         retry_after = e.retry_after
+                        retry_after_seconds = retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else retry_after
                         cls.logger.warning(f"Rate limit hit, waiting {retry_after}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
 
                         # Use interruptible sleep for rate limit waits
                         if hasattr(self, '_delayed_worker_stop'):
                             # Sleep in small chunks to allow for interruption during shutdown
-                            remaining = retry_after
+                            remaining = retry_after_seconds
                             while remaining > 0 and not self._delayed_worker_stop.is_set():
                                 sleep_chunk = min(1.0, remaining)
                                 time.sleep(sleep_chunk)
                                 remaining -= sleep_chunk
                         else:
-                            time.sleep(retry_after)
+                            time.sleep(retry_after_seconds)
                     except telegram.error.TelegramError as e:
                         if not cls.enable_retry:
                             raise
@@ -268,7 +270,7 @@ class TelegramBotManager(LocaleMixin):
                                 cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
                                 raise
 
-                            delay = 60
+                            delay = 60.0
                             cls.logger.warning(f"Rate limit detected, waiting {delay}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
                             if chat_id and hasattr(self, '_chat_timestamps'):
                                 for timestamp in self._chat_timestamps[chat_id]:
@@ -895,7 +897,7 @@ class TelegramBotManager(LocaleMixin):
         else:
             text = kwargs.pop('text')
         args = args[:1]
-        if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
+        if len(prefix + text + suffix) >= MessageLimit.MAX_TEXT_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode('utf-8'))
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
             msg = self._bot_send_message_fallback(args[0], text=truncated, **kwargs)
@@ -947,7 +949,7 @@ class TelegramBotManager(LocaleMixin):
             prefix = html.escape(prefix)
             suffix = html.escape(suffix)
         text = kwargs.pop('text', '')
-        if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
+        if len(prefix + text + suffix) >= MessageLimit.MAX_TEXT_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode())
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
             msg = self._bot_edit_message_text_fallback(text=truncated, **kwargs)
@@ -1209,10 +1211,12 @@ class TelegramBotManager(LocaleMixin):
 
     def session_expired(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
+        from .ptb_compat import sync_update
+        update = sync_update(update)
         assert update.effective_message
         assert update.effective_chat
         if update.callback_query:
-            update.callback_query.answer()
+            sync_callback_query(update.callback_query).answer()
         self.edit_message_text(text=self._("Session expired. Please try again. (SE01)"),
                                chat_id=update.effective_chat.id,
                                message_id=update.effective_message.message_id)

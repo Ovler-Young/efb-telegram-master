@@ -19,8 +19,10 @@ import telegram.error
 import telegram.ext
 from PIL import Image
 from telegram import InputFile, InputMediaPhoto, InputMediaDocument, InputMediaVideo, InputMediaAnimation, \
-    InlineKeyboardMarkup, InlineKeyboardButton, ReplyMarkup, TelegramError, InputMedia
-from telegram.constants import ChatAction
+    InlineKeyboardMarkup, InlineKeyboardButton, InputMedia
+from telegram.constants import ChatAction, FileSizeLimit
+from telegram.error import TelegramError
+from telegram._utils.types import ReplyMarkup
 
 from ehforwarderbot import Message, Status, coordinator
 from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
@@ -778,8 +780,8 @@ class SlaveMessageProcessor(LocaleMixin):
             description.append([InlineKeyboardButton(msg.text, callback_data="void")])
         if reactions:
             description.append([InlineKeyboardButton(reactions, callback_data="void")])
-        effective_reply_markup = reply_markup if isinstance(reply_markup, InlineKeyboardMarkup) else InlineKeyboardMarkup([])
-        effective_reply_markup.inline_keyboard = description + effective_reply_markup.inline_keyboard
+        keyboard = [list(row) for row in reply_markup.inline_keyboard] if isinstance(reply_markup, InlineKeyboardMarkup) else []
+        effective_reply_markup = InlineKeyboardMarkup(description + keyboard)
         return effective_reply_markup
 
 
@@ -864,7 +866,7 @@ class SlaveMessageProcessor(LocaleMixin):
                             target_msg_id: Optional[TelegramMessageID] = None,
                             reply_markup: Optional[ReplyMarkup] = None,
                             silent: bool = False) -> telegram.Message:
-        self.bot.send_chat_action(tg_dest, ChatAction.RECORD_AUDIO, message_thread_id=thread_id)
+        self.bot.send_chat_action(tg_dest, ChatAction.RECORD_VOICE, message_thread_id=thread_id)
         if msg.text:
             text = self.html_substitutions(msg)
         else:
@@ -1065,7 +1067,7 @@ class SlaveMessageProcessor(LocaleMixin):
         if attributes.status_type is StatusAttribute.Types.TYPING:
             self.bot.send_chat_action(tg_dest, ChatAction.TYPING, message_thread_id=thread_id)
         elif attributes.status_type is StatusAttribute.Types.UPLOADING_VOICE:
-            self.bot.send_chat_action(tg_dest, ChatAction.RECORD_AUDIO, message_thread_id=thread_id)
+            self.bot.send_chat_action(tg_dest, ChatAction.RECORD_VOICE, message_thread_id=thread_id)
         elif attributes.status_type is StatusAttribute.Types.UPLOADING_IMAGE:
             self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO, message_thread_id=thread_id)
         elif attributes.status_type is StatusAttribute.Types.UPLOADING_VIDEO:
@@ -1205,9 +1207,9 @@ class SlaveMessageProcessor(LocaleMixin):
         file.seek(0, 2)
         file_size = file.tell()
         file.seek(0)
-        if not self.channel.flag("local_tdlib_api") and file_size > telegram.constants.MAX_FILESIZE_UPLOAD:
+        if not self.channel.flag("local_tdlib_api") and file_size > FileSizeLimit.FILESIZE_UPLOAD:
             size_str = humanize.naturalsize(file_size)
-            max_size_str = humanize.naturalsize(telegram.constants.MAX_FILESIZE_UPLOAD)
+            max_size_str = humanize.naturalsize(FileSizeLimit.FILESIZE_UPLOAD)
             return self._(
                 "Attachment is too large ({size}). Maximum allowed by Telegram Bot API is {max_size}. (AT02)").format(
                 size=size_str, max_size=max_size_str)

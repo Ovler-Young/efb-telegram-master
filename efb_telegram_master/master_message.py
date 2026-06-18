@@ -8,7 +8,7 @@ from typing import Optional, TYPE_CHECKING, Tuple, Any
 
 import humanize
 from telegram import Update, Message, Chat, Contact, File
-from telegram.constants import MAX_FILESIZE_DOWNLOAD
+from telegram.constants import FileSizeLimit
 from telegram.error import TelegramError
 from telegram.ext import CallbackContext, filters
 from telegram.helpers import escape_markdown
@@ -25,7 +25,7 @@ from .chat_destination_cache import ChatDestinationCache
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType, get_msg_type
-from .ptb_compat import CommandHandler, MessageHandler
+from .ptb_compat import CommandHandler, MessageHandler, sync_message, sync_update
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 
 if TYPE_CHECKING:
@@ -107,6 +107,7 @@ class MasterMessageProcessor(LocaleMixin):
                 self.logger.exception(
                     "Error [%r] occurred while processing update %s.", e, update)
                 if update.effective_message:
+                    update = sync_update(update)
                     update.effective_message.reply_text(
                         self._("Unknown error has occurred while "
                                "trying to process this message. See log for "
@@ -137,11 +138,12 @@ class MasterMessageProcessor(LocaleMixin):
 
     def enqueue_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
+        update = sync_update(update)
 
         self.message_queue.put((update, context))
         if not self.message_worker_thread.is_alive():
             if update.effective_message:
-                update.effective_message.reply_text(
+                sync_message(update.effective_message).reply_text(
                     self._(
                         "ETM message worker is not running due to unforeseen reason. This might be a bug. Please see log for details."))
 
@@ -150,10 +152,11 @@ class MasterMessageProcessor(LocaleMixin):
         Process, wrap and dispatch messages from user.
         """
         assert isinstance(update, Update)
+        update = sync_update(update)
         assert update.effective_message
         assert update.effective_chat
 
-        message: Message = update.effective_message
+        message = sync_message(update.effective_message)
         mid = utils.message_id_to_str(update=update)
 
         self.logger.debug("[%s] Received message from Telegram: %s", mid, message.to_dict())
@@ -194,7 +197,8 @@ class MasterMessageProcessor(LocaleMixin):
                         if topic_id == thread_id:
                             self.logger.debug("[%s] Chat %s is singly-linked to %s in topic %s", mid, message.chat, dest, topic_id)
                             destination = dest
-                            quote = message.reply_to_message.message_id != message.reply_to_message.message_thread_id
+                            reply_to_message = message.reply_to_message
+                            quote = bool(reply_to_message and reply_to_message.message_id != reply_to_message.message_thread_id)
                             if not quote:
                                 message.reply_to_message = None  # type: ignore[assignment]
                             break
@@ -276,12 +280,13 @@ class MasterMessageProcessor(LocaleMixin):
             edited: old message log entry if the message can be edited.
         """
         assert isinstance(update, Update)
+        update = sync_update(update)
         assert update.effective_message
 
         # Message ID for logging
         message_id = utils.message_id_to_str(update=update)
 
-        message: Message = update.effective_message
+        message = sync_message(update.effective_message)
 
         channel, uid, gid = utils.chat_id_str_to_id(destination)
         if channel not in coordinator.slaves:
@@ -293,7 +298,8 @@ class MasterMessageProcessor(LocaleMixin):
         try:
             m.uid = MessageID(message_id)
             # Store Telegram message type
-            m.type_telegram = mtype = get_msg_type(message)
+            raw_message = message.wrapped_message
+            m.type_telegram = mtype = get_msg_type(raw_message)
 
             if self.TYPE_DICT.get(mtype, None):
                 m.type = self.TYPE_DICT[mtype]
@@ -305,7 +311,7 @@ class MasterMessageProcessor(LocaleMixin):
                     self._("{type_name} messages are not supported by EFB Telegram Master channel.")
                         .format(type_name=mtype.name))
 
-            m.put_telegram_file(message)
+            m.put_telegram_file(raw_message)
             # Chat and author related stuff
             m.chat = self.chat_manager.get_chat(channel, uid, build_dummy=True)
             m.author = m.chat.self or m.chat.add_self()
@@ -313,7 +319,7 @@ class MasterMessageProcessor(LocaleMixin):
             m.deliver_to = coordinator.slaves[channel]
 
             if quote:
-                self.attach_target_message(message, m, channel)
+                self.attach_target_message(raw_message, m, channel)
             # Type specific stuff
             self.logger.debug("[%s] Message type from Telegram: %s", message_id, mtype)
 
@@ -518,7 +524,7 @@ class MasterMessageProcessor(LocaleMixin):
                 dest_name = dest_chat.full_name
             else:
                 dest_name = cached_dest
-            update.effective_message.reply_text(
+            sync_message(update.effective_message).reply_text(
                 self._(
                     "This message is sent to “{dest}” with quick reply feature.\n"
                     "\n"
@@ -541,9 +547,9 @@ class MasterMessageProcessor(LocaleMixin):
         """
         size = getattr(file_obj, "file_size", None)
         if size and not self.channel.flag("local_tdlib_api")\
-                and size > MAX_FILESIZE_DOWNLOAD:
+                and size > FileSizeLimit.FILESIZE_DOWNLOAD:
             size_str = humanize.naturalsize(size)
-            max_size_str = humanize.naturalsize(MAX_FILESIZE_DOWNLOAD)
+            max_size_str = humanize.naturalsize(FileSizeLimit.FILESIZE_DOWNLOAD)
             raise EFBMessageError(
                 self._(
                     "Attachment is too large ({size}). Maximum allowed by Telegram Bot API is {max_size}. (AT01)").format(
@@ -554,14 +560,15 @@ class MasterMessageProcessor(LocaleMixin):
         Triggered by command ``/rm``.
         """
         assert isinstance(update, Update)
+        update = sync_update(update)
         assert update.message
 
-        message: Message = update.message
+        message = sync_message(update.message)
         if message.reply_to_message is None:
             return self.bot.reply_error(update, self._(
                 "Reply /rm to a message to remove it from its remote chat."
             ))
-        reply: Message = message.reply_to_message
+        reply = sync_message(message.reply_to_message)
         msg_log = self.db.get_msg_log(
             master_msg_id=utils.message_id_to_str(
                 chat_id=TelegramChatID(reply.chat_id),
@@ -606,6 +613,7 @@ class MasterMessageProcessor(LocaleMixin):
 
     def unsupported_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
+        update = sync_update(update)
         assert update.effective_message
 
         message_type = get_msg_type(update.effective_message)

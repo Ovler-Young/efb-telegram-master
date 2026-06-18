@@ -1,7 +1,13 @@
 import asyncio
 from types import SimpleNamespace
 
-from efb_telegram_master.ptb_compat import ConversationHandler, build_request_kwargs, run_sync, wrap_callback
+from efb_telegram_master.ptb_compat import (
+    ConversationHandler,
+    build_request_kwargs,
+    forwarded_from_chat,
+    run_sync,
+    wrap_callback,
+)
 
 
 def test_run_sync_resolves_coroutine():
@@ -64,6 +70,20 @@ def test_build_request_kwargs_maps_socks_proxy_auth():
     assert result == {
         "proxy": "socks5://user:pass@127.0.0.1:1080",
     }
+
+
+def test_forwarded_from_chat_reads_ptb22_forward_origin_chat():
+    chat = SimpleNamespace(id=-100123)
+    message = SimpleNamespace(forward_origin=SimpleNamespace(chat=chat), forward_from_chat=None)
+
+    assert forwarded_from_chat(message) is chat
+
+
+def test_forwarded_from_chat_keeps_legacy_forward_from_chat_fallback():
+    chat = SimpleNamespace(id=-100123)
+    message = SimpleNamespace(forward_from_chat=chat)
+
+    assert forwarded_from_chat(message) is chat
 
 
 def test_wrap_callback_exposes_sync_message_methods():

@@ -3,7 +3,7 @@ import asyncio
 import inspect
 import threading
 from functools import wraps
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, TYPE_CHECKING, cast
 
 import telegram
 from telegram.request import HTTPXRequest
@@ -16,6 +16,10 @@ from telegram.ext import (
     ConversationHandler as PTBConversationHandler,
     MessageHandler as PTBMessageHandler,
 )
+
+if TYPE_CHECKING:
+    from telegram import Chat, Message
+    from telegram.ext import CallbackContext
 
 
 class SyncTelegramBot:
@@ -106,11 +110,7 @@ class SyncCallbackQuery:
         return attr
 
     @property
-    def __class__(self):
-        return self._callback_query.__class__
-
-    @property
-    def message(self):
+    def message(self) -> Any:
         message = self._callback_query.message
         if message is None:
             return None
@@ -135,10 +135,6 @@ class SyncMessage:
         return attr
 
     @property
-    def __class__(self):
-        return self._message.__class__
-
-    @property
     def bot(self):
         if self._bot is not None:
             return self._bot
@@ -146,6 +142,10 @@ class SyncMessage:
         if bot is None:
             return None
         return SyncTelegramBot(bot)
+
+    @property
+    def wrapped_message(self) -> Any:
+        return self._message
 
 
 class SyncUpdate:
@@ -157,17 +157,13 @@ class SyncUpdate:
         return getattr(self._update, item)
 
     @property
-    def __class__(self):
-        return self._update.__class__
-
-    @property
-    def callback_query(self):
+    def callback_query(self) -> Any:
         callback_query = self._update.callback_query
         if callback_query is None:
             return None
         return SyncCallbackQuery(callback_query, self._bot)
 
-    def _message(self, attr: str):
+    def _message(self, attr: str) -> Any:
         message = getattr(self._update, attr)
         if message is None:
             return None
@@ -347,6 +343,35 @@ class ConversationHandler(PTBConversationHandler):
             *args,
             **kwargs,
         )
+
+    @property
+    def conversations(self):
+        return self._conversations
+
+
+def conversation_state(handler: PTBConversationHandler) -> Dict[Any, object]:
+    return cast(Dict[Any, object], handler._conversations)
+
+
+def sync_update(update: telegram.Update) -> Any:
+    return cast(Any, update)
+
+
+def sync_message(message: Any) -> Any:
+    return cast(SyncMessage, message)
+
+
+def sync_callback_query(callback_query: Any) -> Any:
+    return cast(SyncCallbackQuery, callback_query)
+
+
+def forwarded_from_chat(message: Any) -> Optional["Chat"]:
+    forward_origin = getattr(message, "forward_origin", None)
+    if forward_origin is not None:
+        origin_chat = getattr(forward_origin, "chat", None)
+        if origin_chat is not None:
+            return cast("Chat", origin_chat)
+    return cast(Optional["Chat"], getattr(message, "forward_from_chat", None))
 
 
 def forbidden_errors():
