@@ -4,6 +4,9 @@ import html
 import logging
 import mimetypes
 import time
+import warnings
+
+warnings.filterwarnings("ignore", message=".*_id_attrs.*")
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
