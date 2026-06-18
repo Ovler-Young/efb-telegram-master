@@ -331,12 +331,12 @@ class TelegramBotManager(LocaleMixin):
                     if is_empty:
                         return is_empty
 
-                prefix = (prefix and (prefix + "\n")) or prefix
-                suffix = (suffix and ("\n" + suffix)) or suffix
-
                 if str(kwargs.get('parse_mode', '')).lower() == "html":
-                    prefix = html.escape(prefix)
-                    suffix = html.escape(suffix)
+                    prefix = (prefix and (f"<blockquote>{html.escape(prefix.strip())}</blockquote>\n")) or prefix
+                    suffix = (suffix and ("\n" + html.escape(suffix.strip()))) or suffix
+                else:
+                    prefix = (prefix and (prefix.rstrip() + "\n")) or prefix
+                    suffix = (suffix and ("\n" + suffix.lstrip())) or suffix
 
                 if len(prefix + text + suffix) >= telegram.constants.MAX_CAPTION_LENGTH:
                     full_message = io.StringIO(prefix + text + suffix)
@@ -887,11 +887,12 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        prefix = (prefix and (prefix + "\n")) or prefix
-        suffix = (suffix and ("\n" + suffix)) or suffix
         if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = html.escape(prefix)
-            suffix = html.escape(suffix)
+            prefix = (prefix and (f"<blockquote>{html.escape(prefix.strip())}</blockquote>\n")) or prefix
+            suffix = (suffix and ("\n" + html.escape(suffix.strip()))) or suffix
+        else:
+            prefix = (prefix and (prefix.rstrip() + "\n")) or prefix
+            suffix = (suffix and ("\n" + suffix.lstrip())) or suffix
         text: str
         if args[1:]:
             text = args[1]
@@ -944,11 +945,12 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        prefix = (prefix and (prefix + "\n")) or prefix
-        suffix = (suffix and ("\n" + suffix)) or suffix
         if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = html.escape(prefix)
-            suffix = html.escape(suffix)
+            prefix = (prefix and (f"<blockquote>{html.escape(prefix.strip())}</blockquote>\n")) or prefix
+            suffix = (suffix and ("\n" + html.escape(suffix.strip()))) or suffix
+        else:
+            prefix = (prefix and (prefix.rstrip() + "\n")) or prefix
+            suffix = (suffix and ("\n" + suffix.lstrip())) or suffix
         text = kwargs.pop('text', '')
         if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode())
