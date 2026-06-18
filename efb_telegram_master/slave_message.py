@@ -1108,11 +1108,40 @@ class SlaveMessageProcessor(LocaleMixin):
                                   *old_msg_id)
                 try:
                     if not self.channel.flag('prevent_message_removal'):
-                        self.bot.delete_message(*old_msg_id,
-                                                _sender_bot_id=old_msg.sender_bot_id)
-                        return
+                        try:
+                            import html
+                            etm_msg = old_msg.build_etm_msg(self.chat_manager)
+                            slave_uid = utils.chat_id_to_str(chat=etm_msg.chat)
+                            singly_linked = len(self.db.get_chat_assoc(slave_uid=slave_uid)) == 1
+                            msg_template = self.generate_message_template(etm_msg, singly_linked)
+                            
+                            original_text = html.escape(old_msg.text or '')
+                            new_text = f"<del>{original_text}</del>\n[已撤回]" if original_text else "[已撤回]"
+                            
+                            if old_msg.media_type and old_msg.media_type != 'text':
+                                self.bot.edit_message_caption(
+                                    chat_id=old_msg_id[0], 
+                                    message_id=old_msg_id[1], 
+                                    caption=new_text,
+                                    prefix=msg_template,
+                                    parse_mode="HTML"
+                                )
+                            else:
+                                self.bot.edit_message_text(
+                                    chat_id=old_msg_id[0], 
+                                    message_id=old_msg_id[1], 
+                                    text=new_text,
+                                    prefix=msg_template,
+                                    parse_mode="HTML"
+                                )
+                            return
+                        except Exception as e:
+                            self.logger.debug("Failed to edit message %s.%s as recalled: %s. Falling back to delete.", *old_msg_id, e)
+                            self.bot.delete_message(*old_msg_id,
+                                                    _sender_bot_id=old_msg.sender_bot_id)
+                            return
                 except TelegramError as e:
-                    self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
+                    self.logger.warning("Failed to delete/edit message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
                     pass
                 self.bot.send_message(chat_id=old_msg_id[0],
                                       text=f"<blockquote>🚫 {self._('Message is removed in remote chat.')}</blockquote>",
