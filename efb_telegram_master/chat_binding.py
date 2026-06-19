@@ -1191,7 +1191,7 @@ class ChatBindingManager(LocaleMixin):
                     chat_id=tg_chat_id,
                     message_thread_id=thread_id,
                     name=self.truncate_ellipsis(
-                        chat.topic_title if tg_chat_id == self.channel.topic_group else chat.chat_title,
+                        chat.topic_title,
                         self.MAX_LEN_CHAT_TITLE),
                     icon_custom_emoji_id=""
                 )
@@ -1298,7 +1298,7 @@ class ChatBindingManager(LocaleMixin):
                 chat_id=update.effective_chat.id,
                 message_thread_id=thread_id,
                 name=self.truncate_ellipsis(
-                    etm_chat.topic_title if TelegramChatID(update.effective_chat.id) == self.channel.topic_group else etm_chat.chat_title,
+                    etm_chat.topic_title,
                     self.MAX_LEN_CHAT_TITLE),
                 icon_custom_emoji_id=""  # param required by telegram
             )
@@ -1342,7 +1342,7 @@ class ChatBindingManager(LocaleMixin):
                     channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
                     chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                     try:
-                        topic_name = chat.topic_title if telegram_chat_id == self.channel.topic_group else chat.chat_title
+                        topic_name = chat.topic_title
                         topic = self.bot.create_forum_topic(
                             chat_id=telegram_chat_id,
                             name=topic_name
