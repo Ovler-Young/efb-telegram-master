@@ -144,7 +144,7 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     channel.config.pop("topic_icons", None)
 
 
-def test_create_topic_uses_configured_custom_emoji_id(channel, slave):
+def test_create_topic_does_not_set_configured_custom_emoji_id(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(61005)
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
@@ -162,7 +162,6 @@ def test_create_topic_uses_configured_custom_emoji_id(channel, slave):
     create_forum_topic.assert_called_once_with(
         chat_id=topic_chat_id,
         name=channel.chat_manager.get_chat(slave.chat_with_alias.module_id, slave.chat_with_alias.uid).chat_title,
-        icon_custom_emoji_id="emoji-configured",
     )
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
@@ -324,34 +323,31 @@ def test_topic_icon_generation_failure_marks_unavailable_and_falls_back(channel,
     channel.chat_binding._topic_icon_custom_emoji_unavailable_reason = None
 
 
-def test_create_topic_retries_without_generated_icon_when_icon_is_rejected(channel, slave):
+def test_create_topic_does_not_generate_or_set_topic_icon(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(61505)
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
     channel.config.pop("topic_icons", None)
     forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(61506))
 
-    with patch.object(channel.chat_binding, "_get_topic_icon_picture", return_value=_png_bytes()), \
-         patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji", return_value="emoji-generated"), \
-         patch.object(
-             channel.bot_manager,
-             "create_forum_topic",
-             side_effect=[BadRequest("icon custom emoji is invalid"), forum_topic],
-         ) as create_forum_topic:
+    with patch.object(channel.chat_binding, "_get_topic_icon_picture") as get_topic_icon_picture, \
+         patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji") as get_or_create, \
+         patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
         result = channel.chat_binding.create_topic(slave_uid, topic_chat_id)
 
     assert result == TelegramTopicID(61506)
-    assert create_forum_topic.call_count == 2
-    assert create_forum_topic.call_args_list[0].kwargs["icon_custom_emoji_id"] == "emoji-generated"
-    assert "icon_custom_emoji_id" not in create_forum_topic.call_args_list[1].kwargs
-    assert channel.chat_binding._topic_icon_custom_emoji_unavailable is True
+    get_topic_icon_picture.assert_not_called()
+    get_or_create.assert_not_called()
+    create_forum_topic.assert_called_once()
+    assert "icon_custom_emoji_id" not in create_forum_topic.call_args.kwargs
+    assert channel.chat_binding._topic_icon_custom_emoji_unavailable is False
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
     channel.chat_binding._topic_icon_custom_emoji_unavailable = False
     channel.chat_binding._topic_icon_custom_emoji_unavailable_reason = None
 
 
-def test_sync_topic_icons_updates_existing_topic_with_avatar_custom_emoji(channel, slave):
+def test_update_topic_info_does_not_generate_or_set_topic_icon(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(62005)
     thread_id = TelegramTopicID(62006)
@@ -363,7 +359,7 @@ def test_sync_topic_icons_updates_existing_topic_with_avatar_custom_emoji(channe
     }
     sent_message = SimpleNamespace(message_id=123)
 
-    with patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji", return_value="emoji-avatar"), \
+    with patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji") as get_or_create, \
          patch.object(channel.bot_manager, "edit_forum_topic", return_value=True) as edit_forum_topic, \
          patch.object(channel.bot_manager, "send_photo", return_value=sent_message), \
          patch.object(channel.bot_manager, "pin_chat_message"), \
@@ -375,8 +371,9 @@ def test_sync_topic_icons_updates_existing_topic_with_avatar_custom_emoji(channe
 
     assert success is True
     assert count == 1
+    get_or_create.assert_not_called()
     edit_forum_topic.assert_called_once()
-    assert edit_forum_topic.call_args.kwargs["icon_custom_emoji_id"] == "emoji-avatar"
+    assert "icon_custom_emoji_id" not in edit_forum_topic.call_args.kwargs
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
     channel.config.pop("topic_icons", None)
@@ -386,34 +383,22 @@ def test_sync_topic_icons_command_allows_non_configured_topic_group(channel):
     update = _command_update("supergroup", -10062005, is_forum=True)
     channel.topic_group = TelegramChatID(-1001)
 
-    with patch.object(
-        channel.chat_binding,
-        "_sync_forum_topic_icons",
-        return_value=(True, "Synced 1 topic icon.", 1),
-    ) as sync_forum_topic_icons, \
-         patch("efb_telegram_master.chat_binding.sync_reply_text") as reply:
+    with patch.object(channel.bot_manager, "reply_error") as reply_error:
         channel.chat_binding.sync_topic_icons(update, Mock())
 
-    sync_forum_topic_icons.assert_called_once_with(TelegramChatID(-10062005))
-    reply.assert_called_once()
+    reply_error.assert_called_once()
+    assert "disabled" in reply_error.call_args.args[1]
     channel.topic_group = TelegramChatID(channel.flag('topic_group'))
 
 
-def test_sync_topic_icons_private_command_syncs_all_known_topic_groups(channel):
+def test_sync_topic_icons_private_command_reports_disabled(channel):
     update = _command_update("private", 12345)
-    topic_chat_ids = [TelegramChatID(-1001), TelegramChatID(-1002)]
 
-    with patch.object(channel.db, "get_topic_chat_ids", return_value=topic_chat_ids), \
-         patch.object(channel.chat_binding, "_sync_forum_topic_icons", side_effect=[
-             (True, "Synced 1 topic icon.", 1),
-             (True, "Synced 2 topic icons.", 2),
-         ]) as sync_forum_topic_icons, \
-         patch("efb_telegram_master.chat_binding.sync_reply_text") as reply:
+    with patch.object(channel.bot_manager, "reply_error") as reply_error:
         channel.chat_binding.sync_topic_icons(update, Mock())
 
-    assert sync_forum_topic_icons.call_args_list[0].args == (TelegramChatID(-1001),)
-    assert sync_forum_topic_icons.call_args_list[1].args == (TelegramChatID(-1002),)
-    assert "Synced 3 topic icons" in reply.call_args.args[2]
+    reply_error.assert_called_once()
+    assert "disabled" in reply_error.call_args.args[1]
 
 
 def test_update_topic_info_does_not_clear_existing_icon_when_sync_fails(channel, slave):

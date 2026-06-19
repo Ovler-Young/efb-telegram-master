@@ -697,18 +697,17 @@ e.g.:
 
 -   ``topic_icons`` *(dict)* [Default: ``{}``]
 
-    Configure custom emoji icons for forum topics.
+    Configure custom emoji generated from remote chat avatars.
 
     - ``sync_avatar_to_custom_emoji``: when unset or ``true``, ETM tries to
       convert linked remote chat avatars into Telegram custom emoji stickers
-      with the main bot token and applies them to topic icons automatically.
-      If Telegram rejects generated custom emoji for this bot account, ETM
-      records that state for the current run and falls back to updating topics
-      without generated icons. Set this to ``false`` to disable generated
-      avatar emoji while still allowing explicit ``custom_emoji_ids``.
-    - ``/sync_topic_icons``: when sent in a forum group, syncs icons for that
-      known topic group even if it is not the configured ``topic_group``. When
-      sent to the bot privately, syncs icons for all known topic groups.
+      with the main bot token and uses them before member names in bridged
+      group message headers. Topic custom emoji icon updates are currently
+      disabled because Telegram rejects this Bot API operation for bot-only
+      sessions. Set this to ``false`` to disable generated avatar emoji while
+      still allowing explicit ``custom_emoji_ids``.
+    - ``/sync_topic_icons``: replies with a disabled notice while Bot API
+      topic icon updates are not usable from this bot-only implementation.
     - ``sticker_set_name``: base sticker set name used for generated custom
       emoji. Defaults to ``etm_topic_icons``. ETM appends
       ``_by_<bot_username>`` when it is not already present. When one set
@@ -718,8 +717,8 @@ e.g.:
       sets. Defaults to the first configured admin.
     - ``custom_emoji_ids``: optional mapping from ETM slave chat UID to an
       existing ``custom_emoji_id``. These IDs are used before generated avatar
-      emoji, and are the only reliable way to reuse an already-created custom
-      emoji for the same chat across runs.
+      emoji. Generated custom emoji are also deduplicated by avatar PNG hash in
+      ETM's database, so the same avatar is reused across restarts.
 
     Example:
 

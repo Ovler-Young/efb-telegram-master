@@ -72,8 +72,8 @@ async def test_reply_inside_topic_routes_back_to_slave(helper, client, slave_wit
     assert slave_message.text == "topic reply integration"
 
 
-def test_bot_api_accepts_generated_custom_emoji_for_topic_icon(channel_with_topic_group, slave_with_topic_group,
-                                                              bot_topic_group):
+def test_bot_api_accepts_generated_custom_emoji_in_message_text(channel_with_topic_group, slave_with_topic_group,
+                                                                bot_topic_group):
     if os.getenv("TEST_PREMIUM_TOPIC_CUSTOM_EMOJI") != "1":
         pytest.skip("Set TEST_PREMIUM_TOPIC_CUSTOM_EMOJI=1 to run this live Bot API capability check.")
 
@@ -95,11 +95,11 @@ def test_bot_api_accepts_generated_custom_emoji_for_topic_icon(channel_with_topi
         custom_emoji_id = manager._get_or_create_topic_icon_custom_emoji(slave_uid, picture)
 
         assert custom_emoji_id
-        assert channel_with_topic_group.bot_manager.edit_forum_topic(
+        assert channel_with_topic_group.bot_manager.send_message(
             chat_id=bot_topic_group,
+            text=f'<tg-emoji emoji-id="{custom_emoji_id}">😀</tg-emoji> ETM custom emoji smoke',
             message_thread_id=topic.message_thread_id,
-            name="ETM custom emoji smoke",
-            icon_custom_emoji_id=custom_emoji_id,
+            parse_mode="HTML",
         )
     finally:
         if "topic" in locals():

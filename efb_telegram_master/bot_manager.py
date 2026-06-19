@@ -5,6 +5,7 @@ import html
 import io
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -52,6 +53,26 @@ MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
 P = ParamSpec("P")
 T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
+CUSTOM_EMOJI_PLACEHOLDER_RE = re.compile(r"\x00ETM_CUSTOM_EMOJI:([0-9]+)\x00")
+CUSTOM_EMOJI_FALLBACK = "😀"
+
+
+def custom_emoji_placeholder(custom_emoji_id: str) -> str:
+    if not custom_emoji_id.isdigit():
+        raise ValueError("Telegram custom emoji ID must be numeric.")
+    return f"\x00ETM_CUSTOM_EMOJI:{custom_emoji_id}\x00"
+
+
+def render_custom_emoji_placeholders(text: str) -> str:
+    return CUSTOM_EMOJI_PLACEHOLDER_RE.sub(CUSTOM_EMOJI_FALLBACK, text)
+
+
+def escape_html_affix(text: str) -> str:
+    escaped = html.escape(text)
+    return CUSTOM_EMOJI_PLACEHOLDER_RE.sub(
+        lambda match: f'<tg-emoji emoji-id="{match.group(1)}">{CUSTOM_EMOJI_FALLBACK}</tg-emoji>',
+        escaped,
+    )
 
 
 class SyncBotProtocol(Protocol):
@@ -661,8 +682,11 @@ class TelegramBotManager(LocaleMixin):
                 suffix = (suffix and ("\n" + suffix)) or suffix
 
                 if str(kwargs.get('parse_mode', '')).lower() == "html":
-                    prefix = html.escape(prefix)
-                    suffix = html.escape(suffix)
+                    prefix = escape_html_affix(prefix)
+                    suffix = escape_html_affix(suffix)
+                else:
+                    prefix = render_custom_emoji_placeholders(prefix)
+                    suffix = render_custom_emoji_placeholders(suffix)
 
                 if len(prefix + text + suffix) >= telegram.constants.MessageLimit.CAPTION_LENGTH:
                     full_message = io.StringIO(prefix + text + suffix)
@@ -1878,8 +1902,11 @@ class TelegramBotManager(LocaleMixin):
         prefix = (prefix and (prefix + "\n")) or prefix
         suffix = (suffix and ("\n" + suffix)) or suffix
         if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = html.escape(prefix)
-            suffix = html.escape(suffix)
+            prefix = escape_html_affix(prefix)
+            suffix = escape_html_affix(suffix)
+        else:
+            prefix = render_custom_emoji_placeholders(prefix)
+            suffix = render_custom_emoji_placeholders(suffix)
         text: str
         if args[1:]:
             text = args[1]
@@ -1935,8 +1962,11 @@ class TelegramBotManager(LocaleMixin):
         prefix = (prefix and (prefix + "\n")) or prefix
         suffix = (suffix and ("\n" + suffix)) or suffix
         if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = html.escape(prefix)
-            suffix = html.escape(suffix)
+            prefix = escape_html_affix(prefix)
+            suffix = escape_html_affix(suffix)
+        else:
+            prefix = render_custom_emoji_placeholders(prefix)
+            suffix = render_custom_emoji_placeholders(suffix)
         text = kwargs.pop('text', '')
         if len(prefix + text + suffix) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode())

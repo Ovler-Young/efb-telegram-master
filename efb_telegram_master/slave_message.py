@@ -24,12 +24,14 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 
 from ehforwarderbot import Message, Status, coordinator
-from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
+from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat, ChatMember
 from ehforwarderbot.constants import MsgType
+from ehforwarderbot.exceptions import EFBOperationNotSupported
 from ehforwarderbot.message import LinkAttribute, LocationAttribute, MessageCommand, Reactions, \
     StatusAttribute
 from ehforwarderbot.status import ChatUpdates, MemberUpdates, MessageRemoval, MessageReactionsUpdate
 from . import utils
+from .bot_manager import custom_emoji_placeholder
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import ETMCommandMsgStorage
@@ -1196,11 +1198,71 @@ class SlaveMessageProcessor(LocaleMixin):
 
         self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
 
+    def _author_avatar_custom_emoji_prefix(self, msg: Message) -> str:
+        msg_uid = getattr(msg, "uid", "")
+        if not isinstance(msg.chat, GroupChat) or isinstance(msg.author, SelfChatMember):
+            return ""
+        if msg.author == msg.chat.self:
+            return ""
+        if not self.channel.chat_binding._get_topic_icon_config():
+            return ""
+        if not self.channel.chat_binding._is_topic_icon_sync_enabled():
+            return ""
+
+        author = msg.author
+        if not isinstance(author, ChatMember):
+            return ""
+
+        picture = None
+        try:
+            channel_id = author.module_id
+            slave_channel = coordinator.slaves.get(channel_id)
+            if not slave_channel:
+                self.logger.debug(
+                    "[%s] Cannot resolve author avatar custom emoji; channel %s is not loaded.",
+                    msg_uid,
+                    channel_id,
+                )
+                return ""
+
+            picture = slave_channel.get_chat_picture(author)
+            custom_emoji_id = self.channel.chat_binding._resolve_topic_icon_custom_emoji_id(
+                utils.chat_id_to_str(chat=author),
+                picture,
+            )
+            if not custom_emoji_id:
+                return ""
+            return custom_emoji_placeholder(custom_emoji_id)
+        except (EFBOperationNotSupported, TelegramError, ValueError) as e:
+            self.logger.debug(
+                "[%s] Failed to resolve author avatar custom emoji for %s: %s",
+                msg_uid,
+                utils.chat_id_to_str(chat=author),
+                e,
+            )
+            return ""
+        except Exception as e:
+            self.logger.warning(
+                "[%s] Failed to resolve author avatar custom emoji for %s. error_type=%s error_message=%r",
+                msg_uid,
+                utils.chat_id_to_str(chat=author),
+                type(e).__name__,
+                str(e),
+                exc_info=True,
+            )
+            return ""
+        finally:
+            if picture and getattr(picture, 'close', None):
+                picture.close()
+
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name
         if isinstance(msg.chat, GroupChat):
             self.logger.debug("[%s] Message is from a group. Sender: %s", msg.uid, msg.author)
             msg_prefix = msg.author.long_name
+            author_icon_prefix = self._author_avatar_custom_emoji_prefix(msg)
+            if author_icon_prefix:
+                msg_prefix = f"{author_icon_prefix} {msg_prefix}"
 
         if singly_linked:
             if msg_prefix:  # if group message
