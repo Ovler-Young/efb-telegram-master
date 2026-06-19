@@ -230,6 +230,10 @@ class SlaveMessageProcessor(LocaleMixin):
                     target_msg = utils.message_id_str_to_id(log.master_msg_id)
                     if target_msg and target_msg[0] == int(tg_dest):
                         target_msg_id = TelegramMessageID(target_msg[1])
+                        # Strip the quote block from msg.text so that
+                        # html_substitutions won't render a duplicate <blockquote>.
+                        # The native Telegram reply header already shows the quoted content.
+                        msg.text = msg.text[quote_match.end():]
                         self.logger.debug("[%s] Fuzzy quote match found: tg_msg_id=%s",
                                           msg.uid, target_msg_id)
                     else:
