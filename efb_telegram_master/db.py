@@ -687,35 +687,67 @@ class DatabaseManager:
                                limit: int = 200) -> Optional['MsgLog']:
         """Find a message in the database by matching quoted text content.
 
-        Searches the most recent `limit` messages from the same slave chat
-        whose `text` field starts with or contains the given quote_text.
+        Uses a 3-layer matching strategy on a single DB query result:
+        1. Strip "Name：" or "Name:" prefix from quote_text, then check
+           if the remaining body is contained in candidate.text (forward match).
+        2. Reverse match: check if candidate.text is contained in the
+           full quote_text (handles cases where DB text is a substring).
+        3. Normalized fuzzy match: strip all whitespace and CJK/ASCII
+           punctuation from both sides, then check containment.
 
         Args:
             slave_origin_uid: The slave chat identifier string to scope the search.
-            quote_text: The quoted text extracted from the WeChat「」format.
+            quote_text: The quoted text extracted from the WeChat「」format,
+                        typically in the form "SenderName：original content".
             limit: Maximum number of recent messages to search (default 200).
 
         Returns:
             Optional[MsgLog]: The best matching message log entry, or None.
         """
+        import re as _re
+
         if not quote_text or not quote_text.strip():
             return None
 
-        # Strip HTML entities that may have been escaped
-        clean_text = quote_text.strip()
+        full_quote = quote_text.strip()
+
+        # Layer 1 prep: strip "SenderName：" or "SenderName:" prefix
+        # Match everything before the first full-width or half-width colon
+        colon_match = _re.match(r'^[^：:]+[：:](.+)$', full_quote, flags=_re.DOTALL)
+        quote_body = colon_match.group(1).strip() if colon_match else full_quote
+
+        # Layer 3 prep: normalize helper — remove whitespace + common punctuation
+        _punct_re = _re.compile(r'[\s，。！？、；：\u201c\u201d\u2018\u2019（）《》【】…—.,!?\';:\"()\[\]{}<>~`@#$%^&*_+=|/\\-]+')
+
+        def _normalize(s: str) -> str:
+            return _punct_re.sub('', s)
+
+        norm_body = _normalize(quote_body)
+        norm_full = _normalize(full_quote)
 
         try:
-            # Search recent messages from the same slave chat,
-            # ordered by time descending (most recent first).
-            # We use LIKE with the quote text to find messages whose text
-            # starts with the quoted content.
             candidates = (MsgLog.select()
                           .where(MsgLog.slave_origin_uid == slave_origin_uid)
                           .order_by(MsgLog.time.desc())
                           .limit(limit))
 
             for candidate in candidates:
-                if candidate.text and clean_text in candidate.text:
+                ct = candidate.text
+                if not ct:
+                    continue
+
+                # Layer 1: forward match (stripped body in DB text)
+                if quote_body and quote_body in ct:
+                    return candidate
+
+                # Layer 2: reverse match (DB text in full quote)
+                if ct.strip() in full_quote:
+                    return candidate
+
+                # Layer 3: normalized fuzzy match
+                norm_ct = _normalize(ct)
+                if norm_ct and (norm_body and norm_body in norm_ct
+                                or norm_ct in norm_full):
                     return candidate
 
             return None
