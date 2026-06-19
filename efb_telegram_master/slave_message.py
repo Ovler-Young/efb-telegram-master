@@ -139,19 +139,40 @@ class SlaveMessageProcessor(LocaleMixin):
 
             self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
         except Exception as e:
-            if isinstance(e, telegram.error.BadRequest) and e.message:
-                if "Topic" in e.message:
-                    try:
-                        self.bot.reopen_forum_topic(
-                            chat_id=tg_dest,
-                            message_thread_id=thread_id
-                        )
-                    except telegram.error.BadRequest as reopen_err:
-                        self.logger.error('Failed to reopen topic, Reason: %s', reopen_err)
-                        self.db.remove_topic_assoc(
-                            topic_chat_id=tg_dest,
-                            message_thread_id=thread_id,
-                        )
+            if isinstance(e, telegram.error.BadRequest) and e.message and \
+                    ("Topic" in e.message or "thread" in e.message.lower()):
+                # Topic might be closed or deleted. Try to reopen first (works for closed topics).
+                topic_recovered = False
+                try:
+                    self.bot.reopen_forum_topic(
+                        chat_id=tg_dest,
+                        message_thread_id=thread_id
+                    )
+                    topic_recovered = True
+                except telegram.error.BadRequest as reopen_err:
+                    # Reopen failed — topic was deleted, not just closed.
+                    # Remove the stale DB record so a new topic can be created.
+                    self.logger.warning('Topic %s in chat %s was deleted. Removing stale association and retrying. '
+                                        'Reopen error: %s', thread_id, tg_dest, reopen_err)
+                    self.db.remove_topic_assoc(
+                        topic_chat_id=tg_dest,
+                        message_thread_id=thread_id,
+                    )
+
+                # Retry: either the topic was reopened, or the stale record was removed
+                # so get_slave_msg_dest will create a fresh topic.
+                try:
+                    if topic_recovered:
+                        # Topic was merely closed and is now reopened — retry with the same thread_id
+                        self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
+                    else:
+                        # Topic was deleted — re-resolve destination (will auto-create a new topic)
+                        msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(msg)
+                        if tg_dest is not None:
+                            self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
+                except Exception as retry_err:
+                    self.logger.error("Failed to deliver message after topic recovery.\nMessage: %s\n%s\n%s",
+                                      repr(msg), repr(retry_err), traceback.format_exc())
             else:
                 self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
                               repr(msg), repr(e), traceback.format_exc())
@@ -188,6 +209,38 @@ class SlaveMessageProcessor(LocaleMixin):
                     target_msg_id = None
                 else:
                     target_msg_id = target_msg[1]
+
+        # Fallback: If msg.target was not set (no EFB-level reply), but the message
+        # text contains a WeChat-style quote block (「...」\n---\n...), try to find
+        # the original message in the database by fuzzy-matching the quoted text.
+        if target_msg_id is None and not isinstance(msg.target, Message) and msg.text:
+            import re
+            quote_match = re.match(r'^「(.+?)」\n-[\- ]{10,40}\n', msg.text, flags=re.DOTALL)
+            if quote_match:
+                quoted_text = quote_match.group(1)
+                slave_chat_uid = utils.chat_id_to_str(chat=msg.chat)
+                self.logger.debug("[%s] Text quote block detected, attempting fuzzy match: '%.50s...'",
+                                  msg.uid, quoted_text)
+                log = self.db.find_msg_by_quote_text(
+                    slave_origin_uid=slave_chat_uid,
+                    quote_text=quoted_text,
+                    limit=200
+                )
+                if log:
+                    target_msg = utils.message_id_str_to_id(log.master_msg_id)
+                    if target_msg and target_msg[0] == int(tg_dest):
+                        target_msg_id = TelegramMessageID(target_msg[1])
+                        # Flag the message so html_substitutions renders
+                        # the quote as a collapsed (expandable) blockquote,
+                        # avoiding visual duplication with the native reply header.
+                        msg._expandable_quote = True
+                        self.logger.debug("[%s] Fuzzy quote match found: tg_msg_id=%s",
+                                          msg.uid, target_msg_id)
+                    else:
+                        self.logger.debug("[%s] Fuzzy quote match found but in different chat, skipping.",
+                                          msg.uid)
+                else:
+                    self.logger.debug("[%s] No fuzzy quote match found in database.", msg.uid)
 
         # Generate basic reply markup
         commands: Optional[List[MessageCommand]] = None
@@ -368,10 +421,21 @@ class SlaveMessageProcessor(LocaleMixin):
                     t += '</code>'
                 prev = i[1]
             t += html.escape(text[prev:])
-            return t
         elif text:
-            return html.escape(text)
-        return text
+            t = html.escape(text)
+        else:
+            t = text
+
+        if t:
+            import re
+            quote_match = re.match(r'^「(.+?)」\n-[\- ]{10,40}\n(.*)$', t, flags=re.DOTALL)
+            if quote_match:
+                # Use expandable (collapsed) blockquote when a native reply-to
+                # header is present, so the quote doesn't visually duplicate.
+                # Falls back to a regular visible blockquote otherwise.
+                bq_tag = "blockquote expandable" if getattr(msg, '_expandable_quote', False) else "blockquote"
+                t = f"<{bq_tag}>{quote_match.group(1)}</blockquote>\n{quote_match.group(2)}"
+        return t
 
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -1100,15 +1164,49 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.logger.debug("Found message to delete in Telegram: %s.%s",
                                   *old_msg_id)
                 try:
+                    # Get sender name from DB to preserve it in the edited message
+                    sender_prefix = ""
+                    try:
+                        etm_msg = old_msg.build_etm_msg(self.chat_manager)
+                        sender_prefix = f"{etm_msg.author.long_name}:"
+                    except Exception:
+                        pass
+
+                    original_text = html.escape(old_msg.text or '')
+                    new_text = f"<del>{original_text}</del>\n[已撤回]" if original_text else "[已撤回]"
+                    
+                    if old_msg.media_type and old_msg.media_type not in ('Text', 'text'):
+                        self.bot.edit_message_caption(
+                            chat_id=old_msg_id[0], 
+                            message_id=old_msg_id[1], 
+                            caption=new_text,
+                            prefix=sender_prefix,
+                            parse_mode="HTML"
+                        )
+                    else:
+                        self.bot.edit_message_text(
+                            chat_id=old_msg_id[0], 
+                            message_id=old_msg_id[1], 
+                            text=new_text,
+                            prefix=sender_prefix,
+                            parse_mode="HTML"
+                        )
+                    return
+                except Exception as e:
+                    self.logger.debug("Failed to edit message %s.%s as recalled: %s. Falling back to delete/notify.", *old_msg_id, e)
+                    pass
+
+                try:
                     if not self.channel.flag('prevent_message_removal'):
-                        self.bot.delete_message(*old_msg_id,
-                                                _sender_bot_id=old_msg.sender_bot_id)
+                        self.bot.delete_message(*old_msg_id, _sender_bot_id=old_msg.sender_bot_id)
                         return
                 except TelegramError as e:
                     self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
                     pass
+                
                 self.bot.send_message(chat_id=old_msg_id[0],
-                                      text=self._("Message is removed in remote chat."),
+                                      text=f"<blockquote>🚫 {self._('Message is removed in remote chat.')}</blockquote>",
+                                      parse_mode="HTML",
                                       reply_to_message_id=old_msg_id[1],
                                       disable_notification=True)  # Probably silent notification
             else:

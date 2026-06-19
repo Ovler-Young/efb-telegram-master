@@ -351,9 +351,9 @@ class MasterMessageProcessor(LocaleMixin):
                         try:
                             message.delete()
                         except TelegramError:
-                            message.reply_text(self._("Message is removed in remote chat."))
+                            message.reply_text(f"<blockquote>🚫 {self._('Message is removed in remote chat.')}</blockquote>", parse_mode="HTML")
                     else:
-                        message.reply_text(self._("Message is removed in remote chat."))
+                        message.reply_text(f"<blockquote>🚫 {self._('Message is removed in remote chat.')}</blockquote>", parse_mode="HTML")
                     log_message = False
                     return
                 self.logger.debug('[%s] Message is edited (%s)', m.uid, m.edit)
@@ -598,9 +598,9 @@ class MasterMessageProcessor(LocaleMixin):
             try:
                 reply.delete()
             except TelegramError:
-                reply.reply_text(self._("Message is removed in remote chat."))
+                reply.reply_text(f"<blockquote>🚫 {self._('Message is removed in remote chat.')}</blockquote>", parse_mode="HTML")
         else:
-            reply.reply_text(self._("Message is removed in remote chat."))
+            reply.reply_text(f"<blockquote>🚫 {self._('Message is removed in remote chat.')}</blockquote>", parse_mode="HTML")
 
     def unsupported_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)

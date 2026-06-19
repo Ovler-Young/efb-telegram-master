@@ -42,6 +42,40 @@ def test_caption_prefix_suffix(channel, bot_admin, image):
     assert edited.caption == "Edited prefix\nEdited text\nEdited suffix"
 
 
+def test_html_affix_prefix_uses_blockquote():
+    prefix, suffix = TelegramBotManager._format_affix(
+        prefix='Speaker <A&B>', suffix='Seen <ok> & noted', parse_mode='html'
+    )
+
+    assert prefix == '<blockquote>Speaker &lt;A&amp;B&gt;</blockquote>\n'
+    assert suffix == '\nSeen &lt;ok&gt; &amp; noted'
+
+
+def test_html_caption_affix_decorator_uses_blockquote():
+    def fake_send(self, *args, **kwargs):
+        return SimpleNamespace(caption=kwargs['caption'])
+
+    manager = SimpleNamespace(
+        _detect_empty_file=Mock(return_value=None),
+        _format_affix=TelegramBotManager._format_affix,
+    )
+    decorated = TelegramBotManager.Decorators.caption_affix_decorator(fake_send)
+
+    message = decorated(
+        manager,
+        12345,
+        caption='Body',
+        prefix='Speaker <A&B>',
+        suffix='Seen <ok> & noted',
+        parse_mode='html',
+    )
+
+    assert message.caption == (
+        '<blockquote>Speaker &lt;A&amp;B&gt;</blockquote>\n'
+        'Body\nSeen &lt;ok&gt; &amp; noted'
+    )
+
+
 def test_message_truncation(channel, bot_admin):
     msg_body = ''.join(random.choice(string.ascii_letters) for _ in range(100000))
     with patch('telegram.Bot.send_document') as mock_send_document:
