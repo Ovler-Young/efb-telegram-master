@@ -124,8 +124,3 @@ fabric.properties
 
 # Readme translations
 readme_translations/locale
-CLAUDE.md
-.claude/settings.local.json
-
-.venv/
-AGENTS.md

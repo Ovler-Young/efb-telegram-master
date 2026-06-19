@@ -348,8 +348,8 @@ class TelegramBotManager(LocaleMixin):
     Attributes:
         me (telegram.User): Telegram User
         admins (List[int]): List of admin user IDs.
-        updater (telegram.ext.Updater): Updater of the bot
-        dispatcher (telegram.ext.Dispatcher): Dispatcher of the updater
+        application (telegram.ext.Application): PTB application of the bot.
+        dispatcher (telegram.ext.Application): Dispatcher-compatible application instance.
     """
 
     webhook = False

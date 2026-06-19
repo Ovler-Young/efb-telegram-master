@@ -11,7 +11,7 @@ def _make_limiter(**kwargs):
     return SlidingWindowRateLimiter(**defaults)
 
 
-# ── Basic delay / reserve ──────────────────────────────────────────
+# Basic delay / reserve
 
 
 def test_first_request_has_zero_delay():
@@ -25,7 +25,7 @@ def test_peek_does_not_consume_slot():
     limiter = _make_limiter(chat_limit=2)
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
         assert limiter.peek_delay(1) == 0.0
-        assert limiter.peek_delay(1) == 0.0  # still 0 — nothing consumed
+        assert limiter.peek_delay(1) == 0.0  # still 0; nothing consumed
         limiter.reserve_slot(1)
         limiter.reserve_slot(1)
         assert limiter.peek_delay(1) > 0.0  # now full
@@ -57,7 +57,7 @@ def test_different_chats_are_independent():
         assert limiter.peek_delay(2) == 0.0  # chat 2 still free
 
 
-# ── Safety margin ──────────────────────────────────────────────────
+# Safety margin
 
 
 def test_safety_margin_reduces_effective_limit():
@@ -66,10 +66,10 @@ def test_safety_margin_reduces_effective_limit():
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
         assert limiter.reserve_slot(1) == 0.0
         assert limiter.reserve_slot(1) == 0.0
-        assert limiter.peek_delay(1) > 0.0  # 2 consumed, margin=1 → full
+        assert limiter.peek_delay(1) > 0.0  # 2 consumed, margin=1; full
 
 
-# ── Timestamp cleanup ──────────────────────────────────────────────
+# Timestamp cleanup
 
 
 def test_old_timestamps_are_cleaned_up():
@@ -84,7 +84,7 @@ def test_old_timestamps_are_cleaned_up():
         assert limiter.peek_delay(1) == 0.0  # old timestamp cleaned up
 
 
-# ── get_counts ─────────────────────────────────────────────────────
+# get_counts
 
 
 def test_get_counts_returns_correct_values():
@@ -100,7 +100,7 @@ def test_get_counts_returns_correct_values():
         assert global_count == 3
 
 
-# ── Thread safety (smoke) ─────────────────────────────────────────
+# Thread safety (smoke)
 
 
 def test_concurrent_reserves_do_not_crash():

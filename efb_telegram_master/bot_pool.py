@@ -250,7 +250,7 @@ class BotPool:
                 chat_url = f"tg://openmessage?chat_id={chat_id}"
 
             text = (
-                f'📊 Message rate is high in <a href="{chat_url}">chat {chat_id}</a>. '
+                f'Message rate is high in <a href="{chat_url}">chat {chat_id}</a>. '
                 f"To reduce delay, please add {bot_links} to the group."
             )
 
