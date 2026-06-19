@@ -3,7 +3,7 @@
 import logging
 import threading
 import time
-from typing import Optional, List, Dict, Tuple, TYPE_CHECKING
+from typing import Optional, List, Dict, Tuple, TYPE_CHECKING, Callable, Hashable
 
 from .auxiliary_bot import AuxiliaryBot
 
@@ -28,6 +28,8 @@ class BotPool:
         self._bot_by_id: Dict[int, AuxiliaryBot] = {b.bot_id: b for b in aux_bots}
         self._bot_manager = bot_manager
         self._pool_lock = threading.Lock()
+        self._round_robin_cursor_by_chat: Dict[int, int] = {}
+        self._affinity_bot_by_key: Dict[Hashable, int] = {}
 
         # One notification per chat per process lifetime
         self._notified_chats: set = set()
@@ -47,7 +49,54 @@ class BotPool:
         except (TypeError, ValueError):
             return None
 
-    def acquire_send_slot(self, chat_id: int, max_delay: float = float('inf')
+    def _ordered_bots_for_chat(self, chat_id: int) -> List[AuxiliaryBot]:
+        """Return bots in a chat-specific round-robin order."""
+        if not self._bots:
+            return []
+
+        start = self._round_robin_cursor_by_chat.get(chat_id, 0) % len(self._bots)
+        return self._bots[start:] + self._bots[:start]
+
+    def _advance_round_robin_cursor(self, chat_id: int, selected_bot: AuxiliaryBot):
+        """Advance the chat cursor so the next tie starts after *selected_bot*."""
+        try:
+            selected_index = self._bots.index(selected_bot)
+        except ValueError:
+            return
+        self._round_robin_cursor_by_chat[chat_id] = (selected_index + 1) % len(self._bots)
+
+    def _half_chat_capacity(self) -> float:
+        return float(getattr(self._bot_manager, "CHAT_LIMIT", 20)) / 2
+
+    def _try_affinity_bot(self, chat_id: int, max_delay: float,
+                          affinity_key: Optional[Hashable],
+                          skip_bot: Optional[Callable[[AuxiliaryBot], bool]]) -> Optional[Tuple[AuxiliaryBot, float]]:
+        if affinity_key is None:
+            return None
+
+        bot_id = self._affinity_bot_by_key.get(affinity_key)
+        aux_bot = self.get_bot_by_id(bot_id)
+        if aux_bot is None or aux_bot.disabled:
+            return None
+        if skip_bot is not None and skip_bot(aux_bot):
+            return None
+        if aux_bot.check_membership_tri(chat_id) is not True:
+            return None
+
+        delay = aux_bot.peek_delay(chat_id)
+        if delay != 0.0 or delay >= max_delay:
+            return None
+        if aux_bot.get_chat_send_count(chat_id) >= self._half_chat_capacity():
+            return None
+
+        aux_bot.reserve_slot(chat_id)
+        return aux_bot, delay
+
+    def acquire_send_slot(self, chat_id: int, max_delay: float = float('inf'),
+                          skip_bot: Optional[Callable[[AuxiliaryBot], bool]] = None,
+                          affinity_key: Optional[Hashable] = None,
+                          *,
+                          notify_admin: bool = True,
                           ) -> Optional[Tuple[AuxiliaryBot, float]]:
         """Atomically find the best available auxiliary bot for a chat.
 
@@ -62,19 +111,27 @@ class BotPool:
             max_delay: Upper bound on acceptable delay. Bots whose delay
                        >= max_delay are skipped. Pass the main bot's delay
                        so aux bots are only chosen when they're actually faster.
+            affinity_key: Optional logical stream key. When provided, the pool
+                          tries the previously selected bot first while it is
+                          below half of the per-chat capacity.
 
         Returns:
             (AuxiliaryBot, delay) if a suitable aux bot was found,
             None if no aux bot beats max_delay or none are members.
         """
         with self._pool_lock:
+            affinity_slot = self._try_affinity_bot(chat_id, max_delay, affinity_key, skip_bot)
+            if affinity_slot is not None:
+                return affinity_slot
+
             best_bot: Optional[AuxiliaryBot] = None
             best_delay = float('inf')
             confirmed_non_member_bots: List[AuxiliaryBot] = []
             unknown_bots: List[AuxiliaryBot] = []
+            ordered_bots = self._ordered_bots_for_chat(chat_id)
 
-            for aux_bot in self._bots:
-                if aux_bot.disabled:
+            for aux_bot in ordered_bots:
+                if aux_bot.disabled or (skip_bot is not None and skip_bot(aux_bot)):
                     continue
 
                 status = aux_bot.check_membership_tri(chat_id)
@@ -95,6 +152,8 @@ class BotPool:
             # Cold start: synchronously resolve unknown bots so they can help now
             if best_bot is None and unknown_bots:
                 for aux_bot in unknown_bots:
+                    if skip_bot is not None and skip_bot(aux_bot):
+                        continue
                     if aux_bot.check_membership_sync(chat_id, timeout=3.0):
                         delay = aux_bot.peek_delay(chat_id)
                         if delay < best_delay:
@@ -107,9 +166,15 @@ class BotPool:
 
             if best_bot is not None and best_delay < max_delay:
                 best_bot.reserve_slot(chat_id)
+                self._advance_round_robin_cursor(chat_id, best_bot)
+                if affinity_key is not None:
+                    self._affinity_bot_by_key[affinity_key] = best_bot.bot_id
                 return (best_bot, best_delay)
 
-            if confirmed_non_member_bots:
+            # Suggest adding aux bots only when the caller is actually delayed.
+            # Selection budget (max_delay) may include a small epsilon for fairness,
+            # so notification should be controlled by the caller.
+            if confirmed_non_member_bots and notify_admin:
                 self._maybe_notify_admin(chat_id, confirmed_non_member_bots)
 
             return None
@@ -185,7 +250,7 @@ class BotPool:
                 chat_url = f"tg://openmessage?chat_id={chat_id}"
 
             text = (
-                f'📊 Message rate is high in <a href="{chat_url}">chat {chat_id}</a>. '
+                f'Message rate is high in <a href="{chat_url}">chat {chat_id}</a>. '
                 f"To reduce delay, please add {bot_links} to the group."
             )
 

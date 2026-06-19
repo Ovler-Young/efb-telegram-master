@@ -1,11 +1,11 @@
 # coding=utf-8
 import html
 import logging
-from typing import Tuple, Dict, TYPE_CHECKING, List, Any, Union, Optional
+from typing import Tuple, Dict, TYPE_CHECKING, List, Any, Union, Optional, cast
 
 from telegram import Message, Update
 from telegram.ext import CommandHandler, ConversationHandler, CallbackQueryHandler, MessageHandler, CallbackContext
-from telegram.ext.filters import Filters
+from telegram.ext._utils.types import ConversationDict
 
 from ehforwarderbot import coordinator, Channel, Middleware
 from ehforwarderbot.channel import SlaveChannel
@@ -13,6 +13,7 @@ from ehforwarderbot.message import MessageCommand
 from ehforwarderbot.types import ExtraCommandName
 from .constants import Flags
 from .locale_mixin import LocaleMixin
+from .ptb_compat import Filters
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -43,20 +44,20 @@ class CommandsManager(LocaleMixin):
         self.logger = logging.getLogger(__name__)
 
         self.bot.dispatcher.add_handler(
-            CommandHandler("extra", self.extra_listing))
+            CommandHandler("extra", self.bot.as_async_callback(self.extra_listing)))
         self.bot.dispatcher.add_handler(
             MessageHandler(
                 Filters.regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
-                self.extra_usage))
+                self.bot.as_async_callback(self.extra_usage)))
         self.bot.dispatcher.add_handler(
             MessageHandler(
                 Filters.regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
-                self.extra_call))
+                self.bot.as_async_callback(self.extra_call)))
 
         self.command_conv = ConversationHandler(
             entry_points=[],
-            states={Flags.COMMAND_PENDING: [CallbackQueryHandler(self.command_exec)]},
-            fallbacks=[CallbackQueryHandler(self.bot.session_expired)],
+            states={Flags.COMMAND_PENDING: [CallbackQueryHandler(self.bot.as_async_callback(self.command_exec))]},
+            fallbacks=[CallbackQueryHandler(self.bot.as_async_callback(self.bot.session_expired))],
             per_message=True,
             per_chat=True,
             per_user=False
@@ -71,7 +72,11 @@ class CommandsManager(LocaleMixin):
 
     def register_command(self, message: Message, commands: ETMCommandMsgStorage):
         message_identifier = (message.chat.id, message.message_id)
-        self.command_conv.conversations[message_identifier] = Flags.COMMAND_PENDING
+        conversations = getattr(self.command_conv, "_conversations", None)
+        if conversations is None:
+            conversations = getattr(self.command_conv, "conversations")
+        conversations = cast(ConversationDict, conversations)
+        conversations[cast(Tuple[int, ...], message_identifier)] = Flags.COMMAND_PENDING
         self.msg_storage[message_identifier] = commands
 
     def command_exec(self, update: Update, context: CallbackContext) -> Optional[int]:
@@ -101,13 +106,13 @@ class CommandsManager(LocaleMixin):
             msg = self._("Invalid parameter: {0}. (CE01)").format(callback)
             self.msg_storage.pop(index, None)
             self.bot.edit_message_text(text=msg, chat_id=chat_id, message_id=message_id)
-            update.callback_query.answer()
+            self.bot.answer_callback_query(callback_query_id=update.callback_query.id)
             return ConversationHandler.END
         elif not (0 <= int(callback) < len(self.msg_storage[index].commands)):
             msg = self._("Index out of bound: {0}. (CE02)").format(callback)
             self.msg_storage.pop(index, None)
             self.bot.edit_message_text(text=msg, chat_id=chat_id, message_id=message_id)
-            update.callback_query.answer()
+            self.bot.answer_callback_query(callback_query_id=update.callback_query.id)
             return ConversationHandler.END
 
         callback_idx = int(callback)
@@ -119,7 +124,7 @@ class CommandsManager(LocaleMixin):
         self.logger.debug("[%s.%s] Command execution callback is valid. Command storage item: %s", chat_id, message_id, command_storage)
 
         # Clear inline buttons.
-        update.callback_query.edit_message_reply_markup(None)
+        self.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
         self.logger.debug("[%s.%s] Inline buttons cleared", chat_id, message_id)
 
         fn = getattr(module, command.callable_name, None)
@@ -141,7 +146,7 @@ class CommandsManager(LocaleMixin):
         # self.bot.edit_message_text(prefix=prefix, text=msg,
         #                            chat_id=chat_id, message_id=message_id)
         if msg is None:
-            update.callback_query.answer()
+            self.bot.answer_callback_query(callback_query_id=update.callback_query.id)
             return None
         self.bot.answer_callback_query(
             prefix=prefix, text=msg,
