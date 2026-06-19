@@ -699,17 +699,21 @@ e.g.:
 
     Configure custom emoji icons for forum topics.
 
-    - ``sync_avatar_to_custom_emoji``: when ``true``, ``/sync_topic_icons``
-      converts linked remote chat avatars into Telegram custom emoji stickers
-      in reusable sticker sets and applies them to all existing topic bindings.
-      This depends on Telegram accepting generated custom emoji as forum topic
-      icons for the bot account; run the optional live smoke test with
-      ``TEST_PREMIUM_TOPIC_CUSTOM_EMOJI=1`` in a Premium-owner environment
-      before relying on it in production.
+    - ``sync_avatar_to_custom_emoji``: when unset or ``true``, ETM tries to
+      convert linked remote chat avatars into Telegram custom emoji stickers
+      with the main bot token and applies them to topic icons automatically.
+      If Telegram rejects generated custom emoji for this bot account, ETM
+      records that state for the current run and falls back to updating topics
+      without generated icons. Set this to ``false`` to disable generated
+      avatar emoji while still allowing explicit ``custom_emoji_ids``.
+    - ``/sync_topic_icons``: when sent in a forum group, syncs icons for that
+      known topic group even if it is not the configured ``topic_group``. When
+      sent to the bot privately, syncs icons for all known topic groups.
     - ``sticker_set_name``: base sticker set name used for generated custom
-      emoji. ETM appends ``_by_<bot_username>`` when it is not already present.
-      When one set reaches Telegram's 200-sticker limit, ETM adds ``_<n>``
-      before the bot username suffix.
+      emoji. Defaults to ``etm_topic_icons``. ETM appends
+      ``_by_<bot_username>`` when it is not already present. When one set
+      reaches Telegram's 200-sticker limit, ETM adds ``_<n>`` before the bot
+      username suffix.
     - ``owner_user_id``: optional Telegram user ID that owns generated sticker
       sets. Defaults to the first configured admin.
     - ``custom_emoji_ids``: optional mapping from ETM slave chat UID to an

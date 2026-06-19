@@ -1381,4 +1381,3 @@ class SlaveMessageProcessor(LocaleMixin):
             except OSError as e:
                 self.logger.warning("Failed to clean up local API temp file %s: %s", path, e)
         tls.pending_cleanup = []
-

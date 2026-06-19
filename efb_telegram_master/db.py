@@ -622,6 +622,17 @@ class DatabaseManager:
             return None
 
     @staticmethod
+    def get_topic_chat_ids() -> List[TelegramChatID]:
+        """
+        Get all forum group chat IDs with topic associations.
+
+        Returns:
+            List[TelegramChatID]: Forum group chat IDs known to ETM.
+        """
+        query = TopicAssoc.select(TopicAssoc.topic_chat_id).distinct().order_by(TopicAssoc.topic_chat_id)
+        return [TelegramChatID(int(row.topic_chat_id)) for row in query]
+
+    @staticmethod
     def remove_topic_assoc(topic_chat_id: Optional[TelegramChatID] = None,
                            message_thread_id: Optional[TelegramTopicID] = None,
                            slave_uid: Optional[EFBChannelChatIDStr] = None):

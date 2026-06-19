@@ -54,6 +54,17 @@ def _sticker(emoji, custom_emoji_id):
     return SimpleNamespace(emoji=emoji, custom_emoji_id=custom_emoji_id)
 
 
+def _command_update(chat_type, chat_id, *, is_forum=False, user_id=1):
+    chat = SimpleNamespace(id=chat_id, type=chat_type, is_forum=is_forum)
+    message = Mock()
+    message.chat = chat
+    message.chat_id = chat_id
+    message.message_id = 1
+    message.message_thread_id = None
+    message.from_user = SimpleNamespace(id=user_id)
+    return Update(update_id=10, message=message)
+
+
 def test_topic_assoc_crud(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(10001)
@@ -68,6 +79,21 @@ def test_topic_assoc_crud(channel, slave):
 
     channel.db.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=thread_id)
     assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) is None
+
+
+def test_get_topic_chat_ids_lists_all_known_topic_groups(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    other_slave_uid = "tests.mocks.slave other-topic-chat"
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.remove_topic_assoc(slave_uid=other_slave_uid)
+
+    channel.db.add_topic_assoc(TelegramChatID(10001), TelegramTopicID(20002), slave_uid)
+    channel.db.add_topic_assoc(TelegramChatID(10002), TelegramTopicID(20003), other_slave_uid)
+
+    assert channel.db.get_topic_chat_ids() == [TelegramChatID(10001), TelegramChatID(10002)]
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.remove_topic_assoc(slave_uid=other_slave_uid)
 
 
 def test_get_slave_msg_dest_uses_topic_group(channel, slave):
@@ -100,6 +126,9 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(50005)
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.config["topic_icons"] = {
+        "sync_avatar_to_custom_emoji": False,
+    }
 
     forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(60006))
     with patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
@@ -112,6 +141,7 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(60006)
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.config.pop("topic_icons", None)
 
 
 def test_create_topic_uses_configured_custom_emoji_id(channel, slave):
@@ -140,9 +170,7 @@ def test_create_topic_uses_configured_custom_emoji_id(channel, slave):
 
 
 def test_topic_icon_set_name_keeps_bot_username_suffix(channel):
-    channel.config["topic_icons"] = {
-        "sticker_set_name": "etm_topic_icons",
-    }
+    channel.config.pop("topic_icons", None)
 
     with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")):
         base_name = channel.chat_binding._get_topic_icon_set_base_name()
@@ -150,7 +178,6 @@ def test_topic_icon_set_name_keeps_bot_username_suffix(channel):
 
     assert base_name == "etm_topic_icons"
     assert next_name == "etm_topic_icons_2_by_testbot"
-    channel.config.pop("topic_icons", None)
 
 
 def test_topic_icon_adds_to_existing_set_without_guessing_by_emoji(channel, slave):
@@ -214,6 +241,52 @@ def test_topic_icon_creates_next_set_when_existing_sets_are_full(channel, slave)
     channel.config.pop("topic_icons", None)
 
 
+def test_topic_icon_generation_failure_marks_unavailable_and_falls_back(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    channel.config["topic_icons"] = {
+        "sticker_set_name": "etm_topic_icons",
+        "owner_user_id": 99,
+    }
+
+    with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
+         patch.object(channel.bot_manager, "get_sticker_set", side_effect=BadRequest("Sticker set not found")), \
+         patch.object(channel.bot_manager, "create_new_sticker_set", side_effect=BadRequest("not enough rights")):
+        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+
+    assert custom_emoji_id is None
+    assert channel.chat_binding._topic_icon_custom_emoji_unavailable is True
+    channel.config.pop("topic_icons", None)
+    channel.chat_binding._topic_icon_custom_emoji_unavailable = False
+    channel.chat_binding._topic_icon_custom_emoji_unavailable_reason = None
+
+
+def test_create_topic_retries_without_generated_icon_when_icon_is_rejected(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    topic_chat_id = TelegramChatID(61505)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.config.pop("topic_icons", None)
+    forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(61506))
+
+    with patch.object(channel.chat_binding, "_get_topic_icon_picture", return_value=_png_bytes()), \
+         patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji", return_value="emoji-generated"), \
+         patch.object(
+             channel.bot_manager,
+             "create_forum_topic",
+             side_effect=[BadRequest("icon custom emoji is invalid"), forum_topic],
+         ) as create_forum_topic:
+        result = channel.chat_binding.create_topic(slave_uid, topic_chat_id)
+
+    assert result == TelegramTopicID(61506)
+    assert create_forum_topic.call_count == 2
+    assert create_forum_topic.call_args_list[0].kwargs["icon_custom_emoji_id"] == "emoji-generated"
+    assert "icon_custom_emoji_id" not in create_forum_topic.call_args_list[1].kwargs
+    assert channel.chat_binding._topic_icon_custom_emoji_unavailable is True
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_binding._topic_icon_custom_emoji_unavailable = False
+    channel.chat_binding._topic_icon_custom_emoji_unavailable_reason = None
+
+
 def test_sync_topic_icons_updates_existing_topic_with_avatar_custom_emoji(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(62005)
@@ -243,6 +316,40 @@ def test_sync_topic_icons_updates_existing_topic_with_avatar_custom_emoji(channe
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
     channel.config.pop("topic_icons", None)
+
+
+def test_sync_topic_icons_command_allows_non_configured_topic_group(channel):
+    update = _command_update("supergroup", -10062005, is_forum=True)
+    channel.topic_group = TelegramChatID(-1001)
+
+    with patch.object(
+        channel.chat_binding,
+        "_sync_forum_topic_icons",
+        return_value=(True, "Synced 1 topic icon.", 1),
+    ) as sync_forum_topic_icons, \
+         patch("efb_telegram_master.chat_binding.sync_reply_text") as reply:
+        channel.chat_binding.sync_topic_icons(update, Mock())
+
+    sync_forum_topic_icons.assert_called_once_with(TelegramChatID(-10062005))
+    reply.assert_called_once()
+    channel.topic_group = TelegramChatID(channel.flag('topic_group'))
+
+
+def test_sync_topic_icons_private_command_syncs_all_known_topic_groups(channel):
+    update = _command_update("private", 12345)
+    topic_chat_ids = [TelegramChatID(-1001), TelegramChatID(-1002)]
+
+    with patch.object(channel.db, "get_topic_chat_ids", return_value=topic_chat_ids), \
+         patch.object(channel.chat_binding, "_sync_forum_topic_icons", side_effect=[
+             (True, "Synced 1 topic icon.", 1),
+             (True, "Synced 2 topic icons.", 2),
+         ]) as sync_forum_topic_icons, \
+         patch("efb_telegram_master.chat_binding.sync_reply_text") as reply:
+        channel.chat_binding.sync_topic_icons(update, Mock())
+
+    assert sync_forum_topic_icons.call_args_list[0].args == (TelegramChatID(-1001),)
+    assert sync_forum_topic_icons.call_args_list[1].args == (TelegramChatID(-1002),)
+    assert "Synced 3 topic icons" in reply.call_args.args[2]
 
 
 def test_update_topic_info_does_not_clear_existing_icon_when_sync_fails(channel, slave):
