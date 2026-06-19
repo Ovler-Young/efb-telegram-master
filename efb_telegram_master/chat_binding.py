@@ -1223,6 +1223,50 @@ class ChatBindingManager(LocaleMixin):
             keywords=[f"etm-{keyword}"],
         )
 
+    @staticmethod
+    def _hash_topic_icon_png(png: io.BytesIO) -> str:
+        position = png.tell()
+        try:
+            png.seek(0)
+            return hashlib.sha256(png.read()).hexdigest()
+        finally:
+            png.seek(position)
+
+    def _log_topic_icon_custom_emoji(self, action: str, avatar_hash: str, custom_emoji_id: str,
+                                     sticker_set_name: str) -> None:
+        self.logger.debug(
+            "Topic icon custom emoji %s: avatar_hash=%s custom_emoji_id=%s emoji_link=%s sticker_set=%s sticker_set_link=%s",
+            action,
+            avatar_hash,
+            custom_emoji_id,
+            f"tg://emoji?id={custom_emoji_id}",
+            sticker_set_name,
+            f"https://t.me/addemoji/{sticker_set_name}",
+        )
+
+    @staticmethod
+    def _telegram_error_message(error: Exception) -> str:
+        message = getattr(error, "message", None)
+        if isinstance(message, str) and message:
+            return message
+        return str(error)
+
+    def _log_topic_icon_telegram_error(self, action: str, error: Exception, *,
+                                       level: int = logging.WARNING, **context) -> None:
+        fields = {
+            "action": action,
+            "error_type": type(error).__name__,
+            "error_message": ChatBindingManager._telegram_error_message(error),
+            "error_repr": repr(error),
+            **context,
+        }
+        cause = getattr(error, "__cause__", None)
+        if cause:
+            fields["cause_type"] = type(cause).__name__
+            fields["cause_message"] = str(cause)
+        context_text = " ".join(f"{key}={value!r}" for key, value in fields.items() if value is not None)
+        self.logger.log(level, "Topic icon Telegram error: %s", context_text)
+
     def _get_topic_icon_owner_user_id(self) -> Optional[int]:
         owner_user_id = self._get_topic_icon_config().get("owner_user_id")
         if isinstance(owner_user_id, int):
@@ -1265,6 +1309,12 @@ class ChatBindingManager(LocaleMixin):
         png = self._make_topic_icon_png(picture)
         if not png:
             return None
+        avatar_hash = self._hash_topic_icon_png(png)
+        cached = self.db.get_topic_icon_cache(avatar_hash)
+        if cached:
+            custom_emoji_id, sticker_set_name = cached
+            self._log_topic_icon_custom_emoji("reused", avatar_hash, custom_emoji_id, sticker_set_name)
+            return custom_emoji_id
 
         emoji_name = self._topic_icon_emoji_name(slave_uid)
         sticker = self._build_topic_icon_sticker(slave_uid, png)
@@ -1279,7 +1329,15 @@ class ChatBindingManager(LocaleMixin):
             sticker_set_name = self._build_topic_icon_set_name(base_name, index)
             try:
                 sticker_set = self.bot.get_sticker_set(sticker_set_name)
-            except TelegramError:
+            except TelegramError as e:
+                self._log_topic_icon_telegram_error(
+                    "get_sticker_set",
+                    e,
+                    level=logging.DEBUG,
+                    slave_uid=slave_uid,
+                    avatar_hash=avatar_hash,
+                    sticker_set_name=sticker_set_name,
+                )
                 png.seek(0)
                 try:
                     self.bot.create_new_sticker_set(
@@ -1290,8 +1348,20 @@ class ChatBindingManager(LocaleMixin):
                         sticker_type=sticker_type,
                     )
                     created_set = self.bot.get_sticker_set(sticker_set_name)
-                    return created_set.stickers[-1].custom_emoji_id
+                    custom_emoji_id = created_set.stickers[-1].custom_emoji_id
+                    self.db.set_topic_icon_cache(avatar_hash, custom_emoji_id, sticker_set_name)
+                    self._log_topic_icon_custom_emoji("created", avatar_hash, custom_emoji_id, sticker_set_name)
+                    return custom_emoji_id
                 except TelegramError as e:
+                    self._log_topic_icon_telegram_error(
+                        "create_new_sticker_set",
+                        e,
+                        slave_uid=slave_uid,
+                        avatar_hash=avatar_hash,
+                        sticker_set_name=sticker_set_name,
+                        user_id=user_id,
+                        sticker_type=sticker_type,
+                    )
                     self._mark_topic_icon_custom_emoji_unavailable(e)
                     return None
 
@@ -1306,8 +1376,19 @@ class ChatBindingManager(LocaleMixin):
                     sticker=sticker,
                 )
                 updated_set = self.bot.get_sticker_set(sticker_set_name)
-                return updated_set.stickers[-1].custom_emoji_id
+                custom_emoji_id = updated_set.stickers[-1].custom_emoji_id
+                self.db.set_topic_icon_cache(avatar_hash, custom_emoji_id, sticker_set_name)
+                self._log_topic_icon_custom_emoji("added", avatar_hash, custom_emoji_id, sticker_set_name)
+                return custom_emoji_id
             except TelegramError as e:
+                self._log_topic_icon_telegram_error(
+                    "add_sticker_to_set",
+                    e,
+                    slave_uid=slave_uid,
+                    avatar_hash=avatar_hash,
+                    sticker_set_name=sticker_set_name,
+                    user_id=user_id,
+                )
                 self._mark_topic_icon_custom_emoji_unavailable(e)
                 return None
 
@@ -1368,11 +1449,14 @@ class ChatBindingManager(LocaleMixin):
             if self._is_topic_not_modified_error(e):
                 return True
             if custom_emoji_id:
-                self.logger.warning(
-                    "Failed to update topic %s with custom emoji icon for chat %s; retrying without icon: %s",
-                    thread_id,
-                    slave_uid,
+                self._log_topic_icon_telegram_error(
+                    "edit_forum_topic_with_icon",
                     e,
+                    tg_chat_id=tg_chat_id,
+                    thread_id=thread_id,
+                    slave_uid=slave_uid,
+                    custom_emoji_id=custom_emoji_id,
+                    retry_without_icon=True,
                 )
                 try:
                     self.bot.edit_forum_topic(
@@ -1388,14 +1472,22 @@ class ChatBindingManager(LocaleMixin):
                         if self._is_generated_topic_icon_id(slave_uid, custom_emoji_id):
                             self._mark_topic_icon_custom_emoji_unavailable(e)
                         return True
-                    self.logger.warning(
-                        "Failed to update topic %s for chat %s without custom emoji icon: %s",
-                        thread_id,
-                        slave_uid,
+                    self._log_topic_icon_telegram_error(
+                        "edit_forum_topic_without_icon_retry",
                         retry_error,
+                        tg_chat_id=tg_chat_id,
+                        thread_id=thread_id,
+                        slave_uid=slave_uid,
+                        original_error_message=self._telegram_error_message(e),
                     )
                     return False
-            self.logger.warning(f"Failed to update topic {thread_id} for chat {slave_uid}: {e}")
+            self._log_topic_icon_telegram_error(
+                "edit_forum_topic_without_icon",
+                e,
+                tg_chat_id=tg_chat_id,
+                thread_id=thread_id,
+                slave_uid=slave_uid,
+            )
             return False
 
     def _create_forum_topic_with_icon_fallback(self, telegram_chat_id: TelegramChatID, slave_uid: str,
@@ -1412,10 +1504,13 @@ class ChatBindingManager(LocaleMixin):
         except TelegramError as e:
             if not custom_emoji_id:
                 raise
-            self.logger.warning(
-                "Failed to create topic with custom emoji icon for chat %s; retrying without icon: %s",
-                slave_uid,
+            self._log_topic_icon_telegram_error(
+                "create_forum_topic_with_icon",
                 e,
+                telegram_chat_id=telegram_chat_id,
+                slave_uid=slave_uid,
+                custom_emoji_id=custom_emoji_id,
+                retry_without_icon=True,
             )
             topic = self.bot.create_forum_topic(
                 chat_id=telegram_chat_id,
@@ -1573,7 +1668,16 @@ class ChatBindingManager(LocaleMixin):
                 if success:
                     updated_count += 1
             except Exception as e:
-                self.logger.warning(f"Failed to update topic {thread_id}: {e}")
+                self.logger.warning(
+                    "Failed to update topic %s in forum group %s for chat %s. error_type=%s error_message=%r error_repr=%r",
+                    thread_id,
+                    tg_chat_id,
+                    slave_uid,
+                    type(e).__name__,
+                    self._telegram_error_message(e),
+                    repr(e),
+                    exc_info=True,
+                )
 
             time.sleep(30)  # seems pinning message has a special rate limit but I didn't find the official documentation
 
@@ -1638,7 +1742,16 @@ class ChatBindingManager(LocaleMixin):
             return True
 
         except Exception as e:
-            self.logger.warning(f"Failed to update topic {thread_id} for chat {slave_uid}: {e}")
+            self.logger.warning(
+                "Failed to update topic %s in forum group %s for chat %s. error_type=%s error_message=%r error_repr=%r",
+                thread_id,
+                tg_chat_id,
+                slave_uid,
+                type(e).__name__,
+                self._telegram_error_message(e),
+                repr(e),
+                exc_info=True,
+            )
             return False
         finally:
             if picture and getattr(picture, 'close', None):

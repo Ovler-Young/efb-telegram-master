@@ -9,7 +9,7 @@ from functools import partial
 from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING
 from pathlib import Path
 
-from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy
+from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy, IntegrityError
 from playhouse.migrate import migrate
 from telegram import Message
 from typing_extensions import TypedDict
@@ -59,6 +59,14 @@ class TopicAssoc(BaseModel):
     topic_chat_id = TextField()
     message_thread_id = TextField()
     slave_uid = TextField()
+
+
+class TopicIconCache(BaseModel):
+    avatar_hash = TextField(primary_key=True)
+    custom_emoji_id = TextField()
+    sticker_set_name = TextField()
+    created_at = DateTimeField(default=datetime.datetime.now)
+    updated_at = DateTimeField(default=datetime.datetime.now)
 
 
 class ChatAssoc(BaseModel):
@@ -252,12 +260,12 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc])
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, TopicIconCache])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc], safe=True)
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, TopicIconCache], safe=True)
 
     @staticmethod
     def _select_existing_columns(model, table_name: str, requested_fields: List):
@@ -284,7 +292,7 @@ class DatabaseManager:
         sqlite_db.start()
         sqlite_db.connect()
 
-        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog]
+        models = [ChatAssoc, TopicAssoc, TopicIconCache, SlaveChatInfo, MsgLog]
         with sqlite_db.bind_ctx(models):
             chat_assocs = list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
@@ -295,6 +303,14 @@ class DatabaseManager:
                 ).dicts())
             else:
                 topic_assocs = []
+            if TopicIconCache.table_exists():
+                topic_icon_caches = self._select_existing_columns(TopicIconCache, "topiciconcache", [
+                    TopicIconCache.avatar_hash, TopicIconCache.custom_emoji_id,
+                    TopicIconCache.sticker_set_name, TopicIconCache.created_at,
+                    TopicIconCache.updated_at
+                ])
+            else:
+                topic_icon_caches = []
             slave_chat_infos = self._select_existing_columns(SlaveChatInfo, "slavechatinfo", [
                 SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_channel_emoji,
                 SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id,
@@ -319,6 +335,8 @@ class DatabaseManager:
                 ChatAssoc.insert_many(batch).execute()
             for batch in chunked(topic_assocs, 500):
                 TopicAssoc.insert_many(batch).execute()
+            for batch in chunked(topic_icon_caches, 500):
+                TopicIconCache.insert_many(batch).execute()
             for batch in chunked(slave_chat_infos, 500):
                 SlaveChatInfo.insert_many(batch).execute()
             for batch in chunked(msg_logs, 500):
@@ -329,9 +347,10 @@ class DatabaseManager:
 
         self.logger.info(
             "Migration complete. %d chat assocs, %d topic assocs, "
-            "%d chat infos, %d messages migrated. "
+            "%d topic icon caches, %d chat infos, %d messages migrated. "
             "Original SQLite file renamed to %s",
             len(chat_assocs), len(topic_assocs),
+            len(topic_icon_caches),
             len(slave_chat_infos), len(msg_logs),
             migrated_path
         )
@@ -544,6 +563,32 @@ class DatabaseManager:
         self.remove_topic_assoc(slave_uid=slave_uid)
         self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
         return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
+
+    @staticmethod
+    def get_topic_icon_cache(avatar_hash: str) -> Optional[Tuple[str, str]]:
+        row = TopicIconCache.get_or_none(TopicIconCache.avatar_hash == avatar_hash)
+        if row:
+            return row.custom_emoji_id, row.sticker_set_name
+        return None
+
+    @staticmethod
+    def set_topic_icon_cache(avatar_hash: str, custom_emoji_id: str, sticker_set_name: str):
+        now = datetime.datetime.now()
+        try:
+            return TopicIconCache.create(
+                avatar_hash=avatar_hash,
+                custom_emoji_id=custom_emoji_id,
+                sticker_set_name=sticker_set_name,
+                created_at=now,
+                updated_at=now,
+            )
+        except IntegrityError:
+            TopicIconCache.update(
+                custom_emoji_id=custom_emoji_id,
+                sticker_set_name=sticker_set_name,
+                updated_at=now,
+            ).where(TopicIconCache.avatar_hash == avatar_hash).execute()
+            return TopicIconCache.get(TopicIconCache.avatar_hash == avatar_hash)
 
     @staticmethod
     def get_topic_thread_id(slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:

@@ -210,6 +210,70 @@ def test_topic_icon_adds_to_existing_set_without_guessing_by_emoji(channel, slav
     channel.config.pop("topic_icons", None)
 
 
+def test_topic_icon_reuses_db_cache_for_duplicate_avatar(channel, slave, caplog):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    channel.config["topic_icons"] = {
+        "sync_avatar_to_custom_emoji": True,
+        "sticker_set_name": "etm_topic_icons",
+        "owner_user_id": 99,
+    }
+    existing_set = _sticker_set("etm_topic_icons_by_testbot", [_sticker("😀", "emoji-existing")])
+    updated_set = _sticker_set("etm_topic_icons_by_testbot", [
+        _sticker("😀", "emoji-existing"),
+        _sticker(channel.chat_binding._topic_icon_emoji_name(slave_uid), "emoji-added"),
+    ])
+
+    with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
+         patch.object(
+             channel.bot_manager,
+             "get_sticker_set",
+             side_effect=[existing_set, updated_set],
+         ), \
+         patch.object(channel.bot_manager, "add_sticker_to_set") as add_sticker_to_set, \
+         patch.object(channel.bot_manager, "create_new_sticker_set") as create_new_sticker_set:
+        first = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+
+    with caplog.at_level("DEBUG", logger="efb_telegram_master.chat_binding"), \
+         patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
+         patch.object(channel.bot_manager, "get_sticker_set") as get_sticker_set, \
+         patch.object(channel.bot_manager, "add_sticker_to_set") as add_sticker_to_set_again, \
+         patch.object(channel.bot_manager, "create_new_sticker_set") as create_new_sticker_set_again:
+        second = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+
+    assert first == "emoji-added"
+    assert second == "emoji-added"
+    add_sticker_to_set.assert_called_once()
+    create_new_sticker_set.assert_not_called()
+    get_sticker_set.assert_not_called()
+    add_sticker_to_set_again.assert_not_called()
+    create_new_sticker_set_again.assert_not_called()
+    assert "tg://emoji?id=emoji-added" in caplog.text
+    assert "https://t.me/addemoji/etm_topic_icons_by_testbot" in caplog.text
+    channel.config.pop("topic_icons", None)
+
+
+def test_topic_icon_telegram_error_log_includes_context(channel, caplog):
+    error = BadRequest("Premium_account_required")
+
+    with caplog.at_level("WARNING", logger="efb_telegram_master.chat_binding"):
+        channel.chat_binding._log_topic_icon_telegram_error(
+            "edit_forum_topic_with_icon",
+            error,
+            tg_chat_id=TelegramChatID(-10062005),
+            thread_id=TelegramTopicID(40489),
+            slave_uid="milkice.qq group_1107463201",
+            custom_emoji_id="emoji-test",
+            retry_without_icon=True,
+        )
+
+    assert "Topic icon Telegram error" in caplog.text
+    assert "error_type='BadRequest'" in caplog.text
+    assert "error_message='Premium_account_required'" in caplog.text
+    assert "thread_id=40489" in caplog.text
+    assert "custom_emoji_id='emoji-test'" in caplog.text
+    assert "retry_without_icon=True" in caplog.text
+
+
 def test_topic_icon_creates_next_set_when_existing_sets_are_full(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     channel.config["topic_icons"] = {
