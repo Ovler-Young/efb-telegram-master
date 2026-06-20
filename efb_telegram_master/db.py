@@ -591,21 +591,6 @@ class DatabaseManager:
             return TopicIconCache.get(TopicIconCache.avatar_hash == avatar_hash)
 
     @staticmethod
-    def get_topic_icon_cache_custom_emoji_ids(key_prefix: Optional[str] = None) -> set[str]:
-        return {custom_emoji_id for _, custom_emoji_id, _ in DatabaseManager.get_topic_icon_cache_entries(key_prefix)}
-
-    @staticmethod
-    def get_topic_icon_cache_entries(key_prefix: Optional[str] = None) -> List[Tuple[str, str, str]]:
-        query = TopicIconCache.select(
-            TopicIconCache.avatar_hash,
-            TopicIconCache.custom_emoji_id,
-            TopicIconCache.sticker_set_name,
-        )
-        if key_prefix is not None:
-            query = query.where(TopicIconCache.avatar_hash.startswith(key_prefix))
-        return [(row.avatar_hash, row.custom_emoji_id, row.sticker_set_name) for row in query]
-
-    @staticmethod
     def get_topic_thread_id(slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
         """
         Get topic association (topic link) information.

@@ -2434,10 +2434,6 @@ class TelegramBotManager(LocaleMixin):
         return cast(bool, self._bot.add_sticker_to_set(*args, **kwargs))
 
     @Decorators.retry_on_timeout
-    def replace_sticker_in_set(self, *args, **kwargs) -> bool:
-        return cast(bool, self._bot.replace_sticker_in_set(*args, **kwargs))
-
-    @Decorators.retry_on_timeout
     def get_sticker_set(self, *args, **kwargs) -> StickerSet:
         return cast(StickerSet, self._bot.get_sticker_set(*args, **kwargs))
 

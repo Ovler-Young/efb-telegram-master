@@ -13,7 +13,7 @@ from contextlib import suppress
 from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Pattern, cast, Callable
 
 import telegram  # lgtm [py/import-and-import-from]
-from PIL import Image, ImageDraw
+from PIL import Image
 from telegram import InputSticker, Sticker, Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
@@ -99,9 +99,7 @@ class ChatBindingManager(LocaleMixin):
     TELEGRAM_MIN_PROFILE_PICTURE_SIZE = 256
     TELEGRAM_CUSTOM_EMOJI_SIZE = 100
     TELEGRAM_CUSTOM_EMOJI_SET_LIMIT = 200
-    AUTHOR_AVATAR_PLACEHOLDER_MIN_AVAILABLE = 30
     AUTHOR_AVATAR_CACHE_PREFIX = "member-user:"
-    AUTHOR_AVATAR_PLACEHOLDER_CACHE_PREFIX = "member-placeholder:"
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
 
@@ -114,11 +112,8 @@ class ChatBindingManager(LocaleMixin):
         self._topic_icon_custom_emoji_unavailable = False
         self._topic_icon_custom_emoji_unavailable_reason: Optional[str] = None
         self._logged_topic_icon_avatar_hashes: set[str] = set()
-        self._author_avatar_placeholder_lock = threading.Lock()
-        self._author_avatar_placeholder_ids: Dict[str, str] = {}
-        self._author_avatar_placeholder_prepopulate_running = False
+        self._author_avatar_lock = threading.Lock()
         self._author_avatar_inflight: set[str] = set()
-        self._author_avatar_pending: Dict[str, Tuple[str, str]] = {}
 
         # Link handler
         non_edit_filter = Filters.update.message | Filters.update.channel_post
@@ -1321,271 +1316,40 @@ class ChatBindingManager(LocaleMixin):
     def _author_avatar_cache_key(self, slave_uid: str) -> str:
         return f"{self.AUTHOR_AVATAR_CACHE_PREFIX}{slave_uid}"
 
-    def _author_avatar_placeholder_cache_key(self, sticker_set_name: str, custom_emoji_id: str) -> str:
-        return f"{self.AUTHOR_AVATAR_PLACEHOLDER_CACHE_PREFIX}{sticker_set_name}:{custom_emoji_id}"
-
-    def _sync_author_avatar_placeholders_locked(self) -> None:
-        used_ids = self.db.get_topic_icon_cache_custom_emoji_ids(self.AUTHOR_AVATAR_CACHE_PREFIX)
-        used_ids.update(custom_emoji_id for custom_emoji_id, _ in self._author_avatar_pending.values())
-        placeholders = self.db.get_topic_icon_cache_entries(self.AUTHOR_AVATAR_PLACEHOLDER_CACHE_PREFIX)
-        self._author_avatar_placeholder_ids = {
-            custom_emoji_id: sticker_set_name
-            for _, custom_emoji_id, sticker_set_name in placeholders
-            if custom_emoji_id not in used_ids
-        }
-
-    def _allocate_author_avatar_placeholder(self, user_cache_key: str) -> Optional[Tuple[str, str]]:
-        with self._author_avatar_placeholder_lock:
-            pending = self._author_avatar_pending.get(user_cache_key)
-            if pending:
-                return pending
-
-            self._sync_author_avatar_placeholders_locked()
-            if not self._author_avatar_placeholder_ids:
-                self._ensure_author_avatar_placeholder_pool_async_locked()
-                return None
-
-            custom_emoji_id, sticker_set_name = self._author_avatar_placeholder_ids.popitem()
-            self._author_avatar_pending[user_cache_key] = (custom_emoji_id, sticker_set_name)
-            self._ensure_author_avatar_placeholder_pool_async_locked()
-            return custom_emoji_id, sticker_set_name
-
-    def _ensure_author_avatar_placeholder_pool_async(self) -> None:
-        with self._author_avatar_placeholder_lock:
-            self._ensure_author_avatar_placeholder_pool_async_locked()
-
-    def _ensure_author_avatar_placeholder_pool_async_locked(self) -> None:
-        if self._author_avatar_placeholder_prepopulate_running or self._topic_icon_custom_emoji_unavailable:
-            return
-        if len(self._author_avatar_placeholder_ids) >= self.AUTHOR_AVATAR_PLACEHOLDER_MIN_AVAILABLE:
-            return
-        self._author_avatar_placeholder_prepopulate_running = True
-        threading.Thread(
-            target=self._prepopulate_author_avatar_placeholders,
-            daemon=True,
-            name="ETM author avatar custom emoji prepopulate",
-        ).start()
-
-    @staticmethod
-    def _make_author_avatar_placeholder_png(index: int) -> io.BytesIO:
-        out = io.BytesIO()
-        img = Image.new("RGBA", (ChatBindingManager.TELEGRAM_CUSTOM_EMOJI_SIZE,
-                                 ChatBindingManager.TELEGRAM_CUSTOM_EMOJI_SIZE), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        colors = (
-            (83, 128, 255, 255),
-            (38, 166, 154, 255),
-            (255, 183, 77, 255),
-            (171, 71, 188, 255),
-            (102, 187, 106, 255),
-        )
-        color = colors[index % len(colors)]
-        draw.ellipse((8, 8, 92, 92), fill=color)
-        draw.ellipse((35, 24, 65, 54), fill=(255, 255, 255, 230))
-        draw.rounded_rectangle((24, 58, 76, 84), radius=18, fill=(255, 255, 255, 230))
-        img.save(out, "PNG")
-        out.seek(0)
-        return out
-
-    def _create_author_avatar_placeholder_custom_emoji(self, index: int) -> Optional[Tuple[str, str]]:
-        base_name = self._get_topic_icon_set_base_name()
-        user_id = self._get_topic_icon_owner_user_id()
-        if user_id is None:
-            self.logger.warning("topic_icons.owner_user_id or admins[0] is required to prepopulate avatar placeholders.")
-            return None
-
-        png = self._make_author_avatar_placeholder_png(index)
-        sticker = self._build_topic_icon_sticker(f"author-avatar-placeholder:{index}", png)
-        title = self._("ETM author avatar placeholders")
-        sticker_type = getattr(Sticker, "CUSTOM_EMOJI", "custom_emoji")
-
-        for set_index in range(1, 1000):
-            sticker_set_name = self._build_topic_icon_set_name(base_name, set_index)
-            try:
-                sticker_set = self.bot.get_sticker_set(sticker_set_name)
-            except TelegramError as e:
-                self._log_topic_icon_telegram_error(
-                    "get_sticker_set",
-                    e,
-                    level=logging.DEBUG,
-                    sticker_set_name=sticker_set_name,
-                    placeholder_index=index,
-                )
-                png.seek(0)
-                try:
-                    self.bot.create_new_sticker_set(
-                        user_id=user_id,
-                        name=sticker_set_name,
-                        title=title,
-                        stickers=[sticker],
-                        sticker_type=sticker_type,
-                    )
-                    created_set = self.bot.get_sticker_set(sticker_set_name)
-                    custom_emoji_id = created_set.stickers[-1].custom_emoji_id
-                    self.db.set_topic_icon_cache(
-                        self._author_avatar_placeholder_cache_key(sticker_set_name, custom_emoji_id),
-                        custom_emoji_id,
-                        sticker_set_name,
-                    )
-                    return custom_emoji_id, sticker_set_name
-                except TelegramError as create_error:
-                    self._log_topic_icon_telegram_error(
-                        "create_new_sticker_set",
-                        create_error,
-                        sticker_set_name=sticker_set_name,
-                        user_id=user_id,
-                        sticker_type=sticker_type,
-                    )
-                    self._mark_topic_icon_custom_emoji_unavailable(create_error)
-                    return None
-
-            if len(sticker_set.stickers) >= self.TELEGRAM_CUSTOM_EMOJI_SET_LIMIT:
-                continue
-
-            png.seek(0)
-            try:
-                self.bot.add_sticker_to_set(user_id=user_id, name=sticker_set_name, sticker=sticker)
-                updated_set = self.bot.get_sticker_set(sticker_set_name)
-                custom_emoji_id = updated_set.stickers[-1].custom_emoji_id
-                self.db.set_topic_icon_cache(
-                    self._author_avatar_placeholder_cache_key(sticker_set_name, custom_emoji_id),
-                    custom_emoji_id,
-                    sticker_set_name,
-                )
-                return custom_emoji_id, sticker_set_name
-            except TelegramError as e:
-                self._log_topic_icon_telegram_error(
-                    "add_sticker_to_set",
-                    e,
-                    sticker_set_name=sticker_set_name,
-                    user_id=user_id,
-                )
-                self._mark_topic_icon_custom_emoji_unavailable(e)
-                return None
-
-        self.logger.warning("No available custom emoji sticker set slot for author avatar placeholders.")
-        return None
-
-    def _prepopulate_author_avatar_placeholders(self) -> None:
-        try:
-            while not self._topic_icon_custom_emoji_unavailable:
-                with self._author_avatar_placeholder_lock:
-                    self._sync_author_avatar_placeholders_locked()
-                    available = len(self._author_avatar_placeholder_ids)
-                    if available >= self.AUTHOR_AVATAR_PLACEHOLDER_MIN_AVAILABLE:
-                        return
-                created = self._create_author_avatar_placeholder_custom_emoji(available)
-                if not created:
-                    return
-                custom_emoji_id, sticker_set_name = created
-                with self._author_avatar_placeholder_lock:
-                    used_ids = self.db.get_topic_icon_cache_custom_emoji_ids(self.AUTHOR_AVATAR_CACHE_PREFIX)
-                    if custom_emoji_id not in used_ids:
-                        self._author_avatar_placeholder_ids[custom_emoji_id] = sticker_set_name
-        finally:
-            with self._author_avatar_placeholder_lock:
-                self._author_avatar_placeholder_prepopulate_running = False
-
-    def _find_custom_emoji_sticker(self, sticker_set_name: str, custom_emoji_id: str):
-        entry = self._find_custom_emoji_sticker_entry(sticker_set_name, custom_emoji_id)
-        if entry is None:
-            return None
-        return entry[0]
-
-    def _find_custom_emoji_sticker_entry(self, sticker_set_name: str, custom_emoji_id: str):
-        sticker_set = self.bot.get_sticker_set(sticker_set_name)
-        for index, sticker in enumerate(sticker_set.stickers):
-            if getattr(sticker, "custom_emoji_id", None) == custom_emoji_id:
-                return sticker, index
-        return None
-
-    def _custom_emoji_id_after_replace(self, sticker_set_name: str, old_index: int,
-                                       old_custom_emoji_id: str) -> Optional[str]:
-        entry = self._find_custom_emoji_sticker_entry(sticker_set_name, old_custom_emoji_id)
-        if entry is not None:
-            return old_custom_emoji_id
-
-        sticker_set = self.bot.get_sticker_set(sticker_set_name)
-        if old_index < len(sticker_set.stickers):
-            custom_emoji_id = getattr(sticker_set.stickers[old_index], "custom_emoji_id", None)
-            if isinstance(custom_emoji_id, str) and custom_emoji_id:
-                return custom_emoji_id
-        return None
-
-    def _replace_author_avatar_placeholder(
+    def _load_author_avatar_custom_emoji(
         self,
         slave_uid: str,
         user_cache_key: str,
-        custom_emoji_id: str,
-        sticker_set_name: str,
         load_picture: Callable[[], Tuple[IO, str]],
         msg_uid: str,
     ) -> None:
         picture = None
-        replace_succeeded = False
-        cache_succeeded = False
         try:
             picture, picture_source = load_picture()
-            png = self._make_topic_icon_png(picture)
-            if not png:
-                return
-            old_entry = self._find_custom_emoji_sticker_entry(sticker_set_name, custom_emoji_id)
-            if old_entry is None:
-                self.logger.warning(
-                    "[%s] Cannot replace author avatar placeholder; custom_emoji_id=%s not found in %s.",
-                    msg_uid,
-                    custom_emoji_id,
-                    sticker_set_name,
-                )
-                return
-            old_sticker, old_index = old_entry
-            user_id = self._get_topic_icon_owner_user_id()
-            if user_id is None:
-                self.logger.warning("topic_icons.owner_user_id or admins[0] is required to update avatar placeholders.")
-                return
-            png.seek(0)
-            self.bot.replace_sticker_in_set(
-                user_id=user_id,
-                name=sticker_set_name,
-                old_sticker=old_sticker,
-                sticker=self._build_topic_icon_sticker(slave_uid, png),
+            entry = self._get_or_create_topic_icon_custom_emoji_entry(
+                slave_uid,
+                picture,
+                cache_key_override=user_cache_key,
+                title=self._("ETM author avatars"),
             )
-            replace_succeeded = True
-            effective_custom_emoji_id = self._custom_emoji_id_after_replace(
-                sticker_set_name,
-                old_index,
-                custom_emoji_id,
-            )
-            if effective_custom_emoji_id is None:
-                self.logger.warning(
-                    "[%s] Replaced author avatar placeholder but could not resolve the resulting "
-                    "custom_emoji_id: old_custom_emoji_id=%s sticker_set=%s",
-                    msg_uid,
-                    custom_emoji_id,
-                    sticker_set_name,
-                )
+            if not entry:
                 return
-            self.db.set_topic_icon_cache(user_cache_key, effective_custom_emoji_id, sticker_set_name)
-            self.db.set_topic_icon_cache(
-                self._author_avatar_placeholder_cache_key(sticker_set_name, custom_emoji_id),
-                effective_custom_emoji_id,
-                sticker_set_name,
-            )
-            cache_succeeded = True
-            self._log_topic_icon_custom_emoji("replaced", user_cache_key, effective_custom_emoji_id, sticker_set_name)
+            custom_emoji_id, sticker_set_name = entry
+            self.db.set_topic_icon_cache(user_cache_key, custom_emoji_id, sticker_set_name)
+            self._log_topic_icon_custom_emoji("created", user_cache_key, custom_emoji_id, sticker_set_name)
             self.logger.info(
-                "[%s] Updated author avatar placeholder custom emoji: author_uid=%s picture_source=%s "
+                "[%s] Created author avatar custom emoji: author_uid=%s picture_source=%s "
                 "custom_emoji_id=%s",
                 msg_uid,
                 slave_uid,
                 picture_source,
-                effective_custom_emoji_id,
+                custom_emoji_id,
             )
         except (EFBOperationNotSupported, TelegramError, ValueError) as e:
-            self.logger.debug("[%s] Failed to update author avatar custom emoji for %s: %s", msg_uid, slave_uid, e)
+            self.logger.debug("[%s] Failed to create author avatar custom emoji for %s: %s", msg_uid, slave_uid, e)
         except Exception as e:
             self.logger.warning(
-                "[%s] Failed to update author avatar custom emoji for %s. error_type=%s error_message=%r",
+                "[%s] Failed to create author avatar custom emoji for %s. error_type=%s error_message=%r",
                 msg_uid,
                 slave_uid,
                 type(e).__name__,
@@ -1595,10 +1359,8 @@ class ChatBindingManager(LocaleMixin):
         finally:
             if picture and getattr(picture, 'close', None):
                 picture.close()
-            with self._author_avatar_placeholder_lock:
-                if cache_succeeded or not replace_succeeded:
-                    self._author_avatar_inflight.discard(user_cache_key)
-                    self._author_avatar_pending.pop(user_cache_key, None)
+            with self._author_avatar_lock:
+                self._author_avatar_inflight.discard(user_cache_key)
 
     def resolve_author_avatar_custom_emoji_id_lazy(
         self,
@@ -1620,26 +1382,28 @@ class ChatBindingManager(LocaleMixin):
             self._log_topic_icon_custom_emoji("reused", user_cache_key, custom_emoji_id, sticker_set_name)
             return custom_emoji_id
 
-        allocated = self._allocate_author_avatar_placeholder(user_cache_key)
-        if allocated is None:
-            return None
-
-        custom_emoji_id, sticker_set_name = allocated
-        with self._author_avatar_placeholder_lock:
+        with self._author_avatar_lock:
             if user_cache_key in self._author_avatar_inflight:
                 return None
             self._author_avatar_inflight.add(user_cache_key)
 
         threading.Thread(
-            target=self._replace_author_avatar_placeholder,
-            args=(slave_uid, user_cache_key, custom_emoji_id, sticker_set_name, load_picture, msg_uid),
+            target=self._load_author_avatar_custom_emoji,
+            args=(slave_uid, user_cache_key, load_picture, msg_uid),
             daemon=True,
-            name="ETM author avatar custom emoji update",
+            name="ETM author avatar custom emoji create",
         ).start()
         return None
 
-    def _get_or_create_topic_icon_custom_emoji(self, slave_uid: str, picture: IO, *,
-                                               cache_namespace: Optional[str] = None) -> Optional[str]:
+    def _get_or_create_topic_icon_custom_emoji_entry(
+        self,
+        slave_uid: str,
+        picture: IO,
+        *,
+        cache_namespace: Optional[str] = None,
+        cache_key_override: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Optional[Tuple[str, str]]:
         if self._topic_icon_custom_emoji_unavailable:
             return None
 
@@ -1652,20 +1416,19 @@ class ChatBindingManager(LocaleMixin):
         if not png:
             return None
         avatar_hash = self._hash_topic_icon_png(png)
-        cache_key = self._topic_icon_cache_key(avatar_hash, slave_uid, cache_namespace)
+        cache_key = cache_key_override or self._topic_icon_cache_key(avatar_hash, slave_uid, cache_namespace)
         cached = self.db.get_topic_icon_cache(cache_key)
         if cached:
             custom_emoji_id, sticker_set_name = cached
             self._log_topic_icon_custom_emoji("reused", cache_key, custom_emoji_id, sticker_set_name)
-            return custom_emoji_id
+            return custom_emoji_id, sticker_set_name
 
-        emoji_name = self._topic_icon_emoji_name(slave_uid)
         sticker = self._build_topic_icon_sticker(slave_uid, png)
         user_id = self._get_topic_icon_owner_user_id()
         if user_id is None:
             self.logger.warning("topic_icons.owner_user_id or admins[0] is required to sync topic custom emoji icons.")
             return None
-        title = self._("ETM topic icons")
+        title = title or self._("ETM topic icons")
         sticker_type = getattr(Sticker, "CUSTOM_EMOJI", "custom_emoji")
 
         for index in range(1, 1000):
@@ -1694,7 +1457,7 @@ class ChatBindingManager(LocaleMixin):
                     custom_emoji_id = created_set.stickers[-1].custom_emoji_id
                     self.db.set_topic_icon_cache(cache_key, custom_emoji_id, sticker_set_name)
                     self._log_topic_icon_custom_emoji("created", cache_key, custom_emoji_id, sticker_set_name)
-                    return custom_emoji_id
+                    return custom_emoji_id, sticker_set_name
                 except TelegramError as e:
                     self._log_topic_icon_telegram_error(
                         "create_new_sticker_set",
@@ -1722,7 +1485,7 @@ class ChatBindingManager(LocaleMixin):
                 custom_emoji_id = updated_set.stickers[-1].custom_emoji_id
                 self.db.set_topic_icon_cache(cache_key, custom_emoji_id, sticker_set_name)
                 self._log_topic_icon_custom_emoji("added", cache_key, custom_emoji_id, sticker_set_name)
-                return custom_emoji_id
+                return custom_emoji_id, sticker_set_name
             except TelegramError as e:
                 self._log_topic_icon_telegram_error(
                     "add_sticker_to_set",
@@ -1737,6 +1500,17 @@ class ChatBindingManager(LocaleMixin):
 
         self.logger.warning("No available custom emoji sticker set slot for topic icon %s.", slave_uid)
         return None
+
+    def _get_or_create_topic_icon_custom_emoji(self, slave_uid: str, picture: IO, *,
+                                               cache_namespace: Optional[str] = None) -> Optional[str]:
+        entry = self._get_or_create_topic_icon_custom_emoji_entry(
+            slave_uid,
+            picture,
+            cache_namespace=cache_namespace,
+        )
+        if not entry:
+            return None
+        return entry[0]
 
     @staticmethod
     def _topic_icon_emoji_name(slave_uid: str) -> str:
