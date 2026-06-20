@@ -12,7 +12,14 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 1
-          persist-credentials: false # <--- 核心修复：清理大号机器人权限，确保后面使用小号 Token
+          persist-credentials: false
+
+      # 【新增的非常关键的一步】
+      # 删掉大号的 .git 历史和 .github 脚本，留下纯净的代码实体
+      - name: Clean up files
+        run: |
+          rm -rf .git
+          rm -rf .github
 
       - name: Pushes to another repository
         uses: cpina/github-action-push-to-another-repository@main
@@ -22,5 +29,5 @@ jobs:
           source-directory: '.'
           destination-github-username: 'onestao'
           destination-repository-name: 'efb-telegram-master'
-          user-email: 'kettly1266@gmail.com' # 小号的邮箱
-          target-branch: main # 推送到小号的 main 分支
+          user-email: 'kettly1266@gmail.com'
+          target-branch: main
