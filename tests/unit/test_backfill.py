@@ -2,8 +2,10 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import telegram
 from telegram import Update
 
+from efb_telegram_master import TelegramChannel
 from ehforwarderbot.types import ChatID
 
 from efb_telegram_master import utils
@@ -104,6 +106,60 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
     migrate_chat_history.assert_called_once()
     send_history_link.assert_not_called()
     _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(104))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
+    channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
+    update = _build_link_update(bot_group)
+    update.effective_message.text = f"/start {token} true"
+
+    sent_message = Mock()
+    sent_message.chat.id = bot_group
+    sent_message.message_id = 503
+    sent_message.reply_text = Mock()
+
+    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
+         patch.object(channel.bot_manager, "edit_message_text"), \
+         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
+         patch.object(channel.chat_binding, "send_history_link") as send_history_link:
+        channel.chat_binding.link_chat(update, [token])
+
+    migrate_chat_history.assert_called_once()
+    send_history_link.assert_not_called()
+    _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_resolve_command_args_falls_back_to_raw_message_text():
+    args = TelegramChannel._resolve_command_args("/start token true", ["token"])
+
+    assert args == ["token", "true"]
+
+
+def test_start_uses_raw_message_args_for_link_chat(channel):
+    update = Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1,
+                "text": "/start token true",
+                "chat": {"id": -1001, "type": "supergroup", "title": "Test Group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Tester"},
+            },
+        },
+        channel.bot_manager._async_bot,
+    )
+    context = SimpleNamespace(args=["token"])
+
+    with patch.object(channel.chat_binding, "link_chat") as link_chat:
+        channel.start(update, context)
+
+    link_chat.assert_called_once_with(update, ["token", "true"])
 
 
 def test_migrate_chat_history_batches_text_and_forwards_media(channel):

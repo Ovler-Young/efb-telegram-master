@@ -5,7 +5,7 @@ from tempfile import NamedTemporaryFile
 from typing import Optional, List, Tuple
 
 from pytest import mark, approx
-from telegram import MAX_FILESIZE_UPLOAD
+from telegram.constants import FileSizeLimit
 from telethon.tl.custom import Message
 from telethon.tl.types import MessageEntityMentionName, MessageEntityCode
 
@@ -25,7 +25,7 @@ async def test_slave_message_file_oversize(helper, client, bot_group, slave, cha
     with link_chats(channel, (chat,), bot_group),\
             NamedTemporaryFile(suffix=".bin") as f:
         # Write a large enough file
-        f.truncate(MAX_FILESIZE_UPLOAD + 1024 * 10)
+        f.truncate(FileSizeLimit.FILESIZE_UPLOAD + 1024 * 10)
         f.seek(0)
 
         # Send it

@@ -1,17 +1,32 @@
+import re
 from queue import Empty
 
 import pytest
 
-from .helper.filters import in_chats, text
+from efb_telegram_master import utils
+from .helper.filters import in_chats, regex
 
 pytestmark = pytest.mark.asyncio
 
 
+def get_message_thread_id(message):
+    message_thread_id = getattr(message, "message_thread_id", None)
+    if message_thread_id is not None:
+        return message_thread_id
+
+    reply_to = getattr(message, "reply_to", None)
+    return (
+        getattr(reply_to, "reply_to_top_id", None) or
+        getattr(reply_to, "reply_to_msg_id", None) or
+        getattr(message, "reply_to_msg_id", None)
+    )
+
+
 @pytest.fixture(scope="module")
-def poll_bot(channel_with_topic_group):
-    channel_with_topic_group.bot_manager.polling(drop_pending_updates=True)
+def poll_bot(channel_with_topic_group, poll_bot_factory):
+    poll_bot_factory.start(channel_with_topic_group)
     yield channel_with_topic_group.bot_manager
-    channel_with_topic_group.bot_manager.graceful_stop()
+    poll_bot_factory.stop(channel_with_topic_group)
 
 
 @pytest.fixture(scope="function")
@@ -30,21 +45,22 @@ async def test_slave_message_creates_topic_and_delivers(helper, slave_with_topic
     chat = slave_with_topic_group.chat_with_alias
     sent = slave_with_topic_group.send_text_message(chat, chat.other)
 
-    tg_message = await helper.wait_for_message(in_chats(bot_topic_group) & text)
+    tg_message = await helper.wait_for_message(in_chats(bot_topic_group) & regex(re.escape(sent.text)))
+    message_thread_id = get_message_thread_id(tg_message)
 
     assert tg_message.chat_id == bot_topic_group
-    assert tg_message.reply_to_msg_id is None
-    assert tg_message.message_thread_id is not None
+    assert message_thread_id is not None
+    assert tg_message.reply_to_msg_id in (None, message_thread_id)
     assert sent.text in tg_message.raw_text
 
-    slave_uid = channel_with_topic_group.db.get_topic_slave(bot_topic_group, tg_message.message_thread_id)
-    assert slave_uid == chat.channel_id + "." + chat.uid
+    slave_uid = channel_with_topic_group.db.get_topic_slave(bot_topic_group, message_thread_id)
+    assert slave_uid == utils.chat_id_to_str(chat=chat)
 
 
 async def test_reply_inside_topic_routes_back_to_slave(helper, client, slave_with_topic_group, bot_topic_group):
     chat = slave_with_topic_group.chat_with_alias
-    slave_with_topic_group.send_text_message(chat, chat.other)
-    tg_message = await helper.wait_for_message(in_chats(bot_topic_group) & text)
+    sent = slave_with_topic_group.send_text_message(chat, chat.other)
+    tg_message = await helper.wait_for_message(in_chats(bot_topic_group) & regex(re.escape(sent.text)))
 
     await client.send_message(bot_topic_group, "topic reply integration", reply_to=tg_message.id)
 

@@ -7,6 +7,7 @@ from telethon.tl.types import ChannelParticipantsAdmins
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.utils import chat_id_to_str
 from ehforwarderbot import Chat
+from ehforwarderbot.types import ChatID
 
 
 @contextmanager
@@ -21,7 +22,7 @@ def link_chats(channel: TelegramChannel,
     slave_ids = [
         chat_id_to_str(chat=i) for i in slave_chats
     ]
-    master_str = chat_id_to_str(channel.channel_id, str(telegram_chat_id))
+    master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     backup = db.get_chat_assoc(master_uid=master_str)
 
     db.remove_chat_assoc(master_uid=master_str)
@@ -45,7 +46,7 @@ async def is_bot_admin(client: TelegramClient, bot_id: int, group):
 def assert_is_linked(channel: TelegramChannel,
                      slave_chats: Iterable[Chat],
                      telegram_chat_id: int):
-    master_str = chat_id_to_str(channel.channel_id, str(telegram_chat_id))
+    master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     chats_str = set(channel.db.get_chat_assoc(master_uid=master_str))
     slave_ids = {
         chat_id_to_str(chat=i) for i in slave_chats
@@ -55,5 +56,5 @@ def assert_is_linked(channel: TelegramChannel,
 
 
 def unlink_all_chats(channel: TelegramChannel, telegram_chat_id: int):
-    master_str = chat_id_to_str(channel.channel_id, str(telegram_chat_id))
+    master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     channel.db.remove_chat_assoc(master_uid=master_str)

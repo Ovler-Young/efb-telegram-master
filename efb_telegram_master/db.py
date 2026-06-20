@@ -7,7 +7,6 @@ import time
 from contextlib import suppress
 from functools import partial
 from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING
-
 from pathlib import Path
 
 from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy
@@ -60,6 +59,7 @@ class TopicAssoc(BaseModel):
     topic_chat_id = TextField()
     message_thread_id = TextField()
     slave_uid = TextField()
+
 
 class ChatAssoc(BaseModel):
     master_uid = TextField()
@@ -231,12 +231,14 @@ class DatabaseManager:
                 else:
                     self._create()
             else:
+                self._create_missing_tables()
                 self._check_and_run_migrations()
         else:
             # SQLite backend: original logic
-            if not ChatAssoc.table_exists() or not TopicAssoc.table_exists():
+            if not ChatAssoc.table_exists():
                 self._create()
             else:
+                self._create_missing_tables()
                 self._check_and_run_migrations()
         self.logger.debug("Database migration finished...")
 
@@ -251,6 +253,25 @@ class DatabaseManager:
         Initializing tables.
         """
         database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc])
+
+    @staticmethod
+    def _create_missing_tables():
+        """Create tables introduced after the original schema without touching existing data."""
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc], safe=True)
+
+    @staticmethod
+    def _select_existing_columns(model, table_name: str, requested_fields: List):
+        columns = {i.name for i in model._meta.database.get_columns(table_name)}
+        fields = [
+            field
+            for field in requested_fields
+            if field.column_name in columns
+        ]
+        rows = list(model.select(*fields).dicts())
+        for row in rows:
+            for field in requested_fields:
+                row.setdefault(field.column_name, None)
+        return rows
 
     def _migrate_from_sqlite(self, sqlite_path: Path):
         """Migrate data from existing SQLite database to PostgreSQL on first use."""
@@ -268,16 +289,25 @@ class DatabaseManager:
             chat_assocs = list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
             ).dicts())
-            topic_assocs = list(TopicAssoc.select(
-                TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id, TopicAssoc.slave_uid
-            ).dicts())
-            slave_chat_infos = list(SlaveChatInfo.select(
+            if TopicAssoc.table_exists():
+                topic_assocs = list(TopicAssoc.select(
+                    TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id, TopicAssoc.slave_uid
+                ).dicts())
+            else:
+                topic_assocs = []
+            slave_chat_infos = self._select_existing_columns(SlaveChatInfo, "slavechatinfo", [
                 SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_channel_emoji,
                 SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id,
                 SlaveChatInfo.slave_chat_name, SlaveChatInfo.slave_chat_alias,
                 SlaveChatInfo.slave_chat_type, SlaveChatInfo.pickle
-            ).dicts())
-            msg_logs = list(MsgLog.select().dicts())
+            ])
+            msg_logs = self._select_existing_columns(MsgLog, "msglog", [
+                MsgLog.master_msg_id, MsgLog.master_msg_id_alt, MsgLog.slave_message_id,
+                MsgLog.text, MsgLog.slave_origin_uid, MsgLog.slave_origin_display_name,
+                MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
+                MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
+                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id, MsgLog.time,
+            ])
 
         sqlite_db.stop()
         sqlite_db.close()
@@ -396,9 +426,18 @@ class DatabaseManager:
             if bool(master_uid) == bool(slave_uid):
                 raise ValueError("Only one parameter is to be provided.")
             elif master_uid:
-                return ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
+                slave_uids = [
+                    row.slave_uid
+                    for row in ChatAssoc.select(ChatAssoc.slave_uid).where(ChatAssoc.master_uid == master_uid)
+                ]
+                result = ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
+                if slave_uids:
+                    TopicAssoc.delete().where(TopicAssoc.slave_uid.in_(slave_uids)).execute()
+                return result
             elif slave_uid:
-                return ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
+                result = ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
+                TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
+                return result
         except DoesNotExist:
             return 0
 
@@ -502,6 +541,8 @@ class DatabaseManager:
             message_thread_id (EFBChannelChatIDStr): The topic thread ID
             slave_uid (EFBChannelChatIDStr): Slave channel UID ("%(channel_id)s.%(chat_id)s")
         """
+        self.remove_topic_assoc(slave_uid=slave_uid)
+        self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
         return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
 
     @staticmethod

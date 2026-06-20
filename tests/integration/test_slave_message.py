@@ -61,13 +61,13 @@ class MessageFactory(ABC):
         """Issue an edit of the message if applicable.
 
         Returns the edited message, or none if no edit is needed."""
-        return
+        return None
 
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
         """Issue a media edit of the message if applicable.
 
         Returns the edited message, or none if no edit is needed."""
-        return
+        return None
 
     def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         """Finalize the message before discarding if needed."""
@@ -131,7 +131,7 @@ class TextMessageFactory(MessageFactory):
         self.compare_substitutions(tg_msg, efb_msg)
 
     def edit_message(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        slave.edit_text_message(message, reactions=True, commands=True, substitution=True)
+        return slave.edit_text_message(message, reactions=True, commands=True, substitution=True)
 
     def __str__(self):
         if self.unsupported:
@@ -207,6 +207,7 @@ class ImageMessageFactory(MessageFactory):
         if self.large:
             assert tg_msg.file
             assert tg_msg.file.name == efb_msg.filename
+            assert efb_msg.path is not None
             size = efb_msg.path.stat().st_size
             assert tg_msg.file.size == size
         else:
@@ -280,6 +281,7 @@ class FileMessageFactory(MessageFactory):
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert tg_msg.file
         assert tg_msg.file.name == efb_msg.filename
+        assert efb_msg.path is not None
         size = efb_msg.path.stat().st_size
         assert tg_msg.file.size == size
         assert efb_msg.text in tg_msg.raw_text

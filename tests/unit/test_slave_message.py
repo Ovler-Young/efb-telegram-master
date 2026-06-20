@@ -1,7 +1,11 @@
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from ehforwarderbot import Message, Chat
+from ehforwarderbot.constants import MsgType
+from ehforwarderbot.chat import ChatMember
 from ehforwarderbot.types import ReactionName
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_message import SlaveMessageProcessor
@@ -57,7 +61,7 @@ def group_member(slave):
     return slave.group.members[0]
 
 
-def build_dummy_message(chat: Chat, author: Chat) -> Message:
+def build_dummy_message(chat: Chat, author: ChatMember) -> Message:
     message = Message()
     message.chat = chat
     message.author = author
@@ -65,7 +69,7 @@ def build_dummy_message(chat: Chat, author: Chat) -> Message:
 
 
 def test_slave_message_generate_common_private(generate_message_template, private):
-    message = build_dummy_message(private, private)
+    message = build_dummy_message(private, private.other)
     header = generate_message_template(message, False)
     assert private.name in header
     assert private.alias in header
@@ -84,7 +88,7 @@ def test_slave_message_generate_common_private_self(generate_message_template, p
 
 
 def test_slave_message_generate_common_linked(generate_message_template, private):
-    message = build_dummy_message(private, private)
+    message = build_dummy_message(private, private.other)
     header = generate_message_template(message, True)
     assert not header
 
@@ -154,14 +158,14 @@ def keyboard_to_sequence(markup: InlineKeyboardMarkup) -> str:
 
 
 def test_build_inline_keyboard_empty(build_inline_keyboard, private):
-    msg = build_dummy_message(private, private)
+    msg = build_dummy_message(private, private.other)
     keyboard = build_inline_keyboard(msg, "", "", None)
     seq = keyboard_to_sequence(keyboard)
     assert seq == '[]'
 
 
 def test_build_inline_keyboard_full(build_inline_keyboard, private):
-    msg = build_dummy_message(private, private)
+    msg = build_dummy_message(private, private.other)
     msg.text = "__text__"
     keyboard = build_inline_keyboard(msg, "__template__", "__reactions__", None)
     seq = keyboard_to_sequence(keyboard)
@@ -171,7 +175,7 @@ def test_build_inline_keyboard_full(build_inline_keyboard, private):
 
 
 def test_build_inline_keyboard_existing_buttons(build_inline_keyboard, private):
-    msg = build_dummy_message(private, private)
+    msg = build_dummy_message(private, private.other)
     msg.text = "__text__"
     markup = InlineKeyboardMarkup.from_row([
         InlineKeyboardButton("__button_a__"),
@@ -184,3 +188,75 @@ def test_build_inline_keyboard_existing_buttons(build_inline_keyboard, private):
     assert "__text__" in seq
     assert "__template__" in seq
     assert "__reactions__" in seq
+
+
+def test_reaction_target_prefers_primary_message_for_slave_origin_text():
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="blueset.telegram"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt="100.11",
+    )
+
+    effective = SlaveMessageProcessor._reaction_target_message_id(old_msg, old_msg_db)
+
+    assert effective == "100.10"
+
+
+def test_reaction_target_prefers_alt_message_for_telegram_origin_text():
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt="100.11",
+    )
+
+    effective = SlaveMessageProcessor._reaction_target_message_id(old_msg, old_msg_db)
+
+    assert effective == "100.11"
+
+
+def test_update_reactions_waits_for_delayed_database_log():
+    processor = Mock(spec=SlaveMessageProcessor)
+    processor.REACTION_DB_WAIT_TIMEOUT = 1.0
+    processor.REACTION_DB_WAIT_INTERVAL = 0.01
+    processor.chat_manager = Mock()
+    processor.dispatch_message = Mock()
+    processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+    processor.logger = Mock()
+    processor._reaction_target_message_id = SlaveMessageProcessor._reaction_target_message_id
+
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        reactions={},
+        vendor_specific=None,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="blueset.telegram"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt=None,
+        sender_bot_id=None,
+        build_etm_msg=Mock(return_value=old_msg),
+    )
+    processor.db = Mock()
+    processor.db.get_msg_log.side_effect = [None, old_msg_db]
+
+    status = SimpleNamespace(
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+        msg_id="__msg_id_reaction__",
+        reactions={"R0": [object()]},
+    )
+
+    SlaveMessageProcessor.update_reactions(processor, status)
+
+    assert processor.db.get_msg_log.call_count == 2
+    assert old_msg.reactions == status.reactions
+    processor.dispatch_message.assert_called_once_with(old_msg, "__template__", (100, 10), 100, None)
+    processor.logger.error.assert_not_called()
