@@ -13,6 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager, _clone_file_argument
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
+from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
 def test_text_prefix_suffix(channel, bot_admin):
@@ -118,7 +119,8 @@ def test_malformed_html_caption(channel, bot_admin, image):
 
 def test_rate_limit_decorator_forced_routes_to_sender_bot():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False)
+    aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False, reserve_slot=Mock(return_value=0.0))
+    used_bots = []
     manager = SimpleNamespace(
         _delayed_worker_stop=threading.Event(),
         bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
@@ -131,25 +133,31 @@ def test_rate_limit_decorator_forced_routes_to_sender_bot():
     )
 
     class DummyContext:
+        def __init__(self, bot):
+            self.bot = bot
+
         def __enter__(self):
+            used_bots.append(self.bot)
             return None
 
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    manager._using_bot = lambda bot: DummyContext()
+    manager._using_bot = lambda bot: DummyContext(bot)
 
     result = decorated(manager, 123, _sender_bot_id="777")
 
     assert result.sender_bot_id == "777"
+    assert used_bots == [aux_bot.bot]
     manager._select_forced_sender.assert_called_once_with(123, "777")
 
 
 def test_rate_limit_decorator_falls_back_to_main_bot_when_sender_missing():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+    bot_pool = SimpleNamespace(get_bot_by_id=Mock(return_value=None), acquire_send_slot=Mock())
     manager = SimpleNamespace(
         _delayed_worker_stop=threading.Event(),
-        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=None)),
+        bot_pool=bot_pool,
         _select_forced_sender=Mock(return_value=(object(), None, 0.0)),
         _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
         _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
@@ -161,6 +169,56 @@ def test_rate_limit_decorator_falls_back_to_main_bot_when_sender_missing():
     result = decorated(manager, 123, _sender_bot_id="777")
 
     assert result.chat_id == 123
+    manager._calculate_rate_limit_delay.assert_called_once_with(123)
+    bot_pool.acquire_send_slot.assert_not_called()
+
+
+def _make_lightweight_bot_manager():
+    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager._bot = Mock()
+    manager._tls = threading.local()
+    manager.bot_pool = None
+    manager._delayed_worker_stop = threading.Event()
+    manager.GLOBAL_LIMIT = 30
+    manager.GLOBAL_WINDOW = 1.0
+    manager.CHAT_LIMIT = 20
+    manager.CHAT_WINDOW = 60.0
+    manager._rate_limiter = SlidingWindowRateLimiter(
+        global_limit=manager.GLOBAL_LIMIT,
+        global_window=manager.GLOBAL_WINDOW,
+        chat_limit=manager.CHAT_LIMIT,
+        chat_window=manager.CHAT_WINDOW,
+        safety_margin=0,
+    )
+    manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
+    manager.logger = Mock()
+    manager._using_bot = TelegramBotManager._using_bot.__get__(manager, TelegramBotManager)
+    manager._make_send_receipt = TelegramBotManager._make_send_receipt.__get__(manager, TelegramBotManager)
+    manager._calculate_rate_limit_delay = TelegramBotManager._calculate_rate_limit_delay.__get__(
+        manager,
+        TelegramBotManager,
+    )
+    return manager
+
+
+@pytest.mark.parametrize(("method_name", "bot_method_name", "kwargs"), [
+    ("edit_message_text", "edit_message_text", {"chat_id": 123, "message_id": 456, "text": "updated"}),
+    ("edit_message_caption", "edit_message_caption", {"chat_id": 123, "message_id": 456, "caption": "updated"}),
+    ("edit_message_media", "edit_message_media", {"chat_id": 123, "message_id": 456, "media": object()}),
+    ("edit_message_reply_markup", "edit_message_reply_markup", {"chat_id": 123, "message_id": 456, "reply_markup": None}),
+])
+def test_edit_message_methods_reserve_send_quota(method_name, bot_method_name, kwargs):
+    manager = _make_lightweight_bot_manager()
+    bot_method = getattr(manager._bot, bot_method_name)
+    bot_method.return_value = SimpleNamespace(chat_id=123, message_id=456)
+
+    result = getattr(manager, method_name)(**kwargs)
+
+    assert result.chat_id == 123
+    chat_count, global_count = manager._rate_limiter.get_counts(123)
+    assert chat_count == 1
+    assert global_count == 1
+    bot_method.assert_called_once()
 
 
 def test_build_bot_passes_local_mode_when_enabled():
@@ -217,6 +275,25 @@ def test_rate_limit_decorator_routes_new_send_through_aux_pool():
     assert result.sender_bot_id == "999"
     manager._select_sender.assert_called_once_with(123, has_callback=False, message_thread_id=None)
     manager._record_aux_use.assert_called_once_with(123)
+
+
+@pytest.mark.parametrize(("method_name", "kwargs"), [
+    ("edit_message_caption", {"chat_id": 123, "message_id": 456, "caption": "updated"}),
+    ("edit_message_media", {"chat_id": 123, "message_id": 456, "media": object()}),
+])
+def test_no_sender_caption_and_media_edits_reserve_main_quota_without_aux_pool(method_name, kwargs):
+    manager = _make_lightweight_bot_manager()
+    manager.bot_pool = SimpleNamespace(acquire_send_slot=Mock())
+    manager._select_sender = Mock()
+
+    result = getattr(manager, method_name)(**kwargs)
+
+    assert result.sender_bot_id is None
+    chat_count, global_count = manager._rate_limiter.get_counts(123)
+    assert chat_count == 1
+    assert global_count == 1
+    manager._select_sender.assert_not_called()
+    manager.bot_pool.acquire_send_slot.assert_not_called()
 
 
 def test_rate_limit_decorator_force_main_bot_skips_aux_pool():

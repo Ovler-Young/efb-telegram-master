@@ -393,6 +393,8 @@ class TelegramBotManager(LocaleMixin):
             """Apply rate limiting and sender routing for outbound API calls."""
             @wraps(fn)
             def rate_limit_wrapper(self: 'TelegramBotManager', *args, **kwargs):
+                is_edit_method = fn.__name__.startswith('edit_message_')
+
                 # Bypass: caller already reserved a slot and set _using_bot
                 if kwargs.pop('_bypass_rate_limit', False):
                     return fn(self, *args, **kwargs)
@@ -476,7 +478,11 @@ class TelegramBotManager(LocaleMixin):
                     self._cleanup_tls.pending_cleanup = []
 
                     if send_mode == 'eventual':
-                        if force_sender_known and not has_callback:
+                        if is_edit_method:
+                            kwargs = dict(kwargs)
+                            kwargs['_force_sender_known'] = True
+                            kwargs['_force_sender_bot_id'] = None
+                        elif force_sender_known and not has_callback:
                             kwargs = dict(kwargs)
                             kwargs['_force_sender_known'] = True
                             kwargs['_force_sender_bot_id'] = forced_sender_bot_id
@@ -489,7 +495,7 @@ class TelegramBotManager(LocaleMixin):
                         )
 
                     message_thread_id = kwargs.get('message_thread_id')
-                    if force_main_bot or has_callback:
+                    if force_main_bot or has_callback or is_edit_method:
                         bot, chosen_sender_bot_id, delay_time = self._bot, None, 0.0
                     elif force_sender_known:
                         bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
@@ -2208,12 +2214,14 @@ class TelegramBotManager(LocaleMixin):
                                chat_id=update.effective_chat.id,
                                message_id=update.effective_message.message_id)
 
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
         return self._active_bot.edit_message_caption(*args, **kwargs)
 
+    @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):

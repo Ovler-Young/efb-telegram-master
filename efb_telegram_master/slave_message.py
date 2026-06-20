@@ -60,17 +60,13 @@ class SlaveMessageProcessor(LocaleMixin):
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
 
-    def _get_edit_context(self, msg: Message):
-        """Get a context manager for routing edits through the correct bot.
-        Returns the bot_manager's _using_bot context manager if sender_bot_id is set,
-        otherwise returns a no-op context manager."""
-        from contextlib import nullcontext
+    @staticmethod
+    def _get_edit_kwargs(msg: Message):
+        """Forward sender bot metadata so edit wrappers reserve the matching quota."""
         _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
-        if _sender_bot_id and self.bot.bot_pool:
-            aux_bot = self.bot.bot_pool.get_bot_by_id(_sender_bot_id)
-            if aux_bot and not aux_bot.disabled:
-                return self.bot._using_bot(aux_bot.bot)
-        return nullcontext()
+        if _sender_bot_id:
+            return {'_sender_bot_id': _sender_bot_id}
+        return {}
 
     def is_silent(self, msg: Message) -> Optional[bool]:
         """Determine if a message shall be sent silently.
@@ -563,22 +559,23 @@ class SlaveMessageProcessor(LocaleMixin):
 
             if old_msg_id:
                 try:
-                    with self._get_edit_context(msg):
-                        if edit_media:
-                            assert msg.path
-                            media: InputMedia
-                            file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                            if send_as_file:
-                                media = InputMediaDocument(file)
-                            else:
-                                media = InputMediaPhoto(file)
-                            res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=media,
-                                                        reply_markup=reply_markup)
-                            if not text:
-                                return res
-                        return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                             reply_markup=reply_markup,
-                                                             prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                    edit_kwargs = self._get_edit_kwargs(msg)
+                    if edit_media:
+                        assert msg.path
+                        media: InputMedia
+                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                        if send_as_file:
+                            media = InputMediaDocument(file)
+                        else:
+                            media = InputMediaPhoto(file)
+                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=media,
+                                                    reply_markup=reply_markup, **edit_kwargs)
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                         reply_markup=reply_markup,
+                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML",
+                                                         **edit_kwargs)
                 except telegram.error.BadRequest as e:
                     self.logger.warning("[%s] Failed to edit media/caption (BadRequest: %s). Sending new message instead.", msg.uid, e)
                     if old_msg_id[0] == tg_dest:
@@ -659,18 +656,18 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                with self._get_edit_context(msg):
-                    if edit_media:
-                        assert msg.file and msg.path
-                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaAnimation(file),
-                                                    reply_markup=reply_markup)
-                        if not text:
-                            return res
-                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                         prefix=msg_template, suffix=reactions,
-                                                         reply_markup=reply_markup,
-                                                         caption=text, parse_mode="HTML")
+                edit_kwargs = self._get_edit_kwargs(msg)
+                if edit_media:
+                    assert msg.file and msg.path
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaAnimation(file),
+                                                reply_markup=reply_markup, **edit_kwargs)
+                    if not text:
+                        return res
+                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                     prefix=msg_template, suffix=reactions,
+                                                     reply_markup=reply_markup,
+                                                     caption=text, parse_mode="HTML", **edit_kwargs)
             else:
                 assert msg.file and msg.path
                 file = self.process_file_obj(msg.file, msg.path, msg.filename)
@@ -843,15 +840,17 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                with self._get_edit_context(msg):
-                    if edit_media:
-                        assert msg.file is not None and msg.path is not None
-                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaDocument(file))
-                        if not text:
-                            return res
-                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
-                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                edit_kwargs = self._get_edit_kwargs(msg)
+                if edit_media:
+                    assert msg.file is not None and msg.path is not None
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                      media=InputMediaDocument(file), **edit_kwargs)
+                    if not text:
+                        return res
+                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
+                                                     prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML",
+                                                     **edit_kwargs)
             assert msg.file is not None and msg.path is not None
             self.logger.debug("[%s] Uploading file %s (%s) as %s", msg.uid,
                               msg.file.name, msg.mime, file_name)
@@ -906,10 +905,10 @@ class SlaveMessageProcessor(LocaleMixin):
                         target_msg_id = target_msg_id or old_msg_id[1]
                     old_msg_id = None
                 else:
-                    with self._get_edit_context(msg):
-                        return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
-                                                             reply_markup=reply_markup, prefix=msg_template,
-                                                             suffix=reactions, caption=text, parse_mode="HTML")
+                    edit_kwargs = self._get_edit_kwargs(msg)
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                         reply_markup=reply_markup, prefix=msg_template,
+                                                         suffix=reactions, caption=text, parse_mode="HTML", **edit_kwargs)
             if not old_msg_id:
                 assert msg.file is not None
                 import pydub
@@ -1008,16 +1007,17 @@ class SlaveMessageProcessor(LocaleMixin):
                     return message
 
             if old_msg_id:
-                with self._get_edit_context(msg):
-                    if edit_media:
-                        assert msg.file is not None and msg.path is not None
-                        file = self.process_file_obj(msg.file, msg.path, msg.filename)
-                        res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaVideo(file),
-                                                    reply_markup=reply_markup)
-                        if not text:
-                            return res
-                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
-                                                         prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML")
+                edit_kwargs = self._get_edit_kwargs(msg)
+                if edit_media:
+                    assert msg.file is not None and msg.path is not None
+                    file = self.process_file_obj(msg.file, msg.path, msg.filename)
+                    res = self.bot.edit_message_media(chat_id=old_msg_id[0], message_id=old_msg_id[1], media=InputMediaVideo(file),
+                                                reply_markup=reply_markup, **edit_kwargs)
+                    if not text:
+                        return res
+                return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1], reply_markup=reply_markup,
+                                                     prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML",
+                                                     **edit_kwargs)
             assert msg.file is not None and msg.path is not None
             file = self.process_file_obj(msg.file, msg.path, msg.filename)
             return self.bot.send_video(tg_dest, file, prefix=msg_template, suffix=reactions,
@@ -1343,4 +1343,3 @@ class SlaveMessageProcessor(LocaleMixin):
             except OSError as e:
                 self.logger.warning("Failed to clean up local API temp file %s: %s", path, e)
         tls.pending_cleanup = []
-
