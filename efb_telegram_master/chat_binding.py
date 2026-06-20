@@ -1304,7 +1304,14 @@ class ChatBindingManager(LocaleMixin):
             with suppress(Exception):
                 picture.seek(0)
 
-    def _get_or_create_topic_icon_custom_emoji(self, slave_uid: str, picture: IO) -> Optional[str]:
+    @staticmethod
+    def _topic_icon_cache_key(avatar_hash: str, slave_uid: str, cache_namespace: Optional[str]) -> str:
+        if not cache_namespace:
+            return avatar_hash
+        return f"{cache_namespace}:{slave_uid}:{avatar_hash}"
+
+    def _get_or_create_topic_icon_custom_emoji(self, slave_uid: str, picture: IO, *,
+                                               cache_namespace: Optional[str] = None) -> Optional[str]:
         if self._topic_icon_custom_emoji_unavailable:
             return None
 
@@ -1317,10 +1324,11 @@ class ChatBindingManager(LocaleMixin):
         if not png:
             return None
         avatar_hash = self._hash_topic_icon_png(png)
-        cached = self.db.get_topic_icon_cache(avatar_hash)
+        cache_key = self._topic_icon_cache_key(avatar_hash, slave_uid, cache_namespace)
+        cached = self.db.get_topic_icon_cache(cache_key)
         if cached:
             custom_emoji_id, sticker_set_name = cached
-            self._log_topic_icon_custom_emoji("reused", avatar_hash, custom_emoji_id, sticker_set_name)
+            self._log_topic_icon_custom_emoji("reused", cache_key, custom_emoji_id, sticker_set_name)
             return custom_emoji_id
 
         emoji_name = self._topic_icon_emoji_name(slave_uid)
@@ -1356,8 +1364,8 @@ class ChatBindingManager(LocaleMixin):
                     )
                     created_set = self.bot.get_sticker_set(sticker_set_name)
                     custom_emoji_id = created_set.stickers[-1].custom_emoji_id
-                    self.db.set_topic_icon_cache(avatar_hash, custom_emoji_id, sticker_set_name)
-                    self._log_topic_icon_custom_emoji("created", avatar_hash, custom_emoji_id, sticker_set_name)
+                    self.db.set_topic_icon_cache(cache_key, custom_emoji_id, sticker_set_name)
+                    self._log_topic_icon_custom_emoji("created", cache_key, custom_emoji_id, sticker_set_name)
                     return custom_emoji_id
                 except TelegramError as e:
                     self._log_topic_icon_telegram_error(
@@ -1384,8 +1392,8 @@ class ChatBindingManager(LocaleMixin):
                 )
                 updated_set = self.bot.get_sticker_set(sticker_set_name)
                 custom_emoji_id = updated_set.stickers[-1].custom_emoji_id
-                self.db.set_topic_icon_cache(avatar_hash, custom_emoji_id, sticker_set_name)
-                self._log_topic_icon_custom_emoji("added", avatar_hash, custom_emoji_id, sticker_set_name)
+                self.db.set_topic_icon_cache(cache_key, custom_emoji_id, sticker_set_name)
+                self._log_topic_icon_custom_emoji("added", cache_key, custom_emoji_id, sticker_set_name)
                 return custom_emoji_id
             except TelegramError as e:
                 self._log_topic_icon_telegram_error(
@@ -1417,13 +1425,18 @@ class ChatBindingManager(LocaleMixin):
             return custom_emoji_id
         return None
 
-    def _resolve_topic_icon_custom_emoji_id(self, slave_uid: str, picture: Optional[IO]) -> Optional[str]:
+    def _resolve_topic_icon_custom_emoji_id(self, slave_uid: str, picture: Optional[IO], *,
+                                            cache_namespace: Optional[str] = None) -> Optional[str]:
         custom_emoji_id = self._get_configured_topic_icon_custom_emoji_id(slave_uid)
         if custom_emoji_id:
             return custom_emoji_id
 
         if picture and self._is_topic_icon_sync_enabled():
-            return self._get_or_create_topic_icon_custom_emoji(slave_uid, picture)
+            return self._get_or_create_topic_icon_custom_emoji(
+                slave_uid,
+                picture,
+                cache_namespace=cache_namespace,
+            )
         return None
 
     def _build_edit_forum_topic_kwargs(self, name: str) -> dict:

@@ -251,6 +251,47 @@ def test_topic_icon_reuses_db_cache_for_duplicate_avatar(channel, slave, caplog)
     channel.config.pop("topic_icons", None)
 
 
+def test_member_avatar_namespace_does_not_reuse_legacy_global_cache(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.group.members[0])
+    picture = _png_bytes()
+    png = channel.chat_binding._make_topic_icon_png(picture)
+    assert png is not None
+    avatar_hash = channel.chat_binding._hash_topic_icon_png(png)
+    channel.db.set_topic_icon_cache(avatar_hash, "emoji-legacy", "etm_topic_icons_by_testbot")
+    channel.config["topic_icons"] = {
+        "sync_avatar_to_custom_emoji": True,
+        "sticker_set_name": "etm_topic_icons",
+        "owner_user_id": 99,
+    }
+    existing_set = _sticker_set("etm_topic_icons_by_testbot", [_sticker("😀", "emoji-existing")])
+    updated_set = _sticker_set("etm_topic_icons_by_testbot", [
+        _sticker("😀", "emoji-existing"),
+        _sticker(channel.chat_binding._topic_icon_emoji_name(slave_uid), "emoji-member"),
+    ])
+
+    with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
+         patch.object(
+             channel.bot_manager,
+             "get_sticker_set",
+             side_effect=[existing_set, updated_set],
+         ), \
+         patch.object(channel.bot_manager, "add_sticker_to_set") as add_sticker_to_set:
+        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(
+            slave_uid,
+            _png_bytes(),
+            cache_namespace="member",
+        )
+
+    assert custom_emoji_id == "emoji-member"
+    add_sticker_to_set.assert_called_once()
+    assert channel.db.get_topic_icon_cache(avatar_hash) == ("emoji-legacy", "etm_topic_icons_by_testbot")
+    assert channel.db.get_topic_icon_cache(f"member:{slave_uid}:{avatar_hash}") == (
+        "emoji-member",
+        "etm_topic_icons_by_testbot",
+    )
+    channel.config.pop("topic_icons", None)
+
+
 def test_topic_icon_telegram_error_log_includes_context(channel, caplog):
     error = BadRequest("Premium_account_required")
 

@@ -184,7 +184,11 @@ def test_author_avatar_custom_emoji_prefix_uses_chat_member_picture(channel, sla
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
     get_chat_member_picture.assert_called_once_with(group_member)
     get_chat_picture.assert_not_called()
-    get_or_create.assert_called_once()
+    get_or_create.assert_called_once_with(
+        f"{group_member.module_id} {group_member.uid} {group.uid}",
+        picture,
+        cache_namespace="member",
+    )
 
 
 def test_author_avatar_custom_emoji_prefix_falls_back_to_chat_picture(channel, slave, group, group_member):
@@ -212,7 +216,11 @@ def test_author_avatar_custom_emoji_prefix_falls_back_to_chat_picture(channel, s
 
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
     get_chat_picture.assert_called_once_with(group_member)
-    get_or_create.assert_called_once()
+    get_or_create.assert_called_once_with(
+        f"{group_member.module_id} {group_member.uid} {group.uid}",
+        picture,
+        cache_namespace="member",
+    )
 
 
 def test_author_avatar_custom_emoji_prefix_uses_default_topic_icon_config(channel, slave, group, group_member):
@@ -235,7 +243,11 @@ def test_author_avatar_custom_emoji_prefix_uses_default_topic_icon_config(channe
 
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
     get_chat_member_picture.assert_called_once_with(group_member)
-    get_or_create.assert_called_once()
+    get_or_create.assert_called_once_with(
+        f"{group_member.module_id} {group_member.uid} {group.uid}",
+        picture,
+        cache_namespace="member",
+    )
 
 
 def test_slave_message_generate_group_linked_self(generate_message_template, group):

@@ -1238,6 +1238,7 @@ class SlaveMessageProcessor(LocaleMixin):
             custom_emoji_id = self.channel.chat_binding._resolve_topic_icon_custom_emoji_id(
                 utils.chat_id_to_str(chat=author),
                 picture,
+                cache_namespace="member",
             )
             if not custom_emoji_id:
                 return ""
