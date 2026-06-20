@@ -212,8 +212,7 @@ def test_edit_message_methods_reserve_send_quota(method_name, bot_method_name, k
     bot_method = getattr(manager._bot, bot_method_name)
     bot_method.return_value = SimpleNamespace(chat_id=123, message_id=456)
 
-    with patch("efb_telegram_master.bot_manager.time.time", return_value=100.0):
-        result = getattr(manager, method_name)(**kwargs)
+    result = getattr(manager, method_name)(**kwargs)
 
     assert result.chat_id == 123
     chat_count, global_count = manager._rate_limiter.get_counts(123)
