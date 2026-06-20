@@ -55,7 +55,6 @@ T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
 CUSTOM_EMOJI_PLACEHOLDER_RE = re.compile(r"\x00ETM_CUSTOM_EMOJI:([0-9]+)\x00")
 CUSTOM_EMOJI_HTML_RE = re.compile(r'<tg-emoji emoji-id="[0-9]+">.*?</tg-emoji>\s?')
-CUSTOM_EMOJI_FALLBACK = "😀"
 
 
 def custom_emoji_placeholder(custom_emoji_id: str) -> str:
@@ -66,10 +65,6 @@ def custom_emoji_placeholder(custom_emoji_id: str) -> str:
 
 def contains_custom_emoji_placeholders(text: str) -> bool:
     return bool(CUSTOM_EMOJI_PLACEHOLDER_RE.search(text))
-
-
-def custom_emoji_ids_from_placeholders(text: str) -> set[str]:
-    return {match.group(1) for match in CUSTOM_EMOJI_PLACEHOLDER_RE.finditer(text)}
 
 
 def render_custom_emoji_placeholders(text: str) -> str:
@@ -91,7 +86,7 @@ def strip_custom_emoji_html(text: str) -> str:
 def escape_html_affix(text: str) -> str:
     escaped = html.escape(text)
     return CUSTOM_EMOJI_PLACEHOLDER_RE.sub(
-        lambda match: f'<tg-emoji emoji-id="{match.group(1)}">{CUSTOM_EMOJI_FALLBACK}</tg-emoji>',
+        lambda match: f'<tg-emoji emoji-id="{match.group(1)}"></tg-emoji>',
         escaped,
     )
 
@@ -719,7 +714,6 @@ class TelegramBotManager(LocaleMixin):
                 suffix = (suffix and ("\n" + suffix)) or suffix
 
                 if str(kwargs.get('parse_mode', '')).lower() == "html":
-                    self._log_custom_emoji_affix_render(prefix, suffix)
                     prefix = escape_html_affix(prefix)
                     suffix = escape_html_affix(suffix)
                 else:
@@ -806,8 +800,6 @@ class TelegramBotManager(LocaleMixin):
         request_kwargs = self._normalize_request_kwargs(req_kwargs)
         self._request_kwargs = dict(request_kwargs)
         self._bot_identity_kwargs: dict[str, str] = {"token": config['token']}
-        self._logged_custom_emoji_affix_ids: set[str] = set()
-
         self.logger.debug("Setting up Telegram application and sync runtime...")
         if channel.flag('api_base_url'):
             self._bot_identity_kwargs["base_url"] = channel.flag('api_base_url')
@@ -928,19 +920,6 @@ class TelegramBotManager(LocaleMixin):
         self._add_base_dispatchers()
         self.Decorators.enable_retry = channel.flag('retry_on_error')
         self.logger.debug("Base dispatchers added...")
-
-    def _log_custom_emoji_affix_render(self, *texts: str) -> None:
-        custom_emoji_ids = set()
-        for text in texts:
-            custom_emoji_ids.update(custom_emoji_ids_from_placeholders(text))
-        new_ids = custom_emoji_ids - self._logged_custom_emoji_affix_ids
-        if not new_ids:
-            return
-        self._logged_custom_emoji_affix_ids.update(new_ids)
-        self.logger.info(
-            "Rendering custom emoji affix: custom_emoji_ids=%s",
-            ",".join(sorted(new_ids)),
-        )
 
     @staticmethod
     def _normalize_request_kwargs(request_kwargs: Mapping[str, object]) -> dict[str, object]:
@@ -1958,7 +1937,6 @@ class TelegramBotManager(LocaleMixin):
         prefix = (prefix and (prefix + "\n")) or prefix
         suffix = (suffix and ("\n" + suffix)) or suffix
         if str(kwargs.get('parse_mode', '')).lower() == "html":
-            self._log_custom_emoji_affix_render(prefix, suffix)
             prefix = escape_html_affix(prefix)
             suffix = escape_html_affix(suffix)
         else:
@@ -2023,7 +2001,6 @@ class TelegramBotManager(LocaleMixin):
         prefix = (prefix and (prefix + "\n")) or prefix
         suffix = (suffix and ("\n" + suffix)) or suffix
         if str(kwargs.get('parse_mode', '')).lower() == "html":
-            self._log_custom_emoji_affix_render(prefix, suffix)
             prefix = escape_html_affix(prefix)
             suffix = escape_html_affix(suffix)
         else:

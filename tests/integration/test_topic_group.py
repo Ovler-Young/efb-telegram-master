@@ -97,7 +97,7 @@ def test_bot_api_accepts_generated_custom_emoji_in_message_text(channel_with_top
         assert custom_emoji_id
         assert channel_with_topic_group.bot_manager.send_message(
             chat_id=bot_topic_group,
-            text=f'<tg-emoji emoji-id="{custom_emoji_id}">😀</tg-emoji> ETM custom emoji smoke',
+            text=f'<tg-emoji emoji-id="{custom_emoji_id}"></tg-emoji> ETM custom emoji smoke',
             message_thread_id=topic.message_thread_id,
             parse_mode="HTML",
         )

@@ -5,7 +5,7 @@ import random
 import threading
 from typing import Iterator, BinaryIO
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 import telegram.error
@@ -13,8 +13,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager, _clone_file_argument
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
-from efb_telegram_master.bot_manager import custom_emoji_ids_from_placeholders, custom_emoji_placeholder, \
-    escape_html_affix, render_custom_emoji_placeholders, strip_custom_emoji_html
+from efb_telegram_master.bot_manager import custom_emoji_placeholder, escape_html_affix, \
+    render_custom_emoji_placeholders, strip_custom_emoji_html
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
@@ -35,7 +35,7 @@ def test_escape_html_affix_preserves_custom_emoji_placeholder():
         custom_emoji_placeholder("1234567890") + " <b>Alice & Bob</b>"
     )
 
-    assert '<tg-emoji emoji-id="1234567890">😀</tg-emoji>' in escaped
+    assert '<tg-emoji emoji-id="1234567890"></tg-emoji>' in escaped
     assert "&lt;b&gt;Alice &amp; Bob&lt;/b&gt;" in escaped
 
 
@@ -45,18 +45,34 @@ def test_render_custom_emoji_placeholders_drops_unrenderable_emoji():
     assert rendered == "Alice"
 
 
-def test_custom_emoji_ids_from_placeholders():
-    ids = custom_emoji_ids_from_placeholders(
-        custom_emoji_placeholder("1234567890") + " " + custom_emoji_placeholder("9876543210")
-    )
-
-    assert ids == {"1234567890", "9876543210"}
-
-
 def test_strip_custom_emoji_html_drops_unrenderable_emoji():
-    rendered = strip_custom_emoji_html('<tg-emoji emoji-id="1234567890">😀</tg-emoji> Alice')
+    rendered = strip_custom_emoji_html('<tg-emoji emoji-id="1234567890"></tg-emoji> Alice')
 
     assert rendered == "Alice"
+
+
+def test_custom_emoji_parse_error_retries_without_custom_emoji():
+    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    sent = SimpleNamespace(message_id=1)
+    active_bot = SimpleNamespace(
+        send_message=Mock(side_effect=[
+            telegram.error.BadRequest("Can't parse entities: unsupported custom emoji"),
+            sent,
+        ])
+    )
+
+    with patch.object(TelegramBotManager, "_active_bot", new_callable=PropertyMock, return_value=active_bot):
+        result = manager._bot_send_message_fallback(
+            123,
+            text='<tg-emoji emoji-id="1234567890"></tg-emoji> Alice',
+            parse_mode="HTML",
+        )
+
+    assert result is sent
+    retry_kwargs = active_bot.send_message.call_args_list[1].kwargs
+    assert retry_kwargs["text"] == "Alice"
+    assert "parse_mode" not in retry_kwargs
 
 
 @pytest.fixture(scope='function')
