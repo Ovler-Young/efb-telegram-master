@@ -13,8 +13,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager, _clone_file_argument
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
-from efb_telegram_master.bot_manager import custom_emoji_placeholder, escape_html_affix, render_custom_emoji_placeholders, \
-    strip_custom_emoji_html
+from efb_telegram_master.bot_manager import custom_emoji_ids_from_placeholders, custom_emoji_placeholder, \
+    escape_html_affix, render_custom_emoji_placeholders, strip_custom_emoji_html
 
 
 def test_text_prefix_suffix(channel, bot_admin):
@@ -42,6 +42,14 @@ def test_render_custom_emoji_placeholders_drops_unrenderable_emoji():
     rendered = render_custom_emoji_placeholders(custom_emoji_placeholder("1234567890") + " Alice")
 
     assert rendered == "Alice"
+
+
+def test_custom_emoji_ids_from_placeholders():
+    ids = custom_emoji_ids_from_placeholders(
+        custom_emoji_placeholder("1234567890") + " " + custom_emoji_placeholder("9876543210")
+    )
+
+    assert ids == {"1234567890", "9876543210"}
 
 
 def test_strip_custom_emoji_html_drops_unrenderable_emoji():
