@@ -2,14 +2,18 @@ name: Sync to Sub-Account
 
 on:
   push:
-    branches: [ "dev" ] # 当大号的 main 分支有推送时触发
+    branches: [ "dev" ] # 当大号的 dev 分支有推送时触发
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          persist-credentials: false # <--- 核心修复：清理大号机器人权限，确保后面使用小号 Token
+
       - name: Pushes to another repository
         uses: cpina/github-action-push-to-another-repository@main
         env:
@@ -18,5 +22,5 @@ jobs:
           source-directory: '.'
           destination-github-username: 'onestao'
           destination-repository-name: 'efb-telegram-master'
-          user-email: 'kettly1266@gmail.com' # 这里填小号的邮箱
-          target-branch: main
+          user-email: 'kettly1266@gmail.com' # 小号的邮箱
+          target-branch: main # 推送到小号的 main 分支
