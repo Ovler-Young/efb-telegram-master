@@ -61,6 +61,7 @@ class SlaveMessageProcessor(LocaleMixin):
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
+        self._logged_author_avatar_custom_emoji: set[Tuple[str, str, str]] = set()
 
     def _get_edit_context(self, msg: Message):
         """Get a context manager for routing edits through the correct bot.
@@ -1201,6 +1202,13 @@ class SlaveMessageProcessor(LocaleMixin):
 
         self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
 
+    @staticmethod
+    def _get_author_avatar_picture(slave_channel, author: ChatMember) -> Tuple[IO, str]:
+        get_member_picture = getattr(slave_channel, "get_chat_member_picture", None)
+        if callable(get_member_picture):
+            return get_member_picture(author), "member"
+        return slave_channel.get_chat_picture(author), "chat"
+
     def _author_avatar_custom_emoji_prefix(self, msg: Message) -> str:
         msg_uid = getattr(msg, "uid", "")
         if not isinstance(msg.chat, GroupChat) or isinstance(msg.author, SelfChatMember):
@@ -1226,13 +1234,25 @@ class SlaveMessageProcessor(LocaleMixin):
                 )
                 return ""
 
-            picture = slave_channel.get_chat_picture(author)
+            picture, picture_source = self._get_author_avatar_picture(slave_channel, author)
             custom_emoji_id = self.channel.chat_binding._resolve_topic_icon_custom_emoji_id(
                 utils.chat_id_to_str(chat=author),
                 picture,
             )
             if not custom_emoji_id:
                 return ""
+            log_key = (str(author.uid), str(msg.chat.uid), custom_emoji_id)
+            if log_key not in self._logged_author_avatar_custom_emoji:
+                self._logged_author_avatar_custom_emoji.add(log_key)
+                self.logger.info(
+                    "[%s] Resolved author avatar custom emoji: author_uid=%s group_uid=%s picture_source=%s "
+                    "custom_emoji_id=%s",
+                    msg_uid,
+                    author.uid,
+                    msg.chat.uid,
+                    picture_source,
+                    custom_emoji_id,
+                )
             return custom_emoji_placeholder(custom_emoji_id)
         except (EFBOperationNotSupported, TelegramError, ValueError) as e:
             self.logger.debug(
