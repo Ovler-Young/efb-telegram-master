@@ -73,6 +73,8 @@ def custom_emoji_ids_from_placeholders(text: str) -> set[str]:
 
 
 def render_custom_emoji_placeholders(text: str) -> str:
+    if not contains_custom_emoji_placeholders(text):
+        return text
     return CUSTOM_EMOJI_PLACEHOLDER_RE.sub("", text).lstrip()
 
 
@@ -81,6 +83,8 @@ def contains_custom_emoji_html(text: str) -> bool:
 
 
 def strip_custom_emoji_html(text: str) -> str:
+    if not contains_custom_emoji_html(text):
+        return text
     return CUSTOM_EMOJI_HTML_RE.sub("", text).lstrip()
 
 

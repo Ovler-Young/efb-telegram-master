@@ -181,6 +181,7 @@ def test_topic_icon_set_name_keeps_bot_username_suffix(channel):
 
 def test_topic_icon_adds_to_existing_set_without_guessing_by_emoji(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    picture = _png_bytes((255, 0, 0, 255))
     channel.config["topic_icons"] = {
         "sync_avatar_to_custom_emoji": True,
         "sticker_set_name": "etm_topic_icons",
@@ -200,7 +201,7 @@ def test_topic_icon_adds_to_existing_set_without_guessing_by_emoji(channel, slav
          ) as get_sticker_set, \
          patch.object(channel.bot_manager, "add_sticker_to_set") as add_sticker_to_set, \
          patch.object(channel.bot_manager, "create_new_sticker_set") as create_new_sticker_set:
-        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, picture)
 
     assert custom_emoji_id == "emoji-added"
     assert get_sticker_set.call_args_list[-1].args == ("etm_topic_icons_by_testbot",)
@@ -211,6 +212,7 @@ def test_topic_icon_adds_to_existing_set_without_guessing_by_emoji(channel, slav
 
 def test_topic_icon_reuses_db_cache_for_duplicate_avatar(channel, slave, caplog):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    picture = _png_bytes((254, 0, 0, 255))
     channel.config["topic_icons"] = {
         "sync_avatar_to_custom_emoji": True,
         "sticker_set_name": "etm_topic_icons",
@@ -230,14 +232,14 @@ def test_topic_icon_reuses_db_cache_for_duplicate_avatar(channel, slave, caplog)
          ), \
          patch.object(channel.bot_manager, "add_sticker_to_set") as add_sticker_to_set, \
          patch.object(channel.bot_manager, "create_new_sticker_set") as create_new_sticker_set:
-        first = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+        first = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, picture)
 
     with caplog.at_level("DEBUG", logger="efb_telegram_master.chat_binding"), \
          patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
          patch.object(channel.bot_manager, "get_sticker_set") as get_sticker_set, \
          patch.object(channel.bot_manager, "add_sticker_to_set") as add_sticker_to_set_again, \
          patch.object(channel.bot_manager, "create_new_sticker_set") as create_new_sticker_set_again:
-        second = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+        second = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes((254, 0, 0, 255)))
 
     assert first == "emoji-added"
     assert second == "emoji-added"
@@ -253,7 +255,7 @@ def test_topic_icon_reuses_db_cache_for_duplicate_avatar(channel, slave, caplog)
 
 def test_member_avatar_namespace_does_not_reuse_legacy_global_cache(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.group.members[0])
-    picture = _png_bytes()
+    picture = _png_bytes((253, 0, 0, 255))
     png = channel.chat_binding._make_topic_icon_png(picture)
     assert png is not None
     avatar_hash = channel.chat_binding._hash_topic_icon_png(png)
@@ -278,7 +280,7 @@ def test_member_avatar_namespace_does_not_reuse_legacy_global_cache(channel, sla
          patch.object(channel.bot_manager, "add_sticker_to_set") as add_sticker_to_set:
         custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(
             slave_uid,
-            _png_bytes(),
+            _png_bytes((253, 0, 0, 255)),
             cache_namespace="member",
         )
 
@@ -316,6 +318,7 @@ def test_topic_icon_telegram_error_log_includes_context(channel, caplog):
 
 def test_topic_icon_creates_next_set_when_existing_sets_are_full(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    picture = _png_bytes((252, 0, 0, 255))
     channel.config["topic_icons"] = {
         "sync_avatar_to_custom_emoji": True,
         "sticker_set_name": "etm_topic_icons",
@@ -334,7 +337,7 @@ def test_topic_icon_creates_next_set_when_existing_sets_are_full(channel, slave)
     with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
          patch.object(channel.bot_manager, "get_sticker_set", get_sticker_set), \
          patch.object(channel.bot_manager, "create_new_sticker_set", return_value=True) as create_new_sticker_set:
-        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, picture)
 
     assert custom_emoji_id == "emoji-created"
     create_new_sticker_set.assert_called_once()
@@ -347,6 +350,7 @@ def test_topic_icon_creates_next_set_when_existing_sets_are_full(channel, slave)
 
 def test_topic_icon_generation_failure_marks_unavailable_and_falls_back(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    picture = _png_bytes((251, 0, 0, 255))
     channel.config["topic_icons"] = {
         "sticker_set_name": "etm_topic_icons",
         "owner_user_id": 99,
@@ -355,7 +359,7 @@ def test_topic_icon_generation_failure_marks_unavailable_and_falls_back(channel,
     with patch.object(channel.chat_binding, "_get_bot_user", return_value=SimpleNamespace(id=1, username="testbot")), \
          patch.object(channel.bot_manager, "get_sticker_set", side_effect=BadRequest("Sticker set not found")), \
          patch.object(channel.bot_manager, "create_new_sticker_set", side_effect=BadRequest("not enough rights")):
-        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, _png_bytes())
+        custom_emoji_id = channel.chat_binding._get_or_create_topic_icon_custom_emoji(slave_uid, picture)
 
     assert custom_emoji_id is None
     assert channel.chat_binding._topic_icon_custom_emoji_unavailable is True
