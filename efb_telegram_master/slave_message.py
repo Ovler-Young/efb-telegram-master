@@ -1222,7 +1222,6 @@ class SlaveMessageProcessor(LocaleMixin):
         if not isinstance(author, ChatMember):
             return ""
 
-        picture = None
         try:
             channel_id = author.module_id
             slave_channel = coordinator.slaves.get(channel_id)
@@ -1234,11 +1233,11 @@ class SlaveMessageProcessor(LocaleMixin):
                 )
                 return ""
 
-            picture, picture_source = self._get_author_avatar_picture(slave_channel, author)
-            custom_emoji_id = self.channel.chat_binding._resolve_topic_icon_custom_emoji_id(
-                utils.chat_id_to_str(chat=author),
-                picture,
-                cache_namespace="member",
+            author_uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
+            custom_emoji_id = self.channel.chat_binding.resolve_author_avatar_custom_emoji_id_lazy(
+                author_uid,
+                lambda: self._get_author_avatar_picture(slave_channel, author),
+                msg_uid=msg_uid,
             )
             if not custom_emoji_id:
                 return ""
@@ -1246,12 +1245,11 @@ class SlaveMessageProcessor(LocaleMixin):
             if log_key not in self._logged_author_avatar_custom_emoji:
                 self._logged_author_avatar_custom_emoji.add(log_key)
                 self.logger.info(
-                    "[%s] Resolved author avatar custom emoji: author_uid=%s group_uid=%s picture_source=%s "
+                    "[%s] Resolved author avatar custom emoji: author_uid=%s group_uid=%s "
                     "custom_emoji_id=%s",
                     msg_uid,
                     author.uid,
                     msg.chat.uid,
-                    picture_source,
                     custom_emoji_id,
                 )
             return custom_emoji_placeholder(custom_emoji_id)
@@ -1273,9 +1271,6 @@ class SlaveMessageProcessor(LocaleMixin):
                 exc_info=True,
             )
             return ""
-        finally:
-            if picture and getattr(picture, 'close', None):
-                picture.close()
 
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name

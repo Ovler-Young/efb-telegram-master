@@ -162,7 +162,7 @@ def test_slave_message_generate_group_linked_with_author_avatar_emoji(channel, g
     assert group_member.alias in header
 
 
-def test_author_avatar_custom_emoji_prefix_uses_chat_member_picture(channel, slave, group, group_member):
+def test_author_avatar_custom_emoji_prefix_passes_chat_member_picture_loader(channel, slave, group, group_member):
     message = build_dummy_message(group, group_member)
     old_topic_icons = channel.config.get("topic_icons")
     picture = io.BytesIO(b"avatar")
@@ -173,7 +173,11 @@ def test_author_avatar_custom_emoji_prefix_uses_chat_member_picture(channel, sla
         }
         with patch.object(slave, "get_chat_member_picture", return_value=picture, create=True) as get_chat_member_picture, \
              patch.object(slave, "get_chat_picture") as get_chat_picture, \
-             patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji", return_value="12345") as get_or_create:
+             patch.object(
+                 channel.chat_binding,
+                 "resolve_author_avatar_custom_emoji_id_lazy",
+                 return_value="12345",
+             ) as resolve:
             prefix = channel.slave_messages._author_avatar_custom_emoji_prefix(message)
     finally:
         if old_topic_icons is None:
@@ -182,16 +186,16 @@ def test_author_avatar_custom_emoji_prefix_uses_chat_member_picture(channel, sla
             channel.config["topic_icons"] = old_topic_icons
 
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
+    resolve.assert_called_once()
+    assert resolve.call_args.args[0] == f"{group_member.module_id} {group_member.uid}"
+    loaded_picture, picture_source = resolve.call_args.args[1]()
+    assert loaded_picture is picture
+    assert picture_source == "member"
     get_chat_member_picture.assert_called_once_with(group_member)
     get_chat_picture.assert_not_called()
-    get_or_create.assert_called_once_with(
-        f"{group_member.module_id} {group_member.uid} {group.uid}",
-        picture,
-        cache_namespace="member",
-    )
 
 
-def test_author_avatar_custom_emoji_prefix_falls_back_to_chat_picture(channel, slave, group, group_member):
+def test_author_avatar_custom_emoji_prefix_passes_chat_picture_loader(channel, slave, group, group_member):
     message = build_dummy_message(group, group_member)
     old_topic_icons = channel.config.get("topic_icons")
     picture = io.BytesIO(b"avatar")
@@ -204,7 +208,11 @@ def test_author_avatar_custom_emoji_prefix_falls_back_to_chat_picture(channel, s
         if hasattr(slave, "get_chat_member_picture"):
             delattr(slave, "get_chat_member_picture")
         with patch.object(slave, "get_chat_picture", return_value=picture) as get_chat_picture, \
-             patch.object(channel.chat_binding, "_get_or_create_topic_icon_custom_emoji", return_value="12345") as get_or_create:
+             patch.object(
+                 channel.chat_binding,
+                 "resolve_author_avatar_custom_emoji_id_lazy",
+                 return_value="12345",
+             ) as resolve:
             prefix = channel.slave_messages._author_avatar_custom_emoji_prefix(message)
     finally:
         if old_get_chat_member_picture is not None:
@@ -215,12 +223,12 @@ def test_author_avatar_custom_emoji_prefix_falls_back_to_chat_picture(channel, s
             channel.config["topic_icons"] = old_topic_icons
 
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
+    resolve.assert_called_once()
+    assert resolve.call_args.args[0] == f"{group_member.module_id} {group_member.uid}"
+    loaded_picture, picture_source = resolve.call_args.args[1]()
+    assert loaded_picture is picture
+    assert picture_source == "chat"
     get_chat_picture.assert_called_once_with(group_member)
-    get_or_create.assert_called_once_with(
-        f"{group_member.module_id} {group_member.uid} {group.uid}",
-        picture,
-        cache_namespace="member",
-    )
 
 
 def test_author_avatar_custom_emoji_prefix_uses_default_topic_icon_config(channel, slave, group, group_member):
@@ -233,21 +241,20 @@ def test_author_avatar_custom_emoji_prefix_uses_default_topic_icon_config(channe
         with patch.object(slave, "get_chat_member_picture", return_value=picture, create=True) as get_chat_member_picture, \
              patch.object(
                  channel.chat_binding,
-                 "_get_or_create_topic_icon_custom_emoji",
+                 "resolve_author_avatar_custom_emoji_id_lazy",
                  return_value="12345",
-             ) as get_or_create:
+             ) as resolve:
             prefix = channel.slave_messages._author_avatar_custom_emoji_prefix(message)
     finally:
         if old_topic_icons is not None:
             channel.config["topic_icons"] = old_topic_icons
 
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
+    resolve.assert_called_once()
+    loaded_picture, picture_source = resolve.call_args.args[1]()
+    assert loaded_picture is picture
+    assert picture_source == "member"
     get_chat_member_picture.assert_called_once_with(group_member)
-    get_or_create.assert_called_once_with(
-        f"{group_member.module_id} {group_member.uid} {group.uid}",
-        picture,
-        cache_namespace="member",
-    )
 
 
 def test_slave_message_generate_group_linked_self(generate_message_template, group):

@@ -294,6 +294,114 @@ def test_member_avatar_namespace_does_not_reuse_legacy_global_cache(channel, sla
     channel.config.pop("topic_icons", None)
 
 
+def test_author_avatar_lazy_reuses_user_cache_without_loading_picture(channel, slave):
+    slave_uid = f"{utils.chat_id_to_str(chat=slave.group.members[0])}:cached"
+    cache_key = channel.chat_binding._author_avatar_cache_key(slave_uid)
+    channel.db.set_topic_icon_cache(cache_key, "emoji-user", "etm_topic_icons_by_testbot")
+    load_picture = Mock(side_effect=AssertionError("avatar should not be loaded on user cache hit"))
+
+    custom_emoji_id = channel.chat_binding.resolve_author_avatar_custom_emoji_id_lazy(slave_uid, load_picture)
+
+    assert custom_emoji_id == "emoji-user"
+    load_picture.assert_not_called()
+
+
+def test_author_avatar_lazy_returns_none_when_pool_empty_without_loading_picture(channel, slave):
+    slave_uid = f"{utils.chat_id_to_str(chat=slave.group.members[0])}:empty-pool"
+    load_picture = Mock(side_effect=AssertionError("avatar should not be loaded without a placeholder"))
+
+    with patch.object(channel.db, "get_topic_icon_cache_entries", return_value=[]), \
+         patch.object(channel.db, "get_topic_icon_cache_custom_emoji_ids", return_value=set()), \
+         patch.object(channel.chat_binding, "_ensure_author_avatar_placeholder_pool_async_locked") as ensure_pool:
+        custom_emoji_id = channel.chat_binding.resolve_author_avatar_custom_emoji_id_lazy(slave_uid, load_picture)
+
+    assert custom_emoji_id is None
+    ensure_pool.assert_called_once()
+    load_picture.assert_not_called()
+
+
+def test_author_avatar_lazy_uses_available_placeholder_and_starts_background_update(channel, slave):
+    slave_uid = f"{utils.chat_id_to_str(chat=slave.group.members[0])}:placeholder"
+    channel.db.set_topic_icon_cache(
+        "member-placeholder:etm_topic_icons_by_testbot:emoji-placeholder",
+        "emoji-placeholder",
+        "etm_topic_icons_by_testbot",
+    )
+    load_picture = Mock(side_effect=AssertionError("avatar should be loaded only by background thread"))
+    thread = Mock()
+
+    with patch.object(channel.chat_binding, "_ensure_author_avatar_placeholder_pool_async_locked") as ensure_pool, \
+         patch("efb_telegram_master.chat_binding.threading.Thread", return_value=thread) as thread_cls:
+        custom_emoji_id = channel.chat_binding.resolve_author_avatar_custom_emoji_id_lazy(slave_uid, load_picture)
+
+    assert custom_emoji_id == "emoji-placeholder"
+    ensure_pool.assert_called_once()
+    thread_cls.assert_called_once()
+    thread.start.assert_called_once()
+    load_picture.assert_not_called()
+
+
+def test_author_avatar_replace_updates_sticker_and_user_cache(channel, slave):
+    slave_uid = f"{utils.chat_id_to_str(chat=slave.group.members[0])}:replace"
+    user_cache_key = channel.chat_binding._author_avatar_cache_key(slave_uid)
+    picture = _png_bytes((200, 10, 10, 255))
+    old_sticker = SimpleNamespace(custom_emoji_id="emoji-placeholder", file_id="file-placeholder")
+
+    with patch.object(channel.chat_binding, "_get_topic_icon_owner_user_id", return_value=99), \
+         patch.object(channel.chat_binding, "_find_custom_emoji_sticker", return_value=old_sticker), \
+         patch.object(channel.bot_manager, "replace_sticker_in_set", return_value=True) as replace:
+        channel.chat_binding._replace_author_avatar_placeholder(
+            slave_uid,
+            user_cache_key,
+            "emoji-placeholder",
+            "etm_topic_icons_by_testbot",
+            Mock(return_value=(picture, "member")),
+            "msg-1",
+        )
+
+    replace.assert_called_once()
+    assert replace.call_args.kwargs["user_id"] == 99
+    assert replace.call_args.kwargs["name"] == "etm_topic_icons_by_testbot"
+    assert replace.call_args.kwargs["old_sticker"] is old_sticker
+    assert channel.db.get_topic_icon_cache(user_cache_key) == (
+        "emoji-placeholder",
+        "etm_topic_icons_by_testbot",
+    )
+
+
+def test_author_avatar_replace_keeps_placeholder_reserved_when_cache_write_fails(channel, slave):
+    slave_uid = f"{utils.chat_id_to_str(chat=slave.group.members[0])}:replace-cache-fail"
+    user_cache_key = channel.chat_binding._author_avatar_cache_key(slave_uid)
+    picture = _png_bytes((190, 10, 10, 255))
+    old_sticker = SimpleNamespace(custom_emoji_id="emoji-placeholder-fail", file_id="file-placeholder")
+    channel.chat_binding._author_avatar_pending[user_cache_key] = (
+        "emoji-placeholder-fail",
+        "etm_topic_icons_by_testbot",
+    )
+    channel.chat_binding._author_avatar_inflight.add(user_cache_key)
+
+    with patch.object(channel.chat_binding, "_get_topic_icon_owner_user_id", return_value=99), \
+         patch.object(channel.chat_binding, "_find_custom_emoji_sticker", return_value=old_sticker), \
+         patch.object(channel.bot_manager, "replace_sticker_in_set", return_value=True), \
+         patch.object(channel.db, "set_topic_icon_cache", side_effect=RuntimeError("db down")):
+        channel.chat_binding._replace_author_avatar_placeholder(
+            slave_uid,
+            user_cache_key,
+            "emoji-placeholder-fail",
+            "etm_topic_icons_by_testbot",
+            Mock(return_value=(picture, "member")),
+            "msg-1",
+        )
+
+    assert channel.chat_binding._author_avatar_pending[user_cache_key] == (
+        "emoji-placeholder-fail",
+        "etm_topic_icons_by_testbot",
+    )
+    assert user_cache_key in channel.chat_binding._author_avatar_inflight
+    channel.chat_binding._author_avatar_pending.pop(user_cache_key, None)
+    channel.chat_binding._author_avatar_inflight.discard(user_cache_key)
+
+
 def test_topic_icon_telegram_error_log_includes_context(channel, caplog):
     error = BadRequest("Premium_account_required")
 
