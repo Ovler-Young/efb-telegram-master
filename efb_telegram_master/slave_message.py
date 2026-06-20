@@ -1204,8 +1204,6 @@ class SlaveMessageProcessor(LocaleMixin):
             return ""
         if msg.author == msg.chat.self:
             return ""
-        if not self.channel.chat_binding._get_topic_icon_config():
-            return ""
         if not self.channel.chat_binding._is_topic_icon_sync_enabled():
             return ""
 
