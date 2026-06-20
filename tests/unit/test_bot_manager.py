@@ -13,7 +13,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager, _clone_file_argument
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
-from efb_telegram_master.bot_manager import custom_emoji_placeholder, escape_html_affix, render_custom_emoji_placeholders
+from efb_telegram_master.bot_manager import custom_emoji_placeholder, escape_html_affix, render_custom_emoji_placeholders, \
+    strip_custom_emoji_html
 
 
 def test_text_prefix_suffix(channel, bot_admin):
@@ -37,10 +38,16 @@ def test_escape_html_affix_preserves_custom_emoji_placeholder():
     assert "&lt;b&gt;Alice &amp; Bob&lt;/b&gt;" in escaped
 
 
-def test_render_custom_emoji_placeholders_falls_back_to_plain_emoji():
+def test_render_custom_emoji_placeholders_drops_unrenderable_emoji():
     rendered = render_custom_emoji_placeholders(custom_emoji_placeholder("1234567890") + " Alice")
 
-    assert rendered == "😀 Alice"
+    assert rendered == "Alice"
+
+
+def test_strip_custom_emoji_html_drops_unrenderable_emoji():
+    rendered = strip_custom_emoji_html('<tg-emoji emoji-id="1234567890">😀</tg-emoji> Alice')
+
+    assert rendered == "Alice"
 
 
 @pytest.fixture(scope='function')

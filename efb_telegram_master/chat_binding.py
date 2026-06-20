@@ -110,6 +110,7 @@ class ChatBindingManager(LocaleMixin):
         self._topic_mutex = threading.Lock()
         self._topic_icon_custom_emoji_unavailable = False
         self._topic_icon_custom_emoji_unavailable_reason: Optional[str] = None
+        self._logged_topic_icon_avatar_hashes: set[str] = set()
 
         # Link handler
         non_edit_filter = Filters.update.message | Filters.update.channel_post
@@ -1234,7 +1235,13 @@ class ChatBindingManager(LocaleMixin):
 
     def _log_topic_icon_custom_emoji(self, action: str, avatar_hash: str, custom_emoji_id: str,
                                      sticker_set_name: str) -> None:
-        self.logger.debug(
+        if action in {"created", "added"} or avatar_hash not in self._logged_topic_icon_avatar_hashes:
+            level = logging.INFO
+            self._logged_topic_icon_avatar_hashes.add(avatar_hash)
+        else:
+            level = logging.DEBUG
+        self.logger.log(
+            level,
             "Topic icon custom emoji %s: avatar_hash=%s custom_emoji_id=%s emoji_link=%s sticker_set=%s sticker_set_link=%s",
             action,
             avatar_hash,

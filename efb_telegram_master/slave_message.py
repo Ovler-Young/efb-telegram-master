@@ -249,6 +249,7 @@ class SlaveMessageProcessor(LocaleMixin):
         else:
             self.bot.send_chat_action(tg_dest, ChatAction.TYPING, message_thread_id=thread_id)
             tg_msg = self.bot.send_message(tg_dest, prefix=msg_template, suffix=reactions,
+                                           parse_mode="HTML",
                                            disable_notification=silent,
                                            message_thread_id=thread_id,
                                            text=self._('Unknown type of message "{0}". (UT01)')
@@ -722,6 +723,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 except TelegramError:
                     return self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1],
                                                  prefix=msg_template, text=msg.text, suffix=reactions,
+                                                 parse_mode="HTML",
                                                  reply_markup=reply_markup,
                                                  disable_notification=silent)
 
@@ -761,6 +763,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     assert msg.file and msg.path
                     file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
+                                                  parse_mode="HTML",
                                                   message_thread_id=thread_id,
                                                   caption=msg.text, filename=msg.filename,
                                                   reply_to_message_id=target_msg_id,
