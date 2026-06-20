@@ -334,7 +334,7 @@ def test_author_avatar_lazy_uses_available_placeholder_and_starts_background_upd
          patch("efb_telegram_master.chat_binding.threading.Thread", return_value=thread) as thread_cls:
         custom_emoji_id = channel.chat_binding.resolve_author_avatar_custom_emoji_id_lazy(slave_uid, load_picture)
 
-    assert custom_emoji_id == "emoji-placeholder"
+    assert custom_emoji_id is None
     ensure_pool.assert_called_once()
     thread_cls.assert_called_once()
     thread.start.assert_called_once()
@@ -348,7 +348,8 @@ def test_author_avatar_replace_updates_sticker_and_user_cache(channel, slave):
     old_sticker = SimpleNamespace(custom_emoji_id="emoji-placeholder", file_id="file-placeholder")
 
     with patch.object(channel.chat_binding, "_get_topic_icon_owner_user_id", return_value=99), \
-         patch.object(channel.chat_binding, "_find_custom_emoji_sticker", return_value=old_sticker), \
+         patch.object(channel.chat_binding, "_find_custom_emoji_sticker_entry", return_value=(old_sticker, 0)), \
+         patch.object(channel.chat_binding, "_custom_emoji_id_after_replace", return_value="emoji-placeholder"), \
          patch.object(channel.bot_manager, "replace_sticker_in_set", return_value=True) as replace:
         channel.chat_binding._replace_author_avatar_placeholder(
             slave_uid,
@@ -381,7 +382,8 @@ def test_author_avatar_replace_keeps_placeholder_reserved_when_cache_write_fails
     channel.chat_binding._author_avatar_inflight.add(user_cache_key)
 
     with patch.object(channel.chat_binding, "_get_topic_icon_owner_user_id", return_value=99), \
-         patch.object(channel.chat_binding, "_find_custom_emoji_sticker", return_value=old_sticker), \
+         patch.object(channel.chat_binding, "_find_custom_emoji_sticker_entry", return_value=(old_sticker, 0)), \
+         patch.object(channel.chat_binding, "_custom_emoji_id_after_replace", return_value="emoji-placeholder-fail"), \
          patch.object(channel.bot_manager, "replace_sticker_in_set", return_value=True), \
          patch.object(channel.db, "set_topic_icon_cache", side_effect=RuntimeError("db down")):
         channel.chat_binding._replace_author_avatar_placeholder(

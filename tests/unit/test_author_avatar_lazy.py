@@ -79,7 +79,7 @@ def test_author_avatar_lazy_empty_pool_starts_background_fill_without_loading_pi
     load_picture.assert_not_called()
 
 
-def test_author_avatar_lazy_uses_one_available_placeholder_without_waiting_for_pool_target():
+def test_author_avatar_lazy_uses_available_placeholder_in_background_without_returning_emoji():
     manager = _manager()
     manager.db.set_topic_icon_cache(
         "member-placeholder:set_by_bot:12345",
@@ -91,7 +91,7 @@ def test_author_avatar_lazy_uses_one_available_placeholder_without_waiting_for_p
 
     with patch.object(manager, "_ensure_author_avatar_placeholder_pool_async_locked") as ensure_pool, \
          patch("efb_telegram_master.chat_binding.threading.Thread", return_value=thread) as thread_cls:
-        assert manager.resolve_author_avatar_custom_emoji_id_lazy("slave user", load_picture) == "12345"
+        assert manager.resolve_author_avatar_custom_emoji_id_lazy("slave user", load_picture) is None
 
     ensure_pool.assert_called_once()
     thread_cls.assert_called_once()
@@ -102,7 +102,8 @@ def test_author_avatar_lazy_uses_one_available_placeholder_without_waiting_for_p
 def test_author_avatar_replace_writes_user_cache():
     manager = _manager()
     old_sticker = SimpleNamespace(custom_emoji_id="12345")
-    manager._find_custom_emoji_sticker = Mock(return_value=old_sticker)
+    manager._find_custom_emoji_sticker_entry = Mock(return_value=(old_sticker, 0))
+    manager._custom_emoji_id_after_replace = Mock(return_value="12345")
 
     manager._replace_author_avatar_placeholder(
         "slave user",
@@ -120,13 +121,45 @@ def test_author_avatar_replace_writes_user_cache():
     )
 
 
+def test_author_avatar_replace_caches_new_custom_emoji_id_when_replace_changes_it():
+    manager = _manager()
+    old_sticker = SimpleNamespace(custom_emoji_id="12345")
+    manager._find_custom_emoji_sticker_entry = Mock(return_value=(old_sticker, 0))
+    manager._custom_emoji_id_after_replace = Mock(return_value="67890")
+
+    manager._replace_author_avatar_placeholder(
+        "slave user",
+        manager._author_avatar_cache_key("slave user"),
+        "12345",
+        "set_by_bot",
+        Mock(return_value=(_png_bytes(), "member")),
+        "msg-1",
+    )
+
+    assert manager.db.get_topic_icon_cache(manager._author_avatar_cache_key("slave user")) == (
+        "67890",
+        "set_by_bot",
+    )
+
+
+def test_author_avatar_lazy_returns_cache_after_background_update():
+    manager = _manager()
+    user_key = manager._author_avatar_cache_key("slave user")
+    manager.db.set_topic_icon_cache(user_key, "12345", "set_by_bot")
+    load_picture = Mock(side_effect=AssertionError("avatar should not be loaded after cache update"))
+
+    assert manager.resolve_author_avatar_custom_emoji_id_lazy("slave user", load_picture) == "12345"
+    load_picture.assert_not_called()
+
+
 def test_author_avatar_replace_success_without_cache_keeps_placeholder_reserved():
     manager = _manager()
     user_key = manager._author_avatar_cache_key("slave user")
     manager._author_avatar_pending[user_key] = ("12345", "set_by_bot")
     manager._author_avatar_inflight.add(user_key)
     old_sticker = SimpleNamespace(custom_emoji_id="12345")
-    manager._find_custom_emoji_sticker = Mock(return_value=old_sticker)
+    manager._find_custom_emoji_sticker_entry = Mock(return_value=(old_sticker, 0))
+    manager._custom_emoji_id_after_replace = Mock(return_value="12345")
     manager.db.set_topic_icon_cache = Mock(side_effect=RuntimeError("db down"))
 
     manager._replace_author_avatar_placeholder(
