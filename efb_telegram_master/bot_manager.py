@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch
 import telegram.constants
 import telegram.error
 from retrying import retry
-from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, StickerSet, Update, User
+from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, MessageEntity, StickerSet, Update, User
 from telegram import Message as TelegramMessage
 from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
 from telegram.ext import _applicationbuilder as ptb_applicationbuilder
@@ -55,6 +55,7 @@ T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
 CUSTOM_EMOJI_PLACEHOLDER_RE = re.compile(r"\x00ETM_CUSTOM_EMOJI:([0-9]+)\x00")
 CUSTOM_EMOJI_HTML_RE = re.compile(r'<tg-emoji emoji-id="[0-9]+">.*?</tg-emoji>\s?')
+CUSTOM_EMOJI_CARRIER = "🙂"
 
 
 def custom_emoji_placeholder(custom_emoji_id: str) -> str:
@@ -73,6 +74,94 @@ def render_custom_emoji_placeholders(text: str) -> str:
     return CUSTOM_EMOJI_PLACEHOLDER_RE.sub("", text).lstrip()
 
 
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _utf16_offset_to_index(text: str, offset: int) -> int:
+    current = 0
+    for index, char in enumerate(text):
+        if current >= offset:
+            return index
+        current += _utf16_len(char)
+    return len(text)
+
+
+def render_custom_emoji_entities(
+        text: str,
+        existing_entities: Optional[Collection[MessageEntity]] = None,
+        parse_mode: Optional[str] = None) -> Tuple[str, List[MessageEntity]]:
+    entities = list(existing_entities or [])
+    if not contains_custom_emoji_placeholders(text):
+        return text, entities
+    if parse_mode:
+        return render_custom_emoji_placeholders(text), entities
+
+    rendered_parts = []
+    rendered_utf16_offset = 0
+    cursor = 0
+    for match in CUSTOM_EMOJI_PLACEHOLDER_RE.finditer(text):
+        before = text[cursor:match.start()]
+        rendered_parts.append(before)
+        rendered_utf16_offset += _utf16_len(before)
+        rendered_parts.append(CUSTOM_EMOJI_CARRIER)
+        entities.append(MessageEntity(
+            type=MessageEntity.CUSTOM_EMOJI,
+            offset=rendered_utf16_offset,
+            length=_utf16_len(CUSTOM_EMOJI_CARRIER),
+            custom_emoji_id=match.group(1),
+        ))
+        rendered_utf16_offset += _utf16_len(CUSTOM_EMOJI_CARRIER)
+        cursor = match.end()
+    rendered_parts.append(text[cursor:])
+    return "".join(rendered_parts), entities
+
+
+def _entity_value(entity: object, key: str) -> object:
+    if isinstance(entity, Mapping):
+        return entity.get(key)
+    return getattr(entity, key, None)
+
+
+def _is_custom_emoji_entity(entity: object) -> bool:
+    return _entity_value(entity, "type") == MessageEntity.CUSTOM_EMOJI
+
+
+def strip_custom_emoji_entities(text: str, entities: Optional[Collection[object]]) -> str:
+    if not entities:
+        return text
+
+    ranges = []
+    for entity in entities:
+        if not _is_custom_emoji_entity(entity):
+            continue
+        offset = _entity_value(entity, "offset")
+        length = _entity_value(entity, "length")
+        if not isinstance(offset, int) or not isinstance(length, int):
+            continue
+        start = _utf16_offset_to_index(text, offset)
+        end = _utf16_offset_to_index(text, offset + length)
+        ranges.append((start, end))
+
+    if not ranges:
+        return text
+
+    stripped = text
+    for start, end in sorted(ranges, reverse=True):
+        stripped = stripped[:start] + stripped[end:]
+    return stripped.lstrip()
+
+
+def has_custom_emoji_entities(entities: Optional[Collection[object]]) -> bool:
+    return bool(entities) and any(_is_custom_emoji_entity(entity) for entity in entities)
+
+
+def without_custom_emoji_entities(entities: Optional[Collection[object]]) -> Optional[List[object]]:
+    if not entities:
+        return None
+    return [entity for entity in entities if not _is_custom_emoji_entity(entity)]
+
+
 def contains_custom_emoji_html(text: str) -> bool:
     return bool(CUSTOM_EMOJI_HTML_RE.search(text))
 
@@ -84,11 +173,7 @@ def strip_custom_emoji_html(text: str) -> str:
 
 
 def escape_html_affix(text: str) -> str:
-    escaped = html.escape(text)
-    return CUSTOM_EMOJI_PLACEHOLDER_RE.sub(
-        lambda match: f'<tg-emoji emoji-id="{match.group(1)}"></tg-emoji>',
-        escaped,
-    )
+    return html.escape(text)
 
 
 class SyncBotProtocol(Protocol):
@@ -666,9 +751,26 @@ class TelegramBotManager(LocaleMixin):
                 try:
                     return fn(*args, **kwargs)
                 except telegram.error.BadRequest as e:
-                    if e.message.lower().startswith("can't parse entities") and 'parse_mode' in kwargs:
+                    caption_entities = kwargs.get('caption_entities')
+                    custom_emoji_retry = has_custom_emoji_entities(caption_entities)
+                    if e.message.lower().startswith("can't parse entities") and (
+                            'parse_mode' in kwargs or custom_emoji_retry):
                         caption = kwargs.get('caption')
-                        if isinstance(caption, str) and contains_custom_emoji_html(caption):
+                        if isinstance(caption, str) and custom_emoji_retry:
+                            manager = args[0] if args else None
+                            logger = getattr(manager, 'logger', None)
+                            if logger:
+                                logger.warning(
+                                    "Telegram rejected custom emoji caption entities; dropping custom emoji affix "
+                                    "before retrying."
+                                )
+                            kwargs['caption'] = strip_custom_emoji_entities(caption, caption_entities)
+                            cleaned_entities = without_custom_emoji_entities(caption_entities)
+                            if cleaned_entities:
+                                kwargs['caption_entities'] = cleaned_entities
+                            else:
+                                kwargs.pop('caption_entities', None)
+                        elif isinstance(caption, str) and contains_custom_emoji_html(caption):
                             manager = args[0] if args else None
                             logger = getattr(manager, 'logger', None)
                             if logger:
@@ -677,7 +779,7 @@ class TelegramBotManager(LocaleMixin):
                                     "retrying without parse mode."
                                 )
                             kwargs['caption'] = strip_custom_emoji_html(caption)
-                        kwargs.pop("parse_mode")
+                        kwargs.pop("parse_mode", None)
                         for i in args:
                             if callable(getattr(i, 'seek', None)):
                                 i.seek(0)
@@ -717,17 +819,24 @@ class TelegramBotManager(LocaleMixin):
                     prefix = escape_html_affix(prefix)
                     suffix = escape_html_affix(suffix)
                 else:
-                    if contains_custom_emoji_placeholders(prefix) or contains_custom_emoji_placeholders(suffix):
+                    if kwargs.get('parse_mode') and (
+                            contains_custom_emoji_placeholders(prefix) or contains_custom_emoji_placeholders(suffix)):
                         self.logger.warning(
-                            "Custom emoji placeholders require HTML parse mode; dropping them from message affix."
+                            "Custom emoji placeholders cannot be sent with parse mode; dropping them from message "
+                            "affix."
                         )
-                    prefix = render_custom_emoji_placeholders(prefix)
-                    suffix = render_custom_emoji_placeholders(suffix)
 
                 if len(prefix + text + suffix) >= telegram.constants.MessageLimit.CAPTION_LENGTH:
                     full_message = io.StringIO(prefix + text + suffix)
                     truncated = prefix + text[:100] + "\n…\n" + text[-100:] + suffix
                     kwargs['caption'] = truncated
+                    kwargs['caption'], caption_entities = render_custom_emoji_entities(
+                        kwargs['caption'],
+                        kwargs.get('caption_entities'),
+                        kwargs.get('parse_mode'),
+                    )
+                    if caption_entities:
+                        kwargs['caption_entities'] = caption_entities
                     msg = fn(self, *args, **kwargs)
                     chat_id = kwargs.get("chat_id", args[0] if len(args) > 0 else "")
                     filename = "%s_%s.txt" % (chat_id, msg.message_id)
@@ -739,6 +848,13 @@ class TelegramBotManager(LocaleMixin):
                     return msg
                 else:
                     kwargs['caption'] = prefix + text + suffix
+                    kwargs['caption'], caption_entities = render_custom_emoji_entities(
+                        kwargs['caption'],
+                        kwargs.get('caption_entities'),
+                        kwargs.get('parse_mode'),
+                    )
+                    if caption_entities:
+                        kwargs['caption_entities'] = caption_entities
                     return fn(self, *args, **kwargs)
 
             return caption_affix
@@ -1940,12 +2056,11 @@ class TelegramBotManager(LocaleMixin):
             prefix = escape_html_affix(prefix)
             suffix = escape_html_affix(suffix)
         else:
-            if contains_custom_emoji_placeholders(prefix) or contains_custom_emoji_placeholders(suffix):
+            if kwargs.get('parse_mode') and (
+                    contains_custom_emoji_placeholders(prefix) or contains_custom_emoji_placeholders(suffix)):
                 self.logger.warning(
-                    "Custom emoji placeholders require HTML parse mode; dropping them from message affix."
+                    "Custom emoji placeholders cannot be sent with parse mode; dropping them from message affix."
                 )
-            prefix = render_custom_emoji_placeholders(prefix)
-            suffix = render_custom_emoji_placeholders(suffix)
         text: str
         if args[1:]:
             text = args[1]
@@ -1955,6 +2070,10 @@ class TelegramBotManager(LocaleMixin):
         if len(prefix + text + suffix) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode('utf-8'))
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
+            truncated, entities = render_custom_emoji_entities(truncated, kwargs.get('entities'),
+                                                               kwargs.get('parse_mode'))
+            if entities:
+                kwargs['entities'] = entities
             msg = self._bot_send_message_fallback(args[0], text=truncated, **kwargs)
             filename = "%s_%s" % (args[0], msg.message_id)
             if not kwargs.get('parse_mode'):
@@ -1979,6 +2098,10 @@ class TelegramBotManager(LocaleMixin):
             return msg
         else:
             kwargs['text'] = prefix + text + suffix
+            kwargs['text'], entities = render_custom_emoji_entities(kwargs['text'], kwargs.get('entities'),
+                                                                    kwargs.get('parse_mode'))
+            if entities:
+                kwargs['entities'] = entities
             return self._bot_send_message_fallback(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
@@ -2004,16 +2127,19 @@ class TelegramBotManager(LocaleMixin):
             prefix = escape_html_affix(prefix)
             suffix = escape_html_affix(suffix)
         else:
-            if contains_custom_emoji_placeholders(prefix) or contains_custom_emoji_placeholders(suffix):
+            if kwargs.get('parse_mode') and (
+                    contains_custom_emoji_placeholders(prefix) or contains_custom_emoji_placeholders(suffix)):
                 self.logger.warning(
-                    "Custom emoji placeholders require HTML parse mode; dropping them from message affix."
+                    "Custom emoji placeholders cannot be sent with parse mode; dropping them from message affix."
                 )
-            prefix = render_custom_emoji_placeholders(prefix)
-            suffix = render_custom_emoji_placeholders(suffix)
         text = kwargs.pop('text', '')
         if len(prefix + text + suffix) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
             full_message = io.BytesIO((prefix + text + suffix).encode())
             truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
+            truncated, entities = render_custom_emoji_entities(truncated, kwargs.get('entities'),
+                                                               kwargs.get('parse_mode'))
+            if entities:
+                kwargs['entities'] = entities
             msg = self._bot_edit_message_text_fallback(text=truncated, **kwargs)
             filename = "%s_%s" % (kwargs['chat_id'], msg.message_id)
             if kwargs.get('parse_mode', '').lower() == 'markdown':
@@ -2030,6 +2156,10 @@ class TelegramBotManager(LocaleMixin):
             return msg
         else:
             kwargs['text'] = prefix + text + suffix
+            kwargs['text'], entities = render_custom_emoji_entities(kwargs['text'], kwargs.get('entities'),
+                                                                    kwargs.get('parse_mode'))
+            if entities:
+                kwargs['entities'] = entities
             return self._bot_edit_message_text_fallback(**kwargs)
 
     def _bot_send_message_fallback(self, *args, **kwargs):
@@ -2042,15 +2172,29 @@ class TelegramBotManager(LocaleMixin):
         try:
             return self._active_bot.send_message(*args, **kwargs)
         except telegram.error.BadRequest as e:
-            if e.message.lower().startswith("can't parse entities") and 'parse_mode' in kwargs:
+            entities = kwargs.get('entities')
+            custom_emoji_retry = has_custom_emoji_entities(entities)
+            if e.message.lower().startswith("can't parse entities") and (
+                    'parse_mode' in kwargs or custom_emoji_retry):
                 text = kwargs.get('text')
-                if isinstance(text, str) and contains_custom_emoji_html(text):
+                if isinstance(text, str) and custom_emoji_retry:
+                    self.logger.warning(
+                        "Telegram rejected custom emoji message entities; dropping custom emoji affix before "
+                        "retrying."
+                    )
+                    kwargs['text'] = strip_custom_emoji_entities(text, entities)
+                    cleaned_entities = without_custom_emoji_entities(entities)
+                    if cleaned_entities:
+                        kwargs['entities'] = cleaned_entities
+                    else:
+                        kwargs.pop('entities', None)
+                elif isinstance(text, str) and contains_custom_emoji_html(text):
                     self.logger.warning(
                         "Telegram rejected HTML message entities; dropping custom emoji affix before retrying "
                         "without parse mode."
                     )
                     kwargs['text'] = strip_custom_emoji_html(text)
-                kwargs.pop("parse_mode")
+                kwargs.pop("parse_mode", None)
                 return self._active_bot.send_message(*args, **kwargs)
             else:
                 raise e
@@ -2071,15 +2215,28 @@ class TelegramBotManager(LocaleMixin):
             elif e.message == "message to edit not found":
                 kwargs.pop('message_id')
                 return self._active_bot.send_message(*args, **kwargs)
-            elif e.message.lower().startswith("can't parse entities") and 'parse_mode' in kwargs:
+            entities = kwargs.get('entities')
+            custom_emoji_retry = has_custom_emoji_entities(entities)
+            if e.message.lower().startswith("can't parse entities") and (
+                    'parse_mode' in kwargs or custom_emoji_retry):
                 text = kwargs.get('text')
-                if isinstance(text, str) and contains_custom_emoji_html(text):
+                if isinstance(text, str) and custom_emoji_retry:
+                    self.logger.warning(
+                        "Telegram rejected custom emoji edit entities; dropping custom emoji affix before retrying."
+                    )
+                    kwargs['text'] = strip_custom_emoji_entities(text, entities)
+                    cleaned_entities = without_custom_emoji_entities(entities)
+                    if cleaned_entities:
+                        kwargs['entities'] = cleaned_entities
+                    else:
+                        kwargs.pop('entities', None)
+                elif isinstance(text, str) and contains_custom_emoji_html(text):
                     self.logger.warning(
                         "Telegram rejected HTML edit entities; dropping custom emoji affix before retrying without "
                         "parse mode."
                     )
                     kwargs['text'] = strip_custom_emoji_html(text)
-                kwargs.pop("parse_mode")
+                kwargs.pop("parse_mode", None)
                 return self._active_bot.edit_message_text(*args, **kwargs)
             else:
                 raise e

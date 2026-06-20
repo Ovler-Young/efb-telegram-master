@@ -9,12 +9,12 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 import telegram.error
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager, _clone_file_argument
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.bot_manager import custom_emoji_placeholder, escape_html_affix, \
-    render_custom_emoji_placeholders, strip_custom_emoji_html
+    render_custom_emoji_entities, render_custom_emoji_placeholders, strip_custom_emoji_entities, strip_custom_emoji_html
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
@@ -30,17 +30,50 @@ def test_text_prefix_suffix(channel, bot_admin):
     assert edited.text == "Edited prefix\nEdited text\nEdited suffix"
 
 
-def test_escape_html_affix_preserves_custom_emoji_placeholder():
+def test_escape_html_affix_does_not_render_custom_emoji_html():
     escaped = escape_html_affix(
         custom_emoji_placeholder("1234567890") + " <b>Alice & Bob</b>"
     )
 
-    assert '<tg-emoji emoji-id="1234567890"></tg-emoji>' in escaped
+    assert '<tg-emoji emoji-id="1234567890"></tg-emoji>' not in escaped
+    assert custom_emoji_placeholder("1234567890") in escaped
     assert "&lt;b&gt;Alice &amp; Bob&lt;/b&gt;" in escaped
+
+
+def test_render_custom_emoji_entities_inserts_native_entity():
+    rendered, entities = render_custom_emoji_entities(
+        custom_emoji_placeholder("1234567890") + " Alice"
+    )
+
+    assert rendered == "🙂 Alice"
+    assert len(entities) == 1
+    assert entities[0].type == MessageEntity.CUSTOM_EMOJI
+    assert entities[0].offset == 0
+    assert entities[0].length == 2
+    assert entities[0].custom_emoji_id == "1234567890"
+
+
+def test_render_custom_emoji_entities_drops_marker_with_parse_mode():
+    rendered, entities = render_custom_emoji_entities(
+        custom_emoji_placeholder("1234567890") + " Alice",
+        parse_mode="HTML",
+    )
+
+    assert rendered == "Alice"
+    assert entities == []
 
 
 def test_render_custom_emoji_placeholders_drops_unrenderable_emoji():
     rendered = render_custom_emoji_placeholders(custom_emoji_placeholder("1234567890") + " Alice")
+
+    assert rendered == "Alice"
+
+
+def test_strip_custom_emoji_entities_drops_carrier_emoji():
+    rendered = strip_custom_emoji_entities(
+        "🙂 Alice",
+        [MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=0, length=2, custom_emoji_id="1234567890")],
+    )
 
     assert rendered == "Alice"
 
@@ -51,7 +84,7 @@ def test_strip_custom_emoji_html_drops_unrenderable_emoji():
     assert rendered == "Alice"
 
 
-def test_custom_emoji_parse_error_retries_without_custom_emoji():
+def test_custom_emoji_entity_parse_error_retries_without_custom_emoji():
     manager = TelegramBotManager.__new__(TelegramBotManager)
     manager.logger = Mock()
     sent = SimpleNamespace(message_id=1)
@@ -65,14 +98,57 @@ def test_custom_emoji_parse_error_retries_without_custom_emoji():
     with patch.object(TelegramBotManager, "_active_bot", new_callable=PropertyMock, return_value=active_bot):
         result = manager._bot_send_message_fallback(
             123,
-            text='<tg-emoji emoji-id="1234567890"></tg-emoji> Alice',
-            parse_mode="HTML",
+            text="🙂 Alice",
+            entities=[
+                MessageEntity(
+                    type=MessageEntity.CUSTOM_EMOJI,
+                    offset=0,
+                    length=2,
+                    custom_emoji_id="1234567890",
+                )
+            ],
         )
 
     assert result is sent
     retry_kwargs = active_bot.send_message.call_args_list[1].kwargs
     assert retry_kwargs["text"] == "Alice"
+    assert "entities" not in retry_kwargs
     assert "parse_mode" not in retry_kwargs
+
+
+def test_send_message_custom_emoji_prefix_uses_native_entity_without_parse_mode():
+    manager = _make_lightweight_bot_manager()
+    manager._bot.send_message.return_value = SimpleNamespace(chat_id=123, message_id=1)
+
+    manager.send_message(
+        123,
+        "Hello",
+        prefix=custom_emoji_placeholder("1234567890") + " Alice:",
+    )
+
+    kwargs = manager._bot.send_message.call_args.kwargs
+    assert kwargs["text"] == "🙂 Alice:\nHello"
+    assert '<tg-emoji emoji-id="1234567890"></tg-emoji>' not in kwargs["text"]
+    assert kwargs["entities"][0].type == MessageEntity.CUSTOM_EMOJI
+    assert kwargs["entities"][0].custom_emoji_id == "1234567890"
+
+
+def test_send_message_custom_emoji_prefix_drops_marker_with_html_parse_mode():
+    manager = _make_lightweight_bot_manager()
+    manager._bot.send_message.return_value = SimpleNamespace(chat_id=123, message_id=1)
+
+    manager.send_message(
+        123,
+        "<b>Hello</b>",
+        prefix=custom_emoji_placeholder("1234567890") + " Alice:",
+        parse_mode="HTML",
+    )
+
+    kwargs = manager._bot.send_message.call_args.kwargs
+    assert kwargs["text"] == "Alice:\n<b>Hello</b>"
+    assert '<tg-emoji emoji-id="1234567890"></tg-emoji>' not in kwargs["text"]
+    assert "entities" not in kwargs
+    assert kwargs["parse_mode"] == "HTML"
 
 
 @pytest.fixture(scope='function')
