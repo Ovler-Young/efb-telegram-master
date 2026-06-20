@@ -697,10 +697,10 @@ e.g.:
 
 -   ``topic_icons`` *(dict)* [Default: ``{}``]
 
-    Configure custom emoji generated from remote chat avatars.
+    Configure custom emoji generated from remote group member avatars.
 
     - ``sync_avatar_to_custom_emoji``: when unset or ``true``, ETM tries to
-      convert linked remote chat avatars into Telegram custom emoji stickers
+      convert remote group member avatars into Telegram custom emoji stickers
       with the main bot token and uses them before member names in bridged
       group message headers. Topic custom emoji icon updates are currently
       disabled because Telegram rejects this Bot API operation for bot-only
@@ -715,10 +715,10 @@ e.g.:
       username suffix.
     - ``owner_user_id``: optional Telegram user ID that owns generated sticker
       sets. Defaults to the first configured admin.
-    - ``custom_emoji_ids``: optional mapping from ETM slave chat UID to an
-      existing ``custom_emoji_id``. These IDs are used before generated avatar
-      emoji. Generated custom emoji are also deduplicated by avatar PNG hash in
-      ETM's database, so the same avatar is reused across restarts.
+    - ``custom_emoji_ids``: optional mapping from ETM slave group member UID
+      to an existing ``custom_emoji_id``. These IDs are used before generated
+      avatar emoji. Generated custom emoji are also deduplicated by avatar PNG
+      hash in ETM's database, so the same avatar is reused across restarts.
 
     Example:
 
