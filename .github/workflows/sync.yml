@@ -2,7 +2,7 @@ name: Sync to Sub-Account
 
 on:
   push:
-    branches: [ "dev" ] # 当大号的 dev 分支有推送时触发
+    branches: [ "dev" ] 
 
 jobs:
   build:
@@ -14,8 +14,6 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # 【新增的非常关键的一步】
-      # 删掉大号的 .git 历史和 .github 脚本，留下纯净的代码实体
       - name: Clean up files
         run: |
           rm -rf .git
@@ -31,3 +29,5 @@ jobs:
           destination-repository-name: 'efb-telegram-master'
           user-email: 'kettly1266@gmail.com'
           target-branch: main
+          # 【新增下面这一行】：强制写死提交信息，绝对不带大号的任何痕迹
+          commit-message: 'Auto sync latest code'
