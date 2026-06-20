@@ -126,6 +126,8 @@ def test_author_avatar_replace_caches_new_custom_emoji_id_when_replace_changes_i
     old_sticker = SimpleNamespace(custom_emoji_id="12345")
     manager._find_custom_emoji_sticker_entry = Mock(return_value=(old_sticker, 0))
     manager._custom_emoji_id_after_replace = Mock(return_value="67890")
+    placeholder_key = manager._author_avatar_placeholder_cache_key("set_by_bot", "12345")
+    manager.db.set_topic_icon_cache(placeholder_key, "12345", "set_by_bot")
 
     manager._replace_author_avatar_placeholder(
         "slave user",
@@ -137,6 +139,10 @@ def test_author_avatar_replace_caches_new_custom_emoji_id_when_replace_changes_i
     )
 
     assert manager.db.get_topic_icon_cache(manager._author_avatar_cache_key("slave user")) == (
+        "67890",
+        "set_by_bot",
+    )
+    assert manager.db.get_topic_icon_cache(placeholder_key) == (
         "67890",
         "set_by_bot",
     )

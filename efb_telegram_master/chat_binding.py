@@ -1566,6 +1566,11 @@ class ChatBindingManager(LocaleMixin):
                 )
                 return
             self.db.set_topic_icon_cache(user_cache_key, effective_custom_emoji_id, sticker_set_name)
+            self.db.set_topic_icon_cache(
+                self._author_avatar_placeholder_cache_key(sticker_set_name, custom_emoji_id),
+                effective_custom_emoji_id,
+                sticker_set_name,
+            )
             cache_succeeded = True
             self._log_topic_icon_custom_emoji("replaced", user_cache_key, effective_custom_emoji_id, sticker_set_name)
             self.logger.info(
