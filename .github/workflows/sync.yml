@@ -1,0 +1,22 @@
+name: Sync to Sub-Account
+
+on:
+  push:
+    branches: [ "dev" ] # 当大号的 main 分支有推送时触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Pushes to another repository
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
+        with:
+          source-directory: '.'
+          destination-github-username: 'onestao'
+          destination-repository-name: 'efb-telegram-master'
+          user-email: 'kettly1266@gmail.com' # 这里填小号的邮箱
+          target-branch: main
