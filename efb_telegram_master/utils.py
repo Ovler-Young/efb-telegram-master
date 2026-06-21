@@ -57,7 +57,7 @@ class ExperimentalFlagsManager(LocaleMixin):
         "api_base_file_url": None,
         "local_tdlib_api": False,
         "topic_group": None,
-        "solitaire_auto_merge": False,
+        "solitaire_auto_merge": True,
         "solitaire_command": "jl`",
     }
 
