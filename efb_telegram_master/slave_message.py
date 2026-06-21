@@ -4,6 +4,7 @@ import html
 import itertools
 import logging
 import os
+import re
 import tempfile
 import traceback
 import urllib.parse
@@ -35,6 +36,7 @@ from .constants import Emoji
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import get_msg_type
+from .solitaire import ActionPlan, SolitaireCandidate, has_solitaire_header, resolve_solitaire_action
 from .utils import TelegramChatID, TelegramTopicID, TelegramMessageID, OldMsgID
 
 if TYPE_CHECKING:
@@ -45,6 +47,26 @@ if TYPE_CHECKING:
 
 class SlaveMessageProcessor(LocaleMixin):
     """Process messages as Message objects from slave channels."""
+
+    _WECHAT_QUOTE_RE = re.compile(r'「(.+?)」\n-[\- ]{10,80}\n', flags=re.DOTALL)
+    _MEDIA_QUOTE_PATTERNS = (
+        (r'(?:\[图片\]|查看图片)', ['Photo']),
+        (r'(?:\[视频\]|查看视频|收到一条视频消息)', ['Video', 'Animation']),
+        (r'\[文件\]', ['Document']),
+        (r'\[语音\]', ['Voice', 'Audio']),
+        (r'(?:\[表情\]|\[动画表情\])', ['Sticker', 'AnimatedSticker', 'VideoSticker']),
+        (r'\[名片\]', ['Contact']),
+        (r'\[位置\]', ['Location', 'Venue']),
+        (r'\[(?:Image|Photo)\]', ['Photo']),
+        (r'\[Video\]', ['Video', 'Animation']),
+        (r'\[File\]', ['Document']),
+        (r'\[Voice\]', ['Voice', 'Audio']),
+        (r'\[Sticker\]', ['Sticker', 'AnimatedSticker', 'VideoSticker']),
+        (r'\S+\.(?:jpg|jpeg|png|gif|bmp|webp|heic|heif)', ['Photo', 'Document']),
+        (r'\S+\.(?:mp4|avi|mov|mkv|wmv|flv|3gp)', ['Video', 'Animation', 'Document']),
+        (r'\S+\.(?:pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|apk|exe|txt|csv)', ['Document']),
+        (r'Image_\d+.*', ['Photo', 'Document']),
+    )
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
@@ -178,6 +200,123 @@ class SlaveMessageProcessor(LocaleMixin):
                               repr(msg), repr(e), traceback.format_exc())
         return msg
 
+    @classmethod
+    def _parse_wechat_quote(cls, text: str) -> Optional[Tuple[str, Optional[str], str]]:
+        quote_match = next(cls._WECHAT_QUOTE_RE.finditer(text), None)
+        if not quote_match:
+            return None
+
+        quoted_text = quote_match.group(1)
+        colon_split = re.match(r'^(.+?)[：:](.+)$', quoted_text, flags=re.DOTALL)
+        sender_name = colon_split.group(1).strip() if colon_split else None
+        quote_body = colon_split.group(2).strip() if colon_split else quoted_text.strip()
+        return quoted_text, sender_name, quote_body
+
+    @classmethod
+    def _match_media_quote_types(cls, quote_body: str) -> Optional[List[str]]:
+        for pattern, media_types in cls._MEDIA_QUOTE_PATTERNS:
+            if re.match(r'^\s*' + pattern + r'\s*$', quote_body, re.IGNORECASE):
+                return media_types
+        return None
+
+    def _resolve_quoted_sender_uid(self, slave_chat_uid: str, sender_name: Optional[str]) -> Optional[str]:
+        if not sender_name:
+            return None
+
+        matched_uids = self.db.find_member_uids_by_display_name(slave_chat_uid, sender_name)
+        if len(matched_uids) == 1:
+            return matched_uids[0]
+        if len(matched_uids) > 1:
+            self.logger.debug("Quoted sender '%s' matches multiple logged members: %s", sender_name, matched_uids)
+            return None
+
+        try:
+            from .db import MsgLog
+            seen_uids = set()
+            recent_msgs = (MsgLog.select(MsgLog.slave_member_uid)
+                           .where(MsgLog.slave_origin_uid == slave_chat_uid)
+                           .order_by(MsgLog.time.desc())
+                           .limit(500))
+            for row in recent_msgs:
+                uid = row.slave_member_uid
+                if not uid or uid in seen_uids:
+                    continue
+                seen_uids.add(uid)
+                try:
+                    member_channel_id, member_id, _ = utils.chat_id_str_to_id(uid)
+                    _, chat_id, _ = utils.chat_id_str_to_id(slave_chat_uid)
+                    member = self.chat_manager.get_chat_member(
+                        member_channel_id, chat_id, member_id, build_dummy=False
+                    )
+                    if member:
+                        member_display = member.alias or member.name or ''
+                        if sender_name in member_display or member_display in sender_name:
+                            matched_uids.append(uid)
+                except Exception:
+                    continue
+        except Exception:
+            return None
+
+        unique_uids = list(dict.fromkeys(matched_uids))
+        if len(unique_uids) == 1:
+            return unique_uids[0]
+        if len(unique_uids) > 1:
+            self.logger.debug("Quoted sender '%s' matches multiple cached members: %s", sender_name, unique_uids)
+        return None
+
+    @staticmethod
+    def _telegram_msg_id_from_log(log, tg_dest: TelegramChatID) -> Optional[TelegramMessageID]:
+        target_msg = utils.message_id_str_to_id(log.master_msg_id)
+        if target_msg and target_msg[0] == int(tg_dest):
+            return TelegramMessageID(target_msg[1])
+        return None
+
+    def _find_wechat_quote_target(self, msg: Message, tg_dest: TelegramChatID) -> Optional[TelegramMessageID]:
+        parsed_quote = self._parse_wechat_quote(msg.text or "")
+        if not parsed_quote:
+            return None
+
+        quoted_text, sender_name, quote_body = parsed_quote
+        slave_chat_uid = utils.chat_id_to_str(chat=msg.chat)
+        resolved_member_uid = self._resolve_quoted_sender_uid(slave_chat_uid, sender_name)
+        if not resolved_member_uid:
+            self.logger.debug("[%s] Quoted sender '%s' cannot be resolved uniquely; skipping quote target.",
+                              msg.uid, sender_name)
+            return None
+
+        matched_media_types = self._match_media_quote_types(quote_body)
+        if matched_media_types:
+            self.logger.debug("[%s] Media quote detected (types=%s, sender='%s'), requiring unique match.",
+                              msg.uid, matched_media_types, sender_name)
+            candidates = self.db.find_msg_by_media_type(
+                slave_origin_uid=slave_chat_uid,
+                media_types=matched_media_types,
+                slave_member_uid=resolved_member_uid,
+                limit=50,
+                max_age_hours=48,
+            )
+        else:
+            self.logger.debug("[%s] Text quote detected (len=%d, sender_uid=%s), requiring unique match: '%.50s...'",
+                              msg.uid, len(quote_body), resolved_member_uid, quoted_text)
+            candidates = self.db.find_msgs_by_quote_text(
+                slave_origin_uid=slave_chat_uid,
+                quote_text=quoted_text,
+                limit=200,
+                slave_member_uid=resolved_member_uid,
+            )
+
+        candidates = [i for i in candidates if self._telegram_msg_id_from_log(i, tg_dest) is not None]
+        if len(candidates) != 1:
+            self.logger.debug("[%s] Quote target has %d high-confidence candidates; skipping reply target.",
+                              msg.uid, len(candidates))
+            return None
+
+        target_msg_id = self._telegram_msg_id_from_log(candidates[0], tg_dest)
+        if target_msg_id is not None:
+            msg._expandable_quote = True
+            self.logger.debug("[%s] Quote target resolved uniquely: tg_msg_id=%s", msg.uid, target_msg_id)
+        return target_msg_id
+
     def dispatch_message(self, msg: Message, msg_template: str,
                          old_msg_id: Optional[OldMsgID],
                          tg_dest: TelegramChatID,
@@ -186,6 +325,10 @@ class SlaveMessageProcessor(LocaleMixin):
         """Dispatch with header, destination and Telegram message ID and destinations."""
 
         xid = msg.uid
+        db_old_msg_id = old_msg_id
+        solitaire_alias_master_msg_id: Optional[str] = None
+        solitaire_edit = False
+        solitaire_edit_success = False
 
         # When targeting a message (reply to)
         target_msg_id: Optional[TelegramMessageID] = None
@@ -211,143 +354,30 @@ class SlaveMessageProcessor(LocaleMixin):
                     target_msg_id = target_msg[1]
 
         # Fallback: If msg.target was not set (no EFB-level reply), but the message
-        # text contains a WeChat-style quote block (「...」\n---\n...), try to find
-        # the original message in the database by fuzzy-matching the quoted text.
+        # text contains a WeChat-style quote block (「...」\n---\n...), attach a
+        # Telegram reply only when the quoted sender and target are uniquely resolved.
         if target_msg_id is None and not isinstance(msg.target, Message) and msg.text:
-            import re
-            quote_match = re.match(r'^「(.+?)」\n-[\- ]{10,40}\n', msg.text, flags=re.DOTALL)
-            if quote_match:
-                quoted_text = quote_match.group(1)
+            target_msg_id = self._find_wechat_quote_target(msg, tg_dest)
 
-                # Extract sender name and quote body from "SenderName：content"
-                colon_split = re.match(r'^(.+?)[：:](.+)$', quoted_text, flags=re.DOTALL)
-                sender_name = colon_split.group(1).strip() if colon_split else None
-                quote_body = colon_split.group(2).strip() if colon_split else quoted_text.strip()
-
-                # Determine if the quote body is a media placeholder
-                _MEDIA_MAP = {
-                    # Chinese placeholders
-                    r'(?:\[图片\]|查看图片)': ['Photo'],
-                    r'(?:\[视频\]|查看视频|收到一条视频消息)': ['Video', 'Animation'],
-                    r'\[文件\]': ['Document'],
-                    r'\[语音\]': ['Voice', 'Audio'],
-                    r'(?:\[表情\]|\[动画表情\])': ['Sticker', 'AnimatedSticker', 'VideoSticker'],
-                    r'\[名片\]': ['Contact'],
-                    r'\[位置\]': ['Location', 'Venue'],
-                    # English placeholders
-                    r'\[(?:Image|Photo)\]': ['Photo'],
-                    r'\[Video\]': ['Video', 'Animation'],
-                    r'\[File\]': ['Document'],
-                    r'\[Voice\]': ['Voice', 'Audio'],
-                    r'\[Sticker\]': ['Sticker', 'AnimatedSticker', 'VideoSticker'],
-                    # Filename patterns (images/videos/docs)
-                    r'\S+\.(?:jpg|jpeg|png|gif|bmp|webp|heic|heif)': ['Photo', 'Document'],
-                    r'\S+\.(?:mp4|avi|mov|mkv|wmv|flv|3gp)': ['Video', 'Animation', 'Document'],
-                    r'\S+\.(?:pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|apk|exe|txt|csv)': ['Document'],
-                    r'Image_\d+.*': ['Photo', 'Document'],
-                }
-
-                matched_media_types = None
-                for pattern, media_types in _MEDIA_MAP.items():
-                    if re.match(r'^\s*' + pattern + r'\s*$', quote_body, re.IGNORECASE):
-                        matched_media_types = media_types
-                        break
-
-                slave_chat_uid = utils.chat_id_to_str(chat=msg.chat)
-
-                # --- Shared: resolve sender name to slave_member_uid ---
-                resolved_member_uid = None
-                if sender_name:
-                    # Look through recent messages from this chat,
-                    # checking display names via chat_manager.
-                    # We use a broad query (no media_type filter) to maximize
-                    # the chance of finding a name match.
-                    try:
-                        from .db import MsgLog
-                        seen_uids = set()
-                        recent_msgs = (MsgLog.select(MsgLog.slave_member_uid)
-                                       .where(MsgLog.slave_origin_uid == slave_chat_uid)
-                                       .order_by(MsgLog.time.desc())
-                                       .limit(500))
-                        for row in recent_msgs:
-                            uid = row.slave_member_uid
-                            if not uid or uid in seen_uids:
-                                continue
-                            seen_uids.add(uid)
-                            try:
-                                member_channel_id, member_id, _ = utils.chat_id_str_to_id(uid)
-                                _, chat_id, _ = utils.chat_id_str_to_id(slave_chat_uid)
-                                member = self.chat_manager.get_chat_member(
-                                    member_channel_id, chat_id, member_id, build_dummy=False
-                                )
-                                if member:
-                                    member_display = member.alias or member.name or ''
-                                    if sender_name in member_display or member_display in sender_name:
-                                        resolved_member_uid = uid
-                                        self.logger.debug("[%s] Sender '%s' resolved to uid=%s (display='%s')",
-                                                          msg.uid, sender_name, uid, member_display)
-                                        break
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
-
-                if matched_media_types:
-                    # --- Media quote path: match by media_type + sender + time window ---
-                    self.logger.debug("[%s] Media quote detected (types=%s, sender='%s'), attempting media match.",
-                                      msg.uid, matched_media_types, sender_name)
-
-                    results = self.db.find_msg_by_media_type(
-                        slave_origin_uid=slave_chat_uid,
-                        media_types=matched_media_types,
-                        slave_member_uid=resolved_member_uid,
-                        limit=50,
-                        max_age_hours=48
-                    )
-
-                    if results:
-                        # Take the most recent matching media message
-                        log = results[0]
-                        target_msg_result = utils.message_id_str_to_id(log.master_msg_id)
-                        if target_msg_result and target_msg_result[0] == int(tg_dest):
-                            target_msg_id = TelegramMessageID(target_msg_result[1])
-                            msg._expandable_quote = True
-                            self.logger.debug("[%s] Media quote match found: tg_msg_id=%s (sender_uid=%s)",
-                                              msg.uid, target_msg_id, resolved_member_uid)
-                        else:
-                            self.logger.debug("[%s] Media quote match found but in different chat, skipping.",
-                                              msg.uid)
+        if self._should_resolve_solitaire(msg):
+            action_plan = self._resolve_solitaire_action(msg)
+            self.logger.debug("[%s] Solitaire resolver action: %s", msg.uid, action_plan)
+            if action_plan.action_type == "DROP":
+                return
+            if action_plan.action_type == "EDIT":
+                if action_plan.replacement_text is not None:
+                    msg.text = action_plan.replacement_text
+                if action_plan.editable_master_msg_id and action_plan.canonical_master_msg_id:
+                    editable_msg_id = utils.message_id_str_to_id(action_plan.editable_master_msg_id)
+                    canonical_msg_id = utils.message_id_str_to_id(action_plan.canonical_master_msg_id)
+                    if editable_msg_id and canonical_msg_id:
+                        old_msg_id = editable_msg_id
+                        db_old_msg_id = canonical_msg_id
+                        solitaire_alias_master_msg_id = action_plan.canonical_master_msg_id
+                        solitaire_edit = True
                     else:
-                        self.logger.debug("[%s] No media quote match found in database.", msg.uid)
-
-                else:
-                    # --- Text quote path: multi-layer fuzzy text matching ---
-                    # For short quotes (<4 chars), require sender filtering for accuracy.
-                    # For longer quotes, sender filtering is optional (improves precision).
-                    if len(quote_body) < 4 and not resolved_member_uid:
-                        self.logger.debug("[%s] Quote body too short (%d chars) and no sender resolved, skipping: '%s'",
-                                          msg.uid, len(quote_body), quote_body)
-                    else:
-                        self.logger.debug("[%s] Text quote block detected (len=%d, sender_uid=%s), attempting fuzzy match: '%.50s...'",
-                                          msg.uid, len(quote_body), resolved_member_uid, quoted_text)
-                        log = self.db.find_msg_by_quote_text(
-                            slave_origin_uid=slave_chat_uid,
-                            quote_text=quoted_text,
-                            limit=200,
-                            slave_member_uid=resolved_member_uid
-                        )
-                        if log:
-                            target_msg = utils.message_id_str_to_id(log.master_msg_id)
-                            if target_msg and target_msg[0] == int(tg_dest):
-                                target_msg_id = TelegramMessageID(target_msg[1])
-                                msg._expandable_quote = True
-                                self.logger.debug("[%s] Fuzzy quote match found: tg_msg_id=%s",
-                                                  msg.uid, target_msg_id)
-                            else:
-                                self.logger.debug("[%s] Fuzzy quote match found but in different chat, skipping.",
-                                                  msg.uid)
-                        else:
-                            self.logger.debug("[%s] No fuzzy quote match found in database.", msg.uid)
+                        self.logger.warning("[%s] Solitaire resolver returned invalid target: %s",
+                                            msg.uid, action_plan)
 
         # Generate basic reply markup
         commands: Optional[List[MessageCommand]] = None
@@ -366,8 +396,21 @@ class SlaveMessageProcessor(LocaleMixin):
 
         # Type dispatching
         if msg.type == MsgType.Text:
-            tg_msg = self.slave_message_text(msg, tg_dest, thread_id, msg_template, reactions, old_msg_id, target_msg_id,
-                                             reply_markup, silent)
+            try:
+                tg_msg = self.slave_message_text(msg, tg_dest, thread_id, msg_template, reactions, old_msg_id,
+                                                 target_msg_id, reply_markup, silent)
+                solitaire_edit_success = solitaire_edit
+            except TelegramError as e:
+                if not solitaire_edit:
+                    raise
+                self.logger.warning("[%s] Failed to edit solitaire message %s; sending as a new message instead: %s",
+                                    msg.uid, old_msg_id, e)
+                old_msg_id = None
+                db_old_msg_id = None
+                solitaire_alias_master_msg_id = None
+                solitaire_edit = False
+                tg_msg = self.slave_message_text(msg, tg_dest, thread_id, msg_template, reactions, None,
+                                                 target_msg_id, reply_markup, silent)
         elif msg.type == MsgType.Link:
             tg_msg = self.slave_message_link(msg, tg_dest, thread_id, msg_template, reactions, old_msg_id, target_msg_id,
                                              reply_markup, silent)
@@ -432,7 +475,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
             # Register the delayed database update
             if hasattr(tg_msg, 'task_id'):
-                self.bot.register_delayed_database_update(tg_msg.task_id, etm_msg, old_msg_id)
+                self.bot.register_delayed_database_update(tg_msg.task_id, etm_msg, db_old_msg_id)
             else:
                 self.logger.warning("[%s] Delayed message missing task_id, cannot register database update", xid)
         else:
@@ -447,9 +490,59 @@ class SlaveMessageProcessor(LocaleMixin):
             # Capture sender_bot_id annotated by rate_limit_decorator
             sender_bot_id = getattr(tg_msg, '_sender_bot_id', None)
 
-            self.db.add_or_update_message_log(etm_msg, tg_msg, old_msg_id,
+            self.db.add_or_update_message_log(etm_msg, tg_msg, db_old_msg_id,
                                               sender_bot_id=sender_bot_id)
+            if solitaire_edit_success and solitaire_alias_master_msg_id and msg.uid:
+                self.db.add_msg_alias(utils.chat_id_to_str(chat=msg.chat), msg.uid, solitaire_alias_master_msg_id)
             # self.logger.debug("[%s] Message inserted/updated to the database.", xid)
+
+    def _should_resolve_solitaire(self, msg: Message) -> bool:
+        if not self.flag("solitaire_auto_merge"):
+            return False
+        if msg.edit or msg.type != MsgType.Text or not isinstance(msg.chat, GroupChat):
+            return False
+        text = msg.text or ""
+        return text.startswith(self.flag("solitaire_command")) or has_solitaire_header(text)
+
+    def _resolve_solitaire_action(self, msg: Message) -> ActionPlan:
+        chat_uid = utils.chat_id_to_str(chat=msg.chat)
+        candidates = [
+            self._build_solitaire_candidate(row)
+            for row in self.db.get_recent_text_messages(chat_uid, limit=30)
+            if has_solitaire_header(row.text)
+        ]
+        candidates = [i for i in candidates if i is not None]
+
+        command_base = None
+        if (msg.text or "").startswith(self.flag("solitaire_command")) and isinstance(msg.target, Message) \
+                and has_solitaire_header(msg.target.text):
+            target_log = self.db.get_msg_log(
+                slave_msg_id=msg.target.uid,
+                slave_origin_uid=utils.chat_id_to_str(chat=msg.target.chat)
+            )
+            if target_log:
+                command_base = self._build_solitaire_candidate(target_log, text=msg.target.text)
+
+        return resolve_solitaire_action(
+            msg.text or "",
+            str(msg.uid) if msg.uid is not None else None,
+            candidates,
+            command=self.flag("solitaire_command"),
+            command_base=command_base,
+        )
+
+    @staticmethod
+    def _build_solitaire_candidate(row, text: Optional[str] = None) -> Optional[SolitaireCandidate]:
+        canonical_master_msg_id = row.master_msg_id
+        editable_master_msg_id = row.master_msg_id_alt or row.master_msg_id
+        if not canonical_master_msg_id or not editable_master_msg_id:
+            return None
+        return SolitaireCandidate(
+            slave_message_id=str(row.slave_message_id),
+            canonical_master_msg_id=canonical_master_msg_id,
+            editable_master_msg_id=editable_master_msg_id,
+            text=text if text is not None else row.text,
+        )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
         """Get the Telegram destination of a message with its header.

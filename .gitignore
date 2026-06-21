@@ -128,3 +128,5 @@ CLAUDE.md
 .claude/settings.local.json
 
 .venv/
+.codegraph/
+efb.db

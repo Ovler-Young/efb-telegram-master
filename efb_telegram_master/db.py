@@ -3,6 +3,7 @@
 import datetime
 import logging
 import pickle
+import re
 import time
 from contextlib import suppress
 from functools import partial
@@ -169,6 +170,20 @@ class MsgLog(BaseModel):
         return msg
 
 
+class MsgAlias(BaseModel):
+    slave_origin_uid = TextField()
+    slave_message_id = TextField()
+    master_msg_id = TextField()
+    time = DateTimeField(default=datetime.datetime.now, null=True)
+
+    class Meta:
+        database = database
+        indexes = (
+            (("slave_origin_uid", "slave_message_id"), False),
+            (("time",), False),
+        )
+
+
 class SlaveChatInfo(BaseModel):
     slave_channel_id = TextField()
     slave_channel_emoji = CharField()
@@ -249,7 +264,7 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc])
+        database.create_tables([ChatAssoc, MsgLog, MsgAlias, SlaveChatInfo, TopicAssoc])
 
     def _migrate_from_sqlite(self, sqlite_path: Path):
         """Migrate data from existing SQLite database to PostgreSQL on first use."""
@@ -636,6 +651,7 @@ class DatabaseManager:
         row.text = msg.text
         row.slave_origin_uid = chat_id_to_str(chat=msg.chat)
         row.slave_member_uid = chat_id_to_str(chat=msg.author)
+        row.slave_member_display_name = getattr(msg.author, 'alias', None) or getattr(msg.author, 'name', None)
         row.msg_type = msg.type.name
         row.sent_to = msg.deliver_to.channel_id
         row.slave_message_id = msg.uid or f"{self.FAIL_FLAG}.{time.time()}"
@@ -650,6 +666,32 @@ class DatabaseManager:
 
         result = save()
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
+
+    @staticmethod
+    def prune_msg_aliases(max_age_hours: int = 24):
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=max_age_hours)
+        return MsgAlias.delete().where(MsgAlias.time < cutoff).execute()
+
+    @staticmethod
+    def add_msg_alias(slave_origin_uid: EFBChannelChatIDStr,
+                      slave_msg_id: MessageID,
+                      master_msg_id: TgChatMsgIDStr) -> MsgAlias:
+        DatabaseManager.prune_msg_aliases()
+        alias = MsgAlias.get_or_none(
+            (MsgAlias.slave_origin_uid == slave_origin_uid) &
+            (MsgAlias.slave_message_id == slave_msg_id)
+        )
+        if alias is None:
+            alias = MsgAlias()
+            force_insert = True
+        else:
+            force_insert = False
+        alias.slave_origin_uid = slave_origin_uid
+        alias.slave_message_id = slave_msg_id
+        alias.master_msg_id = master_msg_id
+        alias.time = datetime.datetime.now()
+        alias.save(force_insert=force_insert)
+        return alias
 
     @staticmethod
     def get_msg_log(master_msg_id: Optional[TgChatMsgIDStr] = None,
@@ -675,18 +717,42 @@ class DatabaseManager:
                 return MsgLog.select().where(MsgLog.master_msg_id == master_msg_id) \
                     .order_by(MsgLog.time.desc()).first()
             else:
-                return MsgLog.select().where((MsgLog.slave_message_id == slave_msg_id) &
-                                             (MsgLog.slave_origin_uid == slave_origin_uid)
-                                             ).order_by(MsgLog.time.desc()).first()
+                log = MsgLog.select().where((MsgLog.slave_message_id == slave_msg_id) &
+                                            (MsgLog.slave_origin_uid == slave_origin_uid)
+                                            ).order_by(MsgLog.time.desc()).first()
+                if log:
+                    return log
+
+                cutoff = datetime.datetime.now() - datetime.timedelta(hours=24)
+                alias = MsgAlias.select().where(
+                    (MsgAlias.slave_message_id == slave_msg_id) &
+                    (MsgAlias.slave_origin_uid == slave_origin_uid) &
+                    (MsgAlias.time >= cutoff)
+                ).order_by(MsgAlias.time.desc()).first()
+                if alias:
+                    return MsgLog.select().where(MsgLog.master_msg_id == alias.master_msg_id) \
+                        .order_by(MsgLog.time.desc()).first()
+                return None
         except DoesNotExist:
             return None
 
     @staticmethod
-    def find_msg_by_quote_text(slave_origin_uid: 'EFBChannelChatIDStr',
-                               quote_text: str,
-                               limit: int = 200,
-                               slave_member_uid: 'Optional[str]' = None) -> Optional['MsgLog']:
-        """Find a message in the database by matching quoted text content.
+    def _normalize_quote_text(text: str) -> str:
+        punct_re = re.compile(r'[\s，。！？、；：\u201c\u201d\u2018\u2019（）《》【】…—.,!?\';:\"()\[\]{}<>~`@#$%^&*_+=|/\\-]+')
+        return punct_re.sub('', text)
+
+    @staticmethod
+    def _strip_quote_sender(quote_text: str) -> str:
+        full_quote = quote_text.strip()
+        colon_match = re.match(r'^[^：:]+[：:](.+)$', full_quote, flags=re.DOTALL)
+        return colon_match.group(1).strip() if colon_match else full_quote
+
+    @staticmethod
+    def find_msgs_by_quote_text(slave_origin_uid: 'EFBChannelChatIDStr',
+                                quote_text: str,
+                                limit: int = 200,
+                                slave_member_uid: 'Optional[str]' = None) -> 'List[MsgLog]':
+        """Find candidate messages by matching quoted text content.
 
         Uses a 3-layer matching strategy on a single DB query result:
         1. Strip "Name：" or "Name:" prefix from quote_text, then check
@@ -705,28 +771,15 @@ class DatabaseManager:
                               Useful for short quotes where text alone is too ambiguous.
 
         Returns:
-            Optional[MsgLog]: The best matching message log entry, or None.
+            List[MsgLog]: Matching message log entries, ordered by time desc.
         """
-        import re as _re
-
         if not quote_text or not quote_text.strip():
-            return None
+            return []
 
         full_quote = quote_text.strip()
-
-        # Layer 1 prep: strip "SenderName：" or "SenderName:" prefix
-        # Match everything before the first full-width or half-width colon
-        colon_match = _re.match(r'^[^：:]+[：:](.+)$', full_quote, flags=_re.DOTALL)
-        quote_body = colon_match.group(1).strip() if colon_match else full_quote
-
-        # Layer 3 prep: normalize helper — remove whitespace + common punctuation
-        _punct_re = _re.compile(r'[\s，。！？、；：\u201c\u201d\u2018\u2019（）《》【】…—.,!?\';:\"()\[\]{}<>~`@#$%^&*_+=|/\\-]+')
-
-        def _normalize(s: str) -> str:
-            return _punct_re.sub('', s)
-
-        norm_body = _normalize(quote_body)
-        norm_full = _normalize(full_quote)
+        quote_body = DatabaseManager._strip_quote_sender(full_quote)
+        norm_body = DatabaseManager._normalize_quote_text(quote_body)
+        norm_full = DatabaseManager._normalize_quote_text(full_quote)
 
         try:
             query = (MsgLog.select()
@@ -737,30 +790,82 @@ class DatabaseManager:
             if slave_member_uid:
                 query = query.where(MsgLog.slave_member_uid == slave_member_uid)
 
-            candidates = query
+            matches = []
 
-            for candidate in candidates:
+            for candidate in query:
                 ct = candidate.text
                 if not ct:
                     continue
 
                 # Layer 1: forward match (stripped body in DB text)
                 if quote_body and quote_body in ct:
-                    return candidate
+                    matches.append(candidate)
+                    continue
 
                 # Layer 2: reverse match (DB text in full quote)
                 if ct.strip() in full_quote:
-                    return candidate
+                    matches.append(candidate)
+                    continue
 
                 # Layer 3: normalized fuzzy match
-                norm_ct = _normalize(ct)
+                norm_ct = DatabaseManager._normalize_quote_text(ct)
                 if norm_ct and (norm_body and norm_body in norm_ct
                                 or norm_ct in norm_full):
-                    return candidate
+                    matches.append(candidate)
 
-            return None
+            return matches
         except Exception:
-            return None
+            return []
+
+    @staticmethod
+    def find_msg_by_quote_text(slave_origin_uid: 'EFBChannelChatIDStr',
+                               quote_text: str,
+                               limit: int = 200,
+                               slave_member_uid: 'Optional[str]' = None) -> Optional['MsgLog']:
+        """Find the most recent message matching quoted text content."""
+        candidates = DatabaseManager.find_msgs_by_quote_text(
+            slave_origin_uid=slave_origin_uid,
+            quote_text=quote_text,
+            limit=limit,
+            slave_member_uid=slave_member_uid,
+        )
+        if candidates:
+            return candidates[0]
+        return None
+
+    @staticmethod
+    def find_member_uids_by_display_name(slave_origin_uid: 'EFBChannelChatIDStr',
+                                         display_name: str,
+                                         limit: int = 500) -> 'List[str]':
+        """Find member UIDs whose logged display name matches a quoted sender name."""
+        if not display_name or not display_name.strip():
+            return []
+
+        name = display_name.strip()
+        norm_name = DatabaseManager._normalize_quote_text(name)
+        try:
+            rows = (MsgLog.select(MsgLog.slave_member_uid, MsgLog.slave_member_display_name)
+                    .where(MsgLog.slave_origin_uid == slave_origin_uid)
+                    .order_by(MsgLog.time.desc())
+                    .limit(limit))
+
+            matched_uids = []
+            seen_uids = set()
+            for row in rows:
+                uid = row.slave_member_uid
+                display = (row.slave_member_display_name or '').strip()
+                if not uid or uid in seen_uids or not display:
+                    continue
+                norm_display = DatabaseManager._normalize_quote_text(display)
+                if name == display or name in display or display in name \
+                        or (norm_name and norm_display and (norm_name == norm_display
+                                                            or norm_name in norm_display
+                                                            or norm_display in norm_name)):
+                    matched_uids.append(uid)
+                    seen_uids.add(uid)
+            return matched_uids
+        except Exception:
+            return []
 
     @staticmethod
     def find_msg_by_media_type(slave_origin_uid: 'EFBChannelChatIDStr',
@@ -944,6 +1049,17 @@ class DatabaseManager:
             if limit > 0:
                 query = query.limit(limit)
 
+            return list(query)
+        except DoesNotExist:
+            return []
+
+    @staticmethod
+    def get_recent_text_messages(slave_chat_id: EFBChannelChatIDStr, limit: int = 30) -> List[MsgLog]:
+        try:
+            query = MsgLog.select().where(
+                (MsgLog.slave_origin_uid == slave_chat_id) &
+                (MsgLog.msg_type == MsgType.Text.name)
+            ).order_by(MsgLog.time.desc()).limit(limit)
             return list(query)
         except DoesNotExist:
             return []

@@ -10,7 +10,7 @@ from ehforwarderbot import Message, MsgType
 from ehforwarderbot.types import MessageID
 
 from efb_telegram_master import utils
-from efb_telegram_master.db import MsgLog, TopicAssoc
+from efb_telegram_master.db import MsgAlias, MsgLog, TopicAssoc
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
@@ -22,6 +22,14 @@ def test_msglog_schema_has_sender_bot_id(channel):
         from efb_telegram_master.db import database
         columns = {column.name for column in database.get_columns("msglog")}
     assert "sender_bot_id" in columns
+
+
+def test_msgalias_table_exists(channel):
+    tables = channel.db.database.get_tables() if hasattr(channel.db, "database") else None
+    if tables is None:
+        from efb_telegram_master.db import database
+        tables = database.get_tables()
+    assert "msgalias" in tables
 
 
 def test_topic_assoc_table_exists_and_round_trips(channel, slave):
@@ -57,6 +65,32 @@ def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):
     assert stored is not None
     assert stored.sender_bot_id == "777"
 
+    stored.delete_instance()
+
+
+def test_msg_alias_resolves_recent_slave_uid(channel, slave):
+    chat = slave.chat_with_alias
+    author = chat.self
+    etm_msg = ETMMsg(
+        uid=MessageID("canonical-message"),
+        chat=channel.chat_manager.update_chat_obj(chat),
+        author=channel.chat_manager.get_or_enrol_member(chat, author),
+        text="canonical text",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=channel,
+    )
+    master_message = SimpleNamespace(chat_id=3333, message_id=4444)
+    channel.db.add_or_update_message_log(etm_msg, master_message)
+
+    slave_uid = utils.chat_id_to_str(chat=chat)
+    channel.db.add_msg_alias(slave_uid, MessageID("alias-message"), "3333.4444")
+
+    stored = channel.db.get_msg_log(slave_msg_id=MessageID("alias-message"), slave_origin_uid=slave_uid)
+    assert stored is not None
+    assert stored.master_msg_id == "3333.4444"
+
+    MsgAlias.delete().where(MsgAlias.slave_message_id == "alias-message").execute()
     stored.delete_instance()
 
 
