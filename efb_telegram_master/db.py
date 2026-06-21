@@ -755,6 +755,41 @@ class DatabaseManager:
             return None
 
     @staticmethod
+    def find_msg_by_media_type(slave_origin_uid: 'EFBChannelChatIDStr',
+                               media_types: 'List[str]',
+                               slave_member_uid: 'Optional[str]' = None,
+                               limit: int = 200) -> 'List[MsgLog]':
+        """Find recent media messages by type and optionally by sender.
+
+        Used for matching WeChat media quote blocks (e.g. [图片], [视频])
+        where text-based fuzzy matching is unreliable.
+
+        Args:
+            slave_origin_uid: The slave chat identifier string to scope the search.
+            media_types: List of TGMsgType values to filter by (e.g. ["Photo", "Video"]).
+            slave_member_uid: Optional sender UID to further filter results.
+            limit: Maximum number of recent messages to search (default 200).
+
+        Returns:
+            List[MsgLog]: Matching message log entries, ordered by time desc.
+        """
+        try:
+            query = (MsgLog.select()
+                     .where(
+                         (MsgLog.slave_origin_uid == slave_origin_uid) &
+                         (MsgLog.media_type.in_(media_types))
+                     )
+                     .order_by(MsgLog.time.desc())
+                     .limit(limit))
+
+            if slave_member_uid:
+                query = query.where(MsgLog.slave_member_uid == slave_member_uid)
+
+            return list(query)
+        except Exception:
+            return []
+
+    @staticmethod
     def delete_msg_log(master_msg_id: Optional[TgChatMsgIDStr] = None,
                        slave_msg_id: Optional[EFBChannelChatIDStr] = None,
                        slave_origin_uid: Optional[EFBChannelChatIDStr] = None):

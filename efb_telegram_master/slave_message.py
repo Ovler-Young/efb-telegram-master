@@ -218,29 +218,131 @@ class SlaveMessageProcessor(LocaleMixin):
             quote_match = re.match(r'^「(.+?)」\n-[\- ]{10,40}\n', msg.text, flags=re.DOTALL)
             if quote_match:
                 quoted_text = quote_match.group(1)
+
+                # Extract sender name and quote body from "SenderName：content"
+                colon_split = re.match(r'^(.+?)[：:](.+)$', quoted_text, flags=re.DOTALL)
+                sender_name = colon_split.group(1).strip() if colon_split else None
+                quote_body = colon_split.group(2).strip() if colon_split else quoted_text.strip()
+
+                # Determine if the quote body is a media placeholder
+                _MEDIA_MAP = {
+                    # Chinese placeholders
+                    r'(?:\[图片\]|查看图片)': ['Photo'],
+                    r'(?:\[视频\]|查看视频|收到一条视频消息)': ['Video', 'Animation'],
+                    r'\[文件\]': ['Document'],
+                    r'\[语音\]': ['Voice', 'Audio'],
+                    r'(?:\[表情\]|\[动画表情\])': ['Sticker', 'AnimatedSticker', 'VideoSticker'],
+                    r'\[名片\]': ['Contact'],
+                    r'\[位置\]': ['Location', 'Venue'],
+                    # English placeholders
+                    r'\[(?:Image|Photo)\]': ['Photo'],
+                    r'\[Video\]': ['Video', 'Animation'],
+                    r'\[File\]': ['Document'],
+                    r'\[Voice\]': ['Voice', 'Audio'],
+                    r'\[Sticker\]': ['Sticker', 'AnimatedSticker', 'VideoSticker'],
+                    # Filename patterns (images/videos/docs)
+                    r'\S+\.(?:jpg|jpeg|png|gif|bmp|webp|heic|heif)': ['Photo', 'Document'],
+                    r'\S+\.(?:mp4|avi|mov|mkv|wmv|flv|3gp)': ['Video', 'Animation', 'Document'],
+                    r'\S+\.(?:pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|apk|exe|txt|csv)': ['Document'],
+                    r'Image_\d+.*': ['Photo', 'Document'],
+                }
+
+                matched_media_types = None
+                for pattern, media_types in _MEDIA_MAP.items():
+                    if re.match(r'^\s*' + pattern + r'\s*$', quote_body, re.IGNORECASE):
+                        matched_media_types = media_types
+                        break
+
                 slave_chat_uid = utils.chat_id_to_str(chat=msg.chat)
-                self.logger.debug("[%s] Text quote block detected, attempting fuzzy match: '%.50s...'",
-                                  msg.uid, quoted_text)
-                log = self.db.find_msg_by_quote_text(
-                    slave_origin_uid=slave_chat_uid,
-                    quote_text=quoted_text,
-                    limit=200
-                )
-                if log:
-                    target_msg = utils.message_id_str_to_id(log.master_msg_id)
-                    if target_msg and target_msg[0] == int(tg_dest):
-                        target_msg_id = TelegramMessageID(target_msg[1])
-                        # Flag the message so html_substitutions renders
-                        # the quote as a collapsed (expandable) blockquote,
-                        # avoiding visual duplication with the native reply header.
-                        msg._expandable_quote = True
-                        self.logger.debug("[%s] Fuzzy quote match found: tg_msg_id=%s",
-                                          msg.uid, target_msg_id)
+
+                if matched_media_types:
+                    # --- Media quote path: match by media_type + sender name ---
+                    self.logger.debug("[%s] Media quote detected (types=%s, sender='%s'), attempting media match.",
+                                      msg.uid, matched_media_types, sender_name)
+
+                    # First, try to resolve sender name to slave_member_uid
+                    # by looking through recent messages from this chat and
+                    # checking display names via chat_manager.
+                    resolved_member_uid = None
+                    if sender_name:
+                        # Search recent candidates with matching media type
+                        candidates = self.db.find_msg_by_media_type(
+                            slave_origin_uid=slave_chat_uid,
+                            media_types=matched_media_types,
+                            limit=200
+                        )
+                        for candidate in candidates:
+                            if not candidate.slave_member_uid:
+                                continue
+                            try:
+                                member_channel_id, member_id, _ = utils.chat_id_str_to_id(candidate.slave_member_uid)
+                                chat_channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_chat_uid)
+                                member = self.chat_manager.get_chat_member(
+                                    member_channel_id, chat_id, member_id, build_dummy=False
+                                )
+                                if member:
+                                    member_display = member.alias or member.name or ''
+                                    if sender_name in member_display or member_display in sender_name:
+                                        resolved_member_uid = candidate.slave_member_uid
+                                        break
+                            except Exception:
+                                continue
+
+                    # Now query with resolved sender UID for precision
+                    if resolved_member_uid:
+                        results = self.db.find_msg_by_media_type(
+                            slave_origin_uid=slave_chat_uid,
+                            media_types=matched_media_types,
+                            slave_member_uid=resolved_member_uid,
+                            limit=50
+                        )
                     else:
-                        self.logger.debug("[%s] Fuzzy quote match found but in different chat, skipping.",
-                                          msg.uid)
+                        # Fallback: no sender resolution, just use media type
+                        results = self.db.find_msg_by_media_type(
+                            slave_origin_uid=slave_chat_uid,
+                            media_types=matched_media_types,
+                            limit=50
+                        )
+
+                    if results:
+                        # Take the most recent matching media message
+                        log = results[0]
+                        target_msg_result = utils.message_id_str_to_id(log.master_msg_id)
+                        if target_msg_result and target_msg_result[0] == int(tg_dest):
+                            target_msg_id = TelegramMessageID(target_msg_result[1])
+                            msg._expandable_quote = True
+                            self.logger.debug("[%s] Media quote match found: tg_msg_id=%s (sender_uid=%s)",
+                                              msg.uid, target_msg_id, resolved_member_uid)
+                        else:
+                            self.logger.debug("[%s] Media quote match found but in different chat, skipping.",
+                                              msg.uid)
+                    else:
+                        self.logger.debug("[%s] No media quote match found in database.", msg.uid)
+
+                elif len(quote_body) >= 4:
+                    # --- Text quote path: multi-layer fuzzy text matching ---
+                    self.logger.debug("[%s] Text quote block detected, attempting fuzzy match: '%.50s...'",
+                                      msg.uid, quoted_text)
+                    log = self.db.find_msg_by_quote_text(
+                        slave_origin_uid=slave_chat_uid,
+                        quote_text=quoted_text,
+                        limit=200
+                    )
+                    if log:
+                        target_msg = utils.message_id_str_to_id(log.master_msg_id)
+                        if target_msg and target_msg[0] == int(tg_dest):
+                            target_msg_id = TelegramMessageID(target_msg[1])
+                            msg._expandable_quote = True
+                            self.logger.debug("[%s] Fuzzy quote match found: tg_msg_id=%s",
+                                              msg.uid, target_msg_id)
+                        else:
+                            self.logger.debug("[%s] Fuzzy quote match found but in different chat, skipping.",
+                                              msg.uid)
+                    else:
+                        self.logger.debug("[%s] No fuzzy quote match found in database.", msg.uid)
                 else:
-                    self.logger.debug("[%s] No fuzzy quote match found in database.", msg.uid)
+                    self.logger.debug("[%s] Quote body too short (%d chars), skipping: '%s'",
+                                      msg.uid, len(quote_body), quote_body)
 
         # Generate basic reply markup
         commands: Optional[List[MessageCommand]] = None
