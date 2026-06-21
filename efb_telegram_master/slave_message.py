@@ -255,54 +255,55 @@ class SlaveMessageProcessor(LocaleMixin):
 
                 slave_chat_uid = utils.chat_id_to_str(chat=msg.chat)
 
-                if matched_media_types:
-                    # --- Media quote path: match by media_type + sender name ---
-                    self.logger.debug("[%s] Media quote detected (types=%s, sender='%s'), attempting media match.",
-                                      msg.uid, matched_media_types, sender_name)
-
-                    # First, try to resolve sender name to slave_member_uid
-                    # by looking through recent messages from this chat and
+                # --- Shared: resolve sender name to slave_member_uid ---
+                resolved_member_uid = None
+                if sender_name:
+                    # Look through recent messages from this chat,
                     # checking display names via chat_manager.
-                    resolved_member_uid = None
-                    if sender_name:
-                        # Search recent candidates with matching media type
-                        candidates = self.db.find_msg_by_media_type(
-                            slave_origin_uid=slave_chat_uid,
-                            media_types=matched_media_types,
-                            limit=200
-                        )
-                        for candidate in candidates:
-                            if not candidate.slave_member_uid:
+                    # We use a broad query (no media_type filter) to maximize
+                    # the chance of finding a name match.
+                    try:
+                        from .db import MsgLog
+                        seen_uids = set()
+                        recent_msgs = (MsgLog.select(MsgLog.slave_member_uid)
+                                       .where(MsgLog.slave_origin_uid == slave_chat_uid)
+                                       .order_by(MsgLog.time.desc())
+                                       .limit(500))
+                        for row in recent_msgs:
+                            uid = row.slave_member_uid
+                            if not uid or uid in seen_uids:
                                 continue
+                            seen_uids.add(uid)
                             try:
-                                member_channel_id, member_id, _ = utils.chat_id_str_to_id(candidate.slave_member_uid)
-                                chat_channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_chat_uid)
+                                member_channel_id, member_id, _ = utils.chat_id_str_to_id(uid)
+                                _, chat_id, _ = utils.chat_id_str_to_id(slave_chat_uid)
                                 member = self.chat_manager.get_chat_member(
                                     member_channel_id, chat_id, member_id, build_dummy=False
                                 )
                                 if member:
                                     member_display = member.alias or member.name or ''
                                     if sender_name in member_display or member_display in sender_name:
-                                        resolved_member_uid = candidate.slave_member_uid
+                                        resolved_member_uid = uid
+                                        self.logger.debug("[%s] Sender '%s' resolved to uid=%s (display='%s')",
+                                                          msg.uid, sender_name, uid, member_display)
                                         break
                             except Exception:
                                 continue
+                    except Exception:
+                        pass
 
-                    # Now query with resolved sender UID for precision
-                    if resolved_member_uid:
-                        results = self.db.find_msg_by_media_type(
-                            slave_origin_uid=slave_chat_uid,
-                            media_types=matched_media_types,
-                            slave_member_uid=resolved_member_uid,
-                            limit=50
-                        )
-                    else:
-                        # Fallback: no sender resolution, just use media type
-                        results = self.db.find_msg_by_media_type(
-                            slave_origin_uid=slave_chat_uid,
-                            media_types=matched_media_types,
-                            limit=50
-                        )
+                if matched_media_types:
+                    # --- Media quote path: match by media_type + sender + time window ---
+                    self.logger.debug("[%s] Media quote detected (types=%s, sender='%s'), attempting media match.",
+                                      msg.uid, matched_media_types, sender_name)
+
+                    results = self.db.find_msg_by_media_type(
+                        slave_origin_uid=slave_chat_uid,
+                        media_types=matched_media_types,
+                        slave_member_uid=resolved_member_uid,
+                        limit=50,
+                        max_age_hours=48
+                    )
 
                     if results:
                         # Take the most recent matching media message
@@ -319,30 +320,34 @@ class SlaveMessageProcessor(LocaleMixin):
                     else:
                         self.logger.debug("[%s] No media quote match found in database.", msg.uid)
 
-                elif len(quote_body) >= 4:
-                    # --- Text quote path: multi-layer fuzzy text matching ---
-                    self.logger.debug("[%s] Text quote block detected, attempting fuzzy match: '%.50s...'",
-                                      msg.uid, quoted_text)
-                    log = self.db.find_msg_by_quote_text(
-                        slave_origin_uid=slave_chat_uid,
-                        quote_text=quoted_text,
-                        limit=200
-                    )
-                    if log:
-                        target_msg = utils.message_id_str_to_id(log.master_msg_id)
-                        if target_msg and target_msg[0] == int(tg_dest):
-                            target_msg_id = TelegramMessageID(target_msg[1])
-                            msg._expandable_quote = True
-                            self.logger.debug("[%s] Fuzzy quote match found: tg_msg_id=%s",
-                                              msg.uid, target_msg_id)
-                        else:
-                            self.logger.debug("[%s] Fuzzy quote match found but in different chat, skipping.",
-                                              msg.uid)
-                    else:
-                        self.logger.debug("[%s] No fuzzy quote match found in database.", msg.uid)
                 else:
-                    self.logger.debug("[%s] Quote body too short (%d chars), skipping: '%s'",
-                                      msg.uid, len(quote_body), quote_body)
+                    # --- Text quote path: multi-layer fuzzy text matching ---
+                    # For short quotes (<4 chars), require sender filtering for accuracy.
+                    # For longer quotes, sender filtering is optional (improves precision).
+                    if len(quote_body) < 4 and not resolved_member_uid:
+                        self.logger.debug("[%s] Quote body too short (%d chars) and no sender resolved, skipping: '%s'",
+                                          msg.uid, len(quote_body), quote_body)
+                    else:
+                        self.logger.debug("[%s] Text quote block detected (len=%d, sender_uid=%s), attempting fuzzy match: '%.50s...'",
+                                          msg.uid, len(quote_body), resolved_member_uid, quoted_text)
+                        log = self.db.find_msg_by_quote_text(
+                            slave_origin_uid=slave_chat_uid,
+                            quote_text=quoted_text,
+                            limit=200,
+                            slave_member_uid=resolved_member_uid
+                        )
+                        if log:
+                            target_msg = utils.message_id_str_to_id(log.master_msg_id)
+                            if target_msg and target_msg[0] == int(tg_dest):
+                                target_msg_id = TelegramMessageID(target_msg[1])
+                                msg._expandable_quote = True
+                                self.logger.debug("[%s] Fuzzy quote match found: tg_msg_id=%s",
+                                                  msg.uid, target_msg_id)
+                            else:
+                                self.logger.debug("[%s] Fuzzy quote match found but in different chat, skipping.",
+                                                  msg.uid)
+                        else:
+                            self.logger.debug("[%s] No fuzzy quote match found in database.", msg.uid)
 
         # Generate basic reply markup
         commands: Optional[List[MessageCommand]] = None

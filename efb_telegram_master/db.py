@@ -684,7 +684,8 @@ class DatabaseManager:
     @staticmethod
     def find_msg_by_quote_text(slave_origin_uid: 'EFBChannelChatIDStr',
                                quote_text: str,
-                               limit: int = 200) -> Optional['MsgLog']:
+                               limit: int = 200,
+                               slave_member_uid: 'Optional[str]' = None) -> Optional['MsgLog']:
         """Find a message in the database by matching quoted text content.
 
         Uses a 3-layer matching strategy on a single DB query result:
@@ -700,6 +701,8 @@ class DatabaseManager:
             quote_text: The quoted text extracted from the WeChat「」format,
                         typically in the form "SenderName：original content".
             limit: Maximum number of recent messages to search (default 200).
+            slave_member_uid: Optional sender UID to narrow the search.
+                              Useful for short quotes where text alone is too ambiguous.
 
         Returns:
             Optional[MsgLog]: The best matching message log entry, or None.
@@ -726,10 +729,15 @@ class DatabaseManager:
         norm_full = _normalize(full_quote)
 
         try:
-            candidates = (MsgLog.select()
-                          .where(MsgLog.slave_origin_uid == slave_origin_uid)
-                          .order_by(MsgLog.time.desc())
-                          .limit(limit))
+            query = (MsgLog.select()
+                     .where(MsgLog.slave_origin_uid == slave_origin_uid)
+                     .order_by(MsgLog.time.desc())
+                     .limit(limit))
+
+            if slave_member_uid:
+                query = query.where(MsgLog.slave_member_uid == slave_member_uid)
+
+            candidates = query
 
             for candidate in candidates:
                 ct = candidate.text
@@ -758,7 +766,8 @@ class DatabaseManager:
     def find_msg_by_media_type(slave_origin_uid: 'EFBChannelChatIDStr',
                                media_types: 'List[str]',
                                slave_member_uid: 'Optional[str]' = None,
-                               limit: int = 200) -> 'List[MsgLog]':
+                               limit: int = 200,
+                               max_age_hours: int = 48) -> 'List[MsgLog]':
         """Find recent media messages by type and optionally by sender.
 
         Used for matching WeChat media quote blocks (e.g. [图片], [视频])
@@ -769,15 +778,21 @@ class DatabaseManager:
             media_types: List of TGMsgType values to filter by (e.g. ["Photo", "Video"]).
             slave_member_uid: Optional sender UID to further filter results.
             limit: Maximum number of recent messages to search (default 200).
+            max_age_hours: Maximum age of messages to consider in hours (default 48).
+                           Prevents matching very old messages that are unlikely
+                           to be the intended quote target.
 
         Returns:
             List[MsgLog]: Matching message log entries, ordered by time desc.
         """
+        import datetime as _dt
         try:
+            cutoff = _dt.datetime.now() - _dt.timedelta(hours=max_age_hours)
             query = (MsgLog.select()
                      .where(
                          (MsgLog.slave_origin_uid == slave_origin_uid) &
-                         (MsgLog.media_type.in_(media_types))
+                         (MsgLog.media_type.in_(media_types)) &
+                         (MsgLog.time >= cutoff)
                      )
                      .order_by(MsgLog.time.desc())
                      .limit(limit))
