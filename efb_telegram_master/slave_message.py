@@ -513,14 +513,13 @@ class SlaveMessageProcessor(LocaleMixin):
         candidates = [i for i in candidates if i is not None]
 
         command_base = None
-        if (msg.text or "").startswith(self.flag("solitaire_command")) and isinstance(msg.target, Message) \
-                and has_solitaire_header(msg.target.text):
+        if (msg.text or "").startswith(self.flag("solitaire_command")) and isinstance(msg.target, Message):
             target_log = self.db.get_msg_log(
                 slave_msg_id=msg.target.uid,
                 slave_origin_uid=utils.chat_id_to_str(chat=msg.target.chat)
             )
-            if target_log:
-                command_base = self._build_solitaire_candidate(target_log, text=msg.target.text)
+            if target_log and has_solitaire_header(target_log.text):
+                command_base = self._build_solitaire_candidate(target_log)
 
         return resolve_solitaire_action(
             msg.text or "",
