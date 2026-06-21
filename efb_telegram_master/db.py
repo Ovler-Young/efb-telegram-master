@@ -1078,7 +1078,7 @@ class DatabaseManager:
                 (MsgLog.slave_origin_uid == slave_chat_id) &
                 (MsgLog.msg_type == MsgType.Text.name) &
                 (MsgLog.time >= cutoff) &
-                (MsgLog.text.startswith('#接龙') | MsgLog.text.startswith('#接龍'))
+                (MsgLog.text.contains('#接龙') | MsgLog.text.contains('#接龍'))
             ).order_by(MsgLog.time.desc()).limit(limit)
             return list(query)
         except DoesNotExist:
