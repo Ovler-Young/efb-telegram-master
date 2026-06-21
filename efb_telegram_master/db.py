@@ -648,6 +648,7 @@ class DatabaseManager:
 
         row.master_msg_id = master_msg_id
         row.master_msg_id_alt = master_msg_id_alt
+        row.time = datetime.datetime.now()
         row.text = msg.text
         row.slave_origin_uid = chat_id_to_str(chat=msg.chat)
         row.slave_member_uid = chat_id_to_str(chat=msg.author)
@@ -1059,6 +1060,25 @@ class DatabaseManager:
             query = MsgLog.select().where(
                 (MsgLog.slave_origin_uid == slave_chat_id) &
                 (MsgLog.msg_type == MsgType.Text.name)
+            ).order_by(MsgLog.time.desc()).limit(limit)
+            return list(query)
+        except DoesNotExist:
+            return []
+
+    @staticmethod
+    def get_recent_solitaire_messages(
+        slave_chat_id: EFBChannelChatIDStr,
+        limit: int = 5,
+        max_age_hours: int = 72,
+    ) -> List[MsgLog]:
+        """Query recent solitaire messages directly with SQL LIKE filter."""
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=max_age_hours)
+        try:
+            query = MsgLog.select().where(
+                (MsgLog.slave_origin_uid == slave_chat_id) &
+                (MsgLog.msg_type == MsgType.Text.name) &
+                (MsgLog.time >= cutoff) &
+                (MsgLog.text.startswith('#接龙') | MsgLog.text.startswith('#接龍'))
             ).order_by(MsgLog.time.desc()).limit(limit)
             return list(query)
         except DoesNotExist:

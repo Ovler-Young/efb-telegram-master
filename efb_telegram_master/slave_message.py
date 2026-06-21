@@ -508,8 +508,7 @@ class SlaveMessageProcessor(LocaleMixin):
         chat_uid = utils.chat_id_to_str(chat=msg.chat)
         candidates = [
             self._build_solitaire_candidate(row)
-            for row in self.db.get_recent_text_messages(chat_uid, limit=30)
-            if has_solitaire_header(row.text)
+            for row in self.db.get_recent_solitaire_messages(chat_uid)
         ]
         candidates = [i for i in candidates if i is not None]
 
