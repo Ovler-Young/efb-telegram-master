@@ -830,7 +830,9 @@ Development notes (CI and tooling)
   slave channels may set ``msg.vendor_specific["blueset.telegram.image_url"]``
   on ``MsgType.Image`` messages to an HTTP(S) image URL. ETM will pass the URL
   to Telegram for server-side download instead of requiring ``msg.file`` and
-  ``msg.path``.
+  ``msg.path``. If Telegram cannot download the URL on first send, ETM sends
+  an editable placeholder media message so a later media edit can replace it
+  with a reachable URL.
 
 License
 -------

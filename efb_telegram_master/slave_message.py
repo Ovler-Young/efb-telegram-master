@@ -402,6 +402,48 @@ class SlaveMessageProcessor(LocaleMixin):
             parsed_path = f"{parsed_path};{parsed.params}"
         return urllib.parse.unquote(os.path.basename(parsed_path)) or "image"
 
+    def _remote_image_placeholder(self) -> IO[bytes]:
+        placeholder = tempfile.NamedTemporaryFile(
+            suffix=".png",
+            dir=utils.ExperimentalFlagsManager.get_temp_dir(self.channel),
+        )
+        Image.new("RGB", (64, 64), (245, 245, 245)).save(placeholder, "PNG")
+        placeholder.seek(0)
+        return placeholder
+
+    def _send_remote_image_placeholder(self, tg_dest: TelegramChatID,
+                                       thread_id: Optional[TelegramTopicID],
+                                       msg_template: str,
+                                       reactions: str,
+                                       text: str,
+                                       target_msg_id: Optional[TelegramMessageID],
+                                       reply_markup: Optional[ReplyMarkup],
+                                       silent: bool,
+                                       *,
+                                       as_document: bool = False) -> telegram.Message:
+        placeholder = self._remote_image_placeholder()
+        filename = "remote-image-placeholder.png"
+        try:
+            file = self.process_file_obj(placeholder, placeholder.name, filename)
+            if as_document:
+                return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
+                                              caption=text, parse_mode="HTML", filename=filename,
+                                              reply_to_message_id=target_msg_id,
+                                              message_thread_id=thread_id,
+                                              reply_markup=reply_markup,
+                                              disable_notification=silent,
+                                              _send_mode="blocking")
+            return self.bot.send_photo(tg_dest, file, prefix=msg_template, suffix=reactions,
+                                       caption=text, parse_mode="HTML",
+                                       reply_to_message_id=target_msg_id,
+                                       message_thread_id=thread_id,
+                                       reply_markup=reply_markup,
+                                       disable_notification=silent,
+                                       _send_mode="blocking")
+        finally:
+            placeholder.close()
+            self._cleanup_pending_local_api_files()
+
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                            old_msg_id: Optional[OldMsgID] = None,
@@ -562,18 +604,12 @@ class SlaveMessageProcessor(LocaleMixin):
                                            message_thread_id=thread_id,
                                            reply_markup=reply_markup,
                                            disable_notification=silent,
-                                           _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                           _send_mode="blocking")
             except telegram.error.BadRequest as e:
-                self.logger.error('[%s] Failed to send remote image, sending as document. Reason: %s',
-                                  msg.uid, e)
-                file_name = self._remote_image_filename(msg, remote_image_url).replace(';', ' ')
-                return self.bot.send_document(tg_dest, remote_image_url, prefix=msg_template, suffix=reactions,
-                                              caption=text, parse_mode="HTML", filename=file_name,
-                                              reply_to_message_id=target_msg_id,
-                                              message_thread_id=thread_id,
-                                              reply_markup=reply_markup,
-                                              disable_notification=silent,
-                                              _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                self.logger.warning('[%s] Failed to send remote image URL, sending editable placeholder. Reason: %s',
+                                    msg.uid, e)
+                return self._send_remote_image_placeholder(tg_dest, thread_id, msg_template, reactions, text,
+                                                           target_msg_id, reply_markup, silent)
 
         try:
             # Avoid Telegram compression of pictures by sending high definition image messages as files
@@ -910,14 +946,20 @@ class SlaveMessageProcessor(LocaleMixin):
                                                          reply_markup=reply_markup,
                                                          prefix=msg_template, suffix=reactions, caption=text,
                                                          parse_mode="HTML", **edit_kwargs)
-                return self.bot.send_document(tg_dest, remote_image_url,
-                                              prefix=msg_template, suffix=reactions,
-                                              caption=text, parse_mode="HTML", filename=file_name,
-                                              reply_to_message_id=target_msg_id,
-                                              message_thread_id=thread_id,
-                                              reply_markup=reply_markup,
-                                              disable_notification=silent,
-                                              _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                try:
+                    return self.bot.send_document(tg_dest, remote_image_url,
+                                                  prefix=msg_template, suffix=reactions,
+                                                  caption=text, parse_mode="HTML", filename=file_name,
+                                                  reply_to_message_id=target_msg_id,
+                                                  message_thread_id=thread_id,
+                                                  reply_markup=reply_markup,
+                                                  disable_notification=silent,
+                                                  _send_mode="blocking")
+                except telegram.error.BadRequest as e:
+                    self.logger.warning('[%s] Failed to send remote image URL as document, sending editable placeholder. '
+                                        'Reason: %s', msg.uid, e)
+                    return self._send_remote_image_placeholder(tg_dest, thread_id, msg_template, reactions, text,
+                                                               target_msg_id, reply_markup, silent, as_document=True)
 
             file_too_large = self.check_file_size(msg.file)
             edit_media = msg.edit_media

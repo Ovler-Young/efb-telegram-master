@@ -1,5 +1,6 @@
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from telegram.error import BadRequest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -93,9 +94,9 @@ def build_slave_message_processor() -> SlaveMessageProcessor:
     processor = object.__new__(SlaveMessageProcessor)
     processor.bot = Mock()
     processor.bot._cleanup_tls = SimpleNamespace(pending_cleanup=[])
-    processor.flag = Mock(return_value="emoji")
+    processor.flag = Mock(side_effect=lambda flag_name: "emoji" if flag_name == "default_media_prompt" else False)
     processor.logger = Mock()
-    processor.channel = SimpleNamespace(config={"admins": [1]})
+    processor.channel = SimpleNamespace(config={"admins": [1]}, flag=processor.flag)
     return processor
 
 
@@ -243,8 +244,28 @@ def test_slave_message_image_sends_remote_image_url():
         message_thread_id=200,
         reply_markup=None,
         disable_notification=True,
-        _send_mode="eventual",
+        _send_mode="blocking",
     )
+    processor.bot.send_document.assert_not_called()
+
+
+def test_slave_message_image_sends_placeholder_when_remote_image_url_fails():
+    processor = build_slave_message_processor()
+    processor.bot.send_photo.side_effect = [
+        BadRequest("failed to get HTTP URL content"),
+        "__placeholder_message__",
+    ]
+    msg = build_remote_image_message()
+
+    result = processor.slave_message_image(msg, 100, None, "__template__", "__reactions__")
+
+    assert result == "__placeholder_message__"
+    assert processor.bot.send_photo.call_count == 2
+    first_call, second_call = processor.bot.send_photo.call_args_list
+    assert first_call.args[1] == REMOTE_IMAGE_URL
+    assert hasattr(second_call.args[1], "read")
+    assert second_call.kwargs["caption"] == "remote &lt;image&gt;"
+    assert second_call.kwargs["_send_mode"] == "blocking"
     processor.bot.send_document.assert_not_called()
 
 
@@ -288,8 +309,27 @@ def test_slave_message_file_sends_remote_image_url_as_document():
         message_thread_id=None,
         reply_markup=None,
         disable_notification=True,
-        _send_mode="eventual",
+        _send_mode="blocking",
     )
+
+
+def test_slave_message_file_sends_placeholder_when_remote_document_url_fails():
+    processor = build_slave_message_processor()
+    processor.bot.send_document.side_effect = [
+        BadRequest("failed to get HTTP URL content"),
+        "__placeholder_message__",
+    ]
+    msg = build_remote_image_message()
+
+    result = processor.slave_message_file(msg, 100, None, "__template__", "__reactions__")
+
+    assert result == "__placeholder_message__"
+    assert processor.bot.send_document.call_count == 2
+    first_call, second_call = processor.bot.send_document.call_args_list
+    assert first_call.args[1] == REMOTE_IMAGE_URL
+    assert hasattr(second_call.args[1], "read")
+    assert second_call.kwargs["filename"] == "remote-image-placeholder.png"
+    assert second_call.kwargs["_send_mode"] == "blocking"
 
 
 def test_reaction_target_prefers_primary_message_for_slave_origin_text():
