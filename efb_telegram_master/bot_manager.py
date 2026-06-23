@@ -2472,8 +2472,12 @@ class TelegramBotManager(LocaleMixin):
     def _detect_empty_file(self, file, chat, caption, prefix, suffix, message_thread_id=None):
         empty = True
         if isinstance(file, str):
-            stat_path = url2pathname(urlparse(file).path) if file.startswith('file://') else file
-            empty = os.stat(stat_path).st_size == 0
+            parsed = urlparse(file)
+            if parsed.scheme in {'http', 'https'}:
+                empty = False
+            else:
+                stat_path = url2pathname(parsed.path) if parsed.scheme == 'file' else file
+                empty = os.stat(stat_path).st_size == 0
         elif hasattr(file, "seekable"):
             try:
                 if hasattr(file, 'closed') and file.closed:

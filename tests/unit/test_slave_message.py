@@ -1,5 +1,5 @@
 from pytest import fixture
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -66,6 +66,37 @@ def build_dummy_message(chat: Chat, author: ChatMember) -> Message:
     message.chat = chat
     message.author = author
     return message
+
+
+REMOTE_IMAGE_URL = "https://example.com/images/photo.jpg"
+
+
+def build_remote_image_message(remote_image_url: str = REMOTE_IMAGE_URL) -> Message:
+    message = Message()
+    message.uid = "__remote_image_msg__"
+    message.type = MsgType.Image
+    message.text = "remote <image>"
+    message.file = None
+    message.path = None
+    message.mime = None
+    message.filename = None
+    message.edit_media = False
+    message.commands = None
+    message.substitutions = None
+    message.vendor_specific = {
+        SlaveMessageProcessor.REMOTE_IMAGE_URL_VENDOR_KEY: remote_image_url,
+    }
+    return message
+
+
+def build_slave_message_processor() -> SlaveMessageProcessor:
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.bot = Mock()
+    processor.bot._cleanup_tls = SimpleNamespace(pending_cleanup=[])
+    processor.flag = Mock(return_value="emoji")
+    processor.logger = Mock()
+    processor.channel = SimpleNamespace(config={"admins": [1]})
+    return processor
 
 
 def test_slave_message_generate_common_private(generate_message_template, private):
@@ -188,6 +219,77 @@ def test_build_inline_keyboard_existing_buttons(build_inline_keyboard, private):
     assert "__text__" in seq
     assert "__template__" in seq
     assert "__reactions__" in seq
+
+
+def test_slave_message_image_sends_remote_image_url():
+    processor = build_slave_message_processor()
+    processor.bot.send_photo.return_value = "__telegram_message__"
+    msg = build_remote_image_message()
+
+    result = processor.slave_message_image(
+        msg, 100, 200, "__template__", "__reactions__",
+        target_msg_id=300, silent=True
+    )
+
+    assert result == "__telegram_message__"
+    processor.bot.send_photo.assert_called_once_with(
+        100,
+        REMOTE_IMAGE_URL,
+        prefix="__template__",
+        suffix="__reactions__",
+        caption="remote &lt;image&gt;",
+        parse_mode="HTML",
+        reply_to_message_id=300,
+        message_thread_id=200,
+        reply_markup=None,
+        disable_notification=True,
+        _send_mode="eventual",
+    )
+    processor.bot.send_document.assert_not_called()
+
+
+def test_slave_message_image_edits_remote_image_url_media():
+    processor = build_slave_message_processor()
+    processor.bot.edit_message_media.return_value = "__edited_message__"
+    msg = build_remote_image_message()
+    msg.text = ""
+    msg.edit_media = True
+
+    result = processor.slave_message_image(msg, 100, None, "", "", old_msg_id=(100, 10))
+
+    assert result == "__edited_message__"
+    media = processor.bot.edit_message_media.call_args.kwargs["media"]
+    assert isinstance(media, InputMediaPhoto)
+    assert media.media == REMOTE_IMAGE_URL
+    processor.bot.edit_message_caption.assert_not_called()
+
+
+def test_slave_message_file_sends_remote_image_url_as_document():
+    remote_image_url = "https://example.com/images/photo;1.jpg"
+    processor = build_slave_message_processor()
+    processor.bot.send_document.return_value = "__telegram_message__"
+    msg = build_remote_image_message(remote_image_url)
+
+    result = processor.slave_message_file(
+        msg, 100, None, "__template__", "__reactions__",
+        target_msg_id=300, silent=True
+    )
+
+    assert result == "__telegram_message__"
+    processor.bot.send_document.assert_called_once_with(
+        100,
+        remote_image_url,
+        prefix="__template__",
+        suffix="__reactions__",
+        caption="remote &lt;image&gt;",
+        parse_mode="HTML",
+        filename="photo 1.jpg",
+        reply_to_message_id=300,
+        message_thread_id=None,
+        reply_markup=None,
+        disable_notification=True,
+        _send_mode="eventual",
+    )
 
 
 def test_reaction_target_prefers_primary_message_for_slave_origin_text():

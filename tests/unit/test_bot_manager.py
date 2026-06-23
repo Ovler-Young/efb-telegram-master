@@ -117,6 +117,22 @@ def test_malformed_html_caption(channel, bot_admin, image):
     )
 
 
+def test_empty_file_detection_skips_http_url():
+    manager = SimpleNamespace(send_message=Mock(), _=lambda text: text)
+
+    result = TelegramBotManager._detect_empty_file(
+        manager,
+        "https://example.com/images/photo.jpg",
+        100,
+        "",
+        "",
+        "",
+    )
+
+    assert result is None
+    manager.send_message.assert_not_called()
+
+
 def test_rate_limit_decorator_forced_routes_to_sender_bot():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
     aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False, reserve_slot=Mock(return_value=0.0))

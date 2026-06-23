@@ -826,6 +826,11 @@ Development notes (CI and tooling)
   ETM can copy files into a shared directory derived from ``api_base_file_url``
   (when it is a ``file://`` URL) for better container/shared-filesystem
   compatibility.
+- **Remote image URLs from slave channels**: for Telegram-specific delivery,
+  slave channels may set ``msg.vendor_specific["blueset.telegram.image_url"]``
+  on ``MsgType.Image`` messages to an HTTP(S) image URL. ETM will pass the URL
+  to Telegram for server-side download instead of requiring ``msg.file`` and
+  ``msg.path``.
 
 License
 -------

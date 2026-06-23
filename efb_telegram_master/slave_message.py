@@ -50,6 +50,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     REACTION_DB_WAIT_TIMEOUT = 2.0
     REACTION_DB_WAIT_INTERVAL = 0.05
+    REMOTE_IMAGE_URL_VENDOR_KEY = "blueset.telegram.image_url"
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
@@ -381,6 +382,26 @@ class SlaveMessageProcessor(LocaleMixin):
             return 'blocking'
         return 'eventual'
 
+    @classmethod
+    def _remote_image_url(cls, msg: Message) -> Optional[str]:
+        url = (msg.vendor_specific or {}).get(cls.REMOTE_IMAGE_URL_VENDOR_KEY)
+        if not isinstance(url, str):
+            return None
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return url
+        return None
+
+    @staticmethod
+    def _remote_image_filename(msg: Message, remote_image_url: str) -> str:
+        if msg.filename:
+            return msg.filename
+        parsed = urllib.parse.urlparse(remote_image_url)
+        parsed_path = parsed.path
+        if parsed.params:
+            parsed_path = f"{parsed_path};{parsed.params}"
+        return urllib.parse.unquote(os.path.basename(parsed_path)) or "image"
+
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                            old_msg_id: Optional[OldMsgID] = None,
@@ -489,7 +510,9 @@ class SlaveMessageProcessor(LocaleMixin):
                             target_msg_id: Optional[TelegramMessageID] = None,
                             reply_markup: Optional[ReplyMarkup] = None,
                             silent: bool = False) -> telegram.Message:
-        assert msg.file
+        remote_image_url = self._remote_image_url(msg)
+        if not remote_image_url:
+            assert msg.file
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO, message_thread_id=thread_id)
         self.logger.debug("[%s] Message is of %s type; Path: %s; MIME: %s", msg.uid, msg.type, msg.path, msg.mime)
         if msg.path:
@@ -507,6 +530,51 @@ class SlaveMessageProcessor(LocaleMixin):
                 text = ""
         else:
             text = ""
+
+        if remote_image_url:
+            if old_msg_id:
+                try:
+                    edit_kwargs = self._get_edit_kwargs(msg)
+                    if msg.edit_media:
+                        res = self.bot.edit_message_media(
+                            chat_id=old_msg_id[0],
+                            message_id=old_msg_id[1],
+                            media=InputMediaPhoto(remote_image_url),
+                            reply_markup=reply_markup,
+                            **edit_kwargs
+                        )
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                         reply_markup=reply_markup,
+                                                         prefix=msg_template, suffix=reactions, caption=text,
+                                                         parse_mode="HTML", **edit_kwargs)
+                except telegram.error.BadRequest as e:
+                    self.logger.warning("[%s] Failed to edit remote image/caption (BadRequest: %s). "
+                                        "Sending new message instead.", msg.uid, e)
+                    if old_msg_id[0] == tg_dest:
+                        target_msg_id = target_msg_id or old_msg_id[1]
+
+            try:
+                return self.bot.send_photo(tg_dest, remote_image_url, prefix=msg_template, suffix=reactions,
+                                           caption=text, parse_mode="HTML",
+                                           reply_to_message_id=target_msg_id,
+                                           message_thread_id=thread_id,
+                                           reply_markup=reply_markup,
+                                           disable_notification=silent,
+                                           _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+            except telegram.error.BadRequest as e:
+                self.logger.error('[%s] Failed to send remote image, sending as document. Reason: %s',
+                                  msg.uid, e)
+                file_name = self._remote_image_filename(msg, remote_image_url).replace(';', ' ')
+                return self.bot.send_document(tg_dest, remote_image_url, prefix=msg_template, suffix=reactions,
+                                              caption=text, parse_mode="HTML", filename=file_name,
+                                              reply_to_message_id=target_msg_id,
+                                              message_thread_id=thread_id,
+                                              reply_markup=reply_markup,
+                                              disable_notification=silent,
+                                              _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+
         try:
             # Avoid Telegram compression of pictures by sending high definition image messages as files
             # Code adopted from wolfsilver's fork:
@@ -798,7 +866,10 @@ class SlaveMessageProcessor(LocaleMixin):
                            silent: bool = False) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_DOCUMENT, message_thread_id=thread_id)
 
-        if msg.filename is None and msg.path is not None:
+        remote_image_url = self._remote_image_url(msg) if msg.type == MsgType.Image else None
+        if remote_image_url:
+            file_name = self._remote_image_filename(msg, remote_image_url)
+        elif msg.filename is None and msg.path is not None:
             file_name = os.path.basename(msg.path)
         else:
             assert msg.filename is not None  # mypy compliance
@@ -823,6 +894,31 @@ class SlaveMessageProcessor(LocaleMixin):
             text = ""
 
         try:
+            if remote_image_url:
+                if old_msg_id:
+                    edit_kwargs = self._get_edit_kwargs(msg)
+                    if msg.edit_media:
+                        res = self.bot.edit_message_media(
+                            chat_id=old_msg_id[0],
+                            message_id=old_msg_id[1],
+                            media=InputMediaDocument(remote_image_url),
+                            **edit_kwargs
+                        )
+                        if not text:
+                            return res
+                    return self.bot.edit_message_caption(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                         reply_markup=reply_markup,
+                                                         prefix=msg_template, suffix=reactions, caption=text,
+                                                         parse_mode="HTML", **edit_kwargs)
+                return self.bot.send_document(tg_dest, remote_image_url,
+                                              prefix=msg_template, suffix=reactions,
+                                              caption=text, parse_mode="HTML", filename=file_name,
+                                              reply_to_message_id=target_msg_id,
+                                              message_thread_id=thread_id,
+                                              reply_markup=reply_markup,
+                                              disable_notification=silent,
+                                              _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+
             file_too_large = self.check_file_size(msg.file)
             edit_media = msg.edit_media
             if file_too_large:
