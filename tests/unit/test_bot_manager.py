@@ -1121,6 +1121,7 @@ def test_process_db_retry_queue_succeeds_on_retry():
 
     db_mock = Mock()
     db_mock.add_or_update_message_log = Mock()  # succeeds now
+    on_complete = Mock()
 
     etm_msg = Mock()
     real_tg_msg = Mock()
@@ -1128,7 +1129,7 @@ def test_process_db_retry_queue_succeeds_on_retry():
 
     mgr = SimpleNamespace(
         channel=SimpleNamespace(db=db_mock),
-        _db_retry_queue=[(etm_msg, None, real_tg_msg, None, 1, 0.0)],
+        _db_retry_queue=[(etm_msg, None, real_tg_msg, None, 1, 0.0, on_complete)],
         _db_retry_lock=threading.Lock(),
         _db_max_retries=5,
         logger=Mock(),
@@ -1138,6 +1139,7 @@ def test_process_db_retry_queue_succeeds_on_retry():
 
     db_mock.add_or_update_message_log.assert_called_once()
     assert len(mgr._db_retry_queue) == 0
+    on_complete.assert_called_once()
 
 
 def test_process_db_retry_queue_gives_up_after_max_retries():
@@ -1221,6 +1223,92 @@ def test_register_delayed_database_update_stores_timestamp():
     entry = mgr._pending_delayed_logs["task-1"]
     assert len(entry) == 3
     assert entry[2] == 42.0  # registered_at timestamp
+
+
+def test_register_delayed_database_update_stores_completion_callback():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    on_complete = Mock()
+    mgr = SimpleNamespace(
+        _pending_delayed_logs={},
+        _completed_delayed_results={},
+        _pending_logs_lock=threading.Lock(),
+        logger=Mock(),
+    )
+
+    TelegramBotManager.register_delayed_database_update(
+        mgr, "task-1", Mock(), None, on_complete=on_complete,
+    )
+
+    entry = mgr._pending_delayed_logs["task-1"]
+    assert len(entry) == 4
+    assert entry[3] is on_complete
+
+
+def test_drop_delayed_database_update_runs_completion_callback():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    on_complete = Mock()
+    mgr = SimpleNamespace(
+        _pending_delayed_logs={"task-1": (Mock(), None, 1.0, on_complete)},
+        _completed_delayed_results={},
+        _pending_logs_lock=threading.Lock(),
+        logger=Mock(),
+    )
+
+    TelegramBotManager._drop_delayed_database_update(mgr, "task-1")
+
+    assert "task-1" not in mgr._pending_delayed_logs
+    on_complete.assert_called_once()
+
+
+def test_drop_delayed_database_update_before_register_runs_late_callback():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    on_complete = Mock()
+    db_mock = Mock()
+    db_mock.add_or_update_message_log = Mock()
+    mgr = SimpleNamespace(
+        channel=SimpleNamespace(db=db_mock),
+        _pending_delayed_logs={},
+        _completed_delayed_results={},
+        _pending_logs_lock=threading.Lock(),
+        logger=Mock(),
+    )
+
+    TelegramBotManager._drop_delayed_database_update(mgr, "task-1")
+    TelegramBotManager.register_delayed_database_update(
+        mgr, "task-1", Mock(), None, on_complete=on_complete,
+    )
+
+    assert "task-1" not in mgr._pending_delayed_logs
+    assert "task-1" not in mgr._completed_delayed_results
+    db_mock.add_or_update_message_log.assert_not_called()
+    on_complete.assert_called_once()
+
+
+def test_handle_delayed_database_update_runs_completion_callback():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    on_complete = Mock()
+    etm_msg = Mock()
+    real_tg_msg = Mock()
+    real_tg_msg.message_id = 999
+    db_mock = Mock()
+    mgr = SimpleNamespace(
+        channel=SimpleNamespace(db=db_mock),
+        _pending_delayed_logs={"task-1": (etm_msg, None, 1.0, on_complete)},
+        _completed_delayed_results={},
+        _pending_logs_lock=threading.Lock(),
+        logger=Mock(),
+    )
+
+    with patch("efb_telegram_master.bot_manager.get_msg_type", return_value="text"):
+        TelegramBotManager._handle_delayed_database_update(mgr, "task-1", real_tg_msg)
+
+    assert "task-1" not in mgr._pending_delayed_logs
+    db_mock.add_or_update_message_log.assert_called_once()
+    on_complete.assert_called_once()
 
 
 def test_handle_delayed_database_update_stores_timestamp():

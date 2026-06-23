@@ -1,3 +1,4 @@
+import threading
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from types import SimpleNamespace
@@ -66,6 +67,82 @@ def build_dummy_message(chat: Chat, author: ChatMember) -> Message:
     message.chat = chat
     message.author = author
     return message
+
+
+def build_duplicate_test_processor() -> SlaveMessageProcessor:
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    processor.db = Mock()
+    processor.logger = Mock()
+    processor.get_slave_msg_dest = Mock(return_value=("__template__", (123, None)))
+    processor.is_silent = Mock(return_value=False)
+    processor.dispatch_message = Mock()
+    processor._pending_slave_messages = set()
+    processor._pending_slave_messages_lock = threading.Lock()
+    return processor
+
+
+def build_duplicate_test_message(uid: str = "__msg_id__") -> SimpleNamespace:
+    return SimpleNamespace(
+        uid=uid,
+        edit=False,
+        type=MsgType.Text,
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+    )
+
+
+def test_duplicate_slave_message_logged_is_skipped():
+    processor = build_duplicate_test_processor()
+    processor.db.get_msg_log.return_value = SimpleNamespace(master_msg_id="100.10")
+    message = build_duplicate_test_message()
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    processor.get_slave_msg_dest.assert_not_called()
+    processor.dispatch_message.assert_not_called()
+
+
+def test_duplicate_slave_message_pending_is_skipped():
+    processor = build_duplicate_test_processor()
+    processor.db.get_msg_log.return_value = None
+    message = build_duplicate_test_message()
+    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
+    processor._pending_slave_messages.add(key)
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    processor.get_slave_msg_dest.assert_not_called()
+    processor.dispatch_message.assert_not_called()
+
+
+def test_new_slave_message_claims_pending_before_dispatch():
+    processor = build_duplicate_test_processor()
+    processor.db.get_msg_log.return_value = None
+    message = build_duplicate_test_message()
+    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    assert key in processor._pending_slave_messages
+    processor.dispatch_message.assert_called_once_with(
+        message, "__template__", None, 123, None, False, dedupe_key=key,
+    )
+
+
+def test_undelivered_slave_message_releases_pending_claim():
+    processor = build_duplicate_test_processor()
+    processor.db.get_msg_log.return_value = None
+    processor.is_silent.return_value = None
+    message = build_duplicate_test_message()
+    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    assert key not in processor._pending_slave_messages
+    processor.dispatch_message.assert_not_called()
 
 
 def test_slave_message_generate_common_private(generate_message_template, private):
