@@ -2555,11 +2555,6 @@ class TelegramBotManager(LocaleMixin):
         return cast(bool, self._bot.reopen_forum_topic(*args, **kwargs))
 
     @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
-    def delete_forum_topic(self, *args, **kwargs) -> bool:
-        return cast(bool, self._bot.delete_forum_topic(*args, **kwargs))
-
-    @Decorators.retry_on_timeout
     def create_new_sticker_set(self, *args, **kwargs) -> bool:
         return cast(bool, self._bot.create_new_sticker_set(*args, **kwargs))
 
@@ -2570,10 +2565,6 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_timeout
     def get_sticker_set(self, *args, **kwargs) -> StickerSet:
         return cast(StickerSet, self._bot.get_sticker_set(*args, **kwargs))
-
-    @Decorators.retry_on_timeout
-    def get_forum_topic_icon_stickers(self, *args, **kwargs):
-        return self._bot.get_forum_topic_icon_stickers(*args, **kwargs)
 
     @Decorators.retry_on_timeout
     def delete_sticker_from_set(self, *args, **kwargs) -> bool:

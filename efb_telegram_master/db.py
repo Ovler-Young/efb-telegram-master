@@ -61,8 +61,8 @@ class TopicAssoc(BaseModel):
     slave_uid = TextField()
 
 
-class TopicIconCache(BaseModel):
-    avatar_hash = TextField(primary_key=True)
+class UserEmojiCache(BaseModel):
+    cache_key = TextField(primary_key=True)
     custom_emoji_id = TextField()
     sticker_set_name = TextField()
     created_at = DateTimeField(default=datetime.datetime.now)
@@ -260,12 +260,12 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, TopicIconCache])
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, UserEmojiCache])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, TopicIconCache], safe=True)
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, UserEmojiCache], safe=True)
 
     @staticmethod
     def _select_existing_columns(model, table_name: str, requested_fields: List):
@@ -292,7 +292,7 @@ class DatabaseManager:
         sqlite_db.start()
         sqlite_db.connect()
 
-        models = [ChatAssoc, TopicAssoc, TopicIconCache, SlaveChatInfo, MsgLog]
+        models = [ChatAssoc, TopicAssoc, UserEmojiCache, SlaveChatInfo, MsgLog]
         with sqlite_db.bind_ctx(models):
             chat_assocs = list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
@@ -303,14 +303,14 @@ class DatabaseManager:
                 ).dicts())
             else:
                 topic_assocs = []
-            if TopicIconCache.table_exists():
-                topic_icon_caches = self._select_existing_columns(TopicIconCache, "topiciconcache", [
-                    TopicIconCache.avatar_hash, TopicIconCache.custom_emoji_id,
-                    TopicIconCache.sticker_set_name, TopicIconCache.created_at,
-                    TopicIconCache.updated_at
+            if UserEmojiCache.table_exists():
+                user_emoji_caches = self._select_existing_columns(UserEmojiCache, "useremojicache", [
+                    UserEmojiCache.cache_key, UserEmojiCache.custom_emoji_id,
+                    UserEmojiCache.sticker_set_name, UserEmojiCache.created_at,
+                    UserEmojiCache.updated_at
                 ])
             else:
-                topic_icon_caches = []
+                user_emoji_caches = []
             slave_chat_infos = self._select_existing_columns(SlaveChatInfo, "slavechatinfo", [
                 SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_channel_emoji,
                 SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id,
@@ -335,8 +335,8 @@ class DatabaseManager:
                 ChatAssoc.insert_many(batch).execute()
             for batch in chunked(topic_assocs, 500):
                 TopicAssoc.insert_many(batch).execute()
-            for batch in chunked(topic_icon_caches, 500):
-                TopicIconCache.insert_many(batch).execute()
+            for batch in chunked(user_emoji_caches, 500):
+                UserEmojiCache.insert_many(batch).execute()
             for batch in chunked(slave_chat_infos, 500):
                 SlaveChatInfo.insert_many(batch).execute()
             for batch in chunked(msg_logs, 500):
@@ -347,10 +347,10 @@ class DatabaseManager:
 
         self.logger.info(
             "Migration complete. %d chat assocs, %d topic assocs, "
-            "%d topic icon caches, %d chat infos, %d messages migrated. "
+            "%d user emoji caches, %d chat infos, %d messages migrated. "
             "Original SQLite file renamed to %s",
             len(chat_assocs), len(topic_assocs),
-            len(topic_icon_caches),
+            len(user_emoji_caches),
             len(slave_chat_infos), len(msg_logs),
             migrated_path
         )
@@ -565,30 +565,30 @@ class DatabaseManager:
         return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
 
     @staticmethod
-    def get_topic_icon_cache(avatar_hash: str) -> Optional[Tuple[str, str]]:
-        row = TopicIconCache.get_or_none(TopicIconCache.avatar_hash == avatar_hash)
+    def get_user_emoji_cache(cache_key: str) -> Optional[Tuple[str, str]]:
+        row = UserEmojiCache.get_or_none(UserEmojiCache.cache_key == cache_key)
         if row:
             return row.custom_emoji_id, row.sticker_set_name
         return None
 
     @staticmethod
-    def set_topic_icon_cache(avatar_hash: str, custom_emoji_id: str, sticker_set_name: str):
+    def set_user_emoji_cache(cache_key: str, custom_emoji_id: str, sticker_set_name: str):
         now = datetime.datetime.now()
         try:
-            return TopicIconCache.create(
-                avatar_hash=avatar_hash,
+            return UserEmojiCache.create(
+                cache_key=cache_key,
                 custom_emoji_id=custom_emoji_id,
                 sticker_set_name=sticker_set_name,
                 created_at=now,
                 updated_at=now,
             )
         except IntegrityError:
-            TopicIconCache.update(
+            UserEmojiCache.update(
                 custom_emoji_id=custom_emoji_id,
                 sticker_set_name=sticker_set_name,
                 updated_at=now,
-            ).where(TopicIconCache.avatar_hash == avatar_hash).execute()
-            return TopicIconCache.get(TopicIconCache.avatar_hash == avatar_hash)
+            ).where(UserEmojiCache.cache_key == cache_key).execute()
+            return UserEmojiCache.get(UserEmojiCache.cache_key == cache_key)
 
     @staticmethod
     def get_topic_thread_id(slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:

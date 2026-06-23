@@ -695,41 +695,37 @@ e.g.:
       to route messages between a topic and its linked remote chat.
     - The id set here will be the default topic group for new chats.
 
--   ``topic_icons`` *(dict)* [Default: ``{}``]
+-   ``user_emoji`` *(dict)* [Default: ``{}``]
 
-    Configure custom emoji generated from remote group member avatars.
+    Configure custom emoji generated from remote user avatars.
 
-    - ``sync_avatar_to_custom_emoji``: when unset or ``true``, ETM tries to
-      convert remote group member avatars into Telegram custom emoji stickers
-      with the main bot token and uses them before member names in bridged
-      group message headers. Topic custom emoji icon updates are currently
-      disabled because Telegram rejects this Bot API operation for bot-only
-      sessions. Set this to ``false`` to disable generated avatar emoji while
-      still allowing explicit ``custom_emoji_ids``.
-    - ``/sync_topic_icons``: replies with a disabled notice while Bot API
-      topic icon updates are not usable from this bot-only implementation.
+    - ``enabled``: when unset or ``true``, ETM tries to convert remote user
+      avatars into Telegram custom emoji stickers with the main bot token and
+      uses them before user names in bridged message headers. Set this to
+      ``false`` to disable generated avatar emoji while still allowing explicit
+      ``custom_emoji_ids``.
     - ``sticker_set_name``: base sticker set name used for generated custom
-      emoji. Defaults to ``etm_topic_icons``. ETM appends
+      emoji. Defaults to ``etm_user_avatars``. ETM appends
       ``_by_<bot_username>`` when it is not already present. When one set
       reaches Telegram's 200-sticker limit, ETM adds ``_<n>`` before the bot
       username suffix.
     - ``owner_user_id``: optional Telegram user ID that owns generated sticker
       sets. Defaults to the first configured admin.
-    - ``custom_emoji_ids``: optional mapping from ETM slave group member UID
-      to an existing ``custom_emoji_id``. These IDs are used before generated
-      avatar emoji. Generated custom emoji are also deduplicated by avatar PNG
-      hash in ETM's database, so the same avatar is reused across restarts.
+    - ``custom_emoji_ids``: optional mapping from ETM slave user UID to an
+      existing ``custom_emoji_id``. These IDs are used before generated avatar
+      emoji. Generated custom emoji are cached in ETM's database and reused
+      across restarts.
 
     Example:
 
     .. code:: yaml
 
-       topic_icons:
-           sync_avatar_to_custom_emoji: true
-           sticker_set_name: etm_topic_icons
+       user_emoji:
+           enabled: true
+           sticker_set_name: etm_user_avatars
            owner_user_id: 102938475
            custom_emoji_ids:
-               blueset.telegram:example-chat: "5368324170671202286"
+               blueset.telegram:example-user: "5368324170671202286"
 
 Network configuration: timeout tweaks
 -------------------------------------

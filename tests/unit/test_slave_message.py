@@ -137,53 +137,53 @@ def test_slave_message_generate_group_linked(generate_message_template, group, g
     assert group_member.alias in header
 
 
-def test_slave_message_generate_group_linked_with_author_avatar_emoji(channel, group, group_member):
+def test_slave_message_generate_group_linked_with_user_avatar_emoji(channel, group, group_member):
     message = build_dummy_message(group, group_member)
-    old_topic_icons = channel.config.get("topic_icons")
+    old_user_emoji = channel.config.get("user_emoji")
 
     try:
-        channel.config["topic_icons"] = {
-            "sync_avatar_to_custom_emoji": True,
+        channel.config["user_emoji"] = {
+            "enabled": True,
         }
         with patch.object(
             channel.slave_messages,
-            "_author_avatar_custom_emoji_prefix",
+            "_user_avatar_custom_emoji_prefix",
             return_value="\x00ETM_CUSTOM_EMOJI:12345\x00",
         ):
             header = channel.slave_messages.generate_message_template(message, True)
     finally:
-        if old_topic_icons is None:
-            channel.config.pop("topic_icons", None)
+        if old_user_emoji is None:
+            channel.config.pop("user_emoji", None)
         else:
-            channel.config["topic_icons"] = old_topic_icons
+            channel.config["user_emoji"] = old_user_emoji
 
     assert header.startswith("\x00ETM_CUSTOM_EMOJI:12345\x00 ")
     assert group_member.name in header
     assert group_member.alias in header
 
 
-def test_author_avatar_custom_emoji_prefix_passes_chat_member_picture_loader(channel, slave, group, group_member):
+def test_user_avatar_custom_emoji_prefix_passes_chat_member_picture_loader(channel, slave, group, group_member):
     message = build_dummy_message(group, group_member)
-    old_topic_icons = channel.config.get("topic_icons")
+    old_user_emoji = channel.config.get("user_emoji")
     picture = io.BytesIO(b"avatar")
 
     try:
-        channel.config["topic_icons"] = {
-            "sync_avatar_to_custom_emoji": True,
+        channel.config["user_emoji"] = {
+            "enabled": True,
         }
         with patch.object(slave, "get_chat_member_picture", return_value=picture, create=True) as get_chat_member_picture, \
              patch.object(slave, "get_chat_picture") as get_chat_picture, \
              patch.object(
                  channel.chat_binding,
-                 "resolve_author_avatar_custom_emoji_id_lazy",
+                 "resolve_user_avatar_custom_emoji_id_lazy",
                  return_value="12345",
              ) as resolve:
-            prefix = channel.slave_messages._author_avatar_custom_emoji_prefix(message)
+            prefix = channel.slave_messages._user_avatar_custom_emoji_prefix(message)
     finally:
-        if old_topic_icons is None:
-            channel.config.pop("topic_icons", None)
+        if old_user_emoji is None:
+            channel.config.pop("user_emoji", None)
         else:
-            channel.config["topic_icons"] = old_topic_icons
+            channel.config["user_emoji"] = old_user_emoji
 
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
     resolve.assert_called_once()
@@ -195,32 +195,32 @@ def test_author_avatar_custom_emoji_prefix_passes_chat_member_picture_loader(cha
     get_chat_picture.assert_not_called()
 
 
-def test_author_avatar_custom_emoji_prefix_passes_chat_picture_loader(channel, slave, group, group_member):
+def test_user_avatar_custom_emoji_prefix_passes_chat_picture_loader(channel, slave, group, group_member):
     message = build_dummy_message(group, group_member)
-    old_topic_icons = channel.config.get("topic_icons")
+    old_user_emoji = channel.config.get("user_emoji")
     picture = io.BytesIO(b"avatar")
     old_get_chat_member_picture = getattr(slave, "get_chat_member_picture", None)
 
     try:
-        channel.config["topic_icons"] = {
-            "sync_avatar_to_custom_emoji": True,
+        channel.config["user_emoji"] = {
+            "enabled": True,
         }
         if hasattr(slave, "get_chat_member_picture"):
             delattr(slave, "get_chat_member_picture")
         with patch.object(slave, "get_chat_picture", return_value=picture) as get_chat_picture, \
              patch.object(
                  channel.chat_binding,
-                 "resolve_author_avatar_custom_emoji_id_lazy",
+                 "resolve_user_avatar_custom_emoji_id_lazy",
                  return_value="12345",
              ) as resolve:
-            prefix = channel.slave_messages._author_avatar_custom_emoji_prefix(message)
+            prefix = channel.slave_messages._user_avatar_custom_emoji_prefix(message)
     finally:
         if old_get_chat_member_picture is not None:
             slave.get_chat_member_picture = old_get_chat_member_picture
-        if old_topic_icons is None:
-            channel.config.pop("topic_icons", None)
+        if old_user_emoji is None:
+            channel.config.pop("user_emoji", None)
         else:
-            channel.config["topic_icons"] = old_topic_icons
+            channel.config["user_emoji"] = old_user_emoji
 
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
     resolve.assert_called_once()
@@ -231,23 +231,23 @@ def test_author_avatar_custom_emoji_prefix_passes_chat_picture_loader(channel, s
     get_chat_picture.assert_called_once_with(group_member)
 
 
-def test_author_avatar_custom_emoji_prefix_uses_default_topic_icon_config(channel, slave, group, group_member):
+def test_user_avatar_custom_emoji_prefix_uses_default_user_emoji_config(channel, slave, group, group_member):
     message = build_dummy_message(group, group_member)
-    old_topic_icons = channel.config.get("topic_icons")
+    old_user_emoji = channel.config.get("user_emoji")
     picture = io.BytesIO(b"avatar")
 
     try:
-        channel.config.pop("topic_icons", None)
+        channel.config.pop("user_emoji", None)
         with patch.object(slave, "get_chat_member_picture", return_value=picture, create=True) as get_chat_member_picture, \
              patch.object(
                  channel.chat_binding,
-                 "resolve_author_avatar_custom_emoji_id_lazy",
+                 "resolve_user_avatar_custom_emoji_id_lazy",
                  return_value="12345",
              ) as resolve:
-            prefix = channel.slave_messages._author_avatar_custom_emoji_prefix(message)
+            prefix = channel.slave_messages._user_avatar_custom_emoji_prefix(message)
     finally:
-        if old_topic_icons is not None:
-            channel.config["topic_icons"] = old_topic_icons
+        if old_user_emoji is not None:
+            channel.config["user_emoji"] = old_user_emoji
 
     assert prefix == "\x00ETM_CUSTOM_EMOJI:12345\x00"
     resolve.assert_called_once()
@@ -255,6 +255,20 @@ def test_author_avatar_custom_emoji_prefix_uses_default_topic_icon_config(channe
     assert loaded_picture is picture
     assert picture_source == "member"
     get_chat_member_picture.assert_called_once_with(group_member)
+
+
+def test_slave_message_generate_private_with_user_avatar_emoji(channel, private):
+    message = build_dummy_message(private, private.other)
+
+    with patch.object(
+        channel.slave_messages,
+        "_user_avatar_custom_emoji_prefix",
+        return_value="\x00ETM_CUSTOM_EMOJI:12345\x00",
+    ):
+        header = channel.slave_messages.generate_message_template(message, False)
+
+    assert "\x00ETM_CUSTOM_EMOJI:12345\x00" in header
+    assert private.other.long_name in header
 
 
 def test_slave_message_generate_group_linked_self(generate_message_template, group):

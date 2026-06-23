@@ -61,7 +61,7 @@ class SlaveMessageProcessor(LocaleMixin):
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
-        self._logged_author_avatar_custom_emoji: set[Tuple[str, str, str]] = set()
+        self._logged_user_avatar_custom_emoji: set[Tuple[str, str, str]] = set()
 
     @staticmethod
     def _get_edit_kwargs(msg: Message):
@@ -1203,19 +1203,17 @@ class SlaveMessageProcessor(LocaleMixin):
         self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
 
     @staticmethod
-    def _get_author_avatar_picture(slave_channel, author: ChatMember) -> Tuple[IO, str]:
+    def _get_user_avatar_picture(slave_channel, author: ChatMember) -> Tuple[IO, str]:
         get_member_picture = getattr(slave_channel, "get_chat_member_picture", None)
         if callable(get_member_picture):
             return get_member_picture(author), "member"
         return slave_channel.get_chat_picture(author), "chat"
 
-    def _author_avatar_custom_emoji_prefix(self, msg: Message) -> str:
+    def _user_avatar_custom_emoji_prefix(self, msg: Message) -> str:
         msg_uid = getattr(msg, "uid", "")
-        if not isinstance(msg.chat, GroupChat) or isinstance(msg.author, SelfChatMember):
+        if not isinstance(msg.chat, (GroupChat, PrivateChat)) or isinstance(msg.author, SelfChatMember):
             return ""
-        if msg.author == msg.chat.self:
-            return ""
-        if not self.channel.chat_binding._is_topic_icon_sync_enabled():
+        if getattr(msg.chat, "self", None) is not None and msg.author == msg.chat.self:
             return ""
 
         author = msg.author
@@ -1227,25 +1225,25 @@ class SlaveMessageProcessor(LocaleMixin):
             slave_channel = coordinator.slaves.get(channel_id)
             if not slave_channel:
                 self.logger.debug(
-                    "[%s] Cannot resolve author avatar custom emoji; channel %s is not loaded.",
+                    "[%s] Cannot resolve user avatar custom emoji; channel %s is not loaded.",
                     msg_uid,
                     channel_id,
                 )
                 return ""
 
             author_uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
-            custom_emoji_id = self.channel.chat_binding.resolve_author_avatar_custom_emoji_id_lazy(
+            custom_emoji_id = self.channel.chat_binding.resolve_user_avatar_custom_emoji_id_lazy(
                 author_uid,
-                lambda: self._get_author_avatar_picture(slave_channel, author),
+                lambda: self._get_user_avatar_picture(slave_channel, author),
                 msg_uid=msg_uid,
             )
             if not custom_emoji_id:
                 return ""
             log_key = (str(author.uid), str(msg.chat.uid), custom_emoji_id)
-            if log_key not in self._logged_author_avatar_custom_emoji:
-                self._logged_author_avatar_custom_emoji.add(log_key)
+            if log_key not in self._logged_user_avatar_custom_emoji:
+                self._logged_user_avatar_custom_emoji.add(log_key)
                 self.logger.info(
-                    "[%s] Resolved author avatar custom emoji: author_uid=%s group_uid=%s "
+                    "[%s] Resolved user avatar custom emoji: user_uid=%s chat_uid=%s "
                     "custom_emoji_id=%s",
                     msg_uid,
                     author.uid,
@@ -1255,7 +1253,7 @@ class SlaveMessageProcessor(LocaleMixin):
             return custom_emoji_placeholder(custom_emoji_id)
         except (EFBOperationNotSupported, TelegramError, ValueError) as e:
             self.logger.debug(
-                "[%s] Failed to resolve author avatar custom emoji for %s: %s",
+                "[%s] Failed to resolve user avatar custom emoji for %s: %s",
                 msg_uid,
                 utils.chat_id_to_str(chat=author),
                 e,
@@ -1263,7 +1261,7 @@ class SlaveMessageProcessor(LocaleMixin):
             return ""
         except Exception as e:
             self.logger.warning(
-                "[%s] Failed to resolve author avatar custom emoji for %s. error_type=%s error_message=%r",
+                "[%s] Failed to resolve user avatar custom emoji for %s. error_type=%s error_message=%r",
                 msg_uid,
                 utils.chat_id_to_str(chat=author),
                 type(e).__name__,
@@ -1277,23 +1275,25 @@ class SlaveMessageProcessor(LocaleMixin):
         if isinstance(msg.chat, GroupChat):
             self.logger.debug("[%s] Message is from a group. Sender: %s", msg.uid, msg.author)
             msg_prefix = msg.author.long_name
-            author_icon_prefix = self._author_avatar_custom_emoji_prefix(msg)
-            if author_icon_prefix:
-                msg_prefix = f"{author_icon_prefix} {msg_prefix}"
+            user_icon_prefix = self._user_avatar_custom_emoji_prefix(msg)
+            if user_icon_prefix:
+                msg_prefix = f"{user_icon_prefix} {msg_prefix}"
 
         if singly_linked:
             if msg_prefix:  # if group message
                 msg_template = f"{msg_prefix}:"
             else:
                 if msg.chat != msg.author:
-                    msg_template = f"{msg.author.long_name}:"
+                    user_icon_prefix = self._user_avatar_custom_emoji_prefix(msg)
+                    msg_template = f"{user_icon_prefix + ' ' if user_icon_prefix else ''}{msg.author.long_name}:"
                 else:
                     msg_template = ""
         elif isinstance(msg.chat, PrivateChat):
             emoji_prefix = msg.chat.channel_emoji + Emoji.USER
             name_prefix = msg.chat.long_name
             if msg.chat.other != msg.author:
-                name_prefix += f", {msg.author.long_name}"
+                user_icon_prefix = self._user_avatar_custom_emoji_prefix(msg)
+                name_prefix += f", {user_icon_prefix + ' ' if user_icon_prefix else ''}{msg.author.long_name}"
             msg_template = f"{emoji_prefix} {name_prefix}:"
         elif isinstance(msg.chat, GroupChat):
             emoji_prefix = msg.chat.channel_emoji + Emoji.GROUP
