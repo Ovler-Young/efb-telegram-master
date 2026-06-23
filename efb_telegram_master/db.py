@@ -9,7 +9,7 @@ from functools import partial
 from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING
 from pathlib import Path
 
-from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy
+from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy, IntegrityError
 from playhouse.migrate import migrate
 from telegram import Message
 from typing_extensions import TypedDict
@@ -59,6 +59,14 @@ class TopicAssoc(BaseModel):
     topic_chat_id = TextField()
     message_thread_id = TextField()
     slave_uid = TextField()
+
+
+class UserEmojiCache(BaseModel):
+    cache_key = TextField(primary_key=True)
+    custom_emoji_id = TextField()
+    sticker_set_name = TextField()
+    created_at = DateTimeField(default=datetime.datetime.now)
+    updated_at = DateTimeField(default=datetime.datetime.now)
 
 
 class ChatAssoc(BaseModel):
@@ -252,12 +260,12 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc])
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, UserEmojiCache])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc], safe=True)
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, UserEmojiCache], safe=True)
 
     @staticmethod
     def _select_existing_columns(model, table_name: str, requested_fields: List):
@@ -284,7 +292,7 @@ class DatabaseManager:
         sqlite_db.start()
         sqlite_db.connect()
 
-        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog]
+        models = [ChatAssoc, TopicAssoc, UserEmojiCache, SlaveChatInfo, MsgLog]
         with sqlite_db.bind_ctx(models):
             chat_assocs = list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
@@ -295,6 +303,14 @@ class DatabaseManager:
                 ).dicts())
             else:
                 topic_assocs = []
+            if UserEmojiCache.table_exists():
+                user_emoji_caches = self._select_existing_columns(UserEmojiCache, "useremojicache", [
+                    UserEmojiCache.cache_key, UserEmojiCache.custom_emoji_id,
+                    UserEmojiCache.sticker_set_name, UserEmojiCache.created_at,
+                    UserEmojiCache.updated_at
+                ])
+            else:
+                user_emoji_caches = []
             slave_chat_infos = self._select_existing_columns(SlaveChatInfo, "slavechatinfo", [
                 SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_channel_emoji,
                 SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id,
@@ -319,6 +335,8 @@ class DatabaseManager:
                 ChatAssoc.insert_many(batch).execute()
             for batch in chunked(topic_assocs, 500):
                 TopicAssoc.insert_many(batch).execute()
+            for batch in chunked(user_emoji_caches, 500):
+                UserEmojiCache.insert_many(batch).execute()
             for batch in chunked(slave_chat_infos, 500):
                 SlaveChatInfo.insert_many(batch).execute()
             for batch in chunked(msg_logs, 500):
@@ -329,9 +347,10 @@ class DatabaseManager:
 
         self.logger.info(
             "Migration complete. %d chat assocs, %d topic assocs, "
-            "%d chat infos, %d messages migrated. "
+            "%d user emoji caches, %d chat infos, %d messages migrated. "
             "Original SQLite file renamed to %s",
             len(chat_assocs), len(topic_assocs),
+            len(user_emoji_caches),
             len(slave_chat_infos), len(msg_logs),
             migrated_path
         )
@@ -546,6 +565,32 @@ class DatabaseManager:
         return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
 
     @staticmethod
+    def get_user_emoji_cache(cache_key: str) -> Optional[Tuple[str, str]]:
+        row = UserEmojiCache.get_or_none(UserEmojiCache.cache_key == cache_key)
+        if row:
+            return row.custom_emoji_id, row.sticker_set_name
+        return None
+
+    @staticmethod
+    def set_user_emoji_cache(cache_key: str, custom_emoji_id: str, sticker_set_name: str):
+        now = datetime.datetime.now()
+        try:
+            return UserEmojiCache.create(
+                cache_key=cache_key,
+                custom_emoji_id=custom_emoji_id,
+                sticker_set_name=sticker_set_name,
+                created_at=now,
+                updated_at=now,
+            )
+        except IntegrityError:
+            UserEmojiCache.update(
+                custom_emoji_id=custom_emoji_id,
+                sticker_set_name=sticker_set_name,
+                updated_at=now,
+            ).where(UserEmojiCache.cache_key == cache_key).execute()
+            return UserEmojiCache.get(UserEmojiCache.cache_key == cache_key)
+
+    @staticmethod
     def get_topic_thread_id(slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
         """
         Get topic association (topic link) information.
@@ -620,6 +665,17 @@ class DatabaseManager:
             return None
         except AttributeError:
             return None
+
+    @staticmethod
+    def get_topic_chat_ids() -> List[TelegramChatID]:
+        """
+        Get all forum group chat IDs with topic associations.
+
+        Returns:
+            List[TelegramChatID]: Forum group chat IDs known to ETM.
+        """
+        query = TopicAssoc.select(TopicAssoc.topic_chat_id).distinct().order_by(TopicAssoc.topic_chat_id)
+        return [TelegramChatID(int(row.topic_chat_id)) for row in query]
 
     @staticmethod
     def remove_topic_assoc(topic_chat_id: Optional[TelegramChatID] = None,

@@ -5,15 +5,16 @@ import io
 import logging
 import re
 import shlex
+import hashlib
 import urllib.parse
 import threading
 import time
 from contextlib import suppress
-from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Pattern, cast
+from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Pattern, cast, Callable
 
 import telegram  # lgtm [py/import-and-import-from]
 from PIL import Image
-from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InputSticker, Sticker, Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ConversationHandler, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler
@@ -96,6 +97,9 @@ class ChatBindingManager(LocaleMixin):
 
     # Consts
     TELEGRAM_MIN_PROFILE_PICTURE_SIZE = 256
+    TELEGRAM_CUSTOM_EMOJI_SIZE = 100
+    TELEGRAM_CUSTOM_EMOJI_SET_LIMIT = 200
+    USER_AVATAR_CACHE_PREFIX = "member-user:"
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
 
@@ -105,6 +109,11 @@ class ChatBindingManager(LocaleMixin):
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
         self._topic_mutex = threading.Lock()
+        self._user_emoji_unavailable = False
+        self._user_emoji_unavailable_reason: Optional[str] = None
+        self._logged_user_emoji_cache_keys: set[str] = set()
+        self._user_emoji_lock = threading.Lock()
+        self._user_emoji_inflight: set[str] = set()
 
         # Link handler
         non_edit_filter = Filters.update.message | Filters.update.channel_post
@@ -1166,7 +1175,386 @@ class ChatBindingManager(LocaleMixin):
 
         return desc, picture, pic_resized
 
-    def _update_forum_group_info(self, tg_chat_id: TelegramChatID, current_thread_id: Optional[TelegramTopicID] = None):
+    def _get_user_emoji_config(self) -> dict:
+        user_emoji = self.channel.config.get("user_emoji", {})
+        if not isinstance(user_emoji, dict):
+            return {}
+        return user_emoji
+
+    def _is_user_emoji_enabled(self) -> bool:
+        return bool(self._get_user_emoji_config().get("enabled", True))
+
+    def _get_user_emoji_set_base_name(self) -> str:
+        base_name = self._get_user_emoji_config().get("sticker_set_name", "etm_user_avatars")
+        if not isinstance(base_name, str) or not base_name:
+            base_name = "etm_user_avatars"
+
+        bot_username = self._get_bot_user().username
+        if bot_username:
+            suffix = f"_by_{bot_username}"
+            if base_name.lower().endswith(suffix.lower()):
+                base_name = base_name[:-len(suffix)]
+
+        return base_name.rstrip("_") or "etm"
+
+    def _mark_user_emoji_unavailable(self, reason: Union[str, Exception]) -> None:
+        reason_text = str(reason)
+        if not self._user_emoji_unavailable:
+            self.logger.warning(
+                "Generated user avatar custom emoji are unavailable for this session. Reason: %s",
+                reason_text,
+            )
+        self._user_emoji_unavailable = True
+        self._user_emoji_unavailable_reason = reason_text
+
+    def _build_user_emoji_set_name(self, base_name: str, index: int) -> str:
+        bot_username = self._get_bot_user().username
+        suffix = f"_by_{bot_username}" if bot_username else ""
+        index_suffix = "" if index <= 1 else f"_{index}"
+        max_base_len = 64 - len(index_suffix) - len(suffix)
+        return f"{base_name[:max_base_len].rstrip('_')}{index_suffix}{suffix}"
+
+    def _build_user_emoji_sticker(self, user_uid: str, png: io.BytesIO) -> InputSticker:
+        emoji_name = self._user_emoji_name(user_uid)
+        keyword = hashlib.sha1(user_uid.encode("utf-8")).hexdigest()[:16]
+        return InputSticker(
+            sticker=png,
+            emoji_list=[emoji_name],
+            format="static",
+            keywords=[f"etm-{keyword}"],
+        )
+
+    @staticmethod
+    def _hash_user_avatar_png(png: io.BytesIO) -> str:
+        position = png.tell()
+        try:
+            png.seek(0)
+            return hashlib.sha256(png.read()).hexdigest()
+        finally:
+            png.seek(position)
+
+    def _log_user_emoji(self, action: str, cache_key: str, custom_emoji_id: str,
+                        sticker_set_name: str) -> None:
+        if action in {"created", "added"} or cache_key not in self._logged_user_emoji_cache_keys:
+            level = logging.INFO
+            self._logged_user_emoji_cache_keys.add(cache_key)
+        else:
+            level = logging.DEBUG
+        self.logger.log(
+            level,
+            "User avatar custom emoji %s: cache_key=%s custom_emoji_id=%s emoji_link=%s "
+            "sticker_set=%s sticker_set_link=%s",
+            action,
+            cache_key,
+            custom_emoji_id,
+            f"tg://emoji?id={custom_emoji_id}",
+            sticker_set_name,
+            f"https://t.me/addemoji/{sticker_set_name}",
+        )
+
+    @staticmethod
+    def _telegram_error_message(error: Exception) -> str:
+        message = getattr(error, "message", None)
+        if isinstance(message, str) and message:
+            return message
+        return str(error)
+
+    def _log_user_emoji_telegram_error(self, action: str, error: Exception, *,
+                                       level: int = logging.WARNING, **context) -> None:
+        fields = {
+            "action": action,
+            "error_type": type(error).__name__,
+            "error_message": ChatBindingManager._telegram_error_message(error),
+            "error_repr": repr(error),
+            **context,
+        }
+        cause = getattr(error, "__cause__", None)
+        if cause:
+            fields["cause_type"] = type(cause).__name__
+            fields["cause_message"] = str(cause)
+        context_text = " ".join(f"{key}={value!r}" for key, value in fields.items() if value is not None)
+        self.logger.log(level, "User avatar custom emoji Telegram error: %s", context_text)
+
+    def _get_user_emoji_owner_user_id(self) -> Optional[int]:
+        owner_user_id = self._get_user_emoji_config().get("owner_user_id")
+        if isinstance(owner_user_id, int):
+            return owner_user_id
+        admins = self.channel.config.get("admins")
+        if isinstance(admins, list) and admins and isinstance(admins[0], int):
+            return admins[0]
+        return None
+
+    def _make_user_avatar_png(self, picture: IO) -> Optional[io.BytesIO]:
+        try:
+            picture.seek(0)
+            img = Image.open(picture).convert("RGBA")
+            side = min(img.size)
+            left = (img.size[0] - side) // 2
+            top = (img.size[1] - side) // 2
+            resample_lanczos = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            img = img.crop((left, top, left + side, top + side))
+            img = img.resize((self.TELEGRAM_CUSTOM_EMOJI_SIZE, self.TELEGRAM_CUSTOM_EMOJI_SIZE), resample_lanczos)
+            out = io.BytesIO()
+            img.save(out, "PNG")
+            out.seek(0)
+            return out
+        except Exception as e:
+            self.logger.warning("Failed to build user avatar custom emoji image: %s", e)
+            return None
+        finally:
+            with suppress(Exception):
+                picture.seek(0)
+
+    def _user_avatar_cache_key(self, slave_uid: str) -> str:
+        return f"{self.USER_AVATAR_CACHE_PREFIX}{slave_uid}"
+
+    def _load_user_avatar_custom_emoji(
+        self,
+        slave_uid: str,
+        user_cache_key: str,
+        load_picture: Callable[[], Tuple[IO, str]],
+        msg_uid: str,
+    ) -> None:
+        picture = None
+        try:
+            picture, picture_source = load_picture()
+            entry = self._get_or_create_user_avatar_custom_emoji_entry(
+                slave_uid,
+                picture,
+                cache_key_override=user_cache_key,
+                title=self._("ETM user avatars"),
+            )
+            if not entry:
+                return
+            custom_emoji_id, sticker_set_name = entry
+            self.db.set_user_emoji_cache(user_cache_key, custom_emoji_id, sticker_set_name)
+            self._log_user_emoji("created", user_cache_key, custom_emoji_id, sticker_set_name)
+            self.logger.info(
+                "[%s] Created user avatar custom emoji: user_uid=%s picture_source=%s "
+                "custom_emoji_id=%s",
+                msg_uid,
+                slave_uid,
+                picture_source,
+                custom_emoji_id,
+            )
+        except (EFBOperationNotSupported, TelegramError, ValueError) as e:
+            self.logger.debug("[%s] Failed to create user avatar custom emoji for %s: %s", msg_uid, slave_uid, e)
+        except Exception as e:
+            self.logger.warning(
+                "[%s] Failed to create user avatar custom emoji for %s. error_type=%s error_message=%r",
+                msg_uid,
+                slave_uid,
+                type(e).__name__,
+                str(e),
+                exc_info=True,
+            )
+        finally:
+            if picture and getattr(picture, 'close', None):
+                picture.close()
+            with self._user_emoji_lock:
+                self._user_emoji_inflight.discard(user_cache_key)
+
+    def resolve_user_avatar_custom_emoji_id_lazy(
+        self,
+        slave_uid: str,
+        load_picture: Callable[[], Tuple[IO, str]],
+        msg_uid: str = "",
+    ) -> Optional[str]:
+        configured = self._get_configured_user_custom_emoji_id(slave_uid)
+        if configured:
+            return configured
+
+        if not self._is_user_emoji_enabled() or self._user_emoji_unavailable:
+            return None
+
+        user_cache_key = self._user_avatar_cache_key(slave_uid)
+        cached = self.db.get_user_emoji_cache(user_cache_key)
+        if cached:
+            custom_emoji_id, sticker_set_name = cached
+            self._log_user_emoji("reused", user_cache_key, custom_emoji_id, sticker_set_name)
+            return custom_emoji_id
+
+        with self._user_emoji_lock:
+            if user_cache_key in self._user_emoji_inflight:
+                return None
+            self._user_emoji_inflight.add(user_cache_key)
+
+        threading.Thread(
+            target=self._load_user_avatar_custom_emoji,
+            args=(slave_uid, user_cache_key, load_picture, msg_uid),
+            daemon=True,
+            name="ETM user avatar custom emoji create",
+        ).start()
+        return None
+
+    def _get_or_create_user_avatar_custom_emoji_entry(
+        self,
+        slave_uid: str,
+        picture: IO,
+        *,
+        cache_key_override: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Optional[Tuple[str, str]]:
+        if not self._is_user_emoji_enabled() or self._user_emoji_unavailable:
+            return None
+
+        base_name = self._get_user_emoji_set_base_name()
+        if not base_name:
+            self.logger.warning("user_emoji.sticker_set_name is required to generate user avatar custom emoji.")
+            return None
+
+        png = self._make_user_avatar_png(picture)
+        if not png:
+            return None
+        avatar_hash = self._hash_user_avatar_png(png)
+        cache_key = cache_key_override or self._user_avatar_cache_key(f"{slave_uid}:{avatar_hash}")
+        cached = self.db.get_user_emoji_cache(cache_key)
+        if cached:
+            custom_emoji_id, sticker_set_name = cached
+            self._log_user_emoji("reused", cache_key, custom_emoji_id, sticker_set_name)
+            return custom_emoji_id, sticker_set_name
+
+        sticker = self._build_user_emoji_sticker(slave_uid, png)
+        user_id = self._get_user_emoji_owner_user_id()
+        if user_id is None:
+            self.logger.warning("user_emoji.owner_user_id or admins[0] is required to generate user avatar custom emoji.")
+            return None
+        title = title or self._("ETM user avatars")
+        sticker_type = getattr(Sticker, "CUSTOM_EMOJI", "custom_emoji")
+
+        for index in range(1, 1000):
+            sticker_set_name = self._build_user_emoji_set_name(base_name, index)
+            try:
+                sticker_set = self.bot.get_sticker_set(sticker_set_name)
+            except TelegramError as e:
+                self._log_user_emoji_telegram_error(
+                    "get_sticker_set",
+                    e,
+                    level=logging.DEBUG,
+                    slave_uid=slave_uid,
+                    avatar_hash=avatar_hash,
+                    sticker_set_name=sticker_set_name,
+                )
+                png.seek(0)
+                try:
+                    self.bot.create_new_sticker_set(
+                        user_id=user_id,
+                        name=sticker_set_name,
+                        title=title,
+                        stickers=[sticker],
+                        sticker_type=sticker_type,
+                    )
+                    created_set = self.bot.get_sticker_set(sticker_set_name)
+                    custom_emoji_id = created_set.stickers[-1].custom_emoji_id
+                    self.db.set_user_emoji_cache(cache_key, custom_emoji_id, sticker_set_name)
+                    self._log_user_emoji("created", cache_key, custom_emoji_id, sticker_set_name)
+                    return custom_emoji_id, sticker_set_name
+                except TelegramError as e:
+                    self._log_user_emoji_telegram_error(
+                        "create_new_sticker_set",
+                        e,
+                        slave_uid=slave_uid,
+                        avatar_hash=avatar_hash,
+                        sticker_set_name=sticker_set_name,
+                        user_id=user_id,
+                        sticker_type=sticker_type,
+                    )
+                    self._mark_user_emoji_unavailable(e)
+                    return None
+
+            if len(sticker_set.stickers) >= self.TELEGRAM_CUSTOM_EMOJI_SET_LIMIT:
+                continue
+
+            png.seek(0)
+            try:
+                self.bot.add_sticker_to_set(
+                    user_id=user_id,
+                    name=sticker_set_name,
+                    sticker=sticker,
+                )
+                updated_set = self.bot.get_sticker_set(sticker_set_name)
+                custom_emoji_id = updated_set.stickers[-1].custom_emoji_id
+                self.db.set_user_emoji_cache(cache_key, custom_emoji_id, sticker_set_name)
+                self._log_user_emoji("added", cache_key, custom_emoji_id, sticker_set_name)
+                return custom_emoji_id, sticker_set_name
+            except TelegramError as e:
+                self._log_user_emoji_telegram_error(
+                    "add_sticker_to_set",
+                    e,
+                    slave_uid=slave_uid,
+                    avatar_hash=avatar_hash,
+                    sticker_set_name=sticker_set_name,
+                    user_id=user_id,
+                )
+                self._mark_user_emoji_unavailable(e)
+                return None
+
+        self.logger.warning("No available custom emoji sticker set slot for user avatar %s.", slave_uid)
+        return None
+
+    def _get_or_create_user_avatar_custom_emoji(self, slave_uid: str, picture: IO) -> Optional[str]:
+        entry = self._get_or_create_user_avatar_custom_emoji_entry(
+            slave_uid,
+            picture,
+        )
+        if not entry:
+            return None
+        return entry[0]
+
+    @staticmethod
+    def _user_emoji_name(slave_uid: str) -> str:
+        emoji_candidates = ("😀", "🙂", "😄", "😊", "😎", "🤖", "💬", "📨", "📌", "⭐")
+        digest = hashlib.sha1(slave_uid.encode("utf-8")).digest()
+        return emoji_candidates[digest[0] % len(emoji_candidates)]
+
+    def _get_configured_user_custom_emoji_id(self, slave_uid: str) -> Optional[str]:
+        custom_emoji_ids = self._get_user_emoji_config().get("custom_emoji_ids", {})
+        if not isinstance(custom_emoji_ids, dict):
+            return None
+        custom_emoji_id = custom_emoji_ids.get(slave_uid)
+        if isinstance(custom_emoji_id, str) and custom_emoji_id:
+            return custom_emoji_id
+        return None
+
+    def _build_edit_forum_topic_kwargs(self, name: str) -> dict:
+        return {
+            "name": self.truncate_ellipsis(name, self.MAX_LEN_CHAT_TITLE),
+        }
+
+    @staticmethod
+    def _is_topic_not_modified_error(error: TelegramError) -> bool:
+        return getattr(error, "message", "") == "Topic_not_modified"
+
+    def _edit_forum_topic(self, tg_chat_id: TelegramChatID, thread_id: TelegramTopicID,
+                          slave_uid: str, name: str) -> bool:
+        try:
+            self.bot.edit_forum_topic(
+                chat_id=tg_chat_id,
+                message_thread_id=thread_id,
+                **self._build_edit_forum_topic_kwargs(name),
+            )
+            return True
+        except TelegramError as e:
+            if self._is_topic_not_modified_error(e):
+                return True
+            self.logger.warning(
+                "Failed to edit forum topic. tg_chat_id=%s thread_id=%s slave_uid=%s error_type=%s error_message=%r",
+                tg_chat_id,
+                thread_id,
+                slave_uid,
+                type(e).__name__,
+                self._telegram_error_message(e),
+            )
+            return False
+
+    def _create_forum_topic(self, telegram_chat_id: TelegramChatID, name: str):
+        return self.bot.create_forum_topic(
+            chat_id=telegram_chat_id,
+            name=name,
+        )
+
+    def _update_forum_group_info(self, tg_chat_id: TelegramChatID,
+                                 current_thread_id: Optional[TelegramTopicID] = None):
         """
         Update forum group info for multiple linked chats.
         Send a message with avatar and description in each topic and pin it.
@@ -1196,9 +1584,18 @@ class ChatBindingManager(LocaleMixin):
                 if success:
                     updated_count += 1
             except Exception as e:
-                self.logger.warning(f"Failed to update topic {thread_id}: {e}")
+                self.logger.warning(
+                    "Failed to update topic %s in forum group %s for chat %s. error_type=%s error_message=%r error_repr=%r",
+                    thread_id,
+                    tg_chat_id,
+                    slave_uid,
+                    type(e).__name__,
+                    self._telegram_error_message(e),
+                    repr(e),
+                    exc_info=True,
+                )
 
-            time.sleep(30) # seems pinning message has a special rate limit but I didn't find the official documentation
+            time.sleep(30)  # seems pinning message has a special rate limit but I didn't find the official documentation
 
         if updated_count > 0:
             message = self.ngettext('Updated {count} topic.', 'Updated {count} topics.', updated_count).format(count=updated_count)
@@ -1206,7 +1603,8 @@ class ChatBindingManager(LocaleMixin):
 
         return False, self._('Failed to update any topics.'), 0
 
-    def _update_single_topic_info(self, tg_chat_id: TelegramChatID, thread_id: TelegramTopicID, slave_uid: str) -> bool:
+    def _update_single_topic_info(self, tg_chat_id: TelegramChatID, thread_id: TelegramTopicID,
+                                  slave_uid: str) -> bool:
         """
         Update a single topic with chat avatar and description, then pin the message.
         Returns True if successful.
@@ -1221,20 +1619,15 @@ class ChatBindingManager(LocaleMixin):
 
             channel = coordinator.slaves[channel_id]
             chat = self.chat_manager.update_chat_obj(channel.get_chat(chat_uid), full_update=True)
-
-            try:
-                self.bot.edit_forum_topic(
-                    chat_id=tg_chat_id,
-                    message_thread_id=thread_id,
-                    name=self.truncate_ellipsis(chat.chat_title, self.MAX_LEN_CHAT_TITLE),
-                    icon_custom_emoji_id=""
-                )
-            except TelegramError as e:
-                if e.message != "Topic_not_modified":
-                    self.logger.warning(f"Failed to update topic {thread_id} for chat {slave_uid}: {e}")
-                    return False
-
             desc, picture, pic_resized = self._get_chat_info_and_picture(chat, channel)
+
+            if not self._edit_forum_topic(
+                tg_chat_id,
+                thread_id,
+                slave_uid,
+                chat.chat_title,
+            ):
+                return False
 
             sent_message = None
             if picture:
@@ -1263,7 +1656,16 @@ class ChatBindingManager(LocaleMixin):
             return True
 
         except Exception as e:
-            self.logger.warning(f"Failed to update topic {thread_id} for chat {slave_uid}: {e}")
+            self.logger.warning(
+                "Failed to update topic %s in forum group %s for chat %s. error_type=%s error_message=%r error_repr=%r",
+                thread_id,
+                tg_chat_id,
+                slave_uid,
+                type(e).__name__,
+                self._telegram_error_message(e),
+                repr(e),
+                exc_info=True,
+            )
             return False
         finally:
             if picture and getattr(picture, 'close', None):
@@ -1328,12 +1730,13 @@ class ChatBindingManager(LocaleMixin):
         channel = coordinator.slaves[channel_id]
         etm_chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
         try:
-            self.bot.edit_forum_topic(
-                chat_id=update.effective_chat.id,
-                message_thread_id=thread_id,
-                name=self.truncate_ellipsis(etm_chat.chat_title, self.MAX_LEN_CHAT_TITLE),
-                icon_custom_emoji_id=""  # param required by telegram
-            )
+            if not self._edit_forum_topic(
+                TelegramChatID(update.effective_chat.id),
+                TelegramTopicID(thread_id),
+                slave_origin_uid,
+                etm_chat.chat_title,
+            ):
+                return self.bot.reply_error(update, self._('Error occurred while update chat details.'))
             sync_reply_text(self.bot, update.effective_message, self._('Chat details updated.'))
         except EFBChatNotFound:
             self.logger.exception("Chat linked (%s) is not found in the slave channel "
@@ -1374,9 +1777,9 @@ class ChatBindingManager(LocaleMixin):
                     channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
                     chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                     try:
-                        topic = self.bot.create_forum_topic(
-                            chat_id=telegram_chat_id,
-                            name=chat.chat_title
+                        topic = self._create_forum_topic(
+                            telegram_chat_id,
+                            chat.chat_title,
                         )
                         thread_id = topic.message_thread_id
                         self.db.add_topic_assoc(

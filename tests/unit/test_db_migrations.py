@@ -10,7 +10,7 @@ from ehforwarderbot import Message, MsgType
 from ehforwarderbot.types import MessageID
 
 from efb_telegram_master import utils
-from efb_telegram_master.db import ChatAssoc, MsgLog, TopicAssoc
+from efb_telegram_master.db import ChatAssoc, MsgLog, TopicAssoc, UserEmojiCache
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
@@ -37,13 +37,25 @@ def test_topic_assoc_table_exists_and_round_trips(channel, slave):
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
 
 
+def test_user_emoji_cache_table_exists_and_round_trips(channel):
+    cache_key = "user-emoji-cache-test"
+    UserEmojiCache.delete().where(UserEmojiCache.cache_key == cache_key).execute()
+
+    channel.db.set_user_emoji_cache(cache_key, "emoji-cache", "etm_user_avatars_by_testbot")
+
+    assert channel.db.get_user_emoji_cache(cache_key) == ("emoji-cache", "etm_user_avatars_by_testbot")
+    UserEmojiCache.delete().where(UserEmojiCache.cache_key == cache_key).execute()
+
+
 def test_create_missing_tables_preserves_existing_chat_assoc(channel):
     channel.db.add_chat_assoc("master-existing", "slave-existing", multiple_slave=True)
     TopicAssoc.drop_table(safe=True)
+    UserEmojiCache.drop_table(safe=True)
 
     channel.db._create_missing_tables()
 
     assert TopicAssoc.table_exists()
+    assert UserEmojiCache.table_exists()
     assert ChatAssoc.get_or_none(ChatAssoc.master_uid == "master-existing") is not None
     channel.db.remove_chat_assoc(master_uid="master-existing")
 

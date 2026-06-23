@@ -52,6 +52,21 @@ def test_topic_assoc_crud(channel, slave):
     assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) is None
 
 
+def test_get_topic_chat_ids_lists_all_known_topic_groups(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    other_slave_uid = "tests.mocks.slave other-topic-chat"
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.remove_topic_assoc(slave_uid=other_slave_uid)
+
+    channel.db.add_topic_assoc(TelegramChatID(10001), TelegramTopicID(20002), slave_uid)
+    channel.db.add_topic_assoc(TelegramChatID(10002), TelegramTopicID(20003), other_slave_uid)
+
+    assert channel.db.get_topic_chat_ids() == [TelegramChatID(10001), TelegramChatID(10002)]
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.remove_topic_assoc(slave_uid=other_slave_uid)
+
+
 def test_get_slave_msg_dest_uses_topic_group(channel, slave):
     topic_group = TelegramChatID(30003)
     msg = _build_slave_message(slave)
@@ -82,7 +97,6 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(50005)
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
-
     forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(60006))
     with patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
         first = channel.chat_binding.create_topic(slave_uid, topic_chat_id)
@@ -92,6 +106,44 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     assert second == TelegramTopicID(60006)
     assert create_forum_topic.call_count == 1
     assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(60006)
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_create_topic_does_not_set_custom_emoji_icon(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    topic_chat_id = TelegramChatID(61505)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(61506))
+
+    with patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
+        result = channel.chat_binding.create_topic(slave_uid, topic_chat_id)
+
+    assert result == TelegramTopicID(61506)
+    create_forum_topic.assert_called_once()
+    assert "icon_custom_emoji_id" not in create_forum_topic.call_args.kwargs
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_update_topic_info_does_not_set_custom_emoji_icon(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    topic_chat_id = TelegramChatID(62005)
+    thread_id = TelegramTopicID(62006)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+    sent_message = SimpleNamespace(message_id=123)
+
+    with patch.object(channel.bot_manager, "edit_forum_topic", return_value=True) as edit_forum_topic, \
+         patch.object(channel.bot_manager, "send_photo", return_value=sent_message), \
+         patch.object(channel.bot_manager, "pin_chat_message"), \
+         patch("time.sleep"):
+        success, _, count = channel.chat_binding._update_forum_group_info(topic_chat_id)
+
+    assert success is True
+    assert count == 1
+    edit_forum_topic.assert_called_once()
+    assert "icon_custom_emoji_id" not in edit_forum_topic.call_args.kwargs
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
 

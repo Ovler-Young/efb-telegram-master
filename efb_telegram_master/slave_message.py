@@ -24,12 +24,14 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 
 from ehforwarderbot import Message, Status, coordinator
-from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
+from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat, ChatMember
 from ehforwarderbot.constants import MsgType
+from ehforwarderbot.exceptions import EFBOperationNotSupported
 from ehforwarderbot.message import LinkAttribute, LocationAttribute, MessageCommand, Reactions, \
     StatusAttribute
 from ehforwarderbot.status import ChatUpdates, MemberUpdates, MessageRemoval, MessageReactionsUpdate
 from . import utils
+from .bot_manager import custom_emoji_placeholder
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import ETMCommandMsgStorage
@@ -59,6 +61,7 @@ class SlaveMessageProcessor(LocaleMixin):
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
+        self._logged_user_avatar_custom_emoji: set[Tuple[str, str, str]] = set()
 
     @staticmethod
     def _get_edit_kwargs(msg: Message):
@@ -243,6 +246,7 @@ class SlaveMessageProcessor(LocaleMixin):
         else:
             self.bot.send_chat_action(tg_dest, ChatAction.TYPING, message_thread_id=thread_id)
             tg_msg = self.bot.send_message(tg_dest, prefix=msg_template, suffix=reactions,
+                                           parse_mode="HTML",
                                            disable_notification=silent,
                                            message_thread_id=thread_id,
                                            text=self._('Unknown type of message "{0}". (UT01)')
@@ -717,6 +721,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 except TelegramError:
                     return self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1],
                                                  prefix=msg_template, text=msg.text, suffix=reactions,
+                                                 parse_mode="HTML",
                                                  reply_markup=reply_markup,
                                                  disable_notification=silent)
 
@@ -756,6 +761,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     assert msg.file and msg.path
                     file = self.process_file_obj(msg.file, msg.path, msg.filename)
                     return self.bot.send_document(tg_dest, file, prefix=msg_template, suffix=reactions,
+                                                  parse_mode="HTML",
                                                   message_thread_id=thread_id,
                                                   caption=msg.text, filename=msg.filename,
                                                   reply_to_message_id=target_msg_id,
@@ -1196,25 +1202,98 @@ class SlaveMessageProcessor(LocaleMixin):
 
         self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
 
+    @staticmethod
+    def _get_user_avatar_picture(slave_channel, author: ChatMember) -> Tuple[IO, str]:
+        get_member_picture = getattr(slave_channel, "get_chat_member_picture", None)
+        if callable(get_member_picture):
+            return get_member_picture(author), "member"
+        return slave_channel.get_chat_picture(author), "chat"
+
+    def _user_avatar_custom_emoji_prefix(self, msg: Message) -> str:
+        msg_uid = getattr(msg, "uid", "")
+        if not isinstance(msg.chat, (GroupChat, PrivateChat)) or isinstance(msg.author, SelfChatMember):
+            return ""
+        if getattr(msg.chat, "self", None) is not None and msg.author == msg.chat.self:
+            return ""
+
+        author = msg.author
+        if not isinstance(author, ChatMember):
+            return ""
+
+        try:
+            channel_id = author.module_id
+            slave_channel = coordinator.slaves.get(channel_id)
+            if not slave_channel:
+                self.logger.debug(
+                    "[%s] Cannot resolve user avatar custom emoji; channel %s is not loaded.",
+                    msg_uid,
+                    channel_id,
+                )
+                return ""
+
+            author_uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
+            custom_emoji_id = self.channel.chat_binding.resolve_user_avatar_custom_emoji_id_lazy(
+                author_uid,
+                lambda: self._get_user_avatar_picture(slave_channel, author),
+                msg_uid=msg_uid,
+            )
+            if not custom_emoji_id:
+                return ""
+            log_key = (str(author.uid), str(msg.chat.uid), custom_emoji_id)
+            if log_key not in self._logged_user_avatar_custom_emoji:
+                self._logged_user_avatar_custom_emoji.add(log_key)
+                self.logger.info(
+                    "[%s] Resolved user avatar custom emoji: user_uid=%s chat_uid=%s "
+                    "custom_emoji_id=%s",
+                    msg_uid,
+                    author.uid,
+                    msg.chat.uid,
+                    custom_emoji_id,
+                )
+            return custom_emoji_placeholder(custom_emoji_id)
+        except (EFBOperationNotSupported, TelegramError, ValueError) as e:
+            self.logger.debug(
+                "[%s] Failed to resolve user avatar custom emoji for %s: %s",
+                msg_uid,
+                utils.chat_id_to_str(chat=author),
+                e,
+            )
+            return ""
+        except Exception as e:
+            self.logger.warning(
+                "[%s] Failed to resolve user avatar custom emoji for %s. error_type=%s error_message=%r",
+                msg_uid,
+                utils.chat_id_to_str(chat=author),
+                type(e).__name__,
+                str(e),
+                exc_info=True,
+            )
+            return ""
+
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name
         if isinstance(msg.chat, GroupChat):
             self.logger.debug("[%s] Message is from a group. Sender: %s", msg.uid, msg.author)
             msg_prefix = msg.author.long_name
+            user_icon_prefix = self._user_avatar_custom_emoji_prefix(msg)
+            if user_icon_prefix:
+                msg_prefix = f"{user_icon_prefix} {msg_prefix}"
 
         if singly_linked:
             if msg_prefix:  # if group message
                 msg_template = f"{msg_prefix}:"
             else:
                 if msg.chat != msg.author:
-                    msg_template = f"{msg.author.long_name}:"
+                    user_icon_prefix = self._user_avatar_custom_emoji_prefix(msg)
+                    msg_template = f"{user_icon_prefix + ' ' if user_icon_prefix else ''}{msg.author.long_name}:"
                 else:
                     msg_template = ""
         elif isinstance(msg.chat, PrivateChat):
             emoji_prefix = msg.chat.channel_emoji + Emoji.USER
             name_prefix = msg.chat.long_name
             if msg.chat.other != msg.author:
-                name_prefix += f", {msg.author.long_name}"
+                user_icon_prefix = self._user_avatar_custom_emoji_prefix(msg)
+                name_prefix += f", {user_icon_prefix + ' ' if user_icon_prefix else ''}{msg.author.long_name}"
             msg_template = f"{emoji_prefix} {name_prefix}:"
         elif isinstance(msg.chat, GroupChat):
             emoji_prefix = msg.chat.channel_emoji + Emoji.GROUP
