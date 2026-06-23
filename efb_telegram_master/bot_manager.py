@@ -52,6 +52,7 @@ MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
 P = ParamSpec("P")
 T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
+_DELAYED_DATABASE_UPDATE_DROPPED = object()
 
 
 class SyncBotProtocol(Protocol):
@@ -843,7 +844,7 @@ class TelegramBotManager(LocaleMixin):
         # Rendezvous dicts for delayed DB updates — with timestamps for TTL cleanup
         # task_id -> (etm_msg, old_msg_id, registered_at)
         self._pending_delayed_logs: dict[str, tuple] = {}
-        # task_id -> (real_tg_msg, sender_bot_id, completed_at)
+        # task_id -> (real_tg_msg, sender_bot_id, completed_at), or a dropped marker
         self._completed_delayed_results: dict[str, tuple] = {}
         self._pending_logs_lock = threading.Lock()
         self._rendezvous_ttl = 600.0          # 10 minutes
@@ -1682,7 +1683,12 @@ class TelegramBotManager(LocaleMixin):
         pending_update = None
         with self._pending_logs_lock:
             pending_update = self._pending_delayed_logs.pop(task_id, None)
-            self._completed_delayed_results.pop(task_id, None)
+            if pending_update is None:
+                self._completed_delayed_results[task_id] = (
+                    _DELAYED_DATABASE_UPDATE_DROPPED, None, time.time()
+                )
+            else:
+                self._completed_delayed_results.pop(task_id, None)
         TelegramBotManager._run_database_update_callback(
             self, TelegramBotManager._delayed_log_callback(pending_update)
         )
@@ -1858,6 +1864,11 @@ class TelegramBotManager(LocaleMixin):
                     self._pending_delayed_logs[task_id] = (etm_msg, old_msg_id, time.time())
                 self.logger.debug(f"Registered delayed database update for task {task_id}")
                 return
+
+        if completed_result[0] is _DELAYED_DATABASE_UPDATE_DROPPED:
+            self.logger.debug("Delayed task %s was dropped before database registration", task_id)
+            TelegramBotManager._run_database_update_callback(self, on_complete)
+            return
 
         real_tg_msg, sender_bot_id = completed_result[0], completed_result[1]
         self.logger.debug(f"Finalizing already-completed delayed task {task_id}")

@@ -1262,6 +1262,31 @@ def test_drop_delayed_database_update_runs_completion_callback():
     on_complete.assert_called_once()
 
 
+def test_drop_delayed_database_update_before_register_runs_late_callback():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    on_complete = Mock()
+    db_mock = Mock()
+    db_mock.add_or_update_message_log = Mock()
+    mgr = SimpleNamespace(
+        channel=SimpleNamespace(db=db_mock),
+        _pending_delayed_logs={},
+        _completed_delayed_results={},
+        _pending_logs_lock=threading.Lock(),
+        logger=Mock(),
+    )
+
+    TelegramBotManager._drop_delayed_database_update(mgr, "task-1")
+    TelegramBotManager.register_delayed_database_update(
+        mgr, "task-1", Mock(), None, on_complete=on_complete,
+    )
+
+    assert "task-1" not in mgr._pending_delayed_logs
+    assert "task-1" not in mgr._completed_delayed_results
+    db_mock.add_or_update_message_log.assert_not_called()
+    on_complete.assert_called_once()
+
+
 def test_handle_delayed_database_update_runs_completion_callback():
     from efb_telegram_master.bot_manager import TelegramBotManager
 
