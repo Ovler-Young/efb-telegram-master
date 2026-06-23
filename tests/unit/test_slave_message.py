@@ -1,13 +1,15 @@
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.error import BadRequest
+from typing import cast
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from ehforwarderbot import Message, Chat
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.chat import ChatMember
-from ehforwarderbot.types import ReactionName
+from ehforwarderbot.types import MessageID, ReactionName
+from efb_telegram_master import TelegramChannel
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 
@@ -74,7 +76,7 @@ REMOTE_IMAGE_URL = "https://example.com/images/photo.jpg"
 
 def build_remote_image_message(remote_image_url: str = REMOTE_IMAGE_URL) -> Message:
     message = Message()
-    message.uid = "__remote_image_msg__"
+    message.uid = MessageID("__remote_image_msg__")
     message.type = MsgType.Image
     message.text = "remote <image>"
     message.file = None
@@ -96,7 +98,7 @@ def build_slave_message_processor() -> SlaveMessageProcessor:
     processor.bot._cleanup_tls = SimpleNamespace(pending_cleanup=[])
     processor.flag = Mock(side_effect=lambda flag_name: "emoji" if flag_name == "default_media_prompt" else False)
     processor.logger = Mock()
-    processor.channel = SimpleNamespace(config={"admins": [1]}, flag=processor.flag)
+    processor.channel = cast(TelegramChannel, SimpleNamespace(config={"admins": [1]}, flag=processor.flag))
     return processor
 
 
