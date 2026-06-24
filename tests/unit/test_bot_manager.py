@@ -1199,6 +1199,31 @@ def test_queued_placeholder_has_no_delay_fields():
     assert not hasattr(placeholder, "expected_send_time")
 
 
+def test_call_with_reserved_slot_releases_only_on_failure():
+    from contextlib import nullcontext
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    bot = object()
+    mgr = SimpleNamespace(
+        _using_bot=Mock(return_value=nullcontext()),
+        _release_reserved_slot=Mock(),
+    )
+
+    def send_ok(_self):
+        return "sent"
+
+    assert TelegramBotManager._call_with_reserved_slot(mgr, bot, None, 100, send_ok, (), {}) == "sent"
+    mgr._release_reserved_slot.assert_not_called()
+
+    def send_fails(_self):
+        raise RuntimeError("send failed")
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        TelegramBotManager._call_with_reserved_slot(mgr, bot, "777", 100, send_fails, (), {})
+
+    mgr._release_reserved_slot.assert_called_once_with("777", 100)
+
+
 # --- DB retry queue ---
 
 def test_finalize_db_update_enqueues_on_failure():

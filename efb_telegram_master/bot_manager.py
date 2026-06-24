@@ -458,8 +458,9 @@ class TelegramBotManager(LocaleMixin):
                         time.sleep(wait_seconds)
                     if chosen_sender_bot_id:
                         try:
-                            with self._using_bot(bot):
-                                result = fn(self, *args, **kwargs)
+                            result = self._call_with_reserved_slot(
+                                bot, chosen_sender_bot_id, chat_id_int, fn, args, kwargs,
+                            )
                             return self._make_send_receipt(result, sender_bot_id=chosen_sender_bot_id)
                         except telegram.error.Forbidden:
                             aux_bot = self.bot_pool.get_bot_by_id(chosen_sender_bot_id)
@@ -477,14 +478,20 @@ class TelegramBotManager(LocaleMixin):
                             sender_bot_id, chat_id,
                         )
                         self._calculate_rate_limit_delay(chat_id_int)
-                        return self._make_send_receipt(fn(self, *args, **kwargs))
+                        result = self._call_with_reserved_slot(
+                            self._bot, None, chat_id_int, fn, args, kwargs,
+                        )
+                        return self._make_send_receipt(result)
                     aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
                     if aux_bot:
                         aux_bot.update_membership(chat_id_int, False)
                     wait_seconds, _, _ = self._calculate_rate_limit_delay(chat_id_int)
                     if wait_seconds > 0:
                         time.sleep(wait_seconds)
-                    return self._make_send_receipt(fn(self, *args, **kwargs))
+                    result = self._call_with_reserved_slot(
+                        self._bot, None, chat_id_int, fn, args, kwargs,
+                    )
+                    return self._make_send_receipt(result)
 
                 if chat_id:
                     cleanup_files = getattr(self._cleanup_tls, 'pending_cleanup', [])[:]
@@ -523,8 +530,9 @@ class TelegramBotManager(LocaleMixin):
                     if wait_seconds > 0:
                         time.sleep(wait_seconds)
                     try:
-                        with self._using_bot(bot):
-                            result = fn(self, *args, **kwargs)
+                        result = self._call_with_reserved_slot(
+                            bot, chosen_sender_bot_id, int(chat_id), fn, args, kwargs,
+                        )
                         if chosen_sender_bot_id is not None:
                             self._record_aux_use(chat_id)
                         return self._make_send_receipt(result, sender_bot_id=chosen_sender_bot_id)
@@ -541,7 +549,10 @@ class TelegramBotManager(LocaleMixin):
                                 wait_seconds, _, _ = self._calculate_rate_limit_delay(chat_id)
                                 if wait_seconds > 0:
                                     time.sleep(wait_seconds)
-                                return self._make_send_receipt(fn(self, *args, **kwargs))
+                                result = self._call_with_reserved_slot(
+                                    self._bot, None, int(chat_id), fn, args, kwargs,
+                                )
+                                return self._make_send_receipt(result)
                         raise
 
                 return self._make_send_receipt(fn(self, *args, **kwargs))
@@ -1192,6 +1203,15 @@ class TelegramBotManager(LocaleMixin):
             )
         main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
         return self._bot, None, main_delay
+
+    def _call_with_reserved_slot(self, bot: object, sender_bot_id: Optional[str],
+                                 chat_id: int, fn: Callable, args: tuple, kwargs: dict):
+        try:
+            with self._using_bot(bot):
+                return fn(self, *args, **kwargs)
+        except Exception:
+            self._release_reserved_slot(sender_bot_id, chat_id)
+            raise
 
     def _select_available_sender(self, chat_id: int, *, slave_id: Optional[str] = None,
                                 has_callback: bool = False,
