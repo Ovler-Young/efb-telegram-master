@@ -62,6 +62,9 @@ class SlaveMessageProcessor(LocaleMixin):
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
         self._pending_slave_messages: set[Tuple[str, str]] = set()
         self._pending_slave_messages_lock = threading.Lock()
+        self._known_forum_chat_ids: set[int] = set()
+        self._known_forum_chat_ids_lock = threading.Lock()
+        self._timing_tls = threading.local()
 
     def _claim_pending_slave_message(self, key: Tuple[str, str]) -> bool:
         with self._pending_slave_messages_lock:
@@ -81,6 +84,70 @@ class SlaveMessageProcessor(LocaleMixin):
         if msg.edit or msg.uid is None or msg.type == MsgType.Status:
             return None
         return slave_origin_uid, str(msg.uid)
+
+    def _ensure_timing_tls(self):
+        if not hasattr(self, '_timing_tls'):
+            self._timing_tls = threading.local()
+        return self._timing_tls
+
+    def _set_message_timing(self, *, receive_started: float,
+                            destination_resolved: Optional[float] = None):
+        timing_tls = self._ensure_timing_tls()
+        timing_tls.receive_started = receive_started
+        timing_tls.destination_resolved = destination_resolved
+
+    def _clear_message_timing(self):
+        timing_tls = getattr(self, '_timing_tls', None)
+        if timing_tls is None:
+            return
+        for key in ('receive_started', 'destination_resolved'):
+            if hasattr(timing_tls, key):
+                delattr(timing_tls, key)
+
+    def _current_message_timing_kwargs(self) -> dict:
+        timing_tls = getattr(self, '_timing_tls', None)
+        if timing_tls is None:
+            return {}
+        kwargs = {}
+        receive_started = getattr(timing_tls, 'receive_started', None)
+        destination_resolved = getattr(timing_tls, 'destination_resolved', None)
+        if receive_started is not None:
+            kwargs['_timing_receive_monotonic'] = receive_started
+        if destination_resolved is not None:
+            kwargs['_timing_destination_monotonic'] = destination_resolved
+        return kwargs
+
+    def _ensure_forum_cache(self):
+        if not hasattr(self, '_known_forum_chat_ids'):
+            self._known_forum_chat_ids = set()
+        if not hasattr(self, '_known_forum_chat_ids_lock'):
+            self._known_forum_chat_ids_lock = threading.Lock()
+
+    def _known_forum_chat(self, tg_dest: TelegramChatID) -> bool:
+        self._ensure_forum_cache()
+        with self._known_forum_chat_ids_lock:
+            return int(tg_dest) in self._known_forum_chat_ids
+
+    def _mark_known_forum_chat(self, tg_dest: TelegramChatID):
+        self._ensure_forum_cache()
+        with self._known_forum_chat_ids_lock:
+            self._known_forum_chat_ids.add(int(tg_dest))
+
+    def _get_master_chat_is_forum(self, xid: str, tg_dest: TelegramChatID) -> bool:
+        if self._known_forum_chat(tg_dest):
+            self.logger.debug("[%s] get_chat_info skipped for Telegram chat %s (known forum chat).",
+                              xid, tg_dest)
+            return True
+
+        started = time.monotonic()
+        master_chat_info = self.bot.get_chat_info(tg_dest)
+        elapsed = time.monotonic() - started
+        is_forum = bool(master_chat_info.is_forum)
+        self.logger.debug("[%s] get_chat_info finished in %.3fs for Telegram chat %s (is_forum=%s).",
+                          xid, elapsed, tg_dest, is_forum)
+        if is_forum:
+            self._mark_known_forum_chat(tg_dest)
+        return is_forum
 
     @staticmethod
     def _get_edit_kwargs(msg: Message):
@@ -124,9 +191,14 @@ class SlaveMessageProcessor(LocaleMixin):
         """
         dedupe_key: Optional[Tuple[str, str]] = None
         pending_claimed = False
+        receive_started = time.monotonic()
+        tg_dest = None
+        thread_id = None
+        self._set_message_timing(receive_started=receive_started)
         try:
             xid = msg.uid
             self.logger.debug("[%s] Slave message delivered to ETM.\n%s", xid, msg)
+            self.logger.debug("[%s] Message receive timing started.", xid)
 
             slave_origin_uid = utils.chat_id_to_str(chat=msg.chat)
             dedupe_key = self._dedupe_key(msg, slave_origin_uid)
@@ -145,7 +217,19 @@ class SlaveMessageProcessor(LocaleMixin):
                     return msg
                 pending_claimed = True
 
+            destination_started = time.monotonic()
             msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(msg)
+            destination_resolved = time.monotonic()
+            self._set_message_timing(
+                receive_started=receive_started,
+                destination_resolved=destination_resolved,
+            )
+            self.logger.debug(
+                "[%s] Destination resolution finished in %.3fs (%.3fs since receive).",
+                xid,
+                destination_resolved - destination_started,
+                destination_resolved - receive_started,
+            )
 
             silent = self.is_silent(msg)
             if silent is None:
@@ -180,8 +264,16 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.vendor_specific = msg.vendor_specific or {}
                 msg.vendor_specific['_sender_bot_id'] = _edit_sender_bot_id
 
+            dispatch_started = time.monotonic()
             self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
                                   dedupe_key=dedupe_key)
+            dispatch_finished = time.monotonic()
+            self.logger.debug(
+                "[%s] Dispatch returned in %.3fs (%.3fs since receive).",
+                xid,
+                dispatch_finished - dispatch_started,
+                dispatch_finished - receive_started,
+            )
         except Exception as e:
             if pending_claimed:
                 self._release_pending_slave_message(dedupe_key)
@@ -201,6 +293,8 @@ class SlaveMessageProcessor(LocaleMixin):
             else:
                 self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
                               repr(msg), repr(e), traceback.format_exc())
+        finally:
+            self._clear_message_timing()
         return msg
 
     def dispatch_message(self, msg: Message, msg_template: str,
@@ -315,6 +409,10 @@ class SlaveMessageProcessor(LocaleMixin):
         if hasattr(tg_msg, '_queued_execution_pending') and tg_msg._queued_execution_pending:
             self.logger.debug("[%s] Message execution is queued (task_id: %s), deferring database logging.",
                              xid, getattr(tg_msg, 'task_id', 'unknown'))
+            receive_started = getattr(getattr(self, '_timing_tls', None), 'receive_started', None)
+            if receive_started is not None:
+                self.logger.debug("[%s] Message enqueue finished in %.3fs since receive.",
+                                  xid, time.monotonic() - receive_started)
 
             etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
 
@@ -332,6 +430,10 @@ class SlaveMessageProcessor(LocaleMixin):
             # of silently dropped.
             self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
                               xid, tg_msg.chat.id, tg_msg.message_id)
+            receive_started = getattr(getattr(self, '_timing_tls', None), 'receive_started', None)
+            if receive_started is not None:
+                self.logger.debug("[%s] Blocking send completed in %.3fs since receive.",
+                                  xid, time.monotonic() - receive_started)
 
             etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
 
@@ -349,12 +451,16 @@ class SlaveMessageProcessor(LocaleMixin):
             (Optional[TelegramChatID], Optional[TelegramTopicID]): Telegram destination chat ID and thread ID, None if muted.
         """
         xid = msg.uid
+        destination_started = time.monotonic()
         chat = self.chat_manager.update_chat_obj(msg.chat)
         msg.chat = chat
         msg.author = self.chat_manager.get_or_enrol_member(msg.chat, msg.author)
 
         chat_uid = utils.chat_id_to_str(chat=msg.chat)
+        assoc_started = time.monotonic()
         tg_chats = self.db.get_chat_assoc(slave_uid=chat_uid)
+        self.logger.debug("[%s] Destination chat association lookup finished in %.3fs.",
+                          xid, time.monotonic() - assoc_started)
         tg_chat = None
         tg_dest: Optional[TelegramChatID] = None
         thread_id: Optional[TelegramTopicID] = None
@@ -378,11 +484,29 @@ class SlaveMessageProcessor(LocaleMixin):
             tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
         if self.channel.topic_group:
             if not isinstance(chat, SystemChat):
-                tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]) if tg_chat else self.channel.topic_group)
-                master_chat_info = self.bot.get_chat_info(tg_dest)
-                if master_chat_info.is_forum:
+                if tg_chat:
+                    tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
+                else:
+                    tg_dest = TelegramChatID(self.channel.topic_group)
+                if self._get_master_chat_is_forum(xid, tg_dest):
+                    topic_lookup_started = time.monotonic()
                     existing_thread_id = self.db.get_topic_thread_id(slave_uid=chat_uid, topic_chat_id=tg_dest)
+                    self.logger.debug(
+                        "[%s] Topic thread lookup finished in %.3fs for Telegram chat %s (existing_thread_id=%s).",
+                        xid,
+                        time.monotonic() - topic_lookup_started,
+                        tg_dest,
+                        existing_thread_id,
+                    )
+                    topic_started = time.monotonic()
                     thread_id = self.channel.chat_binding.create_topic(slave_uid=chat_uid, telegram_chat_id=tg_dest)
+                    self.logger.debug(
+                        "[%s] Topic creation/resolution finished in %.3fs for Telegram chat %s (thread_id=%s).",
+                        xid,
+                        time.monotonic() - topic_started,
+                        tg_dest,
+                        thread_id,
+                    )
                     if thread_id is not None and existing_thread_id is None:
                         msg.vendor_specific = msg.vendor_specific or {}
                         msg.vendor_specific['_force_send_mode'] = 'blocking'
@@ -399,6 +523,8 @@ class SlaveMessageProcessor(LocaleMixin):
         if self.chat_dest_cache.get(str(tg_dest)) != chat_uid:
             self.chat_dest_cache.remove(str(tg_dest))
 
+        self.logger.debug("[%s] Destination helper finished in %.3fs.",
+                          xid, time.monotonic() - destination_started)
         return msg_template, (tg_dest, thread_id)
 
 
@@ -441,16 +567,20 @@ class SlaveMessageProcessor(LocaleMixin):
     def _send_queue_kwargs(self, msg: Message,
                            old_msg_id: Optional[OldMsgID],
                            thread_id: Optional[TelegramTopicID] = None) -> dict:
-        return {
+        kwargs = {
             '_send_mode': self._send_mode(msg, old_msg_id, thread_id),
             '_slave_id': utils.chat_id_to_str(chat=msg.chat),
         }
+        kwargs.update(self._current_message_timing_kwargs())
+        return kwargs
 
     def _blocking_send_kwargs(self, msg: Message) -> dict:
-        return {
+        kwargs = {
             '_send_mode': 'blocking',
             '_slave_id': utils.chat_id_to_str(chat=msg.chat),
         }
+        kwargs.update(self._current_message_timing_kwargs())
+        return kwargs
 
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,

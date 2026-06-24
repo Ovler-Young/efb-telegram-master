@@ -162,6 +162,57 @@ def test_blocking_send_kwargs_keep_slave_target():
     }
 
 
+def test_get_slave_msg_dest_caches_known_forum_chat_info():
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    chat_uid = "tests.mocks.slave __chat_id__"
+    tg_chat = "telegram -100123"
+
+    def get_chat_assoc(*, slave_uid=None, master_uid=None):
+        if slave_uid == chat_uid:
+            return [tg_chat]
+        if master_uid == tg_chat:
+            return [chat_uid]
+        return []
+
+    processor.channel = SimpleNamespace(
+        config={"admins": [1]},
+        topic_group=-100999,
+        chat_binding=SimpleNamespace(create_topic=Mock(return_value=55)),
+    )
+    processor.bot = SimpleNamespace(get_chat_info=Mock(return_value=SimpleNamespace(is_forum=True)))
+    processor.db = SimpleNamespace(
+        get_chat_assoc=Mock(side_effect=get_chat_assoc),
+        get_topic_thread_id=Mock(return_value=55),
+    )
+    processor.chat_manager = SimpleNamespace(
+        update_chat_obj=lambda chat: chat,
+        get_or_enrol_member=lambda chat, author: author,
+    )
+    processor.chat_dest_cache = SimpleNamespace(get=Mock(return_value=chat_uid), remove=Mock())
+    processor.generate_message_template = Mock(return_value="template")
+    processor.logger = Mock()
+    processor._known_forum_chat_ids = set()
+    processor._known_forum_chat_ids_lock = threading.Lock()
+
+    message_1 = SimpleNamespace(
+        uid="message-1",
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+        author=SimpleNamespace(),
+    )
+    message_2 = SimpleNamespace(
+        uid="message-2",
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+        author=SimpleNamespace(),
+    )
+
+    assert processor.get_slave_msg_dest(message_1) == ("template", (-100123, 55))
+    assert processor.get_slave_msg_dest(message_2) == ("template", (-100123, 55))
+
+    processor.bot.get_chat_info.assert_called_once_with(-100123)
+    assert processor.channel.chat_binding.create_topic.call_count == 2
+    assert -100123 in processor._known_forum_chat_ids
+
+
 def test_duplicate_slave_message_logged_is_skipped():
     processor = build_duplicate_test_processor()
     processor.db.get_msg_log.return_value = SimpleNamespace(master_msg_id="100.10")

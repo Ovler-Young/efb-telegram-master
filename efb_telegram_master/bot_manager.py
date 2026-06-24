@@ -46,6 +46,7 @@ class QueuedSendTask(NamedTuple):
     task_id: str
     arrival_seq: int = 0
     cleanup_files: tuple[str, ...] = ()
+    enqueued_at: float = 0.0
 
     @property
     def slave_id(self) -> str:
@@ -409,6 +410,8 @@ class TelegramBotManager(LocaleMixin):
                 is_edit_method = fn.__name__.startswith('edit_message_')
 
                 # Bypass: caller already reserved a slot and set _using_bot
+                timing_receive_monotonic = kwargs.pop('_timing_receive_monotonic', None)
+                timing_destination_monotonic = kwargs.pop('_timing_destination_monotonic', None)
                 if kwargs.pop('_bypass_rate_limit', False):
                     return fn(self, *args, **kwargs)
 
@@ -509,6 +512,8 @@ class TelegramBotManager(LocaleMixin):
                             (self,) + args,
                             kwargs,
                             cleanup_files=cleanup_files,
+                            timing_receive_monotonic=timing_receive_monotonic,
+                            timing_destination_monotonic=timing_destination_monotonic,
                         )
 
                     message_thread_id = kwargs.get('message_thread_id')
@@ -1167,6 +1172,8 @@ class TelegramBotManager(LocaleMixin):
         kwargs: dict,
         *,
         cleanup_files: Optional[list] = None,
+        timing_receive_monotonic: Optional[float] = None,
+        timing_destination_monotonic: Optional[float] = None,
     ) -> SendReceipt:
         kwargs = dict(kwargs)
         for key in ('photo', 'document', 'video', 'animation', 'audio', 'voice', 'sticker'):
@@ -1184,6 +1191,19 @@ class TelegramBotManager(LocaleMixin):
             kwargs=kwargs,
             cleanup_files=cleanup_files,
         )
+        now = time.monotonic()
+        if timing_receive_monotonic is not None:
+            self.logger.debug(
+                "Queued send task %s enqueued %.3fs after message receive.",
+                task_id,
+                now - timing_receive_monotonic,
+            )
+        if timing_destination_monotonic is not None:
+            self.logger.debug(
+                "Queued send task %s enqueued %.3fs after destination resolution.",
+                task_id,
+                now - timing_destination_monotonic,
+            )
         placeholder = self._create_queued_message_placeholder(chat_id, task_id)
         return self._make_send_receipt(placeholder, queued=True, task_id=task_id)
 
@@ -1469,6 +1489,7 @@ class TelegramBotManager(LocaleMixin):
                            cleanup_files: Optional[list] = None) -> str:
         """Append a task to the per-target FIFO queue."""
         slave_id, chat_id = target
+        enqueued_at = time.monotonic()
         with self._send_queues_lock:
             self._tasks_enqueued += 1
             arrival_seq = self._tasks_enqueued
@@ -1480,12 +1501,15 @@ class TelegramBotManager(LocaleMixin):
                 kwargs=kwargs,
                 task_id=task_id,
                 arrival_seq=arrival_seq,
-                cleanup_files=tuple(cleanup_files or ())
+                cleanup_files=tuple(cleanup_files or ()),
+                enqueued_at=enqueued_at,
             )
             q = self._send_queues.setdefault(target, collections.deque())
             q.append(task)
+            queue_depth = len(q)
 
-        self.logger.debug("Queued send task %s for target %s", task_id, target)
+        self.logger.debug("Queued send task %s for target %s (target_queue_depth=%d)",
+                          task_id, target, queue_depth)
         return task_id
 
     # ── Async-dispatch queued send worker ──────────────────────
@@ -1527,6 +1551,13 @@ class TelegramBotManager(LocaleMixin):
                 self._requeue_send_task(task)
                 continue
 
+            if task.enqueued_at:
+                self.logger.debug(
+                    "Dispatching queued send task %s after %.3fs in queue via bot %s",
+                    task.task_id,
+                    time.monotonic() - task.enqueued_at,
+                    sender_bot_id or "main",
+                )
             self._dispatch_send(task, sender_bot, sender_bot_id)
 
     def _queued_send_worker(self):
@@ -1583,6 +1614,8 @@ class TelegramBotManager(LocaleMixin):
             send_kwargs.pop('_force_sender_known', None)
             send_kwargs.pop('_force_sender_bot_id', None)
             send_kwargs.pop('_slave_id', None)
+            send_kwargs.pop('_timing_receive_monotonic', None)
+            send_kwargs.pop('_timing_destination_monotonic', None)
             send_kwargs['_skip_rate_limit_retry'] = True
             with self._using_bot(sender_bot):
                 return task.function(*task.args, **send_kwargs)
@@ -1636,7 +1669,14 @@ class TelegramBotManager(LocaleMixin):
                 if sender_bot_id is not None:
                     self._record_aux_use(task.chat_id)
 
-                self.logger.debug("Queued send task %s completed successfully", task.task_id)
+                if task.enqueued_at:
+                    self.logger.debug(
+                        "Queued send task %s completed successfully in %.3fs since enqueue",
+                        task.task_id,
+                        time.monotonic() - task.enqueued_at,
+                    )
+                else:
+                    self.logger.debug("Queued send task %s completed successfully", task.task_id)
 
                 if result and hasattr(result, 'message_id'):
                     self._handle_queued_database_update(
