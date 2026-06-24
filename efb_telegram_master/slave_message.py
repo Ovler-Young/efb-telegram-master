@@ -30,6 +30,7 @@ from ehforwarderbot.constants import MsgType
 from ehforwarderbot.message import LinkAttribute, LocationAttribute, MessageCommand, Reactions, \
     StatusAttribute
 from ehforwarderbot.status import ChatUpdates, MemberUpdates, MessageRemoval, MessageReactionsUpdate
+from ehforwarderbot.types import MessageID
 from . import utils
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
@@ -133,7 +134,7 @@ class SlaveMessageProcessor(LocaleMixin):
         with self._known_forum_chat_ids_lock:
             self._known_forum_chat_ids.add(int(tg_dest))
 
-    def _get_master_chat_is_forum(self, xid: str, tg_dest: TelegramChatID) -> bool:
+    def _get_master_chat_is_forum(self, xid: Optional[MessageID], tg_dest: TelegramChatID) -> bool:
         if self._known_forum_chat(tg_dest):
             self.logger.debug("[%s] get_chat_info skipped for Telegram chat %s (known forum chat).",
                               xid, tg_dest)
