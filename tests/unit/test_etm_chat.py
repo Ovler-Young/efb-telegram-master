@@ -1,5 +1,8 @@
 import re
+from datetime import datetime
 from pytest import fixture
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from efb_telegram_master.chat import convert_chat, ETMPrivateChat, ETMChatMember, ETMSelfChatMember, ETMSystemChat, \
     ETMSystemChatMember, ETMGroupChat, unpickle
 from ehforwarderbot.chat import PrivateChat, SystemChat, GroupChat
@@ -77,6 +80,33 @@ def test_etm_chat_type_title_differ(db, slave):
     sys_title = sys.chat_title
 
     assert len({user_title, group_title, sys_title}) == 3
+
+
+def test_last_message_time_uses_ttl_cache():
+    db = Mock()
+    first_time = datetime(2026, 1, 1, 0, 0, 0)
+    second_time = datetime(2026, 1, 1, 0, 1, 1)
+    db.get_last_message.side_effect = [
+        SimpleNamespace(time=first_time),
+        SimpleNamespace(time=second_time),
+    ]
+    chat = ETMPrivateChat(
+        db,
+        module_id="tests.mocks.slave",
+        uid="__chat_id__",
+        name="Chat",
+    )
+
+    with patch("efb_telegram_master.chat.time.time", return_value=100.0):
+        assert chat.last_message_time == first_time
+        assert chat.last_message_time == first_time
+
+    assert db.get_last_message.call_count == 1
+
+    with patch("efb_telegram_master.chat.time.time", return_value=161.0):
+        assert chat.last_message_time == second_time
+
+    assert db.get_last_message.call_count == 2
 
 
 def test_etm_chat_instance_title_differ(db, slave):

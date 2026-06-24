@@ -511,19 +511,17 @@ class DatabaseManager:
             if bool(master_uid) == bool(slave_uid):
                 raise ValueError("Only one parameter is to be provided.")
             elif master_uid:
-                slaves = ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)\
+                slaves = list(
+                    ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)
                     .where(ChatAssoc.master_uid == master_uid)
-                if len(slaves) > 0:
-                    return [i.slave_uid for i in slaves]
-                else:
-                    return []
+                )
+                return [i.slave_uid for i in slaves]
             elif slave_uid:
-                masters = ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)\
+                masters = list(
+                    ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)
                     .where(ChatAssoc.slave_uid == slave_uid)
-                if len(masters) > 0:
-                    return [i.master_uid for i in masters]
-                else:
-                    return []
+                )
+                return [i.master_uid for i in masters]
             else:
                 return []
         except DoesNotExist:

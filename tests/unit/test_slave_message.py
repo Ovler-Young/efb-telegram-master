@@ -90,6 +90,36 @@ def build_duplicate_test_message(uid: str = "__msg_id__") -> SimpleNamespace:
     )
 
 
+def test_send_queue_kwargs_use_slave_target_for_new_message():
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    message = SimpleNamespace(
+        vendor_specific={},
+        commands=[],
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+    )
+
+    kwargs = SlaveMessageProcessor._send_queue_kwargs(processor, message, None)
+
+    assert kwargs == {
+        "_send_mode": "eventual",
+        "_slave_id": "tests.mocks.slave __chat_id__",
+    }
+
+
+def test_blocking_send_kwargs_keep_slave_target():
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+    )
+
+    kwargs = SlaveMessageProcessor._blocking_send_kwargs(processor, message)
+
+    assert kwargs == {
+        "_send_mode": "blocking",
+        "_slave_id": "tests.mocks.slave __chat_id__",
+    }
+
+
 def test_duplicate_slave_message_logged_is_skipped():
     processor = build_duplicate_test_processor()
     processor.db.get_msg_log.return_value = SimpleNamespace(master_msg_id="100.10")
@@ -299,7 +329,7 @@ def test_reaction_target_prefers_alt_message_for_telegram_origin_text():
     assert effective == "100.11"
 
 
-def test_update_reactions_waits_for_delayed_database_log():
+def test_update_reactions_waits_for_queued_database_log():
     processor = Mock(spec=SlaveMessageProcessor)
     processor.REACTION_DB_WAIT_TIMEOUT = 1.0
     processor.REACTION_DB_WAIT_INTERVAL = 0.01

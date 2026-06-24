@@ -294,7 +294,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                            disable_notification=silent,
                                            message_thread_id=thread_id,
                                            text=self._('Unknown type of message "{0}". (UT01)')
-                                           .format(msg.type.name))
+                                           .format(msg.type.name),
+                                           **self._send_queue_kwargs(msg, old_msg_id, thread_id))
 
         if tg_msg and commands:
             self.channel.commands.register_command(tg_msg, ETMCommandMsgStorage(
@@ -311,18 +312,18 @@ class SlaveMessageProcessor(LocaleMixin):
         if dedupe_key is not None:
             on_db_complete = lambda: self._release_pending_slave_message(dedupe_key)
 
-        if hasattr(tg_msg, '_delayed_execution_pending') and tg_msg._delayed_execution_pending:
-            self.logger.debug("[%s] Message execution is delayed (task_id: %s), deferring database logging.",
+        if hasattr(tg_msg, '_queued_execution_pending') and tg_msg._queued_execution_pending:
+            self.logger.debug("[%s] Message execution is queued (task_id: %s), deferring database logging.",
                              xid, getattr(tg_msg, 'task_id', 'unknown'))
 
             etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
 
             if hasattr(tg_msg, 'task_id'):
-                self.bot.register_delayed_database_update(
+                self.bot.register_queued_database_update(
                     tg_msg.task_id, etm_msg, old_msg_id, on_complete=on_db_complete,
                 )
             else:
-                self.logger.warning("[%s] Delayed message missing task_id, cannot register database update", xid)
+                self.logger.warning("[%s] Queued message missing task_id, cannot register database update", xid)
                 self._release_pending_slave_message(dedupe_key)
         else:
             # Normal (blocking) execution — send already succeeded,
@@ -437,6 +438,20 @@ class SlaveMessageProcessor(LocaleMixin):
             return 'blocking'
         return 'eventual'
 
+    def _send_queue_kwargs(self, msg: Message,
+                           old_msg_id: Optional[OldMsgID],
+                           thread_id: Optional[TelegramTopicID] = None) -> dict:
+        return {
+            '_send_mode': self._send_mode(msg, old_msg_id, thread_id),
+            '_slave_id': utils.chat_id_to_str(chat=msg.chat),
+        }
+
+    def _blocking_send_kwargs(self, msg: Message) -> dict:
+        return {
+            '_send_mode': 'blocking',
+            '_slave_id': utils.chat_id_to_str(chat=msg.chat),
+        }
+
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                            old_msg_id: Optional[OldMsgID] = None,
@@ -474,7 +489,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                            message_thread_id=thread_id,
                                            reply_markup=reply_markup,
                                            disable_notification=silent,
-                                           _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                           **self._send_queue_kwargs(msg, old_msg_id, thread_id))
         else:
             # Cannot change reply_to_message_id when editing a message
             edit_kwargs = dict(chat_id=old_msg_id[0],
@@ -527,7 +542,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                          message_thread_id=thread_id,
                                          reply_markup=reply_markup,
                                          disable_notification=silent,
-                                         _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                         **self._send_queue_kwargs(msg, old_msg_id, thread_id))
 
     # Parameters to decide when to pictures as files
     IMG_MIN_SIZE = 1600
@@ -609,7 +624,8 @@ class SlaveMessageProcessor(LocaleMixin):
                     message = self.bot.send_message(chat_id=tg_dest, reply_to_message_id=target_msg_id,
                                                     message_thread_id=thread_id, text=text,
                                                     parse_mode="HTML", reply_markup=reply_markup, disable_notification=silent,
-                                                    prefix=msg_template, suffix=reactions)
+                                                    prefix=msg_template, suffix=reactions,
+                                                    **self._blocking_send_kwargs(msg))
                     message.reply_text(file_too_large)
                     return message
 
@@ -647,7 +663,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                               message_thread_id=thread_id,
                                               reply_markup=reply_markup,
                                               disable_notification=silent,
-                                              _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                              **self._send_queue_kwargs(msg, old_msg_id, thread_id))
             else:
                 try:
                     assert msg.path
@@ -658,7 +674,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                message_thread_id=thread_id,
                                                reply_markup=reply_markup,
                                                disable_notification=silent,
-                                               _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                               **self._send_queue_kwargs(msg, old_msg_id, thread_id))
                 except telegram.error.BadRequest as e:
                     self.logger.error('[%s] Failed to send it as image, sending as document. Reason: %s',
                                       msg.uid, e)
@@ -671,7 +687,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                   message_thread_id=thread_id,
                                                   reply_markup=reply_markup,
                                                   disable_notification=silent,
-                                                  _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                                  **self._send_queue_kwargs(msg, old_msg_id, thread_id))
         finally:
             if msg.file:
                 msg.file.close()
@@ -707,7 +723,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     message_thread_id=thread_id, text=text,
                                                     parse_mode="HTML", reply_markup=reply_markup,
                                                     disable_notification=silent,
-                                                    prefix=msg_template, suffix=reactions)
+                                                    prefix=msg_template, suffix=reactions,
+                                                    **self._blocking_send_kwargs(msg))
                     message.reply_text(file_too_large)
                     return message
 
@@ -735,7 +752,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                message_thread_id=thread_id,
                                                reply_markup=reply_markup,
                                                disable_notification=silent,
-                                               _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                               **self._send_queue_kwargs(msg, old_msg_id, thread_id))
         finally:
             if msg.file is not None:
                 msg.file.close()
@@ -791,7 +808,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                         text=self.html_substitutions(msg),
                                                         parse_mode="HTML", reply_markup=reply_markup,
                                                         disable_notification=silent,
-                                                        prefix=msg_template, suffix=reactions)
+                                                        prefix=msg_template, suffix=reactions,
+                                                        **self._blocking_send_kwargs(msg))
                         message.reply_text(file_too_large)
                         return message
 
@@ -806,7 +824,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                  message_thread_id=thread_id,
                                                  reply_to_message_id=target_msg_id,
                                                  disable_notification=silent,
-                                                 _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                                 **self._send_queue_kwargs(msg, old_msg_id, thread_id))
                 except IOError:
                     self.logger.warning("[%s] Failed to convert image to webp sticker, sending as document.", msg.uid)
                     assert msg.file and msg.path
@@ -817,7 +835,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                   reply_to_message_id=target_msg_id,
                                                   reply_markup=reply_markup,
                                                   disable_notification=silent,
-                                                  _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                                  **self._send_queue_kwargs(msg, old_msg_id, thread_id))
                 finally:
                     if webp_img and not webp_img.closed:
                         webp_img.close()
@@ -891,7 +909,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     message_thread_id=thread_id, text=text,
                                                     parse_mode="HTML", reply_markup=reply_markup,
                                                     disable_notification=silent,
-                                                    prefix=msg_template, suffix=reactions)
+                                                    prefix=msg_template, suffix=reactions,
+                                                    **self._blocking_send_kwargs(msg))
                     message.reply_text(file_too_large)
                     return message
 
@@ -918,7 +937,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                           message_thread_id=thread_id,
                                           reply_markup=reply_markup,
                                           disable_notification=silent,
-                                          _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                          **self._send_queue_kwargs(msg, old_msg_id, thread_id))
         finally:
             if msg.file is not None:
                 msg.file.close()
@@ -949,7 +968,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     message_thread_id=thread_id, text=text,
                                                     parse_mode="HTML", reply_markup=reply_markup,
                                                     disable_notification=silent,
-                                                    prefix=msg_template, suffix=reactions)
+                                                    prefix=msg_template, suffix=reactions,
+                                                    **self._blocking_send_kwargs(msg))
                     message.reply_text(file_too_large)
                     return message
 
@@ -979,7 +999,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                      reply_to_message_id=target_msg_id,
                                                      message_thread_id=thread_id, reply_markup=reply_markup,
                                                      disable_notification=silent,
-                                                     _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                                     **self._send_queue_kwargs(msg, old_msg_id, thread_id))
                         return tg_msg
                     except pydub.exceptions.CouldntDecodeError as e:
                         self.logger.error("[%s] Failed to decode audio file for conversion: %s. Sending as file.", msg.uid, e)
@@ -1024,7 +1044,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                       message_thread_id=thread_id,
                                       reply_markup=location_reply_markup,
                                       disable_notification=silent,
-                                      _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                      **self._send_queue_kwargs(msg, old_msg_id, thread_id))
 
     def slave_message_video(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -1058,7 +1078,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     message_thread_id=thread_id, text=text,
                                                     parse_mode="HTML", reply_markup=reply_markup,
                                                     disable_notification=silent,
-                                                    prefix=msg_template, suffix=reactions)
+                                                    prefix=msg_template, suffix=reactions,
+                                                    **self._blocking_send_kwargs(msg))
                     message.reply_text(file_too_large)
                     return message
 
@@ -1082,7 +1103,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                        message_thread_id=thread_id,
                                        reply_markup=reply_markup,
                                        disable_notification=silent,
-                                       _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                       **self._send_queue_kwargs(msg, old_msg_id, thread_id))
         finally:
             if msg.file is not None:
                 msg.file.close()
@@ -1112,7 +1133,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                            message_thread_id=thread_id,
                                            reply_markup=reply_markup,
                                            disable_notification=silent,
-                                           _send_mode=self._send_mode(msg, old_msg_id, thread_id))
+                                           **self._send_queue_kwargs(msg, old_msg_id, thread_id))
         else:
             # Cannot change reply_to_message_id or thread_id when editing a message
             edit_kwargs = dict(chat_id=old_msg_id[0],
@@ -1389,7 +1410,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def _cleanup_pending_local_api_files(self):
         """Delete temp files copied to shared dir for local Bot API sends in this thread.
-        Only cleans up files that were NOT already claimed by a delayed task."""
+        Only cleans up files that were NOT already claimed by a queued task."""
         tls = self.bot._cleanup_tls
         pending = getattr(tls, 'pending_cleanup', [])
         for path in pending:

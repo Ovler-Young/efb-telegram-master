@@ -83,6 +83,18 @@ def test_old_timestamps_are_cleaned_up():
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=106.0):
         assert limiter.peek_delay(1) == 0.0  # old timestamp cleaned up
 
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=106.0):
+        limiter.reserve_slot(2)
+        assert 1 not in limiter._chat_timestamps
+
+
+def test_release_slot_removes_latest_reservation():
+    limiter = _make_limiter()
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
+        limiter.reserve_slot(1)
+        limiter.release_slot(1)
+        assert limiter.get_counts(1) == (0, 0)
+
 
 # get_counts
 
