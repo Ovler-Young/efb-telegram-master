@@ -659,10 +659,23 @@ class TelegramChannel(MasterChannel):
                 self.logger.exception('Unhandled telegram bot error!\n'
                                       'Update %s caused error %s. Exception', update, error)
 
+    def _is_stopping(self) -> bool:
+        bot_manager = getattr(self, "bot_manager", None)
+        return bool(
+            getattr(self, "_stop_polling_called", False)
+            or getattr(bot_manager, "_stopping", False)
+        )
+
     def send_message(self, msg: EFBMessage) -> EFBMessage:
+        if self._is_stopping():
+            self.logger.debug("Dropping slave message during Telegram Master shutdown: %s", msg)
+            return msg
         return self.slave_messages.send_message(msg)
 
     def send_status(self, status: Status):
+        if self._is_stopping():
+            self.logger.debug("Dropping slave status during Telegram Master shutdown: %s", status)
+            return None
         return self.slave_messages.send_status(status)
 
     def get_message_by_id(self, chat: Chat,

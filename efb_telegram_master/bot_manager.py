@@ -773,6 +773,7 @@ class TelegramBotManager(LocaleMixin):
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         config = self.channel.config
+        self._stopping = False
 
         req_kwargs = {
             'read_timeout': 15.0,
@@ -2507,6 +2508,7 @@ class TelegramBotManager(LocaleMixin):
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
+        self._stopping = True
         self.logger.info("Starting graceful shutdown...")
 
         # Log pending tasks count before stopping

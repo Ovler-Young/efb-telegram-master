@@ -8,6 +8,7 @@ from ehforwarderbot import Message, Chat
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.chat import ChatMember
 from ehforwarderbot.types import ReactionName
+from efb_telegram_master import TelegramChannel
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 
@@ -88,6 +89,47 @@ def build_duplicate_test_message(uid: str = "__msg_id__") -> SimpleNamespace:
         type=MsgType.Text,
         chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
     )
+
+
+def build_stopping_channel() -> TelegramChannel:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel.logger = Mock()
+    channel.slave_messages = Mock()
+    channel.bot_manager = SimpleNamespace(_stopping=False)
+    channel._stop_polling_called = True
+    return channel
+
+
+def test_channel_drops_slave_message_while_stopping():
+    channel = build_stopping_channel()
+    message = SimpleNamespace(uid="__late_msg__")
+
+    result = TelegramChannel.send_message(channel, message)
+
+    assert result is message
+    channel.slave_messages.send_message.assert_not_called()
+
+
+def test_channel_drops_slave_status_while_stopping():
+    channel = build_stopping_channel()
+    status = SimpleNamespace()
+
+    result = TelegramChannel.send_status(channel, status)
+
+    assert result is None
+    channel.slave_messages.send_status.assert_not_called()
+
+
+def test_channel_drops_slave_message_after_bot_manager_shutdown_starts():
+    channel = build_stopping_channel()
+    channel._stop_polling_called = False
+    channel.bot_manager._stopping = True
+    message = SimpleNamespace(uid="__late_msg__")
+
+    result = TelegramChannel.send_message(channel, message)
+
+    assert result is message
+    channel.slave_messages.send_message.assert_not_called()
 
 
 def test_send_queue_kwargs_use_slave_target_for_new_message():
