@@ -283,16 +283,6 @@ class MasterMessageProcessor(LocaleMixin):
         else:
             return self.process_telegram_message(update, context, destination, quote=quote, edited=edited)
 
-    def get_singly_linked_chat_id_str(self, chat: Chat) -> Optional[EFBChannelChatIDStr]:
-        """Return the singly-linked remote chat if available.
-        Otherwise return None.
-        """
-        master_chat_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(chat.id)))
-        chats = self.db.get_chat_assoc(master_uid=master_chat_uid)
-        if len(chats) == 1:
-            return chats[0]
-        return None
-
     def process_telegram_message(self, update: Update, context: CallbackContext,
                                  destination: EFBChannelChatIDStr, quote: bool = False,
                                  edited: Optional["MsgLog"] = None):
