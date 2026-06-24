@@ -4,6 +4,7 @@ import html
 import itertools
 import logging
 import os
+import threading
 import tempfile
 import time
 import traceback
@@ -60,6 +61,27 @@ class SlaveMessageProcessor(LocaleMixin):
         self.db: 'DatabaseManager' = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
+        self._pending_slave_messages: set[Tuple[str, str]] = set()
+        self._pending_slave_messages_lock = threading.Lock()
+
+    def _claim_pending_slave_message(self, key: Tuple[str, str]) -> bool:
+        with self._pending_slave_messages_lock:
+            if key in self._pending_slave_messages:
+                return False
+            self._pending_slave_messages.add(key)
+            return True
+
+    def _release_pending_slave_message(self, key: Optional[Tuple[str, str]]):
+        if key is None:
+            return
+        with self._pending_slave_messages_lock:
+            self._pending_slave_messages.discard(key)
+
+    @staticmethod
+    def _dedupe_key(msg: Message, slave_origin_uid: str) -> Optional[Tuple[str, str]]:
+        if msg.edit or msg.uid is None or msg.type == MsgType.Status:
+            return None
+        return slave_origin_uid, str(msg.uid)
 
     @staticmethod
     def _get_edit_kwargs(msg: Message):
@@ -101,19 +123,40 @@ class SlaveMessageProcessor(LocaleMixin):
         Args:
             msg (Message): The message.
         """
+        dedupe_key: Optional[Tuple[str, str]] = None
+        pending_claimed = False
         try:
             xid = msg.uid
             self.logger.debug("[%s] Slave message delivered to ETM.\n%s", xid, msg)
+
+            slave_origin_uid = utils.chat_id_to_str(chat=msg.chat)
+            dedupe_key = self._dedupe_key(msg, slave_origin_uid)
+            if dedupe_key is not None:
+                existing_msg = self.db.get_msg_log(slave_msg_id=msg.uid,
+                                                   slave_origin_uid=slave_origin_uid)
+                if existing_msg is not None:
+                    self.logger.info(
+                        "[%s] Duplicate slave message is already logged as Telegram message %s; skipping.",
+                        xid, existing_msg.master_msg_id,
+                    )
+                    return msg
+                if not self._claim_pending_slave_message(dedupe_key):
+                    self.logger.info("[%s] Duplicate slave message is already pending delivery; skipping.",
+                                     xid)
+                    return msg
+                pending_claimed = True
 
             msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(msg)
 
             silent = self.is_silent(msg)
             if silent is None:
                 self.logger.debug("[%s] Message is not delivered per silent settings.", xid)
+                self._release_pending_slave_message(dedupe_key)
                 return msg
 
             if tg_dest is None:
                 self.logger.debug("[%s] Sender of the message is muted.", xid)
+                self._release_pending_slave_message(dedupe_key)
                 return msg
 
             # When editing message
@@ -138,8 +181,11 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.vendor_specific = msg.vendor_specific or {}
                 msg.vendor_specific['_sender_bot_id'] = _edit_sender_bot_id
 
-            self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent)
+            self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
+                                  dedupe_key=dedupe_key)
         except Exception as e:
+            if pending_claimed:
+                self._release_pending_slave_message(dedupe_key)
             if isinstance(e, telegram.error.BadRequest) and e.message:
                 if "Topic" in e.message:
                     try:
@@ -162,7 +208,8 @@ class SlaveMessageProcessor(LocaleMixin):
                          old_msg_id: Optional[OldMsgID],
                          tg_dest: TelegramChatID,
                          thread_id: Optional[TelegramTopicID],
-                         silent: bool = False):
+                         silent: bool = False,
+                         dedupe_key: Optional[Tuple[str, str]] = None):
         """Dispatch with header, destination and Telegram message ID and destinations."""
 
         xid = msg.uid
@@ -237,6 +284,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                               reply_markup, silent)
         elif msg.type == MsgType.Status:
             # Status messages are not to be recorded in databases
+            self._release_pending_slave_message(dedupe_key)
             return self.slave_message_status(msg, tg_dest, thread_id)
         elif msg.type == MsgType.Unsupported:
             tg_msg = self.slave_message_unsupported(msg, tg_dest, thread_id, msg_template, reactions, old_msg_id,
@@ -257,7 +305,12 @@ class SlaveMessageProcessor(LocaleMixin):
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. "
                                "This may happen during shutdown or when Telegram API is unavailable.", xid)
+            self._release_pending_slave_message(dedupe_key)
             return
+
+        on_db_complete = None
+        if dedupe_key is not None:
+            on_db_complete = lambda: self._release_pending_slave_message(dedupe_key)
 
         if hasattr(tg_msg, '_delayed_execution_pending') and tg_msg._delayed_execution_pending:
             self.logger.debug("[%s] Message execution is delayed (task_id: %s), deferring database logging.",
@@ -266,9 +319,12 @@ class SlaveMessageProcessor(LocaleMixin):
             etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
 
             if hasattr(tg_msg, 'task_id'):
-                self.bot.register_delayed_database_update(tg_msg.task_id, etm_msg, old_msg_id)
+                self.bot.register_delayed_database_update(
+                    tg_msg.task_id, etm_msg, old_msg_id, on_complete=on_db_complete,
+                )
             else:
                 self.logger.warning("[%s] Delayed message missing task_id, cannot register database update", xid)
+                self._release_pending_slave_message(dedupe_key)
         else:
             # Normal (blocking) execution — send already succeeded,
             # hand off DB write asynchronously so the calling thread is
@@ -282,7 +338,7 @@ class SlaveMessageProcessor(LocaleMixin):
             sender_bot_id = getattr(tg_msg, 'sender_bot_id', None)
 
             self.bot.submit_async_db_write(
-                etm_msg, tg_msg, old_msg_id, sender_bot_id=sender_bot_id,
+                etm_msg, tg_msg, old_msg_id, sender_bot_id=sender_bot_id, on_complete=on_db_complete,
             )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
