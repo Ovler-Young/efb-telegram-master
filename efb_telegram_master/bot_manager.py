@@ -512,6 +512,9 @@ class TelegramBotManager(LocaleMixin):
                         )
 
                     message_thread_id = kwargs.get('message_thread_id')
+                    allow_aux_fallback = not (
+                        force_main_bot or has_callback or is_edit_method or force_sender_known
+                    )
                     if force_main_bot or has_callback or is_edit_method:
                         bot, chosen_sender_bot_id, wait_seconds = self._bot, None, 0.0
                     elif force_sender_known:
@@ -527,6 +530,18 @@ class TelegramBotManager(LocaleMixin):
                         )
                     if chosen_sender_bot_id is None:
                         wait_seconds, _, _ = self._calculate_rate_limit_delay(chat_id)
+                        if wait_seconds > 0 and allow_aux_fallback and self.bot_pool:
+                            slot = self.bot_pool.acquire_send_slot(
+                                int(chat_id),
+                                max_delay=wait_seconds,
+                                affinity_key=str(slave_id) if slave_id else (chat_id, message_thread_id),
+                                notify_admin=True,
+                            )
+                            if slot is not None:
+                                self._release_reserved_slot(None, int(chat_id))
+                                aux_bot, wait_seconds = slot
+                                bot = aux_bot.bot
+                                chosen_sender_bot_id = str(aux_bot.bot_id)
                     if wait_seconds > 0:
                         time.sleep(wait_seconds)
                     try:

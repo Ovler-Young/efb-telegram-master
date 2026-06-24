@@ -288,6 +288,52 @@ def test_rate_limit_decorator_routes_new_send_through_aux_pool():
     manager._record_aux_use.assert_called_once_with(123)
 
 
+def test_rate_limit_decorator_switches_to_aux_when_main_reservation_gets_delayed():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
+    main_bot = object()
+    aux_bot = SimpleNamespace(bot=object(), bot_id=999)
+    used_bots = []
+
+    class DummyContext:
+        def __init__(self, bot):
+            self.bot = bot
+
+        def __enter__(self):
+            used_bots.append(self.bot)
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    manager = SimpleNamespace(
+        _send_worker_stop=threading.Event(),
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=(aux_bot, 0.0))),
+        _calculate_rate_limit_delay=Mock(return_value=(5.0, 0, 0)),
+        _select_sender=Mock(return_value=(main_bot, None, 0.0)),
+        _release_reserved_slot=Mock(),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _using_bot=lambda bot: DummyContext(bot),
+        _record_aux_use=Mock(),
+        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
+            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
+        ),
+        logger=Mock(),
+    )
+
+    result = decorated(manager, 123, _slave_id="slave.chat")
+
+    assert result.sender_bot_id == "999"
+    assert used_bots == [aux_bot.bot]
+    manager.bot_pool.acquire_send_slot.assert_called_once_with(
+        123,
+        max_delay=5.0,
+        affinity_key="slave.chat",
+        notify_admin=True,
+    )
+    manager._release_reserved_slot.assert_called_once_with(None, 123)
+    manager._record_aux_use.assert_called_once_with(123)
+
+
 @pytest.mark.parametrize(("method_name", "kwargs"), [
     ("edit_message_caption", {"chat_id": 123, "message_id": 456, "caption": "updated"}),
     ("edit_message_media", {"chat_id": 123, "message_id": 456, "media": object()}),
