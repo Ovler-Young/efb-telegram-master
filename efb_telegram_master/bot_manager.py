@@ -451,11 +451,11 @@ class TelegramBotManager(LocaleMixin):
 
                 if sender_bot_id and self.bot_pool and not has_callback and chat_id is not None:
                     chat_id_int = int(chat_id)
-                    bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
+                    bot, chosen_sender_bot_id, wait_seconds = self._select_forced_sender(
                         chat_id_int, sender_bot_id,
                     )
-                    if delay_time > 0:
-                        time.sleep(delay_time)
+                    if wait_seconds > 0:
+                        time.sleep(wait_seconds)
                     if chosen_sender_bot_id:
                         try:
                             with self._using_bot(bot):
@@ -481,9 +481,9 @@ class TelegramBotManager(LocaleMixin):
                     aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
                     if aux_bot:
                         aux_bot.update_membership(chat_id_int, False)
-                    delay_time, _, _ = self._calculate_rate_limit_delay(chat_id_int)
-                    if delay_time > 0:
-                        time.sleep(delay_time)
+                    wait_seconds, _, _ = self._calculate_rate_limit_delay(chat_id_int)
+                    if wait_seconds > 0:
+                        time.sleep(wait_seconds)
                     return self._make_send_receipt(fn(self, *args, **kwargs))
 
                 if chat_id:
@@ -506,22 +506,22 @@ class TelegramBotManager(LocaleMixin):
 
                     message_thread_id = kwargs.get('message_thread_id')
                     if force_main_bot or has_callback or is_edit_method:
-                        bot, chosen_sender_bot_id, delay_time = self._bot, None, 0.0
+                        bot, chosen_sender_bot_id, wait_seconds = self._bot, None, 0.0
                     elif force_sender_known:
-                        bot, chosen_sender_bot_id, delay_time = self._select_forced_sender(
+                        bot, chosen_sender_bot_id, wait_seconds = self._select_forced_sender(
                             chat_id, forced_sender_bot_id,
                         )
                     else:
-                        bot, chosen_sender_bot_id, delay_time = self._select_sender(
+                        bot, chosen_sender_bot_id, wait_seconds = self._select_sender(
                             chat_id,
                             slave_id=str(slave_id) if slave_id else None,
                             has_callback=has_callback,
                             message_thread_id=message_thread_id,
                         )
                     if chosen_sender_bot_id is None:
-                        delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
-                    if delay_time > 0:
-                        time.sleep(delay_time)
+                        wait_seconds, _, _ = self._calculate_rate_limit_delay(chat_id)
+                    if wait_seconds > 0:
+                        time.sleep(wait_seconds)
                     try:
                         with self._using_bot(bot):
                             result = fn(self, *args, **kwargs)
@@ -538,9 +538,9 @@ class TelegramBotManager(LocaleMixin):
                                     "marking it as non-member for this chat and retrying with main bot.",
                                     chosen_sender_bot_id, chat_id,
                                 )
-                                delay_time, _, _ = self._calculate_rate_limit_delay(chat_id)
-                                if delay_time > 0:
-                                    time.sleep(delay_time)
+                                wait_seconds, _, _ = self._calculate_rate_limit_delay(chat_id)
+                                if wait_seconds > 0:
+                                    time.sleep(wait_seconds)
                                 return self._make_send_receipt(fn(self, *args, **kwargs))
                         raise
 
@@ -1398,7 +1398,7 @@ class TelegramBotManager(LocaleMixin):
             peek_only: If True, compute delay without reserving a slot.
 
         Returns:
-            tuple: (delay_time, chat_count, global_count)
+            tuple: (wait_seconds, chat_count, global_count)
         """
         if peek_only:
             sleep_time = self._rate_limiter.peek_delay(chat_id)

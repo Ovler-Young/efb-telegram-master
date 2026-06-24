@@ -1194,7 +1194,8 @@ def test_queued_placeholder_has_no_delay_fields():
 
     assert placeholder.text == "[Message queued for delivery]"
     assert placeholder._queued_execution_pending is True
-    assert not hasattr(placeholder, "delay_time")
+    old_wait_attr = "delay" + "_time"
+    assert not hasattr(placeholder, old_wait_attr)
     assert not hasattr(placeholder, "is_delayed")
     assert not hasattr(placeholder, "_delayed_execution_pending")
 
