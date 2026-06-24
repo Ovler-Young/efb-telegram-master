@@ -203,14 +203,6 @@ class SlaveMessageProcessor(LocaleMixin):
             slave_origin_uid = utils.chat_id_to_str(chat=msg.chat)
             dedupe_key = self._dedupe_key(msg, slave_origin_uid)
             if dedupe_key is not None:
-                existing_msg = self.db.get_msg_log(slave_msg_id=msg.uid,
-                                                   slave_origin_uid=slave_origin_uid)
-                if existing_msg is not None:
-                    self.logger.info(
-                        "[%s] Duplicate slave message is already logged as Telegram message %s; skipping.",
-                        xid, existing_msg.master_msg_id,
-                    )
-                    return msg
                 if not self._claim_pending_slave_message(dedupe_key):
                     self.logger.info("[%s] Duplicate slave message is already pending delivery; skipping.",
                                      xid)

@@ -213,35 +213,9 @@ def test_get_slave_msg_dest_caches_known_forum_chat_info():
     assert -100123 in processor._known_forum_chat_ids
 
 
-def test_duplicate_slave_message_logged_is_skipped():
+def test_new_slave_message_does_not_query_sent_message_log_for_dedupe():
     processor = build_duplicate_test_processor()
     processor.db.get_msg_log.return_value = SimpleNamespace(master_msg_id="100.10")
-    message = build_duplicate_test_message()
-
-    result = SlaveMessageProcessor.send_message(processor, message)
-
-    assert result is message
-    processor.get_slave_msg_dest.assert_not_called()
-    processor.dispatch_message.assert_not_called()
-
-
-def test_duplicate_slave_message_pending_is_skipped():
-    processor = build_duplicate_test_processor()
-    processor.db.get_msg_log.return_value = None
-    message = build_duplicate_test_message()
-    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
-    processor._pending_slave_messages.add(key)
-
-    result = SlaveMessageProcessor.send_message(processor, message)
-
-    assert result is message
-    processor.get_slave_msg_dest.assert_not_called()
-    processor.dispatch_message.assert_not_called()
-
-
-def test_new_slave_message_claims_pending_before_dispatch():
-    processor = build_duplicate_test_processor()
-    processor.db.get_msg_log.return_value = None
     message = build_duplicate_test_message()
     key = ("tests.mocks.slave __chat_id__", "__msg_id__")
 
@@ -249,6 +223,37 @@ def test_new_slave_message_claims_pending_before_dispatch():
 
     assert result is message
     assert key in processor._pending_slave_messages
+    processor.db.get_msg_log.assert_not_called()
+    processor.get_slave_msg_dest.assert_called_once_with(message)
+    processor.dispatch_message.assert_called_once_with(
+        message, "__template__", None, 123, None, False, dedupe_key=key,
+    )
+
+
+def test_duplicate_slave_message_pending_is_skipped():
+    processor = build_duplicate_test_processor()
+    message = build_duplicate_test_message()
+    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
+    processor._pending_slave_messages.add(key)
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    processor.db.get_msg_log.assert_not_called()
+    processor.get_slave_msg_dest.assert_not_called()
+    processor.dispatch_message.assert_not_called()
+
+
+def test_new_slave_message_claims_pending_before_dispatch():
+    processor = build_duplicate_test_processor()
+    message = build_duplicate_test_message()
+    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    assert key in processor._pending_slave_messages
+    processor.db.get_msg_log.assert_not_called()
     processor.dispatch_message.assert_called_once_with(
         message, "__template__", None, 123, None, False, dedupe_key=key,
     )
@@ -256,7 +261,6 @@ def test_new_slave_message_claims_pending_before_dispatch():
 
 def test_undelivered_slave_message_releases_pending_claim():
     processor = build_duplicate_test_processor()
-    processor.db.get_msg_log.return_value = None
     processor.is_silent.return_value = None
     message = build_duplicate_test_message()
     key = ("tests.mocks.slave __chat_id__", "__msg_id__")
@@ -265,6 +269,7 @@ def test_undelivered_slave_message_releases_pending_claim():
 
     assert result is message
     assert key not in processor._pending_slave_messages
+    processor.db.get_msg_log.assert_not_called()
     processor.dispatch_message.assert_not_called()
 
 
