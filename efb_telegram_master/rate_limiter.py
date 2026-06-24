@@ -95,7 +95,7 @@ class SlidingWindowRateLimiter:
         """Return ``(chat_count, global_count)`` for diagnostics."""
         with self._lock:
             self._cleanup()
-            return len(self._chat_timestamps[chat_id]), len(self._global_timestamps)
+            return len(self._chat_timestamps.get(chat_id, ())), len(self._global_timestamps)
 
     # Internals
 
@@ -109,8 +109,8 @@ class SlidingWindowRateLimiter:
 
         # Per-chat window
         chat_delay = 0.0
-        chat_ts = self._chat_timestamps[chat_id]
-        if len(chat_ts) >= effective_chat_limit:
+        chat_ts = self._chat_timestamps.get(chat_id)
+        if chat_ts and len(chat_ts) >= effective_chat_limit:
             safe_index = len(chat_ts) - effective_chat_limit
             chat_delay = max(0.0, (chat_ts[safe_index] + self.chat_window) - current_time)
 

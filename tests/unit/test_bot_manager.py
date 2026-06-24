@@ -1194,6 +1194,9 @@ def test_queued_placeholder_has_no_delay_fields():
 
     assert placeholder.text == "[Message queued for delivery]"
     assert placeholder._queued_execution_pending is True
+    assert not hasattr(placeholder, "execute_time")
+    assert not hasattr(placeholder, "delay_time")
+    assert not hasattr(placeholder, "expected_send_time")
 
 
 # --- DB retry queue ---

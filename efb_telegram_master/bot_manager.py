@@ -857,10 +857,6 @@ class TelegramBotManager(LocaleMixin):
         self._send_in_flight: dict[SendTarget, tuple] = {}  # target -> (Future, task, sender_bot_id)
         self._bot_chat_disabled_until: dict[tuple, float] = {}  # (bot_id|None, chat_id) -> RetryAfter deadline
 
-        # Per-chat send interval (200ms safety gap)
-        self._last_send_by_chat: dict[int, float] = {}
-        self.CHAT_SEND_INTERVAL = 0.2  # seconds
-
         # Thread pool for non-blocking sends
         self._send_worker_count = self.DEFAULT_SEND_WORKER_COUNT
         self._send_executor: ThreadPoolExecutor = ThreadPoolExecutor(
@@ -1604,7 +1600,6 @@ class TelegramBotManager(LocaleMixin):
                 if sender_bot_id is not None:
                     self._record_aux_use(task.chat_id)
 
-                self._last_send_by_chat[task.chat_id] = time.time()
                 self.logger.debug("Queued send task %s completed successfully", task.task_id)
 
                 if result and hasattr(result, 'message_id'):

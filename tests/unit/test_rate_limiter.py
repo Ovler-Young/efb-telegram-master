@@ -94,6 +94,15 @@ def test_release_slot_removes_latest_reservation():
         limiter.reserve_slot(1)
         limiter.release_slot(1)
         assert limiter.get_counts(1) == (0, 0)
+        assert 1 not in limiter._chat_timestamps
+
+
+def test_peek_and_counts_do_not_create_empty_chat_key():
+    limiter = _make_limiter()
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
+        assert limiter.peek_delay(1) == 0.0
+        assert limiter.get_counts(1) == (0, 0)
+        assert 1 not in limiter._chat_timestamps
 
 
 # get_counts

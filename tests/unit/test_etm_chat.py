@@ -103,6 +103,11 @@ def test_last_message_time_uses_ttl_cache():
 
     assert db.get_last_message.call_count == 1
 
+    with patch("efb_telegram_master.chat.time.time", return_value=160.0):
+        assert chat.last_message_time == first_time
+
+    assert db.get_last_message.call_count == 1
+
     with patch("efb_telegram_master.chat.time.time", return_value=161.0):
         assert chat.last_message_time == second_time
 
