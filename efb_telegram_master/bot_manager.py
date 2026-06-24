@@ -850,7 +850,7 @@ class TelegramBotManager(LocaleMixin):
 
         self._send_queues: dict[SendTarget, _deque[QueuedSendTask]] = {}
         self._send_queues_lock = threading.Lock()
-        self._tasks_scheduled = 0  # monotonic counter for diagnostics
+        self._tasks_enqueued = 0  # monotonic counter for diagnostics
         self._send_worker_stop = threading.Event()
 
         # Per-target concurrency tracking
@@ -1438,8 +1438,8 @@ class TelegramBotManager(LocaleMixin):
         """Append a task to the per-target FIFO queue."""
         slave_id, chat_id = target
         with self._send_queues_lock:
-            self._tasks_scheduled += 1
-            arrival_seq = self._tasks_scheduled
+            self._tasks_enqueued += 1
+            arrival_seq = self._tasks_enqueued
             task_id = f"{slave_id}_{chat_id}_{arrival_seq}_{time.time_ns()}"
             task = QueuedSendTask(
                 target=target,
@@ -1519,7 +1519,7 @@ class TelegramBotManager(LocaleMixin):
                 # ── 3. Housekeeping ──
                 self._process_db_retry_queue()
 
-                # Purge expired freeze entries
+                # Purge expired disabled bot/chat entries
                 if self._bot_chat_disabled_until:
                     expired = [k for k, v in self._bot_chat_disabled_until.items() if v <= now]
                     for k in expired:

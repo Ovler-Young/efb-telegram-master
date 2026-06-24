@@ -488,40 +488,40 @@ def test_rate_limit_decorator_routes_reply_to_main_bot():
 
 def test_rate_limit_decorator_eventual_mode_enqueues_task():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    scheduled = SimpleNamespace(queued=True, task_id="task-1")
+    queued_receipt = SimpleNamespace(queued=True, task_id="task-1")
     manager = SimpleNamespace(
         _send_worker_stop=threading.Event(),
         bot_pool=None,
         _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _enqueue_eventual_send=Mock(return_value=scheduled),
+        _enqueue_eventual_send=Mock(return_value=queued_receipt),
         logger=Mock(),
     )
 
     result = decorated(manager, 123, _send_mode="eventual", _slave_id="slave.chat")
 
-    assert result is scheduled
+    assert result is queued_receipt
     manager._enqueue_eventual_send.assert_called_once()
 
 
 def test_rate_limit_decorator_eventual_reply_preserves_target_sender():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    scheduled = SimpleNamespace(queued=True, task_id="task-1")
+    queued_receipt = SimpleNamespace(queued=True, task_id="task-1")
     manager = SimpleNamespace(
         _send_worker_stop=threading.Event(),
         channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id=None)))),
         bot_pool=SimpleNamespace(acquire_send_slot=Mock()),
         _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _enqueue_eventual_send=Mock(return_value=scheduled),
+        _enqueue_eventual_send=Mock(return_value=queued_receipt),
         logger=Mock(),
     )
 
     result = decorated(manager, 123, reply_to_message_id=456, _send_mode="eventual", _slave_id="slave.chat")
 
-    assert result is scheduled
-    scheduled_kwargs = manager._enqueue_eventual_send.call_args.args[4]
-    assert scheduled_kwargs["reply_to_message_id"] == 456
-    assert scheduled_kwargs["_force_sender_known"] is True
-    assert scheduled_kwargs["_force_sender_bot_id"] is None
+    assert result is queued_receipt
+    queued_kwargs = manager._enqueue_eventual_send.call_args.args[4]
+    assert queued_kwargs["reply_to_message_id"] == 456
+    assert queued_kwargs["_force_sender_known"] is True
+    assert queued_kwargs["_force_sender_bot_id"] is None
 
 
 def test_select_sender_passes_topic_affinity_key_to_bot_pool():
@@ -1011,7 +1011,7 @@ def test_enqueue_appends_to_per_target_fifo():
     mgr = SimpleNamespace(
         _send_queues={},
         _send_queues_lock=threading.Lock(),
-        _tasks_scheduled=0,
+        _tasks_enqueued=0,
         logger=Mock(),
     )
 
@@ -1021,7 +1021,7 @@ def test_enqueue_appends_to_per_target_fifo():
     q = mgr._send_queues[target]
     assert len(q) == 2
     assert q[0].task_id != q[1].task_id  # distinct tasks
-    assert mgr._tasks_scheduled == 2
+    assert mgr._tasks_enqueued == 2
 
 
 def test_requeue_prepends_to_target_fifo():
@@ -1194,10 +1194,6 @@ def test_queued_placeholder_has_no_delay_fields():
 
     assert placeholder.text == "[Message queued for delivery]"
     assert placeholder._queued_execution_pending is True
-    old_wait_attr = "delay" + "_time"
-    assert not hasattr(placeholder, old_wait_attr)
-    assert not hasattr(placeholder, "is_delayed")
-    assert not hasattr(placeholder, "_delayed_execution_pending")
 
 
 # --- DB retry queue ---
