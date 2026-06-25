@@ -5,6 +5,7 @@ import html
 import io
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -63,6 +64,18 @@ P = ParamSpec("P")
 T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
 _QUEUED_DATABASE_UPDATE_DROPPED = object()
+_INTERNAL_KWARGS = frozenset({
+    '_bypass_rate_limit',
+    '_sender_bot_id',
+    '_slave_id',
+    '_send_mode',
+    '_force_main_bot',
+    '_force_sender_known',
+    '_force_sender_bot_id',
+    '_timing_receive_monotonic',
+    '_timing_destination_monotonic',
+    '_skip_rate_limit_retry',
+})
 
 
 class SyncBotProtocol(Protocol):
@@ -378,6 +391,7 @@ class TelegramBotManager(LocaleMixin):
     bot_pool: Optional['BotPool']
     _send_worker_stop: threading.Event
     _send_queues_lock: threading.Lock
+    _stopping: threading.Event
     _cleanup_tls: threading.local
     _tls: threading.local
     _aux_recent_use: dict[int, float]
@@ -499,21 +513,27 @@ class TelegramBotManager(LocaleMixin):
                     cleanup_files = getattr(self._cleanup_tls, 'pending_cleanup', [])[:]
                     self._cleanup_tls.pending_cleanup = []
 
-                    if send_mode == 'eventual' and not is_edit_method and not has_callback and slave_id:
-                        if force_sender_known:
-                            kwargs = dict(kwargs)
-                            kwargs['_force_sender_known'] = True
-                            kwargs['_force_sender_bot_id'] = forced_sender_bot_id
-                        return self._enqueue_eventual_send(
-                            str(slave_id),
-                            int(chat_id),
-                            fn,
-                            (self,) + args,
-                            kwargs,
-                            cleanup_files=cleanup_files,
-                            timing_receive_monotonic=timing_receive_monotonic,
-                            timing_destination_monotonic=timing_destination_monotonic,
-                        )
+                    if send_mode == 'eventual':
+                        if not slave_id:
+                            self.logger.warning(
+                                "Eventual send requested for chat %s without _slave_id; falling back to blocking.",
+                                chat_id,
+                            )
+                        elif not is_edit_method and not has_callback:
+                            if force_sender_known:
+                                kwargs = dict(kwargs)
+                                kwargs['_force_sender_known'] = True
+                                kwargs['_force_sender_bot_id'] = forced_sender_bot_id
+                            return self._enqueue_eventual_send(
+                                str(slave_id),
+                                int(chat_id),
+                                fn,
+                                (self,) + args,
+                                kwargs,
+                                cleanup_files=cleanup_files,
+                                timing_receive_monotonic=timing_receive_monotonic,
+                                timing_destination_monotonic=timing_destination_monotonic,
+                            )
 
                     message_thread_id = kwargs.get('message_thread_id')
                     allow_aux_fallback = not (
@@ -792,7 +812,7 @@ class TelegramBotManager(LocaleMixin):
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         config = self.channel.config
-        self._stopping = False
+        self._stopping = threading.Event()
 
         req_kwargs = {
             'read_timeout': 15.0,
@@ -887,6 +907,7 @@ class TelegramBotManager(LocaleMixin):
         # Per-target concurrency tracking
         self._send_in_flight: dict[SendTarget, tuple] = {}  # target -> (Future, task, sender_bot_id)
         self._bot_chat_disabled_until: dict[tuple, float] = {}  # (bot_id|None, chat_id) -> RetryAfter deadline
+        self._target_retry_after: dict[SendTarget, float] = {}
 
         # Thread pool for non-blocking sends
         self._send_worker_count = self.DEFAULT_SEND_WORKER_COUNT
@@ -903,6 +924,8 @@ class TelegramBotManager(LocaleMixin):
         self._rendezvous_ttl = 600.0          # 10 minutes
         self._rendezvous_cleanup_interval = 300.0  # 5 minutes
         self._last_rendezvous_cleanup = time.time()
+        self._last_queue_stats_log = time.time()
+        self._queue_stats_log_interval = 60.0
 
         # DB write retry queue
         self._db_retry_queue: list[tuple] = []
@@ -1491,7 +1514,7 @@ class TelegramBotManager(LocaleMixin):
         enqueued_at = time.monotonic()
         with self._send_queues_lock:
             self._tasks_enqueued += 1
-            task_id = f"{slave_id}_{chat_id}_{self._tasks_enqueued}_{time.time_ns()}"
+            task_id = f"{slave_id}_{chat_id}_{self._tasks_enqueued}"
             task = QueuedSendTask(
                 target=target,
                 function=function,
@@ -1515,7 +1538,11 @@ class TelegramBotManager(LocaleMixin):
         with self._send_queues_lock:
             dispatchable_targets = [
                 target for target, q in self._send_queues.items()
-                if q and target not in self._send_in_flight
+                if (
+                    q
+                    and target not in self._send_in_flight
+                    and self._target_retry_after.get(target, 0.0) <= now
+                )
             ]
 
         for target in dispatchable_targets:
@@ -1545,6 +1572,9 @@ class TelegramBotManager(LocaleMixin):
                     now=now,
                 )
             if sender_bot is None or wait_time > 0:
+                if sender_bot_id is not None:
+                    self._release_reserved_slot(sender_bot_id, task.chat_id)
+                self._target_retry_after[task.target] = now + max(float(wait_time or 0.0), 0.05)
                 self._requeue_send_task(task)
                 continue
 
@@ -1584,6 +1614,26 @@ class TelegramBotManager(LocaleMixin):
                     expired = [k for k, v in self._bot_chat_disabled_until.items() if v <= now]
                     for k in expired:
                         del self._bot_chat_disabled_until[k]
+                if self._target_retry_after:
+                    expired = [k for k, v in self._target_retry_after.items() if v <= now]
+                    for k in expired:
+                        del self._target_retry_after[k]
+                if now - self._last_queue_stats_log >= self._queue_stats_log_interval:
+                    with self._send_queues_lock:
+                        queued_targets = len(self._send_queues)
+                        queued_tasks = sum(len(q) for q in self._send_queues.values())
+                        in_flight = len(self._send_in_flight)
+                        retry_targets = len(self._target_retry_after)
+                    with self._db_retry_lock:
+                        db_retries = len(self._db_retry_queue)
+                    if queued_tasks or in_flight or retry_targets or self._bot_chat_disabled_until or db_retries:
+                        self.logger.info(
+                            "Queued send backlog: queued_tasks=%d queued_targets=%d "
+                            "in_flight=%d retry_targets=%d disabled_bot_chats=%d db_retries=%d",
+                            queued_tasks, queued_targets, in_flight, retry_targets,
+                            len(self._bot_chat_disabled_until), db_retries,
+                        )
+                    self._last_queue_stats_log = now
                 if now - self._last_rendezvous_cleanup > self._rendezvous_cleanup_interval:
                     self._cleanup_stale_rendezvous()
                     self._last_rendezvous_cleanup = now
@@ -1607,12 +1657,10 @@ class TelegramBotManager(LocaleMixin):
         """Submit a send operation to the thread pool."""
 
         def _do_send():
-            send_kwargs = dict(task.kwargs)
-            send_kwargs.pop('_force_sender_known', None)
-            send_kwargs.pop('_force_sender_bot_id', None)
-            send_kwargs.pop('_slave_id', None)
-            send_kwargs.pop('_timing_receive_monotonic', None)
-            send_kwargs.pop('_timing_destination_monotonic', None)
+            send_kwargs = {
+                key: value for key, value in task.kwargs.items()
+                if key not in _INTERNAL_KWARGS
+            }
             send_kwargs['_skip_rate_limit_retry'] = True
             with self._using_bot(sender_bot):
                 return task.function(*task.args, **send_kwargs)
@@ -1636,19 +1684,33 @@ class TelegramBotManager(LocaleMixin):
             if isinstance(retry_after_value, timedelta):
                 return retry_after_value.total_seconds()
             return float(retry_after_value)
-        error_text = str(error)
-        if "Too Many Requests" in error_text or "429" in error_text or "Flood" in error_text:
+        response = getattr(getattr(error, "__cause__", None), "response", None)
+        if getattr(response, "status_code", None) == 429:
             return 60.0
+        for error_text in (getattr(error, "message", None), str(error)):
+            if not error_text:
+                continue
+            retry_after_match = re.search(
+                r"(?:retry after|retry_after|retry in)\s+(\d+(?:\.\d+)?)",
+                error_text,
+                re.IGNORECASE,
+            )
+            if retry_after_match:
+                return float(retry_after_match.group(1))
+            if re.search(r"Too Many Requests|\b429\b|Flood", error_text, re.IGNORECASE):
+                return 60.0
         return None
 
     def _requeue_after_telegram_rate_limit(self, task: QueuedSendTask,
                                            sender_bot_id: Optional[str],
                                            retry_after: float):
         self.logger.warning(
-            "Telegram rate limit for bot %s in chat %d (task %s): %.2fs; other bots can still send",
+            "Telegram rate limit for bot %s in chat %d (task %s): %.2fs; other targets can still send",
             sender_bot_id or "main", task.chat_id, task.task_id, retry_after,
         )
-        self._bot_chat_disabled_until[(sender_bot_id, task.chat_id)] = time.time() + retry_after
+        deadline = time.time() + retry_after
+        self._bot_chat_disabled_until[(sender_bot_id, task.chat_id)] = deadline
+        self._target_retry_after[task.target] = deadline
         self._release_reserved_slot(sender_bot_id, task.chat_id)
         self._requeue_send_task(task)
 
@@ -1738,7 +1800,13 @@ class TelegramBotManager(LocaleMixin):
                         )
                         self._requeue_send_task(task)
                         continue
-                self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
+                if sender_bot_id is None:
+                    self.logger.error(
+                        "Main bot got Forbidden in chat %s for queued task %s; dropping task: %s",
+                        task.chat_id, task.task_id, e,
+                    )
+                else:
+                    self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
                 TelegramBotManager._drop_queued_database_update(self, task.task_id)
 
             except telegram.error.TelegramError as e:
@@ -1775,9 +1843,6 @@ class TelegramBotManager(LocaleMixin):
         except Exception as e:
             self.logger.warning("Database update completion callback failed: %s", e)
 
-    def _queued_rendezvous_maps(self) -> tuple[dict[str, tuple], dict[str, tuple]]:
-        return self._pending_queued_logs, self._completed_queued_results
-
     @staticmethod
     def _queued_log_callback(entry: Optional[tuple]) -> Optional[Callable[[], None]]:
         if entry is not None and len(entry) >= 4:
@@ -1790,7 +1855,8 @@ class TelegramBotManager(LocaleMixin):
             return
         pending_update = None
         with self._pending_logs_lock:
-            pending_logs, completed_results = TelegramBotManager._queued_rendezvous_maps(self)
+            pending_logs = self._pending_queued_logs
+            completed_results = self._completed_queued_results
             pending_update = pending_logs.pop(task_id, None)
             if pending_update is None:
                 completed_results[task_id] = (
@@ -1912,7 +1978,8 @@ class TelegramBotManager(LocaleMixin):
         """Remove rendezvous entries that were never paired within the TTL."""
         cutoff = time.time() - self._rendezvous_ttl
         with self._pending_logs_lock:
-            pending_logs, completed_results = TelegramBotManager._queued_rendezvous_maps(self)
+            pending_logs = self._pending_queued_logs
+            completed_results = self._completed_queued_results
             stale_logs = [
                 tid for tid, entry in pending_logs.items()
                 if len(entry) >= 3 and entry[2] < cutoff
@@ -1966,7 +2033,8 @@ class TelegramBotManager(LocaleMixin):
         """
         completed_result: Optional[tuple]
         with self._pending_logs_lock:
-            pending_logs, completed_results = TelegramBotManager._queued_rendezvous_maps(self)
+            pending_logs = self._pending_queued_logs
+            completed_results = self._completed_queued_results
             completed_result = completed_results.pop(task_id, None)
             if completed_result is None:
                 if on_complete is not None:
@@ -2008,7 +2076,8 @@ class TelegramBotManager(LocaleMixin):
         """
         pending_update = None
         with self._pending_logs_lock:
-            pending_logs, completed_results = TelegramBotManager._queued_rendezvous_maps(self)
+            pending_logs = self._pending_queued_logs
+            completed_results = self._completed_queued_results
             pending_update = pending_logs.pop(task_id, None)
             if pending_update is None:
                 completed_results[task_id] = (real_tg_msg, sender_bot_id, time.time())
@@ -2560,7 +2629,9 @@ class TelegramBotManager(LocaleMixin):
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
-        self._stopping = True
+        if not hasattr(self, '_stopping') or not hasattr(self._stopping, 'set'):
+            self._stopping = threading.Event()
+        self._stopping.set()
         self.logger.info("Starting graceful shutdown...")
 
         # Log pending tasks count before stopping

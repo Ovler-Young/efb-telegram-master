@@ -1,4 +1,5 @@
 import threading
+import time
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from types import SimpleNamespace
@@ -148,6 +149,22 @@ def test_send_queue_kwargs_use_slave_target_for_new_message():
     }
 
 
+def test_send_queue_kwargs_preserve_forced_send_mode():
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    message = SimpleNamespace(
+        vendor_specific={"_force_send_mode": "blocking"},
+        commands=[],
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+    )
+
+    kwargs = SlaveMessageProcessor._send_queue_kwargs(processor, message, None)
+
+    assert kwargs == {
+        "_send_mode": "blocking",
+        "_slave_id": "tests.mocks.slave __chat_id__",
+    }
+
+
 def test_blocking_send_kwargs_keep_slave_target():
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
     message = SimpleNamespace(
@@ -191,7 +208,7 @@ def test_get_slave_msg_dest_caches_known_forum_chat_info():
     processor.chat_dest_cache = SimpleNamespace(get=Mock(return_value=chat_uid), remove=Mock())
     processor.generate_message_template = Mock(return_value="template")
     processor.logger = Mock()
-    processor._known_forum_chat_ids = set()
+    processor._known_forum_chat_ids = {}
     processor._known_forum_chat_ids_lock = threading.Lock()
 
     message_1 = SimpleNamespace(
@@ -211,6 +228,17 @@ def test_get_slave_msg_dest_caches_known_forum_chat_info():
     processor.bot.get_chat_info.assert_called_once_with(-100123)
     assert processor.channel.chat_binding.create_topic.call_count == 2
     assert -100123 in processor._known_forum_chat_ids
+
+    processor._known_forum_chat_ids[-100123] = time.monotonic() - processor.FORUM_CHAT_CACHE_TTL - 1
+    message_3 = SimpleNamespace(
+        uid="message-3",
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+        author=SimpleNamespace(),
+    )
+
+    assert processor.get_slave_msg_dest(message_3) == ("template", (-100123, 55))
+    assert processor.bot.get_chat_info.call_count == 2
+    assert processor.channel.chat_binding.create_topic.call_count == 3
 
 
 def test_new_slave_message_does_not_query_sent_message_log_for_dedupe():
