@@ -3,6 +3,7 @@ import io
 import string
 import random
 import threading
+from contextlib import nullcontext
 from typing import Iterator, BinaryIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -14,6 +15,20 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager, _clone_file_argument
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
+
+
+def _bind_reserved_slot_helper(manager):
+    manager._call_with_reserved_slot = TelegramBotManager._call_with_reserved_slot.__get__(
+        manager,
+        TelegramBotManager,
+    )
+    if not hasattr(manager, "_using_bot"):
+        manager._using_bot = Mock(return_value=nullcontext())
+    if not hasattr(manager, "_release_reserved_slot"):
+        manager._release_reserved_slot = Mock()
+    if not hasattr(manager, "_bot"):
+        manager._bot = object()
+    return manager
 
 
 def test_text_prefix_suffix(channel, bot_admin):
@@ -144,6 +159,7 @@ def test_rate_limit_decorator_forced_routes_to_sender_bot():
             return False
 
     manager._using_bot = lambda bot: DummyContext(bot)
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123, _sender_bot_id="777")
 
@@ -165,6 +181,7 @@ def test_rate_limit_decorator_falls_back_to_main_bot_when_sender_missing():
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123, _sender_bot_id="777")
 
@@ -280,6 +297,7 @@ def test_rate_limit_decorator_routes_new_send_through_aux_pool():
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123)
 
@@ -319,6 +337,7 @@ def test_rate_limit_decorator_switches_to_aux_when_main_reservation_gets_delayed
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123, _slave_id="slave.chat")
 
@@ -377,6 +396,7 @@ def test_rate_limit_decorator_force_main_bot_skips_aux_pool():
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123, _force_main_bot=True)
 
@@ -418,6 +438,7 @@ def test_rate_limit_decorator_pool_route_forbidden_marks_chat_non_member_and_ret
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123)
 
@@ -452,6 +473,7 @@ def test_rate_limit_decorator_routes_reply_to_target_sender_bot():
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123, reply_to_message_id=456)
 
@@ -487,6 +509,7 @@ def test_rate_limit_decorator_callback_keyboard_uses_main_bot_even_when_reply_ta
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Open", callback_data="cb")]])
 
     result = decorated(manager, 123, reply_to_message_id=456, reply_markup=reply_markup)
@@ -523,6 +546,7 @@ def test_rate_limit_decorator_routes_reply_to_main_bot():
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123, reply_to_message_id=456)
 
@@ -669,6 +693,7 @@ def test_rate_limit_decorator_forced_sender_fallback_reserves_main_slot():
         ),
         logger=Mock(),
     )
+    _bind_reserved_slot_helper(manager)
 
     result = decorated(manager, 123, _sender_bot_id="777")
 
@@ -1246,7 +1271,6 @@ def test_queued_placeholder_has_no_delay_fields():
 
 
 def test_call_with_reserved_slot_releases_only_on_failure():
-    from contextlib import nullcontext
     from efb_telegram_master.bot_manager import TelegramBotManager
 
     bot = object()

@@ -44,7 +44,6 @@ class QueuedSendTask(NamedTuple):
     args: tuple
     kwargs: dict
     task_id: str
-    arrival_seq: int = 0
     cleanup_files: tuple[str, ...] = ()
     enqueued_at: float = 0.0
 
@@ -1492,15 +1491,13 @@ class TelegramBotManager(LocaleMixin):
         enqueued_at = time.monotonic()
         with self._send_queues_lock:
             self._tasks_enqueued += 1
-            arrival_seq = self._tasks_enqueued
-            task_id = f"{slave_id}_{chat_id}_{arrival_seq}_{time.time_ns()}"
+            task_id = f"{slave_id}_{chat_id}_{self._tasks_enqueued}_{time.time_ns()}"
             task = QueuedSendTask(
                 target=target,
                 function=function,
                 args=args,
                 kwargs=kwargs,
                 task_id=task_id,
-                arrival_seq=arrival_seq,
                 cleanup_files=tuple(cleanup_files or ()),
                 enqueued_at=enqueued_at,
             )
