@@ -513,7 +513,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 send_mode = 'blocking'
             else:
                 send_mode = 'eventual'
-        kwargs = {
+        kwargs: dict[str, object] = {
             '_send_mode': send_mode,
             '_slave_id': utils.chat_id_to_str(chat=msg.chat),
         }

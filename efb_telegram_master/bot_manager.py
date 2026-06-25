@@ -1641,7 +1641,7 @@ class TelegramBotManager(LocaleMixin):
 
         if result and hasattr(result, 'message_id'):
             self._finish_queued_database_update(
-                task.db_log_context, result, sender_bot_id=sender_bot_id,
+                task.db_log_context, cast(TelegramMessage, result), sender_bot_id=sender_bot_id,
             )
         else:
             self._finish_queued_database_update(task.db_log_context)
