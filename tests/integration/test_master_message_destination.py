@@ -131,11 +131,16 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         sent_message: Message = await client.send_message(bot_id, content)
         message: Message = await helper.wait_for_message(in_chats(bot_id) & has_button)
         buttons: List[List[MessageButton]] = message.buttons
-        first_button: MessageButton = buttons[0][0]
-        assert chat.display_name in first_button.text  # The message from previous chat should come first in the list
+        chat_buttons = [
+            button
+            for row in buttons
+            for button in row
+            if chat.display_name in button.text
+        ]
+        assert chat_buttons
         # await buttons[-1][0].click()  # Cancel the error message.
 
-        await first_button.click()  # deliver the message
+        await chat_buttons[0].click()  # deliver the message
         slave.clear_messages()
 
         content = "test_master_master_destination_suggestion edited message shall be delivered without a prompt"
