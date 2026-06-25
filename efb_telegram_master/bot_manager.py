@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Collection, Coroutine, Deque, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
+from typing import TYPE_CHECKING, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import url2pathname
 from unittest.mock import Mock, patch
@@ -38,6 +38,13 @@ from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 SendTarget: TypeAlias = Tuple[str, int]
 
 
+class QueuedDbLogContext(NamedTuple):
+    """Database log context carried by a queued send task."""
+    etm_msg: object
+    old_msg_id: object = None
+    on_complete: Optional[Callable[[], None]] = None
+
+
 class QueuedSendTask(NamedTuple):
     """Represents an in-memory FIFO send task."""
     target: SendTarget
@@ -47,6 +54,7 @@ class QueuedSendTask(NamedTuple):
     task_id: str
     cleanup_files: tuple[str, ...] = ()
     enqueued_at: float = 0.0
+    db_log_context: Optional[QueuedDbLogContext] = None
 
     @property
     def slave_id(self) -> str:
@@ -63,7 +71,6 @@ MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
 P = ParamSpec("P")
 T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
-_QUEUED_DATABASE_UPDATE_DROPPED = object()
 _INTERNAL_KWARGS = frozenset({
     '_bypass_rate_limit',
     '_sender_bot_id',
@@ -74,6 +81,7 @@ _INTERNAL_KWARGS = frozenset({
     '_force_sender_bot_id',
     '_timing_receive_monotonic',
     '_timing_destination_monotonic',
+    '_queued_db_log_context',
     '_skip_rate_limit_retry',
 })
 
@@ -915,22 +923,8 @@ class TelegramBotManager(LocaleMixin):
             max_workers=self._send_worker_count, thread_name_prefix="ETM-send",
         )
 
-        # Rendezvous dicts for queued DB updates — with timestamps for TTL cleanup
-        # task_id -> (etm_msg, old_msg_id, registered_at)
-        self._pending_queued_logs: dict[str, tuple] = {}
-        # task_id -> (real_tg_msg, sender_bot_id, completed_at), or a dropped marker
-        self._completed_queued_results: dict[str, tuple] = {}
-        self._pending_logs_lock = threading.Lock()
-        self._rendezvous_ttl = 600.0          # 10 minutes
-        self._rendezvous_cleanup_interval = 300.0  # 5 minutes
-        self._last_rendezvous_cleanup = time.time()
         self._last_queue_stats_log = time.time()
         self._queue_stats_log_interval = 60.0
-
-        # DB write retry queue
-        self._db_retry_queue: list[tuple] = []
-        self._db_retry_lock = threading.Lock()
-        self._db_max_retries = 5
 
         self._send_worker_thread = threading.Thread(
             target=self._queued_send_worker,
@@ -1198,6 +1192,7 @@ class TelegramBotManager(LocaleMixin):
         timing_destination_monotonic: Optional[float] = None,
     ) -> SendReceipt:
         kwargs = dict(kwargs)
+        db_log_context = kwargs.pop('_queued_db_log_context', None)
         for key in ('photo', 'document', 'video', 'animation', 'audio', 'voice', 'sticker'):
             if key in kwargs:
                 kwargs[key] = _clone_file_argument(kwargs[key])
@@ -1212,6 +1207,7 @@ class TelegramBotManager(LocaleMixin):
             args=args,
             kwargs=kwargs,
             cleanup_files=cleanup_files,
+            db_log_context=db_log_context,
         )
         now = time.monotonic()
         if timing_receive_monotonic is not None:
@@ -1508,7 +1504,8 @@ class TelegramBotManager(LocaleMixin):
 
     def _enqueue_send_task(self, target: SendTarget, function: Callable,
                            args: tuple, kwargs: dict,
-                           cleanup_files: Optional[list] = None) -> str:
+                           cleanup_files: Optional[list] = None,
+                           db_log_context: Optional[QueuedDbLogContext] = None) -> str:
         """Append a task to the per-target FIFO queue."""
         slave_id, chat_id = target
         enqueued_at = time.monotonic()
@@ -1523,6 +1520,7 @@ class TelegramBotManager(LocaleMixin):
                 task_id=task_id,
                 cleanup_files=tuple(cleanup_files or ()),
                 enqueued_at=enqueued_at,
+                db_log_context=db_log_context,
             )
             q = self._send_queues.setdefault(target, collections.deque())
             q.append(task)
@@ -1607,8 +1605,6 @@ class TelegramBotManager(LocaleMixin):
                 self._dispatch_ready_send_tasks(now)
 
                 # ── 3. Housekeeping ──
-                self._process_db_retry_queue()
-
                 # Purge expired disabled bot/chat entries
                 if self._bot_chat_disabled_until:
                     expired = [k for k, v in self._bot_chat_disabled_until.items() if v <= now]
@@ -1624,19 +1620,14 @@ class TelegramBotManager(LocaleMixin):
                         queued_tasks = sum(len(q) for q in self._send_queues.values())
                         in_flight = len(self._send_in_flight)
                         retry_targets = len(self._target_retry_after)
-                    with self._db_retry_lock:
-                        db_retries = len(self._db_retry_queue)
-                    if queued_tasks or in_flight or retry_targets or self._bot_chat_disabled_until or db_retries:
+                    if queued_tasks or in_flight or retry_targets or self._bot_chat_disabled_until:
                         self.logger.info(
                             "Queued send backlog: queued_tasks=%d queued_targets=%d "
-                            "in_flight=%d retry_targets=%d disabled_bot_chats=%d db_retries=%d",
+                            "in_flight=%d retry_targets=%d disabled_bot_chats=%d",
                             queued_tasks, queued_targets, in_flight, retry_targets,
-                            len(self._bot_chat_disabled_until), db_retries,
+                            len(self._bot_chat_disabled_until),
                         )
                     self._last_queue_stats_log = now
-                if now - self._last_rendezvous_cleanup > self._rendezvous_cleanup_interval:
-                    self._cleanup_stale_rendezvous()
-                    self._last_rendezvous_cleanup = now
 
                 self._send_worker_stop.wait(timeout=0.05)
 
@@ -1738,11 +1729,11 @@ class TelegramBotManager(LocaleMixin):
                     self.logger.debug("Queued send task %s completed successfully", task.task_id)
 
                 if result and hasattr(result, 'message_id'):
-                    self._handle_queued_database_update(
-                        task.task_id, result, sender_bot_id=sender_bot_id,
+                    self._finish_queued_database_update(
+                        task.db_log_context, result, sender_bot_id=sender_bot_id,
                     )
                 else:
-                    TelegramBotManager._drop_queued_database_update(self, task.task_id)
+                    self._finish_queued_database_update(task.db_log_context)
 
             except telegram.error.RetryAfter as e:
                 should_cleanup = False
@@ -1768,7 +1759,7 @@ class TelegramBotManager(LocaleMixin):
                     task.kwargs.get("message_thread_id"),
                     getattr(task.function, "__name__", repr(task.function)),
                 )
-                TelegramBotManager._drop_queued_database_update(self, task.task_id)
+                self._finish_queued_database_update(task.db_log_context)
 
             except (telegram.error.TimedOut, telegram.error.NetworkError) as e:
                 retry_after = TelegramBotManager._rate_limit_retry_after_seconds(e)
@@ -1807,7 +1798,7 @@ class TelegramBotManager(LocaleMixin):
                     )
                 else:
                     self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
-                TelegramBotManager._drop_queued_database_update(self, task.task_id)
+                self._finish_queued_database_update(task.db_log_context)
 
             except telegram.error.TelegramError as e:
                 retry_after = TelegramBotManager._rate_limit_retry_after_seconds(e)
@@ -1819,12 +1810,12 @@ class TelegramBotManager(LocaleMixin):
                     continue
                 self._release_reserved_slot(sender_bot_id, task.chat_id)
                 self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
-                TelegramBotManager._drop_queued_database_update(self, task.task_id)
+                self._finish_queued_database_update(task.db_log_context)
 
             except Exception as e:
                 self._release_reserved_slot(sender_bot_id, task.chat_id)
                 self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
-                TelegramBotManager._drop_queued_database_update(self, task.task_id)
+                self._finish_queued_database_update(task.db_log_context)
 
             finally:
                 if should_cleanup:
@@ -1843,32 +1834,7 @@ class TelegramBotManager(LocaleMixin):
         except Exception as e:
             self.logger.warning("Database update completion callback failed: %s", e)
 
-    @staticmethod
-    def _queued_log_callback(entry: Optional[tuple]) -> Optional[Callable[[], None]]:
-        if entry is not None and len(entry) >= 4:
-            return entry[3]
-        return None
-
-    def _drop_queued_database_update(self, task_id: str):
-        """Release bookkeeping for a queued task that will not produce a Telegram message."""
-        if not hasattr(self, '_pending_logs_lock'):
-            return
-        pending_update = None
-        with self._pending_logs_lock:
-            pending_logs = self._pending_queued_logs
-            completed_results = self._completed_queued_results
-            pending_update = pending_logs.pop(task_id, None)
-            if pending_update is None:
-                completed_results[task_id] = (
-                    _QUEUED_DATABASE_UPDATE_DROPPED, None, time.time()
-                )
-            else:
-                completed_results.pop(task_id, None)
-        TelegramBotManager._run_database_update_callback(
-            self, TelegramBotManager._queued_log_callback(pending_update)
-        )
-
-    def _finalize_queued_database_update(
+    def _write_database_update(
         self,
         etm_msg,
         old_msg_id,
@@ -1877,12 +1843,7 @@ class TelegramBotManager(LocaleMixin):
         sender_bot_id: Optional[str] = None,
         on_complete: Optional[Callable[[], None]] = None,
     ):
-        """Write the send result to the database.
-
-        On failure the write is pushed to a retry queue instead of being
-        silently dropped — a lost mapping would cause subsequent edits /
-        deletes to create duplicate messages.
-        """
+        """Write a sent Telegram message to the database once."""
         try:
             etm_msg.type_telegram = get_msg_type(real_tg_msg)
             etm_msg.put_telegram_file(real_tg_msg)
@@ -1892,113 +1853,34 @@ class TelegramBotManager(LocaleMixin):
                 old_msg_id,
                 sender_bot_id=sender_bot_id,
             )
-            TelegramBotManager._run_database_update_callback(self, on_complete)
         except Exception as e:
             self.logger.warning(
-                "DB write failed for tg_msg %s, queuing for retry: %s",
+                "DB write failed for tg_msg %s, dropping mapping: %s",
                 getattr(real_tg_msg, 'message_id', '?'),
                 e,
             )
-            TelegramBotManager._enqueue_db_retry(
-                self, etm_msg, old_msg_id, real_tg_msg, sender_bot_id, on_complete=on_complete
-            )
+        finally:
+            self._run_database_update_callback(on_complete)
 
-    def _enqueue_db_retry(self, etm_msg, old_msg_id, real_tg_msg, sender_bot_id,
-                          attempt: int = 0,
-                          on_complete: Optional[Callable[[], None]] = None):
-        """Push a failed DB write into the retry queue with exponential back-off."""
-        next_retry_at = time.time() + min(2 ** attempt, 30)  # cap at 30 s
-        with self._db_retry_lock:
-            self._db_retry_queue.append(
-                (etm_msg, old_msg_id, real_tg_msg, sender_bot_id,
-                 attempt + 1, next_retry_at, on_complete)
-            )
-
-    def _process_db_retry_queue(self):
-        """Process pending DB-write retries.  Called from the worker loop."""
-        if not self._db_retry_queue:
+    def _finish_queued_database_update(
+        self,
+        db_log_context: Optional[QueuedDbLogContext],
+        real_tg_msg: Optional[TelegramMessage] = None,
+        *,
+        sender_bot_id: Optional[str] = None,
+    ):
+        if db_log_context is None:
             return
-
-        current_time = time.time()
-        still_pending: list[tuple] = []
-
-        with self._db_retry_lock:
-            items = self._db_retry_queue[:]
-            self._db_retry_queue.clear()
-
-        for item in items:
-            if len(item) >= 7:
-                etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt, next_retry_at, on_complete = item
-            else:
-                etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt, next_retry_at = item
-                on_complete = None
-            if current_time < next_retry_at:
-                still_pending.append(
-                    (etm_msg, old_msg_id, real_tg_msg, sender_bot_id,
-                     attempt, next_retry_at, on_complete)
-                )
-                continue
-            try:
-                self.channel.db.add_or_update_message_log(
-                    etm_msg,
-                    real_tg_msg,
-                    old_msg_id,
-                    sender_bot_id=sender_bot_id,
-                )
-                self.logger.info(
-                    "DB retry succeeded for tg_msg %s (attempt %d)",
-                    getattr(real_tg_msg, 'message_id', '?'),
-                    attempt,
-                )
-                TelegramBotManager._run_database_update_callback(self, on_complete)
-            except Exception as e:
-                if attempt >= self._db_max_retries:
-                    self.logger.error(
-                        "DB write permanently failed after %d attempts for tg_msg %s: %s",
-                        attempt,
-                        getattr(real_tg_msg, 'message_id', '?'),
-                        e,
-                    )
-                else:
-                    self.logger.warning(
-                        "DB retry %d failed for tg_msg %s, will retry: %s",
-                        attempt,
-                        getattr(real_tg_msg, 'message_id', '?'),
-                        e,
-                    )
-                    TelegramBotManager._enqueue_db_retry(
-                        self, etm_msg, old_msg_id, real_tg_msg, sender_bot_id, attempt, on_complete=on_complete
-                    )
-
-        if still_pending:
-            with self._db_retry_lock:
-                self._db_retry_queue.extend(still_pending)
-
-    def _cleanup_stale_rendezvous(self):
-        """Remove rendezvous entries that were never paired within the TTL."""
-        cutoff = time.time() - self._rendezvous_ttl
-        with self._pending_logs_lock:
-            pending_logs = self._pending_queued_logs
-            completed_results = self._completed_queued_results
-            stale_logs = [
-                tid for tid, entry in pending_logs.items()
-                if len(entry) >= 3 and entry[2] < cutoff
-            ]
-            for tid in stale_logs:
-                TelegramBotManager._run_database_update_callback(
-                    self,
-                    TelegramBotManager._queued_log_callback(pending_logs.get(tid)),
-                )
-                del pending_logs[tid]
-                self.logger.warning("Rendezvous TTL: dropped stale pending log for task %s", tid)
-
-            stale_results = [
-                tid for tid, entry in completed_results.items()
-                if len(entry) >= 3 and entry[2] < cutoff
-            ]
-            for tid in stale_results:
-                del completed_results[tid]
-                self.logger.warning("Rendezvous TTL: dropped stale completed result for task %s", tid)
+        if real_tg_msg is None:
+            self._run_database_update_callback(db_log_context.on_complete)
+            return
+        self._write_database_update(
+            db_log_context.etm_msg,
+            db_log_context.old_msg_id,
+            real_tg_msg,
+            sender_bot_id=sender_bot_id,
+            on_complete=db_log_context.on_complete,
+        )
 
     def submit_async_db_write(
         self,
@@ -2009,92 +1891,14 @@ class TelegramBotManager(LocaleMixin):
         sender_bot_id: Optional[str] = None,
         on_complete: Optional[Callable[[], None]] = None,
     ):
-        """Fire-and-forget database write, usable from both blocking and eventual paths.
-
-        Failures are caught and routed to the retry queue — callers should
-        NEVER re-send to Telegram on a DB-write error.
-        """
-        TelegramBotManager._finalize_queued_database_update(
-            self,
-            etm_msg, old_msg_id, real_tg_msg,
-            sender_bot_id=sender_bot_id,
-            on_complete=on_complete,
-        )
-
-    def register_queued_database_update(self, task_id: str, etm_msg, old_msg_id=None,
-                                         on_complete: Optional[Callable[[], None]] = None):
-        """
-        Register a pending database update for a queued task.
-
-        Args:
-            task_id: Task identifier from queued execution
-            etm_msg: ETMMsg object to log
-            old_msg_id: Optional old message ID for updates
-        """
-        completed_result: Optional[tuple]
-        with self._pending_logs_lock:
-            pending_logs = self._pending_queued_logs
-            completed_results = self._completed_queued_results
-            completed_result = completed_results.pop(task_id, None)
-            if completed_result is None:
-                if on_complete is not None:
-                    pending_logs[task_id] = (etm_msg, old_msg_id, time.time(), on_complete)
-                else:
-                    pending_logs[task_id] = (etm_msg, old_msg_id, time.time())
-                self.logger.debug("Registered queued database update for task %s", task_id)
-                return
-
-        if completed_result[0] is _QUEUED_DATABASE_UPDATE_DROPPED:
-            self.logger.debug("Queued task %s was dropped before database registration", task_id)
-            TelegramBotManager._run_database_update_callback(self, on_complete)
-            return
-
-        real_tg_msg, sender_bot_id = completed_result[0], completed_result[1]
-        self.logger.debug("Finalizing already-completed queued task %s", task_id)
-        TelegramBotManager._finalize_queued_database_update(
-            self,
+        """Write database mapping after a blocking send has succeeded."""
+        self._write_database_update(
             etm_msg,
             old_msg_id,
             real_tg_msg,
             sender_bot_id=sender_bot_id,
             on_complete=on_complete,
         )
-
-    def _handle_queued_database_update(
-        self,
-        task_id: str,
-        real_tg_msg,
-        *,
-        sender_bot_id: Optional[str] = None,
-    ):
-        """
-        Handle database update when queued task completes.
-
-        Args:
-            task_id: Task identifier
-            real_tg_msg: The real Telegram message that was sent
-        """
-        pending_update = None
-        with self._pending_logs_lock:
-            pending_logs = self._pending_queued_logs
-            completed_results = self._completed_queued_results
-            pending_update = pending_logs.pop(task_id, None)
-            if pending_update is None:
-                completed_results[task_id] = (real_tg_msg, sender_bot_id, time.time())
-                self.logger.debug("Stored queued result for task %s until database registration is ready", task_id)
-                return
-
-        etm_msg, old_msg_id = pending_update[0], pending_update[1]
-        on_complete = TelegramBotManager._queued_log_callback(pending_update)
-        TelegramBotManager._finalize_queued_database_update(
-            self,
-            etm_msg,
-            old_msg_id,
-            real_tg_msg,
-            sender_bot_id=sender_bot_id,
-            on_complete=on_complete,
-        )
-        self.logger.debug("Updated database with real message for queued task %s", task_id)
 
     def stop_queued_worker(self):
         """Stop the queued send worker thread."""
@@ -2111,11 +1915,6 @@ class TelegramBotManager(LocaleMixin):
                 self.logger.warning("Queued send worker did not stop gracefully within timeout")
             else:
                 self.logger.debug("Queued send worker stopped successfully")
-
-        # Drain any remaining DB retries before shutdown
-        if hasattr(self, '_db_retry_queue') and self._db_retry_queue:
-            self.logger.info("Processing %d remaining DB retries at shutdown...", len(self._db_retry_queue))
-            self._process_db_retry_queue()
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout

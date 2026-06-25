@@ -32,6 +32,7 @@ from ehforwarderbot.message import LinkAttribute, LocationAttribute, MessageComm
 from ehforwarderbot.status import ChatUpdates, MemberUpdates, MessageRemoval, MessageReactionsUpdate
 from ehforwarderbot.types import MessageID
 from . import utils
+from .bot_manager import QueuedDbLogContext
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import ETMCommandMsgStorage
@@ -102,7 +103,7 @@ class SlaveMessageProcessor(LocaleMixin):
         timing_tls = getattr(self, '_timing_tls', None)
         if timing_tls is None:
             return
-        for key in ('receive_started', 'destination_resolved'):
+        for key in ('receive_started', 'destination_resolved', 'queued_db_on_complete'):
             if hasattr(timing_tls, key):
                 delattr(timing_tls, key)
 
@@ -348,6 +349,10 @@ class SlaveMessageProcessor(LocaleMixin):
         reactions = self.build_reactions_footer(msg.reactions)
 
         msg.text = msg.text or ""
+        on_db_complete = None
+        if dedupe_key is not None:
+            on_db_complete = lambda: self._release_pending_slave_message(dedupe_key)
+        self._ensure_timing_tls().queued_db_on_complete = on_db_complete
 
         # Type dispatching
         if msg.type == MsgType.Text:
@@ -408,32 +413,20 @@ class SlaveMessageProcessor(LocaleMixin):
             self._release_pending_slave_message(dedupe_key)
             return
 
-        on_db_complete = None
-        if dedupe_key is not None:
-            on_db_complete = lambda: self._release_pending_slave_message(dedupe_key)
-
         if hasattr(tg_msg, '_queued_execution_pending') and tg_msg._queued_execution_pending:
             self.logger.debug("[%s] Message execution is queued (task_id: %s), deferring database logging.",
-                             xid, getattr(tg_msg, 'task_id', 'unknown'))
+                              xid, getattr(tg_msg, 'task_id', 'unknown'))
             receive_started = getattr(getattr(self, '_timing_tls', None), 'receive_started', None)
             if receive_started is not None:
                 self.logger.debug("[%s] Message enqueue finished in %.3fs since receive.",
                                   xid, time.monotonic() - receive_started)
 
-            etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
-
-            if hasattr(tg_msg, 'task_id'):
-                self.bot.register_queued_database_update(
-                    tg_msg.task_id, etm_msg, old_msg_id, on_complete=on_db_complete,
-                )
-            else:
-                self.logger.warning("[%s] Queued message missing task_id, cannot register database update", xid)
+            if not hasattr(tg_msg, 'task_id'):
+                self.logger.warning("[%s] Queued message missing task_id, cannot track database update", xid)
                 self._release_pending_slave_message(dedupe_key)
         else:
-            # Normal (blocking) execution — send already succeeded,
-            # hand off DB write asynchronously so the calling thread is
-            # not blocked by local I/O, and failures are retried instead
-            # of silently dropped.
+            # Normal (blocking) execution: send already succeeded, then
+            # write the DB mapping once. DB failures are logged only.
             self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
                               xid, tg_msg.chat.id, tg_msg.message_id)
             receive_started = getattr(getattr(self, '_timing_tls', None), 'receive_started', None)
@@ -572,6 +565,18 @@ class SlaveMessageProcessor(LocaleMixin):
             '_send_mode': send_mode,
             '_slave_id': utils.chat_id_to_str(chat=msg.chat),
         }
+        timing_tls = getattr(self, '_timing_tls', None)
+        if (
+            send_mode == 'eventual'
+            and timing_tls is not None
+            and hasattr(timing_tls, 'queued_db_on_complete')
+        ):
+            on_complete = getattr(timing_tls, 'queued_db_on_complete', None)
+            kwargs['_queued_db_log_context'] = QueuedDbLogContext(
+                ETMMsg.from_efbmsg(msg, self.chat_manager),
+                old_msg_id,
+                on_complete,
+            )
         kwargs.update(self._current_message_timing_kwargs())
         return kwargs
 

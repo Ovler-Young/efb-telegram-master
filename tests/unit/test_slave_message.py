@@ -3,7 +3,7 @@ import time
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from ehforwarderbot import Message, Chat
 from ehforwarderbot.constants import MsgType
@@ -163,6 +163,29 @@ def test_send_queue_kwargs_preserve_forced_send_mode():
         "_send_mode": "blocking",
         "_slave_id": "tests.mocks.slave __chat_id__",
     }
+
+
+def test_send_queue_kwargs_attach_db_context_when_dispatch_sets_callback():
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    processor._timing_tls = threading.local()
+    processor.chat_manager = Mock()
+    on_complete = Mock()
+    processor._timing_tls.queued_db_on_complete = on_complete
+    message = SimpleNamespace(
+        vendor_specific={},
+        commands=[],
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+    )
+    etm_msg = Mock()
+
+    with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=etm_msg):
+        kwargs = SlaveMessageProcessor._send_queue_kwargs(processor, message, None)
+
+    db_context = kwargs["_queued_db_log_context"]
+    assert kwargs["_send_mode"] == "eventual"
+    assert db_context.etm_msg is etm_msg
+    assert db_context.old_msg_id is None
+    assert db_context.on_complete is on_complete
 
 
 def test_blocking_send_kwargs_keep_slave_target():

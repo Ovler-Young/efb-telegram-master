@@ -32,6 +32,22 @@ def _bind_reserved_slot_helper(manager):
     return manager
 
 
+def _bind_db_update_helpers(manager):
+    manager._run_database_update_callback = TelegramBotManager._run_database_update_callback.__get__(
+        manager,
+        TelegramBotManager,
+    )
+    manager._write_database_update = TelegramBotManager._write_database_update.__get__(
+        manager,
+        TelegramBotManager,
+    )
+    manager._finish_queued_database_update = TelegramBotManager._finish_queued_database_update.__get__(
+        manager,
+        TelegramBotManager,
+    )
+    return manager
+
+
 def test_text_prefix_suffix(channel, bot_admin):
     message = channel.bot_manager.send_message(bot_admin, 'Message', prefix='Prefix', suffix='Suffix')
     assert message.text == 'Prefix\nMessage\nSuffix'
@@ -1190,6 +1206,7 @@ def test_harvest_completed_sends_does_not_retry_bad_request():
         logger=Mock(),
         _release_reserved_slot=Mock(),
     )
+    _bind_db_update_helpers(mgr)
 
     TelegramBotManager._harvest_completed_sends(mgr)
 
@@ -1496,6 +1513,7 @@ def test_harvest_forbidden_from_main_bot_logs_explicit_error():
         _release_reserved_slot=Mock(),
         logger=Mock(),
     )
+    _bind_db_update_helpers(mgr)
 
     TelegramBotManager._harvest_completed_sends(mgr)
 
@@ -1508,244 +1526,117 @@ def test_harvest_forbidden_from_main_bot_logs_explicit_error():
     )
 
 
-# --- DB retry queue ---
+# --- Queued DB logging ---
 
-def test_finalize_db_update_enqueues_on_failure():
-    """DB write failure must push to retry queue, not crash."""
+def test_enqueue_eventual_send_moves_db_context_from_kwargs_to_task():
+    from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
+
+    db_context = QueuedDbLogContext(Mock(), None, Mock())
+    mgr = SimpleNamespace(
+        _send_queues={},
+        _send_queues_lock=threading.Lock(),
+        _tasks_enqueued=0,
+        logger=Mock(),
+    )
+    mgr._enqueue_send_task = TelegramBotManager._enqueue_send_task.__get__(mgr, TelegramBotManager)
+    mgr._create_queued_message_placeholder = TelegramBotManager._create_queued_message_placeholder.__get__(
+        mgr,
+        TelegramBotManager,
+    )
+    mgr._make_send_receipt = TelegramBotManager._make_send_receipt.__get__(mgr, TelegramBotManager)
+
+    TelegramBotManager._enqueue_eventual_send(
+        mgr,
+        "slave.chat",
+        100,
+        lambda: None,
+        (),
+        {"_queued_db_log_context": db_context, "text": "hello"},
+    )
+
+    task = mgr._send_queues[("slave.chat", 100)][0]
+    assert task.db_log_context is db_context
+    assert "_queued_db_log_context" not in task.kwargs
+
+
+def test_harvest_completed_sends_writes_db_from_task_context():
+    from concurrent.futures import Future
+    from efb_telegram_master.bot_manager import QueuedDbLogContext, QueuedSendTask, TelegramBotManager
+
+    on_complete = Mock()
+    etm_msg = Mock()
+    real_tg_msg = Mock()
+    real_tg_msg.message_id = 999
+    db_mock = Mock()
+    db_context = QueuedDbLogContext(etm_msg, "old-message-id", on_complete)
+    task = QueuedSendTask(("slave.chat", 100), lambda: None, (), {}, "t1", db_log_context=db_context)
+    future = Future()
+    future.set_result(real_tg_msg)
+    mgr = SimpleNamespace(
+        _send_in_flight={task.target: (future, task, "777")},
+        channel=SimpleNamespace(db=db_mock),
+        _record_aux_use=Mock(),
+        logger=Mock(),
+    )
+    _bind_db_update_helpers(mgr)
+
+    with patch("efb_telegram_master.bot_manager.get_msg_type", return_value="text"):
+        TelegramBotManager._harvest_completed_sends(mgr)
+
+    db_mock.add_or_update_message_log.assert_called_once_with(
+        etm_msg,
+        real_tg_msg,
+        "old-message-id",
+        sender_bot_id="777",
+    )
+    etm_msg.put_telegram_file.assert_called_once_with(real_tg_msg)
+    on_complete.assert_called_once()
+
+
+def test_harvest_completed_sends_runs_callback_without_db_for_non_message_result():
+    from concurrent.futures import Future
+    from efb_telegram_master.bot_manager import QueuedDbLogContext, QueuedSendTask, TelegramBotManager
+
+    on_complete = Mock()
+    db_context = QueuedDbLogContext(Mock(), None, on_complete)
+    task = QueuedSendTask(("slave.chat", 100), lambda: None, (), {}, "t1", db_log_context=db_context)
+    future = Future()
+    future.set_result(None)
+    mgr = SimpleNamespace(
+        _send_in_flight={task.target: (future, task, None)},
+        logger=Mock(),
+    )
+    _bind_db_update_helpers(mgr)
+
+    TelegramBotManager._harvest_completed_sends(mgr)
+
+    db_context.etm_msg.put_telegram_file.assert_not_called()
+    on_complete.assert_called_once()
+
+
+def test_submit_async_db_write_logs_failure_and_runs_completion_callback():
     from efb_telegram_master.bot_manager import TelegramBotManager
-    from efb_telegram_master.msg_type import get_msg_type
 
+    on_complete = Mock()
     db_mock = Mock()
     db_mock.add_or_update_message_log = Mock(side_effect=Exception("DB down"))
-
     mgr = SimpleNamespace(
         channel=SimpleNamespace(db=db_mock),
-        _db_retry_queue=[],
-        _db_retry_lock=threading.Lock(),
         logger=Mock(),
     )
-
+    _bind_db_update_helpers(mgr)
     etm_msg = Mock()
     real_tg_msg = Mock()
     real_tg_msg.message_id = 999
 
     with patch("efb_telegram_master.bot_manager.get_msg_type", return_value="text"):
-        TelegramBotManager._finalize_queued_database_update(
-            mgr, etm_msg, None, real_tg_msg, sender_bot_id=None,
+        TelegramBotManager.submit_async_db_write(
+            mgr,
+            etm_msg,
+            real_tg_msg,
+            sender_bot_id=None,
+            on_complete=on_complete,
         )
 
-    assert len(mgr._db_retry_queue) == 1
-    entry = mgr._db_retry_queue[0]
-    assert entry[4] == 1  # attempt count
-
-
-def test_process_db_retry_queue_succeeds_on_retry():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    db_mock = Mock()
-    db_mock.add_or_update_message_log = Mock()  # succeeds now
-    on_complete = Mock()
-
-    etm_msg = Mock()
-    real_tg_msg = Mock()
-    real_tg_msg.message_id = 999
-
-    mgr = SimpleNamespace(
-        channel=SimpleNamespace(db=db_mock),
-        _db_retry_queue=[(etm_msg, None, real_tg_msg, None, 1, 0.0, on_complete)],
-        _db_retry_lock=threading.Lock(),
-        _db_max_retries=5,
-        logger=Mock(),
-    )
-
-    TelegramBotManager._process_db_retry_queue(mgr)
-
-    db_mock.add_or_update_message_log.assert_called_once()
-    assert len(mgr._db_retry_queue) == 0
+    mgr.logger.warning.assert_called_once()
     on_complete.assert_called_once()
-
-
-def test_process_db_retry_queue_gives_up_after_max_retries():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    db_mock = Mock()
-    db_mock.add_or_update_message_log = Mock(side_effect=Exception("still down"))
-
-    etm_msg = Mock()
-    real_tg_msg = Mock()
-    real_tg_msg.message_id = 999
-
-    mgr = SimpleNamespace(
-        channel=SimpleNamespace(db=db_mock),
-        _db_retry_queue=[(etm_msg, None, real_tg_msg, None, 5, 0.0)],
-        _db_retry_lock=threading.Lock(),
-        _db_max_retries=5,
-        logger=Mock(),
-    )
-
-    TelegramBotManager._process_db_retry_queue(mgr)
-
-    # Should NOT re-enqueue — max retries exceeded
-    assert len(mgr._db_retry_queue) == 0
-    mgr.logger.error.assert_called()
-
-
-# --- Rendezvous TTL cleanup ---
-
-def test_cleanup_stale_rendezvous_removes_old_entries():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    mgr = SimpleNamespace(
-        _pending_queued_logs={"old_task": (Mock(), None, 1.0)},       # registered_at = 1.0
-        _completed_queued_results={"old_result": (Mock(), None, 2.0)},  # completed_at = 2.0
-        _pending_logs_lock=threading.Lock(),
-        _rendezvous_ttl=600.0,
-        logger=Mock(),
-    )
-
-    with patch("efb_telegram_master.bot_manager.time.time", return_value=700.0):
-        TelegramBotManager._cleanup_stale_rendezvous(mgr)
-
-    assert "old_task" not in mgr._pending_queued_logs
-    assert "old_result" not in mgr._completed_queued_results
-
-
-def test_cleanup_stale_rendezvous_keeps_fresh_entries():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    mgr = SimpleNamespace(
-        _pending_queued_logs={"fresh": (Mock(), None, 100.0)},
-        _completed_queued_results={},
-        _pending_logs_lock=threading.Lock(),
-        _rendezvous_ttl=600.0,
-        logger=Mock(),
-    )
-
-    with patch("efb_telegram_master.bot_manager.time.time", return_value=200.0):
-        TelegramBotManager._cleanup_stale_rendezvous(mgr)
-
-    assert "fresh" in mgr._pending_queued_logs
-
-
-# --- Rendezvous dicts store timestamps ---
-
-def test_register_queued_database_update_stores_timestamp():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    mgr = SimpleNamespace(
-        _pending_queued_logs={},
-        _completed_queued_results={},
-        _pending_logs_lock=threading.Lock(),
-        logger=Mock(),
-    )
-
-    with patch("efb_telegram_master.bot_manager.time.time", return_value=42.0):
-        TelegramBotManager.register_queued_database_update(mgr, "task-1", Mock(), None)
-
-    entry = mgr._pending_queued_logs["task-1"]
-    assert len(entry) == 3
-    assert entry[2] == 42.0  # registered_at timestamp
-
-
-def test_register_queued_database_update_stores_completion_callback():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    on_complete = Mock()
-    mgr = SimpleNamespace(
-        _pending_queued_logs={},
-        _completed_queued_results={},
-        _pending_logs_lock=threading.Lock(),
-        logger=Mock(),
-    )
-
-    TelegramBotManager.register_queued_database_update(
-        mgr, "task-1", Mock(), None, on_complete=on_complete,
-    )
-
-    entry = mgr._pending_queued_logs["task-1"]
-    assert len(entry) == 4
-    assert entry[3] is on_complete
-
-
-def test_drop_queued_database_update_runs_completion_callback():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    on_complete = Mock()
-    mgr = SimpleNamespace(
-        _pending_queued_logs={"task-1": (Mock(), None, 1.0, on_complete)},
-        _completed_queued_results={},
-        _pending_logs_lock=threading.Lock(),
-        logger=Mock(),
-    )
-
-    TelegramBotManager._drop_queued_database_update(mgr, "task-1")
-
-    assert "task-1" not in mgr._pending_queued_logs
-    on_complete.assert_called_once()
-
-
-def test_drop_queued_database_update_before_register_runs_late_callback():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    on_complete = Mock()
-    db_mock = Mock()
-    db_mock.add_or_update_message_log = Mock()
-    mgr = SimpleNamespace(
-        channel=SimpleNamespace(db=db_mock),
-        _pending_queued_logs={},
-        _completed_queued_results={},
-        _pending_logs_lock=threading.Lock(),
-        logger=Mock(),
-    )
-
-    TelegramBotManager._drop_queued_database_update(mgr, "task-1")
-    TelegramBotManager.register_queued_database_update(
-        mgr, "task-1", Mock(), None, on_complete=on_complete,
-    )
-
-    assert "task-1" not in mgr._pending_queued_logs
-    assert "task-1" not in mgr._completed_queued_results
-    db_mock.add_or_update_message_log.assert_not_called()
-    on_complete.assert_called_once()
-
-
-def test_handle_queued_database_update_runs_completion_callback():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    on_complete = Mock()
-    etm_msg = Mock()
-    real_tg_msg = Mock()
-    real_tg_msg.message_id = 999
-    db_mock = Mock()
-    mgr = SimpleNamespace(
-        channel=SimpleNamespace(db=db_mock),
-        _pending_queued_logs={"task-1": (etm_msg, None, 1.0, on_complete)},
-        _completed_queued_results={},
-        _pending_logs_lock=threading.Lock(),
-        logger=Mock(),
-    )
-
-    with patch("efb_telegram_master.bot_manager.get_msg_type", return_value="text"):
-        TelegramBotManager._handle_queued_database_update(mgr, "task-1", real_tg_msg)
-
-    assert "task-1" not in mgr._pending_queued_logs
-    db_mock.add_or_update_message_log.assert_called_once()
-    on_complete.assert_called_once()
-
-
-def test_handle_queued_database_update_stores_timestamp():
-    from efb_telegram_master.bot_manager import TelegramBotManager
-
-    mgr = SimpleNamespace(
-        _pending_queued_logs={},
-        _completed_queued_results={},
-        _pending_logs_lock=threading.Lock(),
-        logger=Mock(),
-    )
-
-    with patch("efb_telegram_master.bot_manager.time.time", return_value=55.0):
-        TelegramBotManager._handle_queued_database_update(mgr, "task-2", Mock(), sender_bot_id="bot1")
-
-    entry = mgr._completed_queued_results["task-2"]
-    assert len(entry) == 3
-    assert entry[2] == 55.0  # completed_at timestamp
