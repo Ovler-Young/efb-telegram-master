@@ -124,8 +124,8 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         assert not channel.chat_dest_cache.enabled
         slave.clear_messages()
         chat = slave.chat_with_alias
-        slave.send_text_message(chat, author=chat.other)
-        await helper.wait_for_message_text(in_chats(bot_id) & regex(chat.display_name))
+        previous_message = slave.send_text_message(chat, author=chat.other)
+        await helper.wait_for_message_text(in_chats(bot_id) & regex(previous_message.text))
 
         content = "test_master_master_destination_suggestion this shall be replied with a list of candidates"
         sent_message: Message = await client.send_message(bot_id, content)
