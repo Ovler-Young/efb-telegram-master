@@ -7,7 +7,7 @@ from contextlib import nullcontext
 from datetime import timedelta
 from typing import Iterator, BinaryIO
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import telegram.error
@@ -844,6 +844,31 @@ def test_select_queued_sender_available_path_uses_slave_affinity_key():
     assert call.kwargs["affinity_key"] == "slave.chat"
 
 
+def test_select_queued_sender_reuses_main_delay_when_aux_unavailable():
+    chat_id = -1002608436807
+    main_bot = object()
+    manager = SimpleNamespace(
+        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=None)),
+        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
+        _bot_chat_disabled_until={},
+        _bot=main_bot,
+    )
+
+    bot, sender_bot_id, delay = TelegramBotManager._select_queued_sender(
+        manager,
+        chat_id,
+        now=10.0,
+    )
+
+    assert bot is main_bot
+    assert sender_bot_id is None
+    assert delay == 0.0
+    assert manager._calculate_rate_limit_delay.call_args_list == [
+        call(chat_id, peek_only=True),
+        call(chat_id),
+    ]
+
+
 def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_disabled():
     attempts = {"count": 0}
 
@@ -1223,6 +1248,40 @@ def test_enqueue_priority_tasks_precede_normal_tasks_and_keep_priority_order():
         "slave.chat_100_1",
         "slave.chat_100_4",
     ]
+
+
+def test_enqueue_blocking_send_times_out_and_removes_queued_task():
+    from efb_telegram_master.bot_manager import TelegramBotManager
+
+    mgr = SimpleNamespace(
+        _send_queues={},
+        _send_queues_lock=threading.Lock(),
+        _tasks_enqueued=0,
+        BLOCKING_SEND_TIMEOUT=0.01,
+        BLOCKING_SEND_TARGET_SLAVE_ID=TelegramBotManager.BLOCKING_SEND_TARGET_SLAVE_ID,
+        logger=Mock(),
+    )
+    mgr._enqueue_send_task = TelegramBotManager._enqueue_send_task.__get__(mgr, TelegramBotManager)
+    mgr._remove_queued_send_task = TelegramBotManager._remove_queued_send_task.__get__(
+        mgr,
+        TelegramBotManager,
+    )
+    mgr._resolve_task_waiter_exception = TelegramBotManager._resolve_task_waiter_exception
+    mgr._cleanup_queued_task_files = Mock()
+
+    with pytest.raises(RuntimeError, match="Blocking send to chat 100 timed out after 0.01s"):
+        TelegramBotManager._enqueue_blocking_send_and_wait(
+            mgr,
+            None,
+            100,
+            lambda *_args, **_kwargs: None,
+            (),
+            {},
+        )
+
+    assert mgr._send_queues == {}
+    removed_task = mgr._cleanup_queued_task_files.call_args.args[0]
+    assert removed_task.task_id == "__blocking___100_1"
 
 
 def test_requeue_prepends_to_target_fifo():

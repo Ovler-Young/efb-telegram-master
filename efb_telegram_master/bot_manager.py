@@ -388,6 +388,8 @@ class TelegramBotManager(LocaleMixin):
     DEFAULT_SEND_WORKER_COUNT = 8
     DEFAULT_HTTPX_POOL_MULTIPLIER = 2.0
     HTTPX_POOL_MULTIPLIER_ENV = "ETM_HTTPX_POOL_MULTIPLIER"
+    BLOCKING_SEND_TIMEOUT = 300.0
+    BLOCKING_SEND_TARGET_SLAVE_ID = "__blocking__"
 
     # Type declarations for instance attributes assigned in __init__
     application: Application
@@ -1147,8 +1149,10 @@ class TelegramBotManager(LocaleMixin):
             args = args[:2] + (_clone_file_argument(args[2]),) + args[3:]
 
         waiter: Future = Future()
-        target = (slave_id or "__blocking__", int(chat_id))
-        self._enqueue_send_task(
+        # Blocking operations without slave affinity share one per-chat target.
+        # This keeps edit/callback sends ordered after they enter the FIFO.
+        target = (slave_id or self.BLOCKING_SEND_TARGET_SLAVE_ID, int(chat_id))
+        task_id = self._enqueue_send_task(
             target=target,
             function=function,
             args=args,
@@ -1157,7 +1161,21 @@ class TelegramBotManager(LocaleMixin):
             priority=True,
             waiter=waiter,
         )
-        return waiter.result()
+        try:
+            return waiter.result(timeout=self.BLOCKING_SEND_TIMEOUT)
+        except FutureTimeoutError as exc:
+            if waiter.done():
+                return waiter.result(timeout=0)
+            error = RuntimeError(
+                f"Blocking send to chat {chat_id} timed out after {self.BLOCKING_SEND_TIMEOUT:g}s"
+            )
+            removed_task = self._remove_queued_send_task(target, task_id)
+            if removed_task is not None:
+                self._resolve_task_waiter_exception(removed_task, error)
+                self._cleanup_queued_task_files(removed_task)
+            elif not waiter.done():
+                waiter.set_exception(error)
+            raise error from exc
 
     def _select_queued_sender(
         self,
@@ -1192,8 +1210,9 @@ class TelegramBotManager(LocaleMixin):
                 forced_sender_bot_id, chat_id,
             )
 
+        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
+
         if not force_main and forced_sender_bot_id is None and self.bot_pool and not has_callback:
-            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
             slot = self.bot_pool.acquire_send_slot(
                 chat_id,
                 max_delay=1e-9,
@@ -1209,7 +1228,6 @@ class TelegramBotManager(LocaleMixin):
         if main_disabled > now:
             return None, None, main_disabled - now
 
-        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
         if main_delay <= 0:
             self._calculate_rate_limit_delay(chat_id)  # reserve
             return self._bot, None, 0.0
@@ -1220,6 +1238,20 @@ class TelegramBotManager(LocaleMixin):
         with self._send_queues_lock:
             q = self._send_queues.setdefault(task.target, collections.deque())
             q.appendleft(task)
+
+    def _remove_queued_send_task(self, target: SendTarget, task_id: str) -> Optional[QueuedSendTask]:
+        """Remove a task that has not yet been dispatched."""
+        with self._send_queues_lock:
+            q = self._send_queues.get(target)
+            if not q:
+                return None
+            for task in list(q):
+                if task.task_id == task_id:
+                    q.remove(task)
+                    if not q:
+                        del self._send_queues[target]
+                    return task
+        return None
 
     def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
         """Initialize the auxiliary bot pool from config."""
@@ -1678,16 +1710,16 @@ class TelegramBotManager(LocaleMixin):
 
         for target, (future, task, sender_bot_id) in completed:
             del self._send_in_flight[target]
-            should_cleanup = True
+            should_cleanup = False
 
             try:
                 result = future.result()  # already done, won't block
                 self._finish_successful_send(task, result, sender_bot_id)
+                should_cleanup = True
 
             except Exception as e:
                 retry_after = self._rate_limit_retry_after_seconds(e)
                 if retry_after is not None:
-                    should_cleanup = False
                     self._requeue_after_telegram_rate_limit(
                         task, sender_bot_id, retry_after
                     )
@@ -1704,10 +1736,10 @@ class TelegramBotManager(LocaleMixin):
                         getattr(task.function, "__name__", repr(task.function)),
                     )
                     self._finish_failed_send(task, e)
+                    should_cleanup = True
                     continue
 
                 if isinstance(e, (telegram.error.TimedOut, telegram.error.NetworkError)):
-                    should_cleanup = False
                     self.logger.warning(
                         "Transient error for queued task %s, retrying: %s",
                         task.task_id, e,
@@ -1722,7 +1754,6 @@ class TelegramBotManager(LocaleMixin):
                         aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
                         if aux_bot:
                             aux_bot.update_membership(task.chat_id, False)
-                            should_cleanup = False
                             self.logger.warning(
                                 "Aux bot %s got Forbidden in chat %s for queued task %s; "
                                 "marking it as non-member for this chat and retrying.",
@@ -1738,11 +1769,13 @@ class TelegramBotManager(LocaleMixin):
                     else:
                         self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
                     self._finish_failed_send(task, e)
+                    should_cleanup = True
                     continue
 
                 self._release_reserved_slot(sender_bot_id, task.chat_id)
                 self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
                 self._finish_failed_send(task, e)
+                should_cleanup = True
 
             finally:
                 if should_cleanup:

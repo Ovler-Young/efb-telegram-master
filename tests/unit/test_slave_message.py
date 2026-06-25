@@ -167,10 +167,8 @@ def test_make_send_kwargs_preserve_forced_send_mode():
 
 def test_make_send_kwargs_attach_db_context_when_dispatch_sets_callback():
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
-    processor._timing_tls = threading.local()
     processor.chat_manager = Mock()
     on_complete = Mock()
-    processor._timing_tls.queued_db_on_complete = on_complete
     message = SimpleNamespace(
         vendor_specific={},
         commands=[],
@@ -179,7 +177,7 @@ def test_make_send_kwargs_attach_db_context_when_dispatch_sets_callback():
     etm_msg = Mock()
 
     with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=etm_msg):
-        kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, None)
+        kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, None, on_complete=on_complete)
 
     db_context = kwargs["_queued_db_log_context"]
     assert kwargs["_send_mode"] == "eventual"
