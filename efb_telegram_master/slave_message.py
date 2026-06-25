@@ -376,7 +376,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
             sender_bot_id = getattr(tg_msg, 'sender_bot_id', None)
 
-            self.bot.submit_async_db_write(
+            self.bot.write_db_mapping(
                 etm_msg, tg_msg, old_msg_id, sender_bot_id=sender_bot_id, on_complete=on_db_complete,
             )
 

@@ -1837,7 +1837,7 @@ class TelegramBotManager(LocaleMixin):
             on_complete=db_log_context.on_complete,
         )
 
-    def submit_async_db_write(
+    def write_db_mapping(
         self,
         etm_msg,
         real_tg_msg: TelegramMessage,
@@ -2224,6 +2224,7 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
@@ -2231,6 +2232,7 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
+    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
         return self._active_bot.edit_message_media(*args, **kwargs)

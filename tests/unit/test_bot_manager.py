@@ -1667,6 +1667,25 @@ def test_dispatch_send_strips_internal_kwargs_and_sets_skip_retry():
     assert task.target in mgr._send_in_flight
 
 
+@pytest.mark.parametrize(("method_name", "kwargs"), [
+    ("edit_message_caption", {"chat_id": 123, "message_id": 456, "caption": "updated"}),
+    ("edit_message_media", {"chat_id": 123, "message_id": 456, "media": object()}),
+])
+def test_edit_methods_strip_skip_retry_before_calling_bot(method_name, kwargs):
+    mgr = SimpleNamespace(_active_bot=Mock())
+    bot_method = getattr(mgr._active_bot, method_name)
+    bot_method.return_value = SimpleNamespace(chat_id=123, message_id=456)
+
+    getattr(TelegramBotManager, method_name)(
+        mgr,
+        _bypass_rate_limit=True,
+        _skip_rate_limit_retry=True,
+        **kwargs,
+    )
+
+    assert "_skip_rate_limit_retry" not in bot_method.call_args.kwargs
+
+
 def test_harvest_forbidden_from_main_bot_logs_explicit_error():
     from concurrent.futures import Future
     from efb_telegram_master.bot_manager import QueuedSendTask, TelegramBotManager
@@ -1780,7 +1799,7 @@ def test_harvest_completed_sends_runs_callback_without_db_for_non_message_result
     on_complete.assert_called_once()
 
 
-def test_submit_async_db_write_logs_failure_and_runs_completion_callback():
+def test_write_db_mapping_logs_failure_and_runs_completion_callback():
     from efb_telegram_master.bot_manager import TelegramBotManager
 
     on_complete = Mock()
@@ -1796,7 +1815,7 @@ def test_submit_async_db_write_logs_failure_and_runs_completion_callback():
     real_tg_msg.message_id = 999
 
     with patch("efb_telegram_master.bot_manager.get_msg_type", return_value="text"):
-        TelegramBotManager.submit_async_db_write(
+        TelegramBotManager.write_db_mapping(
             mgr,
             etm_msg,
             real_tg_msg,
