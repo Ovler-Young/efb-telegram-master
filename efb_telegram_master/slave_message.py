@@ -10,6 +10,7 @@ import time
 import traceback
 import urllib.parse
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Tuple, Optional, TYPE_CHECKING, List, IO, Union
 
@@ -88,49 +89,27 @@ class SlaveMessageProcessor(LocaleMixin):
             return None
         return slave_origin_uid, str(msg.uid)
 
-    def _ensure_timing_tls(self):
-        if not hasattr(self, '_timing_tls'):
-            self._timing_tls = threading.local()
-        return self._timing_tls
+    @contextmanager
+    def _timed_phase(self, xid: Optional[MessageID], phase_name: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.logger.debug(
+                "[%s] %s finished in %.3fs.",
+                xid,
+                phase_name,
+                time.monotonic() - started,
+            )
 
-    def _set_message_timing(self, *, receive_started: float,
-                            destination_resolved: Optional[float] = None):
-        timing_tls = self._ensure_timing_tls()
-        timing_tls.receive_started = receive_started
-        timing_tls.destination_resolved = destination_resolved
-
-    def _clear_message_timing(self):
+    def _clear_dispatch_context(self):
         timing_tls = getattr(self, '_timing_tls', None)
         if timing_tls is None:
             return
-        for key in ('receive_started', 'destination_resolved', 'queued_db_on_complete'):
-            if hasattr(timing_tls, key):
-                delattr(timing_tls, key)
-
-    def _current_message_timing_kwargs(self) -> dict:
-        timing_tls = getattr(self, '_timing_tls', None)
-        if timing_tls is None:
-            return {}
-        kwargs = {}
-        receive_started = getattr(timing_tls, 'receive_started', None)
-        destination_resolved = getattr(timing_tls, 'destination_resolved', None)
-        if receive_started is not None:
-            kwargs['_timing_receive_monotonic'] = receive_started
-        if destination_resolved is not None:
-            kwargs['_timing_destination_monotonic'] = destination_resolved
-        return kwargs
-
-    def _ensure_forum_cache(self):
-        if not hasattr(self, '_known_forum_chat_ids'):
-            self._known_forum_chat_ids = {}
-        elif not isinstance(self._known_forum_chat_ids, dict):
-            now = time.monotonic()
-            self._known_forum_chat_ids = {int(chat_id): now for chat_id in self._known_forum_chat_ids}
-        if not hasattr(self, '_known_forum_chat_ids_lock'):
-            self._known_forum_chat_ids_lock = threading.Lock()
+        if hasattr(timing_tls, 'queued_db_on_complete'):
+            delattr(timing_tls, 'queued_db_on_complete')
 
     def _known_forum_chat(self, tg_dest: TelegramChatID) -> bool:
-        self._ensure_forum_cache()
         with self._known_forum_chat_ids_lock:
             chat_id = int(tg_dest)
             cached_at = self._known_forum_chat_ids.get(chat_id)
@@ -142,7 +121,6 @@ class SlaveMessageProcessor(LocaleMixin):
             return False
 
     def _mark_known_forum_chat(self, tg_dest: TelegramChatID):
-        self._ensure_forum_cache()
         with self._known_forum_chat_ids_lock:
             self._known_forum_chat_ids[int(tg_dest)] = time.monotonic()
 
@@ -152,12 +130,11 @@ class SlaveMessageProcessor(LocaleMixin):
                               xid, tg_dest)
             return True
 
-        started = time.monotonic()
-        master_chat_info = self.bot.get_chat_info(tg_dest)
-        elapsed = time.monotonic() - started
+        with self._timed_phase(xid, f"get_chat_info for Telegram chat {tg_dest}"):
+            master_chat_info = self.bot.get_chat_info(tg_dest)
         is_forum = bool(master_chat_info.is_forum)
-        self.logger.debug("[%s] get_chat_info finished in %.3fs for Telegram chat %s (is_forum=%s).",
-                          xid, elapsed, tg_dest, is_forum)
+        self.logger.debug("[%s] get_chat_info for Telegram chat %s returned is_forum=%s.",
+                          xid, tg_dest, is_forum)
         if is_forum:
             self._mark_known_forum_chat(tg_dest)
         return is_forum
@@ -204,14 +181,11 @@ class SlaveMessageProcessor(LocaleMixin):
         """
         dedupe_key: Optional[Tuple[str, str]] = None
         pending_claimed = False
-        receive_started = time.monotonic()
         tg_dest = None
         thread_id = None
-        self._set_message_timing(receive_started=receive_started)
+        xid = msg.uid
         try:
-            xid = msg.uid
             self.logger.debug("[%s] Slave message delivered to ETM.\n%s", xid, msg)
-            self.logger.debug("[%s] Message receive timing started.", xid)
 
             slave_origin_uid = utils.chat_id_to_str(chat=msg.chat)
             dedupe_key = self._dedupe_key(msg, slave_origin_uid)
@@ -224,19 +198,8 @@ class SlaveMessageProcessor(LocaleMixin):
                     return msg
                 pending_claimed = True
 
-            destination_started = time.monotonic()
-            msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(msg)
-            destination_resolved = time.monotonic()
-            self._set_message_timing(
-                receive_started=receive_started,
-                destination_resolved=destination_resolved,
-            )
-            self.logger.debug(
-                "[%s] Destination resolution finished in %.3fs (%.3fs since receive).",
-                xid,
-                destination_resolved - destination_started,
-                destination_resolved - receive_started,
-            )
+            with self._timed_phase(xid, "Destination resolution"):
+                msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(msg)
 
             silent = self.is_silent(msg)
             if silent is None:
@@ -271,16 +234,9 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.vendor_specific = msg.vendor_specific or {}
                 msg.vendor_specific['_sender_bot_id'] = _edit_sender_bot_id
 
-            dispatch_started = time.monotonic()
-            self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
-                                  dedupe_key=dedupe_key)
-            dispatch_finished = time.monotonic()
-            self.logger.debug(
-                "[%s] Dispatch returned in %.3fs (%.3fs since receive).",
-                xid,
-                dispatch_finished - dispatch_started,
-                dispatch_finished - receive_started,
-            )
+            with self._timed_phase(xid, "Dispatch"):
+                self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
+                                      dedupe_key=dedupe_key)
         except Exception as e:
             if pending_claimed:
                 self._release_pending_slave_message(dedupe_key)
@@ -301,7 +257,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
                               repr(msg), repr(e), traceback.format_exc())
         finally:
-            self._clear_message_timing()
+            self._clear_dispatch_context()
         return msg
 
     def dispatch_message(self, msg: Message, msg_template: str,
@@ -352,7 +308,7 @@ class SlaveMessageProcessor(LocaleMixin):
         on_db_complete = None
         if dedupe_key is not None:
             on_db_complete = lambda: self._release_pending_slave_message(dedupe_key)
-        self._ensure_timing_tls().queued_db_on_complete = on_db_complete
+        self._timing_tls.queued_db_on_complete = on_db_complete
 
         # Type dispatching
         if msg.type == MsgType.Text:
@@ -400,7 +356,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                            message_thread_id=thread_id,
                                            text=self._('Unknown type of message "{0}". (UT01)')
                                            .format(msg.type.name),
-                                           **self._send_queue_kwargs(msg, old_msg_id))
+                                           **self._make_send_kwargs(msg, old_msg_id))
 
         if tg_msg and commands:
             self.channel.commands.register_command(tg_msg, ETMCommandMsgStorage(
@@ -416,10 +372,6 @@ class SlaveMessageProcessor(LocaleMixin):
         if hasattr(tg_msg, '_queued_execution_pending') and tg_msg._queued_execution_pending:
             self.logger.debug("[%s] Message execution is queued (task_id: %s), deferring database logging.",
                               xid, getattr(tg_msg, 'task_id', 'unknown'))
-            receive_started = getattr(getattr(self, '_timing_tls', None), 'receive_started', None)
-            if receive_started is not None:
-                self.logger.debug("[%s] Message enqueue finished in %.3fs since receive.",
-                                  xid, time.monotonic() - receive_started)
 
             if not hasattr(tg_msg, 'task_id'):
                 self.logger.warning("[%s] Queued message missing task_id, cannot track database update", xid)
@@ -429,10 +381,6 @@ class SlaveMessageProcessor(LocaleMixin):
             # write the DB mapping once. DB failures are logged only.
             self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
                               xid, tg_msg.chat.id, tg_msg.message_id)
-            receive_started = getattr(getattr(self, '_timing_tls', None), 'receive_started', None)
-            if receive_started is not None:
-                self.logger.debug("[%s] Blocking send completed in %.3fs since receive.",
-                                  xid, time.monotonic() - receive_started)
 
             etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
 
@@ -450,16 +398,13 @@ class SlaveMessageProcessor(LocaleMixin):
             (Optional[TelegramChatID], Optional[TelegramTopicID]): Telegram destination chat ID and thread ID, None if muted.
         """
         xid = msg.uid
-        destination_started = time.monotonic()
         chat = self.chat_manager.update_chat_obj(msg.chat)
         msg.chat = chat
         msg.author = self.chat_manager.get_or_enrol_member(msg.chat, msg.author)
 
         chat_uid = utils.chat_id_to_str(chat=msg.chat)
-        assoc_started = time.monotonic()
-        tg_chats = self.db.get_chat_assoc(slave_uid=chat_uid)
-        self.logger.debug("[%s] Destination chat association lookup finished in %.3fs.",
-                          xid, time.monotonic() - assoc_started)
+        with self._timed_phase(xid, "Destination chat association lookup"):
+            tg_chats = self.db.get_chat_assoc(slave_uid=chat_uid)
         tg_chat = None
         tg_dest: Optional[TelegramChatID] = None
         thread_id: Optional[TelegramTopicID] = None
@@ -488,21 +433,25 @@ class SlaveMessageProcessor(LocaleMixin):
                 else:
                     tg_dest = TelegramChatID(self.channel.topic_group)
                 if self._get_master_chat_is_forum(xid, tg_dest):
-                    topic_lookup_started = time.monotonic()
-                    existing_thread_id = self.db.get_topic_thread_id(slave_uid=chat_uid, topic_chat_id=tg_dest)
+                    with self._timed_phase(xid, f"Topic thread lookup for Telegram chat {tg_dest}"):
+                        existing_thread_id = self.db.get_topic_thread_id(
+                            slave_uid=chat_uid,
+                            topic_chat_id=tg_dest,
+                        )
                     self.logger.debug(
-                        "[%s] Topic thread lookup finished in %.3fs for Telegram chat %s (existing_thread_id=%s).",
+                        "[%s] Topic thread lookup for Telegram chat %s returned existing_thread_id=%s.",
                         xid,
-                        time.monotonic() - topic_lookup_started,
                         tg_dest,
                         existing_thread_id,
                     )
-                    topic_started = time.monotonic()
-                    thread_id = self.channel.chat_binding.create_topic(slave_uid=chat_uid, telegram_chat_id=tg_dest)
+                    with self._timed_phase(xid, f"Topic creation/resolution for Telegram chat {tg_dest}"):
+                        thread_id = self.channel.chat_binding.create_topic(
+                            slave_uid=chat_uid,
+                            telegram_chat_id=tg_dest,
+                        )
                     self.logger.debug(
-                        "[%s] Topic creation/resolution finished in %.3fs for Telegram chat %s (thread_id=%s).",
+                        "[%s] Topic creation/resolution for Telegram chat %s returned thread_id=%s.",
                         xid,
-                        time.monotonic() - topic_started,
                         tg_dest,
                         thread_id,
                     )
@@ -522,8 +471,6 @@ class SlaveMessageProcessor(LocaleMixin):
         if self.chat_dest_cache.get(str(tg_dest)) != chat_uid:
             self.chat_dest_cache.remove(str(tg_dest))
 
-        self.logger.debug("[%s] Destination helper finished in %.3fs.",
-                          xid, time.monotonic() - destination_started)
         return msg_template, (tg_dest, thread_id)
 
 
@@ -552,15 +499,20 @@ class SlaveMessageProcessor(LocaleMixin):
             return html.escape(text)
         return text
 
-    def _send_queue_kwargs(self, msg: Message,
-                           old_msg_id: Optional[OldMsgID]) -> dict:
-        force_send_mode = (msg.vendor_specific or {}).get('_force_send_mode')
-        if force_send_mode in {'blocking', 'eventual'}:
-            send_mode = force_send_mode
-        elif old_msg_id is not None or msg.commands:
-            send_mode = 'blocking'
+    def _make_send_kwargs(self, msg: Message,
+                          old_msg_id: Optional[OldMsgID] = None,
+                          *,
+                          mode: Optional[str] = None) -> dict:
+        if mode is not None:
+            send_mode = mode
         else:
-            send_mode = 'eventual'
+            force_send_mode = (msg.vendor_specific or {}).get('_force_send_mode')
+            if force_send_mode in {'blocking', 'eventual'}:
+                send_mode = force_send_mode
+            elif old_msg_id is not None or msg.commands:
+                send_mode = 'blocking'
+            else:
+                send_mode = 'eventual'
         kwargs = {
             '_send_mode': send_mode,
             '_slave_id': utils.chat_id_to_str(chat=msg.chat),
@@ -577,15 +529,6 @@ class SlaveMessageProcessor(LocaleMixin):
                 old_msg_id,
                 on_complete,
             )
-        kwargs.update(self._current_message_timing_kwargs())
-        return kwargs
-
-    def _blocking_send_kwargs(self, msg: Message) -> dict:
-        kwargs = {
-            '_send_mode': 'blocking',
-            '_slave_id': utils.chat_id_to_str(chat=msg.chat),
-        }
-        kwargs.update(self._current_message_timing_kwargs())
         return kwargs
 
     def slave_message_text(self, msg: Message, tg_dest: TelegramChatID,
@@ -625,7 +568,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                            message_thread_id=thread_id,
                                            reply_markup=reply_markup,
                                            disable_notification=silent,
-                                           **self._send_queue_kwargs(msg, old_msg_id))
+                                           **self._make_send_kwargs(msg, old_msg_id))
         else:
             # Cannot change reply_to_message_id when editing a message
             edit_kwargs = dict(chat_id=old_msg_id[0],
@@ -678,7 +621,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                          message_thread_id=thread_id,
                                          reply_markup=reply_markup,
                                          disable_notification=silent,
-                                         **self._send_queue_kwargs(msg, old_msg_id))
+                                         **self._make_send_kwargs(msg, old_msg_id))
 
     # Parameters to decide when to pictures as files
     IMG_MIN_SIZE = 1600
@@ -761,7 +704,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     message_thread_id=thread_id, text=text,
                                                     parse_mode="HTML", reply_markup=reply_markup, disable_notification=silent,
                                                     prefix=msg_template, suffix=reactions,
-                                                    **self._blocking_send_kwargs(msg))
+                                                    **self._make_send_kwargs(msg, mode='blocking'))
                     message.reply_text(file_too_large)
                     return message
 
@@ -799,7 +742,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                               message_thread_id=thread_id,
                                               reply_markup=reply_markup,
                                               disable_notification=silent,
-                                              **self._send_queue_kwargs(msg, old_msg_id))
+                                              **self._make_send_kwargs(msg, old_msg_id))
             else:
                 try:
                     assert msg.path
@@ -810,7 +753,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                message_thread_id=thread_id,
                                                reply_markup=reply_markup,
                                                disable_notification=silent,
-                                               **self._send_queue_kwargs(msg, old_msg_id))
+                                               **self._make_send_kwargs(msg, old_msg_id))
                 except telegram.error.BadRequest as e:
                     self.logger.error('[%s] Failed to send it as image, sending as document. Reason: %s',
                                       msg.uid, e)
@@ -823,7 +766,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                   message_thread_id=thread_id,
                                                   reply_markup=reply_markup,
                                                   disable_notification=silent,
-                                                  **self._send_queue_kwargs(msg, old_msg_id))
+                                                  **self._make_send_kwargs(msg, old_msg_id))
         finally:
             if msg.file:
                 msg.file.close()
@@ -860,7 +803,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     parse_mode="HTML", reply_markup=reply_markup,
                                                     disable_notification=silent,
                                                     prefix=msg_template, suffix=reactions,
-                                                    **self._blocking_send_kwargs(msg))
+                                                    **self._make_send_kwargs(msg, mode='blocking'))
                     message.reply_text(file_too_large)
                     return message
 
@@ -888,7 +831,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                message_thread_id=thread_id,
                                                reply_markup=reply_markup,
                                                disable_notification=silent,
-                                               **self._send_queue_kwargs(msg, old_msg_id))
+                                               **self._make_send_kwargs(msg, old_msg_id))
         finally:
             if msg.file is not None:
                 msg.file.close()
@@ -945,7 +888,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                         parse_mode="HTML", reply_markup=reply_markup,
                                                         disable_notification=silent,
                                                         prefix=msg_template, suffix=reactions,
-                                                        **self._blocking_send_kwargs(msg))
+                                                        **self._make_send_kwargs(msg, mode='blocking'))
                         message.reply_text(file_too_large)
                         return message
 
@@ -960,7 +903,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                  message_thread_id=thread_id,
                                                  reply_to_message_id=target_msg_id,
                                                  disable_notification=silent,
-                                                 **self._send_queue_kwargs(msg, old_msg_id))
+                                                 **self._make_send_kwargs(msg, old_msg_id))
                 except IOError:
                     self.logger.warning("[%s] Failed to convert image to webp sticker, sending as document.", msg.uid)
                     assert msg.file and msg.path
@@ -971,7 +914,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                   reply_to_message_id=target_msg_id,
                                                   reply_markup=reply_markup,
                                                   disable_notification=silent,
-                                                  **self._send_queue_kwargs(msg, old_msg_id))
+                                                  **self._make_send_kwargs(msg, old_msg_id))
                 finally:
                     if webp_img and not webp_img.closed:
                         webp_img.close()
@@ -1046,7 +989,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     parse_mode="HTML", reply_markup=reply_markup,
                                                     disable_notification=silent,
                                                     prefix=msg_template, suffix=reactions,
-                                                    **self._blocking_send_kwargs(msg))
+                                                    **self._make_send_kwargs(msg, mode='blocking'))
                     message.reply_text(file_too_large)
                     return message
 
@@ -1073,7 +1016,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                           message_thread_id=thread_id,
                                           reply_markup=reply_markup,
                                           disable_notification=silent,
-                                          **self._send_queue_kwargs(msg, old_msg_id))
+                                          **self._make_send_kwargs(msg, old_msg_id))
         finally:
             if msg.file is not None:
                 msg.file.close()
@@ -1105,7 +1048,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     parse_mode="HTML", reply_markup=reply_markup,
                                                     disable_notification=silent,
                                                     prefix=msg_template, suffix=reactions,
-                                                    **self._blocking_send_kwargs(msg))
+                                                    **self._make_send_kwargs(msg, mode='blocking'))
                     message.reply_text(file_too_large)
                     return message
 
@@ -1135,7 +1078,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                      reply_to_message_id=target_msg_id,
                                                      message_thread_id=thread_id, reply_markup=reply_markup,
                                                      disable_notification=silent,
-                                                     **self._send_queue_kwargs(msg, old_msg_id))
+                                                     **self._make_send_kwargs(msg, old_msg_id))
                         return tg_msg
                     except pydub.exceptions.CouldntDecodeError as e:
                         self.logger.error("[%s] Failed to decode audio file for conversion: %s. Sending as file.", msg.uid, e)
@@ -1180,7 +1123,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                       message_thread_id=thread_id,
                                       reply_markup=location_reply_markup,
                                       disable_notification=silent,
-                                      **self._send_queue_kwargs(msg, old_msg_id))
+                                      **self._make_send_kwargs(msg, old_msg_id))
 
     def slave_message_video(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
@@ -1215,7 +1158,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     parse_mode="HTML", reply_markup=reply_markup,
                                                     disable_notification=silent,
                                                     prefix=msg_template, suffix=reactions,
-                                                    **self._blocking_send_kwargs(msg))
+                                                    **self._make_send_kwargs(msg, mode='blocking'))
                     message.reply_text(file_too_large)
                     return message
 
@@ -1239,7 +1182,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                        message_thread_id=thread_id,
                                        reply_markup=reply_markup,
                                        disable_notification=silent,
-                                       **self._send_queue_kwargs(msg, old_msg_id))
+                                       **self._make_send_kwargs(msg, old_msg_id))
         finally:
             if msg.file is not None:
                 msg.file.close()
@@ -1269,7 +1212,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                            message_thread_id=thread_id,
                                            reply_markup=reply_markup,
                                            disable_notification=silent,
-                                           **self._send_queue_kwargs(msg, old_msg_id))
+                                           **self._make_send_kwargs(msg, old_msg_id))
         else:
             # Cannot change reply_to_message_id or thread_id when editing a message
             edit_kwargs = dict(chat_id=old_msg_id[0],

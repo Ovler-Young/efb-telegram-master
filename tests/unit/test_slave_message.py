@@ -133,7 +133,7 @@ def test_channel_drops_slave_message_after_bot_manager_shutdown_starts():
     channel.slave_messages.send_message.assert_not_called()
 
 
-def test_send_queue_kwargs_use_slave_target_for_new_message():
+def test_make_send_kwargs_use_slave_target_for_new_message():
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
     message = SimpleNamespace(
         vendor_specific={},
@@ -141,7 +141,7 @@ def test_send_queue_kwargs_use_slave_target_for_new_message():
         chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
     )
 
-    kwargs = SlaveMessageProcessor._send_queue_kwargs(processor, message, None)
+    kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, None)
 
     assert kwargs == {
         "_send_mode": "eventual",
@@ -149,7 +149,7 @@ def test_send_queue_kwargs_use_slave_target_for_new_message():
     }
 
 
-def test_send_queue_kwargs_preserve_forced_send_mode():
+def test_make_send_kwargs_preserve_forced_send_mode():
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
     message = SimpleNamespace(
         vendor_specific={"_force_send_mode": "blocking"},
@@ -157,7 +157,7 @@ def test_send_queue_kwargs_preserve_forced_send_mode():
         chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
     )
 
-    kwargs = SlaveMessageProcessor._send_queue_kwargs(processor, message, None)
+    kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, None)
 
     assert kwargs == {
         "_send_mode": "blocking",
@@ -165,7 +165,7 @@ def test_send_queue_kwargs_preserve_forced_send_mode():
     }
 
 
-def test_send_queue_kwargs_attach_db_context_when_dispatch_sets_callback():
+def test_make_send_kwargs_attach_db_context_when_dispatch_sets_callback():
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
     processor._timing_tls = threading.local()
     processor.chat_manager = Mock()
@@ -179,7 +179,7 @@ def test_send_queue_kwargs_attach_db_context_when_dispatch_sets_callback():
     etm_msg = Mock()
 
     with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=etm_msg):
-        kwargs = SlaveMessageProcessor._send_queue_kwargs(processor, message, None)
+        kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, None)
 
     db_context = kwargs["_queued_db_log_context"]
     assert kwargs["_send_mode"] == "eventual"
@@ -188,13 +188,13 @@ def test_send_queue_kwargs_attach_db_context_when_dispatch_sets_callback():
     assert db_context.on_complete is on_complete
 
 
-def test_blocking_send_kwargs_keep_slave_target():
+def test_make_send_kwargs_keep_slave_target_for_blocking_mode():
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
     message = SimpleNamespace(
         chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
     )
 
-    kwargs = SlaveMessageProcessor._blocking_send_kwargs(processor, message)
+    kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, mode='blocking')
 
     assert kwargs == {
         "_send_mode": "blocking",
