@@ -1,8 +1,9 @@
 import threading
+import time
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from ehforwarderbot import Message, Chat
 from ehforwarderbot.constants import MsgType
@@ -132,7 +133,7 @@ def test_channel_drops_slave_message_after_bot_manager_shutdown_starts():
     channel.slave_messages.send_message.assert_not_called()
 
 
-def test_send_queue_kwargs_use_slave_target_for_new_message():
+def test_make_send_kwargs_use_slave_target_for_new_message():
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
     message = SimpleNamespace(
         vendor_specific={},
@@ -140,7 +141,7 @@ def test_send_queue_kwargs_use_slave_target_for_new_message():
         chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
     )
 
-    kwargs = SlaveMessageProcessor._send_queue_kwargs(processor, message, None)
+    kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, None)
 
     assert kwargs == {
         "_send_mode": "eventual",
@@ -148,13 +149,15 @@ def test_send_queue_kwargs_use_slave_target_for_new_message():
     }
 
 
-def test_blocking_send_kwargs_keep_slave_target():
+def test_make_send_kwargs_preserve_forced_send_mode():
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
     message = SimpleNamespace(
+        vendor_specific={"_force_send_mode": "blocking"},
+        commands=[],
         chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
     )
 
-    kwargs = SlaveMessageProcessor._blocking_send_kwargs(processor, message)
+    kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, None)
 
     assert kwargs == {
         "_send_mode": "blocking",
@@ -162,35 +165,106 @@ def test_blocking_send_kwargs_keep_slave_target():
     }
 
 
-def test_duplicate_slave_message_logged_is_skipped():
+def test_make_send_kwargs_attach_db_context_when_dispatch_sets_callback():
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    processor.chat_manager = Mock()
+    on_complete = Mock()
+    message = SimpleNamespace(
+        vendor_specific={},
+        commands=[],
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+    )
+    etm_msg = Mock()
+
+    with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=etm_msg):
+        kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, None, on_complete=on_complete)
+
+    db_context = kwargs["_queued_db_log_context"]
+    assert kwargs["_send_mode"] == "eventual"
+    assert db_context.etm_msg is etm_msg
+    assert db_context.old_msg_id is None
+    assert db_context.on_complete is on_complete
+
+
+def test_make_send_kwargs_keep_slave_target_for_blocking_mode():
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+    )
+
+    kwargs = SlaveMessageProcessor._make_send_kwargs(processor, message, mode='blocking')
+
+    assert kwargs == {
+        "_send_mode": "blocking",
+        "_slave_id": "tests.mocks.slave __chat_id__",
+    }
+
+
+def test_get_slave_msg_dest_caches_known_forum_chat_info():
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    chat_uid = "tests.mocks.slave __chat_id__"
+    tg_chat = "telegram -100123"
+
+    def get_chat_assoc(*, slave_uid=None, master_uid=None):
+        if slave_uid == chat_uid:
+            return [tg_chat]
+        if master_uid == tg_chat:
+            return [chat_uid]
+        return []
+
+    processor.channel = SimpleNamespace(
+        config={"admins": [1]},
+        topic_group=-100999,
+        chat_binding=SimpleNamespace(create_topic=Mock(return_value=55)),
+    )
+    processor.bot = SimpleNamespace(get_chat_info=Mock(return_value=SimpleNamespace(is_forum=True)))
+    processor.db = SimpleNamespace(
+        get_chat_assoc=Mock(side_effect=get_chat_assoc),
+        get_topic_thread_id=Mock(return_value=55),
+    )
+    processor.chat_manager = SimpleNamespace(
+        update_chat_obj=lambda chat: chat,
+        get_or_enrol_member=lambda chat, author: author,
+    )
+    processor.chat_dest_cache = SimpleNamespace(get=Mock(return_value=chat_uid), remove=Mock())
+    processor.generate_message_template = Mock(return_value="template")
+    processor.logger = Mock()
+    processor._known_forum_chat_ids = {}
+    processor._known_forum_chat_ids_lock = threading.Lock()
+
+    message_1 = SimpleNamespace(
+        uid="message-1",
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+        author=SimpleNamespace(),
+    )
+    message_2 = SimpleNamespace(
+        uid="message-2",
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+        author=SimpleNamespace(),
+    )
+
+    assert processor.get_slave_msg_dest(message_1) == ("template", (-100123, 55))
+    assert processor.get_slave_msg_dest(message_2) == ("template", (-100123, 55))
+
+    processor.bot.get_chat_info.assert_called_once_with(-100123)
+    assert processor.channel.chat_binding.create_topic.call_count == 2
+    assert -100123 in processor._known_forum_chat_ids
+
+    processor._known_forum_chat_ids[-100123] = time.monotonic() - processor.FORUM_CHAT_CACHE_TTL - 1
+    message_3 = SimpleNamespace(
+        uid="message-3",
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
+        author=SimpleNamespace(),
+    )
+
+    assert processor.get_slave_msg_dest(message_3) == ("template", (-100123, 55))
+    assert processor.bot.get_chat_info.call_count == 2
+    assert processor.channel.chat_binding.create_topic.call_count == 3
+
+
+def test_new_slave_message_does_not_query_sent_message_log_for_dedupe():
     processor = build_duplicate_test_processor()
     processor.db.get_msg_log.return_value = SimpleNamespace(master_msg_id="100.10")
-    message = build_duplicate_test_message()
-
-    result = SlaveMessageProcessor.send_message(processor, message)
-
-    assert result is message
-    processor.get_slave_msg_dest.assert_not_called()
-    processor.dispatch_message.assert_not_called()
-
-
-def test_duplicate_slave_message_pending_is_skipped():
-    processor = build_duplicate_test_processor()
-    processor.db.get_msg_log.return_value = None
-    message = build_duplicate_test_message()
-    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
-    processor._pending_slave_messages.add(key)
-
-    result = SlaveMessageProcessor.send_message(processor, message)
-
-    assert result is message
-    processor.get_slave_msg_dest.assert_not_called()
-    processor.dispatch_message.assert_not_called()
-
-
-def test_new_slave_message_claims_pending_before_dispatch():
-    processor = build_duplicate_test_processor()
-    processor.db.get_msg_log.return_value = None
     message = build_duplicate_test_message()
     key = ("tests.mocks.slave __chat_id__", "__msg_id__")
 
@@ -198,6 +272,37 @@ def test_new_slave_message_claims_pending_before_dispatch():
 
     assert result is message
     assert key in processor._pending_slave_messages
+    processor.db.get_msg_log.assert_not_called()
+    processor.get_slave_msg_dest.assert_called_once_with(message)
+    processor.dispatch_message.assert_called_once_with(
+        message, "__template__", None, 123, None, False, dedupe_key=key,
+    )
+
+
+def test_duplicate_slave_message_pending_is_skipped():
+    processor = build_duplicate_test_processor()
+    message = build_duplicate_test_message()
+    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
+    processor._pending_slave_messages.add(key)
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    processor.db.get_msg_log.assert_not_called()
+    processor.get_slave_msg_dest.assert_not_called()
+    processor.dispatch_message.assert_not_called()
+
+
+def test_new_slave_message_claims_pending_before_dispatch():
+    processor = build_duplicate_test_processor()
+    message = build_duplicate_test_message()
+    key = ("tests.mocks.slave __chat_id__", "__msg_id__")
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    assert key in processor._pending_slave_messages
+    processor.db.get_msg_log.assert_not_called()
     processor.dispatch_message.assert_called_once_with(
         message, "__template__", None, 123, None, False, dedupe_key=key,
     )
@@ -205,7 +310,6 @@ def test_new_slave_message_claims_pending_before_dispatch():
 
 def test_undelivered_slave_message_releases_pending_claim():
     processor = build_duplicate_test_processor()
-    processor.db.get_msg_log.return_value = None
     processor.is_silent.return_value = None
     message = build_duplicate_test_message()
     key = ("tests.mocks.slave __chat_id__", "__msg_id__")
@@ -214,6 +318,7 @@ def test_undelivered_slave_message_releases_pending_claim():
 
     assert result is message
     assert key not in processor._pending_slave_messages
+    processor.db.get_msg_log.assert_not_called()
     processor.dispatch_message.assert_not_called()
 
 

@@ -661,9 +661,12 @@ class TelegramChannel(MasterChannel):
 
     def _is_stopping(self) -> bool:
         bot_manager = getattr(self, "bot_manager", None)
+        manager_stopping = getattr(bot_manager, "_stopping", False)
+        if hasattr(manager_stopping, "is_set"):
+            manager_stopping = manager_stopping.is_set()
         return bool(
             getattr(self, "_stop_polling_called", False)
-            or getattr(bot_manager, "_stopping", False)
+            or manager_stopping
         )
 
     def send_message(self, msg: EFBMessage) -> EFBMessage:

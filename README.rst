@@ -723,6 +723,11 @@ done by adjusting values ``request_kwargs`` section in ETM’s
        read_timeout: 6
        connect_timeout: 7
 
+For high queued-send throughput, ETM sizes the Telegram HTTPX connection
+pool from the send worker count. Set the environment variable
+``ETM_HTTPX_POOL_MULTIPLIER`` to a positive number to tune that pool size
+multiplier; the default is ``2.0``.
+
 Run ETM behind a proxy
 ----------------------
 

@@ -84,11 +84,13 @@ class SlidingWindowRateLimiter:
         """Undo the latest reservation for *chat_id* when no send happened."""
         with self._lock:
             chat_ts = self._chat_timestamps.get(chat_id)
-            if chat_ts:
-                candidate_time = chat_ts.pop()
-                idx = bisect.bisect_left(self._global_timestamps, candidate_time)
-                if idx < len(self._global_timestamps) and self._global_timestamps[idx] == candidate_time:
-                    self._global_timestamps.pop(idx)
+            if not chat_ts:
+                self._cleanup()
+                return
+            candidate_time = chat_ts.pop()
+            idx = bisect.bisect_left(self._global_timestamps, candidate_time)
+            if idx < len(self._global_timestamps) and self._global_timestamps[idx] == candidate_time:
+                self._global_timestamps.pop(idx)
             self._cleanup()
 
     def get_counts(self, chat_id: int) -> Tuple[int, int]:

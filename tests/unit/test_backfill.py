@@ -35,6 +35,15 @@ def _cleanup_link_state(channel, chat, master_chat_id):
     channel.db.remove_topic_assoc(slave_uid=utils.chat_id_to_str(chat=chat))
 
 
+def _sent_link_message(chat_id, message_id, sender_bot_id=None):
+    sent_message = Mock()
+    sent_message.chat.id = chat_id
+    sent_message.message_id = message_id
+    sent_message.reply_text = Mock()
+    sent_message.sender_bot_id = sender_bot_id
+    return sent_message
+
+
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
@@ -42,10 +51,7 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     _store_link_session(channel, chat, storage_key, backfill_mode=None)
     update = _build_link_update(bot_group)
 
-    sent_message = Mock()
-    sent_message.chat.id = bot_group
-    sent_message.message_id = 500
-    sent_message.reply_text = Mock()
+    sent_message = _sent_link_message(bot_group, 500)
 
     with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
          patch.object(channel.bot_manager, "edit_message_text"), \
@@ -58,6 +64,28 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     _cleanup_link_state(channel, chat, bot_group)
 
 
+def test_link_chat_edits_status_message_with_sender_bot(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(105))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    update = _build_link_update(bot_group)
+
+    sent_message = _sent_link_message(bot_group, 505, sender_bot_id="8465204282")
+
+    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
+         patch.object(channel.bot_manager, "edit_message_text") as edit_message_text, \
+         patch.object(channel.chat_binding, "migrate_chat_history"), \
+         patch.object(channel.chat_binding, "send_history_link"):
+        channel.chat_binding.link_chat(update, [token])
+
+    target_status_edit = edit_message_text.call_args_list[0].kwargs
+    assert target_status_edit["chat_id"] == bot_group
+    assert target_status_edit["message_id"] == 505
+    assert target_status_edit["_sender_bot_id"] == "8465204282"
+    _cleanup_link_state(channel, chat, bot_group)
+
+
 def test_link_chat_auto_mode_sends_history_link_on_relink(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(102))
@@ -67,10 +95,7 @@ def test_link_chat_auto_mode_sends_history_link_on_relink(channel, slave, bot_gr
     channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
     update = _build_link_update(bot_group)
 
-    sent_message = Mock()
-    sent_message.chat.id = bot_group
-    sent_message.message_id = 501
-    sent_message.reply_text = Mock()
+    sent_message = _sent_link_message(bot_group, 501)
 
     with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
          patch.object(channel.bot_manager, "edit_message_text"), \
@@ -92,10 +117,7 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
     channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
     update = _build_link_update(bot_group)
 
-    sent_message = Mock()
-    sent_message.chat.id = bot_group
-    sent_message.message_id = 502
-    sent_message.reply_text = Mock()
+    sent_message = _sent_link_message(bot_group, 502)
 
     with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
          patch.object(channel.bot_manager, "edit_message_text"), \
@@ -118,10 +140,7 @@ def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(
     update = _build_link_update(bot_group)
     update.effective_message.text = f"/start {token} true"
 
-    sent_message = Mock()
-    sent_message.chat.id = bot_group
-    sent_message.message_id = 503
-    sent_message.reply_text = Mock()
+    sent_message = _sent_link_message(bot_group, 503)
 
     with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
          patch.object(channel.bot_manager, "edit_message_text"), \
