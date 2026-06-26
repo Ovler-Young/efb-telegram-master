@@ -119,11 +119,7 @@ class BotPool:
             (AuxiliaryBot, delay) if a suitable aux bot was found,
             None if no aux bot beats max_delay or none are members.
         """
-        with self._pool_lock:
-            affinity_slot = self._try_affinity_bot(chat_id, max_delay, affinity_key, skip_bot)
-            if affinity_slot is not None:
-                return affinity_slot
-
+        def _select_locked() -> tuple[Optional[Tuple[AuxiliaryBot, float]], List[AuxiliaryBot], List[AuxiliaryBot]]:
             best_bot: Optional[AuxiliaryBot] = None
             best_delay = float('inf')
             confirmed_non_member_bots: List[AuxiliaryBot] = []
@@ -149,35 +145,42 @@ class BotPool:
                     if delay == 0.0:
                         break
 
-            # Cold start: synchronously resolve unknown bots so they can help now
-            if best_bot is None and unknown_bots:
-                for aux_bot in unknown_bots:
-                    if skip_bot is not None and skip_bot(aux_bot):
-                        continue
-                    if aux_bot.check_membership_sync(chat_id, timeout=3.0):
-                        delay = aux_bot.peek_delay(chat_id)
-                        if delay < best_delay:
-                            best_bot = aux_bot
-                            best_delay = delay
-                            if delay == 0.0:
-                                break
-                    else:
-                        confirmed_non_member_bots.append(aux_bot)
-
             if best_bot is not None and best_delay < max_delay:
                 best_bot.reserve_slot(chat_id)
                 self._advance_round_robin_cursor(chat_id, best_bot)
                 if affinity_key is not None:
                     self._affinity_bot_by_key[affinity_key] = best_bot.bot_id
-                return (best_bot, best_delay)
+                return (best_bot, best_delay), confirmed_non_member_bots, unknown_bots
+            return None, confirmed_non_member_bots, unknown_bots
 
-            # Suggest adding aux bots only when the caller is actually delayed.
-            # Selection budget (max_delay) may include a small epsilon for fairness,
-            # so notification should be controlled by the caller.
-            if confirmed_non_member_bots and notify_admin:
-                self._maybe_notify_admin(chat_id, confirmed_non_member_bots)
+        with self._pool_lock:
+            affinity_slot = self._try_affinity_bot(chat_id, max_delay, affinity_key, skip_bot)
+            if affinity_slot is not None:
+                return affinity_slot
+            selected, confirmed_non_member_bots, unknown_bots = _select_locked()
+            if selected is not None:
+                return selected
 
-            return None
+        if unknown_bots:
+            for aux_bot in unknown_bots:
+                if skip_bot is not None and skip_bot(aux_bot):
+                    continue
+                aux_bot.check_membership_sync(chat_id, timeout=3.0)
+            with self._pool_lock:
+                affinity_slot = self._try_affinity_bot(chat_id, max_delay, affinity_key, skip_bot)
+                if affinity_slot is not None:
+                    return affinity_slot
+                selected, confirmed_non_member_bots, _unknown_bots = _select_locked()
+                if selected is not None:
+                    return selected
+
+        # Suggest adding aux bots only when the caller is actually rate-limited.
+        # Selection budget (max_delay) may include a small epsilon for fairness,
+        # so notification should be controlled by the caller.
+        if confirmed_non_member_bots and notify_admin:
+            self._maybe_notify_admin(chat_id, confirmed_non_member_bots)
+
+        return None
 
     def send_blocking(self, chat_id: int, timeout: float = 60.0) -> Optional[AuxiliaryBot]:
         """Block until any bot in the pool has a free slot for the given chat.

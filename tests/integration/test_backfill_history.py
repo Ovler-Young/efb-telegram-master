@@ -226,14 +226,11 @@ def _expected_stream_indices(expected_count: int) -> Set[int]:
     return set(range(expected_count))
 
 
-def _delayed_state(bot_manager):
-    with bot_manager._chat_queues_lock:
-        queue_len = sum(len(q) for q in bot_manager._chat_queues.values())
-    in_flight = len(bot_manager._chat_in_flight)
-    with bot_manager._pending_logs_lock:
-        pending_len = len(bot_manager._pending_delayed_logs)
-        completed_len = len(bot_manager._completed_delayed_results)
-    return queue_len + in_flight, pending_len, completed_len
+def _queued_state(bot_manager):
+    with bot_manager._send_queues_lock:
+        queue_len = sum(len(q) for q in bot_manager._send_queues.values())
+    in_flight = len(bot_manager._send_in_flight)
+    return queue_len + in_flight
 
 
 def _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix: str):
@@ -271,14 +268,14 @@ async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_cha
             for idx in _extract_stream_indices(message.raw_text or "", prefix)
         }
 
-        queue_len, pending_len, completed_len = _delayed_state(channel_with_auxiliary_bots.bot_manager)
+        queue_len = _queued_state(channel_with_auxiliary_bots.bot_manager)
         last_debug = (
             f"db={len(db_logs)} (idx={len(db_indices)}/{expected_count}), "
             f"tg={len(group_messages)} (idx={len(group_indices)}/{expected_count}), "
-            f"delayed_queue={queue_len}, pending_logs={pending_len}, completed_results={completed_len}"
+            f"queued_tasks={queue_len}"
         )
 
-        if db_indices == expected and group_indices == expected and (queue_len, pending_len, completed_len) == (0, 0, 0):
+        if db_indices == expected and group_indices == expected and queue_len == 0:
             return db_logs, group_messages
 
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -337,7 +334,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id)
 
     bot_manager = channel_with_auxiliary_bots.bot_manager
-    task_counter_before = bot_manager._tasks_scheduled
+    task_counter_before = bot_manager._tasks_enqueued
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
     await asyncio.to_thread(stream_thread.join, STREAM_DURATION_SECONDS + 15.0)
@@ -377,9 +374,9 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     group_sender_ids = {message.sender_id for message in group_messages if message.sender_id is not None}
     assert group_sender_ids & set(working_aux_bot_ids), "Expected auxiliary bot messages in the linked group."
 
-    # 4) Delayed queue was used, and there is no pending delayed DB update residue.
-    assert bot_manager._tasks_scheduled - task_counter_before >= STREAM_MESSAGE_COUNT
-    assert _delayed_state(bot_manager) == (0, 0, 0)
+    # 4) Queued send path was used, and there is no queued send residue.
+    assert bot_manager._tasks_enqueued - task_counter_before >= STREAM_MESSAGE_COUNT
+    assert _queued_state(bot_manager) == 0
 
     # ---- Relink/migration checks (same stream history) ----
 

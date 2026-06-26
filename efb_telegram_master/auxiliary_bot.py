@@ -169,6 +169,10 @@ class AuxiliaryBot:
         """Reserve a send slot and return the delay. Thread-safe."""
         return self._rate_limiter.reserve_slot(chat_id)
 
+    def release_slot(self, chat_id: int) -> None:
+        """Release the latest reservation when a send did not happen."""
+        self._rate_limiter.release_slot(chat_id)
+
     def get_chat_send_count(self, chat_id: int) -> int:
         """Return this bot's current per-chat sliding-window send count."""
         chat_count, _global_count = self._rate_limiter.get_counts(chat_id)
