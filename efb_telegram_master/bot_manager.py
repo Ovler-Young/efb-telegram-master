@@ -2215,9 +2215,12 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
+        fallback_to_document = kwargs.pop('_fallback_to_document', True)
         try:
             return self._active_bot.send_photo(*args, **kwargs)
         except telegram.error.BadRequest:
+            if not fallback_to_document:
+                raise
             return self._active_bot.send_document(*args, **kwargs)
 
     @Decorators.skip_on_rate_limit

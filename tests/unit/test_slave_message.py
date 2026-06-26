@@ -323,6 +323,7 @@ def test_slave_message_image_sends_remote_image_url():
         message_thread_id=200,
         reply_markup=None,
         disable_notification=True,
+        _fallback_to_document=False,
         _send_mode="blocking",
     )
     processor.bot.send_document.assert_not_called()
@@ -342,6 +343,7 @@ def test_slave_message_image_sends_placeholder_when_remote_image_url_fails():
     assert processor.bot.send_photo.call_count == 2
     first_call, second_call = processor.bot.send_photo.call_args_list
     assert first_call.args[1] == REMOTE_IMAGE_URL
+    assert first_call.kwargs["_fallback_to_document"] is False
     assert hasattr(second_call.args[1], "read")
     assert second_call.kwargs["caption"] == "remote &lt;image&gt;"
     assert second_call.kwargs["_send_mode"] == "blocking"

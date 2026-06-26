@@ -660,6 +660,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                            message_thread_id=thread_id,
                                            reply_markup=reply_markup,
                                            disable_notification=silent,
+                                           _fallback_to_document=False,
                                            _send_mode="blocking")
             except telegram.error.BadRequest as e:
                 self.logger.warning('[%s] Failed to send remote image URL, sending editable placeholder. Reason: %s',

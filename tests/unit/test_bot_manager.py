@@ -133,6 +133,21 @@ def test_empty_file_detection_skips_http_url():
     manager.send_message.assert_not_called()
 
 
+def test_send_photo_can_disable_document_fallback_for_remote_url():
+    manager = _make_lightweight_bot_manager()
+    manager._bot.send_photo.side_effect = telegram.error.BadRequest("failed to get HTTP URL content")
+
+    with pytest.raises(telegram.error.BadRequest):
+        manager.send_photo(
+            123,
+            "https://example.com/images/photo.jpg",
+            caption="caption",
+            _fallback_to_document=False,
+        )
+
+    manager._bot.send_document.assert_not_called()
+
+
 def test_rate_limit_decorator_forced_routes_to_sender_bot():
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
     aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False, reserve_slot=Mock(return_value=0.0))
