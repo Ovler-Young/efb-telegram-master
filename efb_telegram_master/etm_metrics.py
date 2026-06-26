@@ -318,7 +318,7 @@ class _ManagerStateExporter:
         known_chat_ids: Iterable[int],
         effective_limit: int,
     ) -> None:
-        distribution = collections.Counter()
+        distribution: collections.Counter[tuple[int, str]] = collections.Counter()
         for chat_id in set(known_chat_ids) | set(chat_counts):
             used = int(chat_counts.get(chat_id, 0))
             state = "cooling" if effective_limit > 0 and used >= effective_limit else "available"
