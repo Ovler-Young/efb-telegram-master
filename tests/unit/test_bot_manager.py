@@ -11,9 +11,15 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import telegram.error
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
+from telegram.request._requestparameter import RequestParameter
 
-from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager, _clone_file_argument
+from efb_telegram_master.bot_manager import (
+    SendReceipt,
+    TelegramBotManager,
+    _clone_file_argument,
+    _clone_media_argument,
+)
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
@@ -796,6 +802,17 @@ def test_clone_file_argument_keeps_queued_send_readable_after_original_closes():
     original.close()
 
     assert cloned.read() == b"queued-media"
+
+
+def test_clone_media_argument_preserves_input_media_attachment_reference():
+    original = InputMediaVideo(io.BytesIO(b"queued-video"), filename="queued-video.mp4")
+
+    cloned = _clone_media_argument(original)
+    request_parameter = RequestParameter.from_input("media", cloned)
+
+    assert cloned.media.attach_name is not None
+    assert request_parameter.value["media"] == cloned.media.attach_uri
+    assert cloned.media.attach_name in request_parameter.multipart_data
 
 
 def test_select_queued_sender_available_path_passes_topic_affinity_key_to_bot_pool():

@@ -326,7 +326,14 @@ def _has_callback_keyboard(reply_markup) -> bool:
 def _clone_file_argument(value):
     """Copy file-like send arguments so queued tasks don't depend on caller-owned handles."""
     if isinstance(value, InputFile):
-        return InputFile(io.BytesIO(value.input_file_content), filename=value.filename)
+        content = value.input_file_content
+        if hasattr(content, 'read') and hasattr(content, 'seek'):
+            content = _clone_file_argument(content).read()
+        return InputFile(
+            io.BytesIO(content),
+            filename=value.filename,
+            attach=value.attach_name is not None,
+        )
     if hasattr(value, 'read') and hasattr(value, 'seek'):
         current_pos = None
         try:
