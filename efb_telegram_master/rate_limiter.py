@@ -99,6 +99,21 @@ class SlidingWindowRateLimiter:
             self._cleanup()
             return len(self._chat_timestamps.get(chat_id, ())), len(self._global_timestamps)
 
+    def get_chat_count_snapshot(self) -> Tuple[Dict[int, int], int]:
+        """Return current per-chat occupancy and the effective per-chat limit."""
+        with self._lock:
+            self._cleanup()
+            return (
+                {chat_id: len(timestamps) for chat_id, timestamps in self._chat_timestamps.items() if timestamps},
+                max(0, self.chat_limit - self._margin),
+            )
+
+    def get_reserved_slot_count(self) -> int:
+        """Return current global sliding-window reservations for diagnostics."""
+        with self._lock:
+            self._cleanup()
+            return len(self._global_timestamps)
+
     # Internals
 
     def _compute_delay(self, chat_id: int) -> float:

@@ -135,6 +135,42 @@ def test_get_counts_returns_correct_values():
         assert global_count == 3
 
 
+def test_chat_count_snapshot_returns_active_counts_and_effective_limit():
+    limiter = _make_limiter(chat_limit=3, safety_margin=1)
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
+        limiter.reserve_slot(1)
+        limiter.reserve_slot(1)
+        limiter.reserve_slot(2)
+
+        chat_counts, effective_limit = limiter.get_chat_count_snapshot()
+
+    assert chat_counts == {1: 2, 2: 1}
+    assert effective_limit == 2
+
+
+def test_chat_count_snapshot_cleans_up_expired_chats():
+    limiter = _make_limiter(chat_limit=3, chat_window=10.0)
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
+        limiter.reserve_slot(1)
+
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=111.0):
+        chat_counts, effective_limit = limiter.get_chat_count_snapshot()
+
+    assert chat_counts == {}
+    assert effective_limit == 3
+
+
+def test_reserved_slot_count_uses_global_window_cleanup():
+    limiter = _make_limiter(global_window=5.0, chat_window=100.0)
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
+        limiter.reserve_slot(1)
+        limiter.reserve_slot(2)
+        assert limiter.get_reserved_slot_count() == 2
+
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=106.0):
+        assert limiter.get_reserved_slot_count() == 0
+
+
 # Thread safety (smoke)
 
 

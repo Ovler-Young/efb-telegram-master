@@ -189,6 +189,26 @@ def test_acquire_send_slot_skips_disabled_and_respects_max_delay():
     slow_bot.reserve_slot.assert_not_called()
 
 
+def test_explain_send_slot_unavailable_returns_bounded_reason_labels():
+    assert BotPool([], _make_manager()).explain_send_slot_unavailable(100) == "not_configured"
+
+    non_member = _make_aux_bot(1, membership=False)
+    pool = BotPool([non_member], _make_manager())
+    assert pool.explain_send_slot_unavailable(100) == "no_aux_member"
+
+    unknown = _make_aux_bot(2, membership=None)
+    pool = BotPool([unknown], _make_manager())
+    assert pool.explain_send_slot_unavailable(100) == "membership_unknown"
+
+    delayed = _make_aux_bot(3, membership=True, delay=1.0)
+    pool = BotPool([delayed], _make_manager())
+    assert pool.explain_send_slot_unavailable(100) == "local_rate_limit"
+
+    skipped = _make_aux_bot(4, membership=True, delay=0.0)
+    pool = BotPool([skipped], _make_manager())
+    assert pool.explain_send_slot_unavailable(100, skip_bot=lambda bot: True) == "bot_chat_cooldown"
+
+
 def test_send_blocking_waits_until_slot_is_available():
     aux_bot = _make_aux_bot(1, delay=1.0)
     aux_bot.peek_delay.side_effect = [1.0, 0.0]

@@ -203,6 +203,57 @@ class BotPool:
             time.sleep(0.2)
         return None
 
+    def explain_send_slot_unavailable(
+        self,
+        chat_id: int,
+        skip_bot: Optional[Callable[[AuxiliaryBot], bool]] = None,
+    ) -> str:
+        """Return a bounded reason label when no auxiliary bot can be selected."""
+        has_usable_bot = False
+        has_skipped_bot = False
+        has_unknown_membership = False
+        has_confirmed_non_member = False
+        has_rate_limited_member = False
+
+        with self._pool_lock:
+            ordered_bots = self._ordered_bots_for_chat(chat_id)
+            if not ordered_bots:
+                return "not_configured"
+
+            for aux_bot in ordered_bots:
+                if aux_bot.disabled:
+                    continue
+                has_usable_bot = True
+
+                if skip_bot is not None and skip_bot(aux_bot):
+                    has_skipped_bot = True
+                    continue
+
+                status = aux_bot.check_membership_tri(chat_id)
+                if status is None:
+                    has_unknown_membership = True
+                    continue
+                if status is False:
+                    has_confirmed_non_member = True
+                    continue
+
+                if aux_bot.peek_delay(chat_id) > 0:
+                    has_rate_limited_member = True
+                    continue
+                return "available"
+
+        if has_unknown_membership:
+            return "membership_unknown"
+        if has_rate_limited_member:
+            return "local_rate_limit"
+        if has_confirmed_non_member:
+            return "no_aux_member"
+        if has_skipped_bot:
+            return "bot_chat_cooldown"
+        if not has_usable_bot:
+            return "disabled"
+        return "unavailable"
+
     def on_bots_joined_chat(self, bot_ids: list, chat_id: int):
         """Update membership cache when aux bots are added to a group."""
         for bot_id in bot_ids:

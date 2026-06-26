@@ -21,6 +21,7 @@ from efb_telegram_master.bot_manager import (
     _clone_media_argument,
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
+from efb_telegram_master.etm_metrics import _ManagerStateExporter, bad_request_reason_class
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
@@ -1149,6 +1150,101 @@ def test_parse_metrics_config_defaults_and_disables_invalid_endpoint_options():
     assert logger.warning.call_count == 2
 
 
+def test_bot_chat_occupancy_rows_include_zero_and_cooling_groups():
+    rows = []
+
+    _ManagerStateExporter.append_bot_chat_occupancy_rows(
+        rows,
+        sender="aux",
+        bot_id=123,
+        username="botA",
+        chat_counts={1: 1, 2: 18, 3: 5},
+        known_chat_ids={1, 2, 3, 4, 5},
+        effective_limit=18,
+    )
+
+    assert rows == [
+        ("aux", 123, "botA", 0, 18, "available", 2),
+        ("aux", 123, "botA", 1, 18, "available", 1),
+        ("aux", 123, "botA", 5, 18, "available", 1),
+        ("aux", 123, "botA", 18, 18, "cooling", 1),
+    ]
+
+
+def test_bot_debug_state_snapshots_group_cooldown_membership_and_reserved_slots():
+    mgr = object.__new__(TelegramBotManager)
+    mgr.me = SimpleNamespace(id=1, username="mainbot")
+
+    aux_bot = SimpleNamespace(
+        bot_id=123,
+        username="botA",
+        get_membership_cache_snapshot=Mock(return_value={
+            "member": 2,
+            "not_member": 1,
+            "unknown_probe_pending": 1,
+        }),
+        get_reserved_slot_count=Mock(return_value=7),
+    )
+    mgr.bot_pool = SimpleNamespace(
+        bots=[aux_bot],
+        get_bot_by_id=Mock(return_value=aux_bot),
+    )
+    mgr._rate_limiter = SimpleNamespace(get_reserved_slot_count=Mock(return_value=3))
+    mgr._bot_chat_disabled_until = {
+        (None, 100): 115.0,
+        ("123", 200): 110.0,
+        ("123", 300): 90.0,
+    }
+
+    with patch("efb_telegram_master.bot_manager.time.time", return_value=100.0):
+        exporter = _ManagerStateExporter(mgr)
+        cooldown_rows = exporter.bot_chat_cooldown_rows()
+
+    assert cooldown_rows == [
+        ("main", 1, "mainbot", 1, 15.0),
+        ("aux", 123, "botA", 1, 10.0),
+    ]
+    assert exporter.membership_cache_rows() == [
+        (123, "botA", "member", 2),
+        (123, "botA", "not_member", 1),
+        (123, "botA", "unknown_probe_pending", 1),
+    ]
+    assert exporter.reserved_slots_rows() == [
+        ("main", 1, "mainbot", 3),
+        ("aux", 123, "botA", 7),
+    ]
+
+
+def test_select_queued_sender_records_main_blocked_metrics():
+    manager = SimpleNamespace(
+        bot_pool=None,
+        _calculate_rate_limit_delay=Mock(return_value=(2.0, 0, 0)),
+        _bot_chat_disabled_until={},
+        _bot=object(),
+        _metrics=Mock(),
+    )
+
+    bot, sender_bot_id, delay = TelegramBotManager._select_queued_sender(manager, 123)
+
+    assert bot is None
+    assert sender_bot_id is None
+    assert delay == 2.0
+    manager._metrics.sender_selection.assert_called_once_with("main", "blocked", "local_rate_limit")
+    manager._metrics.dispatch_blocked.assert_called_once_with("local_rate_limit")
+
+
+def test_bad_request_reason_classifies_common_failures():
+    assert bad_request_reason_class(
+        telegram.error.BadRequest("Message to be replied not found")
+    ) == "reply_target_missing"
+    assert bad_request_reason_class(
+        telegram.error.BadRequest("Can't parse entities")
+    ) == "invalid_markup"
+    assert bad_request_reason_class(
+        telegram.error.BadRequest("Message is too long")
+    ) == "message_too_long"
+
+
 @pytest.mark.asyncio
 async def test_shutdown_ptb_application_signals_stop_running():
     application = SimpleNamespace(stop_running=Mock())
@@ -1387,8 +1483,11 @@ def test_harvest_completed_sends_does_not_retry_bad_request():
     from concurrent.futures import Future
     from efb_telegram_master.bot_manager import QueuedSendTask, TelegramBotManager
 
+    def send_message():
+        return None
+
     task = QueuedSendTask(
-        ("slave.chat", 100), lambda: None, (),
+        ("slave.chat", 100), send_message, (),
         {"reply_to_message_id": 321, "message_thread_id": 654}, "t1",
     )
     future = Future()
@@ -1405,8 +1504,10 @@ def test_harvest_completed_sends_does_not_retry_bad_request():
 
     assert mgr._send_in_flight == {}
     mgr._release_reserved_slot.assert_called_once_with(None, 100)
+    mgr._metrics.send_failure_from_exception.assert_called_once_with("main", task.function, future.exception())
     mgr._metrics.send_completed.assert_called_once_with("main", "dropped_bad_request")
     mgr._metrics.task_dropped.assert_called_once_with("bad_request")
+    mgr._metrics.bad_request_from_exception.assert_called_once_with(task.function, future.exception())
     mgr.logger.warning.assert_called_once_with(
         "Non-retryable BadRequest for queued task %s, dropping: %s "
         "(chat_id=%s, reply_to_message_id=%s, message_thread_id=%s, method=%s)",
@@ -1780,17 +1881,7 @@ def test_queued_send_worker_final_snapshot_after_in_flight_wait():
 
     assert mgr._send_in_flight == {}
     mgr._send_executor.shutdown.assert_called_once_with(wait=False)
-    mgr._metrics.snapshot.assert_called_once_with(
-        queued_tasks=0,
-        queued_targets=0,
-        max_target_depth=0,
-        in_flight=0,
-        disabled_bot_chats=0,
-        retry_targets=0,
-        worker_alive=False,
-        aux_pool_size=0,
-        aux_disabled=0,
-    )
+    mgr._metrics.snapshot_manager_state.assert_called_once_with(mgr, worker_alive=False)
 
 
 def test_queued_placeholder_has_no_delay_fields():
