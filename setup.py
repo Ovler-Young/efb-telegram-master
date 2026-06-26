@@ -65,6 +65,7 @@ setup(
         "cjkwrap",
         "humanize",
         "typing-extensions>=3.7.4.1",
+        "prometheus_client",
     ],
     extras_require={
         "tests": tests_require,

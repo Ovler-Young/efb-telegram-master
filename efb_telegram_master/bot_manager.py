@@ -1,6 +1,7 @@
 # coding=utf-8
 import asyncio
 import collections
+import collections.abc
 import html
 import io
 import logging
@@ -45,6 +46,7 @@ class QueuedSendTask(NamedTuple):
     kwargs: dict
     task_id: str
     arrival_seq: int = 0
+    enqueued_at: float = 0.0
     cleanup_files: tuple[str, ...] = ()
 
     @property
@@ -883,6 +885,28 @@ class TelegramBotManager(LocaleMixin):
         # Per-target concurrency tracking
         self._send_in_flight: dict[SendTarget, tuple] = {}  # target -> (Future, task, sender_bot_id)
         self._bot_chat_disabled_until: dict[tuple, float] = {}  # (bot_id|None, chat_id) -> RetryAfter deadline
+        self._last_metrics_snapshot = 0.0
+
+        from .etm_metrics import Metrics, start_metrics_server
+        metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
+        self._metrics = Metrics(namespace="etm", top_n=metrics_top_n)
+
+        def _queue_snapshot():
+            with self._send_queues_lock:
+                return [
+                    (target[0], target[1], len(queue))
+                    for target, queue in self._send_queues.items()
+                ]
+
+        self._metrics.register_topn(_queue_snapshot)
+        self._metrics_httpd = None
+        if metrics_endpoint is not None:
+            metrics_host, metrics_port = metrics_endpoint
+            self._metrics_httpd = start_metrics_server(
+                metrics_host,
+                metrics_port,
+                registry=self._metrics.registry,
+            )
 
         # Thread pool for non-blocking sends
         self._send_worker_count = self.DEFAULT_SEND_WORKER_COUNT
@@ -1296,6 +1320,70 @@ class TelegramBotManager(LocaleMixin):
             q = self._send_queues.setdefault(task.target, collections.deque())
             q.appendleft(task)
 
+    @staticmethod
+    def _metrics_sender(sender_bot_id: Optional[str]) -> str:
+        return "aux" if sender_bot_id else "main"
+
+    @staticmethod
+    def _parse_metrics_config(metrics_cfg: object, logger) -> tuple[int, Optional[tuple[str, int]]]:
+        top_n = 20
+        if metrics_cfg is None:
+            return top_n, None
+        if not isinstance(metrics_cfg, collections.abc.Mapping):
+            logger.warning("Invalid metrics config, Prometheus endpoint disabled: %s", metrics_cfg)
+            return top_n, None
+
+        try:
+            parsed_top_n = int(metrics_cfg.get('top_n', top_n))
+            if parsed_top_n < 0:
+                raise ValueError
+            top_n = parsed_top_n
+        except (TypeError, ValueError):
+            logger.warning("Invalid metrics top_n, using default %d: %s", top_n, metrics_cfg.get('top_n'))
+
+        host = metrics_cfg.get('host', '127.0.0.1')
+        if not isinstance(host, str) or not host:
+            logger.warning("Invalid metrics host, Prometheus endpoint disabled: %s", host)
+            return top_n, None
+
+        try:
+            port = int(metrics_cfg.get('port', 9101))
+            if not 0 <= port <= 65535:
+                raise ValueError
+        except (TypeError, ValueError):
+            logger.warning("Invalid metrics port, Prometheus endpoint disabled: %s", metrics_cfg.get('port'))
+            return top_n, None
+
+        return top_n, (host, port)
+
+    @staticmethod
+    def _task_total_seconds(task: QueuedSendTask) -> Optional[float]:
+        if not task.enqueued_at:
+            return None
+        total_seconds = time.monotonic() - task.enqueued_at
+        return total_seconds if total_seconds >= 0 else None
+
+    def _snapshot_send_metrics(self, *, worker_alive: bool):
+        metrics = getattr(self, '_metrics', None)
+        if not metrics:
+            return
+
+        with self._send_queues_lock:
+            depths = [len(queue) for queue in self._send_queues.values()]
+
+        aux_bots = self.bot_pool.bots if self.bot_pool else []
+        metrics.snapshot(
+            queued_tasks=sum(depths),
+            queued_targets=len(depths),
+            max_target_depth=max(depths) if depths else 0,
+            in_flight=len(self._send_in_flight),
+            disabled_bot_chats=len(self._bot_chat_disabled_until),
+            retry_targets=0,
+            worker_alive=worker_alive,
+            aux_pool_size=len(aux_bots),
+            aux_disabled=sum(1 for bot in aux_bots if getattr(bot, 'disabled', False)),
+        )
+
     def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
         """Initialize the auxiliary bot pool from config."""
         req_kwargs = {
@@ -1480,10 +1568,15 @@ class TelegramBotManager(LocaleMixin):
                 kwargs=kwargs,
                 task_id=task_id,
                 arrival_seq=arrival_seq,
+                enqueued_at=time.monotonic(),
                 cleanup_files=tuple(cleanup_files or ())
             )
             q = self._send_queues.setdefault(target, collections.deque())
             q.append(task)
+
+        metrics = getattr(self, '_metrics', None)
+        if metrics:
+            metrics.task_enqueued(priority=False)
 
         self.logger.debug("Queued send task %s for target %s", task_id, target)
         return task_id
@@ -1524,9 +1617,17 @@ class TelegramBotManager(LocaleMixin):
                     now=now,
                 )
             if sender_bot is None or wait_time > 0:
+                metrics = getattr(self, '_metrics', None)
+                if metrics:
+                    metrics.task_requeued("local_rate_limit")
                 self._requeue_send_task(task)
                 continue
 
+            metrics = getattr(self, '_metrics', None)
+            if metrics:
+                if task.enqueued_at:
+                    metrics.observe_queue_wait(time.monotonic() - task.enqueued_at)
+                metrics.task_dispatched(TelegramBotManager._metrics_sender(sender_bot_id))
             self._dispatch_send(task, sender_bot, sender_bot_id)
 
     def _queued_send_worker(self):
@@ -1537,10 +1638,13 @@ class TelegramBotManager(LocaleMixin):
         The worker thread itself never blocks on HTTP; it only orchestrates.
         """
         self.logger.debug("Queued send worker started")
+        metrics = getattr(self, '_metrics', None)
 
         while not self._send_worker_stop.is_set():
             try:
                 now = time.time()
+                if metrics:
+                    metrics.loop_tick()
 
                 # ── 1. Harvest completed sends ──
                 self._harvest_completed_sends()
@@ -1560,23 +1664,33 @@ class TelegramBotManager(LocaleMixin):
                     self._cleanup_stale_rendezvous()
                     self._last_rendezvous_cleanup = now
 
+                if metrics and now - self._last_metrics_snapshot >= 1.0:
+                    self._snapshot_send_metrics(worker_alive=True)
+                    self._last_metrics_snapshot = now
+
                 self._send_worker_stop.wait(timeout=0.05)
 
             except Exception as e:
+                if metrics:
+                    metrics.loop_error()
                 self.logger.exception(f"Error in queued send worker: {e}")
                 self._send_worker_stop.wait(timeout=1)
 
         # Shutdown: wait for in-flight sends to finish
-        for _target, (future, task, _bot_id) in list(self._send_in_flight.items()):
+        for target, (future, _task, _bot_id) in list(self._send_in_flight.items()):
             try:
                 future.result(timeout=10)
             except Exception:
                 pass
+            finally:
+                self._send_in_flight.pop(target, None)
         self._send_executor.shutdown(wait=False)
+        self._snapshot_send_metrics(worker_alive=False)
         self.logger.debug("Queued send worker stopped")
 
     def _dispatch_send(self, task: QueuedSendTask, sender_bot, sender_bot_id: Optional[str]):
         """Submit a send operation to the thread pool."""
+        sender = TelegramBotManager._metrics_sender(sender_bot_id)
 
         def _do_send():
             send_kwargs = dict(task.kwargs)
@@ -1584,8 +1698,13 @@ class TelegramBotManager(LocaleMixin):
             send_kwargs.pop('_force_sender_bot_id', None)
             send_kwargs.pop('_slave_id', None)
             send_kwargs['_skip_rate_limit_retry'] = True
+            started = time.monotonic()
             with self._using_bot(sender_bot):
-                return task.function(*task.args, **send_kwargs)
+                result = task.function(*task.args, **send_kwargs)
+            metrics = getattr(self, '_metrics', None)
+            if metrics:
+                metrics.observe_send_latency(sender, time.monotonic() - started)
+            return result
 
         future = self._send_executor.submit(_do_send)
         self._send_in_flight[task.target] = (future, task, sender_bot_id)
@@ -1618,6 +1737,10 @@ class TelegramBotManager(LocaleMixin):
             "Telegram rate limit for bot %s in chat %d (task %s): %.2fs; other bots can still send",
             sender_bot_id or "main", task.chat_id, task.task_id, retry_after,
         )
+        metrics = getattr(self, '_metrics', None)
+        if metrics:
+            metrics.rate_limited(TelegramBotManager._metrics_sender(sender_bot_id))
+            metrics.task_requeued("rate_limit")
         self._bot_chat_disabled_until[(sender_bot_id, task.chat_id)] = time.time() + retry_after
         self._release_reserved_slot(sender_bot_id, task.chat_id)
         self._requeue_send_task(task)
@@ -1629,9 +1752,16 @@ class TelegramBotManager(LocaleMixin):
         for target, (future, task, sender_bot_id) in completed:
             del self._send_in_flight[target]
             should_cleanup = True
+            sender = TelegramBotManager._metrics_sender(sender_bot_id)
+            metrics = getattr(self, '_metrics', None)
+            terminal_metric_recorded = False
 
             try:
                 result = future.result()  # already done, won't block
+
+                if metrics:
+                    metrics.send_completed(sender, "ok", TelegramBotManager._task_total_seconds(task))
+                    terminal_metric_recorded = True
 
                 if sender_bot_id is not None:
                     self._record_aux_use(task.chat_id)
@@ -1661,6 +1791,9 @@ class TelegramBotManager(LocaleMixin):
                     )
                     continue
                 self._release_reserved_slot(sender_bot_id, task.chat_id)
+                if metrics:
+                    metrics.send_completed(sender, "dropped_bad_request")
+                    metrics.task_dropped("bad_request")
                 self.logger.warning(
                     "Non-retryable BadRequest for queued task %s, dropping: %s "
                     "(chat_id=%s, reply_to_message_id=%s, message_thread_id=%s, method=%s)",
@@ -1685,6 +1818,9 @@ class TelegramBotManager(LocaleMixin):
                     task.task_id, e,
                 )
                 self._release_reserved_slot(sender_bot_id, task.chat_id)
+                if metrics:
+                    reason = "timed_out" if isinstance(e, telegram.error.TimedOut) else "network"
+                    metrics.task_requeued(reason)
                 self._requeue_send_task(task)
 
             except telegram.error.Forbidden as e:
@@ -1699,8 +1835,13 @@ class TelegramBotManager(LocaleMixin):
                             "marking it as non-member for this chat and retrying.",
                             sender_bot_id, task.chat_id, task.task_id,
                         )
+                        if metrics:
+                            metrics.task_requeued("forbidden_aux")
                         self._requeue_send_task(task)
                         continue
+                if metrics:
+                    metrics.send_completed(sender, "dropped_forbidden")
+                    metrics.task_dropped("forbidden")
                 self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
                 TelegramBotManager._drop_queued_database_update(self, task.task_id)
 
@@ -1713,11 +1854,17 @@ class TelegramBotManager(LocaleMixin):
                     )
                     continue
                 self._release_reserved_slot(sender_bot_id, task.chat_id)
+                if metrics:
+                    metrics.send_completed(sender, "error")
+                    metrics.task_dropped("error")
                 self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
                 TelegramBotManager._drop_queued_database_update(self, task.task_id)
 
             except Exception as e:
                 self._release_reserved_slot(sender_bot_id, task.chat_id)
+                if metrics and not terminal_metric_recorded:
+                    metrics.send_completed(sender, "error")
+                    metrics.task_dropped("error")
                 self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
                 TelegramBotManager._drop_queued_database_update(self, task.task_id)
 
@@ -2538,6 +2685,11 @@ class TelegramBotManager(LocaleMixin):
 
         # Stop the queued send worker first
         self.stop_queued_worker()
+
+        metrics_httpd = getattr(self, '_metrics_httpd', None)
+        if metrics_httpd:
+            metrics_httpd.shutdown()
+            metrics_httpd.server_close()
 
         # Shut down auxiliary bot pool
         if self.bot_pool:
