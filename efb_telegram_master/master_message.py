@@ -168,6 +168,14 @@ class MasterMessageProcessor(LocaleMixin):
 
         message: Message = update.effective_message
         mid = utils.message_id_to_str(update=update)
+        master_chat_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id)))
+        linked_slave_chats: Optional[list[EFBChannelChatIDStr]] = None
+
+        def get_linked_slave_chats() -> list[EFBChannelChatIDStr]:
+            nonlocal linked_slave_chats
+            if linked_slave_chats is None:
+                linked_slave_chats = self.db.get_chat_assoc(master_uid=master_chat_uid)
+            return linked_slave_chats
 
         self.logger.debug("[%s] Received message from Telegram: %s", mid, message.to_dict())
 
@@ -188,7 +196,9 @@ class MasterMessageProcessor(LocaleMixin):
             quote = msg_log.build_etm_msg(self.chat_manager).target is not None
 
         if destination is None:
-            destination = self.get_singly_linked_chat_id_str(update.effective_chat)
+            chats = get_linked_slave_chats()
+            if len(chats) == 1:
+                destination = chats[0]
             if destination:
                 quote = message.reply_to_message is not None
                 self.logger.debug("[%s] Chat %s is singly-linked to %s", mid, message.chat, destination)
@@ -220,7 +230,7 @@ class MasterMessageProcessor(LocaleMixin):
                         return
                 else:
                     self.logger.debug("[%s] Chat %s is a forum, but no thread ID is found.", mid, message.chat)
-                    destinations = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id))))
+                    destinations = get_linked_slave_chats()
                     if topic_destinations is not None and len(destinations) == len(topic_destinations):
                         self.logger.debug("[%s] Chat %s is a forum, and all destinations are in topics. The new message is not in any topic, so ignore it.", mid, message.chat)
                         return
@@ -253,7 +263,7 @@ class MasterMessageProcessor(LocaleMixin):
             self.logger.debug("[%s] Destination is not found for this message", mid)
             candidates = (
                  self.db.get_recent_slave_chats(TelegramChatID(message.chat.id), limit=5) or
-                 self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id))))[:5]
+                 get_linked_slave_chats()[:5]
             )
             if candidates:
                 self.logger.debug("[%s] Candidate suggestions are found for this message: %s", mid, candidates)
@@ -272,16 +282,6 @@ class MasterMessageProcessor(LocaleMixin):
                                 quote=True)
         else:
             return self.process_telegram_message(update, context, destination, quote=quote, edited=edited)
-
-    def get_singly_linked_chat_id_str(self, chat: Chat) -> Optional[EFBChannelChatIDStr]:
-        """Return the singly-linked remote chat if available.
-        Otherwise return None.
-        """
-        master_chat_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(chat.id)))
-        chats = self.db.get_chat_assoc(master_uid=master_chat_uid)
-        if len(chats) == 1:
-            return chats[0]
-        return None
 
     def process_telegram_message(self, update: Update, context: CallbackContext,
                                  destination: EFBChannelChatIDStr, quote: bool = False,

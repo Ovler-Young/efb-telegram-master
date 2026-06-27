@@ -80,11 +80,24 @@ class SlidingWindowRateLimiter:
             self._chat_timestamps[chat_id].append(candidate_time)
             return delay
 
+    def release_slot(self, chat_id: int) -> None:
+        """Undo the latest reservation for *chat_id* when no send happened."""
+        with self._lock:
+            chat_ts = self._chat_timestamps.get(chat_id)
+            if not chat_ts:
+                self._cleanup()
+                return
+            candidate_time = chat_ts.pop()
+            idx = bisect.bisect_left(self._global_timestamps, candidate_time)
+            if idx < len(self._global_timestamps) and self._global_timestamps[idx] == candidate_time:
+                self._global_timestamps.pop(idx)
+            self._cleanup()
+
     def get_counts(self, chat_id: int) -> Tuple[int, int]:
         """Return ``(chat_count, global_count)`` for diagnostics."""
         with self._lock:
             self._cleanup()
-            return len(self._chat_timestamps[chat_id]), len(self._global_timestamps)
+            return len(self._chat_timestamps.get(chat_id, ())), len(self._global_timestamps)
 
     # Internals
 
@@ -98,8 +111,8 @@ class SlidingWindowRateLimiter:
 
         # Per-chat window
         chat_delay = 0.0
-        chat_ts = self._chat_timestamps[chat_id]
-        if len(chat_ts) >= effective_chat_limit:
+        chat_ts = self._chat_timestamps.get(chat_id)
+        if chat_ts and len(chat_ts) >= effective_chat_limit:
             safe_index = len(chat_ts) - effective_chat_limit
             chat_delay = max(0.0, (chat_ts[safe_index] + self.chat_window) - current_time)
 
@@ -125,6 +138,11 @@ class SlidingWindowRateLimiter:
             self._global_timestamps.pop(0)
 
         chat_cutoff = current_time - self.chat_window
-        for _cid, ts in self._chat_timestamps.items():
+        empty_chat_ids = []
+        for cid, ts in self._chat_timestamps.items():
             while ts and ts[0] <= chat_cutoff:
                 ts.popleft()
+            if not ts:
+                empty_chat_ids.append(cid)
+        for cid in empty_chat_ids:
+            del self._chat_timestamps[cid]

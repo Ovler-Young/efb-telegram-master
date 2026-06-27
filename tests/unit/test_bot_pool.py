@@ -64,6 +64,19 @@ def test_acquire_send_slot_reuses_affinity_bot_below_half_capacity():
     bot_b.reserve_slot.assert_not_called()
 
 
+def test_acquire_send_slot_keeps_affinity_per_slave_id():
+    bot_a = _make_aux_bot(1, delay=0.0)
+    bot_b = _make_aux_bot(2, delay=0.0)
+    pool = BotPool([bot_a, bot_b], _make_manager())
+
+    first = pool.acquire_send_slot(100, max_delay=1.0, affinity_key="slave.chat")
+    second = pool.acquire_send_slot(200, max_delay=1.0, affinity_key="slave.chat")
+
+    assert first == (bot_a, 0.0)
+    assert second == (bot_a, 0.0)
+    assert pool._affinity_bot_by_key["slave.chat"] == 1
+
+
 def test_acquire_send_slot_switches_affinity_bot_at_half_capacity():
     bot_a = _make_aux_bot(1, delay=0.0)
     bot_b = _make_aux_bot(2, delay=0.0)
@@ -75,6 +88,7 @@ def test_acquire_send_slot_switches_affinity_bot_at_half_capacity():
 
     assert first == (bot_a, 0.0)
     assert second == (bot_b, 0.0)
+    assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_b.reserve_slot.assert_called_once_with(100)
 
 
@@ -101,6 +115,7 @@ def test_acquire_send_slot_falls_back_when_affinity_bot_unavailable():
     selected = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 10))
 
     assert selected == (bot_b, 0.0)
+    assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
 
@@ -114,11 +129,12 @@ def test_acquire_send_slot_falls_back_when_affinity_bot_is_not_member():
     selected = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 10))
 
     assert selected == (bot_b, 0.0)
+    assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
 
 
-def test_acquire_send_slot_falls_back_when_affinity_bot_is_skipped():
+def test_acquire_send_slot_falls_back_when_affinity_bot_disabled_by_skip():
     bot_a = _make_aux_bot(1, delay=0.0)
     bot_b = _make_aux_bot(2, delay=0.0)
     pool = BotPool([bot_a, bot_b], _make_manager())
@@ -132,11 +148,12 @@ def test_acquire_send_slot_falls_back_when_affinity_bot_is_skipped():
     )
 
     assert selected == (bot_b, 0.0)
+    assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
 
 
-def test_acquire_send_slot_falls_back_when_affinity_bot_is_delayed():
+def test_acquire_send_slot_falls_back_when_affinity_bot_has_local_delay():
     bot_a = _make_aux_bot(1, delay=1.0)
     bot_b = _make_aux_bot(2, delay=0.0)
     pool = BotPool([bot_a, bot_b], _make_manager())
@@ -145,11 +162,12 @@ def test_acquire_send_slot_falls_back_when_affinity_bot_is_delayed():
     selected = pool.acquire_send_slot(100, max_delay=2.0, affinity_key=(100, 10))
 
     assert selected == (bot_b, 0.0)
+    assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
 
 
-def test_acquire_send_slot_skips_frozen_bots_before_selecting():
+def test_acquire_send_slot_skips_disabled_bots_before_selecting():
     bot_a = _make_aux_bot(1, delay=0.0)
     bot_b = _make_aux_bot(2, delay=0.0)
     pool = BotPool([bot_a, bot_b], _make_manager())

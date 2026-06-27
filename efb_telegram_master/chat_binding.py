@@ -669,7 +669,12 @@ class ChatBindingManager(LocaleMixin):
                     self.logger.warning("Auto update group info failed for %s: %s", chat_display_name, e)
 
         txt = self._("Chat {0} is now linked.").format(chat_display_name)
-        self.bot.edit_message_text(text=txt, chat_id=msg.chat.id, message_id=msg.message_id)
+        self.bot.edit_message_text(
+            text=txt,
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            _sender_bot_id=getattr(msg, 'sender_bot_id', None),
+        )
 
         self.bot.edit_message_text(chat_id=storage_key[0],
                                    message_id=storage_key[1],
