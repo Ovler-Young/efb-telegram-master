@@ -1,14 +1,16 @@
 import threading
 import time
 from pytest import fixture
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from telegram.error import BadRequest
+from typing import cast
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ehforwarderbot import Message, Chat
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.chat import ChatMember
-from ehforwarderbot.types import ReactionName
+from ehforwarderbot.types import MessageID, ReactionName
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_message import SlaveMessageProcessor
@@ -71,13 +73,45 @@ def build_dummy_message(chat: Chat, author: ChatMember) -> Message:
     return message
 
 
+REMOTE_IMAGE_URL = "https://example.com/images/photo.jpg"
+
+
+def build_remote_image_message(remote_image_url: str = REMOTE_IMAGE_URL) -> Message:
+    message = Message()
+    message.uid = MessageID("__remote_image_msg__")
+    message.type = MsgType.Image
+    message.text = "remote <image>"
+    message.chat = SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__")
+    message.file = None
+    message.path = None
+    message.mime = None
+    message.filename = None
+    message.edit_media = False
+    message.commands = None
+    message.substitutions = None
+    message.vendor_specific = {
+        SlaveMessageProcessor.REMOTE_IMAGE_URL_VENDOR_KEY: remote_image_url,
+    }
+    return message
+
+
+def build_slave_message_processor() -> SlaveMessageProcessor:
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.bot = Mock()
+    processor.bot._cleanup_tls = SimpleNamespace(pending_cleanup=[])
+    processor.flag = Mock(side_effect=lambda flag_name: "emoji" if flag_name == "default_media_prompt" else False)
+    processor.logger = Mock()
+    processor.channel = cast(TelegramChannel, SimpleNamespace(config={"admins": [1]}, flag=processor.flag))
+    return processor
+
+
 def build_duplicate_test_processor() -> SlaveMessageProcessor:
-    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    processor = object.__new__(SlaveMessageProcessor)
     processor.db = Mock()
     processor.logger = Mock()
-    processor.get_slave_msg_dest = Mock(return_value=("__template__", (123, None)))
-    processor.is_silent = Mock(return_value=False)
-    processor.dispatch_message = Mock()
+    setattr(processor, "get_slave_msg_dest", Mock(return_value=("__template__", (123, None))))
+    setattr(processor, "is_silent", Mock(return_value=False))
+    setattr(processor, "dispatch_message", Mock())
     processor._pending_slave_messages = set()
     processor._pending_slave_messages_lock = threading.Lock()
     return processor
@@ -442,6 +476,121 @@ def test_build_inline_keyboard_existing_buttons(build_inline_keyboard, private):
     assert "__text__" in seq
     assert "__template__" in seq
     assert "__reactions__" in seq
+
+
+def test_slave_message_image_sends_remote_image_url():
+    processor = build_slave_message_processor()
+    processor.bot.send_photo.return_value = "__telegram_message__"
+    msg = build_remote_image_message()
+
+    result = processor.slave_message_image(
+        msg, 100, 200, "__template__", "__reactions__",
+        target_msg_id=300, silent=True
+    )
+
+    assert result == "__telegram_message__"
+    processor.bot.send_photo.assert_called_once_with(
+        100,
+        REMOTE_IMAGE_URL,
+        prefix="__template__",
+        suffix="__reactions__",
+        caption="remote &lt;image&gt;",
+        parse_mode="HTML",
+        reply_to_message_id=300,
+        message_thread_id=200,
+        reply_markup=None,
+        disable_notification=True,
+        _fallback_to_document=False,
+        _send_mode="blocking",
+        _slave_id="tests.mocks.slave __chat_id__",
+    )
+    processor.bot.send_document.assert_not_called()
+
+
+def test_slave_message_image_sends_placeholder_when_remote_image_url_fails():
+    processor = build_slave_message_processor()
+    processor.bot.send_photo.side_effect = [
+        BadRequest("failed to get HTTP URL content"),
+        "__placeholder_message__",
+    ]
+    msg = build_remote_image_message()
+
+    result = processor.slave_message_image(msg, 100, None, "__template__", "__reactions__")
+
+    assert result == "__placeholder_message__"
+    assert processor.bot.send_photo.call_count == 2
+    first_call, second_call = processor.bot.send_photo.call_args_list
+    assert first_call.args[1] == REMOTE_IMAGE_URL
+    assert first_call.kwargs["_fallback_to_document"] is False
+    assert first_call.kwargs["_slave_id"] == "tests.mocks.slave __chat_id__"
+    assert hasattr(second_call.args[1], "read")
+    assert second_call.kwargs["caption"] == "remote &lt;image&gt;"
+    assert second_call.kwargs["_send_mode"] == "blocking"
+    processor.bot.send_document.assert_not_called()
+
+
+def test_slave_message_image_edits_remote_image_url_media():
+    processor = build_slave_message_processor()
+    processor.bot.edit_message_media.return_value = "__edited_message__"
+    msg = build_remote_image_message()
+    msg.text = ""
+    msg.edit_media = True
+
+    result = processor.slave_message_image(msg, 100, None, "", "", old_msg_id=(100, 10))
+
+    assert result == "__edited_message__"
+    media = processor.bot.edit_message_media.call_args.kwargs["media"]
+    assert isinstance(media, InputMediaPhoto)
+    assert media.media == REMOTE_IMAGE_URL
+    processor.bot.edit_message_caption.assert_not_called()
+
+
+def test_slave_message_file_sends_remote_image_url_as_document():
+    remote_image_url = "https://example.com/images/photo;1.jpg"
+    processor = build_slave_message_processor()
+    processor.bot.send_document.return_value = "__telegram_message__"
+    msg = build_remote_image_message(remote_image_url)
+
+    result = processor.slave_message_file(
+        msg, 100, None, "__template__", "__reactions__",
+        target_msg_id=300, silent=True
+    )
+
+    assert result == "__telegram_message__"
+    processor.bot.send_document.assert_called_once_with(
+        100,
+        remote_image_url,
+        prefix="__template__",
+        suffix="__reactions__",
+        caption="remote &lt;image&gt;",
+        parse_mode="HTML",
+        filename="photo 1.jpg",
+        reply_to_message_id=300,
+        message_thread_id=None,
+        reply_markup=None,
+        disable_notification=True,
+        _send_mode="blocking",
+        _slave_id="tests.mocks.slave __chat_id__",
+    )
+
+
+def test_slave_message_file_sends_placeholder_when_remote_document_url_fails():
+    processor = build_slave_message_processor()
+    processor.bot.send_document.side_effect = [
+        BadRequest("failed to get HTTP URL content"),
+        "__placeholder_message__",
+    ]
+    msg = build_remote_image_message()
+
+    result = processor.slave_message_file(msg, 100, None, "__template__", "__reactions__")
+
+    assert result == "__placeholder_message__"
+    assert processor.bot.send_document.call_count == 2
+    first_call, second_call = processor.bot.send_document.call_args_list
+    assert first_call.args[1] == REMOTE_IMAGE_URL
+    assert hasattr(second_call.args[1], "read")
+    assert second_call.kwargs["filename"] == "remote-image-placeholder.png"
+    assert second_call.kwargs["_send_mode"] == "blocking"
 
 
 def test_reaction_target_prefers_primary_message_for_slave_origin_text():

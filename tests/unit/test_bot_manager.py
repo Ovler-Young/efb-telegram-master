@@ -29,7 +29,7 @@ def _bind_blocking_enqueue_helper(manager):
         def _enqueue_blocking_send_and_wait(slave_id, chat_id, fn, args, kwargs, cleanup_files=None):
             send_kwargs = {
                 key: value for key, value in kwargs.items()
-                if not key.startswith("_")
+                if not key.startswith("_") or key == "_fallback_to_document"
             }
             result = fn(*args, **send_kwargs)
             sender_bot_id = None
@@ -180,6 +180,37 @@ def test_malformed_html_caption(channel, bot_admin, image):
         caption='<b>Bold and <i>italics</i> text</b> and <abbr title="unknown tag to Telegram">UTTT</abbr> and an <a href="https://example.com">incomplete link</a',
         parse_mode="html"
     )
+
+
+def test_empty_file_detection_skips_http_url():
+    manager = SimpleNamespace(send_message=Mock(), _=lambda text: text)
+
+    result = TelegramBotManager._detect_empty_file(
+        manager,
+        "https://example.com/images/photo.jpg",
+        100,
+        "",
+        "",
+        "",
+    )
+
+    assert result is None
+    manager.send_message.assert_not_called()
+
+
+def test_send_photo_can_disable_document_fallback_for_remote_url():
+    manager = _make_lightweight_bot_manager()
+    manager._bot.send_photo.side_effect = telegram.error.BadRequest("failed to get HTTP URL content")
+
+    with pytest.raises(telegram.error.BadRequest):
+        manager.send_photo(
+            123,
+            "https://example.com/images/photo.jpg",
+            caption="caption",
+            _fallback_to_document=False,
+        )
+
+    manager._bot.send_document.assert_not_called()
 
 
 def test_rate_limit_decorator_forced_routes_to_sender_bot():

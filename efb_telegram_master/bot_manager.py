@@ -2157,9 +2157,12 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
+        fallback_to_document = kwargs.pop('_fallback_to_document', True)
         try:
             return self._active_bot.send_photo(*args, **kwargs)
         except telegram.error.BadRequest:
+            if not fallback_to_document:
+                raise
             return self._active_bot.send_document(*args, **kwargs)
 
     @Decorators.skip_on_rate_limit
@@ -2492,8 +2495,12 @@ class TelegramBotManager(LocaleMixin):
     def _detect_empty_file(self, file, chat, caption, prefix, suffix, message_thread_id=None):
         empty = True
         if isinstance(file, str):
-            stat_path = url2pathname(urlparse(file).path) if file.startswith('file://') else file
-            empty = os.stat(stat_path).st_size == 0
+            parsed = urlparse(file)
+            if parsed.scheme in {'http', 'https'}:
+                empty = False
+            else:
+                stat_path = url2pathname(parsed.path) if parsed.scheme == 'file' else file
+                empty = os.stat(stat_path).st_size == 0
         elif hasattr(file, "seekable"):
             try:
                 if hasattr(file, 'closed') and file.closed:
