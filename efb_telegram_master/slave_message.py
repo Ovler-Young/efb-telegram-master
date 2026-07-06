@@ -375,6 +375,9 @@ class SlaveMessageProcessor(LocaleMixin):
                         db_old_msg_id = canonical_msg_id
                         solitaire_alias_master_msg_id = action_plan.canonical_master_msg_id
                         solitaire_edit = True
+                        if action_plan.sender_bot_id:
+                            msg.vendor_specific = msg.vendor_specific or {}
+                            msg.vendor_specific['_sender_bot_id'] = action_plan.sender_bot_id
                     else:
                         self.logger.warning("[%s] Solitaire resolver returned invalid target: %s",
                                             msg.uid, action_plan)
@@ -540,6 +543,7 @@ class SlaveMessageProcessor(LocaleMixin):
             canonical_master_msg_id=canonical_master_msg_id,
             editable_master_msg_id=editable_master_msg_id,
             text=text if text is not None else row.text,
+            sender_bot_id=getattr(row, 'sender_bot_id', None),
         )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:

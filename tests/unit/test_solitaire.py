@@ -7,12 +7,13 @@ from efb_telegram_master.solitaire import (
 )
 
 
-def candidate(uid, master_id, text):
+def candidate(uid, master_id, text, sender_bot_id=None):
     return SolitaireCandidate(
         slave_message_id=uid,
         canonical_master_msg_id=master_id,
         editable_master_msg_id=master_id,
         text=text,
+        sender_bot_id=sender_bot_id,
     )
 
 
@@ -131,6 +132,38 @@ def test_ambiguous_candidates_fall_back_to_send():
 
     assert plan.action_type == "SEND"
     assert plan.reason == "ambiguous_match"
+
+
+def test_continuation_prefers_latest_snapshot_when_previous_merges_were_missed():
+    one = solitaire("A材料学院水果美食团购", note="下午5.3左右到")
+    two = solitaire("A材料学院水果美食团购", "Laine. 半个西瓜，西北", note="下午5.3左右到")
+    three = solitaire(
+        "A材料学院水果美食团购",
+        "Laine. 半个西瓜，西北",
+        "朝夕。 蟠桃1斤 脆桃2斤",
+        note="下午5.3左右到",
+    )
+    four = solitaire(
+        "A材料学院水果美食团购",
+        "Laine. 半个西瓜，西北",
+        "朝夕。 蟠桃1斤 脆桃2斤",
+        "fantasy 西瓜果切两盒",
+        note="下午5.3左右到",
+    )
+
+    plan = resolve_solitaire_action(
+        four,
+        "new",
+        [
+            candidate("one", "1.10", one),
+            candidate("two", "1.11", two),
+            candidate("three", "1.12", three, sender_bot_id="777"),
+        ],
+    )
+
+    assert plan.action_type == "EDIT"
+    assert plan.canonical_master_msg_id == "1.12"
+    assert plan.sender_bot_id == "777"
 
 
 def test_command_appends_to_base_candidate():

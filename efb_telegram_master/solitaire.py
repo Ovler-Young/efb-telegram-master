@@ -18,6 +18,7 @@ class ActionPlan:
     editable_master_msg_id: Optional[str] = None
     replacement_text: Optional[str] = None
     reason: str = ""
+    sender_bot_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class SolitaireCandidate:
     canonical_master_msg_id: str
     editable_master_msg_id: str
     text: str
+    sender_bot_id: Optional[str] = None
 
 
 _HEADER_VALUES = ("#接龙", "#接龍")
@@ -112,6 +114,7 @@ def resolve_solitaire_action(
             canonical_master_msg_id=base.canonical_master_msg_id,
             editable_master_msg_id=base.editable_master_msg_id,
             replacement_text=replacement,
+            sender_bot_id=base.sender_bot_id,
             reason="command_append",
         )
 
@@ -141,6 +144,7 @@ def resolve_solitaire_action(
             "EDIT",
             canonical_master_msg_id=best_candidate.canonical_master_msg_id,
             editable_master_msg_id=best_candidate.editable_master_msg_id,
+            sender_bot_id=best_candidate.sender_bot_id,
             reason=reason,
         )
     return ActionPlan("SEND", reason="ambiguous_match")
@@ -158,7 +162,10 @@ def _score_match(old: SolitaireParse, new: SolitaireParse) -> Tuple[float, str]:
             return 0.0, "continuation_prefix_changed"
         if len(new_items) - len(old_items) > 20:
             return 0.0, "continuation_growth_too_large"
-        return max(0.9, 1.0 - changed * 0.05), "continuation"
+        # Prefer the most complete prior snapshot when several missed candidates
+        # all match the same continuation chain.
+        coverage = len(old_items) / len(new_items)
+        return max(0.9, 1.0 + coverage - changed * 0.05), "continuation"
 
     if len(new_items) == len(old_items):
         if len(old_items) < 5:
