@@ -1,3 +1,4 @@
+import io
 import string
 import random
 import threading
@@ -228,6 +229,29 @@ def test_rate_limit_decorator_schedules_delayed_task_when_main_bot_is_limited():
     assert result.is_delayed is True
     manager._schedule_delayed_task.assert_called_once()
     manager._create_delayed_message_placeholder.assert_called_once_with(123, 5.0, "task-1")
+
+
+def test_rate_limit_decorator_freezes_file_for_delayed_task():
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(
+        lambda self, chat_id, sticker: SimpleNamespace(chat_id=chat_id, sticker=sticker.read())
+    )
+    manager = SimpleNamespace(
+        _delayed_worker_stop=threading.Event(),
+        bot_pool=None,
+        _calculate_rate_limit_delay=Mock(return_value=(5.0, 1, 1)),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _schedule_delayed_task=Mock(return_value="task-1"),
+        _create_delayed_message_placeholder=Mock(return_value=SimpleNamespace(is_delayed=True, task_id="task-1")),
+        logger=Mock(),
+    )
+    source_file = io.BytesIO(b"sticker-bytes")
+
+    decorated(manager, 123, source_file)
+    source_file.close()
+
+    scheduled_args = manager._schedule_delayed_task.call_args.kwargs["args"]
+    frozen_file = scheduled_args[2]
+    assert frozen_file.read() == b"sticker-bytes"
 
 
 def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_disabled():

@@ -57,6 +57,36 @@ def _has_callback_keyboard(reply_markup) -> bool:
     return False
 
 
+def _freeze_delayed_file_arg(value):
+    """Copy open file-like arguments so delayed sends do not read closed files."""
+    if isinstance(value, (str, bytes, os.PathLike)):
+        return value
+    if not hasattr(value, 'read'):
+        return value
+
+    try:
+        if getattr(value, 'closed', False):
+            return value
+        original_pos = value.tell() if hasattr(value, 'tell') else None
+        if hasattr(value, 'seek'):
+            value.seek(0)
+        frozen = io.BytesIO(value.read())
+        frozen.name = getattr(value, 'name', None)
+        if original_pos is not None and hasattr(value, 'seek'):
+            value.seek(original_pos)
+        frozen.seek(0)
+        return frozen
+    except (OSError, ValueError):
+        return value
+
+
+def _freeze_delayed_task_arguments(args: tuple, kwargs: dict) -> Tuple[tuple, dict]:
+    """Snapshot delayed task arguments that may become invalid before execution."""
+    return tuple(_freeze_delayed_file_arg(arg) for arg in args), {
+        key: _freeze_delayed_file_arg(value) for key, value in kwargs.items()
+    }
+
+
 class TelegramBotManager(LocaleMixin):
     """
     This is a wrapper of Telegram's message sending and editing methods.
@@ -207,14 +237,15 @@ class TelegramBotManager(LocaleMixin):
                         # Grab any pending cleanup files before scheduling
                         cleanup_files = getattr(self._cleanup_tls, 'pending_cleanup', [])[:]  # pylint: disable=protected-access
                         self._cleanup_tls.pending_cleanup = []  # pylint: disable=protected-access
+                        delayed_args, delayed_kwargs = _freeze_delayed_task_arguments(args, kwargs)
 
                         # Schedule the delayed execution using the new system
                         task_id = self._schedule_delayed_task(  # pylint: disable=protected-access
                             chat_id=chat_id,
                             delay_time=delay_time,
                             function=fn,
-                            args=(self,) + args,
-                            kwargs=kwargs,
+                            args=(self,) + delayed_args,
+                            kwargs=delayed_kwargs,
                             cleanup_files=cleanup_files
                         )
 
