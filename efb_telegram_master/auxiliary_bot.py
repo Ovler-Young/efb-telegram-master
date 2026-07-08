@@ -88,6 +88,7 @@ class AuxiliaryBot:
         self._membership_cache: Dict[int, Tuple[bool, float]] = {}
         self._membership_lock = threading.Lock()
         self._pending_probes: set = set()
+        self._metrics = None
 
     def _create_bot(self) -> telegram.Bot:
         request = self._build_request() if self._request_kwargs else None
@@ -178,6 +179,43 @@ class AuxiliaryBot:
         chat_count, _global_count = self._rate_limiter.get_counts(chat_id)
         return chat_count
 
+    def get_chat_count_snapshot(self) -> Tuple[Dict[int, int], int]:
+        """Return current per-chat rate-limit occupancy for metrics."""
+        return self._rate_limiter.get_chat_count_snapshot()
+
+    def get_reserved_slot_count(self) -> int:
+        """Return current global sliding-window reservations for metrics."""
+        return self._rate_limiter.get_reserved_slot_count()
+
+    def get_known_member_chat_ids(self) -> set[int]:
+        """Return chat IDs where this bot is currently cached as a member."""
+        with self._membership_lock:
+            return {
+                chat_id
+                for chat_id, (is_member, _timestamp) in self._membership_cache.items()
+                if is_member
+            }
+
+    def get_membership_cache_snapshot(self) -> Dict[str, int]:
+        """Return membership cache counts without exposing chat IDs."""
+        with self._membership_lock:
+            member_count = sum(1 for is_member, _timestamp in self._membership_cache.values() if is_member)
+            not_member_count = sum(1 for is_member, _timestamp in self._membership_cache.values() if not is_member)
+            pending_count = len(self._pending_probes)
+        return {
+            "member": member_count,
+            "not_member": not_member_count,
+            "unknown_probe_pending": pending_count,
+        }
+
+    def bind_metrics(self, metrics) -> None:
+        self._metrics = metrics
+
+    def _record_membership_probe(self, outcome: str) -> None:
+        metrics = self._metrics
+        if metrics:
+            metrics.membership_probe(self.bot_id, self.username, outcome)
+
     # Tri-state membership results
     MEMBERSHIP_MEMBER = True
     MEMBERSHIP_NOT_MEMBER = False
@@ -246,6 +284,7 @@ class AuxiliaryBot:
             time.sleep(0.05)
 
         logger.warning("Membership sync check timed out for bot %d in chat %d", self.bot_id, chat_id)
+        self._record_membership_probe("timeout")
         return False
 
     def update_membership(self, chat_id: int, is_member: bool):
@@ -277,16 +316,20 @@ class AuxiliaryBot:
             )
             is_member = member.status in ('member', 'administrator', 'creator', 'restricted')
             self.update_membership(chat_id, is_member)
+            self._record_membership_probe("ok_member" if is_member else "ok_not_member")
             logger.debug("Membership probe for bot %d in chat %d: %s (status=%s)",
                          self.bot_id, chat_id, is_member, member.status)
         except telegram.error.Forbidden:
             self.update_membership(chat_id, False)
+            self._record_membership_probe("forbidden")
             logger.warning("Membership probe for bot %d in chat %d got Forbidden", self.bot_id, chat_id)
         except telegram.error.BadRequest as e:
             self.update_membership(chat_id, False)
+            self._record_membership_probe("bad_request")
             logger.debug("Membership probe for bot %d in chat %d failed: %s", self.bot_id, chat_id, e)
         except Exception as e:
             self.update_membership(chat_id, False)
+            self._record_membership_probe("error")
             logger.warning("Membership probe failed for bot %d in chat %d: %s", self.bot_id, chat_id, e)
         finally:
             with self._membership_lock:

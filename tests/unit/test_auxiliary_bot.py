@@ -135,6 +135,56 @@ def test_probe_membership_marks_non_member_on_bad_request():
     assert aux_bot.check_membership(4000) is False
 
 
+def test_membership_cache_snapshot_counts_cached_and_pending_states():
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+
+    aux_bot.update_membership(100, True)
+    aux_bot.update_membership(200, False)
+    with aux_bot._membership_lock:
+        aux_bot._pending_probes.add(300)
+
+    assert aux_bot.get_membership_cache_snapshot() == {
+        "member": 1,
+        "not_member": 1,
+        "unknown_probe_pending": 1,
+    }
+
+
+def test_probe_membership_records_bad_request_metric():
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
+        bot = bot_cls.return_value
+        bot.get_chat_member.side_effect = telegram.error.BadRequest("not found")
+        aux_bot = AuxiliaryBot("123:token")
+        aux_bot.bot_id = 123
+        aux_bot.username = "botA"
+        metrics = Mock()
+        aux_bot.bind_metrics(metrics)
+
+    aux_bot._probe_membership(4000)
+
+    metrics.membership_probe.assert_called_once_with(123, "botA", "bad_request")
+
+
+def test_check_membership_sync_records_timeout_metric():
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+        aux_bot.bot_id = 123
+        aux_bot.username = "botA"
+        metrics = Mock()
+        aux_bot.bind_metrics(metrics)
+
+    def fake_start(chat_id):
+        with aux_bot._membership_lock:
+            aux_bot._pending_probes.add(chat_id)
+
+    with patch.object(aux_bot, "_start_membership_probe", side_effect=fake_start), \
+         patch("efb_telegram_master.auxiliary_bot.time.time", side_effect=[0.0, 2.0, 2.0]):
+        assert aux_bot.check_membership_sync(3000, timeout=1.0) is False
+
+    metrics.membership_probe.assert_called_once_with(123, "botA", "timeout")
+
+
 def test_probe_membership_forbidden_marks_non_member_without_disabling():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
         bot = bot_cls.return_value
