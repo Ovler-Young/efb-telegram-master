@@ -10,7 +10,7 @@ from ehforwarderbot import Message, MsgType
 from ehforwarderbot.types import MessageID
 
 from efb_telegram_master import utils
-from efb_telegram_master.db import ChatAssoc, MsgLog, TopicAssoc
+from efb_telegram_master.db import ChatAssoc, HistoryMigrationEntry, MsgLog, TopicAssoc
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
@@ -22,6 +22,26 @@ def test_msglog_schema_has_sender_bot_id(channel):
         from efb_telegram_master.db import database
         columns = {column.name for column in database.get_columns("msglog")}
     assert "sender_bot_id" in columns
+
+
+def test_history_migration_entry_table_exists():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    with test_db.bind_ctx([HistoryMigrationEntry, MsgLog]):
+        test_db.create_tables([HistoryMigrationEntry, MsgLog])
+        history_columns = {column.name for column in test_db.get_columns("historymigrationentry")}
+        msglog_columns = {column.name for column in test_db.get_columns("msglog")}
+
+    assert {
+        "slave_chat_id",
+        "target_chat_id",
+        "message_thread_id",
+        "source_master_msg_id",
+        "formatted_text",
+        "position",
+    }.issubset(history_columns)
+    assert "source_master_msg_id" not in msglog_columns
 
 
 def test_topic_assoc_table_exists_and_round_trips(channel, slave):
@@ -40,10 +60,12 @@ def test_topic_assoc_table_exists_and_round_trips(channel, slave):
 def test_create_missing_tables_preserves_existing_chat_assoc(channel):
     channel.db.add_chat_assoc("master-existing", "slave-existing", multiple_slave=True)
     TopicAssoc.drop_table(safe=True)
+    HistoryMigrationEntry.drop_table(safe=True)
 
     channel.db._create_missing_tables()
 
     assert TopicAssoc.table_exists()
+    assert HistoryMigrationEntry.table_exists()
     assert ChatAssoc.get_or_none(ChatAssoc.master_uid == "master-existing") is not None
     channel.db.remove_chat_assoc(master_uid="master-existing")
 
