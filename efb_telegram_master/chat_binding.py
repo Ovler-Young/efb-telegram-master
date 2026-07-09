@@ -245,7 +245,7 @@ class ChatBindingManager(LocaleMixin):
                 )
             )
             if msg_log:
-                channel_id, chat_id, _ = utils.chat_id_str_to_id(msg_log.slave_origin_uid)
+                channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(msg_log.slave_origin_uid))
                 chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(

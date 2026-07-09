@@ -179,8 +179,8 @@ class MasterMessageProcessor(LocaleMixin):
 
         self.logger.debug("[%s] Received message from Telegram: %s", mid, message.to_dict())
 
-        destination = None
-        edited = None
+        destination: Optional[EFBChannelChatIDStr] = None
+        edited: Optional["MsgLog"] = None
         quote = False
 
         if update.edited_message or update.edited_channel_post:
@@ -191,7 +191,7 @@ class MasterMessageProcessor(LocaleMixin):
                                 self._("Error: This message cannot be edited, and thus is not sent. (ME01)"),
                                 quote=True)
                 return
-            destination = msg_log.slave_origin_uid
+            destination = EFBChannelChatIDStr(msg_log.slave_origin_uid)
             edited = msg_log
             quote = msg_log.build_etm_msg(self.chat_manager).target is not None
 
@@ -249,7 +249,7 @@ class MasterMessageProcessor(LocaleMixin):
                     )
                 )
                 if dest_msg:
-                    destination = dest_msg.slave_origin_uid
+                    destination = EFBChannelChatIDStr(dest_msg.slave_origin_uid)
                     self.chat_dest_cache.set(str(message.chat.id), destination)
                     self.logger.debug("[%s] Quoted message is found in database with destination: %s", mid, destination)
             elif cached_dest:
@@ -363,7 +363,7 @@ class MasterMessageProcessor(LocaleMixin):
                 m.edit = True
                 text = msg_md_text or msg_md_caption
 
-                m.uid = edited.slave_message_id
+                m.uid = MessageID(edited.slave_message_id)
                 if text.startswith(self.DELETE_FLAG):
                     coordinator.send_status(MessageRemoval(
                         source_channel=self.channel,
@@ -505,7 +505,7 @@ class MasterMessageProcessor(LocaleMixin):
             self.logger.error("[%s] Quoted message not found in database, give up quoting.",
                               tg_msg.message_id)
             return etm_msg
-        target_channel, _, _ = utils.chat_id_str_to_id(target_log.slave_origin_uid)
+        target_channel, _, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(target_log.slave_origin_uid))
         if target_channel != channel:
             self.logger.error("[%s] Quoted message is sent to channel %s, but this message is sent to %s, give up quoting.",
                               tg_msg.message_id, target_channel, channel)

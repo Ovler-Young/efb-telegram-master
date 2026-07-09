@@ -6,7 +6,7 @@ import pickle
 import time
 from contextlib import suppress
 from functools import partial
-from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING
+from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING, cast
 from pathlib import Path
 
 from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 database = DatabaseProxy()
 
 PickledDict = TypedDict('PickledDict', {
-    "target": EFBChannelChatIDStr,
+    "target": TgChatMsgIDStr,
     "is_system": bool,
     "attributes": MessageAttribute,
     "commands": MessageCommands,
@@ -109,12 +109,13 @@ class MsgLog(BaseModel):
 
     def build_etm_msg(self, chat_manager: ChatObjectCacheManager,
                       recur: bool = True) -> ETMMsg:
-        c_module, c_id, _ = chat_id_str_to_id(self.slave_origin_uid)
-        a_module, a_id, a_grp = chat_id_str_to_id(self.slave_member_uid)
+        c_module, c_id, _ = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_origin_uid))
+        assert self.slave_member_uid is not None
+        a_module, a_id, a_grp = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_member_uid))
         chat: 'ETMChatType' = chat_manager.get_chat(c_module, c_id, build_dummy=True)
         author: 'ETMChatMember' = chat_manager.get_chat_member(a_module, a_grp, a_id, build_dummy=True)  # type: ignore
         msg = ETMMsg(
-            uid=self.slave_message_id,
+            uid=MessageID(self.slave_message_id),
             chat=chat,
             author=author,
             text=self.text,
@@ -125,7 +126,7 @@ class MsgLog(BaseModel):
         )
         msg.sender_bot_id = self.sender_bot_id
         with suppress(NameError):
-            to_module = coordinator.get_module_by_id(self.sent_to)
+            to_module = coordinator.get_module_by_id(ModuleID(self.sent_to))
             if isinstance(to_module, Channel):
                 msg.deliver_to = to_module
 
@@ -286,22 +287,22 @@ class DatabaseManager:
 
         models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog]
         with sqlite_db.bind_ctx(models):
-            chat_assocs = list(ChatAssoc.select(
+            chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
-            ).dicts())
+            ).dicts()))
             if TopicAssoc.table_exists():
-                topic_assocs = list(TopicAssoc.select(
+                topic_assocs = cast(List[Dict[str, object]], list(TopicAssoc.select(
                     TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id, TopicAssoc.slave_uid
-                ).dicts())
+                ).dicts()))
             else:
                 topic_assocs = []
-            slave_chat_infos = self._select_existing_columns(SlaveChatInfo, "slavechatinfo", [
+            slave_chat_infos: List[Dict[str, object]] = self._select_existing_columns(SlaveChatInfo, "slavechatinfo", [
                 SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_channel_emoji,
                 SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id,
                 SlaveChatInfo.slave_chat_name, SlaveChatInfo.slave_chat_alias,
                 SlaveChatInfo.slave_chat_type, SlaveChatInfo.pickle
             ])
-            msg_logs = self._select_existing_columns(MsgLog, "msglog", [
+            msg_logs: List[Dict[str, object]] = self._select_existing_columns(MsgLog, "msglog", [
                 MsgLog.master_msg_id, MsgLog.master_msg_id_alt, MsgLog.slave_message_id,
                 MsgLog.text, MsgLog.slave_origin_uid, MsgLog.slave_origin_display_name,
                 MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
@@ -442,14 +443,14 @@ class DatabaseManager:
             return 0
 
     @staticmethod
-    def get_master_msg_id(message: EFBMessage) -> Optional[EFBChannelChatIDStr]:
+    def get_master_msg_id(message: EFBMessage) -> Optional[TgChatMsgIDStr]:
         """Get master message ID from a message object."""
         log: Optional[MsgLog] = MsgLog.get_or_none(
             MsgLog.slave_origin_uid == chat_id_to_str(chat=message.chat),
             MsgLog.slave_message_id == message.uid
         )
         if log:
-            return log.master_msg_id
+            return TgChatMsgIDStr(log.master_msg_id)
         return None
 
     def pickle_misc_msg(self, message: EFBMessage) -> Optional[bytes]:
@@ -515,13 +516,13 @@ class DatabaseManager:
                     ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)
                     .where(ChatAssoc.master_uid == master_uid)
                 )
-                return [i.slave_uid for i in slaves]
+                return [EFBChannelChatIDStr(i.slave_uid) for i in slaves]
             elif slave_uid:
                 masters = list(
                     ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)
                     .where(ChatAssoc.slave_uid == slave_uid)
                 )
-                return [i.master_uid for i in masters]
+                return [EFBChannelChatIDStr(i.master_uid) for i in masters]
             else:
                 return []
         except DoesNotExist:
@@ -612,7 +613,7 @@ class DatabaseManager:
         """
         try:
             query = TopicAssoc.select(TopicAssoc.slave_uid, TopicAssoc.message_thread_id)\
-                .where(TopicAssoc.topic_chat_id == topic_chat_id).order_by(TopicAssoc.id.desc())
+                .where(TopicAssoc.topic_chat_id == topic_chat_id).order_by(getattr(TopicAssoc, "id").desc())
             return [(EFBChannelChatIDStr(row.slave_uid), TelegramTopicID(int(row.message_thread_id))) for row in query]
         except DoesNotExist:
             return None
@@ -779,7 +780,6 @@ class DatabaseManager:
             SlaveChatInfo: The inserted or updated row
         """
         slave_channel_id = chat_object.module_id
-        slave_channel_name = chat_object.module_name
         slave_channel_emoji = chat_object.channel_emoji
         slave_chat_uid = chat_object.uid
         slave_chat_name = chat_object.name
@@ -796,7 +796,6 @@ class DatabaseManager:
                                              slave_chat_uid=slave_chat_uid,
                                              slave_chat_group_id=slave_chat_group_id)
         if chat_info is not None:
-            chat_info.slave_channel_name = slave_channel_name
             chat_info.slave_channel_emoji = slave_channel_emoji
             chat_info.slave_chat_name = slave_chat_name
             chat_info.slave_chat_alias = slave_chat_alias
@@ -806,7 +805,6 @@ class DatabaseManager:
             return chat_info
         else:
             return SlaveChatInfo.create(slave_channel_id=slave_channel_id,
-                                        slave_channel_name=slave_channel_name,
                                         slave_channel_emoji=slave_channel_emoji,
                                         slave_chat_uid=slave_chat_uid,
                                         slave_chat_group_id=slave_chat_group_id,
