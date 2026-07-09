@@ -6,10 +6,10 @@ import pickle
 import time
 from contextlib import suppress
 from functools import partial
-from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING
+from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING, cast
 from pathlib import Path
 
-from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy, IntegerField
+from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy, IntegerField, AutoField
 from playhouse.migrate import migrate
 from telegram import Message
 from typing_extensions import TypedDict
@@ -56,6 +56,7 @@ class BaseModel(Model):
 
 
 class TopicAssoc(BaseModel):
+    id = AutoField()
     topic_chat_id = TextField()
     message_thread_id = TextField()
     slave_uid = TextField()
@@ -109,12 +110,12 @@ class MsgLog(BaseModel):
 
     def build_etm_msg(self, chat_manager: ChatObjectCacheManager,
                       recur: bool = True) -> ETMMsg:
-        c_module, c_id, _ = chat_id_str_to_id(self.slave_origin_uid)
-        a_module, a_id, a_grp = chat_id_str_to_id(self.slave_member_uid)
+        c_module, c_id, _ = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_origin_uid))
+        a_module, a_id, a_grp = chat_id_str_to_id(cast(EFBChannelChatIDStr, self.slave_member_uid))
         chat: 'ETMChatType' = chat_manager.get_chat(c_module, c_id, build_dummy=True)
         author: 'ETMChatMember' = chat_manager.get_chat_member(a_module, a_grp, a_id, build_dummy=True)  # type: ignore
         msg = ETMMsg(
-            uid=self.slave_message_id,
+            uid=MessageID(self.slave_message_id),
             chat=chat,
             author=author,
             text=self.text,
@@ -125,7 +126,7 @@ class MsgLog(BaseModel):
         )
         msg.sender_bot_id = self.sender_bot_id
         with suppress(NameError):
-            to_module = coordinator.get_module_by_id(self.sent_to)
+            to_module = coordinator.get_module_by_id(ModuleID(self.sent_to))
             if isinstance(to_module, Channel):
                 msg.deliver_to = to_module
 
@@ -170,6 +171,7 @@ class MsgLog(BaseModel):
 
 
 class HistoryMigrationEntry(BaseModel):
+    id = AutoField()
     slave_chat_id = TextField()
     target_chat_id = TextField()
     message_thread_id = TextField(null=True)
@@ -342,16 +344,16 @@ class DatabaseManager:
         self._create()
 
         with database.atomic():
-            for batch in chunked(chat_assocs, 500):
-                ChatAssoc.insert_many(batch).execute()
-            for batch in chunked(topic_assocs, 500):
-                TopicAssoc.insert_many(batch).execute()
-            for batch in chunked(slave_chat_infos, 500):
-                SlaveChatInfo.insert_many(batch).execute()
-            for batch in chunked(msg_logs, 500):
-                MsgLog.insert_many(batch).execute()
-            for batch in chunked(history_migration_entries, 500):
-                HistoryMigrationEntry.insert_many(batch).execute()
+            for chat_assoc_batch in chunked(chat_assocs, 500):
+                ChatAssoc.insert_many(chat_assoc_batch).execute()
+            for topic_assoc_batch in chunked(topic_assocs, 500):
+                TopicAssoc.insert_many(topic_assoc_batch).execute()
+            for slave_chat_info_batch in chunked(slave_chat_infos, 500):
+                SlaveChatInfo.insert_many(slave_chat_info_batch).execute()
+            for msg_log_batch in chunked(msg_logs, 500):
+                MsgLog.insert_many(msg_log_batch).execute()
+            for history_migration_entry_batch in chunked(history_migration_entries, 500):
+                HistoryMigrationEntry.insert_many(history_migration_entry_batch).execute()
 
         migrated_path = sqlite_path.with_suffix('.db.migrated')
         sqlite_path.rename(migrated_path)
@@ -479,7 +481,7 @@ class DatabaseManager:
             MsgLog.slave_message_id == message.uid
         )
         if log:
-            return log.master_msg_id
+            return EFBChannelChatIDStr(log.master_msg_id)
         return None
 
     def pickle_misc_msg(self, message: EFBMessage) -> Optional[bytes]:
@@ -545,13 +547,13 @@ class DatabaseManager:
                     ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)
                     .where(ChatAssoc.master_uid == master_uid)
                 )
-                return [i.slave_uid for i in slaves]
+                return [EFBChannelChatIDStr(i.slave_uid) for i in slaves]
             elif slave_uid:
                 masters = list(
                     ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)
                     .where(ChatAssoc.slave_uid == slave_uid)
                 )
-                return [i.master_uid for i in masters]
+                return [EFBChannelChatIDStr(i.master_uid) for i in masters]
             else:
                 return []
         except DoesNotExist:
@@ -826,7 +828,7 @@ class DatabaseManager:
                                              slave_chat_uid=slave_chat_uid,
                                              slave_chat_group_id=slave_chat_group_id)
         if chat_info is not None:
-            chat_info.slave_channel_name = slave_channel_name
+            setattr(chat_info, "slave_channel_name", slave_channel_name)
             chat_info.slave_channel_emoji = slave_channel_emoji
             chat_info.slave_chat_name = slave_chat_name
             chat_info.slave_chat_alias = slave_chat_alias

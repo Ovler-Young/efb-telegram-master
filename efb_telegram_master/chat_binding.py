@@ -248,7 +248,7 @@ class ChatBindingManager(LocaleMixin):
                 )
             )
             if msg_log:
-                channel_id, chat_id, _ = utils.chat_id_str_to_id(msg_log.slave_origin_uid)
+                channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(msg_log.slave_origin_uid))
                 chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(
@@ -1637,7 +1637,7 @@ class ChatBindingManager(LocaleMixin):
         """Wait for a slot, then forward a media message through the best available bot."""
         try:
             # Parse the original message ID
-            original_chat_id, original_msg_id = utils.message_id_str_to_id(master_msg_id)
+            original_chat_id, original_msg_id = utils.message_id_str_to_id(TgChatMsgIDStr(master_msg_id))
         except Exception as e:
             self.logger.warning("Failed to parse message ID %s: %s", master_msg_id, e)
             return

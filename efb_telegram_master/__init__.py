@@ -484,7 +484,7 @@ class TelegramChannel(MasterChannel):
                 return
 
         message_id = msg_log.slave_message_id
-        channel_id, chat_uid, _ = etm_utils.chat_id_str_to_id(msg_log.slave_origin_uid)
+        channel_id, chat_uid, _ = etm_utils.chat_id_str_to_id(etm_utils.EFBChannelChatIDStr(msg_log.slave_origin_uid))
 
         if channel_id not in coordinator.slaves:
             sync_reply_text(self.bot_manager, message,
