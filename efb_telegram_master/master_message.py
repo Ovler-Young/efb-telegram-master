@@ -180,7 +180,7 @@ class MasterMessageProcessor(LocaleMixin):
         self.logger.debug("[%s] Received message from Telegram: %s", mid, message.to_dict())
 
         destination: Optional[EFBChannelChatIDStr] = None
-        edited = None
+        edited: Optional["MsgLog"] = None
         quote = False
 
         if update.edited_message or update.edited_channel_post:

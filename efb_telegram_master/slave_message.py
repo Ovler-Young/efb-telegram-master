@@ -41,7 +41,7 @@ from .constants import Emoji
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import get_msg_type
-from .utils import TelegramChatID, TelegramTopicID, TelegramMessageID, OldMsgID, TgChatMsgIDStr
+from .utils import TelegramChatID, TelegramTopicID, TelegramMessageID, OldMsgID
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -216,9 +216,9 @@ class SlaveMessageProcessor(LocaleMixin):
                     _edit_sender_bot_id = old_msg.sender_bot_id
 
                     if old_msg.master_msg_id_alt:
-                        old_msg_id = utils.message_id_str_to_id(TgChatMsgIDStr(old_msg.master_msg_id_alt))
+                        old_msg_id = utils.message_id_str_to_id(utils.TgChatMsgIDStr(old_msg.master_msg_id_alt))
                     else:
-                        old_msg_id = utils.message_id_str_to_id(TgChatMsgIDStr(old_msg.master_msg_id))
+                        old_msg_id = utils.message_id_str_to_id(utils.TgChatMsgIDStr(old_msg.master_msg_id))
                 else:
                     self.logger.info('[%s] Was supposed to edit this message, '
                                      'but it does not exist in database. Sending new message instead.',
@@ -274,7 +274,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.logger.debug("[%s] Target message %s is not found in database.", msg.uid, msg.target)
             else:
                 self.logger.debug("[%s] Target message has database entry: %s.", msg.uid, log)
-                target_msg = utils.message_id_str_to_id(TgChatMsgIDStr(log.master_msg_id))
+                target_msg = utils.message_id_str_to_id(utils.TgChatMsgIDStr(log.master_msg_id))
                 if not target_msg or target_msg[0] != int(tg_dest):
                     self.logger.error('[%s] Trying to reply to a message not from this chat. '
                                       'Message destination: %s. Target message: %s.',
@@ -1423,7 +1423,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 slave_origin_uid=utils.chat_id_to_str(chat=status.message.chat))
             if old_msg:
                 old_msg_id: OldMsgID = utils.message_id_str_to_id(
-                    TgChatMsgIDStr(old_msg.master_msg_id_alt or old_msg.master_msg_id)
+                    utils.TgChatMsgIDStr(old_msg.master_msg_id_alt or old_msg.master_msg_id)
                 )
                 self.logger.debug("Found message to delete in Telegram: %s.%s",
                                   *old_msg_id)

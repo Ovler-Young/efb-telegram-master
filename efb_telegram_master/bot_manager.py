@@ -398,6 +398,9 @@ class TelegramBotManager(LocaleMixin):
     HTTPX_POOL_MULTIPLIER_ENV = "ETM_HTTPX_POOL_MULTIPLIER"
     BLOCKING_SEND_TIMEOUT = 300.0
     BLOCKING_SEND_TARGET_SLAVE_ID = "__blocking__"
+    TELEGRAM_RETRY_AFTER_GRACE_SECONDS = 5.0
+    TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS = 60.0
+    TELEGRAM_RETRY_AFTER_BACKOFF_CAP_SECONDS = 900.0
 
     # Type declarations for instance attributes assigned in __init__
     application: Application
@@ -842,6 +845,7 @@ class TelegramBotManager(LocaleMixin):
         self._send_in_flight: dict[SendTarget, tuple] = {}  # target -> (Future, task, sender_bot_id)
         self._bot_chat_disabled_until: dict[tuple, float] = {}  # (bot_id|None, chat_id) -> RetryAfter deadline
         self._target_retry_after: dict[SendTarget, float] = {}
+        self._target_retry_failures: dict[SendTarget, int] = {}
         self._last_metrics_snapshot = 0.0
 
         from .etm_metrics import Metrics, start_metrics_server
@@ -1754,19 +1758,54 @@ class TelegramBotManager(LocaleMixin):
                 return 60.0
         return None
 
+    @classmethod
+    def _telegram_retry_delay_seconds(cls, retry_after: float, consecutive_failures: int) -> float:
+        retry_after = max(float(retry_after), 0.0)
+        delay = retry_after + cls.TELEGRAM_RETRY_AFTER_GRACE_SECONDS
+        if consecutive_failures >= 2:
+            floor = cls.TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS * (2 ** (consecutive_failures - 2))
+            delay = max(delay, min(floor, cls.TELEGRAM_RETRY_AFTER_BACKOFF_CAP_SECONDS))
+        return delay
+
+    @staticmethod
+    def _queued_send_affinity_key(task: QueuedSendTask):
+        if task.kwargs.get('_force_sender_known') or task.kwargs.get('_force_main_bot'):
+            return None
+        if _has_callback_keyboard(task.kwargs.get('reply_markup')):
+            return None
+        return task.slave_id or (task.chat_id, task.kwargs.get('message_thread_id'))
+
+    def _forget_queued_send_affinity_after_retry(self, task: QueuedSendTask,
+                                                 sender_bot_id: Optional[str]) -> None:
+        if sender_bot_id is None:
+            return
+        bot_pool = getattr(self, 'bot_pool', None)
+        if bot_pool is None or not hasattr(bot_pool, 'forget_affinity'):
+            return
+        bot_pool.forget_affinity(TelegramBotManager._queued_send_affinity_key(task))
+
     def _requeue_after_telegram_rate_limit(self, task: QueuedSendTask,
                                            sender_bot_id: Optional[str],
                                            retry_after: float):
+        retry_failures = getattr(self, '_target_retry_failures', None)
+        consecutive_failures = 1
+        if retry_failures is not None:
+            consecutive_failures = retry_failures.get(task.target, 0) + 1
+            retry_failures[task.target] = consecutive_failures
+        retry_delay = TelegramBotManager._telegram_retry_delay_seconds(retry_after, consecutive_failures)
         self.logger.warning(
-            "Telegram rate limit for bot %s in chat %d (task %s): %.2fs; other targets can still send",
-            sender_bot_id or "main", task.chat_id, task.task_id, retry_after,
+            "Telegram rate limit for bot %s in chat %d (task %s): retry_after=%.2fs "
+            "scheduled_wait=%.2fs consecutive_target_failures=%d; other targets can still send",
+            sender_bot_id or "main", task.chat_id, task.task_id,
+            retry_after, retry_delay, consecutive_failures,
         )
         metrics = getattr(self, '_metrics', None)
         if metrics:
             metrics.rate_limited(TelegramBotManager._metrics_sender(sender_bot_id))
             metrics.task_requeued("rate_limit")
             metrics.dispatch_blocked("target_retry_after")
-        deadline = time.time() + retry_after
+        TelegramBotManager._forget_queued_send_affinity_after_retry(self, task, sender_bot_id)
+        deadline = time.time() + retry_delay
         self._bot_chat_disabled_until[(sender_bot_id, task.chat_id)] = deadline
         self._target_retry_after[task.target] = deadline
         self._release_reserved_slot(sender_bot_id, task.chat_id)
@@ -1796,6 +1835,9 @@ class TelegramBotManager(LocaleMixin):
     ):
         metrics = getattr(self, '_metrics', None)
         sender = TelegramBotManager._metrics_sender(sender_bot_id)
+        retry_failures = getattr(self, '_target_retry_failures', None)
+        if retry_failures is not None:
+            retry_failures.pop(task.target, None)
         if metrics:
             metrics.send_completed(sender, "ok", TelegramBotManager._task_total_seconds(task))
 
@@ -1820,6 +1862,9 @@ class TelegramBotManager(LocaleMixin):
         self._resolve_task_waiter_success(task, result, sender_bot_id)
 
     def _finish_failed_send(self, task: QueuedSendTask, error: Exception):
+        retry_failures = getattr(self, '_target_retry_failures', None)
+        if retry_failures is not None:
+            retry_failures.pop(task.target, None)
         self._finish_queued_database_update(task.db_log_context)
         self._resolve_task_waiter_exception(task, error)
 
