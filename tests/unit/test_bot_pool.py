@@ -77,6 +77,20 @@ def test_acquire_send_slot_keeps_affinity_per_slave_id():
     assert pool._affinity_bot_by_key["slave.chat"] == 1
 
 
+def test_forget_affinity_allows_next_selection_to_rotate():
+    bot_a = _make_aux_bot(1, delay=0.0)
+    bot_b = _make_aux_bot(2, delay=0.0)
+    pool = BotPool([bot_a, bot_b], _make_manager())
+
+    first = pool.acquire_send_slot(100, max_delay=1.0, affinity_key="slave.chat")
+    pool.forget_affinity("slave.chat")
+    second = pool.acquire_send_slot(100, max_delay=1.0, affinity_key="slave.chat")
+
+    assert first == (bot_a, 0.0)
+    assert second == (bot_b, 0.0)
+    assert pool._affinity_bot_by_key["slave.chat"] == 2
+
+
 def test_acquire_send_slot_switches_affinity_bot_at_half_capacity():
     bot_a = _make_aux_bot(1, delay=0.0)
     bot_b = _make_aux_bot(2, delay=0.0)

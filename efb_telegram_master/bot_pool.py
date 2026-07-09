@@ -65,6 +65,13 @@ class BotPool:
             return
         self._round_robin_cursor_by_chat[chat_id] = (selected_index + 1) % len(self._bots)
 
+    def forget_affinity(self, affinity_key: Optional[Hashable]) -> None:
+        """Allow the next send for this stream to pick through the pool again."""
+        if affinity_key is None:
+            return
+        with self._pool_lock:
+            self._affinity_bot_by_key.pop(affinity_key, None)
+
     def _half_chat_capacity(self) -> float:
         return float(getattr(self._bot_manager, "CHAT_LIMIT", 20)) / 2
 
