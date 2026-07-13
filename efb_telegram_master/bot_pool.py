@@ -6,6 +6,7 @@ import time
 from typing import Optional, List, Dict, Tuple, TYPE_CHECKING, Callable, Hashable
 
 from .auxiliary_bot import AuxiliaryBot
+from .rate_limiter import SlotReservation
 
 if TYPE_CHECKING:
     from .bot_manager import TelegramBotManager
@@ -30,6 +31,8 @@ class BotPool:
         self._pool_lock = threading.Lock()
         self._round_robin_cursor_by_chat: Dict[int, int] = {}
         self._affinity_bot_by_key: Dict[Hashable, int] = {}
+        for bot in self._bots:
+            bot._membership_changed_callback = self._wake_scheduler
 
         # One notification per chat per process lifetime
         self._notified_chats: set = set()
@@ -37,6 +40,11 @@ class BotPool:
 
         logger.info("BotPool initialized with %d auxiliary bot(s): %s",
                      len(aux_bots), [f"@{b.username}" for b in aux_bots])
+
+    def _wake_scheduler(self) -> None:
+        scheduler = getattr(self._bot_manager, "_outbound_scheduler", None)
+        if scheduler is not None:
+            scheduler.wake_event.set()
 
     @property
     def bots(self) -> List[AuxiliaryBot]:
@@ -77,7 +85,7 @@ class BotPool:
 
     def _try_affinity_bot(self, chat_id: int, max_delay: float,
                           affinity_key: Optional[Hashable],
-                          skip_bot: Optional[Callable[[AuxiliaryBot], bool]]) -> Optional[Tuple[AuxiliaryBot, float]]:
+                          skip_bot: Optional[Callable[[AuxiliaryBot], bool]]) -> Optional[Tuple[AuxiliaryBot, SlotReservation]]:
         if affinity_key is None:
             return None
 
@@ -91,20 +99,20 @@ class BotPool:
             return None
 
         delay = aux_bot.peek_delay(chat_id)
-        if delay != 0.0 or delay >= max_delay:
+        if delay > 0.0:
             return None
         if aux_bot.get_chat_send_count(chat_id) >= self._half_chat_capacity():
             return None
 
-        aux_bot.reserve_slot(chat_id)
-        return aux_bot, delay
+        reservation = aux_bot.reserve_slot(chat_id).reservation
+        return aux_bot, reservation
 
     def acquire_send_slot(self, chat_id: int, max_delay: float = float('inf'),
                           skip_bot: Optional[Callable[[AuxiliaryBot], bool]] = None,
                           affinity_key: Optional[Hashable] = None,
                           *,
                           notify_admin: bool = True,
-                          ) -> Optional[Tuple[AuxiliaryBot, float]]:
+                          ) -> Optional[Tuple[AuxiliaryBot, SlotReservation]]:
         """Atomically find the best available auxiliary bot for a chat.
 
         Iterates aux bots confirmed as members of the chat, picks the one
@@ -123,10 +131,10 @@ class BotPool:
                           below half of the per-chat capacity.
 
         Returns:
-            (AuxiliaryBot, delay) if a suitable aux bot was found,
+            (AuxiliaryBot, reservation) if a suitable aux bot was found,
             None if no aux bot beats max_delay or none are members.
         """
-        def _select_locked() -> tuple[Optional[Tuple[AuxiliaryBot, float]], List[AuxiliaryBot], List[AuxiliaryBot]]:
+        def _select_locked() -> tuple[Optional[Tuple[AuxiliaryBot, SlotReservation]], List[AuxiliaryBot], List[AuxiliaryBot]]:
             best_bot: Optional[AuxiliaryBot] = None
             best_delay = float('inf')
             confirmed_non_member_bots: List[AuxiliaryBot] = []
@@ -153,11 +161,11 @@ class BotPool:
                         break
 
             if best_bot is not None and best_delay < max_delay:
-                best_bot.reserve_slot(chat_id)
+                reservation = best_bot.reserve_slot(chat_id).reservation
                 self._advance_round_robin_cursor(chat_id, best_bot)
                 if affinity_key is not None:
                     self._affinity_bot_by_key[affinity_key] = best_bot.bot_id
-                return (best_bot, best_delay), confirmed_non_member_bots, unknown_bots
+                return (best_bot, reservation), confirmed_non_member_bots, unknown_bots
             return None, confirmed_non_member_bots, unknown_bots
 
         with self._pool_lock:
@@ -187,27 +195,6 @@ class BotPool:
         if confirmed_non_member_bots and notify_admin:
             self._maybe_notify_admin(chat_id, confirmed_non_member_bots)
 
-        return None
-
-    def send_blocking(self, chat_id: int, timeout: float = 60.0) -> Optional[AuxiliaryBot]:
-        """Block until any bot in the pool has a free slot for the given chat.
-        Used by history migration for higher throughput.
-
-        Returns the AuxiliaryBot to use, or None on timeout.
-        """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            with self._pool_lock:
-                for aux_bot in self._bots:
-                    if aux_bot.disabled:
-                        continue
-                    if not aux_bot.check_membership(chat_id):
-                        continue
-                    delay = aux_bot.peek_delay(chat_id)
-                    if delay == 0.0:
-                        aux_bot.reserve_slot(chat_id)
-                        return aux_bot
-            time.sleep(0.2)
         return None
 
     def explain_send_slot_unavailable(

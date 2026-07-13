@@ -367,7 +367,7 @@ class SlaveMessageProcessor(LocaleMixin):
             if not hasattr(tg_msg, 'task_id'):
                 self.logger.warning("[%s] Queued message missing task_id, cannot track database update", xid)
                 self._release_pending_slave_message(dedupe_key)
-        else:
+        elif not getattr(tg_msg, 'durable_db_logged', False):
             # Normal (blocking) execution: send already succeeded, then
             # write the DB mapping once. DB failures are logged only.
             self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
@@ -509,10 +509,8 @@ class SlaveMessageProcessor(LocaleMixin):
             '_send_mode': send_mode,
             '_slave_id': utils.chat_id_to_str(chat=msg.chat),
         }
-        if send_mode == 'eventual' and on_complete is not self._NO_DB_CALLBACK:
+        if on_complete is not self._NO_DB_CALLBACK:
             db_on_complete = cast(Optional[Callable[[], None]], on_complete)
-            # This is a DB metadata snapshot. Send file handles are cloned when
-            # the Telegram call enters the FIFO queue.
             kwargs['_queued_db_log_context'] = QueuedDbLogContext(
                 ETMMsg.from_efbmsg(msg, self.chat_manager),
                 old_msg_id,

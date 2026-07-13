@@ -102,6 +102,10 @@ def build_slave_message_processor() -> SlaveMessageProcessor:
     processor.flag = Mock(side_effect=lambda flag_name: "emoji" if flag_name == "default_media_prompt" else False)
     processor.logger = Mock()
     processor.channel = cast(TelegramChannel, SimpleNamespace(config={"admins": [1]}, flag=processor.flag))
+    processor._make_send_kwargs = Mock(return_value={
+        "_send_mode": "blocking",
+        "_slave_id": "tests.mocks.slave __chat_id__",
+    })
     return processor
 
 

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from efb_telegram_master.bot_pool import BotPool
+from efb_telegram_master.rate_limiter import ReservationOutcome, SlotReservation
 
 
 def _make_aux_bot(bot_id, *, disabled=False, membership=True, delay=0.0, username=None):
@@ -13,7 +14,8 @@ def _make_aux_bot(bot_id, *, disabled=False, membership=True, delay=0.0, usernam
     aux_bot.check_membership_sync.return_value = membership
     aux_bot.check_membership.return_value = bool(membership)
     aux_bot.peek_delay.return_value = delay
-    aux_bot.reserve_slot.return_value = delay
+    aux_bot.reservation = SlotReservation(bot_id, str(bot_id), 100, 100.0)
+    aux_bot.reserve_slot.return_value = ReservationOutcome(delay, aux_bot.reservation)
     aux_bot.get_chat_send_count.return_value = 0
     aux_bot.has_pending_probes.return_value = False
     return aux_bot
@@ -30,7 +32,7 @@ def test_acquire_send_slot_picks_lowest_delay_bot():
 
     selected = pool.acquire_send_slot(100, max_delay=2.0)
 
-    assert selected == (bot_b, 0.25)
+    assert selected == (bot_b, bot_b.reservation)
     bot_b.reserve_slot.assert_called_once_with(100)
 
 
@@ -43,9 +45,9 @@ def test_acquire_send_slot_rotates_equal_delay_bots_per_chat():
     second = pool.acquire_send_slot(100, max_delay=1.0)
     third = pool.acquire_send_slot(100, max_delay=1.0)
 
-    assert first == (bot_a, 0.0)
-    assert second == (bot_b, 0.0)
-    assert third == (bot_a, 0.0)
+    assert first == (bot_a, bot_a.reservation)
+    assert second == (bot_b, bot_b.reservation)
+    assert third == (bot_a, bot_a.reservation)
     bot_a.reserve_slot.assert_called_with(100)
     bot_b.reserve_slot.assert_called_once_with(100)
 
@@ -58,8 +60,8 @@ def test_acquire_send_slot_reuses_affinity_bot_below_half_capacity():
     first = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 10))
     second = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 10))
 
-    assert first == (bot_a, 0.0)
-    assert second == (bot_a, 0.0)
+    assert first == (bot_a, bot_a.reservation)
+    assert second == (bot_a, bot_a.reservation)
     assert bot_a.reserve_slot.call_count == 2
     bot_b.reserve_slot.assert_not_called()
 
@@ -72,8 +74,8 @@ def test_acquire_send_slot_keeps_affinity_per_slave_id():
     first = pool.acquire_send_slot(100, max_delay=1.0, affinity_key="slave.chat")
     second = pool.acquire_send_slot(200, max_delay=1.0, affinity_key="slave.chat")
 
-    assert first == (bot_a, 0.0)
-    assert second == (bot_a, 0.0)
+    assert first == (bot_a, bot_a.reservation)
+    assert second == (bot_a, bot_a.reservation)
     assert pool._affinity_bot_by_key["slave.chat"] == 1
 
 
@@ -86,8 +88,8 @@ def test_forget_affinity_allows_next_selection_to_rotate():
     pool.forget_affinity("slave.chat")
     second = pool.acquire_send_slot(100, max_delay=1.0, affinity_key="slave.chat")
 
-    assert first == (bot_a, 0.0)
-    assert second == (bot_b, 0.0)
+    assert first == (bot_a, bot_a.reservation)
+    assert second == (bot_b, bot_b.reservation)
     assert pool._affinity_bot_by_key["slave.chat"] == 2
 
 
@@ -100,8 +102,8 @@ def test_acquire_send_slot_switches_affinity_bot_at_half_capacity():
     bot_a.get_chat_send_count.return_value = 10
     second = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 10))
 
-    assert first == (bot_a, 0.0)
-    assert second == (bot_b, 0.0)
+    assert first == (bot_a, bot_a.reservation)
+    assert second == (bot_b, bot_b.reservation)
     assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_b.reserve_slot.assert_called_once_with(100)
 
@@ -115,9 +117,9 @@ def test_acquire_send_slot_keeps_affinity_per_topic():
     second_topic = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 20))
     first_topic_again = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 10))
 
-    assert first_topic == (bot_a, 0.0)
-    assert second_topic == (bot_b, 0.0)
-    assert first_topic_again == (bot_a, 0.0)
+    assert first_topic == (bot_a, bot_a.reservation)
+    assert second_topic == (bot_b, bot_b.reservation)
+    assert first_topic_again == (bot_a, bot_a.reservation)
 
 
 def test_acquire_send_slot_falls_back_when_affinity_bot_unavailable():
@@ -128,7 +130,7 @@ def test_acquire_send_slot_falls_back_when_affinity_bot_unavailable():
 
     selected = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 10))
 
-    assert selected == (bot_b, 0.0)
+    assert selected == (bot_b, bot_b.reservation)
     assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
@@ -142,7 +144,7 @@ def test_acquire_send_slot_falls_back_when_affinity_bot_is_not_member():
 
     selected = pool.acquire_send_slot(100, max_delay=1.0, affinity_key=(100, 10))
 
-    assert selected == (bot_b, 0.0)
+    assert selected == (bot_b, bot_b.reservation)
     assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
@@ -161,7 +163,7 @@ def test_acquire_send_slot_falls_back_when_affinity_bot_disabled_by_skip():
         skip_bot=lambda bot: bot.bot_id == 1,
     )
 
-    assert selected == (bot_b, 0.0)
+    assert selected == (bot_b, bot_b.reservation)
     assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
@@ -175,7 +177,7 @@ def test_acquire_send_slot_falls_back_when_affinity_bot_has_local_delay():
 
     selected = pool.acquire_send_slot(100, max_delay=2.0, affinity_key=(100, 10))
 
-    assert selected == (bot_b, 0.0)
+    assert selected == (bot_b, bot_b.reservation)
     assert pool._affinity_bot_by_key[(100, 10)] == 2
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
@@ -188,7 +190,7 @@ def test_acquire_send_slot_skips_disabled_bots_before_selecting():
 
     selected = pool.acquire_send_slot(100, max_delay=1.0, skip_bot=lambda bot: bot.bot_id == 1)
 
-    assert selected == (bot_b, 0.0)
+    assert selected == (bot_b, bot_b.reservation)
     bot_a.reserve_slot.assert_not_called()
     bot_b.reserve_slot.assert_called_once_with(100)
 
@@ -221,22 +223,6 @@ def test_explain_send_slot_unavailable_returns_bounded_reason_labels():
     skipped = _make_aux_bot(4, membership=True, delay=0.0)
     pool = BotPool([skipped], _make_manager())
     assert pool.explain_send_slot_unavailable(100, skip_bot=lambda bot: True) == "bot_chat_cooldown"
-
-
-def test_send_blocking_waits_until_slot_is_available():
-    aux_bot = _make_aux_bot(1, delay=1.0)
-    aux_bot.peek_delay.side_effect = [1.0, 0.0]
-    manager = _make_manager()
-    pool = BotPool([aux_bot], manager)
-
-    time_values = iter([0.0, 0.1, 0.2, 0.3])
-    with patch("efb_telegram_master.bot_pool.time.time", side_effect=lambda: next(time_values)), \
-         patch("efb_telegram_master.bot_pool.time.sleep") as sleep:
-        selected = pool.send_blocking(100, timeout=1.0)
-
-    assert selected is aux_bot
-    assert sleep.called
-    aux_bot.reserve_slot.assert_called_once_with(100)
 
 
 def test_membership_updates_are_forwarded_to_bots():

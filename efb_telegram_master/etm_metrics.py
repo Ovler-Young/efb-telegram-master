@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import collections
+import datetime
 import re
 import threading
 import time
@@ -57,12 +58,12 @@ def bad_request_reason_class(error: Exception) -> str:
 
 
 class _TopNQueueCollector:
-    """Expose the N deepest current target queues without remembering labels."""
+    """Expose the N deepest current source lanes without remembering labels."""
 
     def __init__(
         self,
         namespace: str,
-        snapshot_fn: Callable[[], Iterable[tuple[object, object, int]]],
+        snapshot_fn: Callable[[], Iterable[tuple[object, object, object, int]]],
         top_n: int = 20,
     ):
         self._namespace = namespace
@@ -72,32 +73,32 @@ class _TopNQueueCollector:
     def collect(self):
         family = GaugeMetricFamily(
             f"{self._namespace}_send_queue_target_depth",
-            "Current source backlog within the deepest Telegram chat FIFOs.",
-            labels=["slave_id", "chat_id"],
+            "Current durable backlog within the deepest source submission lanes.",
+            labels=["source_key", "chat_id", "priority"],
         )
         try:
             rows = [
-                (slave_id, chat_id, depth)
-                for slave_id, chat_id, depth in self._snapshot_fn()
+                (source_key, chat_id, priority, depth)
+                for source_key, chat_id, priority, depth in self._snapshot_fn()
                 if depth > 0
             ]
         except Exception:
             yield family
             return
 
-        rows.sort(key=lambda row: row[2], reverse=True)
-        for slave_id, chat_id, depth in rows[: self._top_n]:
-            family.add_metric([str(slave_id), str(chat_id)], depth)
+        rows.sort(key=lambda row: row[3], reverse=True)
+        for source_key, chat_id, priority, depth in rows[: self._top_n]:
+            family.add_metric([str(source_key), str(chat_id), str(priority)], depth)
         yield family
 
 
 class _TopNQueueAgeCollector:
-    """Expose the N oldest current target queues without remembering labels."""
+    """Expose the N oldest current source lanes without remembering labels."""
 
     def __init__(
         self,
         namespace: str,
-        snapshot_fn: Callable[[], Iterable[tuple[object, object, float]]],
+        snapshot_fn: Callable[[], Iterable[tuple[object, object, object, float]]],
         top_n: int = 20,
     ):
         self._namespace = namespace
@@ -108,21 +109,21 @@ class _TopNQueueAgeCollector:
         family = GaugeMetricFamily(
             f"{self._namespace}_send_queue_target_oldest_age_seconds",
             "Oldest queued task age by source and Telegram chat.",
-            labels=["slave_id", "chat_id"],
+            labels=["source_key", "chat_id", "priority"],
         )
         try:
             rows = [
-                (slave_id, chat_id, age)
-                for slave_id, chat_id, age in self._snapshot_fn()
+                (source_key, chat_id, priority, age)
+                for source_key, chat_id, priority, age in self._snapshot_fn()
                 if age > 0
             ]
         except Exception:
             yield family
             return
 
-        rows.sort(key=lambda row: row[2], reverse=True)
-        for slave_id, chat_id, age in rows[: self._top_n]:
-            family.add_metric([str(slave_id), str(chat_id)], age)
+        rows.sort(key=lambda row: row[3], reverse=True)
+        for source_key, chat_id, priority, age in rows[: self._top_n]:
+            family.add_metric([str(source_key), str(chat_id), str(priority)], age)
         yield family
 
 
@@ -263,49 +264,59 @@ class _ManagerStateExporter:
         self.manager = manager
 
     def queue_depth_rows(self):
-        with self.manager._send_queues_lock:
-            depths: collections.Counter[tuple[str, int]] = collections.Counter(
-                (task.slave_id, task.chat_id)
-                for queue in self.manager._send_queues.values()
-                for task in queue
-            )
+        from .db import OutboundTask
+        from .outbound import TaskState
+
+        depths: collections.Counter[tuple[str, int, str]] = collections.Counter(
+            (task.source_key, task.target_chat_id, "blocking" if task.priority else "normal")
+            for task in OutboundTask.select().where(OutboundTask.state.in_(TaskState.UNSUBMITTED))
+        )
         return [
-            (slave_id, chat_id, depth)
-            for (slave_id, chat_id), depth in depths.items()
+            (source_key, chat_id, priority, depth)
+            for (source_key, chat_id, priority), depth in depths.items()
         ]
 
     def queue_oldest_age_rows(self):
-        now = time.monotonic()
-        with self.manager._send_queues_lock:
-            oldest_by_source: dict[tuple[str, int], float] = {}
-            for queue in self.manager._send_queues.values():
-                for task in queue:
-                    if not task.enqueued_at:
-                        continue
-                    key = (task.slave_id, task.chat_id)
-                    oldest_by_source[key] = min(
-                        task.enqueued_at,
-                        oldest_by_source.get(key, task.enqueued_at),
-                    )
+        from .db import OutboundTask
+        from .outbound import TaskState, utc_now
+
+        now = utc_now()
+        oldest_by_source: dict[tuple[str, int, str], datetime.datetime] = {}
+        for task in OutboundTask.select().where(OutboundTask.state.in_(TaskState.UNSUBMITTED)):
+            if task.accepted_at is None:
+                continue
+            key = (
+                task.source_key,
+                task.target_chat_id,
+                "blocking" if task.priority else "normal",
+            )
+            oldest_by_source[key] = min(
+                task.accepted_at,
+                oldest_by_source.get(key, task.accepted_at),
+            )
         return [
-            (slave_id, chat_id, max(0.0, now - enqueued_at))
-            for (slave_id, chat_id), enqueued_at in oldest_by_source.items()
+            (source_key, chat_id, priority, max(0.0, (now - accepted_at).total_seconds()))
+            for (source_key, chat_id, priority), accepted_at in oldest_by_source.items()
         ]
 
     def queue_summary(self):
-        now = time.monotonic()
-        wall_time = time.time()
-        with self.manager._send_queues_lock:
-            depths = [len(queue) for queue in self.manager._send_queues.values()]
-            oldest_ages = [
-                max(0.0, now - min(task.enqueued_at for task in queue if task.enqueued_at))
-                for queue in self.manager._send_queues.values()
-                if any(task.enqueued_at for task in queue)
-            ]
-            retry_targets = sum(
-                1 for queue in self.manager._send_queues.values()
-                if queue and queue[0].not_before > wall_time
-            )
+        from .db import OutboundTask
+        from .outbound import TaskState, utc_now
+
+        now = utc_now()
+        rows = list(OutboundTask.select().where(OutboundTask.state.in_(TaskState.UNSUBMITTED)))
+        depths_by_source: collections.Counter[tuple[str, bool]] = collections.Counter(
+            (task.source_key, task.priority) for task in rows
+        )
+        depths = list(depths_by_source.values())
+        oldest_ages = [
+            max(0.0, (now - task.accepted_at).total_seconds())
+            for task in rows if task.accepted_at is not None
+        ]
+        retry_targets = len({
+            (task.source_key, task.priority) for task in rows
+            if task.available_at is not None and task.available_at > now
+        })
 
         return {
             "queued_tasks": sum(depths),
@@ -418,7 +429,7 @@ class Metrics:
 
         self.enqueued = Counter(
             f"{ns}_send_tasks_enqueued_total",
-            "Tasks appended to a Telegram chat FIFO queue.",
+            "Tasks accepted into durable source submission lanes.",
             ["priority"],
             registry=self.registry,
         )
@@ -436,7 +447,7 @@ class Metrics:
         )
         self.requeued = Counter(
             f"{ns}_send_tasks_requeued_total",
-            "Tasks put back on the front of their target FIFO.",
+            "Tasks returned to their durable source lane.",
             ["reason"],
             registry=self.registry,
         )
@@ -454,7 +465,7 @@ class Metrics:
         )
         self.dispatch_blocked_c = Counter(
             f"{ns}_send_dispatch_blocked_total",
-            "Queued send dispatch attempts blocked before a sender was available.",
+            "Durable lane dispatch attempts blocked before a sender was available.",
             ["reason"],
             registry=self.registry,
         )
@@ -515,17 +526,17 @@ class Metrics:
 
         self.queued_tasks_g = Gauge(
             f"{ns}_send_queue_depth",
-            "Total tasks across all Telegram chat FIFOs.",
+            "Total tasks awaiting submission across durable source lanes.",
             registry=self.registry,
         )
         self.queued_targets_g = Gauge(
             f"{ns}_send_queue_targets",
-            "Number of distinct targets with a backlog.",
+            "Number of distinct source lanes with a backlog.",
             registry=self.registry,
         )
         self.max_target_depth_g = Gauge(
             f"{ns}_send_queue_max_target_depth",
-            "Deepest single-target FIFO.",
+            "Deepest durable source submission lane.",
             registry=self.registry,
         )
         self.queue_oldest_age_g = Gauge(
@@ -545,7 +556,7 @@ class Metrics:
         )
         self.retry_targets_g = Gauge(
             f"{ns}_retry_targets",
-            "Telegram chat queues waiting for their next scheduling attempt.",
+            "Source lanes waiting for their next scheduling attempt.",
             registry=self.registry,
         )
         self.worker_alive_g = Gauge(
@@ -568,16 +579,39 @@ class Metrics:
             "Auxiliary bots currently disabled.",
             registry=self.registry,
         )
+        self.recovery_c = Counter(
+            f"{ns}_outbound_recovery_total",
+            "Durable outbound rows handled during process recovery.",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.waiter_timeout_c = Counter(
+            f"{ns}_outbound_waiter_timeouts_total",
+            "Same-process blocking callers that stopped waiting for durable work.",
+            ["operation"],
+            registry=self.registry,
+        )
+        self.workflow_terminal_c = Counter(
+            f"{ns}_outbound_workflows_terminal_total",
+            "Durable outbound workflows reaching a terminal state.",
+            ["state"],
+            registry=self.registry,
+        )
+        self.lease_heartbeat_c = Counter(
+            f"{ns}_outbound_lease_heartbeats_total",
+            "Live in-flight task leases extended by the worker.",
+            registry=self.registry,
+        )
 
     def register_topn(
         self,
-        snapshot_fn: Callable[[], Iterable[tuple[object, object, int]]],
+        snapshot_fn: Callable[[], Iterable[tuple[object, object, object, int]]],
     ) -> None:
         self.registry.register(_TopNQueueCollector(self.namespace, snapshot_fn, self.top_n))
 
     def register_queue_oldest_age_topn(
         self,
-        snapshot_fn: Callable[[], Iterable[tuple[object, object, float]]],
+        snapshot_fn: Callable[[], Iterable[tuple[object, object, object, float]]],
     ) -> None:
         self.registry.register(_TopNQueueAgeCollector(self.namespace, snapshot_fn, self.top_n))
 
@@ -621,10 +655,24 @@ class Metrics:
         self.register_reserved_slots(state.reserved_slots_rows)
 
     def task_enqueued(self, priority: bool) -> None:
-        self.enqueued.labels(priority="true" if priority else "false").inc()
+        self.enqueued.labels(priority="blocking" if priority else "normal").inc()
 
     def task_dispatched(self, sender: str) -> None:
         self.dispatched.labels(sender=sender).inc()
+
+    def recovered(self, outcome: str, count: int = 1) -> None:
+        if count > 0:
+            self.recovery_c.labels(outcome=outcome).inc(count)
+
+    def waiter_timed_out(self, operation: str) -> None:
+        self.waiter_timeout_c.labels(operation=operation).inc()
+
+    def workflow_terminal(self, state: str) -> None:
+        self.workflow_terminal_c.labels(state=state).inc()
+
+    def lease_heartbeat(self, count: int) -> None:
+        if count > 0:
+            self.lease_heartbeat_c.inc(count)
 
     def observe_queue_wait(self, seconds: float) -> None:
         if seconds >= 0:
@@ -718,7 +766,7 @@ class Metrics:
             queued_targets=queue_summary["queued_targets"],
             max_target_depth=queue_summary["max_target_depth"],
             queue_oldest_age=queue_summary["queue_oldest_age"],
-            in_flight=len(manager._send_in_flight),
+            in_flight=len(manager._outbound_scheduler.in_flight_snapshot()),
             disabled_bot_chats=len(manager._bot_chat_disabled_until),
             retry_targets=queue_summary["retry_targets"],
             worker_alive=worker_alive,

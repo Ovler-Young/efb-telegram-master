@@ -5,7 +5,9 @@ import threading
 import time
 from collections.abc import Coroutine
 from inspect import isawaitable
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, TypeVar, cast, overload, Literal
+from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING, TypeVar, cast, overload, Literal
+
+from .rate_limiter import ReservationOutcome, SlotReservation
 
 import telegram
 import telegram.error
@@ -89,6 +91,7 @@ class AuxiliaryBot:
         self._membership_lock = threading.Lock()
         self._pending_probes: set = set()
         self._metrics = None
+        self._membership_changed_callback: Optional[Callable[[], None]] = None
 
     def _create_bot(self) -> telegram.Bot:
         request = self._build_request() if self._request_kwargs else None
@@ -149,6 +152,7 @@ class AuxiliaryBot:
             me: telegram.User = cast(telegram.User, _resolve_bot_result(validation_bot.get_me(), self._runtime))
             self.bot_id = me.id
             self.username = me.username or ""
+            self._rate_limiter.set_owner_id(str(self.bot_id))
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)
             return True
         except telegram.error.Forbidden as e:
@@ -166,13 +170,13 @@ class AuxiliaryBot:
         """Check rate limit delay without reserving a slot. Thread-safe."""
         return self._rate_limiter.peek_delay(chat_id)
 
-    def reserve_slot(self, chat_id: int) -> float:
-        """Reserve a send slot and return the delay. Thread-safe."""
+    def reserve_slot(self, chat_id: int) -> ReservationOutcome:
+        """Reserve a send slot and return its exact token. Thread-safe."""
         return self._rate_limiter.reserve_slot(chat_id)
 
-    def release_slot(self, chat_id: int) -> None:
-        """Release the latest reservation when a send did not happen."""
-        self._rate_limiter.release_slot(chat_id)
+    def release_slot(self, reservation: Optional[SlotReservation]) -> None:
+        """Release an exact reservation when a send did not happen."""
+        self._rate_limiter.release_slot(reservation)
 
     def get_chat_send_count(self, chat_id: int) -> int:
         """Return this bot's current per-chat sliding-window send count."""
@@ -291,6 +295,8 @@ class AuxiliaryBot:
         """Update the membership cache directly (e.g. from chat_left handler)."""
         with self._membership_lock:
             self._membership_cache[chat_id] = (is_member, time.time())
+        if self._membership_changed_callback is not None:
+            self._membership_changed_callback()
 
     def _start_membership_probe(self, chat_id: int):
         """Start a background thread to check membership via get_chat_member API."""

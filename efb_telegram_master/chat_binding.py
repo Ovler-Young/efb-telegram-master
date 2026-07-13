@@ -1386,10 +1386,10 @@ class ChatBindingManager(LocaleMixin):
                             chat_id=telegram_chat_id,
                             name=chat.chat_title
                         )
-                        thread_id = topic.message_thread_id
+                        thread_id = TelegramTopicID(topic.message_thread_id)
                         self.db.add_topic_assoc(
                             topic_chat_id=telegram_chat_id,
-                            message_thread_id=topic.message_thread_id,
+                            message_thread_id=thread_id,
                             slave_uid=slave_uid,
                         )
                     except Exception as e:
@@ -1535,7 +1535,8 @@ class ChatBindingManager(LocaleMixin):
             target = self.db.get_next_history_migration_target()
             if target is None:
                 return
-            self._process_history_migration_target(target)
+            if not self._process_history_migration_target(target):
+                return
 
     def _process_history_migration_target(self, target):
         slave_chat_id = EFBChannelChatIDStr(target.slave_chat_id)
@@ -1544,7 +1545,21 @@ class ChatBindingManager(LocaleMixin):
         entries = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
 
         if not entries:
-            return
+            return True
+
+        linked_workflow_ids = {
+            entry.outbound_workflow_id
+            for entry in entries
+            if entry.outbound_workflow_id is not None
+        }
+        for workflow_id in sorted(linked_workflow_ids):
+            state = self.db.reconcile_history_migration_workflow(workflow_id)
+            if state == "active":
+                return False
+        entries = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
+        entries = [entry for entry in entries if entry.state == "queued"]
+        if not entries:
+            return True
 
         self.logger.info("Migrating %s pending historical messages for chat %s", len(entries), slave_chat_id)
 
@@ -1556,109 +1571,87 @@ class ChatBindingManager(LocaleMixin):
             if entry.formatted_text:
                 expected_msg_length = len(entry.formatted_text)
                 if current_text_batch and current_length + expected_msg_length > 4096 - 20:
-                    self._send_pending_history_text_batch(tg_chat_id, current_text_batch, current_entry_ids, thread_id)
-                    current_text_batch = []
-                    current_entry_ids = []
-                    current_length = 0
+                    break
                 current_text_batch.append(entry.formatted_text)
                 current_entry_ids.append(entry.id)
                 current_length += expected_msg_length
                 continue
 
             if current_text_batch:
-                self._send_pending_history_text_batch(tg_chat_id, current_text_batch, current_entry_ids, thread_id)
-                current_text_batch = []
-                current_entry_ids = []
-                current_length = 0
+                break
 
             try:
-                self._migration_forward_media_by_master_msg_id(entry.source_master_msg_id, tg_chat_id, thread_id)
-            except Exception as e:
-                self.logger.warning("Failed to forward message %s: %s", entry.source_master_msg_id, e)
-            finally:
-                self.db.delete_history_migration_entries([entry.id])
+                original_chat_id, original_msg_id = utils.message_id_str_to_id(
+                    TgChatMsgIDStr(entry.source_master_msg_id)
+                )
+            except Exception as error:
+                self.logger.warning("Failed to parse history message ID %s: %s", entry.source_master_msg_id, error)
+                from .db import HistoryMigrationEntry
+                HistoryMigrationEntry.update(
+                    state="dead",
+                    last_error=f"Invalid source message ID: {error}",
+                ).where(HistoryMigrationEntry.id == entry.id).execute()
+                return True
+
+            copy_kwargs: dict[str, object] = {
+                'chat_id': tg_chat_id,
+                'from_chat_id': original_chat_id,
+                'message_id': original_msg_id,
+                'disable_notification': True,
+            }
+            if thread_id is not None:
+                copy_kwargs['message_thread_id'] = thread_id
+            self.bot.enqueue_history_operation(
+                source_key=str(slave_chat_id),
+                target_chat_id=tg_chat_id,
+                operation='copy_message',
+                args=(),
+                kwargs=copy_kwargs,
+                history_entry_ids=[entry.id],
+            )
+            return False
 
         if current_text_batch:
-            self._send_pending_history_text_batch(tg_chat_id, current_text_batch, current_entry_ids, thread_id)
+            send_kwargs: dict[str, object] = {
+                'chat_id': tg_chat_id,
+                'text': "".join(current_text_batch),
+                'parse_mode': 'Markdown',
+                'disable_notification': True,
+            }
+            if thread_id is not None:
+                send_kwargs['message_thread_id'] = thread_id
+            self.bot.enqueue_history_operation(
+                source_key=str(slave_chat_id),
+                target_chat_id=tg_chat_id,
+                operation='send_message',
+                args=(),
+                kwargs=send_kwargs,
+                history_entry_ids=current_entry_ids,
+            )
+            return False
+        return True
 
     def _send_pending_history_text_batch(self, tg_chat_id: int, text_batch: List[str],
                                          entry_ids: List[int],
                                          thread_id: Optional[TelegramTopicID] = None):
-        try:
-            self._migration_send_text(tg_chat_id, text_batch, thread_id)
-        except Exception as e:
-            self.logger.warning("Failed to send text batch: %s", e)
-        finally:
-            self.db.delete_history_migration_entries(entry_ids)
-
-    def _migration_send_text(self, tg_chat_id: int, text_batch: List[str],
-                             thread_id: Optional[TelegramTopicID] = None):
-        """Send a batch of formatted text messages.
-
-        Args:
-            text_batch: List of formatted text strings ready to send
-            tg_chat_id: The Telegram chat ID to send messages to
-            thread_id: Optional thread ID for forum groups
-        """
         if not text_batch:
             return
-
-        combined_text = "".join(text_batch)
-        kwargs: dict = {
+        kwargs: dict[str, object] = {
             'chat_id': tg_chat_id,
-            'text': combined_text,
+            'text': "".join(text_batch),
             'parse_mode': 'Markdown',
-            'disable_notification': True
+            'disable_notification': True,
         }
-        if thread_id:
+        if thread_id is not None:
             kwargs['message_thread_id'] = thread_id
-
-        def _do_send(**extra):
-            kw = {**kwargs, **extra}
-            try:
-                self.bot.send_message(**kw)
-            except Exception:
-                kw['parse_mode'] = None
-                kw['text'] = combined_text.replace('*', '').replace('`', '')
-                self.bot.send_message(**kw)
-
-        if self.bot.bot_pool:
-            self.bot.send_blocking_migration(tg_chat_id, _do_send, timeout=30.0)
-        else:
-            _do_send(_bypass_rate_limit=False)
-
-    def _migration_forward_media(self, msg_log, tg_chat_id: int,
-                                  thread_id: Optional[TelegramTopicID] = None):
-        """Wait for a slot, then forward a media message through the best available bot."""
-        self._migration_forward_media_by_master_msg_id(msg_log.master_msg_id, tg_chat_id, thread_id)
-
-    def _migration_forward_media_by_master_msg_id(self, master_msg_id: str, tg_chat_id: int,
-                                                  thread_id: Optional[TelegramTopicID] = None):
-        """Wait for a slot, then forward a media message through the best available bot."""
-        try:
-            # Parse the original message ID
-            original_chat_id, original_msg_id = utils.message_id_str_to_id(TgChatMsgIDStr(master_msg_id))
-        except Exception as e:
-            self.logger.warning("Failed to parse message ID %s: %s", master_msg_id, e)
-            return
-
-        # Use copy_message to copy the media
-        kwargs: dict = {
-            'chat_id': tg_chat_id,
-            'from_chat_id': original_chat_id,
-            'message_id': original_msg_id,
-            'disable_notification': True
-        }
-        if thread_id:
-            kwargs['message_thread_id'] = thread_id
-
-        def _do_copy(**extra):
-            self.bot.copy_message(**{**kwargs, **extra})
-
-        if self.bot.bot_pool:
-            self.bot.send_blocking_migration(tg_chat_id, _do_copy, timeout=30.0)
-        else:
-            _do_copy(_bypass_rate_limit=False)
+        self.bot.enqueue_history_operation(
+            source_key=f"legacy:{tg_chat_id}",
+            target_chat_id=tg_chat_id,
+            operation='send_message',
+            args=(),
+            kwargs=kwargs,
+            history_entry_ids=entry_ids,
+        )
 
     @staticmethod
     def truncate_ellipsis(text: str, length: int) -> str:

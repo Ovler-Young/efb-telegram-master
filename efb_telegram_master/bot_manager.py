@@ -4,17 +4,19 @@ import collections
 import collections.abc
 import html
 import io
+import json
 import logging
 import os
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
+from typing import TYPE_CHECKING, BinaryIO, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import url2pathname
 from unittest.mock import Mock, patch
@@ -30,63 +32,54 @@ from telegram.request import HTTPXRequest
 
 from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
+from .db import OutboundTask
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
+from .outbound import (
+    FailureDisposition,
+    OutboundPayloadCodec,
+    OutboundRepository,
+    OutboundScheduler,
+    OutboundTaskSpec,
+    RunCondition,
+    SenderSelection,
+    SenderSelectionResult,
+    TaskState,
+    WorkflowOutcome,
+    utc_now,
+)
 from .ptb_compat import Filters
+from .rate_limiter import SlotReservation
 from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
 SendTarget: TypeAlias = Tuple[str, int]
-QueueTarget: TypeAlias = int
 BotChatKey: TypeAlias = Tuple[Optional[str], int]
 
 
 class QueuedDbLogContext(NamedTuple):
     """Database log context carried by a queued send task."""
-    etm_msg: object
-    old_msg_id: object = None
+    etm_msg: 'ETMMsg'
+    old_msg_id: Optional['OldMsgID'] = None
     on_complete: Optional[Callable[[], None]] = None
 
 
-class QueuedSendTask(NamedTuple):
-    """Represents an in-memory FIFO send task."""
-    target: SendTarget
-    function: Callable
-    args: tuple
-    kwargs: dict
-    task_id: str
-    cleanup_files: tuple[str, ...] = ()
-    enqueued_at: float = 0.0
-    db_log_context: Optional[QueuedDbLogContext] = None
-    priority: bool = False
-    waiter: Optional[Future] = None
-    not_before: float = 0.0
-
-    @property
-    def slave_id(self) -> str:
-        return self.target[0]
-
-    @property
-    def chat_id(self) -> int:
-        return self.target[1]
-
 if TYPE_CHECKING:
     from . import TelegramChannel
+    from .message import ETMMsg
+    from .utils import OldMsgID
 
 MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
 P = ParamSpec("P")
 T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
 _INTERNAL_KWARGS = frozenset({
-    '_bypass_rate_limit',
     '_sender_bot_id',
     '_slave_id',
     '_send_mode',
     '_force_main_bot',
-    '_force_sender_known',
-    '_force_sender_bot_id',
+    '_required_sender_bot_id',
     '_queued_db_log_context',
-    '_skip_rate_limit_retry',
 })
 
 
@@ -286,6 +279,7 @@ class SendReceipt:
     queued: bool = False
     task_id: Optional[str] = None
     manager: Optional["TelegramBotManager"] = None
+    durable_db_logged: bool = False
 
     def __getattr__(self, item: str):
         return getattr(self.message, item)
@@ -327,61 +321,6 @@ def _has_callback_keyboard(reply_markup) -> bool:
     return False
 
 
-def _clone_file_argument(value):
-    """Copy file-like send arguments so queued tasks don't depend on caller-owned handles."""
-    if isinstance(value, InputFile):
-        content = value.input_file_content
-        if hasattr(content, 'read') and hasattr(content, 'seek'):
-            content = _clone_file_argument(content).read()
-        return InputFile(
-            io.BytesIO(content),
-            filename=value.filename,
-            attach=value.attach_name is not None,
-        )
-    if hasattr(value, 'read') and hasattr(value, 'seek'):
-        current_pos = None
-        try:
-            current_pos = value.tell()
-        except (AttributeError, OSError):
-            pass
-        try:
-            value.seek(0)
-            data = value.read()
-        finally:
-            if current_pos is not None:
-                try:
-                    value.seek(current_pos)
-                except OSError:
-                    pass
-        return io.BytesIO(data)
-    return value
-
-
-def _clone_media_argument(value):
-    """Copy Telegram media objects that wrap caller-owned file handles."""
-    if not hasattr(value, 'media'):
-        return value
-    kwargs = {
-        'caption': getattr(value, 'caption', None),
-        'parse_mode': getattr(value, 'parse_mode', None),
-        'caption_entities': getattr(value, 'caption_entities', None),
-    }
-    optional_attrs = (
-        'filename', 'has_spoiler', 'show_caption_above_media',
-        'disable_content_type_detection', 'thumbnail', 'width', 'height',
-        'duration', 'supports_streaming', 'performer', 'title', 'api_kwargs',
-    )
-    for attr in optional_attrs:
-        if hasattr(value, attr):
-            attr_value = getattr(value, attr)
-            if attr_value:
-                kwargs[attr] = _clone_file_argument(attr_value) if attr == 'thumbnail' else attr_value
-    try:
-        return value.__class__(_clone_file_argument(value.media), **kwargs)
-    except TypeError:
-        return value
-
-
 class TelegramBotManager(LocaleMixin):
     """
     This is a wrapper of Telegram's message sending and editing methods.
@@ -414,7 +353,6 @@ class TelegramBotManager(LocaleMixin):
     dispatcher: Application
     bot_pool: Optional['BotPool']
     _send_worker_stop: threading.Event
-    _send_queues_lock: threading.Lock
     _stopping: threading.Event
     _cleanup_tls: threading.local
     _tls: threading.local
@@ -446,16 +384,11 @@ class TelegramBotManager(LocaleMixin):
             def rate_limit_wrapper(self: 'TelegramBotManager', *args, **kwargs):
                 is_edit_method = fn.__name__.startswith('edit_message_')
 
-                # Bypass: caller already reserved a slot and set _using_bot
-                if kwargs.pop('_bypass_rate_limit', False):
-                    return fn(self, *args, **kwargs)
-
                 sender_bot_id = kwargs.pop('_sender_bot_id', None)
                 slave_id = kwargs.pop('_slave_id', None)
                 send_mode = kwargs.pop('_send_mode', 'blocking')
                 force_main_bot = kwargs.pop('_force_main_bot', False)
-                force_sender_known = False
-                forced_sender_bot_id = None
+                required_sender_bot_id = str(sender_bot_id) if sender_bot_id and is_edit_method else None
 
                 chat_id = None
                 if args:
@@ -466,30 +399,8 @@ class TelegramBotManager(LocaleMixin):
 
                 send_worker_stop = getattr(self, '_send_worker_stop', None)
                 if send_worker_stop is not None and send_worker_stop.is_set():
-                    self.logger.warning(f"Queued send worker is stopped. Not scheduling new tasks for chat {chat_id}.")
+                    self.logger.warning("Durable outbound worker is stopped; rejecting work for chat %s.", chat_id)
                     return None
-
-                reply_to_message_id = kwargs.get('reply_to_message_id')
-                if sender_bot_id and not (has_callback and not is_edit_method):
-                    force_sender_known = True
-                    forced_sender_bot_id = sender_bot_id
-                elif sender_bot_id is None and not has_callback and chat_id and reply_to_message_id and hasattr(self, 'channel'):
-                    try:
-                        target_log = self.channel.db.get_msg_log(
-                            master_msg_id=message_id_to_str(
-                                TelegramChatID(int(chat_id)),
-                                TelegramMessageID(int(reply_to_message_id)),
-                            )
-                        )
-                    except Exception as e:
-                        self.logger.debug(
-                            "Failed to resolve reply target sender for %s.%s: %s",
-                            chat_id, reply_to_message_id, e,
-                        )
-                    else:
-                        if target_log is not None:
-                            force_sender_known = True
-                            forced_sender_bot_id = target_log.sender_bot_id
 
                 if chat_id:
                     chat_id_int = int(chat_id)
@@ -505,10 +416,6 @@ class TelegramBotManager(LocaleMixin):
                                 chat_id,
                             )
                         elif not is_edit_method and not has_callback:
-                            if force_sender_known:
-                                kwargs = dict(kwargs)
-                                kwargs['_force_sender_known'] = True
-                                kwargs['_force_sender_bot_id'] = forced_sender_bot_id
                             return self._enqueue_eventual_send(
                                 str(slave_id),
                                 int(chat_id),
@@ -519,11 +426,12 @@ class TelegramBotManager(LocaleMixin):
                             )
 
                     blocking_kwargs = dict(kwargs)
-                    if force_sender_known:
-                        blocking_kwargs['_force_sender_known'] = True
-                        blocking_kwargs['_force_sender_bot_id'] = forced_sender_bot_id
-                    if force_main_bot or (has_callback and not is_edit_method) or (is_edit_method and not force_sender_known):
-                        blocking_kwargs['_force_main_bot'] = True
+                    if required_sender_bot_id is not None:
+                        blocking_kwargs['_required_sender_bot_id'] = required_sender_bot_id
+                    if force_main_bot or (has_callback and not is_edit_method) or (
+                        is_edit_method and required_sender_bot_id is None
+                    ):
+                        blocking_kwargs['_required_sender_bot_id'] = "__main__"
 
                     return self._enqueue_blocking_send_and_wait(
                         str(slave_id) if slave_id else None,
@@ -548,8 +456,6 @@ class TelegramBotManager(LocaleMixin):
             @wraps(fn)
             def rate_limit_error_handler(self: 'TelegramBotManager', *args, **kwargs):
                 max_retries = 3
-                skip_rate_limit_retry = kwargs.pop('_skip_rate_limit_retry', False)
-
                 # Extract chat_id from arguments for logging
                 chat_id = None
                 if args:
@@ -568,8 +474,6 @@ class TelegramBotManager(LocaleMixin):
                     try:
                         return fn(self, *args, **kwargs)
                     except telegram.error.RetryAfter as e:
-                        if skip_rate_limit_retry:
-                            raise
                         timestamp_info = get_timestamp_info()
                         if attempt >= max_retries:
                             cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
@@ -596,8 +500,6 @@ class TelegramBotManager(LocaleMixin):
                         if not cls.enable_retry:
                             raise
                         if "Too Many Requests" in str(e) or "429" in str(e) or "Flood" in str(e):
-                            if skip_rate_limit_retry:
-                                raise
                             timestamp_info = get_timestamp_info()
                             if attempt >= max_retries:
                                 cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
@@ -624,84 +526,17 @@ class TelegramBotManager(LocaleMixin):
             return rate_limit_error_handler
 
         @classmethod
-        def caption_strip_class_on_failure(cls, fn: Callable):
-            @wraps(fn)
-            def caption_strip_class_on_failure_wrapper(*args, **kwargs):
-                try:
-                    return fn(*args, **kwargs)
-                except telegram.error.BadRequest as e:
-                    if e.message.lower().startswith("can't parse entities") and 'parse_mode' in kwargs:
-                        kwargs.pop("parse_mode")
-                        for i in args:
-                            if callable(getattr(i, 'seek', None)):
-                                i.seek(0)
-                        for i in kwargs.values():
-                            if callable(getattr(i, 'seek', None)):
-                                i.seek(0)
-                        return fn(*args, **kwargs)
-                    else:
-                        raise e
-
-            return caption_strip_class_on_failure_wrapper
-
-        @classmethod
-        def caption_affix_decorator(cls, fn: Callable):
-            fn = cls.caption_strip_class_on_failure(fn)
-
-            @wraps(fn)
-            def caption_affix(self, *args, **kwargs):
-                prefix = kwargs.pop('prefix', '')
-                suffix = kwargs.pop('suffix', '')
-                text = kwargs.pop('caption', '')
-
-                file = args[1] if len(args) >= 2 else kwargs.get('file', None)
-                chat = args[0] if len(args) >= 1 else kwargs.get('chat_id', None)
-                message_thread_id = kwargs.get('message_thread_id', None)
-
-                if file:
-                    is_empty = self._detect_empty_file(file, chat, text, prefix, suffix, message_thread_id)
-
-                    if is_empty:
-                        return is_empty
-
-                prefix = (prefix and (prefix + "\n")) or prefix
-                suffix = (suffix and ("\n" + suffix)) or suffix
-
-                if str(kwargs.get('parse_mode', '')).lower() == "html":
-                    prefix = html.escape(prefix)
-                    suffix = html.escape(suffix)
-
-                if len(prefix + text + suffix) >= telegram.constants.MessageLimit.CAPTION_LENGTH:
-                    full_message = io.StringIO(prefix + text + suffix)
-                    truncated = prefix + text[:100] + "\n…\n" + text[-100:] + suffix
-                    kwargs['caption'] = truncated
-                    msg = fn(self, *args, **kwargs)
-                    chat_id = kwargs.get("chat_id", args[0] if len(args) > 0 else "")
-                    filename = "%s_%s.txt" % (chat_id, msg.message_id)
-                    self._active_bot.send_document(chat_id, full_message,
-                                                   filename=filename,
-                                                   reply_to_message_id=msg.message_id,
-                                                   caption=self._("Caption is truncated due to its length. "
-                                                                  "Full message is sent as attachment."))
-                    return msg
-                else:
-                    kwargs['caption'] = prefix + text + suffix
-                    return fn(self, *args, **kwargs)
-
-            return caption_affix
-
-        @classmethod
         def skip_on_rate_limit(cls, fn: Callable):
             """Skip execution silently if messages are queued or pool is in
             high-volume mode for the target chat.
-            For non-essential calls like typing indicators."""
+            TN-0005 keeps nonessential chat actions outside message quotas and
+            suppresses them while they could compete with durable work."""
             AUX_USE_RECENCY = 5.0  # seconds
 
             @wraps(fn)
             def skip_wrapper(self: 'TelegramBotManager', *args, **kwargs):
-                with self._send_queues_lock:
-                    if any(self._send_queues.values()) or self._send_in_flight:
-                        return None
+                if OutboundTask.select().where(OutboundTask.state.in_(TaskState.ACTIVE)).exists():
+                    return None
 
                 # Suppress when aux bots were recently used for this chat
                 chat_id = args[0] if args else kwargs.get('chat_id')
@@ -832,22 +667,21 @@ class TelegramBotManager(LocaleMixin):
             self._init_bot_pool(aux_configs, config, channel)
         self.logger.debug("Bot pool initialization complete...")
 
-        # ── Outbound send pipeline ────────────────────────────────────
-        # Per-Telegram-chat FIFO queues + thread pool for concurrent dispatch.
-        # Sends to one Telegram chat are serial; different chats run concurrently.
-        from collections import deque as _deque
+        # Durable source lanes feed a bounded executor. Telegram destinations
+        # participate only in sender quota selection, never in FIFO ownership.
         from concurrent.futures import ThreadPoolExecutor
 
-        self._send_queues: dict[QueueTarget, _deque[QueuedSendTask]] = {}
-        self._send_queues_lock = threading.Lock()
-        self._tasks_enqueued = 0  # monotonic counter for diagnostics
         self._send_worker_stop = threading.Event()
-
-        # Per-Telegram-chat concurrency tracking
-        self._send_in_flight: dict[QueueTarget, tuple] = {}
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._bot_chat_retry_failures: dict[BotChatKey, int] = {}
         self._last_metrics_snapshot = 0.0
+        self._outbound_waiters: dict[int, Future] = {}
+        self._outbound_waiter_receipts: dict[int, bool] = {}
+        self._outbound_db_callbacks: dict[int, Optional[Callable[[], None]]] = {}
+        self._outbound_workflow_by_task: dict[int, int] = {}
+        self._outbound_live_results: dict[int, tuple[object, Optional[str]]] = {}
+        self._outbound_live_errors: dict[int, Exception] = {}
+        self._outbound_registry_lock = threading.Lock()
 
         from .etm_metrics import Metrics, start_metrics_server
         metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
@@ -867,6 +701,31 @@ class TelegramBotManager(LocaleMixin):
         self._send_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._send_worker_count, thread_name_prefix="ETM-send",
         )
+        self._outbound_codec = OutboundPayloadCodec(channel.db._base_path / "outbound-spool")
+        self._outbound_repository = OutboundRepository(self._outbound_codec)
+        removed_orphaned_spool_files = self._outbound_repository.cleanup_orphaned_spool_files()
+        if removed_orphaned_spool_files:
+            self.logger.info(
+                "Removed %d orphaned outbound spool file(s) during startup.",
+                removed_orphaned_spool_files,
+            )
+        self._outbound_scheduler = OutboundScheduler(
+            self._outbound_repository,
+            self,
+            executor=self._send_executor,
+            worker_count=self._send_worker_count,
+            lease_owner=f"{os.getpid()}-{uuid.uuid4().hex}",
+        )
+        recovery = self._outbound_repository.recover(utc_now())
+        if recovery.requeued_ambiguous_ids:
+            self.logger.warning(
+                "Recovered %d ambiguous outbound task(s) for at-least-once retry.",
+                len(recovery.requeued_ambiguous_ids),
+            )
+            self._metrics.recovered("ambiguous_requeued", len(recovery.requeued_ambiguous_ids))
+        if recovery.sent_pending_log_ids:
+            self._metrics.recovered("sent_pending_log", len(recovery.sent_pending_log_ids))
+        self._reconcile_sent_pending_tasks(recovery.sent_pending_log_ids)
 
         self._last_queue_stats_log = time.time()
         self._queue_stats_log_interval = 60.0
@@ -877,7 +736,7 @@ class TelegramBotManager(LocaleMixin):
             daemon=True
         )
         self._send_worker_thread.start()
-        self.logger.debug("Queued send system initialized...")
+        self.logger.debug("Durable outbound system initialized...")
 
         self.logger.debug("Adding base dispatchers...")
         self._add_base_dispatchers()
@@ -1115,6 +974,7 @@ class TelegramBotManager(LocaleMixin):
         *,
         queued: bool = False,
         task_id: Optional[str] = None,
+        durable_db_logged: bool = False,
     ) -> SendReceipt:
         return SendReceipt(
             message=message,
@@ -1122,6 +982,7 @@ class TelegramBotManager(LocaleMixin):
             queued=queued,
             task_id=task_id,
             manager=self,
+            durable_db_logged=durable_db_logged,
         )
 
     def _enqueue_eventual_send(
@@ -1136,13 +997,6 @@ class TelegramBotManager(LocaleMixin):
     ) -> SendReceipt:
         kwargs = dict(kwargs)
         db_log_context = kwargs.pop('_queued_db_log_context', None)
-        for key in ('photo', 'document', 'video', 'animation', 'audio', 'voice', 'sticker'):
-            if key in kwargs:
-                kwargs[key] = _clone_file_argument(kwargs[key])
-        if 'media' in kwargs:
-            kwargs['media'] = _clone_media_argument(kwargs['media'])
-        if len(args) >= 3:
-            args = args[:2] + (_clone_file_argument(args[2]),) + args[3:]
 
         task_id = self._enqueue_send_task(
             target=(slave_id, int(chat_id)),
@@ -1166,18 +1020,11 @@ class TelegramBotManager(LocaleMixin):
         cleanup_files: Optional[list] = None,
     ) -> SendReceipt:
         kwargs = dict(kwargs)
-        kwargs.pop('_queued_db_log_context', None)
-        for key in ('photo', 'document', 'video', 'animation', 'audio', 'voice', 'sticker'):
-            if key in kwargs:
-                kwargs[key] = _clone_file_argument(kwargs[key])
-        if 'media' in kwargs:
-            kwargs['media'] = _clone_media_argument(kwargs['media'])
-        if len(args) >= 3:
-            args = args[:2] + (_clone_file_argument(args[2]),) + args[3:]
+        db_log_context = kwargs.pop('_queued_db_log_context', None)
 
         waiter: Future = Future()
-        # Blocking operations without slave affinity share one per-chat target.
-        # This keeps edit/callback sends ordered after they enter the FIFO.
+        # Blocking operations without slave affinity share a per-chat control
+        # source so their local submissions retain a deterministic order.
         target = (slave_id or self.BLOCKING_SEND_TARGET_SLAVE_ID, int(chat_id))
         task_id = self._enqueue_send_task(
             target=target,
@@ -1185,6 +1032,7 @@ class TelegramBotManager(LocaleMixin):
             args=args,
             kwargs=kwargs,
             cleanup_files=cleanup_files,
+            db_log_context=db_log_context,
             priority=True,
             waiter=waiter,
         )
@@ -1196,98 +1044,378 @@ class TelegramBotManager(LocaleMixin):
             error = RuntimeError(
                 f"Blocking send to chat {chat_id} timed out after {self.BLOCKING_SEND_TIMEOUT:g}s"
             )
-            removed_task = self._remove_queued_send_task(target, task_id)
-            if removed_task is not None:
-                self._resolve_task_waiter_exception(removed_task, error)
-                self._cleanup_queued_task_files(removed_task)
-            elif not waiter.done():
-                waiter.set_exception(error)
+            task_number = int(task_id)
+            with self._outbound_registry_lock:
+                workflow_id = self._outbound_workflow_by_task.get(task_number)
+                if workflow_id is not None and self._outbound_waiters.get(workflow_id) is waiter:
+                    self._outbound_waiters.pop(workflow_id, None)
+                    self._outbound_waiter_receipts.pop(workflow_id, None)
+            metrics = getattr(self, '_metrics', None)
+            if metrics:
+                metrics.waiter_timed_out(function.__name__)
             raise error from exc
 
-    def _select_queued_sender(
+    def select_sender(
         self,
-        chat_id: int,
-        *,
-        forced_sender_bot_id: Optional[str] = None,
-        force_main: bool = False,
-        slave_id: Optional[str] = None,
-        has_callback: bool = False,
-        message_thread_id: Optional[int] = None,
-        now: float = 0.0,
-    ):
-        """Select an immediately available sender for a queued task."""
-        now = now or time.time()
+        task: OutboundTask,
+        now: datetime,
+    ) -> SenderSelectionResult:
+        """Reserve an immediately eligible bot without creating destination FIFO state."""
+        now_timestamp = now.timestamp()
+        required_sender_bot_id = task.required_sender_bot_id
 
-        if not force_main and forced_sender_bot_id and self.bot_pool:
-            disabled_until = self._bot_chat_disabled_until.get((str(forced_sender_bot_id), chat_id), 0.0)
-            if disabled_until > now:
-                TelegramBotManager._record_sender_selection(self, "aux", "blocked", "bot_chat_cooldown")
-                TelegramBotManager._record_dispatch_blocked(self, "bot_chat_cooldown")
-                return None, None, disabled_until - now
-            aux_bot = self.bot_pool.get_bot_by_id(forced_sender_bot_id)
-            is_member = True
-            if aux_bot is not None and hasattr(aux_bot, 'check_membership_tri'):
-                is_member = aux_bot.check_membership_tri(chat_id) is not False
-            if aux_bot and not aux_bot.disabled and is_member:
-                delay = aux_bot.peek_delay(chat_id)
-                if delay <= 0:
-                    aux_bot.reserve_slot(chat_id)
-                    TelegramBotManager._record_sender_selection(self, "aux", "selected", "available")
-                    return aux_bot.bot, str(forced_sender_bot_id), 0.0
-                TelegramBotManager._record_sender_selection(self, "aux", "blocked", "local_rate_limit")
-                TelegramBotManager._record_dispatch_blocked(self, "local_rate_limit")
-                return None, None, delay
-            TelegramBotManager._record_sender_selection(self, "aux", "skipped", "forced_sender_unavailable")
-            self.logger.warning(
-                "Forced sender bot %s is unavailable for queued chat %s; falling back to main bot.",
-                forced_sender_bot_id, chat_id,
-            )
-
-        main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
-
-        if forced_sender_bot_id is None and self.bot_pool:
-            if force_main:
-                TelegramBotManager._record_sender_selection(self, "aux", "skipped", "forced_main")
-            elif has_callback:
-                TelegramBotManager._record_sender_selection(self, "aux", "skipped", "callback_requires_main")
-            else:
-                skip_bot = lambda aux_bot: self._bot_chat_disabled_until.get((str(aux_bot.bot_id), chat_id), 0.0) > now
-                slot = self.bot_pool.acquire_send_slot(
-                    chat_id,
-                    max_delay=1e-9,
-                    skip_bot=skip_bot,
-                    affinity_key=slave_id or (chat_id, message_thread_id),
-                    notify_admin=(main_delay > 0),
+        if required_sender_bot_id == "__main__":
+            cooldown = self._bot_chat_disabled_until.get((None, task.target_chat_id), 0.0)
+            delay = max(self._rate_limiter.peek_delay(task.target_chat_id), cooldown - now_timestamp)
+            if delay > 0:
+                return SenderSelectionResult(
+                    retry_at=now + timedelta(seconds=delay),
+                    reason="required_main_unavailable",
                 )
-                if slot is not None:
-                    aux_bot_obj, aux_delay = slot
-                    TelegramBotManager._record_sender_selection(self, "aux", "selected", "available")
-                    return aux_bot_obj.bot, str(aux_bot_obj.bot_id), aux_delay
-                if hasattr(self.bot_pool, "explain_send_slot_unavailable"):
-                    reason = self.bot_pool.explain_send_slot_unavailable(chat_id, skip_bot=skip_bot)
-                else:
-                    reason = "unavailable"
-                TelegramBotManager._record_sender_selection(self, "aux", "skipped", reason)
+            outcome = self._rate_limiter.reserve_slot(task.target_chat_id)
+            return SenderSelectionResult(selection=SenderSelection(
+                sender=self._bot,
+                sender_bot_id=None,
+                reservation=outcome.reservation,
+            ))
 
-        main_disabled = self._bot_chat_disabled_until.get((None, chat_id), 0.0)
-        if main_disabled > now:
-            TelegramBotManager._record_sender_selection(self, "main", "blocked", "bot_chat_cooldown")
-            TelegramBotManager._record_dispatch_blocked(self, "bot_chat_cooldown")
-            return None, None, main_disabled - now
+        if required_sender_bot_id is not None:
+            aux_bot = self.bot_pool.get_bot_by_id(required_sender_bot_id) if self.bot_pool else None
+            if aux_bot is None or aux_bot.disabled:
+                return SenderSelectionResult(
+                    reason=f"Required sender {required_sender_bot_id} is not configured or is disabled.",
+                    terminal_error_class="required_sender_unavailable",
+                )
+            membership = aux_bot.check_membership_tri(task.target_chat_id)
+            if membership is None:
+                membership = aux_bot.check_membership_sync(task.target_chat_id, timeout=3.0)
+            if membership is not True:
+                return SenderSelectionResult(
+                    reason=f"Required sender {required_sender_bot_id} is not a member of chat {task.target_chat_id}.",
+                    terminal_error_class="required_sender_not_member",
+                )
+            cooldown = self._bot_chat_disabled_until.get(
+                (str(required_sender_bot_id), task.target_chat_id), 0.0,
+            )
+            delay = max(aux_bot.peek_delay(task.target_chat_id), cooldown - now_timestamp)
+            if delay > 0:
+                return SenderSelectionResult(
+                    retry_at=now + timedelta(seconds=delay),
+                    reason="required_sender_rate_limited",
+                )
+            outcome = aux_bot.reserve_slot(task.target_chat_id)
+            return SenderSelectionResult(selection=SenderSelection(
+                sender=aux_bot.bot,
+                sender_bot_id=str(aux_bot.bot_id),
+                reservation=outcome.reservation,
+            ))
+
+        main_cooldown = self._bot_chat_disabled_until.get((None, task.target_chat_id), 0.0)
+        main_delay = max(
+            self._rate_limiter.peek_delay(task.target_chat_id),
+            main_cooldown - now_timestamp,
+        )
+        if self.bot_pool:
+            def skip_bot(aux_bot: AuxiliaryBot) -> bool:
+                return self._bot_chat_disabled_until.get(
+                    (str(aux_bot.bot_id), task.target_chat_id), 0.0,
+                ) > now_timestamp
+
+            slot = self.bot_pool.acquire_send_slot(
+                task.target_chat_id,
+                max_delay=1e-9,
+                skip_bot=skip_bot,
+                affinity_key=task.slave_id,
+                notify_admin=main_delay > 0,
+            )
+            if slot is not None:
+                aux_bot, reservation = slot
+                return SenderSelectionResult(selection=SenderSelection(
+                    sender=aux_bot.bot,
+                    sender_bot_id=str(aux_bot.bot_id),
+                    reservation=reservation,
+                ))
 
         if main_delay <= 0:
-            self._calculate_rate_limit_delay(chat_id)  # reserve
-            TelegramBotManager._record_sender_selection(self, "main", "selected", "available")
-            return self._bot, None, 0.0
-        TelegramBotManager._record_sender_selection(self, "main", "blocked", "local_rate_limit")
-        TelegramBotManager._record_dispatch_blocked(self, "local_rate_limit")
-        return None, None, main_delay
+            outcome = self._rate_limiter.reserve_slot(task.target_chat_id)
+            return SenderSelectionResult(selection=SenderSelection(
+                sender=self._bot,
+                sender_bot_id=None,
+                reservation=outcome.reservation,
+            ))
 
-    def _requeue_send_task(self, task: QueuedSendTask):
-        """Put a task back at the front of its Telegram chat FIFO."""
-        with self._send_queues_lock:
-            q = self._send_queues.setdefault(task.chat_id, collections.deque())
-            q.appendleft(task)
+        candidate_delays = [main_delay]
+        for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
+            if aux_bot.disabled or aux_bot.check_membership_tri(task.target_chat_id) is not True:
+                continue
+            cooldown = self._bot_chat_disabled_until.get(
+                (str(aux_bot.bot_id), task.target_chat_id), 0.0,
+            )
+            candidate_delays.append(max(
+                aux_bot.peek_delay(task.target_chat_id),
+                cooldown - now_timestamp,
+            ))
+        wait_seconds = max(0.05, min(candidate_delays))
+        return SenderSelectionResult(
+            retry_at=now + timedelta(seconds=wait_seconds),
+            reason="all_senders_rate_limited",
+        )
+
+    def execute_task(self, task: OutboundTask, selection: SenderSelection) -> object:
+        operation, args, kwargs = self._outbound_codec.decode_command(task.payload)
+        if task.depends_on_task_id is not None:
+            predecessor = OutboundTask.get_by_id(task.depends_on_task_id)
+            if not predecessor.result_payload:
+                raise ValueError(f"Outbound predecessor {predecessor.id} has no result payload.")
+            predecessor_payload = json.loads(predecessor.result_payload)
+            args = cast(tuple, self._resolve_outbound_result_refs(args, predecessor_payload))
+            kwargs = cast(dict, self._resolve_outbound_result_refs(kwargs, predecessor_payload))
+        if not operation.startswith('api_'):
+            raise RuntimeError(f"Unsupported durable outbound operation: {operation}")
+        api_method_name = operation[len('api_'):]
+        method = getattr(selection.sender, api_method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"Selected bot does not support outbound operation: {api_method_name}")
+        started = time.monotonic()
+        result = method(*args, **kwargs)
+        metrics = getattr(self, '_metrics', None)
+        if metrics:
+            metrics.observe_send_latency(
+                self._metrics_sender(selection.sender_bot_id),
+                time.monotonic() - started,
+            )
+        return result
+
+    def release_reservation(self, selection: SenderSelection) -> None:
+        if selection.sender_bot_id is not None and self.bot_pool:
+            aux_bot = self.bot_pool.get_bot_by_id(selection.sender_bot_id)
+            if aux_bot is not None:
+                aux_bot.release_slot(selection.reservation)
+                return
+        self._rate_limiter.release_slot(selection.reservation)
+
+    def task_dispatched(
+        self,
+        task: OutboundTask,
+        selection: SenderSelection,
+        now: datetime,
+    ) -> None:
+        metrics = getattr(self, '_metrics', None)
+        if not metrics:
+            return
+        metrics.task_dispatched(self._metrics_sender(selection.sender_bot_id))
+        if task.accepted_at is not None:
+            metrics.observe_queue_wait(max(0.0, (now - task.accepted_at).total_seconds()))
+
+    def serialize_result(
+        self,
+        task: OutboundTask,
+        result: object,
+        selection: SenderSelection,
+    ) -> Mapping[str, object]:
+        self._outbound_live_results[task.id] = (result, selection.sender_bot_id)
+        if selection.sender_bot_id is not None:
+            self._record_aux_use(task.target_chat_id)
+        metrics = getattr(self, '_metrics', None)
+        if metrics:
+            total_seconds = None
+            if task.accepted_at is not None:
+                total_seconds = max(0.0, (utc_now() - task.accepted_at).total_seconds())
+            metrics.send_completed(self._metrics_sender(selection.sender_bot_id), "ok", total_seconds)
+        chat = getattr(result, 'chat', None)
+        chat_id = getattr(result, 'chat_id', None) or getattr(chat, 'id', None) or task.target_chat_id
+        message_id = getattr(result, 'message_id', None)
+        if message_id is None:
+            _operation, _args, kwargs = self._outbound_codec.decode_command(task.payload)
+            message_id = kwargs.get('message_id')
+        payload: dict[str, object] = {
+            "ok": True,
+            "chat_id": int(chat_id),
+            "sender_bot_id": selection.sender_bot_id,
+        }
+        if message_id is not None:
+            payload["message_id"] = int(message_id)
+        try:
+            payload["media_type"] = get_msg_type(cast(TelegramMessage, result)).value
+        except Exception:
+            pass
+
+        attachment = None
+        for attribute in ('animation', 'document', 'video', 'voice', 'audio', 'sticker', 'video_note'):
+            attachment = getattr(result, attribute, None)
+            if attachment is not None:
+                break
+        if attachment is None:
+            photos = getattr(result, 'photo', None)
+            if photos:
+                attachment = photos[-1]
+        if attachment is not None:
+            file_id = getattr(attachment, 'file_id', None)
+            file_unique_id = getattr(attachment, 'file_unique_id', None)
+            mime = getattr(attachment, 'mime_type', None)
+            if file_id is not None:
+                payload["file_id"] = file_id
+            if file_unique_id is not None:
+                payload["file_unique_id"] = file_unique_id
+            if mime is not None:
+                payload["mime"] = mime
+        return payload
+
+    def classify_error(
+        self,
+        task: OutboundTask,
+        error: Exception,
+        selection: SenderSelection,
+        now: datetime,
+    ) -> FailureDisposition:
+        if isinstance(error, telegram.error.ChatMigrated):
+            new_chat_id = int(error.new_chat_id)
+            with OutboundTask._meta.database.atomic():
+                self.channel.chat_binding.chat_migration_by_id(task.target_chat_id, new_chat_id)
+                self._outbound_repository.migrate_chat_target(task.target_chat_id, new_chat_id)
+            return FailureDisposition(FailureDisposition.RETRY, "chat_migrated", retry_at=now)
+
+        retry_after = self._rate_limit_retry_after_seconds(error)
+        if retry_after is not None:
+            bot_chat_key = (selection.sender_bot_id, task.target_chat_id)
+            failures = self._bot_chat_retry_failures.get(bot_chat_key, 0) + 1
+            self._bot_chat_retry_failures[bot_chat_key] = failures
+            delay = self._telegram_retry_delay_seconds(retry_after, failures)
+            self._bot_chat_disabled_until[bot_chat_key] = now.timestamp() + delay
+            if self.bot_pool and task.slave_id:
+                self.bot_pool.forget_affinity(task.slave_id)
+            metrics = getattr(self, '_metrics', None)
+            if metrics:
+                metrics.rate_limited(self._metrics_sender(selection.sender_bot_id))
+                metrics.task_requeued("rate_limit")
+            return FailureDisposition(FailureDisposition.RETRY, "retry_after", retry_at=None)
+
+        if isinstance(error, (telegram.error.TimedOut, telegram.error.NetworkError)):
+            if task.attempt_count < 3:
+                return FailureDisposition(FailureDisposition.RETRY, "network", retry_at=now)
+            self._outbound_live_errors[task.id] = error
+            return FailureDisposition(FailureDisposition.DEAD, "network_attempts_exhausted")
+
+        if isinstance(error, telegram.error.Forbidden) and selection.sender_bot_id and self.bot_pool:
+            aux_bot = self.bot_pool.get_bot_by_id(selection.sender_bot_id)
+            if aux_bot is not None:
+                aux_bot.update_membership(task.target_chat_id, False)
+                return FailureDisposition(FailureDisposition.RETRY, "forbidden_aux", retry_at=now)
+
+        error_class = "telegram_error"
+        if isinstance(error, telegram.error.BadRequest):
+            message = (getattr(error, 'message', None) or str(error)).lower()
+            if "can't parse entities" in message:
+                error_class = "parse_entities"
+            elif "can't be edited" in message:
+                error_class = "edit_not_allowed"
+            elif "message to edit not found" in message:
+                error_class = "edit_not_found"
+            elif task.operation in {'api_send_audio', 'api_send_voice', 'api_send_video', 'api_send_photo'}:
+                error_class = "media_bad_request"
+            else:
+                error_class = "bad_request"
+            if self._outbound_repository.has_error_handler(task.id, error_class):
+                return FailureDisposition(FailureDisposition.EXPECTED, error_class)
+        elif isinstance(error, telegram.error.Forbidden):
+            error_class = "forbidden"
+        self._outbound_live_errors[task.id] = error
+        return FailureDisposition(FailureDisposition.DEAD, error_class)
+
+    def reconcile_sent_task(
+        self,
+        task: OutboundTask,
+        result_payload: Mapping[str, object],
+        selection: SenderSelection,
+    ) -> None:
+        if not task.log_payload:
+            return
+        if "message_id" not in result_payload:
+            raise ValueError(f"Outbound task {task.id} produced no Telegram message ID for logging.")
+        self.channel.db.reconcile_outbound_message_log(
+            task.id,
+            json.loads(task.log_payload),
+            result_payload,
+            sender_bot_id=selection.sender_bot_id,
+        )
+
+    def workflow_finished(self, workflow_outcome: WorkflowOutcome) -> None:
+        metrics = getattr(self, '_metrics', None)
+        if metrics:
+            metrics.workflow_terminal(workflow_outcome.state)
+        with self._outbound_registry_lock:
+            waiter = self._outbound_waiters.pop(workflow_outcome.workflow_id, None)
+            return_receipt = self._outbound_waiter_receipts.pop(workflow_outcome.workflow_id, False)
+            callback = self._outbound_db_callbacks.pop(workflow_outcome.workflow_id, None)
+            task_ids = [
+                task_id for task_id, workflow_id in self._outbound_workflow_by_task.items()
+                if workflow_id == workflow_outcome.workflow_id
+            ]
+            for task_id in task_ids:
+                self._outbound_workflow_by_task.pop(task_id, None)
+
+        result_entry = None
+        if workflow_outcome.result_task_id is not None:
+            result_entry = self._outbound_live_results.get(workflow_outcome.result_task_id)
+        live_error = next(
+            (self._outbound_live_errors[task_id] for task_id in task_ids if task_id in self._outbound_live_errors),
+            None,
+        )
+        for task_id in task_ids:
+            if task_id != workflow_outcome.result_task_id:
+                self._outbound_live_results.pop(task_id, None)
+
+        try:
+            if waiter is not None and not waiter.done():
+                if workflow_outcome.state == "completed" and result_entry is not None:
+                    result, sender_bot_id = result_entry
+                    if return_receipt:
+                        waiter.set_result(self._make_send_receipt(
+                            result,
+                            sender_bot_id=sender_bot_id,
+                            task_id=str(workflow_outcome.result_task_id),
+                            durable_db_logged=True,
+                        ))
+                    else:
+                        waiter.set_result(result)
+                elif live_error is not None:
+                    waiter.set_exception(live_error)
+                else:
+                    waiter.set_exception(RuntimeError(
+                        f"Outbound workflow {workflow_outcome.workflow_id} ended as "
+                        f"{workflow_outcome.state}: {workflow_outcome.error_class or 'no result'}"
+                    ))
+        finally:
+            if workflow_outcome.result_task_id is not None:
+                self._outbound_live_results.pop(workflow_outcome.result_task_id, None)
+            for task_id in task_ids:
+                self._outbound_live_errors.pop(task_id, None)
+            self._run_database_update_callback(callback)
+            chat_binding = getattr(self.channel, 'chat_binding', None)
+            if chat_binding is not None:
+                chat_binding.resume_pending_history_migrations()
+
+    def _reconcile_sent_pending_tasks(self, task_ids: Optional[Collection[int]] = None) -> None:
+        for task in self._outbound_repository.sent_pending_tasks(
+            tuple(task_ids) if task_ids is not None else None
+        ):
+            if not task.result_payload:
+                continue
+            result_payload = json.loads(task.result_payload)
+            try:
+                if task.log_payload:
+                    self.channel.db.reconcile_outbound_message_log(
+                        task.id,
+                        json.loads(task.log_payload),
+                        result_payload,
+                        sender_bot_id=cast(Optional[str], result_payload.get("sender_bot_id")),
+                    )
+                outcome = self._outbound_repository.complete_success(task.id, utc_now())
+            except Exception:
+                self.logger.exception("Failed to reconcile sent outbound task %s", task.id)
+                continue
+            if outcome is not None:
+                self.workflow_finished(outcome)
 
     @staticmethod
     def _metrics_sender(sender_bot_id: Optional[str]) -> str:
@@ -1335,32 +1463,10 @@ class TelegramBotManager(LocaleMixin):
 
         return top_n, (host, port)
 
-    @staticmethod
-    def _task_total_seconds(task: QueuedSendTask) -> Optional[float]:
-        if not task.enqueued_at:
-            return None
-        total_seconds = time.monotonic() - task.enqueued_at
-        return total_seconds if total_seconds >= 0 else None
-
     def _snapshot_send_metrics(self, *, worker_alive: bool):
         metrics = getattr(self, '_metrics', None)
         if metrics:
             metrics.snapshot_manager_state(self, worker_alive=worker_alive)
-
-    def _remove_queued_send_task(self, target: SendTarget, task_id: str) -> Optional[QueuedSendTask]:
-        """Remove a task that has not yet been dispatched."""
-        queue_target = target[1]
-        with self._send_queues_lock:
-            q = self._send_queues.get(queue_target)
-            if not q:
-                return None
-            for task in list(q):
-                if task.task_id == task_id:
-                    q.remove(task)
-                    if not q:
-                        del self._send_queues[queue_target]
-                    return task
-        return None
 
     def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
         """Initialize the auxiliary bot pool from config."""
@@ -1428,96 +1534,6 @@ class TelegramBotManager(LocaleMixin):
         """Record that an aux bot was used for a chat (for typing suppression)."""
         self._aux_recent_use[chat_id] = time.time()
 
-    def _notify_admin_disabled_bot(self, aux_bot: AuxiliaryBot):
-        """Send one-shot notification to admin that an aux bot was disabled."""
-        def _notify():
-            try:
-                admin_id = self.admins[0]
-                self._bot.send_message(
-                    admin_id,
-                    f"⚠️ Auxiliary bot @{aux_bot.username} (id={aux_bot.bot_id}) has been "
-                    f"disabled: {aux_bot._disable_reason}. Please check the token in config."
-                )
-            except Exception as e:
-                self.logger.warning("Failed to notify admin about disabled aux bot: %s", e)
-
-        threading.Thread(target=_notify, daemon=True, name="AuxBotDisabledNotify").start()
-
-    def send_blocking_migration(self, chat_id: int, send_callable: Callable,
-                                timeout: float = 60.0):
-        """Block until any bot (main or aux) has a free slot, then send through it.
-
-        The callable receives a single ``_bypass_rate_limit=True`` kwarg that
-        the caller must forward to the decorated send method so the decorator
-        skips its own routing/reservation.
-
-        Returns whatever the send_callable returns.
-        """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            main_delay, _, _ = self._calculate_rate_limit_delay(chat_id, peek_only=True)
-
-            # Try aux bots first if they can beat the main bot
-            if self.bot_pool:
-                slot = self.bot_pool.acquire_send_slot(chat_id, max_delay=max(main_delay, 0.01))
-                if slot is not None:
-                    aux_bot, aux_delay = slot
-                    if aux_delay > 0:
-                        time.sleep(aux_delay)
-                    try:
-                        with self._using_bot(aux_bot.bot):
-                            return send_callable(_bypass_rate_limit=True)
-                    except telegram.error.Forbidden:
-                        aux_bot.update_membership(chat_id, False)
-                        self.logger.warning(
-                            "Auxiliary bot %s got Forbidden in chat %s during migration send; "
-                            "marking it as non-member for this chat.",
-                            aux_bot.bot_id, chat_id,
-                        )
-
-            # Try main bot
-            if main_delay == 0.0:
-                self._calculate_rate_limit_delay(chat_id)  # reserve
-                return send_callable(_bypass_rate_limit=True)
-
-            time.sleep(0.2)
-
-        # Timeout fallback: reserve on main and send anyway
-        self.logger.warning("send_blocking_migration timed out for chat %d, sending on main bot", chat_id)
-        self._calculate_rate_limit_delay(chat_id)
-        return send_callable(_bypass_rate_limit=True)
-
-    def _calculate_rate_limit_delay(self, chat_id: int, peek_only: bool = False):
-        """
-        Calculate rate limiting delay using the shared sliding window limiter.
-
-        Args:
-            chat_id: Telegram chat ID
-            peek_only: If True, compute delay without reserving a slot.
-
-        Returns:
-            tuple: (wait_seconds, chat_count, global_count)
-        """
-        if peek_only:
-            sleep_time = self._rate_limiter.peek_delay(chat_id)
-        else:
-            sleep_time = self._rate_limiter.reserve_slot(chat_id)
-
-        chat_count, global_count = self._rate_limiter.get_counts(chat_id)
-
-        if sleep_time > 0:
-            self.logger.info(
-                "Rate limit reached, need to delay %.2fs for chat %d. Chat: %d/%d, Global: %d/%d",
-                sleep_time, chat_id, chat_count, self.CHAT_LIMIT, global_count, self.GLOBAL_LIMIT,
-            )
-        else:
-            self.logger.debug(
-                "Rate limit not reached for chat %d. Chat: %d/%d, Global: %d/%d",
-                chat_id, chat_count, self.CHAT_LIMIT, global_count, self.GLOBAL_LIMIT,
-            )
-
-        return sleep_time, chat_count, global_count
-
     def _create_queued_message_placeholder(self, chat_id: int, task_id: str):
         """Create a placeholder message object for queued execution."""
         placeholder = QueuedSendPlaceholder(
@@ -1530,211 +1546,562 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Created queued message placeholder for chat %s", chat_id)
         return placeholder
 
+    @staticmethod
+    def _call_argument(args: tuple, kwargs: Mapping[str, object], name: str, index: int, default=None):
+        if len(args) > index:
+            return args[index]
+        return kwargs.get(name, default)
+
+    @staticmethod
+    def _replace_call_argument(
+        args: tuple,
+        kwargs: Mapping[str, object],
+        name: str,
+        index: int,
+        value: object,
+    ) -> tuple[tuple, dict]:
+        mutable_args = list(args)
+        mutable_kwargs = dict(kwargs)
+        if len(mutable_args) > index:
+            mutable_args[index] = value
+            mutable_kwargs.pop(name, None)
+        else:
+            mutable_kwargs[name] = value
+        return tuple(mutable_args), mutable_kwargs
+
+    @staticmethod
+    def _rename_call_argument(
+        args: tuple,
+        kwargs: Mapping[str, object],
+        old_name: str,
+        new_name: str,
+        index: int,
+    ) -> tuple[tuple, dict]:
+        mutable_kwargs = dict(kwargs)
+        if len(args) <= index and old_name in mutable_kwargs:
+            mutable_kwargs[new_name] = mutable_kwargs.pop(old_name)
+        return args, mutable_kwargs
+
+    @staticmethod
+    def _outbound_file_is_empty(value: object) -> bool:
+        if isinstance(value, str):
+            parsed = urlparse(value)
+            if parsed.scheme in {'http', 'https'}:
+                return False
+            path = url2pathname(parsed.path) if parsed.scheme == 'file' else value
+            return os.stat(path).st_size == 0
+        if isinstance(value, InputFile):
+            content = value.input_file_content
+            if isinstance(content, bytes):
+                return not content
+            value = content
+        if callable(getattr(value, 'seek', None)) and callable(getattr(value, 'tell', None)):
+            stream = cast(BinaryIO, value)
+            current = stream.tell()
+            try:
+                stream.seek(0, 2)
+                return stream.tell() == 0
+            finally:
+                stream.seek(current)
+        return False
+
+    @staticmethod
+    def _resolve_outbound_result_refs(value: object, predecessor_payload: Mapping[str, object]) -> object:
+        if isinstance(value, dict):
+            result_key = value.get("__etm_outbound_result__")
+            if isinstance(result_key, str):
+                if result_key not in predecessor_payload:
+                    raise ValueError(f"Predecessor result has no {result_key!r} field.")
+                return predecessor_payload[result_key]
+            return {
+                key: TelegramBotManager._resolve_outbound_result_refs(item, predecessor_payload)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [TelegramBotManager._resolve_outbound_result_refs(item, predecessor_payload) for item in value]
+        if isinstance(value, tuple):
+            return tuple(TelegramBotManager._resolve_outbound_result_refs(item, predecessor_payload) for item in value)
+        return value
+
+    def _build_outbound_workflow_specs(
+        self,
+        *,
+        source_key: str,
+        slave_id: Optional[str],
+        priority: bool,
+        target_chat_id: int,
+        operation: str,
+        args: tuple,
+        kwargs: Mapping[str, object],
+        required_sender_bot_id: Optional[str],
+        log_payload: Optional[Mapping[str, object]],
+    ) -> tuple[list[OutboundTaskSpec], int]:
+        specs: list[OutboundTaskSpec] = []
+        message_thread_id = cast(Optional[int], kwargs.get('message_thread_id'))
+
+        def add(
+            api_operation: str,
+            step_args: tuple,
+            step_kwargs: Mapping[str, object],
+            *,
+            dependency: Optional[int] = None,
+            run_condition: str = RunCondition.ALWAYS,
+            step_log_payload: Optional[Mapping[str, object]] = None,
+            required_sender: Optional[str] = required_sender_bot_id,
+        ) -> int:
+            step_index = len(specs)
+            specs.append(OutboundTaskSpec(
+                source_key=source_key,
+                slave_id=slave_id,
+                priority=priority,
+                target_chat_id=target_chat_id,
+                message_thread_id=message_thread_id,
+                operation=f"api_{api_operation}",
+                args=step_args,
+                kwargs=step_kwargs,
+                depends_on_step_index=dependency,
+                run_condition=run_condition,
+                required_sender_bot_id=required_sender,
+                log_payload=step_log_payload,
+            ))
+            return step_index
+
+        def add_parse_variant(
+            api_operation: str,
+            primary_index: int,
+            step_args: tuple,
+            step_kwargs: Mapping[str, object],
+            *,
+            step_log_payload: Optional[Mapping[str, object]],
+            required_sender: Optional[str] = required_sender_bot_id,
+        ) -> Optional[int]:
+            if 'parse_mode' not in step_kwargs or step_kwargs.get('parse_mode') is None:
+                return None
+            fallback_kwargs = dict(step_kwargs)
+            fallback_kwargs.pop('parse_mode', None)
+            return add(
+                api_operation,
+                step_args,
+                fallback_kwargs,
+                dependency=primary_index,
+                run_condition=f"{RunCondition.PREDECESSOR_ERROR_PREFIX}parse_entities",
+                step_log_payload=step_log_payload,
+                required_sender=required_sender,
+            )
+
+        def add_full_text_attachment(predecessor_index: int, content: str, filename: str) -> None:
+            attachment_kwargs: dict[str, object] = {
+                "chat_id": target_chat_id,
+                "document": io.BytesIO(content.encode("utf-8")),
+                "filename": filename,
+                "reply_to_message_id": {"__etm_outbound_result__": "message_id"},
+                "caption": self._("Message is truncated due to its length. Full message is sent as attachment."),
+            }
+            if message_thread_id is not None:
+                attachment_kwargs["message_thread_id"] = message_thread_id
+            add(
+                "send_document",
+                (),
+                attachment_kwargs,
+                dependency=predecessor_index,
+                run_condition=RunCondition.PREDECESSOR_SUCCESS,
+                required_sender=None,
+            )
+
+        if operation == 'send_message':
+            step_kwargs = dict(kwargs)
+            prefix = str(step_kwargs.pop('prefix', '') or '')
+            suffix = str(step_kwargs.pop('suffix', '') or '')
+            text = str(self._call_argument(args, step_kwargs, 'text', 1, '') or '')
+            prefix = f"{prefix}\n" if prefix else ''
+            suffix = f"\n{suffix}" if suffix else ''
+            if str(step_kwargs.get('parse_mode', '')).lower() == 'html':
+                prefix = html.escape(prefix)
+                suffix = html.escape(suffix)
+            full_text = prefix + text + suffix
+            send_text = full_text
+            is_long = len(full_text) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH
+            if is_long:
+                send_text = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
+            step_args, step_kwargs = self._replace_call_argument(args, step_kwargs, 'text', 1, send_text)
+            primary = add('send_message', step_args, step_kwargs, step_log_payload=log_payload)
+            parse_fallback = add_parse_variant(
+                'send_message', primary, step_args, step_kwargs, step_log_payload=log_payload,
+            )
+            if is_long:
+                extension = '.html' if str(step_kwargs.get('parse_mode', '')).lower() == 'html' else '.txt'
+                add_full_text_attachment(primary, full_text, f"{target_chat_id}_message{extension}")
+                if parse_fallback is not None:
+                    add_full_text_attachment(parse_fallback, full_text, f"{target_chat_id}_message.txt")
+            return specs, primary
+
+        if operation == 'edit_message_text':
+            step_kwargs = dict(kwargs)
+            prefix = str(step_kwargs.pop('prefix', '') or '')
+            suffix = str(step_kwargs.pop('suffix', '') or '')
+            text = str(step_kwargs.get('text', '') or '')
+            prefix = f"{prefix}\n" if prefix else ''
+            suffix = f"\n{suffix}" if suffix else ''
+            if str(step_kwargs.get('parse_mode', '')).lower() == 'html':
+                prefix = html.escape(prefix)
+                suffix = html.escape(suffix)
+            full_text = prefix + text + suffix
+            is_long = len(full_text) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH
+            step_kwargs['text'] = (
+                prefix + text[:100] + "\n...\n" + text[-100:] + suffix
+                if is_long else full_text
+            )
+            primary = add('edit_message_text', args, step_kwargs, step_log_payload=log_payload)
+            variants = [primary]
+            parse_fallback = add_parse_variant(
+                'edit_message_text', primary, args, step_kwargs,
+                step_log_payload=log_payload,
+            )
+            if parse_fallback is not None:
+                variants.append(parse_fallback)
+
+            for edit_index, edit_kwargs in [(primary, step_kwargs)] + (
+                [(parse_fallback, {key: value for key, value in step_kwargs.items() if key != 'parse_mode'})]
+                if parse_fallback is not None else []
+            ):
+                for error_class, reply_to_original in (
+                    ('edit_not_allowed', True),
+                    ('edit_not_found', False),
+                ):
+                    fallback_kwargs = dict(edit_kwargs)
+                    original_message_id = fallback_kwargs.pop('message_id', None)
+                    if reply_to_original and original_message_id is not None:
+                        fallback_kwargs['reply_to_message_id'] = original_message_id
+                    fallback = add(
+                        'send_message',
+                        (),
+                        fallback_kwargs,
+                        dependency=cast(int, edit_index),
+                        run_condition=f"{RunCondition.PREDECESSOR_ERROR_PREFIX}{error_class}",
+                        step_log_payload=log_payload,
+                        required_sender=None,
+                    )
+                    variants.append(fallback)
+                    parse_send_fallback = add_parse_variant(
+                        'send_message', fallback, (), fallback_kwargs,
+                        step_log_payload=log_payload, required_sender=None,
+                    )
+                    if parse_send_fallback is not None:
+                        variants.append(parse_send_fallback)
+            if is_long:
+                for variant in variants:
+                    add_full_text_attachment(variant, full_text, f"{target_chat_id}_message.txt")
+            return specs, primary
+
+        caption_operations = {
+            'send_audio': 'audio',
+            'send_voice': 'voice',
+            'send_video': 'video',
+            'send_document': 'document',
+            'send_animation': 'animation',
+            'send_photo': 'photo',
+        }
+        if operation in caption_operations or operation == 'edit_message_caption':
+            step_kwargs = dict(kwargs)
+            fallback_to_document = bool(step_kwargs.pop('_fallback_to_document', True))
+            prefix = str(step_kwargs.pop('prefix', '') or '')
+            suffix = str(step_kwargs.pop('suffix', '') or '')
+            caption = str(step_kwargs.pop('caption', '') or '')
+            if operation in caption_operations:
+                file_value = self._call_argument(
+                    args,
+                    step_kwargs,
+                    caption_operations[operation],
+                    1,
+                )
+                if file_value is not None and self._outbound_file_is_empty(file_value):
+                    return self._build_outbound_workflow_specs(
+                        source_key=source_key,
+                        slave_id=slave_id,
+                        priority=priority,
+                        target_chat_id=target_chat_id,
+                        operation='send_message',
+                        args=(target_chat_id,),
+                        kwargs={
+                            "prefix": self._("Empty attachment detected.") + prefix,
+                            "text": caption,
+                            "suffix": suffix,
+                            **(
+                                {"message_thread_id": message_thread_id}
+                                if message_thread_id is not None else {}
+                            ),
+                        },
+                        required_sender_bot_id=None,
+                        log_payload=log_payload,
+                    )
+            prefix = f"{prefix}\n" if prefix else ''
+            suffix = f"\n{suffix}" if suffix else ''
+            if str(step_kwargs.get('parse_mode', '')).lower() == 'html':
+                prefix = html.escape(prefix)
+                suffix = html.escape(suffix)
+            full_caption = prefix + caption + suffix
+            is_long = len(full_caption) >= telegram.constants.MessageLimit.CAPTION_LENGTH
+            step_kwargs['caption'] = (
+                prefix + caption[:100] + "\n...\n" + caption[-100:] + suffix
+                if is_long else full_caption
+            )
+            primary = add(operation, args, step_kwargs, step_log_payload=log_payload)
+            variants = [primary]
+            parse_fallback = add_parse_variant(
+                operation, primary, args, step_kwargs, step_log_payload=log_payload,
+            )
+            if parse_fallback is not None:
+                variants.append(parse_fallback)
+
+            document_fallback_operations = {'send_audio', 'send_voice', 'send_video'}
+            if operation in document_fallback_operations or (
+                operation == 'send_photo' and fallback_to_document
+            ):
+                for media_index, media_kwargs in [(primary, step_kwargs)] + (
+                    [(parse_fallback, {key: value for key, value in step_kwargs.items() if key != 'parse_mode'})]
+                    if parse_fallback is not None else []
+                ):
+                    document_args, document_kwargs = self._rename_call_argument(
+                        args,
+                        media_kwargs,
+                        caption_operations[operation],
+                        'document',
+                        1,
+                    )
+                    fallback = add(
+                        'send_document',
+                        document_args,
+                        document_kwargs,
+                        dependency=cast(int, media_index),
+                        run_condition=f"{RunCondition.PREDECESSOR_ERROR_PREFIX}media_bad_request",
+                        step_log_payload=log_payload,
+                        required_sender=None,
+                    )
+                    variants.append(fallback)
+                    parse_document = add_parse_variant(
+                        'send_document', fallback, document_args, document_kwargs,
+                        step_log_payload=log_payload, required_sender=None,
+                    )
+                    if parse_document is not None:
+                        variants.append(parse_document)
+            if is_long:
+                for variant in variants:
+                    add_full_text_attachment(variant, full_caption, f"{target_chat_id}_caption.txt")
+            return specs, primary
+
+        primary = add(operation, args, kwargs, step_log_payload=log_payload)
+        return specs, primary
+
     def _enqueue_send_task(self, target: SendTarget, function: Callable,
                            args: tuple, kwargs: dict,
                            cleanup_files: Optional[list] = None,
                            db_log_context: Optional[QueuedDbLogContext] = None,
                            priority: bool = False,
                            waiter: Optional[Future] = None) -> str:
-        """Append a task to the destination Telegram chat FIFO queue."""
+        """Durably accept one bounded Telegram operation into a source lane."""
         slave_id, chat_id = target
-        enqueued_at = time.monotonic()
-        with self._send_queues_lock:
-            self._tasks_enqueued += 1
-            task_id = f"{slave_id}_{chat_id}_{self._tasks_enqueued}"
-            task = QueuedSendTask(
-                target=target,
-                function=function,
-                args=args,
-                kwargs=kwargs,
-                task_id=task_id,
-                cleanup_files=tuple(cleanup_files or ()),
-                enqueued_at=enqueued_at,
-                db_log_context=db_log_context,
-                priority=priority,
-                waiter=waiter,
+        durable_kwargs = dict(kwargs)
+        required_sender_bot_id = durable_kwargs.pop('_required_sender_bot_id', None)
+        for key in _INTERNAL_KWARGS:
+            durable_kwargs.pop(key, None)
+        durable_args = args[1:] if args and args[0] is self else args
+        log_payload = None
+        if db_log_context is not None:
+            log_payload = self.channel.db.build_outbound_log_payload(
+                db_log_context.etm_msg,
+                db_log_context.old_msg_id,
             )
-            q = self._send_queues.setdefault(chat_id, collections.deque())
-            if priority:
-                insert_at = 0
-                for existing in q:
-                    if not existing.priority:
-                        break
-                    insert_at += 1
-                q.insert(insert_at, task)
-            else:
-                q.append(task)
-            queue_depth = len(q)
+        specs, result_task_index = self._build_outbound_workflow_specs(
+            source_key=slave_id,
+            slave_id=None if slave_id == self.BLOCKING_SEND_TARGET_SLAVE_ID else slave_id,
+            priority=priority,
+            target_chat_id=int(chat_id),
+            operation=function.__name__,
+            args=durable_args,
+            kwargs=durable_kwargs,
+            required_sender_bot_id=required_sender_bot_id,
+            log_payload=log_payload,
+        )
+        created = self._outbound_repository.create_workflow(
+            specs,
+            result_task_index=result_task_index,
+        )
+        task = created.tasks[0]
+        with self._outbound_registry_lock:
+            for workflow_task in created.tasks:
+                self._outbound_workflow_by_task[workflow_task.id] = created.workflow.id
+            if waiter is not None:
+                self._outbound_waiters[created.workflow.id] = waiter
+                self._outbound_waiter_receipts[created.workflow.id] = True
+            if db_log_context is not None:
+                self._outbound_db_callbacks[created.workflow.id] = db_log_context.on_complete
+
+        for path in cleanup_files or ():
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                self.logger.warning("Failed to remove source temp file %s after durable spooling: %s", path, error)
 
         metrics = getattr(self, '_metrics', None)
         if metrics:
             metrics.task_enqueued(priority=priority)
 
-        self.logger.debug("Queued send task %s for target %s (chat_queue_depth=%d)",
-                          task_id, target, queue_depth)
-        return task_id
+        self._outbound_scheduler.wake_event.set()
+        self.logger.debug("Durably accepted outbound task %s for source %s", task.id, slave_id)
+        return str(task.id)
+
+    def enqueue_history_operation(
+        self,
+        *,
+        source_key: str,
+        target_chat_id: int,
+        operation: str,
+        args: tuple,
+        kwargs: Mapping[str, object],
+        history_entry_ids: Collection[int],
+    ) -> int:
+        specs, result_task_index = self._build_outbound_workflow_specs(
+            source_key=f"history:{source_key}",
+            slave_id=None,
+            priority=False,
+            target_chat_id=target_chat_id,
+            operation=operation,
+            args=args,
+            kwargs=kwargs,
+            required_sender_bot_id=None,
+            log_payload=None,
+        )
+        with OutboundTask._meta.database.atomic():
+            created = self._outbound_repository.create_workflow(
+                specs,
+                result_task_index=result_task_index,
+            )
+            self.channel.db.link_history_migration_entries(
+                history_entry_ids,
+                cast(int, created.workflow.id),
+            )
+        with self._outbound_registry_lock:
+            for task in created.tasks:
+                self._outbound_workflow_by_task[task.id] = created.workflow.id
+        self._outbound_scheduler.wake_event.set()
+        return cast(int, created.workflow.id)
+
+    def _enqueue_blocking_api_operation(
+        self,
+        *,
+        target_chat_id: int,
+        operation: str,
+        args: tuple,
+        kwargs: Mapping[str, object],
+        required_sender_bot_id: Optional[str],
+    ) -> object:
+        created = self._outbound_repository.create_workflow([
+            OutboundTaskSpec(
+                source_key=f"__control__:{target_chat_id}",
+                slave_id=None,
+                priority=True,
+                target_chat_id=target_chat_id,
+                message_thread_id=cast(Optional[int], kwargs.get('message_thread_id')),
+                operation=f"api_{operation}",
+                args=args,
+                kwargs=kwargs,
+                required_sender_bot_id=required_sender_bot_id,
+            )
+        ])
+        waiter: Future = Future()
+        with self._outbound_registry_lock:
+            for task in created.tasks:
+                self._outbound_workflow_by_task[task.id] = created.workflow.id
+            self._outbound_waiters[created.workflow.id] = waiter
+            self._outbound_waiter_receipts[created.workflow.id] = False
+        self._outbound_scheduler.wake_event.set()
+        try:
+            return waiter.result(timeout=self.BLOCKING_SEND_TIMEOUT)
+        except FutureTimeoutError as error:
+            with self._outbound_registry_lock:
+                if self._outbound_waiters.get(created.workflow.id) is waiter:
+                    self._outbound_waiters.pop(created.workflow.id, None)
+                    self._outbound_waiter_receipts.pop(created.workflow.id, None)
+            metrics = getattr(self, '_metrics', None)
+            if metrics:
+                metrics.waiter_timed_out(operation)
+            raise RuntimeError(
+                f"Outbound control workflow {created.workflow.id} timed out; durable work remains queued."
+            ) from error
+
+    def _enqueue_main_chat_mutation(
+        self,
+        operation: str,
+        args: tuple,
+        kwargs: Mapping[str, object],
+    ) -> object:
+        chat_id_value = args[0] if args else kwargs['chat_id']
+        if not isinstance(chat_id_value, (int, str)):
+            raise TypeError("Telegram chat_id must be an integer or decimal string.")
+        chat_id = int(chat_id_value)
+        return self._enqueue_blocking_api_operation(
+            target_chat_id=chat_id,
+            operation=operation,
+            args=args,
+            kwargs=kwargs,
+            required_sender_bot_id="__main__",
+        )
 
     # ── Async-dispatch queued send worker ──────────────────────
 
     def _dispatch_ready_send_tasks(self, now: float):
-        with self._send_queues_lock:
-            dispatchable_targets = [
-                chat_id for chat_id, q in self._send_queues.items()
-                if (
-                    q
-                    and chat_id not in self._send_in_flight
-                    and q[0].not_before <= now
-                )
-            ]
-
-        for chat_id in dispatchable_targets:
-            if self._send_worker_stop.is_set():
-                break
-
-            with self._send_queues_lock:
-                q = self._send_queues.get(chat_id)
-                if not q:
-                    continue
-                task = q.popleft()
-                if not q:
-                    del self._send_queues[chat_id]
-
-            sender_bot, sender_bot_id, wait_time = self._select_queued_sender(
-                task.chat_id,
-                forced_sender_bot_id=task.kwargs.get('_force_sender_bot_id')
-                if task.kwargs.get('_force_sender_known') else None,
-                force_main=bool(task.kwargs.get('_force_main_bot')),
-                slave_id=task.slave_id,
-                has_callback=_has_callback_keyboard(task.kwargs.get('reply_markup')),
-                message_thread_id=task.kwargs.get('message_thread_id'),
-                now=now,
-            )
-            metrics = getattr(self, '_metrics', None)
-            if sender_bot is None or wait_time > 0:
-                if metrics:
-                    metrics.task_requeued("local_rate_limit")
-                if sender_bot_id is not None:
-                    self._release_reserved_slot(sender_bot_id, task.chat_id)
-                self._requeue_send_task(
-                    task._replace(not_before=now + max(float(wait_time or 0.0), 0.05))
-                )
-                continue
-
-            if task.enqueued_at:
-                self.logger.debug(
-                    "Dispatching queued send task %s after %.3fs in queue via bot %s",
-                    task.task_id,
-                    time.monotonic() - task.enqueued_at,
-                    sender_bot_id or "main",
-                )
-            if metrics:
-                if task.enqueued_at:
-                    metrics.observe_queue_wait(time.monotonic() - task.enqueued_at)
-                metrics.task_dispatched(TelegramBotManager._metrics_sender(sender_bot_id))
-            self._dispatch_send(task, sender_bot, sender_bot_id)
+        return self._outbound_scheduler.dispatch_ready(datetime.utcfromtimestamp(now))
 
     def _queued_send_worker(self):
-        """Worker thread: dispatch sends to a thread pool.
-
-        Same Telegram chat → serial (one in-flight at a time, preserves order).
-        Different Telegram chats → parallel (thread pool).
-        The worker thread itself never blocks on HTTP; it only orchestrates.
-        """
-        self.logger.debug("Queued send worker started")
+        """Drive durable lane heads without blocking on Telegram HTTP calls."""
+        self.logger.debug("Durable outbound worker started")
         metrics = getattr(self, '_metrics', None)
 
         while not self._send_worker_stop.is_set():
             try:
-                now = time.time()
+                now = utc_now()
                 if metrics:
                     metrics.loop_tick()
+                recovery = self._outbound_repository.recover(
+                    now,
+                    local_in_flight_task_ids=self._outbound_scheduler.in_flight_task_ids(),
+                )
+                if metrics and recovery.requeued_ambiguous_ids:
+                    metrics.recovered("ambiguous_requeued", len(recovery.requeued_ambiguous_ids))
+                self._reconcile_sent_pending_tasks(recovery.sent_pending_log_ids)
+                self._outbound_scheduler.harvest_completed(now)
+                heartbeat_count = self._outbound_scheduler.heartbeat(now)
+                if metrics:
+                    metrics.lease_heartbeat(heartbeat_count)
+                self._outbound_scheduler.dispatch_ready(now)
 
-                # ── 1. Harvest completed sends ──
-                self._harvest_completed_sends()
-
-                # ── 2. Dispatch ready tasks ──
-                self._dispatch_ready_send_tasks(now)
-
-                # ── 3. Housekeeping ──
-                # Purge expired disabled bot/chat entries
+                now_timestamp = now.timestamp()
                 if self._bot_chat_disabled_until:
-                    expired = [k for k, v in self._bot_chat_disabled_until.items() if v <= now]
+                    expired = [k for k, v in self._bot_chat_disabled_until.items() if v <= now_timestamp]
                     for k in expired:
                         del self._bot_chat_disabled_until[k]
-                if now - self._last_queue_stats_log >= self._queue_stats_log_interval:
-                    with self._send_queues_lock:
-                        queued_targets = len(self._send_queues)
-                        queued_tasks = sum(len(q) for q in self._send_queues.values())
-                        in_flight = len(self._send_in_flight)
-                        retry_targets = sum(
-                            1 for q in self._send_queues.values()
-                            if q and q[0].not_before > now
-                        )
-                    if queued_tasks or in_flight or retry_targets or self._bot_chat_disabled_until:
-                        self.logger.info(
-                            "Queued send backlog: queued_tasks=%d queued_targets=%d "
-                            "in_flight=%d retry_targets=%d disabled_bot_chats=%d",
-                            queued_tasks, queued_targets, in_flight, retry_targets,
-                            len(self._bot_chat_disabled_until),
-                        )
-                    self._last_queue_stats_log = now
-
-                if metrics and now - self._last_metrics_snapshot >= 1.0:
+                if metrics and now_timestamp - self._last_metrics_snapshot >= 1.0:
                     self._snapshot_send_metrics(worker_alive=True)
-                    self._last_metrics_snapshot = now
+                    self._last_metrics_snapshot = now_timestamp
 
-                self._send_worker_stop.wait(timeout=0.05)
+                self._outbound_scheduler.wake_event.wait(timeout=0.25)
+                self._outbound_scheduler.wake_event.clear()
 
             except Exception as e:
                 if metrics:
                     metrics.loop_error()
-                self.logger.exception(f"Error in queued send worker: {e}")
+                self.logger.exception("Error in durable outbound worker: %s", e)
                 self._send_worker_stop.wait(timeout=1)
 
-        # Shutdown: wait for in-flight sends to finish
-        self._drop_pending_queued_tasks_on_shutdown()
-        for chat_id, (future, task, bot_id) in list(self._send_in_flight.items()):
-            try:
-                result = future.result(timeout=10)
-            except Exception as e:
-                self._finish_failed_send(task, e, bot_id)
-            else:
-                self._finish_successful_send(task, result, bot_id)
-            finally:
-                self._send_in_flight.pop(chat_id, None)
+        shutdown_deadline = time.monotonic() + 10.0
+        while self._outbound_scheduler.in_flight_snapshot() and time.monotonic() < shutdown_deadline:
+            self._outbound_scheduler.harvest_completed(utc_now())
+            self._send_worker_stop.wait(timeout=0.05)
         self._send_executor.shutdown(wait=False)
         self._snapshot_send_metrics(worker_alive=False)
-        self.logger.debug("Queued send worker stopped")
-
-    def _dispatch_send(self, task: QueuedSendTask, sender_bot, sender_bot_id: Optional[str]):
-        """Submit a send operation to the thread pool."""
-        sender = TelegramBotManager._metrics_sender(sender_bot_id)
-
-        def _do_send():
-            send_kwargs = {
-                key: value for key, value in task.kwargs.items()
-                if key not in _INTERNAL_KWARGS
-            }
-            send_kwargs['_skip_rate_limit_retry'] = True
-            started = time.monotonic()
-            with self._using_bot(sender_bot):
-                result = task.function(*task.args, **send_kwargs)
-            metrics = getattr(self, '_metrics', None)
-            if metrics:
-                metrics.observe_send_latency(sender, time.monotonic() - started)
-            return result
-
-        future = self._send_executor.submit(_do_send)
-        self._send_in_flight[task.chat_id] = (future, task, sender_bot_id)
-
-    def _release_reserved_slot(self, sender_bot_id: Optional[str], chat_id: int):
-        if sender_bot_id and self.bot_pool:
-            aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
-            if aux_bot and hasattr(aux_bot, "release_slot"):
-                aux_bot.release_slot(chat_id)
-            return
-        if hasattr(self, "_rate_limiter"):
-            self._rate_limiter.release_slot(chat_id)
+        self.logger.debug("Durable outbound worker stopped")
 
     @staticmethod
     def _rate_limit_retry_after_seconds(error: Exception) -> Optional[float]:
@@ -1768,225 +2135,6 @@ class TelegramBotManager(LocaleMixin):
             floor = cls.TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS * (2 ** (consecutive_failures - 2))
             delay = max(delay, min(floor, cls.TELEGRAM_RETRY_AFTER_BACKOFF_CAP_SECONDS))
         return delay
-
-    @staticmethod
-    def _queued_send_affinity_key(task: QueuedSendTask):
-        if task.kwargs.get('_force_sender_known') or task.kwargs.get('_force_main_bot'):
-            return None
-        if _has_callback_keyboard(task.kwargs.get('reply_markup')):
-            return None
-        return task.slave_id or (task.chat_id, task.kwargs.get('message_thread_id'))
-
-    def _forget_queued_send_affinity_after_retry(self, task: QueuedSendTask,
-                                                 sender_bot_id: Optional[str]) -> None:
-        if sender_bot_id is None:
-            return
-        bot_pool = getattr(self, 'bot_pool', None)
-        if bot_pool is None or not hasattr(bot_pool, 'forget_affinity'):
-            return
-        bot_pool.forget_affinity(TelegramBotManager._queued_send_affinity_key(task))
-
-    def _requeue_after_telegram_rate_limit(self, task: QueuedSendTask,
-                                           sender_bot_id: Optional[str],
-                                           retry_after: float):
-        retry_failures = getattr(self, '_bot_chat_retry_failures', None)
-        bot_chat_key = (sender_bot_id, task.chat_id)
-        consecutive_failures = 1
-        if retry_failures is not None:
-            consecutive_failures = retry_failures.get(bot_chat_key, 0) + 1
-            retry_failures[bot_chat_key] = consecutive_failures
-        retry_delay = TelegramBotManager._telegram_retry_delay_seconds(retry_after, consecutive_failures)
-        self.logger.warning(
-            "Telegram rate limit for bot %s in chat %d (task %s): retry_after=%.2fs "
-            "scheduled_wait=%.2fs consecutive_bot_chat_failures=%d; other bots can still send",
-            sender_bot_id or "main", task.chat_id, task.task_id,
-            retry_after, retry_delay, consecutive_failures,
-        )
-        metrics = getattr(self, '_metrics', None)
-        if metrics:
-            metrics.rate_limited(TelegramBotManager._metrics_sender(sender_bot_id))
-            metrics.task_requeued("rate_limit")
-            metrics.dispatch_blocked("bot_chat_cooldown")
-        TelegramBotManager._forget_queued_send_affinity_after_retry(self, task, sender_bot_id)
-        deadline = time.time() + retry_delay
-        self._bot_chat_disabled_until[bot_chat_key] = deadline
-        self._release_reserved_slot(sender_bot_id, task.chat_id)
-        self._requeue_send_task(task)
-
-    def _resolve_task_waiter_success(
-        self,
-        task: QueuedSendTask,
-        result: object,
-        sender_bot_id: Optional[str],
-    ):
-        if task.waiter is not None and not task.waiter.done():
-            task.waiter.set_result(
-                self._make_send_receipt(result, sender_bot_id=sender_bot_id)
-            )
-
-    @staticmethod
-    def _resolve_task_waiter_exception(task: QueuedSendTask, error: Exception):
-        if task.waiter is not None and not task.waiter.done():
-            task.waiter.set_exception(error)
-
-    def _finish_successful_send(
-        self,
-        task: QueuedSendTask,
-        result: object,
-        sender_bot_id: Optional[str],
-    ):
-        metrics = getattr(self, '_metrics', None)
-        sender = TelegramBotManager._metrics_sender(sender_bot_id)
-        retry_failures = getattr(self, '_bot_chat_retry_failures', None)
-        if retry_failures is not None:
-            retry_failures.pop((sender_bot_id, task.chat_id), None)
-        if metrics:
-            metrics.send_completed(sender, "ok", TelegramBotManager._task_total_seconds(task))
-
-        if sender_bot_id is not None:
-            self._record_aux_use(task.chat_id)
-
-        if task.enqueued_at:
-            self.logger.debug(
-                "Queued send task %s completed successfully in %.3fs since enqueue",
-                task.task_id,
-                time.monotonic() - task.enqueued_at,
-            )
-        else:
-            self.logger.debug("Queued send task %s completed successfully", task.task_id)
-
-        if result and hasattr(result, 'message_id'):
-            self._finish_queued_database_update(
-                task.db_log_context, cast(TelegramMessage, result), sender_bot_id=sender_bot_id,
-            )
-        else:
-            self._finish_queued_database_update(task.db_log_context)
-        self._resolve_task_waiter_success(task, result, sender_bot_id)
-
-    def _finish_failed_send(self, task: QueuedSendTask, error: Exception,
-                            sender_bot_id: Optional[str] = None):
-        retry_failures = getattr(self, '_bot_chat_retry_failures', None)
-        if retry_failures is not None:
-            retry_failures.pop((sender_bot_id, task.chat_id), None)
-        self._finish_queued_database_update(task.db_log_context)
-        self._resolve_task_waiter_exception(task, error)
-
-    def _cleanup_queued_task_files(self, task: QueuedSendTask):
-        for path in task.cleanup_files:
-            try:
-                os.unlink(path)
-                self.logger.debug("Cleaned up queued task temp file: %s", path)
-            except OSError as e:
-                self.logger.warning("Failed to clean up temp file %s: %s", path, e)
-
-    def _drop_pending_queued_tasks_on_shutdown(self):
-        error = RuntimeError("Queued send worker stopped before task was dispatched.")
-        with self._send_queues_lock:
-            pending_tasks = [
-                task
-                for q in self._send_queues.values()
-                for task in q
-            ]
-            self._send_queues.clear()
-        for task in pending_tasks:
-            self._finish_failed_send(task, error)
-            self._cleanup_queued_task_files(task)
-
-    def _harvest_completed_sends(self):
-        """Check all in-flight futures; handle success / errors."""
-        completed = [(chat_id, ft) for chat_id, ft in self._send_in_flight.items() if ft[0].done()]
-
-        for chat_id, (future, task, sender_bot_id) in completed:
-            del self._send_in_flight[chat_id]
-            sender = TelegramBotManager._metrics_sender(sender_bot_id)
-            metrics = getattr(self, '_metrics', None)
-            should_cleanup = False
-
-            try:
-                result = future.result()  # already done, won't block
-                self._finish_successful_send(task, result, sender_bot_id)
-                should_cleanup = True
-
-            except Exception as e:
-                if metrics:
-                    metrics.send_failure_from_exception(sender, task.function, e)
-                retry_after = self._rate_limit_retry_after_seconds(e)
-                if retry_after is not None:
-                    self._requeue_after_telegram_rate_limit(
-                        task, sender_bot_id, retry_after
-                    )
-                    continue
-
-                if isinstance(e, telegram.error.BadRequest):
-                    self._release_reserved_slot(sender_bot_id, task.chat_id)
-                    if metrics:
-                        metrics.send_completed(sender, "dropped_bad_request")
-                        metrics.task_dropped("bad_request")
-                        metrics.bad_request_from_exception(task.function, e)
-                    self.logger.warning(
-                        "Non-retryable BadRequest for queued task %s, dropping: %s "
-                        "(chat_id=%s, reply_to_message_id=%s, message_thread_id=%s, method=%s)",
-                        task.task_id, e, task.chat_id,
-                        task.kwargs.get("reply_to_message_id"),
-                        task.kwargs.get("message_thread_id"),
-                        getattr(task.function, "__name__", repr(task.function)),
-                    )
-                    self._finish_failed_send(task, e, sender_bot_id)
-                    should_cleanup = True
-                    continue
-
-                if isinstance(e, (telegram.error.TimedOut, telegram.error.NetworkError)):
-                    self.logger.warning(
-                        "Transient error for queued task %s, retrying: %s",
-                        task.task_id, e,
-                    )
-                    self._release_reserved_slot(sender_bot_id, task.chat_id)
-                    if metrics:
-                        reason = "timed_out" if isinstance(e, telegram.error.TimedOut) else "network"
-                        metrics.task_requeued(reason)
-                    self._requeue_send_task(task)
-                    continue
-
-                if isinstance(e, telegram.error.Forbidden):
-                    self._release_reserved_slot(sender_bot_id, task.chat_id)
-                    if sender_bot_id and self.bot_pool:
-                        aux_bot = self.bot_pool.get_bot_by_id(sender_bot_id)
-                        if aux_bot:
-                            aux_bot.update_membership(task.chat_id, False)
-                            self.logger.warning(
-                                "Aux bot %s got Forbidden in chat %s for queued task %s; "
-                                "marking it as non-member for this chat and retrying.",
-                                sender_bot_id, task.chat_id, task.task_id,
-                            )
-                            if metrics:
-                                metrics.task_requeued("forbidden_aux")
-                            self._requeue_send_task(task)
-                            continue
-                    if sender_bot_id is None:
-                        self.logger.error(
-                            "Main bot got Forbidden in chat %s for queued task %s; dropping task: %s",
-                            task.chat_id, task.task_id, e,
-                        )
-                    else:
-                        self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
-                    if metrics:
-                        metrics.send_completed(sender, "dropped_forbidden")
-                        metrics.task_dropped("forbidden")
-                    self._finish_failed_send(task, e, sender_bot_id)
-                    should_cleanup = True
-                    continue
-
-                self._release_reserved_slot(sender_bot_id, task.chat_id)
-                if metrics:
-                    metrics.send_completed(sender, "error")
-                    metrics.task_dropped("error")
-                self.logger.exception(f"Error executing queued task {task.task_id}: {e}")
-                self._finish_failed_send(task, e, sender_bot_id)
-                should_cleanup = True
-
-            finally:
-                if should_cleanup:
-                    self._cleanup_queued_task_files(task)
 
     def _run_database_update_callback(self, on_complete: Optional[Callable[[], None]]):
         if on_complete is None:
@@ -2024,26 +2172,6 @@ class TelegramBotManager(LocaleMixin):
         finally:
             self._run_database_update_callback(on_complete)
 
-    def _finish_queued_database_update(
-        self,
-        db_log_context: Optional[QueuedDbLogContext],
-        real_tg_msg: Optional[TelegramMessage] = None,
-        *,
-        sender_bot_id: Optional[str] = None,
-    ):
-        if db_log_context is None:
-            return
-        if real_tg_msg is None:
-            self._run_database_update_callback(db_log_context.on_complete)
-            return
-        self._write_database_update(
-            db_log_context.etm_msg,
-            db_log_context.old_msg_id,
-            real_tg_msg,
-            sender_bot_id=sender_bot_id,
-            on_complete=db_log_context.on_complete,
-        )
-
     def write_db_mapping(
         self,
         etm_msg,
@@ -2063,20 +2191,22 @@ class TelegramBotManager(LocaleMixin):
         )
 
     def stop_queued_worker(self):
-        """Stop the queued send worker thread."""
-        self.logger.debug("Stopping queued send worker...")
+        """Stop the durable outbound worker thread."""
+        self.logger.debug("Stopping durable outbound worker...")
 
         if hasattr(self, '_send_worker_stop'):
             self._send_worker_stop.set()
+        if hasattr(self, '_outbound_scheduler'):
+            self._outbound_scheduler.wake_event.set()
 
         if hasattr(self, '_send_worker_thread') and self._send_worker_thread.is_alive():
-            self.logger.debug("Waiting for queued send worker to stop...")
+            self.logger.debug("Waiting for durable outbound worker to stop...")
             self._send_worker_thread.join(timeout=5)
 
             if self._send_worker_thread.is_alive():
-                self.logger.warning("Queued send worker did not stop gracefully within timeout")
+                self.logger.warning("Durable outbound worker did not stop within timeout")
             else:
-                self.logger.debug("Queued send worker stopped successfully")
+                self.logger.debug("Durable outbound worker stopped")
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -2096,45 +2226,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        prefix = (prefix and (prefix + "\n")) or prefix
-        suffix = (suffix and ("\n" + suffix)) or suffix
-        if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = html.escape(prefix)
-            suffix = html.escape(suffix)
-        text: str
-        if args[1:]:
-            text = args[1]
-        else:
-            text = kwargs.pop('text')
-        args = args[:1]
-        if len(prefix + text + suffix) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
-            full_message = io.BytesIO((prefix + text + suffix).encode('utf-8'))
-            truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
-            msg = self._bot_send_message_fallback(args[0], text=truncated, **kwargs)
-            filename = "%s_%s" % (args[0], msg.message_id)
-            if not kwargs.get('parse_mode'):
-                filename += ".txt"
-            elif kwargs.get('parse_mode', '').lower() == 'markdown':
-                filename += ".md"
-            elif kwargs.get('parse_mode', '').lower() == 'html':
-                filename += ".html"
-                full_message_html = (
-                    "<html><head><meta charset='utf-8'></head>"
-                    "<body><pre style='white-space:pre-wrap'>" + (prefix + text + suffix) + "</pre></body></html>"
-                )
-                # Replace the attachment payload with HTML-wrapped content.
-                # (Previous logic did seek(0) then truncate(), which empties the buffer.)
-                full_message = io.BytesIO(full_message_html.encode('utf-8'))
-            else:
-                filename += ".txt"
-            self._active_bot.send_document(args[0], full_message, filename=filename,
-                                          reply_to_message_id=msg.message_id,
-                                          caption=self._("Message is truncated due to its length. "
-                                                         "Full message is sent as attachment."))
-            return msg
-        else:
-            kwargs['text'] = prefix + text + suffix
-            return self._bot_send_message_fallback(*args, **kwargs)
+        return self._active_bot.send_message(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
@@ -2153,75 +2245,11 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        prefix = (prefix and (prefix + "\n")) or prefix
-        suffix = (suffix and ("\n" + suffix)) or suffix
-        if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = html.escape(prefix)
-            suffix = html.escape(suffix)
-        text = kwargs.pop('text', '')
-        if len(prefix + text + suffix) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
-            full_message = io.BytesIO((prefix + text + suffix).encode())
-            truncated = prefix + text[:100] + "\n...\n" + text[-100:] + suffix
-            msg = self._bot_edit_message_text_fallback(text=truncated, **kwargs)
-            filename = "%s_%s" % (kwargs['chat_id'], msg.message_id)
-            if kwargs.get('parse_mode', '').lower() == 'markdown':
-                filename += ".md"
-            elif kwargs.get('parse_mode', '').lower() == 'html':
-                filename += ".html"
-            else:
-                filename += ".txt"
-            self._active_bot.send_document(kwargs['chat_id'], full_message,
-                                          filename=filename,
-                                          reply_to_message_id=msg.message_id,
-                                          caption=self._("Message is truncated due to its length. "
-                                                         "Full message is sent as attachment."))
-            return msg
-        else:
-            kwargs['text'] = prefix + text + suffix
-            return self._bot_edit_message_text_fallback(**kwargs)
-
-    def _bot_send_message_fallback(self, *args, **kwargs):
-        """
-        Remove ``parse_mode`` if the server fails to parse.
-
-        Returns:
-            telegram.Message: The message sent
-        """
-        try:
-            return self._active_bot.send_message(*args, **kwargs)
-        except telegram.error.BadRequest as e:
-            if e.message.lower().startswith("can't parse entities") and 'parse_mode' in kwargs:
-                kwargs.pop("parse_mode")
-                return self._active_bot.send_message(*args, **kwargs)
-            else:
-                raise e
-
-    def _bot_edit_message_text_fallback(self, *args, **kwargs):
-        """
-        Remove ``parse_mode`` if the server fails to parse.
-
-        Returns:
-            telegram.Message: The message sent
-        """
-        try:
-            return self._active_bot.edit_message_text(*args, **kwargs)
-        except telegram.error.BadRequest as e:
-            if e.message == "Message can't be edited":
-                kwargs['reply_to_message_id'] = kwargs.pop('message_id')
-                return self._active_bot.send_message(*args, **kwargs)
-            elif e.message == "message to edit not found":
-                kwargs.pop('message_id')
-                return self._active_bot.send_message(*args, **kwargs)
-            elif e.message.lower().startswith("can't parse entities") and 'parse_mode' in kwargs:
-                kwargs.pop("parse_mode")
-                return self._active_bot.edit_message_text(*args, **kwargs)
-            else:
-                raise e
+        return self._active_bot.edit_message_text(**kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def send_audio(self, *args, **kwargs):
         """
@@ -2239,15 +2267,11 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        try:
-            return self._active_bot.send_audio(*args, **kwargs)
-        except telegram.error.BadRequest:
-            return self._active_bot.send_document(*args, **kwargs)
+        return self._active_bot.send_audio(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def send_voice(self, *args, **kwargs):
         """
@@ -2265,15 +2289,11 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        try:
-            return self._active_bot.send_voice(*args, **kwargs)
-        except telegram.error.BadRequest:
-            return self._active_bot.send_document(*args, **kwargs)
+        return self._active_bot.send_voice(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def send_video(self, *args, **kwargs):
         """
@@ -2291,15 +2311,11 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        try:
-            return self._active_bot.send_video(*args, **kwargs)
-        except telegram.error.BadRequest:
-            return self._active_bot.send_document(*args, **kwargs)
+        return self._active_bot.send_video(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def send_document(self, *args, **kwargs):
         """
@@ -2320,7 +2336,6 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def send_animation(self, *args, **kwargs):
         """
@@ -2341,7 +2356,6 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def send_photo(self, *args, **kwargs):
         """
@@ -2357,13 +2371,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        fallback_to_document = kwargs.pop('_fallback_to_document', True)
-        try:
-            return self._active_bot.send_photo(*args, **kwargs)
-        except telegram.error.BadRequest:
-            if not fallback_to_document:
-                raise
-            return self._active_bot.send_document(*args, **kwargs)
+        return self._active_bot.send_photo(*args, **kwargs)
 
     @Decorators.skip_on_rate_limit
     @Decorators.retry_on_timeout
@@ -2435,7 +2443,6 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.rate_limit_decorator
     @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
-    @Decorators.caption_affix_decorator
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
         return self._active_bot.edit_message_caption(*args, **kwargs)
@@ -2462,29 +2469,21 @@ class TelegramBotManager(LocaleMixin):
     def get_file(self, file_id: str) -> File:
         return cast(File, self._active_bot.get_file(file_id))
 
-    @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
     def delete_message(self, chat_id, message_id, _sender_bot_id=None):
-        if _sender_bot_id and self.bot_pool:
-            aux_bot = self.bot_pool.get_bot_by_id(_sender_bot_id)
-            if aux_bot and not aux_bot.disabled:
-                try:
-                    return aux_bot.bot.delete_message(chat_id, message_id)
-                except telegram.error.Forbidden:
-                    aux_bot.update_membership(chat_id, False)
-                    self.logger.warning(
-                        "Auxiliary bot %s got Forbidden in chat %s during delete_message; "
-                        "marking it as non-member for this chat.",
-                        _sender_bot_id, chat_id,
-                    )
-                except telegram.error.BadRequest:
-                    pass  # Fall through to main bot
-        return self._active_bot.delete_message(chat_id, message_id)
+        required_sender = str(_sender_bot_id) if _sender_bot_id else "__main__"
+        return self._enqueue_blocking_api_operation(
+            target_chat_id=int(chat_id),
+            operation="delete_message",
+            args=(chat_id, message_id),
+            kwargs={},
+            required_sender_bot_id=required_sender,
+        )
 
     @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def answer_callback_query(self, *args, prefix="", suffix="", text=None,
                               message_id=None, **kwargs):
+        chat_id = kwargs.pop('chat_id', None)
         if text is None:
             return self._bot.answer_callback_query(
                 *args, **kwargs
@@ -2492,25 +2491,69 @@ class TelegramBotManager(LocaleMixin):
         prefix = (prefix and (prefix + "\n")) or prefix
         suffix = (suffix and ("\n" + suffix)) or suffix
 
-        chat_id = kwargs.get('chat_id')
-
         if len(prefix + text + suffix) >= MAX_CALLBACK_QUERY_ANSWER_LENGTH:
             full_message = prefix + text + suffix
-            full_message_buffer = io.StringIO(full_message)
             keep_size = MAX_CALLBACK_QUERY_ANSWER_LENGTH // 3
-            truncated = full_message[:keep_size] + "…" + full_message[keep_size:]
-            result = self._bot.answer_callback_query(*args, text=truncated, **kwargs)
+            truncated = full_message[:keep_size] + "..." + full_message[-keep_size:]
             filename = f"{chat_id}_{message_id}.txt"
             if chat_id is not None:
-                self._bot.send_document(
-                    chat_id,
-                    full_message_buffer,
-                    filename,
-                    reply_to_message_id=message_id,
-                    caption=self._("Response is truncated due to its length. "
-                                   "Full message is sent as attachment."),
-                )
-            return result
+                source_key = f"__callback__:{chat_id}"
+                specs = [
+                    OutboundTaskSpec(
+                        source_key=source_key,
+                        slave_id=None,
+                        priority=True,
+                        target_chat_id=int(chat_id),
+                        message_thread_id=None,
+                        operation="api_answer_callback_query",
+                        args=args,
+                        kwargs={**kwargs, "text": truncated},
+                        required_sender_bot_id="__main__",
+                    ),
+                    OutboundTaskSpec(
+                        source_key=source_key,
+                        slave_id=None,
+                        priority=True,
+                        target_chat_id=int(chat_id),
+                        message_thread_id=None,
+                        operation="api_send_document",
+                        args=(),
+                        kwargs={
+                            "chat_id": int(chat_id),
+                            "document": io.StringIO(full_message),
+                            "filename": filename,
+                            "reply_to_message_id": message_id,
+                            "caption": self._(
+                                "Response is truncated due to its length. Full message is sent as attachment."
+                            ),
+                        },
+                        depends_on_step_index=0,
+                        run_condition=RunCondition.PREDECESSOR_SUCCESS,
+                        required_sender_bot_id="__main__",
+                    ),
+                ]
+                created = self._outbound_repository.create_workflow(specs, result_task_index=0)
+                waiter: Future = Future()
+                with self._outbound_registry_lock:
+                    for task in created.tasks:
+                        self._outbound_workflow_by_task[task.id] = created.workflow.id
+                    self._outbound_waiters[created.workflow.id] = waiter
+                    self._outbound_waiter_receipts[created.workflow.id] = False
+                self._outbound_scheduler.wake_event.set()
+                try:
+                    return waiter.result(timeout=self.BLOCKING_SEND_TIMEOUT)
+                except FutureTimeoutError as error:
+                    with self._outbound_registry_lock:
+                        if self._outbound_waiters.get(created.workflow.id) is waiter:
+                            self._outbound_waiters.pop(created.workflow.id, None)
+                            self._outbound_waiter_receipts.pop(created.workflow.id, None)
+                    metrics = getattr(self, '_metrics', None)
+                    if metrics:
+                        metrics.waiter_timed_out("answer_callback_query")
+                    raise RuntimeError(
+                        f"Callback response workflow {created.workflow.id} timed out; durable work remains queued."
+                    ) from error
+            return self._bot.answer_callback_query(*args, text=truncated, **kwargs)
         self.logger.debug(f"answer_callback_query({args}, {kwargs})")
         return self._bot.answer_callback_query(
             *args, text=prefix + text + suffix, **kwargs
@@ -2521,40 +2564,47 @@ class TelegramBotManager(LocaleMixin):
     def get_chat_info(self, *args, **kwargs):
         return self._bot.get_chat(*args, **kwargs)
 
-    @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
     def create_forum_topic(self, *args, **kwargs) -> ForumTopic:
-        return cast(ForumTopic, self._bot.create_forum_topic(*args, **kwargs))
+        chat_id = int(args[0] if args else kwargs['chat_id'])
+        return cast(ForumTopic, self._enqueue_blocking_api_operation(
+            target_chat_id=chat_id,
+            operation="create_forum_topic",
+            args=args,
+            kwargs=kwargs,
+            required_sender_bot_id="__main__",
+        ))
 
-    @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
     def edit_forum_topic(self, *args, **kwargs):
-        return self._bot.edit_forum_topic(*args, **kwargs)
+        chat_id = int(args[0] if args else kwargs['chat_id'])
+        return self._enqueue_blocking_api_operation(
+            target_chat_id=chat_id,
+            operation="edit_forum_topic",
+            args=args,
+            kwargs=kwargs,
+            required_sender_bot_id="__main__",
+        )
 
-    @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
     def reopen_forum_topic(self, *args, **kwargs) -> bool:
-        return cast(bool, self._bot.reopen_forum_topic(*args, **kwargs))
+        chat_id = int(args[0] if args else kwargs['chat_id'])
+        return cast(bool, self._enqueue_blocking_api_operation(
+            target_chat_id=chat_id,
+            operation="reopen_forum_topic",
+            args=args,
+            kwargs=kwargs,
+            required_sender_bot_id="__main__",
+        ))
 
-    @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
     def set_chat_title(self, *args, **kwargs):
-        return self._bot.set_chat_title(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("set_chat_title", args, kwargs)
 
-    @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
     def set_chat_photo(self, *args, **kwargs):
-        return self._bot.set_chat_photo(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("set_chat_photo", args, kwargs)
 
-    @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
     def pin_chat_message(self, *args, **kwargs):
-        return self._bot.pin_chat_message(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("pin_chat_message", args, kwargs)
 
-    @Decorators.retry_on_timeout
-    @Decorators.retry_on_chat_migration
     def set_chat_description(self, *args, **kwargs):
-        return self._bot.set_chat_description(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("set_chat_description", args, kwargs)
 
     def polling(self, drop_pending_updates: bool = False, timeout: int | timedelta = 10):
         """
@@ -2602,10 +2652,10 @@ class TelegramBotManager(LocaleMixin):
 
         # Log pending tasks count before stopping
         pending_count = 0
-        if hasattr(self, '_send_queues'):
-            with self._send_queues_lock:
-                pending_count = sum(len(q) for q in self._send_queues.values())
-            pending_count += len(self._send_in_flight)
+        if hasattr(self, '_outbound_scheduler'):
+            pending_count = OutboundTask.select().where(
+                OutboundTask.state.in_(TaskState.ACTIVE)
+            ).count()
 
         if pending_count > 0:
             self.logger.info("Found %d pending queued send tasks", pending_count)
@@ -2696,32 +2746,3 @@ class TelegramBotManager(LocaleMixin):
         except Exception:
             # Don't raise exceptions in __del__
             pass
-
-    def _detect_empty_file(self, file, chat, caption, prefix, suffix, message_thread_id=None):
-        empty = True
-        if isinstance(file, str):
-            parsed = urlparse(file)
-            if parsed.scheme in {'http', 'https'}:
-                empty = False
-            else:
-                stat_path = url2pathname(parsed.path) if parsed.scheme == 'file' else file
-                empty = os.stat(stat_path).st_size == 0
-        elif hasattr(file, "seekable"):
-            try:
-                if hasattr(file, 'closed') and file.closed:
-                    empty = True
-                elif file.seekable():
-                    file.seek(0, 2)
-                    empty = file.tell() == 0
-                    file.seek(0, 0)
-                else:
-                    empty = True
-            except (ValueError, OSError):
-                empty = True
-        elif isinstance(file, InputFile):
-            empty = not bool(len(file.input_file_content))
-        if empty:
-            kwargs = {'prefix': self._("Empty attachment detected.") + prefix, 'text': caption, 'suffix': suffix}
-            if message_thread_id is not None:
-                kwargs['message_thread_id'] = message_thread_id
-            return self.send_message(chat, **kwargs)

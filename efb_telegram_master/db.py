@@ -1,15 +1,30 @@
 # coding=utf-8
 
+import base64
 import datetime
 import logging
 import pickle
 import time
 from contextlib import suppress
 from functools import partial
-from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING, cast
+from typing import Collection, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING, cast
 from pathlib import Path
 
-from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy, IntegerField, AutoField
+from peewee import (
+    AutoField,
+    BigIntegerField,
+    BlobField,
+    BooleanField,
+    CharField,
+    DatabaseProxy,
+    DateTimeField,
+    DoesNotExist,
+    IntegerField,
+    Model,
+    SQL,
+    TextField,
+    fn,
+)
 from playhouse.migrate import migrate
 from telegram import Message
 from typing_extensions import TypedDict
@@ -67,6 +82,51 @@ class ChatAssoc(BaseModel):
     slave_uid = TextField()
 
 
+class OutboundWorkflow(BaseModel):
+    id = AutoField()
+    state = TextField(default="active")
+    result_task_id = BigIntegerField(null=True)
+    error_class = TextField(null=True)
+    created_at = DateTimeField(constraints=[SQL("DEFAULT CURRENT_TIMESTAMP")])
+    completed_at = DateTimeField(null=True)
+
+
+class OutboundTask(BaseModel):
+    id = AutoField()
+    source_key = TextField()
+    slave_id = TextField(null=True)
+    priority = BooleanField(default=False)
+    target_chat_id = BigIntegerField()
+    message_thread_id = BigIntegerField(null=True)
+    operation = TextField()
+    payload = TextField()
+    media_ref = TextField(null=True)
+    workflow_id = BigIntegerField(index=True)
+    step_index = IntegerField(default=0)
+    depends_on_task_id = BigIntegerField(null=True)
+    run_condition = TextField(default="always")
+    result_payload = TextField(null=True)
+    log_payload = TextField(null=True)
+    required_sender_bot_id = TextField(null=True)
+    state = TextField(default="queued")
+    available_at = DateTimeField(null=True)
+    lease_owner = TextField(null=True)
+    lease_until = DateTimeField(null=True)
+    lease_heartbeat_at = DateTimeField(null=True)
+    submitted_at = DateTimeField(null=True)
+    attempt_count = IntegerField(default=0)
+    accepted_at = DateTimeField(constraints=[SQL("DEFAULT CURRENT_TIMESTAMP")])
+    error_class = TextField(null=True)
+    last_error = TextField(null=True)
+
+    class Meta:
+        indexes = (
+            (("source_key", "priority", "accepted_at", "id"), False),
+            (("state", "available_at"), False),
+            (("workflow_id", "step_index"), True),
+        )
+
+
 class MsgLog(BaseModel):
     master_msg_id = TextField(unique=True, primary_key=True)
     """Message ID from Telegram."""
@@ -105,6 +165,8 @@ class MsgLog(BaseModel):
     """Module ID of the message sent to."""
     sender_bot_id = TextField(null=True)
     """Telegram bot user ID that sent this message. NULL means the main bot."""
+    outbound_task_id = BigIntegerField(null=True, unique=True)
+    """Durable outbound task that produced this Telegram message."""
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
@@ -182,6 +244,9 @@ class HistoryMigrationEntry(BaseModel):
     source_time = DateTimeField(null=True)
     position = IntegerField()
     created_at = DateTimeField(default=datetime.datetime.now)
+    outbound_workflow_id = BigIntegerField(null=True, index=True)
+    state = TextField(default="queued")
+    last_error = TextField(null=True)
 
     class Meta:
         indexes = (
@@ -223,19 +288,24 @@ class DatabaseManager:
                 password=db_config.get('password', ''),
                 max_connections=db_config.get('max_connections', 8),
                 stale_timeout=db_config.get('stale_timeout', 300),
+                options=db_config.get('options', '-c timezone=UTC'),
             )
             self._migrator_cls = PostgresqlMigrator
             self._is_sqlite = False
         else:
-            from playhouse.sqliteq import SqliteQueueDatabase
+            from peewee import SqliteDatabase
             from playhouse.migrate import SqliteMigrator
-            actual_db = SqliteQueueDatabase(
+            actual_db = SqliteDatabase(
                 str(base_path / 'tgdata.db'),
-                autostart=False,
+                pragmas={
+                    "journal_mode": "wal",
+                    "foreign_keys": 1,
+                    "busy_timeout": 5000,
+                },
+                check_same_thread=False,
             )
             self._migrator_cls = SqliteMigrator
             self._is_sqlite = True
-            actual_db.start()
 
         database.initialize(actual_db)
         database.connect()
@@ -263,8 +333,9 @@ class DatabaseManager:
         self.logger.debug("Database migration finished...")
 
     def stop_worker(self):
-        if self._is_sqlite:
-            database.obj.stop()
+        stop = getattr(database.obj, "stop", None)
+        if callable(stop):
+            stop()
         database.close()
 
     @staticmethod
@@ -272,12 +343,18 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry])
+        database.create_tables([
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            OutboundWorkflow, OutboundTask,
+        ])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry], safe=True)
+        database.create_tables([
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            OutboundWorkflow, OutboundTask,
+        ], safe=True)
 
     @staticmethod
     def _select_existing_columns(model, table_name: str, requested_fields: List):
@@ -304,7 +381,10 @@ class DatabaseManager:
         sqlite_db.start()
         sqlite_db.connect()
 
-        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry]
+        models = [
+            ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry,
+            OutboundWorkflow, OutboundTask,
+        ]
         with sqlite_db.bind_ctx(models):
             chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
@@ -326,7 +406,8 @@ class DatabaseManager:
                 MsgLog.text, MsgLog.slave_origin_uid, MsgLog.slave_origin_display_name,
                 MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
                 MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
-                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id, MsgLog.time,
+                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id,
+                MsgLog.outbound_task_id, MsgLog.time,
             ])
             if HistoryMigrationEntry.table_exists():
                 history_migration_entries = self._select_existing_columns(HistoryMigrationEntry, "historymigrationentry", [
@@ -334,17 +415,38 @@ class DatabaseManager:
                     HistoryMigrationEntry.message_thread_id, HistoryMigrationEntry.source_master_msg_id,
                     HistoryMigrationEntry.formatted_text, HistoryMigrationEntry.media_type,
                     HistoryMigrationEntry.source_time, HistoryMigrationEntry.position,
-                    HistoryMigrationEntry.created_at,
+                    HistoryMigrationEntry.created_at, HistoryMigrationEntry.outbound_workflow_id,
+                    HistoryMigrationEntry.state, HistoryMigrationEntry.last_error,
                 ])
             else:
                 history_migration_entries = []
+            if OutboundWorkflow.table_exists():
+                outbound_workflows = self._select_existing_columns(OutboundWorkflow, "outboundworkflow", [
+                    OutboundWorkflow.id, OutboundWorkflow.state, OutboundWorkflow.result_task_id,
+                    OutboundWorkflow.error_class, OutboundWorkflow.created_at, OutboundWorkflow.completed_at,
+                ])
+            else:
+                outbound_workflows = []
+            if OutboundTask.table_exists():
+                outbound_tasks = self._select_existing_columns(OutboundTask, "outboundtask", [
+                    OutboundTask.id, OutboundTask.source_key, OutboundTask.slave_id,
+                    OutboundTask.priority, OutboundTask.target_chat_id, OutboundTask.message_thread_id,
+                    OutboundTask.operation, OutboundTask.payload, OutboundTask.media_ref,
+                    OutboundTask.workflow_id, OutboundTask.step_index, OutboundTask.depends_on_task_id,
+                    OutboundTask.run_condition, OutboundTask.result_payload, OutboundTask.log_payload,
+                    OutboundTask.required_sender_bot_id, OutboundTask.state, OutboundTask.available_at,
+                    OutboundTask.lease_owner, OutboundTask.lease_until, OutboundTask.lease_heartbeat_at,
+                    OutboundTask.submitted_at, OutboundTask.attempt_count, OutboundTask.accepted_at,
+                    OutboundTask.error_class, OutboundTask.last_error,
+                ])
+            else:
+                outbound_tasks = []
 
         sqlite_db.stop()
         sqlite_db.close()
 
-        self._create()
-
         with database.atomic():
+            self._create()
             for chat_assoc_batch in chunked(chat_assocs, 500):
                 ChatAssoc.insert_many(chat_assoc_batch).execute()
             for topic_assoc_batch in chunked(topic_assocs, 500):
@@ -355,6 +457,21 @@ class DatabaseManager:
                 MsgLog.insert_many(msg_log_batch).execute()
             for history_migration_entry_batch in chunked(history_migration_entries, 500):
                 HistoryMigrationEntry.insert_many(history_migration_entry_batch).execute()
+            for outbound_workflow_batch in chunked(outbound_workflows, 500):
+                OutboundWorkflow.insert_many(outbound_workflow_batch).execute()
+            for outbound_task_batch in chunked(outbound_tasks, 500):
+                OutboundTask.insert_many(outbound_task_batch).execute()
+
+            if outbound_workflows:
+                database.execute_sql(
+                    "SELECT setval(pg_get_serial_sequence('outboundworkflow', 'id'), "
+                    "COALESCE((SELECT MAX(id) FROM outboundworkflow), 1), true)"
+                )
+            if outbound_tasks:
+                database.execute_sql(
+                    "SELECT setval(pg_get_serial_sequence('outboundtask', 'id'), "
+                    "COALESCE((SELECT MAX(id) FROM outboundtask), 1), true)"
+                )
 
         migrated_path = sqlite_path.with_suffix('.db.migrated')
         sqlite_path.rename(migrated_path)
@@ -373,6 +490,7 @@ class DatabaseManager:
         """Check schema and run pending migrations."""
         msg_log_columns = {i.name for i in database.get_columns("msglog")}
         slave_chat_info_columns = {i.name for i in database.get_columns("slavechatinfo")}
+        history_columns = {i.name for i in database.get_columns("historymigrationentry")}
         if "file_id" not in msg_log_columns:
             self._migrate(0)
         elif "pickle" not in msg_log_columns:
@@ -383,6 +501,10 @@ class DatabaseManager:
             self._migrate(3)
         elif "sender_bot_id" not in msg_log_columns:
             self._migrate(4)
+        elif "outbound_task_id" not in msg_log_columns:
+            self._migrate(5)
+        elif "outbound_workflow_id" not in history_columns:
+            self._migrate(6)
 
     def _migrate(self, i: int):
         """
@@ -425,6 +547,22 @@ class DatabaseManager:
             # Migration 4: Add column for sender bot ID (multi-bot pool support)
             migrate(
                 migrator.add_column("msglog", "sender_bot_id", MsgLog.sender_bot_id)
+            )
+        if i <= 5:
+            # Migration 5: Link idempotent message logging to durable outbound tasks.
+            migrate(
+                migrator.add_column("msglog", "outbound_task_id", MsgLog.outbound_task_id),
+            )
+        if i <= 6:
+            # Migration 6: Keep failed history work linked to its durable workflow.
+            migrate(
+                migrator.add_column(
+                    "historymigrationentry",
+                    "outbound_workflow_id",
+                    HistoryMigrationEntry.outbound_workflow_id,
+                ),
+                migrator.add_column("historymigrationentry", "state", HistoryMigrationEntry.state),
+                migrator.add_column("historymigrationentry", "last_error", HistoryMigrationEntry.last_error),
             )
 
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,
@@ -561,7 +699,7 @@ class DatabaseManager:
             return []
 
     def add_topic_assoc(self, topic_chat_id: TelegramChatID,
-                       message_thread_id: EFBChannelChatIDStr,
+                       message_thread_id: TelegramTopicID,
                        slave_uid: EFBChannelChatIDStr, ):
         """
         Add topic associations (topic links).
@@ -723,6 +861,87 @@ class DatabaseManager:
 
         result = save()
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
+
+    def build_outbound_log_payload(
+        self,
+        msg: ETMMsg,
+        old_message_id: Optional[OldMsgID] = None,
+    ) -> Dict[str, object]:
+        """Create the JSON-safe message metadata needed after process restart."""
+        pickle_data = self.pickle_misc_msg(msg)
+        return {
+            "old_message_id": list(old_message_id) if old_message_id is not None else None,
+            "text": msg.text,
+            "slave_origin_uid": str(chat_id_to_str(chat=msg.chat)),
+            "slave_member_uid": str(chat_id_to_str(chat=msg.author)),
+            "msg_type": msg.type.name,
+            "sent_to": str(msg.deliver_to.channel_id),
+            "slave_message_id": str(msg.uid or f"{self.FAIL_FLAG}.{time.time()}"),
+            "media_type": msg.type_telegram.value,
+            "file_id": msg.file_id,
+            "file_unique_id": msg.file_unique_id,
+            "mime": msg.mime,
+            "pickle_b64": base64.b64encode(pickle_data).decode("ascii") if pickle_data else None,
+        }
+
+    def reconcile_outbound_message_log(
+        self,
+        outbound_task_id: int,
+        log_payload: Mapping[str, object],
+        result_payload: Mapping[str, object],
+        *,
+        sender_bot_id: Optional[str],
+    ) -> None:
+        """Idempotently materialize a sent durable task into ``MsgLog``."""
+        chat_id_value = result_payload["chat_id"]
+        message_id_value = result_payload["message_id"]
+        if not isinstance(chat_id_value, (int, str)):
+            raise TypeError("Outbound result chat_id must be an integer or decimal string.")
+        if not isinstance(message_id_value, (int, str)):
+            raise TypeError("Outbound result message_id must be an integer or decimal string.")
+        chat_id = TelegramChatID(int(chat_id_value))
+        message_id = TelegramMessageID(int(message_id_value))
+        sent_master_msg_id = message_id_to_str(chat_id, message_id)
+        old_message_id = log_payload.get("old_message_id")
+        master_msg_id = sent_master_msg_id
+        master_msg_id_alt = None
+        if isinstance(old_message_id, list) and len(old_message_id) == 2:
+            old_master_msg_id = message_id_to_str(
+                TelegramChatID(int(old_message_id[0])),
+                TelegramMessageID(int(old_message_id[1])),
+            )
+            if old_master_msg_id != sent_master_msg_id:
+                master_msg_id = old_master_msg_id
+                master_msg_id_alt = sent_master_msg_id
+
+        row = MsgLog.get_or_none(MsgLog.outbound_task_id == outbound_task_id)
+        if row is None:
+            row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
+        row_is_new = row is None
+        if row is None:
+            row = MsgLog()
+
+        row.master_msg_id = master_msg_id
+        row.master_msg_id_alt = master_msg_id_alt
+        row.text = str(log_payload.get("text") or "")
+        row.slave_origin_uid = str(log_payload["slave_origin_uid"])
+        row.slave_member_uid = str(log_payload["slave_member_uid"])
+        row.msg_type = str(log_payload["msg_type"])
+        row.sent_to = str(log_payload["sent_to"])
+        row.slave_message_id = str(log_payload["slave_message_id"])
+        row.media_type = str(result_payload.get("media_type") or log_payload.get("media_type") or "Text")
+        row.file_id = cast(Optional[str], result_payload.get("file_id") or log_payload.get("file_id"))
+        row.file_unique_id = cast(
+            Optional[str],
+            result_payload.get("file_unique_id") or log_payload.get("file_unique_id"),
+        )
+        row.mime = cast(Optional[str], result_payload.get("mime") or log_payload.get("mime"))
+        row.sender_bot_id = sender_bot_id
+        row.outbound_task_id = outbound_task_id
+        pickle_b64 = log_payload.get("pickle_b64")
+        if isinstance(pickle_b64, str):
+            row.pickle = base64.b64decode(pickle_b64)
+        row.save(force_insert=row_is_new)
 
     @staticmethod
     def get_msg_log(master_msg_id: Optional[TgChatMsgIDStr] = None,
@@ -937,7 +1156,12 @@ class DatabaseManager:
 
     @staticmethod
     def get_next_history_migration_target() -> Optional[HistoryMigrationEntry]:
-        return HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id.asc()).first()
+        return (
+            HistoryMigrationEntry.select()
+            .where(HistoryMigrationEntry.state != "dead")
+            .order_by(HistoryMigrationEntry.id.asc())
+            .first()
+        )
 
     @staticmethod
     def get_history_migration_entries(
@@ -966,6 +1190,42 @@ class DatabaseManager:
         if rowcount is not None:
             return rowcount
         return cast(int, result)
+
+    @staticmethod
+    def link_history_migration_entries(entry_ids: Collection[int], workflow_id: int) -> int:
+        if not entry_ids:
+            return 0
+        result = (
+            HistoryMigrationEntry.update(
+                outbound_workflow_id=workflow_id,
+                state="active",
+                last_error=None,
+            )
+            .where(HistoryMigrationEntry.id.in_(list(entry_ids)))
+            .execute()
+        )
+        return int(result)
+
+    @staticmethod
+    def reconcile_history_migration_workflow(workflow_id: int) -> str:
+        workflow = OutboundWorkflow.get_or_none(OutboundWorkflow.id == workflow_id)
+        if workflow is None:
+            HistoryMigrationEntry.update(
+                outbound_workflow_id=None,
+                state="queued",
+                last_error="Linked outbound workflow is missing; queued again.",
+            ).where(HistoryMigrationEntry.outbound_workflow_id == workflow_id).execute()
+            return "queued"
+        if workflow.state == "completed":
+            HistoryMigrationEntry.delete().where(
+                HistoryMigrationEntry.outbound_workflow_id == workflow_id
+            ).execute()
+        elif workflow.state == "dead":
+            HistoryMigrationEntry.update(
+                state="dead",
+                last_error=workflow.error_class or "Outbound history workflow failed.",
+            ).where(HistoryMigrationEntry.outbound_workflow_id == workflow_id).execute()
+        return cast(str, workflow.state)
 
     @staticmethod
     def _wait_for_write_result(result: object) -> Optional[int]:

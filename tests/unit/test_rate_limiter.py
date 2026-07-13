@@ -19,7 +19,7 @@ def test_first_request_has_zero_delay():
     limiter = _make_limiter()
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
         assert limiter.peek_delay(1) == 0.0
-        assert limiter.reserve_slot(1) == 0.0
+        assert limiter.reserve_slot(1).delay == 0.0
 
 
 def test_peek_does_not_consume_slot():
@@ -35,8 +35,8 @@ def test_peek_does_not_consume_slot():
 def test_chat_limit_triggers_delay():
     limiter = _make_limiter(chat_limit=2, chat_window=10.0)
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.reserve_slot(1) == 0.0
-        assert limiter.reserve_slot(1) == 0.0
+        assert limiter.reserve_slot(1).delay == 0.0
+        assert limiter.reserve_slot(1).delay == 0.0
         delay = limiter.peek_delay(1)
         assert delay > 0.0  # third request must wait
 
@@ -44,8 +44,8 @@ def test_chat_limit_triggers_delay():
 def test_global_limit_triggers_delay():
     limiter = _make_limiter(global_limit=2, global_window=1.0, chat_limit=100)
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.reserve_slot(1) == 0.0
-        assert limiter.reserve_slot(2) == 0.0  # different chat
+        assert limiter.reserve_slot(1).delay == 0.0
+        assert limiter.reserve_slot(2).delay == 0.0  # different chat
         delay = limiter.peek_delay(3)
         assert delay > 0.0  # global limit hit
 
@@ -53,7 +53,7 @@ def test_global_limit_triggers_delay():
 def test_different_chats_are_independent():
     limiter = _make_limiter(chat_limit=1, chat_window=10.0, global_limit=100)
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.reserve_slot(1) == 0.0
+        assert limiter.reserve_slot(1).delay == 0.0
         assert limiter.peek_delay(1) > 0.0  # chat 1 full
         assert limiter.peek_delay(2) == 0.0  # chat 2 still free
 
@@ -65,8 +65,8 @@ def test_safety_margin_reduces_effective_limit():
     limiter = _make_limiter(chat_limit=3, safety_margin=1)
     # effective chat limit = 3 - 1 = 2
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.reserve_slot(1) == 0.0
-        assert limiter.reserve_slot(1) == 0.0
+        assert limiter.reserve_slot(1).delay == 0.0
+        assert limiter.reserve_slot(1).delay == 0.0
         assert limiter.peek_delay(1) > 0.0  # 2 consumed, margin=1; full
 
 
@@ -89,11 +89,11 @@ def test_old_timestamps_are_cleaned_up():
         assert 1 not in limiter._chat_timestamps
 
 
-def test_release_slot_removes_latest_reservation():
+def test_release_slot_removes_exact_reservation():
     limiter = _make_limiter()
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.reserve_slot(1)
-        limiter.release_slot(1)
+        reservation = limiter.reserve_slot(1).reservation
+        limiter.release_slot(reservation)
         assert limiter.get_counts(1) == (0, 0)
         assert 1 not in limiter._chat_timestamps
 
@@ -101,14 +101,26 @@ def test_release_slot_removes_latest_reservation():
 def test_release_slot_is_idempotent_without_reservation():
     limiter = _make_limiter()
     with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.release_slot(1)
+        limiter.release_slot(None)
         assert limiter.get_counts(1) == (0, 0)
         assert 1 not in limiter._chat_timestamps
 
         limiter._chat_timestamps[1] = deque()
-        limiter.release_slot(1)
+        limiter.release_slot(None)
         assert limiter.get_counts(1) == (0, 0)
         assert 1 not in limiter._chat_timestamps
+
+
+def test_release_slot_does_not_remove_later_concurrent_reservation():
+    limiter = _make_limiter()
+    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
+        earlier = limiter.reserve_slot(1).reservation
+        later = limiter.reserve_slot(1).reservation
+
+        limiter.release_slot(earlier)
+
+        assert limiter.get_counts(1) == (1, 1)
+        assert limiter.has_reservation(later)
 
 
 def test_peek_and_counts_do_not_create_empty_chat_key():

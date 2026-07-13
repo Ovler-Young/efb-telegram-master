@@ -17,7 +17,24 @@ import bisect
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class SlotReservation:
+    """Exact reservation identity shared by the global and per-chat windows."""
+
+    token_id: int
+    owner_id: Optional[str]
+    chat_id: int
+    reserved_at: float
+
+
+@dataclass(frozen=True)
+class ReservationOutcome:
+    delay: float
+    reservation: SlotReservation
 
 
 class SlidingWindowRateLimiter:
@@ -45,15 +62,18 @@ class SlidingWindowRateLimiter:
         chat_limit: int = 20,
         chat_window: float = 60.0,
         safety_margin: int = 2,
+        owner_id: Optional[str] = None,
     ):
         self.global_limit = global_limit
         self.global_window = global_window
         self.chat_limit = chat_limit
         self.chat_window = chat_window
         self._margin = safety_margin
+        self._owner_id = owner_id
 
         self._lock = threading.Lock()
-        self._global_timestamps: list[float] = []
+        self._next_token_id = 1
+        self._global_timestamps: list[tuple[float, int]] = []
         self._chat_timestamps: Dict[int, deque] = defaultdict(deque)
 
     # Public API
@@ -67,8 +87,13 @@ class SlidingWindowRateLimiter:
         with self._lock:
             return self._compute_delay(chat_id)
 
-    def reserve_slot(self, chat_id: int) -> float:
-        """Reserve a send slot for *chat_id* and return the delay.
+    def set_owner_id(self, owner_id: Optional[str]) -> None:
+        """Set the bot identity copied into future reservation tokens."""
+        with self._lock:
+            self._owner_id = owner_id
+
+    def reserve_slot(self, chat_id: int) -> ReservationOutcome:
+        """Reserve a send slot for *chat_id* and return its exact token.
 
         The slot is recorded at ``now + delay`` in both the global and
         per-chat timestamp lists.
@@ -76,22 +101,47 @@ class SlidingWindowRateLimiter:
         with self._lock:
             delay = self._compute_delay(chat_id)
             candidate_time = time.time() + delay
-            bisect.insort(self._global_timestamps, candidate_time)
-            self._chat_timestamps[chat_id].append(candidate_time)
-            return delay
+            token_id = self._next_token_id
+            self._next_token_id += 1
+            reservation = SlotReservation(
+                token_id=token_id,
+                owner_id=self._owner_id,
+                chat_id=chat_id,
+                reserved_at=candidate_time,
+            )
+            timestamp_entry = (candidate_time, token_id)
+            bisect.insort(self._global_timestamps, timestamp_entry)
+            self._chat_timestamps[chat_id].append(timestamp_entry)
+            return ReservationOutcome(delay=delay, reservation=reservation)
 
-    def release_slot(self, chat_id: int) -> None:
-        """Undo the latest reservation for *chat_id* when no send happened."""
+    def release_slot(self, reservation: Optional[SlotReservation]) -> None:
+        """Undo one exact reservation when its Telegram call did not happen."""
         with self._lock:
-            chat_ts = self._chat_timestamps.get(chat_id)
-            if not chat_ts:
+            if reservation is None:
                 self._cleanup()
                 return
-            candidate_time = chat_ts.pop()
-            idx = bisect.bisect_left(self._global_timestamps, candidate_time)
-            if idx < len(self._global_timestamps) and self._global_timestamps[idx] == candidate_time:
+
+            entry = (reservation.reserved_at, reservation.token_id)
+            chat_ts = self._chat_timestamps.get(reservation.chat_id)
+            if chat_ts:
+                try:
+                    chat_ts.remove(entry)
+                except ValueError:
+                    pass
+            idx = bisect.bisect_left(self._global_timestamps, entry)
+            if idx < len(self._global_timestamps) and self._global_timestamps[idx] == entry:
                 self._global_timestamps.pop(idx)
             self._cleanup()
+
+    def has_reservation(self, reservation: SlotReservation) -> bool:
+        """Return whether an exact token is still present in both windows."""
+        with self._lock:
+            self._cleanup()
+            entry = (reservation.reserved_at, reservation.token_id)
+            return (
+                entry in self._global_timestamps
+                and entry in self._chat_timestamps.get(reservation.chat_id, ())
+            )
 
     def get_counts(self, chat_id: int) -> Tuple[int, int]:
         """Return ``(chat_count, global_count)`` for diagnostics."""
@@ -129,19 +179,20 @@ class SlidingWindowRateLimiter:
         chat_ts = self._chat_timestamps.get(chat_id)
         if chat_ts and len(chat_ts) >= effective_chat_limit:
             safe_index = len(chat_ts) - effective_chat_limit
-            chat_delay = max(0.0, (chat_ts[safe_index] + self.chat_window) - current_time)
+            chat_delay = max(0.0, (chat_ts[safe_index][0] + self.chat_window) - current_time)
 
         candidate_time = current_time + chat_delay
 
         # Global window
         while True:
-            left_bound = candidate_time - self.global_window
+            left_bound = (candidate_time - self.global_window, float('inf'))
+            right_bound = (candidate_time, float('inf'))
             idx = bisect.bisect_right(self._global_timestamps, left_bound)
-            right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
+            right_idx = bisect.bisect_right(self._global_timestamps, right_bound)
             in_window = right_idx - idx
             if in_window < effective_global_limit:
                 break
-            candidate_time = self._global_timestamps[idx] + self.global_window
+            candidate_time = self._global_timestamps[idx][0] + self.global_window
 
         return max(0.0, candidate_time - current_time)
 
@@ -149,13 +200,13 @@ class SlidingWindowRateLimiter:
         """Remove timestamps older than their respective windows."""
         current_time = time.time()
         global_cutoff = current_time - self.global_window
-        while self._global_timestamps and self._global_timestamps[0] <= global_cutoff:
+        while self._global_timestamps and self._global_timestamps[0][0] <= global_cutoff:
             self._global_timestamps.pop(0)
 
         chat_cutoff = current_time - self.chat_window
         empty_chat_ids = []
         for cid, ts in self._chat_timestamps.items():
-            while ts and ts[0] <= chat_cutoff:
+            while ts and ts[0][0] <= chat_cutoff:
                 ts.popleft()
             if not ts:
                 empty_chat_ids.append(cid)

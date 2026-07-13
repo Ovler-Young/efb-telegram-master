@@ -1,4 +1,5 @@
 import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,16 @@ from ehforwarderbot.types import MessageID
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
-from efb_telegram_master.db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, MsgLog, TopicAssoc
+from efb_telegram_master.db import (
+    ChatAssoc,
+    DatabaseManager,
+    HistoryMigrationEntry,
+    MsgLog,
+    OutboundTask,
+    OutboundWorkflow,
+    TopicAssoc,
+    database,
+)
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
@@ -43,6 +53,87 @@ def test_history_migration_entry_table_exists():
         "position",
     }.issubset(history_columns)
     assert "source_master_msg_id" not in msglog_columns
+
+
+def test_outbound_tables_and_history_workflow_fields_exist():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    models = [OutboundWorkflow, OutboundTask, HistoryMigrationEntry, MsgLog]
+    with test_db.bind_ctx(models):
+        test_db.create_tables(models)
+        history_columns = {column.name for column in test_db.get_columns("historymigrationentry")}
+        task_indexes = {index.name for index in test_db.get_indexes("outboundtask")}
+
+    assert {"outbound_workflow_id", "state", "last_error"}.issubset(history_columns)
+    assert any("source_key" in index_name for index_name in task_indexes)
+
+
+def test_sqlite_legacy_migration_adds_durable_outbound_links_and_preserves_rows(tmp_path):
+    from peewee import SqliteDatabase
+    from playhouse.migrate import SqliteMigrator
+
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "legacy.db")
+    database.initialize(test_db)
+    test_db.connect()
+    try:
+        test_db.execute_sql("CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY)")
+        test_db.execute_sql(
+            "CREATE TABLE historymigrationentry ("
+            "id INTEGER PRIMARY KEY, source_master_msg_id TEXT, state_marker TEXT)"
+        )
+        test_db.execute_sql("INSERT INTO msglog (master_msg_id) VALUES ('100.1')")
+        test_db.execute_sql(
+            "INSERT INTO historymigrationentry (id, source_master_msg_id, state_marker) "
+            "VALUES (1, '100.1', 'preserve')"
+        )
+        manager = object.__new__(DatabaseManager)
+        manager._migrator_cls = SqliteMigrator
+
+        manager._migrate(5)
+
+        msglog_columns = {column.name for column in test_db.get_columns("msglog")}
+        history_columns = {column.name for column in test_db.get_columns("historymigrationentry")}
+        history_indexes = test_db.get_indexes("historymigrationentry")
+        preserved = test_db.execute_sql(
+            "SELECT source_master_msg_id, state_marker FROM historymigrationentry WHERE id = 1"
+        ).fetchone()
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+    assert "outbound_task_id" in msglog_columns
+    assert {"outbound_workflow_id", "state", "last_error"}.issubset(history_columns)
+    assert any(index.columns == ["outbound_workflow_id"] for index in history_indexes)
+    assert preserved == ("100.1", "preserve")
+
+
+def test_database_manager_uses_transactional_wal_sqlite_and_creates_durable_tables(tmp_path, monkeypatch):
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    channel = SimpleNamespace(channel_id="tests.sqlite", config={})
+    manager = DatabaseManager(channel)
+    try:
+        assert isinstance(database.obj, SqliteDatabase)
+        assert database.obj.pragma("journal_mode").lower() == "wal"
+        with database.atomic():
+            workflow = OutboundWorkflow.create()
+            OutboundTask.create(
+                source_key="module chat",
+                slave_id="module chat",
+                priority=False,
+                target_chat_id=100,
+                operation="api_send_message",
+                payload='{"version":1}',
+                workflow_id=workflow.id,
+            )
+        assert OutboundTask.select().count() == 1
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
 
 
 def test_write_result_wait_reads_rowcount():
@@ -189,3 +280,66 @@ def test_postgresql_env_is_configured():
     ]
     for key in required:
         assert os.getenv(key)
+
+
+@pytest.mark.skipif(
+    not os.getenv("TEST_POSTGRES_HOST"),
+    reason="PostgreSQL test environment is not configured",
+)
+def test_postgresql_durable_outbound_migration_and_schema_preserve_legacy_rows():
+    from peewee import PostgresqlDatabase
+    from playhouse.migrate import PostgresqlMigrator
+
+    connection_kwargs = {
+        "database": os.environ["TEST_POSTGRES_DB"],
+        "host": os.environ["TEST_POSTGRES_HOST"],
+        "port": int(os.environ["TEST_POSTGRES_PORT"]),
+        "user": os.environ["TEST_POSTGRES_USER"],
+        "password": os.environ["TEST_POSTGRES_PASSWORD"],
+    }
+    schema = f"etm_outbound_{uuid.uuid4().hex}"
+    admin_db = PostgresqlDatabase(**connection_kwargs)
+    admin_db.connect()
+    admin_db.execute_sql(f'CREATE SCHEMA "{schema}"')
+    admin_db.close()
+
+    original_database = database.obj
+    test_db = PostgresqlDatabase(
+        **connection_kwargs,
+        options=f'-c search_path="{schema}" -c timezone=UTC',
+    )
+    database.initialize(test_db)
+    test_db.connect()
+    try:
+        test_db.execute_sql("CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY)")
+        test_db.execute_sql(
+            "CREATE TABLE historymigrationentry ("
+            "id BIGSERIAL PRIMARY KEY, source_master_msg_id TEXT, state_marker TEXT)"
+        )
+        test_db.execute_sql("INSERT INTO msglog (master_msg_id) VALUES ('100.1')")
+        test_db.execute_sql(
+            "INSERT INTO historymigrationentry (source_master_msg_id, state_marker) "
+            "VALUES ('100.1', 'preserve')"
+        )
+        manager = object.__new__(DatabaseManager)
+        manager._migrator_cls = PostgresqlMigrator
+        manager._migrate(5)
+        test_db.create_tables([OutboundWorkflow, OutboundTask])
+
+        assert "outbound_task_id" in {column.name for column in test_db.get_columns("msglog")}
+        assert {"outbound_workflow_id", "state", "last_error"}.issubset(
+            column.name for column in test_db.get_columns("historymigrationentry")
+        )
+        assert OutboundWorkflow.table_exists()
+        assert OutboundTask.table_exists()
+        preserved = test_db.execute_sql(
+            "SELECT source_master_msg_id, state_marker FROM historymigrationentry"
+        ).fetchone()
+        assert preserved == ("100.1", "preserve")
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+        admin_db = PostgresqlDatabase(**connection_kwargs)
+        admin_db.connect()
+        admin_db.execute_sql(f'DROP SCHEMA "{schema}" CASCADE')
+        admin_db.close()
