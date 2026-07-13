@@ -2,7 +2,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -114,29 +114,6 @@ def test_build_etm_msg_restores_sender_bot_id(channel, slave):
     assert restored.sender_bot_id == "888"
 
     row.delete_instance()
-
-
-def test_build_etm_msg_restores_message_time():
-    sent_at = datetime(2024, 2, 3, 4, 5, 6)
-    chat_manager = Mock()
-    chat_manager.get_chat.return_value = Mock()
-    chat_manager.get_chat_member.return_value = Mock()
-    row = MsgLog(
-        master_msg_id="6666.7777",
-        slave_message_id="restored-time-message",
-        text="restored time",
-        slave_origin_uid="tests.mocks.slave chat",
-        slave_member_uid="tests.mocks.slave author chat",
-        media_type=TGMsgType.Text.value,
-        msg_type=MsgType.Text.name,
-        sent_to="tests.mocks.slave",
-        time=sent_at,
-    )
-
-    with patch("efb_telegram_master.db.coordinator.get_module_by_id", return_value=None):
-        restored = row.build_etm_msg(chat_manager)
-
-    assert restored.time == sent_at
 
 
 @pytest.mark.skipif(

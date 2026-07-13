@@ -1,4 +1,3 @@
-import datetime
 import logging
 import mimetypes
 import os
@@ -31,8 +30,6 @@ __all__ = ['ETMMsg']
 
 
 class ETMMsg(Message):
-    time: Optional[datetime.datetime] = None
-    """Original sent time when the message is restored from the message log."""
     file_id: Optional[str] = None
     """File ID from Telegram Bot API"""
     file_unique_id: Optional[str] = None

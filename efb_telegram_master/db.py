@@ -125,7 +125,6 @@ class MsgLog(BaseModel):
             file_id=self.file_id or None,
         )
         msg.sender_bot_id = self.sender_bot_id
-        msg.time = self.time
         with suppress(NameError):
             to_module = coordinator.get_module_by_id(ModuleID(self.sent_to))
             if isinstance(to_module, Channel):
