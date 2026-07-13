@@ -923,9 +923,12 @@ class DatabaseManager:
             message_thread_id,
         )
         with database.atomic():
-            HistoryMigrationEntry.delete().where(target_filter).execute()
+            delete_result = HistoryMigrationEntry.delete().where(target_filter).execute()
+            DatabaseManager._wait_for_write_result(delete_result)
             if entries:
-                HistoryMigrationEntry.insert_many(entries).execute()
+                insert_result = HistoryMigrationEntry.insert_many(entries).execute()
+                DatabaseManager._wait_for_write_result(insert_result)
+        DatabaseManager._flush_write_queue()
         return len(entries)
 
     @staticmethod
@@ -957,4 +960,27 @@ class DatabaseManager:
     def delete_history_migration_entries(entry_ids: Collection[int]) -> int:
         if not entry_ids:
             return 0
-        return HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(list(entry_ids))).execute()
+        result = HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(list(entry_ids))).execute()
+        rowcount = DatabaseManager._wait_for_write_result(result)
+        DatabaseManager._flush_write_queue()
+        if rowcount is not None:
+            return rowcount
+        return cast(int, result)
+
+    @staticmethod
+    def _wait_for_write_result(result: object) -> Optional[int]:
+        with suppress(AttributeError):
+            return cast(int, getattr(result, "rowcount"))
+        return None
+
+    @staticmethod
+    def _flush_write_queue() -> None:
+        db_obj = database.obj
+        pause = getattr(db_obj, "pause", None)
+        unpause = getattr(db_obj, "unpause", None)
+        if not callable(pause) or not callable(unpause):
+            return
+
+        paused = pause()
+        if paused is not False:
+            unpause()
