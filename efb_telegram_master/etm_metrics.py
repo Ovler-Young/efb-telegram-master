@@ -294,6 +294,10 @@ class _ManagerStateExporter:
             "queued_targets": len(depths),
             "max_target_depth": max(depths) if depths else 0,
             "queue_oldest_age": max(oldest_ages) if oldest_ages else 0.0,
+            "deferred_tasks": sum(
+                1 for queue in self.manager._send_queues.values()
+                for task in queue if task.not_before > time.time()
+            ),
         }
 
     def bot_identity(self, sender_bot_id: Optional[str]) -> tuple[str, object, str]:
@@ -524,9 +528,9 @@ class Metrics:
             "Bot/chat pairs currently frozen by Telegram RetryAfter.",
             registry=self.registry,
         )
-        self.retry_targets_g = Gauge(
-            f"{ns}_retry_targets",
-            "Targets currently deferred by a target retry deadline.",
+        self.deferred_tasks_g = Gauge(
+            f"{ns}_send_deferred_tasks",
+            "Queued tasks waiting for their next scheduling attempt.",
             registry=self.registry,
         )
         self.worker_alive_g = Gauge(
@@ -671,7 +675,7 @@ class Metrics:
         queue_oldest_age: float,
         in_flight: int,
         disabled_bot_chats: int,
-        retry_targets: int,
+        deferred_tasks: int,
         worker_alive: bool,
         aux_pool_size: int = 0,
         aux_disabled: int = 0,
@@ -682,7 +686,7 @@ class Metrics:
         self.queue_oldest_age_g.set(max(0.0, queue_oldest_age))
         self.in_flight_g.set(in_flight)
         self.disabled_bot_chats_g.set(disabled_bot_chats)
-        self.retry_targets_g.set(retry_targets)
+        self.deferred_tasks_g.set(deferred_tasks)
         self.worker_alive_g.set(1 if worker_alive else 0)
         self.aux_pool_size_g.set(aux_pool_size)
         self.aux_disabled_g.set(aux_disabled)
@@ -701,7 +705,7 @@ class Metrics:
             queue_oldest_age=queue_summary["queue_oldest_age"],
             in_flight=len(manager._send_in_flight),
             disabled_bot_chats=len(manager._bot_chat_disabled_until),
-            retry_targets=len(getattr(manager, '_target_retry_after', {})),
+            deferred_tasks=queue_summary["deferred_tasks"],
             worker_alive=worker_alive,
             aux_pool_size=len(aux_bots),
             aux_disabled=sum(1 for bot in aux_bots if getattr(bot, 'disabled', False)),

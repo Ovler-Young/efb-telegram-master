@@ -1564,7 +1564,7 @@ def test_harvest_completed_sends_records_success_metrics():
     future.set_result(result)
     mgr = SimpleNamespace(
         _send_in_flight={task.target: (future, task, "777")},
-        _target_retry_failures={task.target: 3},
+        _bot_chat_retry_failures={("777", 100): 3},
         _metrics=Mock(),
         _record_aux_use=Mock(),
         logger=Mock(),
@@ -1575,7 +1575,7 @@ def test_harvest_completed_sends_records_success_metrics():
         TelegramBotManager._harvest_completed_sends(mgr)
 
     assert mgr._send_in_flight == {}
-    assert mgr._target_retry_failures == {}
+    assert mgr._bot_chat_retry_failures == {}
     mgr._metrics.send_completed.assert_called_once_with("aux", "ok", 5.0)
     mgr._record_aux_use.assert_called_once_with(100)
 
@@ -1636,8 +1636,7 @@ def test_harvest_retry_after_disables_only_sender_bot_chat_and_requeues_front():
     mgr = SimpleNamespace(
         _send_in_flight={task.target: (future, task, "777")},
         _bot_chat_disabled_until={},
-        _target_retry_after={},
-        _target_retry_failures={},
+        _bot_chat_retry_failures={},
         _release_reserved_slot=Mock(),
         _requeue_send_task=Mock(),
         bot_pool=SimpleNamespace(forget_affinity=Mock()),
@@ -1651,8 +1650,7 @@ def test_harvest_retry_after_disables_only_sender_bot_chat_and_requeues_front():
 
     assert mgr._send_in_flight == {}
     assert mgr._bot_chat_disabled_until == {("777", 100): 17.0}
-    assert mgr._target_retry_after == {task.target: 17.0}
-    assert mgr._target_retry_failures == {task.target: 1}
+    assert mgr._bot_chat_retry_failures == {("777", 100): 1}
     mgr._release_reserved_slot.assert_called_once_with("777", 100)
     mgr._requeue_send_task.assert_called_once_with(task)
     mgr.bot_pool.forget_affinity.assert_called_once_with("slave.chat")
@@ -1670,8 +1668,7 @@ def test_harvest_repeated_retry_after_waits_at_least_sixty_seconds():
     mgr = SimpleNamespace(
         _send_in_flight={task.target: (future, task, "777")},
         _bot_chat_disabled_until={},
-        _target_retry_after={},
-        _target_retry_failures={task.target: 1},
+        _bot_chat_retry_failures={("777", 100): 1},
         _release_reserved_slot=Mock(),
         _requeue_send_task=Mock(),
         bot_pool=SimpleNamespace(forget_affinity=Mock()),
@@ -1683,8 +1680,27 @@ def test_harvest_repeated_retry_after_waits_at_least_sixty_seconds():
         TelegramBotManager._harvest_completed_sends(mgr)
 
     assert mgr._bot_chat_disabled_until == {("777", 100): 70.0}
-    assert mgr._target_retry_after == {task.target: 70.0}
-    assert mgr._target_retry_failures == {task.target: 2}
+    assert mgr._bot_chat_retry_failures == {("777", 100): 2}
+
+
+def test_retry_after_failures_are_scoped_to_the_sender_bot_and_chat():
+    from efb_telegram_master.bot_manager import QueuedSendTask, TelegramBotManager
+
+    task = QueuedSendTask(("other.slave", 100), lambda: None, (), {}, "t1")
+    mgr = SimpleNamespace(
+        _bot_chat_disabled_until={},
+        _bot_chat_retry_failures={("777", 100): 1},
+        _release_reserved_slot=Mock(),
+        _requeue_send_task=Mock(),
+        bot_pool=SimpleNamespace(forget_affinity=Mock()),
+        logger=Mock(),
+    )
+
+    with patch("efb_telegram_master.bot_manager.time.time", return_value=10.0):
+        TelegramBotManager._requeue_after_telegram_rate_limit(mgr, task, "888", 2.0)
+
+    assert mgr._bot_chat_disabled_until == {("888", 100): 17.0}
+    assert mgr._bot_chat_retry_failures == {("777", 100): 1, ("888", 100): 1}
 
 
 def test_harvest_retry_after_keeps_blocking_waiter_pending():
@@ -1698,8 +1714,7 @@ def test_harvest_retry_after_keeps_blocking_waiter_pending():
     mgr = SimpleNamespace(
         _send_in_flight={task.target: (future, task, None)},
         _bot_chat_disabled_until={},
-        _target_retry_after={},
-        _target_retry_failures={},
+        _bot_chat_retry_failures={},
         _release_reserved_slot=Mock(),
         _requeue_send_task=Mock(),
         logger=Mock(),
@@ -1723,8 +1738,7 @@ def test_harvest_retry_after_uses_main_bot_disable_key():
     mgr = SimpleNamespace(
         _send_in_flight={task.target: (future, task, None)},
         _bot_chat_disabled_until={},
-        _target_retry_after={},
-        _target_retry_failures={},
+        _bot_chat_retry_failures={},
         _release_reserved_slot=Mock(),
         _requeue_send_task=Mock(),
         logger=Mock(),
@@ -1735,7 +1749,6 @@ def test_harvest_retry_after_uses_main_bot_disable_key():
         TelegramBotManager._harvest_completed_sends(mgr)
 
     assert mgr._bot_chat_disabled_until == {(None, 100): 17.0}
-    assert mgr._target_retry_after == {task.target: 17.0}
 
 
 def test_harvest_429_disables_only_sender_bot_chat_and_requeues_front():
@@ -1748,8 +1761,7 @@ def test_harvest_429_disables_only_sender_bot_chat_and_requeues_front():
     mgr = SimpleNamespace(
         _send_in_flight={task.target: (future, task, "777")},
         _bot_chat_disabled_until={},
-        _target_retry_after={},
-        _target_retry_failures={},
+        _bot_chat_retry_failures={},
         _release_reserved_slot=Mock(),
         _requeue_send_task=Mock(),
         bot_pool=SimpleNamespace(forget_affinity=Mock()),
@@ -1763,7 +1775,6 @@ def test_harvest_429_disables_only_sender_bot_chat_and_requeues_front():
 
     assert mgr._send_in_flight == {}
     assert mgr._bot_chat_disabled_until == {("777", 100): 75.0}
-    assert mgr._target_retry_after == {task.target: 75.0}
     mgr._release_reserved_slot.assert_called_once_with("777", 100)
     mgr._requeue_send_task.assert_called_once_with(task)
     mgr.bot_pool.forget_affinity.assert_called_once_with("slave.chat")
@@ -1800,39 +1811,64 @@ def test_dispatch_ready_send_tasks_requeues_local_limiter_delay_without_disablin
         _requeue_send_task=None,
         _bot_chat_disabled_until={},
         _metrics=Mock(),
-        _target_retry_after={},
+        _bot_chat_retry_failures={},
     )
     mgr._requeue_send_task = TelegramBotManager._requeue_send_task.__get__(mgr, TelegramBotManager)
 
     TelegramBotManager._dispatch_ready_send_tasks(mgr, 10.0)
 
-    assert list(mgr._send_queues[task.target]) == [task]
+    assert [queued_task.task_id for queued_task in mgr._send_queues[task.target]] == [task.task_id]
     assert mgr._bot_chat_disabled_until == {}
-    assert mgr._target_retry_after == {task.target: 12.0}
+    deferred_task = mgr._send_queues[task.target][0]
+    assert deferred_task.not_before == 12.0
     mgr._dispatch_send.assert_not_called()
     mgr._metrics.task_requeued.assert_called_once_with("local_rate_limit")
 
 
-def test_dispatch_ready_send_tasks_skips_target_until_retry_after():
+def test_dispatch_ready_send_tasks_skips_task_until_its_dispatch_time():
     import collections as _collections
     from efb_telegram_master.bot_manager import QueuedSendTask, TelegramBotManager
 
-    task = QueuedSendTask(("slave.chat", 100), lambda: None, (), {}, "t1")
+    task = QueuedSendTask(("slave.chat", 100), lambda: None, (), {}, "t1", not_before=11.0)
     mgr = SimpleNamespace(
         _send_queues={task.target: _collections.deque([task])},
         _send_queues_lock=threading.Lock(),
         _send_in_flight={},
         _send_worker_stop=threading.Event(),
-        _target_retry_after={task.target: 11.0},
         _select_queued_sender=Mock(),
         _dispatch_send=Mock(),
     )
 
     TelegramBotManager._dispatch_ready_send_tasks(mgr, 10.0)
 
-    assert list(mgr._send_queues[task.target]) == [task]
+    assert [queued_task.task_id for queued_task in mgr._send_queues[task.target]] == [task.task_id]
     mgr._select_queued_sender.assert_not_called()
     mgr._dispatch_send.assert_not_called()
+
+
+def test_dispatch_ready_send_tasks_does_not_defer_other_source_queue():
+    import collections as _collections
+    from efb_telegram_master.bot_manager import QueuedSendTask, TelegramBotManager
+
+    deferred = QueuedSendTask(("slave.a", 100), lambda: None, (), {}, "t1", not_before=11.0)
+    ready = QueuedSendTask(("slave.b", 100), lambda: None, (), {}, "t2")
+    mgr = SimpleNamespace(
+        _send_queues={
+            deferred.target: _collections.deque([deferred]),
+            ready.target: _collections.deque([ready]),
+        },
+        _send_queues_lock=threading.Lock(),
+        _send_in_flight={},
+        _send_worker_stop=threading.Event(),
+        _select_queued_sender=Mock(return_value=(object(), "888", 0.0)),
+        _dispatch_send=Mock(),
+    )
+
+    TelegramBotManager._dispatch_ready_send_tasks(mgr, 10.0)
+
+    mgr._dispatch_send.assert_called_once()
+    assert mgr._dispatch_send.call_args.args[0].task_id == "t2"
+    assert list(mgr._send_queues[deferred.target]) == [deferred]
 
 
 def test_dispatch_ready_send_tasks_releases_aux_slot_on_requeue():
@@ -1845,7 +1881,7 @@ def test_dispatch_ready_send_tasks_releases_aux_slot_on_requeue():
         _send_queues_lock=threading.Lock(),
         _send_in_flight={},
         _send_worker_stop=threading.Event(),
-        _target_retry_after={},
+        _bot_chat_retry_failures={},
         _select_queued_sender=Mock(return_value=(object(), "777", 2.0)),
         _release_reserved_slot=Mock(),
         _dispatch_send=Mock(),
@@ -1856,8 +1892,9 @@ def test_dispatch_ready_send_tasks_releases_aux_slot_on_requeue():
     TelegramBotManager._dispatch_ready_send_tasks(mgr, 10.0)
 
     mgr._release_reserved_slot.assert_called_once_with("777", 100)
-    assert mgr._target_retry_after == {task.target: 12.0}
-    assert list(mgr._send_queues[task.target]) == [task]
+    deferred_task = mgr._send_queues[task.target][0]
+    assert deferred_task.not_before == 12.0
+    assert [queued_task.task_id for queued_task in mgr._send_queues[task.target]] == [task.task_id]
 
 
 def test_different_targets_dispatch_concurrently_with_same_chat_id():
@@ -1879,7 +1916,6 @@ def test_different_targets_dispatch_concurrently_with_same_chat_id():
         _send_queues_lock=threading.Lock(),
         _send_in_flight=in_flight,
         _send_worker_stop=threading.Event(),
-        _target_retry_after={},
         _select_queued_sender=Mock(return_value=(sender_bot, "777", 0.0)),
         _dispatch_send=Mock(),
         _metrics=Mock(),

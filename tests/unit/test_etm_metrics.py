@@ -171,10 +171,11 @@ def test_snapshot_updates_queue_oldest_age_gauge():
         queue_oldest_age=12.5,
         in_flight=0,
         disabled_bot_chats=0,
-        retry_targets=0,
+        deferred_tasks=0,
         worker_alive=True,
     )
 
     rendered = metrics.render().decode()
 
     assert "etm_send_queue_oldest_age_seconds 12.5" in rendered
+    assert "etm_send_deferred_tasks 0.0" in rendered
