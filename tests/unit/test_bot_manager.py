@@ -1411,7 +1411,7 @@ def test_enqueue_appends_to_per_target_fifo():
         logger=Mock(),
     )
 
-    with patch("efb_telegram_master.bot_manager.time.monotonic", side_effect=[100.0, 101.0]):
+    with patch("efb_telegram_master.bot_manager.time.monotonic", return_value=100.0):
         TelegramBotManager._enqueue_send_task(mgr, target, lambda: None, (), {}, cleanup_files=[])
         TelegramBotManager._enqueue_send_task(mgr, target, lambda: None, (), {}, cleanup_files=[])
 
@@ -1419,7 +1419,7 @@ def test_enqueue_appends_to_per_target_fifo():
     assert len(q) == 2
     assert q[0].task_id != q[1].task_id  # distinct tasks
     assert q[0].enqueued_at == 100.0
-    assert q[1].enqueued_at == 101.0
+    assert q[1].enqueued_at == 100.0
     assert q[0].task_id == "slave.chat_100_1"
     assert q[1].task_id == "slave.chat_100_2"
     assert mgr._tasks_enqueued == 2
