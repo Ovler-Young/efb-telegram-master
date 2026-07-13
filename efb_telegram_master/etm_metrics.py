@@ -72,7 +72,7 @@ class _TopNQueueCollector:
     def collect(self):
         family = GaugeMetricFamily(
             f"{self._namespace}_send_queue_target_depth",
-            "Current backlog of the deepest per-target FIFOs.",
+            "Current source backlog within the deepest Telegram chat FIFOs.",
             labels=["slave_id", "chat_id"],
         )
         try:
@@ -107,7 +107,7 @@ class _TopNQueueAgeCollector:
     def collect(self):
         family = GaugeMetricFamily(
             f"{self._namespace}_send_queue_target_oldest_age_seconds",
-            "Oldest queued task age for the oldest per-target FIFOs.",
+            "Oldest queued task age by source and Telegram chat.",
             labels=["slave_id", "chat_id"],
         )
         try:
@@ -264,23 +264,37 @@ class _ManagerStateExporter:
 
     def queue_depth_rows(self):
         with self.manager._send_queues_lock:
-            return [
-                (target[0], target[1], len(queue))
-                for target, queue in self.manager._send_queues.items()
-            ]
+            depths: collections.Counter[tuple[str, int]] = collections.Counter(
+                (task.slave_id, task.chat_id)
+                for queue in self.manager._send_queues.values()
+                for task in queue
+            )
+        return [
+            (slave_id, chat_id, depth)
+            for (slave_id, chat_id), depth in depths.items()
+        ]
 
     def queue_oldest_age_rows(self):
         now = time.monotonic()
-        rows = []
         with self.manager._send_queues_lock:
-            for target, queue in self.manager._send_queues.items():
-                enqueued_at = [task.enqueued_at for task in queue if task.enqueued_at]
-                if enqueued_at:
-                    rows.append((target[0], target[1], max(0.0, now - min(enqueued_at))))
-        return rows
+            oldest_by_source: dict[tuple[str, int], float] = {}
+            for queue in self.manager._send_queues.values():
+                for task in queue:
+                    if not task.enqueued_at:
+                        continue
+                    key = (task.slave_id, task.chat_id)
+                    oldest_by_source[key] = min(
+                        task.enqueued_at,
+                        oldest_by_source.get(key, task.enqueued_at),
+                    )
+        return [
+            (slave_id, chat_id, max(0.0, now - enqueued_at))
+            for (slave_id, chat_id), enqueued_at in oldest_by_source.items()
+        ]
 
     def queue_summary(self):
         now = time.monotonic()
+        wall_time = time.time()
         with self.manager._send_queues_lock:
             depths = [len(queue) for queue in self.manager._send_queues.values()]
             oldest_ages = [
@@ -288,16 +302,17 @@ class _ManagerStateExporter:
                 for queue in self.manager._send_queues.values()
                 if any(task.enqueued_at for task in queue)
             ]
+            retry_targets = sum(
+                1 for queue in self.manager._send_queues.values()
+                if queue and queue[0].not_before > wall_time
+            )
 
         return {
             "queued_tasks": sum(depths),
             "queued_targets": len(depths),
             "max_target_depth": max(depths) if depths else 0,
             "queue_oldest_age": max(oldest_ages) if oldest_ages else 0.0,
-            "deferred_tasks": sum(
-                1 for queue in self.manager._send_queues.values()
-                for task in queue if task.not_before > time.time()
-            ),
+            "retry_targets": retry_targets,
         }
 
     def bot_identity(self, sender_bot_id: Optional[str]) -> tuple[str, object, str]:
@@ -403,7 +418,7 @@ class Metrics:
 
         self.enqueued = Counter(
             f"{ns}_send_tasks_enqueued_total",
-            "Tasks appended to a per-target FIFO queue.",
+            "Tasks appended to a Telegram chat FIFO queue.",
             ["priority"],
             registry=self.registry,
         )
@@ -500,7 +515,7 @@ class Metrics:
 
         self.queued_tasks_g = Gauge(
             f"{ns}_send_queue_depth",
-            "Total tasks across all per-target FIFOs.",
+            "Total tasks across all Telegram chat FIFOs.",
             registry=self.registry,
         )
         self.queued_targets_g = Gauge(
@@ -528,9 +543,9 @@ class Metrics:
             "Bot/chat pairs currently frozen by Telegram RetryAfter.",
             registry=self.registry,
         )
-        self.deferred_tasks_g = Gauge(
-            f"{ns}_send_deferred_tasks",
-            "Queued tasks waiting for their next scheduling attempt.",
+        self.retry_targets_g = Gauge(
+            f"{ns}_retry_targets",
+            "Telegram chat queues waiting for their next scheduling attempt.",
             registry=self.registry,
         )
         self.worker_alive_g = Gauge(
@@ -675,7 +690,7 @@ class Metrics:
         queue_oldest_age: float,
         in_flight: int,
         disabled_bot_chats: int,
-        deferred_tasks: int,
+        retry_targets: int,
         worker_alive: bool,
         aux_pool_size: int = 0,
         aux_disabled: int = 0,
@@ -686,7 +701,7 @@ class Metrics:
         self.queue_oldest_age_g.set(max(0.0, queue_oldest_age))
         self.in_flight_g.set(in_flight)
         self.disabled_bot_chats_g.set(disabled_bot_chats)
-        self.deferred_tasks_g.set(deferred_tasks)
+        self.retry_targets_g.set(retry_targets)
         self.worker_alive_g.set(1 if worker_alive else 0)
         self.aux_pool_size_g.set(aux_pool_size)
         self.aux_disabled_g.set(aux_disabled)
@@ -705,7 +720,7 @@ class Metrics:
             queue_oldest_age=queue_summary["queue_oldest_age"],
             in_flight=len(manager._send_in_flight),
             disabled_bot_chats=len(manager._bot_chat_disabled_until),
-            deferred_tasks=queue_summary["deferred_tasks"],
+            retry_targets=queue_summary["retry_targets"],
             worker_alive=worker_alive,
             aux_pool_size=len(aux_bots),
             aux_disabled=sum(1 for bot in aux_bots if getattr(bot, 'disabled', False)),

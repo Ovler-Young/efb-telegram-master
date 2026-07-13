@@ -37,6 +37,7 @@ from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
 SendTarget: TypeAlias = Tuple[str, int]
+QueueTarget: TypeAlias = int
 BotChatKey: TypeAlias = Tuple[Optional[str], int]
 
 
@@ -56,10 +57,10 @@ class QueuedSendTask(NamedTuple):
     task_id: str
     cleanup_files: tuple[str, ...] = ()
     enqueued_at: float = 0.0
-    not_before: float = 0.0
     db_log_context: Optional[QueuedDbLogContext] = None
     priority: bool = False
     waiter: Optional[Future] = None
+    not_before: float = 0.0
 
     @property
     def slave_id(self) -> str:
@@ -832,19 +833,18 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Bot pool initialization complete...")
 
         # ── Outbound send pipeline ────────────────────────────────────
-        # Per-target FIFO queues + thread pool for concurrent dispatch.
-        # Same (slave_id, chat_id): sends are serial (ordering guarantee).
-        # Different targets: sends run in parallel threads.
+        # Per-Telegram-chat FIFO queues + thread pool for concurrent dispatch.
+        # Sends to one Telegram chat are serial; different chats run concurrently.
         from collections import deque as _deque
         from concurrent.futures import ThreadPoolExecutor
 
-        self._send_queues: dict[SendTarget, _deque[QueuedSendTask]] = {}
+        self._send_queues: dict[QueueTarget, _deque[QueuedSendTask]] = {}
         self._send_queues_lock = threading.Lock()
         self._tasks_enqueued = 0  # monotonic counter for diagnostics
         self._send_worker_stop = threading.Event()
 
-        # Per-target concurrency tracking
-        self._send_in_flight: dict[SendTarget, tuple] = {}  # target -> (Future, task, sender_bot_id)
+        # Per-Telegram-chat concurrency tracking
+        self._send_in_flight: dict[QueueTarget, tuple] = {}
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._bot_chat_retry_failures: dict[BotChatKey, int] = {}
         self._last_metrics_snapshot = 0.0
@@ -1284,9 +1284,9 @@ class TelegramBotManager(LocaleMixin):
         return None, None, main_delay
 
     def _requeue_send_task(self, task: QueuedSendTask):
-        """Put a task back at the front of its target FIFO."""
+        """Put a task back at the front of its Telegram chat FIFO."""
         with self._send_queues_lock:
-            q = self._send_queues.setdefault(task.target, collections.deque())
+            q = self._send_queues.setdefault(task.chat_id, collections.deque())
             q.appendleft(task)
 
     @staticmethod
@@ -1349,15 +1349,16 @@ class TelegramBotManager(LocaleMixin):
 
     def _remove_queued_send_task(self, target: SendTarget, task_id: str) -> Optional[QueuedSendTask]:
         """Remove a task that has not yet been dispatched."""
+        queue_target = target[1]
         with self._send_queues_lock:
-            q = self._send_queues.get(target)
+            q = self._send_queues.get(queue_target)
             if not q:
                 return None
             for task in list(q):
                 if task.task_id == task_id:
                     q.remove(task)
                     if not q:
-                        del self._send_queues[target]
+                        del self._send_queues[queue_target]
                     return task
         return None
 
@@ -1535,7 +1536,7 @@ class TelegramBotManager(LocaleMixin):
                            db_log_context: Optional[QueuedDbLogContext] = None,
                            priority: bool = False,
                            waiter: Optional[Future] = None) -> str:
-        """Append a task to the per-target FIFO queue."""
+        """Append a task to the destination Telegram chat FIFO queue."""
         slave_id, chat_id = target
         enqueued_at = time.monotonic()
         with self._send_queues_lock:
@@ -1553,7 +1554,7 @@ class TelegramBotManager(LocaleMixin):
                 priority=priority,
                 waiter=waiter,
             )
-            q = self._send_queues.setdefault(target, collections.deque())
+            q = self._send_queues.setdefault(chat_id, collections.deque())
             if priority:
                 insert_at = 0
                 for existing in q:
@@ -1569,7 +1570,7 @@ class TelegramBotManager(LocaleMixin):
         if metrics:
             metrics.task_enqueued(priority=priority)
 
-        self.logger.debug("Queued send task %s for target %s (target_queue_depth=%d)",
+        self.logger.debug("Queued send task %s for target %s (chat_queue_depth=%d)",
                           task_id, target, queue_depth)
         return task_id
 
@@ -1578,25 +1579,25 @@ class TelegramBotManager(LocaleMixin):
     def _dispatch_ready_send_tasks(self, now: float):
         with self._send_queues_lock:
             dispatchable_targets = [
-                target for target, q in self._send_queues.items()
+                chat_id for chat_id, q in self._send_queues.items()
                 if (
                     q
-                    and target not in self._send_in_flight
+                    and chat_id not in self._send_in_flight
                     and q[0].not_before <= now
                 )
             ]
 
-        for target in dispatchable_targets:
+        for chat_id in dispatchable_targets:
             if self._send_worker_stop.is_set():
                 break
 
             with self._send_queues_lock:
-                q = self._send_queues.get(target)
+                q = self._send_queues.get(chat_id)
                 if not q:
                     continue
                 task = q.popleft()
                 if not q:
-                    del self._send_queues[target]
+                    del self._send_queues[chat_id]
 
             sender_bot, sender_bot_id, wait_time = self._select_queued_sender(
                 task.chat_id,
@@ -1635,8 +1636,8 @@ class TelegramBotManager(LocaleMixin):
     def _queued_send_worker(self):
         """Worker thread: dispatch sends to a thread pool.
 
-        Same (slave_id, chat_id) → serial (one in-flight at a time, preserves order).
-        Different targets → parallel (thread pool).
+        Same Telegram chat → serial (one in-flight at a time, preserves order).
+        Different Telegram chats → parallel (thread pool).
         The worker thread itself never blocks on HTTP; it only orchestrates.
         """
         self.logger.debug("Queued send worker started")
@@ -1665,15 +1666,15 @@ class TelegramBotManager(LocaleMixin):
                         queued_targets = len(self._send_queues)
                         queued_tasks = sum(len(q) for q in self._send_queues.values())
                         in_flight = len(self._send_in_flight)
-                        deferred_tasks = sum(
-                            1 for q in self._send_queues.values() for task in q
-                            if task.not_before > now
+                        retry_targets = sum(
+                            1 for q in self._send_queues.values()
+                            if q and q[0].not_before > now
                         )
-                    if queued_tasks or in_flight or deferred_tasks or self._bot_chat_disabled_until:
+                    if queued_tasks or in_flight or retry_targets or self._bot_chat_disabled_until:
                         self.logger.info(
                             "Queued send backlog: queued_tasks=%d queued_targets=%d "
-                            "in_flight=%d deferred_tasks=%d disabled_bot_chats=%d",
-                            queued_tasks, queued_targets, in_flight, deferred_tasks,
+                            "in_flight=%d retry_targets=%d disabled_bot_chats=%d",
+                            queued_tasks, queued_targets, in_flight, retry_targets,
                             len(self._bot_chat_disabled_until),
                         )
                     self._last_queue_stats_log = now
@@ -1692,15 +1693,15 @@ class TelegramBotManager(LocaleMixin):
 
         # Shutdown: wait for in-flight sends to finish
         self._drop_pending_queued_tasks_on_shutdown()
-        for target, (future, task, bot_id) in list(self._send_in_flight.items()):
+        for chat_id, (future, task, bot_id) in list(self._send_in_flight.items()):
             try:
                 result = future.result(timeout=10)
             except Exception as e:
-                self._finish_failed_send(task, e)
+                self._finish_failed_send(task, e, bot_id)
             else:
                 self._finish_successful_send(task, result, bot_id)
             finally:
-                self._send_in_flight.pop(target, None)
+                self._send_in_flight.pop(chat_id, None)
         self._send_executor.shutdown(wait=False)
         self._snapshot_send_metrics(worker_alive=False)
         self.logger.debug("Queued send worker stopped")
@@ -1724,7 +1725,7 @@ class TelegramBotManager(LocaleMixin):
             return result
 
         future = self._send_executor.submit(_do_send)
-        self._send_in_flight[task.target] = (future, task, sender_bot_id)
+        self._send_in_flight[task.chat_id] = (future, task, sender_bot_id)
 
     def _release_reserved_slot(self, sender_bot_id: Optional[str], chat_id: int):
         if sender_bot_id and self.bot_pool:
@@ -1893,10 +1894,10 @@ class TelegramBotManager(LocaleMixin):
 
     def _harvest_completed_sends(self):
         """Check all in-flight futures; handle success / errors."""
-        completed = [(target, ft) for target, ft in self._send_in_flight.items() if ft[0].done()]
+        completed = [(chat_id, ft) for chat_id, ft in self._send_in_flight.items() if ft[0].done()]
 
-        for target, (future, task, sender_bot_id) in completed:
-            del self._send_in_flight[target]
+        for chat_id, (future, task, sender_bot_id) in completed:
+            del self._send_in_flight[chat_id]
             sender = TelegramBotManager._metrics_sender(sender_bot_id)
             metrics = getattr(self, '_metrics', None)
             should_cleanup = False

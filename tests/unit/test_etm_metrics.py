@@ -1,6 +1,46 @@
 from efb_telegram_master.etm_metrics import Metrics
 
 
+def test_manager_state_exporter_preserves_source_labels_for_shared_chat_fifo():
+    import collections
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from efb_telegram_master.bot_manager import QueuedSendTask
+    from efb_telegram_master.etm_metrics import _ManagerStateExporter
+
+    first = QueuedSendTask(
+        ("slave.a", 100), lambda: None, (), {}, "t1", enqueued_at=90.0, not_before=110.0
+    )
+    second = QueuedSendTask(
+        ("slave.b", 100), lambda: None, (), {}, "t2", enqueued_at=95.0
+    )
+    manager = SimpleNamespace(
+        _send_queues={100: collections.deque([first, second])},
+        _send_queues_lock=threading.Lock(),
+    )
+    exporter = _ManagerStateExporter(manager)
+
+    with patch("efb_telegram_master.etm_metrics.time.monotonic", return_value=100.0), \
+            patch("efb_telegram_master.etm_metrics.time.time", return_value=100.0):
+        assert sorted(exporter.queue_depth_rows()) == [
+            ("slave.a", 100, 1),
+            ("slave.b", 100, 1),
+        ]
+        assert sorted(exporter.queue_oldest_age_rows()) == [
+            ("slave.a", 100, 10.0),
+            ("slave.b", 100, 5.0),
+        ]
+        assert exporter.queue_summary() == {
+            "queued_tasks": 2,
+            "queued_targets": 1,
+            "max_target_depth": 2,
+            "queue_oldest_age": 10.0,
+            "retry_targets": 1,
+        }
+
+
 def test_topn_queue_collector_caps_rows_and_omits_zero_depths():
     rows = [(f"slave.{i}", i, i) for i in range(25)]
     rows.append(("slave.zero", 999, 0))
@@ -171,11 +211,11 @@ def test_snapshot_updates_queue_oldest_age_gauge():
         queue_oldest_age=12.5,
         in_flight=0,
         disabled_bot_chats=0,
-        deferred_tasks=0,
+        retry_targets=0,
         worker_alive=True,
     )
 
     rendered = metrics.render().decode()
 
     assert "etm_send_queue_oldest_age_seconds 12.5" in rendered
-    assert "etm_send_deferred_tasks 0.0" in rendered
+    assert "etm_retry_targets 0.0" in rendered
