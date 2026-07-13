@@ -57,6 +57,7 @@ setup(
         "peewee",
         "requests",
         "pydub",
+        "audioop-lts; python_version >= '3.13'",
         "ruamel.yaml",
         "pillow",
         "language-tags",

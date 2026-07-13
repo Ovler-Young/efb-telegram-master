@@ -9,7 +9,7 @@ from functools import partial
 from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING, cast
 from pathlib import Path
 
-from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy
+from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy, IntegerField, AutoField
 from playhouse.migrate import migrate
 from telegram import Message
 from typing_extensions import TypedDict
@@ -56,6 +56,7 @@ class BaseModel(Model):
 
 
 class TopicAssoc(BaseModel):
+    id = AutoField()
     topic_chat_id = TextField()
     message_thread_id = TextField()
     slave_uid = TextField()
@@ -170,6 +171,24 @@ class MsgLog(BaseModel):
         return msg
 
 
+class HistoryMigrationEntry(BaseModel):
+    id = AutoField()
+    slave_chat_id = TextField()
+    target_chat_id = TextField()
+    message_thread_id = TextField(null=True)
+    source_master_msg_id = TextField()
+    formatted_text = TextField(null=True)
+    media_type = TextField(null=True)
+    source_time = DateTimeField(null=True)
+    position = IntegerField()
+    created_at = DateTimeField(default=datetime.datetime.now)
+
+    class Meta:
+        indexes = (
+            (("slave_chat_id", "target_chat_id", "message_thread_id", "position"), False),
+        )
+
+
 class SlaveChatInfo(BaseModel):
     slave_channel_id = TextField()
     slave_channel_emoji = CharField()
@@ -253,12 +272,12 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc])
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc], safe=True)
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry], safe=True)
 
     @staticmethod
     def _select_existing_columns(model, table_name: str, requested_fields: List):
@@ -285,7 +304,7 @@ class DatabaseManager:
         sqlite_db.start()
         sqlite_db.connect()
 
-        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog]
+        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry]
         with sqlite_db.bind_ctx(models):
             chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
@@ -309,6 +328,16 @@ class DatabaseManager:
                 MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
                 MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id, MsgLog.time,
             ])
+            if HistoryMigrationEntry.table_exists():
+                history_migration_entries = self._select_existing_columns(HistoryMigrationEntry, "historymigrationentry", [
+                    HistoryMigrationEntry.slave_chat_id, HistoryMigrationEntry.target_chat_id,
+                    HistoryMigrationEntry.message_thread_id, HistoryMigrationEntry.source_master_msg_id,
+                    HistoryMigrationEntry.formatted_text, HistoryMigrationEntry.media_type,
+                    HistoryMigrationEntry.source_time, HistoryMigrationEntry.position,
+                    HistoryMigrationEntry.created_at,
+                ])
+            else:
+                history_migration_entries = []
 
         sqlite_db.stop()
         sqlite_db.close()
@@ -316,14 +345,16 @@ class DatabaseManager:
         self._create()
 
         with database.atomic():
-            for batch in chunked(chat_assocs, 500):
-                ChatAssoc.insert_many(batch).execute()
-            for batch in chunked(topic_assocs, 500):
-                TopicAssoc.insert_many(batch).execute()
-            for batch in chunked(slave_chat_infos, 500):
-                SlaveChatInfo.insert_many(batch).execute()
-            for batch in chunked(msg_logs, 500):
-                MsgLog.insert_many(batch).execute()
+            for chat_assoc_batch in chunked(chat_assocs, 500):
+                ChatAssoc.insert_many(chat_assoc_batch).execute()
+            for topic_assoc_batch in chunked(topic_assocs, 500):
+                TopicAssoc.insert_many(topic_assoc_batch).execute()
+            for slave_chat_info_batch in chunked(slave_chat_infos, 500):
+                SlaveChatInfo.insert_many(slave_chat_info_batch).execute()
+            for msg_log_batch in chunked(msg_logs, 500):
+                MsgLog.insert_many(msg_log_batch).execute()
+            for history_migration_entry_batch in chunked(history_migration_entries, 500):
+                HistoryMigrationEntry.insert_many(history_migration_entry_batch).execute()
 
         migrated_path = sqlite_path.with_suffix('.db.migrated')
         sqlite_path.rename(migrated_path)
@@ -331,9 +362,10 @@ class DatabaseManager:
         self.logger.info(
             "Migration complete. %d chat assocs, %d topic assocs, "
             "%d chat infos, %d messages migrated. "
-            "Original SQLite file renamed to %s",
+            "%d pending history entries migrated. Original SQLite file renamed to %s",
             len(chat_assocs), len(topic_assocs),
             len(slave_chat_infos), len(msg_logs),
+            len(history_migration_entries),
             migrated_path
         )
 
@@ -862,3 +894,93 @@ class DatabaseManager:
             return list(query)
         except DoesNotExist:
             return []
+
+    @staticmethod
+    def _history_migration_target_filter(
+        slave_chat_id: EFBChannelChatIDStr,
+        target_chat_id: int,
+        message_thread_id: Optional[TelegramTopicID] = None,
+    ):
+        thread_value = str(message_thread_id) if message_thread_id is not None else None
+        base_filter = (
+            (HistoryMigrationEntry.slave_chat_id == str(slave_chat_id)) &
+            (HistoryMigrationEntry.target_chat_id == str(target_chat_id))
+        )
+        if thread_value is None:
+            return base_filter & HistoryMigrationEntry.message_thread_id.is_null(True)
+        return base_filter & (HistoryMigrationEntry.message_thread_id == thread_value)
+
+    @staticmethod
+    def replace_history_migration_entries(
+        slave_chat_id: EFBChannelChatIDStr,
+        target_chat_id: int,
+        message_thread_id: Optional[TelegramTopicID],
+        entries: List[Dict[str, object]],
+    ) -> int:
+        target_filter = DatabaseManager._history_migration_target_filter(
+            slave_chat_id,
+            target_chat_id,
+            message_thread_id,
+        )
+        with database.atomic():
+            delete_result = HistoryMigrationEntry.delete().where(target_filter).execute()
+            DatabaseManager._wait_for_write_result(delete_result)
+            if entries:
+                insert_result = HistoryMigrationEntry.insert_many(entries).execute()
+                DatabaseManager._wait_for_write_result(insert_result)
+        DatabaseManager._flush_write_queue()
+        return len(entries)
+
+    @staticmethod
+    def has_pending_history_migrations() -> bool:
+        return HistoryMigrationEntry.select().exists()
+
+    @staticmethod
+    def get_next_history_migration_target() -> Optional[HistoryMigrationEntry]:
+        return HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id.asc()).first()
+
+    @staticmethod
+    def get_history_migration_entries(
+        slave_chat_id: EFBChannelChatIDStr,
+        target_chat_id: int,
+        message_thread_id: Optional[TelegramTopicID] = None,
+    ) -> List[HistoryMigrationEntry]:
+        target_filter = DatabaseManager._history_migration_target_filter(
+            slave_chat_id,
+            target_chat_id,
+            message_thread_id,
+        )
+        return list(
+            HistoryMigrationEntry.select()
+            .where(target_filter)
+            .order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
+        )
+
+    @staticmethod
+    def delete_history_migration_entries(entry_ids: Collection[int]) -> int:
+        if not entry_ids:
+            return 0
+        result = HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(list(entry_ids))).execute()
+        rowcount = DatabaseManager._wait_for_write_result(result)
+        DatabaseManager._flush_write_queue()
+        if rowcount is not None:
+            return rowcount
+        return cast(int, result)
+
+    @staticmethod
+    def _wait_for_write_result(result: object) -> Optional[int]:
+        with suppress(AttributeError):
+            return cast(int, getattr(result, "rowcount"))
+        return None
+
+    @staticmethod
+    def _flush_write_queue() -> None:
+        db_obj = database.obj
+        pause = getattr(db_obj, "pause", None)
+        unpause = getattr(db_obj, "unpause", None)
+        if not callable(pause) or not callable(unpause):
+            return
+
+        paused = pause()
+        if paused is not False:
+            unpause()

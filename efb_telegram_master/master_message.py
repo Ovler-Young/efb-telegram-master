@@ -254,7 +254,7 @@ class MasterMessageProcessor(LocaleMixin):
                     self.logger.debug("[%s] Quoted message is found in database with destination: %s", mid, destination)
             elif cached_dest:
                 self.logger.debug("[%s] Cached destination found: %s", mid, cached_dest)
-                destination = cached_dest
+                destination = EFBChannelChatIDStr(cached_dest)
                 self._send_cached_chat_warning(update, TelegramChatID(message.chat.id), cached_dest)
 
         self.logger.debug("[%s] Destination chat = %s", mid, destination)
