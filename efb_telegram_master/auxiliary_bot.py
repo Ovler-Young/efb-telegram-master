@@ -7,8 +7,6 @@ from collections.abc import Coroutine
 from inspect import isawaitable
 from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING, TypeVar, cast, overload, Literal
 
-from .rate_limiter import ReservationOutcome, SlotReservation
-
 import telegram
 import telegram.error
 from telegram.request import HTTPXRequest
@@ -53,11 +51,7 @@ class AuxiliaryBot:
                  request_kwargs: Optional[dict] = None,
                  base_url: Optional[str] = None,
                  base_file_url: Optional[str] = None,
-                 local_mode: bool = False,
-                 global_limit: int = 30,
-                 global_window: float = 1.0,
-                 chat_limit: int = 20,
-                 chat_window: float = 60.0):
+                 local_mode: bool = False):
         self._token = token
         self._request_kwargs = dict(request_kwargs or {})
         self._base_kwargs: Dict[str, str] = {}
@@ -76,14 +70,9 @@ class AuxiliaryBot:
         self.disabled: bool = False
         self._runtime: Optional['AsyncTelegramRuntime'] = None
 
-        # Rate limiting — delegates to shared SlidingWindowRateLimiter
+        # Each auxiliary bot has independent global and bot-chat acquisition keys.
         from .rate_limiter import SlidingWindowRateLimiter
-        self._rate_limiter = SlidingWindowRateLimiter(
-            global_limit=global_limit,
-            global_window=global_window,
-            chat_limit=chat_limit,
-            chat_window=chat_window,
-        )
+        self._rate_limiter = SlidingWindowRateLimiter()
 
         # Membership cache: chat_id -> (is_member, timestamp)
         self._membership_cache: Dict[int, Tuple[bool, float]] = {}
@@ -151,7 +140,6 @@ class AuxiliaryBot:
             me: telegram.User = cast(telegram.User, _resolve_bot_result(validation_bot.get_me(), self._runtime))
             self.bot_id = me.id
             self.username = me.username or ""
-            self._rate_limiter.set_owner_id(str(self.bot_id))
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)
             return True
         except telegram.error.Forbidden as e:
@@ -167,26 +155,14 @@ class AuxiliaryBot:
         """Check rate limit delay without reserving a slot. Thread-safe."""
         return self._rate_limiter.peek_delay(chat_id)
 
-    def reserve_slot(self, chat_id: int) -> ReservationOutcome:
-        """Reserve a send slot and return its exact token. Thread-safe."""
-        return self._rate_limiter.reserve_slot(chat_id)
-
-    def release_slot(self, reservation: Optional[SlotReservation]) -> None:
-        """Release an exact reservation when a send did not happen."""
-        self._rate_limiter.release_slot(reservation)
+    def try_acquire_limits(self, chat_id: int) -> bool:
+        """Consume global then bot-chat capacity without waiting or rollback."""
+        return self._rate_limiter.try_acquire(chat_id)
 
     def get_chat_send_count(self, chat_id: int) -> int:
         """Return this bot's current per-chat sliding-window send count."""
         chat_count, _global_count = self._rate_limiter.get_counts(chat_id)
         return chat_count
-
-    def get_chat_count_snapshot(self) -> Tuple[Dict[int, int], int]:
-        """Return current per-chat rate-limit occupancy for metrics."""
-        return self._rate_limiter.get_chat_count_snapshot()
-
-    def get_reserved_slot_count(self) -> int:
-        """Return current global sliding-window reservations for metrics."""
-        return self._rate_limiter.get_reserved_slot_count()
 
     def get_known_member_chat_ids(self) -> set[int]:
         """Return chat IDs where this bot is currently cached as a member."""

@@ -47,7 +47,6 @@ from .outbound import (
     utc_now,
 )
 from .ptb_compat import Filters
-from .rate_limiter import SlotReservation
 from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
@@ -615,18 +614,13 @@ class TelegramBotManager(LocaleMixin):
         self.admins = config['admins']
         self.dispatcher = self.application
 
-        # Initialize sliding window rate limiting — shared implementation
+        # Each bot owns independent in-memory global and bot-chat limits.
         from .rate_limiter import SlidingWindowRateLimiter
-        self.GLOBAL_LIMIT = 30    # messages per second
+        self.GLOBAL_LIMIT = 28    # acquisitions per second
         self.GLOBAL_WINDOW = 1.0
-        self.CHAT_LIMIT = 20      # messages per minute per chat
+        self.CHAT_LIMIT = 18      # acquisitions per minute per chat
         self.CHAT_WINDOW = 60.0
-        self._rate_limiter = SlidingWindowRateLimiter(
-            global_limit=self.GLOBAL_LIMIT,
-            global_window=self.GLOBAL_WINDOW,
-            chat_limit=self.CHAT_LIMIT,
-            chat_window=self.CHAT_WINDOW,
-        )
+        self._rate_limiter = SlidingWindowRateLimiter()
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
         self._shutdown_complete_event = threading.Event()
@@ -1030,33 +1024,35 @@ class TelegramBotManager(LocaleMixin):
         task: OutboundTask,
         now: datetime,
     ) -> SenderSelectionResult:
-        """Reserve an immediately eligible bot without creating destination FIFO state."""
-        now_timestamp = now.timestamp()
+        """Choose a sender without consuming any rate-limit capacity."""
+        now_timestamp = time.monotonic()
         required_sender_bot_id = task.required_sender_bot_id
+        chat_id = getattr(task, "telegram_chat_id", None)
+        if chat_id is None:
+            chat_id = task.target_chat_id
 
         if required_sender_bot_id == "__main__":
-            cooldown = self._bot_chat_disabled_until.get((None, task.target_chat_id), 0.0)
-            delay = max(self._rate_limiter.peek_delay(task.target_chat_id), cooldown - now_timestamp)
+            cooldown = self._bot_chat_disabled_until.get((None, chat_id), 0.0)
+            delay = max(self._rate_limiter.peek_delay(chat_id), cooldown - now_timestamp)
             if delay > 0:
                 return SenderSelectionResult(
                     retry_at=now + timedelta(seconds=delay),
                     reason="required_main_unavailable",
                 )
-            outcome = self._rate_limiter.reserve_slot(task.target_chat_id)
             return SenderSelectionResult(selection=SenderSelection(
                 sender=self._bot,
                 sender_bot_id=None,
-                reservation=outcome.reservation,
+                reservation=None,
             ))
 
         if required_sender_bot_id is not None:
             aux_bot = self.bot_pool.get_bot_by_id(required_sender_bot_id) if self.bot_pool else None
             if aux_bot is None or aux_bot.disabled:
                 return SenderSelectionResult(
-                    reason=f"Required sender {required_sender_bot_id} is not configured or is disabled.",
+                    reason="required_sender_unavailable",
                     terminal_error_class="required_sender_unavailable",
                 )
-            membership = aux_bot.check_membership_tri(task.target_chat_id)
+            membership = aux_bot.check_membership_tri(chat_id)
             if membership is None:
                 return SenderSelectionResult(
                     retry_at=now + timedelta(seconds=self.MEMBERSHIP_RECHECK_SECONDS),
@@ -1064,81 +1060,111 @@ class TelegramBotManager(LocaleMixin):
                 )
             if membership is not True:
                 return SenderSelectionResult(
-                    reason=f"Required sender {required_sender_bot_id} is not a member of chat {task.target_chat_id}.",
-                    terminal_error_class="required_sender_not_member",
+                    reason="required_sender_unavailable",
+                    terminal_error_class="required_sender_unavailable",
                 )
             cooldown = self._bot_chat_disabled_until.get(
-                (str(required_sender_bot_id), task.target_chat_id), 0.0,
+                (str(required_sender_bot_id), chat_id), 0.0,
             )
-            delay = max(aux_bot.peek_delay(task.target_chat_id), cooldown - now_timestamp)
+            delay = max(aux_bot.peek_delay(chat_id), cooldown - now_timestamp)
             if delay > 0:
                 return SenderSelectionResult(
                     retry_at=now + timedelta(seconds=delay),
                     reason="required_sender_rate_limited",
                 )
-            outcome = aux_bot.reserve_slot(task.target_chat_id)
             return SenderSelectionResult(selection=SenderSelection(
                 sender=aux_bot.bot,
                 sender_bot_id=str(aux_bot.bot_id),
-                reservation=outcome.reservation,
+                reservation=None,
             ))
 
-        main_cooldown = self._bot_chat_disabled_until.get((None, task.target_chat_id), 0.0)
+        main_cooldown = self._bot_chat_disabled_until.get((None, chat_id), 0.0)
         main_delay = max(
-            self._rate_limiter.peek_delay(task.target_chat_id),
+            self._rate_limiter.peek_delay(chat_id),
             main_cooldown - now_timestamp,
         )
+        candidates: list[tuple[object, Optional[str], float]] = [(self._bot, None, main_delay)]
+        unknown_membership = False
         if self.bot_pool:
-            def skip_bot(aux_bot: AuxiliaryBot) -> bool:
-                return self._bot_chat_disabled_until.get(
-                    (str(aux_bot.bot_id), task.target_chat_id), 0.0,
-                ) > now_timestamp
-
-            slot = self.bot_pool.acquire_send_slot(
-                task.target_chat_id,
-                max_delay=1e-9,
-                skip_bot=skip_bot,
-                affinity_key=task.slave_id,
-                notify_admin=main_delay > 0,
-            )
-            if slot is not None:
-                aux_bot, reservation = slot
-                return SenderSelectionResult(selection=SenderSelection(
-                    sender=aux_bot.bot,
-                    sender_bot_id=str(aux_bot.bot_id),
-                    reservation=reservation,
+            for aux_bot, membership in self.bot_pool.candidate_bots(chat_id):
+                if membership is None:
+                    unknown_membership = True
+                    continue
+                if membership is not True:
+                    continue
+                cooldown = self._bot_chat_disabled_until.get((str(aux_bot.bot_id), chat_id), 0.0)
+                candidates.append((
+                    aux_bot.bot,
+                    str(aux_bot.bot_id),
+                    max(aux_bot.peek_delay(chat_id), cooldown - now_timestamp),
                 ))
 
-        if main_delay <= 0:
-            outcome = self._rate_limiter.reserve_slot(task.target_chat_id)
-            return SenderSelectionResult(selection=SenderSelection(
-                sender=self._bot,
-                sender_bot_id=None,
-                reservation=outcome.reservation,
-            ))
-
-        candidate_delays = [main_delay]
-        for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
-            if aux_bot.disabled:
-                continue
-            membership = aux_bot.check_membership_tri(task.target_chat_id)
-            if membership is None:
-                candidate_delays.append(self.MEMBERSHIP_RECHECK_SECONDS)
-                continue
-            if membership is not True:
-                continue
-            cooldown = self._bot_chat_disabled_until.get(
-                (str(aux_bot.bot_id), task.target_chat_id), 0.0,
+        if unknown_membership:
+            return SenderSelectionResult(
+                retry_at=now + timedelta(seconds=self.MEMBERSHIP_RECHECK_SECONDS),
+                reason="auxiliary_membership_pending",
             )
-            candidate_delays.append(max(
-                aux_bot.peek_delay(task.target_chat_id),
-                cooldown - now_timestamp,
-            ))
-        wait_seconds = max(0.05, min(candidate_delays))
-        return SenderSelectionResult(
-            retry_at=now + timedelta(seconds=wait_seconds),
-            reason="all_senders_rate_limited",
+
+        earliest_delay = min(delay for _sender, _bot_id, delay in candidates)
+        if earliest_delay > 0:
+            return SenderSelectionResult(
+                retry_at=now + timedelta(seconds=earliest_delay),
+                reason="all_senders_rate_limited",
+            )
+
+        selectable = [candidate for candidate in candidates if candidate[2] == 0]
+        preferred_bot = self.bot_pool.preferred_sender(task.slave_id) if self.bot_pool else None
+        if preferred_bot is not None:
+            preferred_id = str(preferred_bot.bot_id)
+            for sender, sender_bot_id, _delay in selectable:
+                if sender_bot_id == preferred_id:
+                    return SenderSelectionResult(selection=SenderSelection(
+                        sender=sender,
+                        sender_bot_id=sender_bot_id,
+                        reservation=None,
+                    ))
+
+        for sender, sender_bot_id, _delay in selectable:
+            if sender_bot_id is None:
+                return SenderSelectionResult(selection=SenderSelection(
+                    sender=sender,
+                    sender_bot_id=None,
+                    reservation=None,
+                ))
+
+        sender, sender_bot_id, _delay = min(
+            selectable,
+            key=lambda candidate: str(candidate[1]),
         )
+        return SenderSelectionResult(selection=SenderSelection(
+            sender=sender,
+            sender_bot_id=sender_bot_id,
+            reservation=None,
+        ))
+
+    def acquire_sender_limits(self, selection: SenderSelection, telegram_chat_id: int) -> bool:
+        """Consume the chosen sender's global limit before its bot-chat limit."""
+        if selection.sender_bot_id is None:
+            return self._rate_limiter.try_acquire(telegram_chat_id)
+        aux_bot = self.bot_pool.get_bot_by_id(selection.sender_bot_id) if self.bot_pool else None
+        return aux_bot is not None and aux_bot.try_acquire_limits(telegram_chat_id)
+
+    def next_sender_deadline(self, selection: SenderSelection, telegram_chat_id: int) -> float:
+        """Return the chosen sender's monotonic limiter delay after a failed acquisition."""
+        if selection.sender_bot_id is None:
+            return self._rate_limiter.peek_delay(telegram_chat_id)
+        aux_bot = self.bot_pool.get_bot_by_id(selection.sender_bot_id) if self.bot_pool else None
+        return float('inf') if aux_bot is None else aux_bot.peek_delay(telegram_chat_id)
+
+    def record_successful_sender(self, task: OutboundTask, selection: SenderSelection) -> None:
+        """Persist no state; update optional in-memory affinity after an auxiliary success."""
+        if selection.sender_bot_id is not None and self.bot_pool:
+            self.bot_pool.record_successful_auxiliary_send(task.slave_id, selection.sender_bot_id)
+
+    def remove_confirmed_non_member_affinity(self, task: OutboundTask, sender_bot_id: Optional[str]) -> None:
+        """Apply membership-probe failure only to the triggering affinity entry."""
+        if sender_bot_id is not None and self.bot_pool:
+            self.bot_pool.remove_failed_membership_affinity(task.slave_id, sender_bot_id)
 
     def execute_task(self, task: OutboundTask, selection: SenderSelection) -> object:
         operation, args, kwargs = self._outbound_codec.decode_command(task.payload)
@@ -1164,14 +1190,6 @@ class TelegramBotManager(LocaleMixin):
                 time.monotonic() - started,
             )
         return result
-
-    def release_reservation(self, selection: SenderSelection) -> None:
-        if selection.sender_bot_id is not None and self.bot_pool:
-            aux_bot = self.bot_pool.get_bot_by_id(selection.sender_bot_id)
-            if aux_bot is not None:
-                aux_bot.release_slot(selection.reservation)
-                return
-        self._rate_limiter.release_slot(selection.reservation)
 
     def task_dispatched(
         self,
@@ -1199,6 +1217,7 @@ class TelegramBotManager(LocaleMixin):
         )
         if selection.sender_bot_id is not None:
             self._record_aux_use(task.target_chat_id)
+            self.record_successful_sender(task, selection)
         metrics = getattr(self, '_metrics', None)
         if metrics:
             total_seconds = None
@@ -1486,10 +1505,6 @@ class TelegramBotManager(LocaleMixin):
                 base_url=channel.flag('api_base_url') or None,
                 base_file_url=channel.flag('api_base_file_url') or None,
                 local_mode=self._local_mode,
-                global_limit=self.GLOBAL_LIMIT,
-                global_window=self.GLOBAL_WINDOW,
-                chat_limit=self.CHAT_LIMIT,
-                chat_window=self.CHAT_WINDOW,
             )
             aux_bot.bind_runtime(self._runtime)
             if aux_bot.initialize():
