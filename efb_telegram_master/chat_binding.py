@@ -1544,92 +1544,87 @@ class ChatBindingManager(LocaleMixin):
         thread_id = TelegramTopicID(int(target.message_thread_id)) if target.message_thread_id is not None else None
         entries = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
 
-        if not entries:
-            return True
-
-        linked_workflow_ids = {
-            entry.outbound_workflow_id
-            for entry in entries
-            if entry.outbound_workflow_id is not None
-        }
-        for workflow_id in sorted(linked_workflow_ids):
-            state = self.db.reconcile_history_migration_workflow(workflow_id)
-            if state == "active":
-                return False
-        entries = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
-        entries = [entry for entry in entries if entry.state == "queued"]
-        if not entries:
-            return True
-
         self.logger.info("Migrating %s pending historical messages for chat %s", len(entries), slave_chat_id)
-
-        current_text_batch: list[str] = []
-        current_entry_ids: list[int] = []
-        current_length = 0
-
         for entry in entries:
-            if entry.formatted_text:
-                expected_msg_length = len(entry.formatted_text)
-                if current_text_batch and current_length + expected_msg_length > 4096 - 20:
-                    break
-                current_text_batch.append(entry.formatted_text)
-                current_entry_ids.append(entry.id)
-                current_length += expected_msg_length
-                continue
-
-            if current_text_batch:
-                break
-
             try:
-                original_chat_id, original_msg_id = utils.message_id_str_to_id(
-                    TgChatMsgIDStr(entry.source_master_msg_id)
+                prepared_call = self._prepare_history_migration_call(
+                    entry,
+                    tg_chat_id,
+                    thread_id,
                 )
             except Exception as error:
-                self.logger.warning("Failed to parse history message ID %s: %s", entry.source_master_msg_id, error)
-                from .db import HistoryMigrationEntry
-                HistoryMigrationEntry.update(
-                    state="dead",
-                    last_error=f"Invalid source message ID: {error}",
-                ).where(HistoryMigrationEntry.id == entry.id).execute()
-                return True
+                self._log_history_migration_failure(entry.id, 0, error)
+                return False
 
-            copy_kwargs: dict[str, object] = {
-                'chat_id': tg_chat_id,
-                'from_chat_id': original_chat_id,
-                'message_id': original_msg_id,
-                'disable_notification': True,
-            }
-            if thread_id is not None:
-                copy_kwargs['message_thread_id'] = thread_id
-            self.bot.enqueue_history_operation(
-                source_key=str(slave_chat_id),
-                target_chat_id=tg_chat_id,
-                operation='copy_message',
-                args=(),
-                kwargs=copy_kwargs,
-                history_entry_ids=[entry.id],
-            )
-            return False
+            if prepared_call is None:
+                self.db.delete_history_migration_entry(entry.id)
+                self.logger.info("History migration entry %d completed 0 calls", entry.id)
+                continue
 
-        if current_text_batch:
-            send_kwargs: dict[str, object] = {
+            operation, kwargs = prepared_call
+            completed_call_count = 0
+            try:
+                waiter = self.bot.enqueue_history_operation(
+                    source_key=str(slave_chat_id),
+                    target_chat_id=tg_chat_id,
+                    operation=operation,
+                    args=(),
+                    kwargs=kwargs,
+                    history_entry_ids=[entry.id],
+                )
+                waiter.result()
+                completed_call_count += 1
+            except BaseException as error:
+                self._log_history_migration_failure(entry.id, completed_call_count, error)
+                return False
+
+            self.db.delete_history_migration_entry(entry.id)
+        return True
+
+    @staticmethod
+    def _prepare_history_migration_call(
+        entry,
+        tg_chat_id: int,
+        thread_id: Optional[TelegramTopicID],
+    ) -> Optional[tuple[str, dict[str, object]]]:
+        if entry.formatted_text == "":
+            return None
+        if entry.formatted_text is not None:
+            kwargs: dict[str, object] = {
                 'chat_id': tg_chat_id,
-                'text': "".join(current_text_batch),
+                'text': entry.formatted_text,
                 'parse_mode': 'Markdown',
                 'disable_notification': True,
             }
             if thread_id is not None:
-                send_kwargs['message_thread_id'] = thread_id
-            self.bot.enqueue_history_operation(
-                source_key=str(slave_chat_id),
-                target_chat_id=tg_chat_id,
-                operation='send_message',
-                args=(),
-                kwargs=send_kwargs,
-                history_entry_ids=current_entry_ids,
-            )
-            return False
-        return True
+                kwargs['message_thread_id'] = thread_id
+            return 'send_message', kwargs
+
+        original_chat_id, original_msg_id = utils.message_id_str_to_id(
+            TgChatMsgIDStr(entry.source_master_msg_id)
+        )
+        kwargs = {
+            'chat_id': tg_chat_id,
+            'from_chat_id': original_chat_id,
+            'message_id': original_msg_id,
+            'disable_notification': True,
+        }
+        if thread_id is not None:
+            kwargs['message_thread_id'] = thread_id
+        return 'copy_message', kwargs
+
+    def _log_history_migration_failure(
+        self,
+        entry_id: int,
+        completed_call_count: int,
+        error: BaseException,
+    ) -> None:
+        self.logger.warning(
+            "History migration entry %d retained after %d completed calls: %s",
+            entry_id,
+            completed_call_count,
+            error,
+        )
 
     @staticmethod
     def truncate_ellipsis(text: str, length: int) -> str:
