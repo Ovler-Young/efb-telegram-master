@@ -208,7 +208,6 @@ def test_rate_limit_decorator_ignores_non_edit_sender_hint_without_pool_lookup()
 def _make_lightweight_bot_manager():
     manager = TelegramBotManager.__new__(TelegramBotManager)
     manager._bot = Mock()
-    manager._tls = threading.local()
     manager.bot_pool = None
     manager._send_worker_stop = threading.Event()
     manager.GLOBAL_LIMIT = 30
@@ -224,7 +223,6 @@ def _make_lightweight_bot_manager():
     )
     manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
     manager.logger = Mock()
-    manager._using_bot = TelegramBotManager._using_bot.__get__(manager, TelegramBotManager)
     manager._make_send_receipt = TelegramBotManager._make_send_receipt.__get__(manager, TelegramBotManager)
     _bind_blocking_enqueue_helper(manager)
     return manager
@@ -866,6 +864,20 @@ def test_graceful_stop_shuts_down_metrics_server():
 
     metrics_httpd.shutdown.assert_called_once_with()
     metrics_httpd.server_close.assert_called_once_with()
+
+
+def test_stop_worker_join_covers_outbound_drain_deadline():
+    manager = object.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._send_worker_stop = threading.Event()
+    manager._outbound_scheduler = SimpleNamespace(wake_event=threading.Event())
+    manager._send_worker_thread = Mock()
+    manager._send_worker_thread.is_alive.return_value = True
+
+    manager.stop_queued_worker()
+
+    join_timeout = manager._send_worker_thread.join.call_args.kwargs["timeout"]
+    assert join_timeout > manager.SHUTDOWN_DRAIN_TIMEOUT
 
 
 def test_parse_metrics_config_defaults_and_disables_invalid_endpoint_options():

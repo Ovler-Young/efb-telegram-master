@@ -136,42 +136,6 @@ def test_database_manager_uses_transactional_wal_sqlite_and_creates_durable_tabl
         database.initialize(original_database)
 
 
-def test_write_result_wait_reads_rowcount():
-    class WriteResult:
-        def __init__(self):
-            self.rowcount_read = False
-
-        @property
-        def rowcount(self):
-            self.rowcount_read = True
-            return 3
-
-    result = WriteResult()
-
-    assert DatabaseManager._wait_for_write_result(result) == 3
-    assert result.rowcount_read
-
-
-def test_flush_write_queue_pauses_and_unpauses_sqlite_queue(monkeypatch):
-    calls = []
-
-    class QueueDatabase:
-        def pause(self):
-            calls.append("pause")
-
-        def unpause(self):
-            calls.append("unpause")
-
-    class DatabaseProxy:
-        obj = QueueDatabase()
-
-    monkeypatch.setattr(db_module, "database", DatabaseProxy())
-
-    DatabaseManager._flush_write_queue()
-
-    assert calls == ["pause", "unpause"]
-
-
 def test_topic_assoc_table_exists_and_round_trips(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(11111)

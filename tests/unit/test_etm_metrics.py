@@ -169,16 +169,12 @@ def test_bot_chat_occupancy_collector_returns_empty_family_on_snapshot_error():
 def test_debug_event_metrics_render_bounded_labels():
     metrics = Metrics()
 
-    metrics.dispatch_blocked("local_rate_limit")
-    metrics.sender_selection("aux", "skipped", "no_aux_member")
     metrics.send_failure("main", "bad_request", "send_message")
     metrics.bad_request("send_message", "invalid_markup")
     metrics.membership_probe(123, "botA", "ok_member")
 
     rendered = metrics.render().decode()
 
-    assert 'etm_send_dispatch_blocked_total{reason="local_rate_limit"} 1.0' in rendered
-    assert 'etm_sender_selection_total{reason="no_aux_member",result="skipped",sender="aux"} 1.0' in rendered
     assert 'etm_telegram_send_failures_total{error_type="bad_request",method="send_message",sender="main"} 1.0' in rendered
     assert 'etm_bad_request_total{method="send_message",reason_class="invalid_markup"} 1.0' in rendered
     assert 'etm_membership_probe_total{bot_id="123",outcome="ok_member",username="botA"} 1.0' in rendered

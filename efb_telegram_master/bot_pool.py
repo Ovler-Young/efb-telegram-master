@@ -118,8 +118,8 @@ class BotPool:
         Iterates aux bots confirmed as members of the chat, picks the one
         with the lowest delay, then reserves a slot.
 
-        For bots whose membership is unknown (first encounter / cold start),
-        a synchronous probe is performed so they can participate immediately.
+        Bots with unknown membership start their existing background probe and
+        participate on a later scheduler pass.
 
         Args:
             chat_id: Target Telegram chat.
@@ -134,11 +134,13 @@ class BotPool:
             (AuxiliaryBot, reservation) if a suitable aux bot was found,
             None if no aux bot beats max_delay or none are members.
         """
-        def _select_locked() -> tuple[Optional[Tuple[AuxiliaryBot, SlotReservation]], List[AuxiliaryBot], List[AuxiliaryBot]]:
+        def _select_locked() -> tuple[
+            Optional[Tuple[AuxiliaryBot, SlotReservation]],
+            List[AuxiliaryBot],
+        ]:
             best_bot: Optional[AuxiliaryBot] = None
             best_delay = float('inf')
             confirmed_non_member_bots: List[AuxiliaryBot] = []
-            unknown_bots: List[AuxiliaryBot] = []
             ordered_bots = self._ordered_bots_for_chat(chat_id)
 
             for aux_bot in ordered_bots:
@@ -147,7 +149,6 @@ class BotPool:
 
                 status = aux_bot.check_membership_tri(chat_id)
                 if status is None:
-                    unknown_bots.append(aux_bot)
                     continue
                 if status is False:
                     confirmed_non_member_bots.append(aux_bot)
@@ -165,29 +166,16 @@ class BotPool:
                 self._advance_round_robin_cursor(chat_id, best_bot)
                 if affinity_key is not None:
                     self._affinity_bot_by_key[affinity_key] = best_bot.bot_id
-                return (best_bot, reservation), confirmed_non_member_bots, unknown_bots
-            return None, confirmed_non_member_bots, unknown_bots
+                return (best_bot, reservation), confirmed_non_member_bots
+            return None, confirmed_non_member_bots
 
         with self._pool_lock:
             affinity_slot = self._try_affinity_bot(chat_id, max_delay, affinity_key, skip_bot)
             if affinity_slot is not None:
                 return affinity_slot
-            selected, confirmed_non_member_bots, unknown_bots = _select_locked()
+            selected, confirmed_non_member_bots = _select_locked()
             if selected is not None:
                 return selected
-
-        if unknown_bots:
-            for aux_bot in unknown_bots:
-                if skip_bot is not None and skip_bot(aux_bot):
-                    continue
-                aux_bot.check_membership_sync(chat_id, timeout=3.0)
-            with self._pool_lock:
-                affinity_slot = self._try_affinity_bot(chat_id, max_delay, affinity_key, skip_bot)
-                if affinity_slot is not None:
-                    return affinity_slot
-                selected, confirmed_non_member_bots, _unknown_bots = _select_locked()
-                if selected is not None:
-                    return selected
 
         # Suggest adding aux bots only when the caller is actually rate-limited.
         # Selection budget (max_delay) may include a small epsilon for fairness,
@@ -196,57 +184,6 @@ class BotPool:
             self._maybe_notify_admin(chat_id, confirmed_non_member_bots)
 
         return None
-
-    def explain_send_slot_unavailable(
-        self,
-        chat_id: int,
-        skip_bot: Optional[Callable[[AuxiliaryBot], bool]] = None,
-    ) -> str:
-        """Return a bounded reason label when no auxiliary bot can be selected."""
-        has_usable_bot = False
-        has_skipped_bot = False
-        has_unknown_membership = False
-        has_confirmed_non_member = False
-        has_rate_limited_member = False
-
-        with self._pool_lock:
-            ordered_bots = self._ordered_bots_for_chat(chat_id)
-            if not ordered_bots:
-                return "not_configured"
-
-            for aux_bot in ordered_bots:
-                if aux_bot.disabled:
-                    continue
-                has_usable_bot = True
-
-                if skip_bot is not None and skip_bot(aux_bot):
-                    has_skipped_bot = True
-                    continue
-
-                status = aux_bot.check_membership_tri(chat_id)
-                if status is None:
-                    has_unknown_membership = True
-                    continue
-                if status is False:
-                    has_confirmed_non_member = True
-                    continue
-
-                if aux_bot.peek_delay(chat_id) > 0:
-                    has_rate_limited_member = True
-                    continue
-                return "available"
-
-        if has_unknown_membership:
-            return "membership_unknown"
-        if has_rate_limited_member:
-            return "local_rate_limit"
-        if has_confirmed_non_member:
-            return "no_aux_member"
-        if has_skipped_bot:
-            return "bot_chat_cooldown"
-        if not has_usable_bot:
-            return "disabled"
-        return "unavailable"
 
     def on_bots_joined_chat(self, bot_ids: list, chat_id: int):
         """Update membership cache when aux bots are added to a group."""

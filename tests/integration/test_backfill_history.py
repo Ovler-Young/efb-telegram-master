@@ -15,6 +15,8 @@ from telethon.tl.types import Channel, Chat as TelethonChat
 from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
+from efb_telegram_master.db import OutboundTask
+from efb_telegram_master.outbound import TaskState
 from .helper.filters import has_button, in_chats
 
 pytestmark = pytest.mark.asyncio
@@ -227,10 +229,7 @@ def _expected_stream_indices(expected_count: int) -> Set[int]:
 
 
 def _queued_state(bot_manager):
-    with bot_manager._send_queues_lock:
-        queue_len = sum(len(q) for q in bot_manager._send_queues.values())
-    in_flight = len(bot_manager._send_in_flight)
-    return queue_len + in_flight
+    return OutboundTask.select().where(OutboundTask.state.in_(TaskState.ACTIVE)).count()
 
 
 def _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix: str):

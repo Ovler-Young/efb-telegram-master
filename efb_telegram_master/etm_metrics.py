@@ -463,18 +463,6 @@ class Metrics:
             ["sender"],
             registry=self.registry,
         )
-        self.dispatch_blocked_c = Counter(
-            f"{ns}_send_dispatch_blocked_total",
-            "Durable lane dispatch attempts blocked before a sender was available.",
-            ["reason"],
-            registry=self.registry,
-        )
-        self.sender_selection_c = Counter(
-            f"{ns}_sender_selection_total",
-            "Sender selection outcomes for queued sends.",
-            ["sender", "result", "reason"],
-            registry=self.registry,
-        )
         self.send_failures_c = Counter(
             f"{ns}_telegram_send_failures_total",
             "Telegram send call failures by bounded error class and method.",
@@ -700,12 +688,6 @@ class Metrics:
 
     def rate_limited(self, sender: str) -> None:
         self.rate_limit_hits.labels(sender=sender).inc()
-
-    def dispatch_blocked(self, reason: str) -> None:
-        self.dispatch_blocked_c.labels(reason=reason).inc()
-
-    def sender_selection(self, sender: str, result: str, reason: str) -> None:
-        self.sender_selection_c.labels(sender=sender, result=result, reason=reason).inc()
 
     def send_failure(self, sender: str, error_type: str, method: str) -> None:
         self.send_failures_c.labels(sender=sender, error_type=error_type, method=method).inc()

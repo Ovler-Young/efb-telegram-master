@@ -1142,12 +1142,9 @@ class DatabaseManager:
             message_thread_id,
         )
         with database.atomic():
-            delete_result = HistoryMigrationEntry.delete().where(target_filter).execute()
-            DatabaseManager._wait_for_write_result(delete_result)
+            HistoryMigrationEntry.delete().where(target_filter).execute()
             if entries:
-                insert_result = HistoryMigrationEntry.insert_many(entries).execute()
-                DatabaseManager._wait_for_write_result(insert_result)
-        DatabaseManager._flush_write_queue()
+                HistoryMigrationEntry.insert_many(entries).execute()
         return len(entries)
 
     @staticmethod
@@ -1184,12 +1181,12 @@ class DatabaseManager:
     def delete_history_migration_entries(entry_ids: Collection[int]) -> int:
         if not entry_ids:
             return 0
-        result = HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(list(entry_ids))).execute()
-        rowcount = DatabaseManager._wait_for_write_result(result)
-        DatabaseManager._flush_write_queue()
-        if rowcount is not None:
-            return rowcount
-        return cast(int, result)
+        return cast(
+            int,
+            HistoryMigrationEntry.delete().where(
+                HistoryMigrationEntry.id.in_(list(entry_ids))
+            ).execute(),
+        )
 
     @staticmethod
     def link_history_migration_entries(entry_ids: Collection[int], workflow_id: int) -> int:
@@ -1226,21 +1223,3 @@ class DatabaseManager:
                 last_error=workflow.error_class or "Outbound history workflow failed.",
             ).where(HistoryMigrationEntry.outbound_workflow_id == workflow_id).execute()
         return cast(str, workflow.state)
-
-    @staticmethod
-    def _wait_for_write_result(result: object) -> Optional[int]:
-        with suppress(AttributeError):
-            return cast(int, getattr(result, "rowcount"))
-        return None
-
-    @staticmethod
-    def _flush_write_queue() -> None:
-        db_obj = database.obj
-        pause = getattr(db_obj, "pause", None)
-        unpause = getattr(db_obj, "unpause", None)
-        if not callable(pause) or not callable(unpause):
-            return
-
-        paused = pause()
-        if paused is not False:
-            unpause()

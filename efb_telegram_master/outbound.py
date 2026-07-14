@@ -18,10 +18,10 @@ from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
 
 import telegram
-from peewee import SQL
+from peewee import fn
 from telegram import InputFile, TelegramObject
 
-from .db import OutboundTask, OutboundWorkflow, database
+from .db import OutboundTask, OutboundWorkflow
 from .rate_limiter import SlotReservation
 
 
@@ -68,6 +68,7 @@ class OutboundTaskSpec:
     run_condition: str = RunCondition.ALWAYS
     required_sender_bot_id: Optional[str] = None
     log_payload: Optional[Mapping[str, object]] = None
+    owned_local_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -170,7 +171,6 @@ class OutboundSchedulerAdapter(Protocol):
 class InFlightTask:
     future: Future
     task_id: int
-    source_key: str
     selection: SenderSelection
 
 
@@ -189,13 +189,21 @@ class OutboundPayloadCodec:
         operation: str,
         args: Sequence[object],
         kwargs: Mapping[str, object],
+        *,
+        owned_local_paths: Sequence[str] = (),
     ) -> EncodedCommand:
         media_refs: list[str] = []
+        managed_paths: dict[str, Path] = {}
+        for path_value in owned_local_paths:
+            path = Path(path_value).resolve()
+            managed_paths[path_value] = path
+            managed_paths[str(path)] = path
+            managed_paths[path.as_uri()] = path
         document = {
             "version": self.VERSION,
             "operation": operation,
-            "args": self._encode(tuple(args), media_refs),
-            "kwargs": self._encode(dict(kwargs), media_refs),
+            "args": self._encode(tuple(args), media_refs, managed_paths),
+            "kwargs": self._encode(dict(kwargs), media_refs, managed_paths),
         }
         return EncodedCommand(
             payload=json.dumps(document, separators=(",", ":"), sort_keys=True),
@@ -267,11 +275,30 @@ class OutboundPayloadCodec:
             content = bytes(content)
         return content
 
-    def _encode(self, value: object, media_refs: list[str]) -> object:
+    @staticmethod
+    def _managed_local_path(
+        value: object,
+        managed_paths: Mapping[str, Path],
+    ) -> Optional[Path]:
+        if not isinstance(value, str) or not managed_paths:
+            return None
+        return managed_paths.get(value)
+
+    def _encode(
+        self,
+        value: object,
+        media_refs: list[str],
+        managed_paths: Mapping[str, Path],
+    ) -> object:
+        managed_path = self._managed_local_path(value, managed_paths)
+        if managed_path is not None:
+            media_ref = self._spool_bytes(managed_path.read_bytes(), managed_path.name)
+            media_refs.append(media_ref)
+            return {self.TYPE_KEY: "file", "media_ref": media_ref, "filename": managed_path.name}
         if value is None or isinstance(value, (bool, int, float, str)):
             return value
         if isinstance(value, enum.Enum):
-            return self._encode(value.value, media_refs)
+            return self._encode(value.value, media_refs, managed_paths)
         if isinstance(value, (bytes, bytearray, memoryview)):
             media_ref = self._spool_bytes(bytes(value), None)
             media_refs.append(media_ref)
@@ -298,7 +325,7 @@ class OutboundPayloadCodec:
             return {
                 self.TYPE_KEY: "telegram_object",
                 "class": value.__class__.__name__,
-                "data": self._encode(value.to_dict(recursive=False), media_refs),
+                "data": self._encode(value.to_dict(recursive=False), media_refs, managed_paths),
             }
         if isinstance(value, datetime.datetime):
             return {self.TYPE_KEY: "datetime", "value": value.isoformat()}
@@ -307,18 +334,27 @@ class OutboundPayloadCodec:
         if isinstance(value, datetime.timedelta):
             return {self.TYPE_KEY: "timedelta", "seconds": value.total_seconds()}
         if isinstance(value, tuple):
-            return {self.TYPE_KEY: "tuple", "items": [self._encode(item, media_refs) for item in value]}
+            return {
+                self.TYPE_KEY: "tuple",
+                "items": [self._encode(item, media_refs, managed_paths) for item in value],
+            }
         if isinstance(value, list):
-            return [self._encode(item, media_refs) for item in value]
+            return [self._encode(item, media_refs, managed_paths) for item in value]
         if isinstance(value, Mapping):
             if all(isinstance(key, str) for key in value):
                 if self.TYPE_KEY in value:
                     raise TypeError(f"Mapping key {self.TYPE_KEY!r} is reserved by the outbound codec.")
-                return {key: self._encode(item, media_refs) for key, item in value.items()}
+                return {
+                    key: self._encode(item, media_refs, managed_paths)
+                    for key, item in value.items()
+                }
             return {
                 self.TYPE_KEY: "mapping",
                 "items": [
-                    [self._encode(key, media_refs), self._encode(item, media_refs)]
+                    [
+                        self._encode(key, media_refs, managed_paths),
+                        self._encode(item, media_refs, managed_paths),
+                    ]
                     for key, item in value.items()
                 ],
             }
@@ -396,7 +432,12 @@ class OutboundRepository:
         all_media_refs: list[str] = []
         try:
             for spec in specs:
-                encoded = self.codec.encode_command(spec.operation, spec.args, spec.kwargs)
+                encoded = self.codec.encode_command(
+                    spec.operation,
+                    spec.args,
+                    spec.kwargs,
+                    owned_local_paths=spec.owned_local_paths,
+                )
                 encoded_specs.append((spec, encoded))
                 all_media_refs.extend(encoded.media_refs)
 
@@ -445,26 +486,37 @@ class OutboundRepository:
 
     @staticmethod
     def list_lane_heads(now: datetime.datetime) -> list[OutboundTask]:
-        rows = list(
-            OutboundTask.select()
-            .where(OutboundTask.state.in_(TaskState.LANE_HEAD_STATES))
-            .order_by(
-                OutboundTask.source_key.asc(),
-                OutboundTask.priority.desc(),
-                OutboundTask.accepted_at.asc(),
-                OutboundTask.id.asc(),
+        candidate = OutboundTask.alias("candidate")
+        earlier = OutboundTask.alias("earlier")
+        earlier_in_lane = (
+            (earlier.priority > candidate.priority)
+            | (
+                (earlier.priority == candidate.priority)
+                & (
+                    (earlier.accepted_at < candidate.accepted_at)
+                    | (
+                        (earlier.accepted_at == candidate.accepted_at)
+                        & (earlier.id < candidate.id)
+                    )
+                )
             )
         )
-        heads_by_source: dict[str, OutboundTask] = {}
-        for row in rows:
-            heads_by_source.setdefault(row.source_key, row)
-        return sorted(
-            heads_by_source.values(),
-            key=lambda task: (
-                -int(task.priority),
-                task.accepted_at or now,
-                task.id,
-            ),
+        earlier_query = earlier.select(earlier.id).where(
+            earlier.source_key == candidate.source_key,
+            earlier.state.in_(TaskState.LANE_HEAD_STATES),
+            earlier_in_lane,
+        )
+        return list(
+            candidate.select()
+            .where(
+                candidate.state.in_(TaskState.LANE_HEAD_STATES),
+                ~fn.EXISTS(earlier_query),
+            )
+            .order_by(
+                candidate.priority.desc(),
+                candidate.accepted_at.asc(),
+                candidate.id.asc(),
+            )
         )
 
     @staticmethod
@@ -821,7 +873,10 @@ class OutboundRepository:
 
     def cleanup_orphaned_spool_files(self) -> int:
         referenced: set[str] = set()
-        for task in OutboundTask.select(OutboundTask.media_ref).where(OutboundTask.media_ref.is_null(False)):
+        for task in OutboundTask.select(OutboundTask.media_ref).where(
+            OutboundTask.media_ref.is_null(False),
+            OutboundTask.state.in_(TaskState.ACTIVE),
+        ):
             media_ref = task.media_ref
             if media_ref is None:
                 continue
@@ -933,19 +988,6 @@ class OutboundRepository:
             sent_pending_log_ids=sent_ids,
         )
 
-    @staticmethod
-    def database_now() -> datetime.datetime:
-        row = database.execute_sql("SELECT CURRENT_TIMESTAMP").fetchone()
-        value = row[0]
-        if isinstance(value, datetime.datetime):
-            return value
-        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
-
-    @staticmethod
-    def set_available_now(task_id: int) -> None:
-        OutboundTask.update(available_at=SQL("CURRENT_TIMESTAMP")).where(OutboundTask.id == task_id).execute()
-
-
 class OutboundScheduler:
     """Fill bounded worker capacity from stateless durable source lane heads."""
 
@@ -971,7 +1013,6 @@ class OutboundScheduler:
         self.worker_permits = threading.BoundedSemaphore(worker_count)
         self.wake_event = threading.Event()
         self._in_flight: dict[int, InFlightTask] = {}
-        self._source_in_flight: dict[str, dict[int, InFlightTask]] = {}
         self._in_flight_lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
 
@@ -1070,12 +1111,10 @@ class OutboundScheduler:
                     in_flight = InFlightTask(
                         future=future,
                         task_id=task.id,
-                        source_key=task.source_key,
                         selection=selection,
                     )
                     with self._in_flight_lock:
                         self._in_flight[task.id] = in_flight
-                        self._source_in_flight.setdefault(task.source_key, {})[task.id] = in_flight
                     future.add_done_callback(self._future_done)
                     permit_transferred = True
                     task_dispatched = getattr(self.adapter, "task_dispatched", None)
@@ -1120,11 +1159,6 @@ class OutboundScheduler:
             completed = [item for item in self._in_flight.values() if item.future.done()]
             for item in completed:
                 self._in_flight.pop(item.task_id, None)
-                source_tasks = self._source_in_flight.get(item.source_key)
-                if source_tasks is not None:
-                    source_tasks.pop(item.task_id, None)
-                    if not source_tasks:
-                        self._source_in_flight.pop(item.source_key, None)
 
         for in_flight in completed:
             task = OutboundTask.get_by_id(in_flight.task_id)

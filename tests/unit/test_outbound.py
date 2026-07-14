@@ -98,6 +98,38 @@ def test_payload_codec_spools_files_and_round_trips_telegram_objects(tmp_path):
     assert (tmp_path / "spool" / encoded.media_refs[0]).read_bytes() == b"durable bytes"
 
 
+def test_payload_codec_claims_managed_local_file_uri_before_source_cleanup(tmp_path):
+    test_db = SqliteDatabase(":memory:")
+    models = [OutboundWorkflow, OutboundTask]
+    source_path = tmp_path / "shared" / "payload.bin"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"local bot api bytes")
+
+    with test_db.bind_ctx(models):
+        test_db.create_tables(models)
+        repository, codec = _repository(tmp_path)
+        created = repository.create_workflow([
+            OutboundTaskSpec(
+                **{
+                    **_spec().__dict__,
+                    "operation": "api_send_document",
+                    "kwargs": {
+                        "chat_id": 100,
+                        "document": source_path.as_uri(),
+                        "caption": "x" * 10_000,
+                    },
+                    "owned_local_paths": (str(source_path),),
+                }
+            )
+        ])
+        source_path.unlink()
+        _operation, _args, kwargs = codec.decode_command(created.tasks[0].payload)
+
+    assert kwargs["document"].read() == b"local bot api bytes"
+    assert kwargs["caption"] == "x" * 10_000
+    assert len(json.loads(created.tasks[0].media_ref)) == 1
+
+
 def test_repository_assigns_database_order_and_selects_priority_lane_head(tmp_path):
     test_db = SqliteDatabase(":memory:")
     models = [OutboundWorkflow, OutboundTask]
@@ -113,6 +145,31 @@ def test_repository_assigns_database_order_and_selects_priority_lane_head(tmp_pa
     assert blocking.accepted_at is not None
     assert normal.id < blocking.id
     assert head.id == blocking.id
+
+
+def test_lane_head_query_materializes_only_one_row_per_source(tmp_path, monkeypatch):
+    test_db = SqliteDatabase(":memory:")
+    models = [OutboundWorkflow, OutboundTask]
+    with test_db.bind_ctx(models):
+        test_db.create_tables(models)
+        repository, _codec = _repository(tmp_path)
+        for source in ("source-a", "source-b"):
+            for index in range(10):
+                repository.create_workflow([_spec(source_key=source, text=str(index))])
+
+        materialized = 0
+        original_init = OutboundTask.__init__
+
+        def counting_init(self, *args, **kwargs):
+            nonlocal materialized
+            materialized += 1
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(OutboundTask, "__init__", counting_init)
+        heads = repository.list_lane_heads(datetime.datetime.now())
+
+    assert len(heads) == 2
+    assert materialized == 2
 
 
 def test_waiting_dependency_blocks_later_lane_rows(tmp_path):
@@ -845,7 +902,7 @@ def test_mark_in_flight_requires_matching_lease_owner(tmp_path):
     assert final_state == TaskState.IN_FLIGHT
 
 
-def test_orphaned_spool_cleanup_preserves_referenced_media(tmp_path):
+def test_orphaned_spool_cleanup_preserves_active_media_and_removes_terminal_media(tmp_path):
     test_db = SqliteDatabase(":memory:")
     models = [OutboundWorkflow, OutboundTask]
     with test_db.bind_ctx(models):
@@ -860,13 +917,26 @@ def test_orphaned_spool_cleanup_preserves_referenced_media(tmp_path):
             )
         ])
         referenced_name = json.loads(created.tasks[0].media_ref)[0]
+        terminal = repository.create_workflow([
+            OutboundTaskSpec(
+                **{
+                    **_spec(source_key="terminal").__dict__,
+                    "kwargs": {"chat_id": 100, "document": io.BytesIO(b"terminal")},
+                }
+            )
+        ]).tasks[0]
+        terminal_name = json.loads(terminal.media_ref)[0]
+        OutboundTask.update(state=TaskState.COMPLETED).where(
+            OutboundTask.id == terminal.id
+        ).execute()
         orphan_path = codec.spool_dir / "orphan.bin"
         orphan_path.write_bytes(b"orphan")
 
         removed = repository.cleanup_orphaned_spool_files()
 
-    assert removed == 1
+    assert removed == 2
     assert orphan_path.exists() is False
+    assert (codec.spool_dir / terminal_name).exists() is False
     assert (codec.spool_dir / referenced_name).read_bytes() == b"referenced"
 
 
@@ -1008,6 +1078,78 @@ def test_retry_after_rotates_old_row_without_cross_chat_cooldown():
     assert (None, 100) not in manager._bot_chat_disabled_until
 
 
+def test_unknown_aux_membership_uses_bounded_recheck_without_blocking_probe():
+    manager = object.__new__(TelegramBotManager)
+    manager._bot = object()
+    manager._rate_limiter = SlidingWindowRateLimiter(
+        global_limit=100,
+        chat_limit=1,
+        chat_window=60,
+        safety_margin=0,
+    )
+    manager._rate_limiter.reserve_slot(100)
+    manager._bot_chat_disabled_until = {}
+    manager._metrics = None
+    manager.logger = Mock()
+    unknown_bot = SimpleNamespace(
+        bot_id=777,
+        username="aux",
+        disabled=False,
+        bot=object(),
+        check_membership_tri=Mock(return_value=None),
+        check_membership_sync=Mock(return_value=False),
+        peek_delay=Mock(return_value=0.0),
+        reserve_slot=Mock(),
+        get_chat_send_count=Mock(return_value=0),
+    )
+    manager.bot_pool = BotPool([unknown_bot], manager)
+    task = SimpleNamespace(
+        target_chat_id=100,
+        required_sender_bot_id=None,
+        slave_id="module chat",
+    )
+    now = datetime.datetime.now()
+
+    result = manager.select_sender(task, now)
+
+    assert result.selection is None
+    assert result.retry_at is not None
+    assert 0 < (result.retry_at - now).total_seconds() <= 0.25
+    unknown_bot.check_membership_sync.assert_not_called()
+
+
+def test_successful_send_resets_sender_chat_retry_failure_count():
+    manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_retry_failures = {(None, 100): 3, (None, 200): 1}
+    manager._outbound_live_results = {}
+    manager._metrics = None
+    task = SimpleNamespace(
+        id=1,
+        target_chat_id=100,
+        accepted_at=None,
+        payload="",
+    )
+    result = SimpleNamespace(
+        chat_id=100,
+        message_id=10,
+        chat=SimpleNamespace(id=100),
+        animation=None,
+        document=None,
+        video=None,
+        voice=None,
+        audio=None,
+        sticker=None,
+        video_note=None,
+        photo=None,
+    )
+    selection = SimpleNamespace(sender_bot_id=None)
+
+    manager.serialize_result(task, result, selection)
+
+    assert (None, 100) not in manager._bot_chat_retry_failures
+    assert manager._bot_chat_retry_failures[(None, 200)] == 1
+
+
 def test_sent_pending_log_reconciliation_is_idempotent(tmp_path):
     test_db = SqliteDatabase(":memory:")
     models = [OutboundWorkflow, OutboundTask, MsgLog]
@@ -1117,6 +1259,40 @@ def test_terminal_workflow_preserves_telegram_error_for_live_blocking_waiter():
     with pytest.raises(telegram.error.BadRequest) as raised:
         waiter.result()
     assert raised.value is telegram_error
+    assert manager._outbound_live_errors == {}
+
+
+def test_recovered_workflow_cleans_live_state_using_durable_task_relationship(tmp_path):
+    test_db = SqliteDatabase(":memory:")
+    models = [OutboundWorkflow, OutboundTask]
+    with test_db.bind_ctx(models):
+        test_db.create_tables(models)
+        repository, _codec = _repository(tmp_path)
+        created = repository.create_workflow([_spec(), _spec()])
+        first_id, result_id = (task.id for task in created.tasks)
+        manager = object.__new__(TelegramBotManager)
+        manager._metrics = None
+        manager._outbound_waiters = {}
+        manager._outbound_waiter_receipts = {}
+        manager._outbound_db_callbacks = {}
+        manager._outbound_workflow_by_task = {}
+        manager._outbound_live_results = {
+            first_id: (object(), None),
+            result_id: (object(), None),
+        }
+        manager._outbound_live_errors = {first_id: RuntimeError("terminal")}
+        manager._outbound_registry_lock = threading.Lock()
+        manager.channel = SimpleNamespace(chat_binding=None)
+
+        manager.workflow_finished(WorkflowOutcome(
+            workflow_id=created.workflow.id,
+            state="dead",
+            result_task_id=result_id,
+            result_payload=None,
+            error_class="terminal",
+        ))
+
+    assert manager._outbound_live_results == {}
     assert manager._outbound_live_errors == {}
 
 

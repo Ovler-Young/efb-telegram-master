@@ -12,7 +12,6 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import wraps
@@ -23,7 +22,6 @@ from unittest.mock import Mock, patch
 
 import telegram.constants
 import telegram.error
-from retrying import retry
 from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
 from telegram import Message as TelegramMessage
 from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
@@ -343,6 +341,9 @@ class TelegramBotManager(LocaleMixin):
     TELEGRAM_RETRY_AFTER_GRACE_SECONDS = 5.0
     TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS = 60.0
     TELEGRAM_RETRY_AFTER_BACKOFF_CAP_SECONDS = 900.0
+    MEMBERSHIP_RECHECK_SECONDS = 0.25
+    SHUTDOWN_DRAIN_TIMEOUT = 10.0
+    SHUTDOWN_JOIN_GRACE = 1.0
 
     # Type declarations for instance attributes assigned in __init__
     application: Application
@@ -355,7 +356,6 @@ class TelegramBotManager(LocaleMixin):
     _send_worker_stop: threading.Event
     _stopping: threading.Event
     _cleanup_tls: threading.local
-    _tls: threading.local
     _aux_recent_use: dict[int, float]
 
     class Decorators:
@@ -367,15 +367,6 @@ class TelegramBotManager(LocaleMixin):
         def exception_filter(cls, exception: Exception):
             cls.logger.exception("Exception: %s while sending request to Telegram server.", exception)
             return isinstance(exception, telegram.error.TimedOut)
-
-        @classmethod
-        def retry_on_timeout(cls, fn: Callable):
-            """Infinitely retry for timed-out exceptions."""
-            if not cls.enable_retry:
-                return fn
-            cls.logger.debug("Trying to call %s with infinite retry.", fn)
-            return retry(wait_exponential_multiplier=1e3, wait_exponential_max=180e3,
-                         retry_on_exception=cls.exception_filter)(fn)
 
         @classmethod
         def rate_limit_decorator(cls, fn: Callable):
@@ -654,7 +645,6 @@ class TelegramBotManager(LocaleMixin):
         )
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
-        self._tls = threading.local()  # Thread-local for bot override (_active_bot)
         self._shutdown_complete_event = threading.Event()
         self._manual_polling_stop_event: Optional[asyncio.Event] = None
         self._aux_recent_use: dict[int, float] = {}  # chat_id -> timestamp of last aux bot use
@@ -726,9 +716,6 @@ class TelegramBotManager(LocaleMixin):
         if recovery.sent_pending_log_ids:
             self._metrics.recovered("sent_pending_log", len(recovery.sent_pending_log_ids))
         self._reconcile_sent_pending_tasks(recovery.sent_pending_log_ids)
-
-        self._last_queue_stats_log = time.time()
-        self._queue_stats_log_interval = 60.0
 
         self._send_worker_thread = threading.Thread(
             target=self._queued_send_worker,
@@ -1088,7 +1075,10 @@ class TelegramBotManager(LocaleMixin):
                 )
             membership = aux_bot.check_membership_tri(task.target_chat_id)
             if membership is None:
-                membership = aux_bot.check_membership_sync(task.target_chat_id, timeout=3.0)
+                return SenderSelectionResult(
+                    retry_at=now + timedelta(seconds=self.MEMBERSHIP_RECHECK_SECONDS),
+                    reason="required_sender_membership_pending",
+                )
             if membership is not True:
                 return SenderSelectionResult(
                     reason=f"Required sender {required_sender_bot_id} is not a member of chat {task.target_chat_id}.",
@@ -1146,7 +1136,13 @@ class TelegramBotManager(LocaleMixin):
 
         candidate_delays = [main_delay]
         for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
-            if aux_bot.disabled or aux_bot.check_membership_tri(task.target_chat_id) is not True:
+            if aux_bot.disabled:
+                continue
+            membership = aux_bot.check_membership_tri(task.target_chat_id)
+            if membership is None:
+                candidate_delays.append(self.MEMBERSHIP_RECHECK_SECONDS)
+                continue
+            if membership is not True:
                 continue
             cooldown = self._bot_chat_disabled_until.get(
                 (str(aux_bot.bot_id), task.target_chat_id), 0.0,
@@ -1214,6 +1210,10 @@ class TelegramBotManager(LocaleMixin):
         selection: SenderSelection,
     ) -> Mapping[str, object]:
         self._outbound_live_results[task.id] = (result, selection.sender_bot_id)
+        self._bot_chat_retry_failures.pop(
+            (selection.sender_bot_id, task.target_chat_id),
+            None,
+        )
         if selection.sender_bot_id is not None:
             self._record_aux_use(task.target_chat_id)
         metrics = getattr(self, '_metrics', None)
@@ -1354,6 +1354,20 @@ class TelegramBotManager(LocaleMixin):
             for task_id in task_ids:
                 self._outbound_workflow_by_task.pop(task_id, None)
 
+        if not task_ids:
+            try:
+                task_ids = [
+                    task.id
+                    for task in OutboundTask.select(OutboundTask.id).where(
+                        OutboundTask.workflow_id == workflow_outcome.workflow_id
+                    )
+                ]
+            except Exception:
+                self.logger.exception(
+                    "Failed to load durable task IDs for completed workflow %s.",
+                    workflow_outcome.workflow_id,
+                )
+
         result_entry = None
         if workflow_outcome.result_task_id is not None:
             result_entry = self._outbound_live_results.get(workflow_outcome.result_task_id)
@@ -1420,16 +1434,6 @@ class TelegramBotManager(LocaleMixin):
     @staticmethod
     def _metrics_sender(sender_bot_id: Optional[str]) -> str:
         return "aux" if sender_bot_id else "main"
-
-    def _record_dispatch_blocked(self, reason: str) -> None:
-        metrics = getattr(self, '_metrics', None)
-        if metrics:
-            metrics.dispatch_blocked(reason)
-
-    def _record_sender_selection(self, sender: str, result: str, reason: str) -> None:
-        metrics = getattr(self, '_metrics', None)
-        if metrics:
-            metrics.sender_selection(sender, result, reason)
 
     @staticmethod
     def _parse_metrics_config(metrics_cfg: object, logger) -> tuple[int, Optional[tuple[str, int]]]:
@@ -1513,22 +1517,6 @@ class TelegramBotManager(LocaleMixin):
         if aux_bots:
             self.bot_pool = BotPool(aux_bots, self)
             self.logger.info("Initialized bot pool with %d auxiliary bot(s)", len(aux_bots))
-
-    @property
-    def _active_bot(self):
-        """Return the bot to use for the current send operation.
-        Thread-safe: each thread has its own override slot."""
-        return cast(SyncBotProtocol, getattr(self._tls, 'override_bot', None) or self._bot)
-
-    @contextmanager
-    def _using_bot(self, bot: object):
-        """Context manager to temporarily route sends through a different bot."""
-        old = getattr(self._tls, 'override_bot', None)
-        self._tls.override_bot = bot
-        try:
-            yield
-        finally:
-            self._tls.override_bot = old
 
     def _record_aux_use(self, chat_id: int):
         """Record that an aux bot was used for a chat (for typing suppression)."""
@@ -1635,6 +1623,7 @@ class TelegramBotManager(LocaleMixin):
         kwargs: Mapping[str, object],
         required_sender_bot_id: Optional[str],
         log_payload: Optional[Mapping[str, object]],
+        owned_local_paths: tuple[str, ...] = (),
     ) -> tuple[list[OutboundTaskSpec], int]:
         specs: list[OutboundTaskSpec] = []
         message_thread_id = cast(Optional[int], kwargs.get('message_thread_id'))
@@ -1663,6 +1652,7 @@ class TelegramBotManager(LocaleMixin):
                 run_condition=run_condition,
                 required_sender_bot_id=required_sender,
                 log_payload=step_log_payload,
+                owned_local_paths=owned_local_paths,
             ))
             return step_index
 
@@ -1833,6 +1823,7 @@ class TelegramBotManager(LocaleMixin):
                         },
                         required_sender_bot_id=None,
                         log_payload=log_payload,
+                        owned_local_paths=owned_local_paths,
                     )
             prefix = f"{prefix}\n" if prefix else ''
             suffix = f"\n{suffix}" if suffix else ''
@@ -1921,6 +1912,7 @@ class TelegramBotManager(LocaleMixin):
             kwargs=durable_kwargs,
             required_sender_bot_id=required_sender_bot_id,
             log_payload=log_payload,
+            owned_local_paths=tuple(str(path) for path in cleanup_files or ()),
         )
         created = self._outbound_repository.create_workflow(
             specs,
@@ -2095,7 +2087,7 @@ class TelegramBotManager(LocaleMixin):
                 self.logger.exception("Error in durable outbound worker: %s", e)
                 self._send_worker_stop.wait(timeout=1)
 
-        shutdown_deadline = time.monotonic() + 10.0
+        shutdown_deadline = time.monotonic() + self.SHUTDOWN_DRAIN_TIMEOUT
         while self._outbound_scheduler.in_flight_snapshot() and time.monotonic() < shutdown_deadline:
             self._outbound_scheduler.harvest_completed(utc_now())
             self._send_worker_stop.wait(timeout=0.05)
@@ -2201,7 +2193,9 @@ class TelegramBotManager(LocaleMixin):
 
         if hasattr(self, '_send_worker_thread') and self._send_worker_thread.is_alive():
             self.logger.debug("Waiting for durable outbound worker to stop...")
-            self._send_worker_thread.join(timeout=5)
+            self._send_worker_thread.join(
+                timeout=self.SHUTDOWN_DRAIN_TIMEOUT + self.SHUTDOWN_JOIN_GRACE
+            )
 
             if self._send_worker_thread.is_alive():
                 self.logger.warning("Durable outbound worker did not stop within timeout")
@@ -2209,7 +2203,6 @@ class TelegramBotManager(LocaleMixin):
                 self.logger.debug("Durable outbound worker stopped")
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_message(self, *args, prefix: str = '', suffix: str = '', **kwargs):
@@ -2226,10 +2219,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._active_bot.send_message(*args, **kwargs)
+        return self._bot.send_message(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_text(self, prefix='', suffix='', **kwargs):
@@ -2245,10 +2237,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._active_bot.edit_message_text(**kwargs)
+        return self._bot.edit_message_text(**kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_audio(self, *args, **kwargs):
@@ -2267,10 +2258,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._active_bot.send_audio(*args, **kwargs)
+        return self._bot.send_audio(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_voice(self, *args, **kwargs):
@@ -2289,10 +2279,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._active_bot.send_voice(*args, **kwargs)
+        return self._bot.send_voice(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_video(self, *args, **kwargs):
@@ -2311,10 +2300,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._active_bot.send_video(*args, **kwargs)
+        return self._bot.send_video(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_document(self, *args, **kwargs):
@@ -2331,10 +2319,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._active_bot.send_document(*args, **kwargs)
+        return self._bot.send_document(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_animation(self, *args, **kwargs):
@@ -2351,10 +2338,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._active_bot.send_animation(*args, **kwargs)
+        return self._bot.send_animation(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_photo(self, *args, **kwargs):
@@ -2371,10 +2357,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._active_bot.send_photo(*args, **kwargs)
+        return self._bot.send_photo(*args, **kwargs)
 
     @Decorators.skip_on_rate_limit
-    @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
         message_thread_id = kwargs.pop('message_thread_id', None)
@@ -2383,48 +2368,41 @@ class TelegramBotManager(LocaleMixin):
         return self._bot.send_chat_action(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_reply_markup(self, *args, **kwargs):
-        return self._active_bot.edit_message_reply_markup(*args, **kwargs)
+        return self._bot.edit_message_reply_markup(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_location(self, *args, **kwargs):
-        return self._active_bot.send_location(*args, **kwargs)
+        return self._bot.send_location(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_venue(self, *args, **kwargs):
-        return self._active_bot.send_venue(*args, **kwargs)
+        return self._bot.send_venue(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_sticker(self, *args, **kwargs):
-        return self._active_bot.send_sticker(*args, **kwargs)
+        return self._bot.send_sticker(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def forward_message(self, *args, **kwargs):
-        return self._active_bot.forward_message(*args, **kwargs)
+        return self._bot.forward_message(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def copy_message(self, *args, **kwargs):
-        return self._active_bot.copy_message(*args, **kwargs)
+        return self._bot.copy_message(*args, **kwargs)
 
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def get_me(self, *args, **kwargs):
@@ -2441,18 +2419,16 @@ class TelegramBotManager(LocaleMixin):
                                message_id=update.effective_message.message_id)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
-        return self._active_bot.edit_message_caption(*args, **kwargs)
+        return self._bot.edit_message_caption(*args, **kwargs)
 
     @Decorators.rate_limit_decorator
-    @Decorators.retry_on_timeout
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
-        return self._active_bot.edit_message_media(*args, **kwargs)
+        return self._bot.edit_message_media(*args, **kwargs)
 
     def reply_error(self, update, errmsg):
         """
@@ -2464,10 +2440,9 @@ class TelegramBotManager(LocaleMixin):
         return self.send_message(update.effective_chat.id, errmsg,
                                  reply_to_message_id=update.effective_message.message_id)
 
-    @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def get_file(self, file_id: str) -> File:
-        return cast(File, self._active_bot.get_file(file_id))
+        return cast(File, self._bot.get_file(file_id))
 
     def delete_message(self, chat_id, message_id, _sender_bot_id=None):
         required_sender = str(_sender_bot_id) if _sender_bot_id else "__main__"
@@ -2479,7 +2454,6 @@ class TelegramBotManager(LocaleMixin):
             required_sender_bot_id=required_sender,
         )
 
-    @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def answer_callback_query(self, *args, prefix="", suffix="", text=None,
                               message_id=None, **kwargs):
@@ -2559,7 +2533,6 @@ class TelegramBotManager(LocaleMixin):
             *args, text=prefix + text + suffix, **kwargs
         )
 
-    @Decorators.retry_on_timeout
     @Decorators.retry_on_chat_migration
     def get_chat_info(self, *args, **kwargs):
         return self._bot.get_chat(*args, **kwargs)

@@ -1631,28 +1631,6 @@ class ChatBindingManager(LocaleMixin):
             return False
         return True
 
-    def _send_pending_history_text_batch(self, tg_chat_id: int, text_batch: List[str],
-                                         entry_ids: List[int],
-                                         thread_id: Optional[TelegramTopicID] = None):
-        if not text_batch:
-            return
-        kwargs: dict[str, object] = {
-            'chat_id': tg_chat_id,
-            'text': "".join(text_batch),
-            'parse_mode': 'Markdown',
-            'disable_notification': True,
-        }
-        if thread_id is not None:
-            kwargs['message_thread_id'] = thread_id
-        self.bot.enqueue_history_operation(
-            source_key=f"legacy:{tg_chat_id}",
-            target_chat_id=tg_chat_id,
-            operation='send_message',
-            args=(),
-            kwargs=kwargs,
-            history_entry_ids=entry_ids,
-        )
-
     @staticmethod
     def truncate_ellipsis(text: str, length: int) -> str:
         """Truncate a string with ellipsis added to the end if needed."""
