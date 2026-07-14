@@ -37,6 +37,7 @@ from .msg_type import get_msg_type
 from .outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
+    QUEUED_OPERATIONS,
     QueueEnqueueError,
     QueueRequest,
     SchedulerStoppedError,
@@ -350,10 +351,13 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def rate_limit_decorator(cls, fn: Callable):
-            """Apply rate limiting and sender routing for outbound API calls."""
+            """Queue only the supported outbound Telegram operation set."""
             @wraps(fn)
             def rate_limit_wrapper(self: 'TelegramBotManager', *args, **kwargs):
-                is_edit_method = fn.__name__.startswith('edit_message_')
+                operation = fn.__name__
+                is_edit_method = operation in {
+                    'edit_message_text', 'edit_message_caption', 'edit_message_media',
+                }
 
                 sender_bot_id = kwargs.pop('_sender_bot_id', None)
                 slave_id = kwargs.pop('_slave_id', None)
@@ -361,59 +365,49 @@ class TelegramBotManager(LocaleMixin):
                 force_main_bot = kwargs.pop('_force_main_bot', False)
                 required_sender_bot_id = str(sender_bot_id) if sender_bot_id and is_edit_method else None
 
+                if operation not in QUEUED_OPERATIONS:
+                    return self._make_send_receipt(fn(self, *args, **kwargs))
+
+                if send_mode not in {'blocking', 'eventual'}:
+                    raise QueueEnqueueError("_send_mode must be 'blocking' or 'eventual'.")
+
                 chat_id = None
                 if args:
                     chat_id = args[0]
                 elif 'chat_id' in kwargs:
                     chat_id = kwargs['chat_id']
                 has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
+                cleanup_tls = getattr(self, '_cleanup_tls', None)
+                cleanup_files = getattr(cleanup_tls, 'pending_cleanup', [])[:]
+                if cleanup_tls is not None:
+                    cleanup_tls.pending_cleanup = []
 
-                send_worker_stop = getattr(self, '_send_worker_stop', None)
-                if send_worker_stop is not None and send_worker_stop.is_set():
-                    self.logger.warning("Durable outbound worker is stopped; rejecting work for chat %s.", chat_id)
-                    return None
-
-                if chat_id:
-                    chat_id_int = int(chat_id)
-                    cleanup_tls = getattr(self, '_cleanup_tls', None)
-                    cleanup_files = getattr(cleanup_tls, 'pending_cleanup', [])[:]
-                    if cleanup_tls is not None:
-                        cleanup_tls.pending_cleanup = []
-
-                    if send_mode == 'eventual':
-                        if not slave_id:
-                            self.logger.warning(
-                                "Eventual send requested for chat %s without _slave_id; falling back to blocking.",
-                                chat_id,
-                            )
-                        elif not is_edit_method and not has_callback:
-                            return self._enqueue_eventual_send(
-                                str(slave_id),
-                                int(chat_id),
-                                fn,
-                                (self,) + args,
-                                kwargs,
-                                cleanup_files=cleanup_files,
-                            )
-
-                    blocking_kwargs = dict(kwargs)
-                    if required_sender_bot_id is not None:
-                        blocking_kwargs['_required_sender_bot_id'] = required_sender_bot_id
-                    if force_main_bot or (has_callback and not is_edit_method) or (
-                        is_edit_method and required_sender_bot_id is None
-                    ):
-                        blocking_kwargs['_required_sender_bot_id'] = "__main__"
-
-                    return self._enqueue_blocking_send_and_wait(
-                        str(slave_id) if slave_id else None,
-                        chat_id_int,
+                if send_mode == 'eventual' and slave_id and not is_edit_method and not has_callback:
+                    return self._enqueue_eventual_send(
+                        str(slave_id),
+                        chat_id,
                         fn,
                         (self,) + args,
-                        blocking_kwargs,
+                        kwargs,
                         cleanup_files=cleanup_files,
                     )
 
-                return self._make_send_receipt(fn(self, *args, **kwargs))
+                blocking_kwargs = dict(kwargs)
+                if required_sender_bot_id is not None:
+                    blocking_kwargs['_required_sender_bot_id'] = required_sender_bot_id
+                if force_main_bot or (has_callback and not is_edit_method) or (
+                    is_edit_method and required_sender_bot_id is None
+                ):
+                    blocking_kwargs['_required_sender_bot_id'] = "__main__"
+
+                return self._enqueue_blocking_send_and_wait(
+                    str(slave_id) if slave_id else None,
+                    chat_id,
+                    fn,
+                    (self,) + args,
+                    blocking_kwargs,
+                    cleanup_files=cleanup_files,
+                )
 
             return rate_limit_wrapper
 
@@ -498,26 +492,11 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def skip_on_rate_limit(cls, fn: Callable):
-            """Skip execution silently if messages are queued or pool is in
-            high-volume mode for the target chat.
-            TN-0005 keeps nonessential chat actions outside message quotas and
-            suppresses them while they could compete with durable work."""
-            AUX_USE_RECENCY = 5.0  # seconds
+            """Keep non-queued calls outside outbound queue state and limits."""
 
             @wraps(fn)
             def skip_wrapper(self: 'TelegramBotManager', *args, **kwargs):
-                if OutboundTask.select().where(OutboundTask.state.in_(TaskState.ACTIVE)).exists():
-                    return None
-
-                # Suppress when aux bots were recently used for this chat
-                chat_id = args[0] if args else kwargs.get('chat_id')
-                if chat_id and self._aux_recent_use.get(chat_id, 0) > time.time() - AUX_USE_RECENCY:
-                    return None
-
-                try:
-                    return fn(self, *args, **kwargs)
-                except telegram.error.RetryAfter:
-                    return None
+                return fn(self, *args, **kwargs)
 
             return skip_wrapper
 
@@ -2542,6 +2521,12 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._bot.send_photo(*args, **kwargs)
 
+    @Decorators.rate_limit_decorator
+    @Decorators.handle_rate_limit_error
+    @Decorators.retry_on_chat_migration
+    def send_media_group(self, *args, **kwargs):
+        return self._bot.send_media_group(*args, **kwargs)
+
     @Decorators.skip_on_rate_limit
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
@@ -2652,64 +2637,6 @@ class TelegramBotManager(LocaleMixin):
             full_message = prefix + text + suffix
             keep_size = MAX_CALLBACK_QUERY_ANSWER_LENGTH // 3
             truncated = full_message[:keep_size] + "..." + full_message[-keep_size:]
-            filename = f"{chat_id}_{message_id}.txt"
-            if chat_id is not None:
-                source_key = f"__callback__:{chat_id}"
-                specs = [
-                    OutboundTaskSpec(
-                        source_key=source_key,
-                        slave_id=None,
-                        priority=True,
-                        target_chat_id=int(chat_id),
-                        message_thread_id=None,
-                        operation="api_answer_callback_query",
-                        args=args,
-                        kwargs={**kwargs, "text": truncated},
-                        required_sender_bot_id="__main__",
-                    ),
-                    OutboundTaskSpec(
-                        source_key=source_key,
-                        slave_id=None,
-                        priority=True,
-                        target_chat_id=int(chat_id),
-                        message_thread_id=None,
-                        operation="api_send_document",
-                        args=(),
-                        kwargs={
-                            "chat_id": int(chat_id),
-                            "document": io.StringIO(full_message),
-                            "filename": filename,
-                            "reply_to_message_id": message_id,
-                            "caption": self._(
-                                "Response is truncated due to its length. Full message is sent as attachment."
-                            ),
-                        },
-                        depends_on_step_index=0,
-                        run_condition=RunCondition.PREDECESSOR_SUCCESS,
-                        required_sender_bot_id="__main__",
-                    ),
-                ]
-                created = self._outbound_repository.create_workflow(specs, result_task_index=0)
-                waiter: Future = Future()
-                with self._outbound_registry_lock:
-                    for task in created.tasks:
-                        self._outbound_workflow_by_task[task.id] = created.workflow.id
-                    self._outbound_waiters[created.workflow.id] = waiter
-                    self._outbound_waiter_receipts[created.workflow.id] = False
-                self._outbound_scheduler.wake_event.set()
-                try:
-                    return waiter.result(timeout=self.BLOCKING_SEND_TIMEOUT)
-                except FutureTimeoutError as error:
-                    with self._outbound_registry_lock:
-                        if self._outbound_waiters.get(created.workflow.id) is waiter:
-                            self._outbound_waiters.pop(created.workflow.id, None)
-                            self._outbound_waiter_receipts.pop(created.workflow.id, None)
-                    metrics = getattr(self, '_metrics', None)
-                    if metrics:
-                        metrics.waiter_timed_out("answer_callback_query")
-                    raise RuntimeError(
-                        f"Callback response workflow {created.workflow.id} timed out; durable work remains queued."
-                    ) from error
             return self._bot.answer_callback_query(*args, text=truncated, **kwargs)
         self.logger.debug(f"answer_callback_query({args}, {kwargs})")
         return self._bot.answer_callback_query(
@@ -2721,46 +2648,25 @@ class TelegramBotManager(LocaleMixin):
         return self._bot.get_chat(*args, **kwargs)
 
     def create_forum_topic(self, *args, **kwargs) -> ForumTopic:
-        chat_id = int(args[0] if args else kwargs['chat_id'])
-        return cast(ForumTopic, self._enqueue_blocking_api_operation(
-            target_chat_id=chat_id,
-            operation="create_forum_topic",
-            args=args,
-            kwargs=kwargs,
-            required_sender_bot_id="__main__",
-        ))
+        return cast(ForumTopic, self._bot.create_forum_topic(*args, **kwargs))
 
     def edit_forum_topic(self, *args, **kwargs):
-        chat_id = int(args[0] if args else kwargs['chat_id'])
-        return self._enqueue_blocking_api_operation(
-            target_chat_id=chat_id,
-            operation="edit_forum_topic",
-            args=args,
-            kwargs=kwargs,
-            required_sender_bot_id="__main__",
-        )
+        return self._bot.edit_forum_topic(*args, **kwargs)
 
     def reopen_forum_topic(self, *args, **kwargs) -> bool:
-        chat_id = int(args[0] if args else kwargs['chat_id'])
-        return cast(bool, self._enqueue_blocking_api_operation(
-            target_chat_id=chat_id,
-            operation="reopen_forum_topic",
-            args=args,
-            kwargs=kwargs,
-            required_sender_bot_id="__main__",
-        ))
+        return cast(bool, self._bot.reopen_forum_topic(*args, **kwargs))
 
     def set_chat_title(self, *args, **kwargs):
-        return self._enqueue_main_chat_mutation("set_chat_title", args, kwargs)
+        return self._bot.set_chat_title(*args, **kwargs)
 
     def set_chat_photo(self, *args, **kwargs):
-        return self._enqueue_main_chat_mutation("set_chat_photo", args, kwargs)
+        return self._bot.set_chat_photo(*args, **kwargs)
 
     def pin_chat_message(self, *args, **kwargs):
-        return self._enqueue_main_chat_mutation("pin_chat_message", args, kwargs)
+        return self._bot.pin_chat_message(*args, **kwargs)
 
     def set_chat_description(self, *args, **kwargs):
-        return self._enqueue_main_chat_mutation("set_chat_description", args, kwargs)
+        return self._bot.set_chat_description(*args, **kwargs)
 
     def polling(self, drop_pending_updates: bool = False, timeout: int | timedelta = 10):
         """
