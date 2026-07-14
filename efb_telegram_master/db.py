@@ -1178,17 +1178,6 @@ class DatabaseManager:
         )
 
     @staticmethod
-    def delete_history_migration_entries(entry_ids: Collection[int]) -> int:
-        if not entry_ids:
-            return 0
-        return cast(
-            int,
-            HistoryMigrationEntry.delete().where(
-                HistoryMigrationEntry.id.in_(list(entry_ids))
-            ).execute(),
-        )
-
-    @staticmethod
     def link_history_migration_entries(entry_ids: Collection[int], workflow_id: int) -> int:
         if not entry_ids:
             return 0

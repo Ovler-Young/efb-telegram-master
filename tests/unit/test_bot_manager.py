@@ -13,7 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
-from efb_telegram_master.etm_metrics import _ManagerStateExporter, bad_request_reason_class
+from efb_telegram_master.etm_metrics import _ManagerStateExporter
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
@@ -964,18 +964,6 @@ def test_bot_debug_state_snapshots_group_cooldown_membership_and_reserved_slots(
         ("main", 1, "mainbot", 3),
         ("aux", 123, "botA", 7),
     ]
-
-
-def test_bad_request_reason_classifies_common_failures():
-    assert bad_request_reason_class(
-        telegram.error.BadRequest("Message to be replied not found")
-    ) == "reply_target_missing"
-    assert bad_request_reason_class(
-        telegram.error.BadRequest("Can't parse entities")
-    ) == "invalid_markup"
-    assert bad_request_reason_class(
-        telegram.error.BadRequest("Message is too long")
-    ) == "message_too_long"
 
 
 @pytest.mark.asyncio

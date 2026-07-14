@@ -1,14 +1,10 @@
-import asyncio
-from collections.abc import Callable, Collection, Coroutine
-from functools import wraps
-from typing import ParamSpec, Protocol, TypeAlias, TypeVar
+from collections.abc import Collection
+from typing import Protocol, TypeAlias
 
 from telegram import Chat, Message, MessageOriginChannel
 from telegram.ext import filters
 
 FilterUserId: TypeAlias = int | Collection[int] | None
-P = ParamSpec("P")
-T = TypeVar("T")
 
 
 class MessageIdentifier(Protocol):
@@ -66,18 +62,6 @@ class _FiltersCompat:
 
 
 Filters = _FiltersCompat()
-
-
-def threaded_callback(
-    callback: Callable[P, T],
-) -> Callable[P, Coroutine[None, None, T]]:
-    """Run a synchronous PTB callback in a worker thread."""
-
-    @wraps(callback)
-    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-        return await asyncio.to_thread(callback, *args, **kwargs)
-
-    return wrapper
 
 
 def get_forwarded_chat(message: Message) -> Chat | None:

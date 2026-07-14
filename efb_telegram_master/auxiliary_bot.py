@@ -74,7 +74,6 @@ class AuxiliaryBot:
         self.bot_id: int = 0
         self.username: str = ""
         self.disabled: bool = False
-        self._disable_reason: str = ""
         self._runtime: Optional['AsyncTelegramRuntime'] = None
 
         # Rate limiting — delegates to shared SlidingWindowRateLimiter
@@ -157,12 +156,10 @@ class AuxiliaryBot:
             return True
         except telegram.error.Forbidden as e:
             self.disabled = True
-            self._disable_reason = str(e)
             logger.error("Failed to initialize auxiliary bot: %s", e)
             return False
         except Exception as e:
             self.disabled = True
-            self._disable_reason = str(e)
             logger.error("Failed to initialize auxiliary bot: %s", e)
             return False
 
@@ -220,24 +217,6 @@ class AuxiliaryBot:
         if metrics:
             metrics.membership_probe(self.bot_id, self.username, outcome)
 
-    # Tri-state membership results
-    MEMBERSHIP_MEMBER = True
-    MEMBERSHIP_NOT_MEMBER = False
-    MEMBERSHIP_UNKNOWN = None
-
-    def check_membership(self, chat_id: int) -> bool:
-        """Return cached membership status. On cache miss, trigger a
-        background probe and return False (non-blocking).
-
-        Uses stale-while-revalidate: if cached value exists but is expired,
-        return the stale value while refreshing in the background. This avoids
-        false "not a member" results when all bots' caches expire simultaneously.
-        """
-        result = self.check_membership_tri(chat_id)
-        if result is None:
-            return False
-        return result
-
     def check_membership_tri(self, chat_id: int):
         """Tri-state membership check: True (member), False (confirmed not member),
         None (unknown / probe in progress).
@@ -261,35 +240,6 @@ class AuxiliaryBot:
 
         self._start_membership_probe(chat_id)
         return None
-
-    def check_membership_sync(self, chat_id: int, timeout: float = 5.0) -> bool:
-        """Blocking membership check. Waits for a pending probe to finish,
-        or runs one synchronously if no cache entry exists."""
-        with self._membership_lock:
-            entry = self._membership_cache.get(chat_id)
-            if entry is not None:
-                is_member, timestamp = entry
-                ttl = self.MEMBERSHIP_TTL_MEMBER if is_member else self.MEMBERSHIP_TTL_NOT_MEMBER
-                if time.time() - timestamp < ttl:
-                    return is_member
-
-        # Trigger probe if not already running
-        self._start_membership_probe(chat_id)
-
-        # Wait for the probe to finish
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            with self._membership_lock:
-                if chat_id not in self._pending_probes:
-                    entry = self._membership_cache.get(chat_id)
-                    if entry is not None:
-                        return entry[0]
-                    return False
-            time.sleep(0.05)
-
-        logger.warning("Membership sync check timed out for bot %d in chat %d", self.bot_id, chat_id)
-        self._record_membership_probe("timeout")
-        return False
 
     def update_membership(self, chat_id: int, is_member: bool):
         """Update the membership cache directly (e.g. from chat_left handler)."""
@@ -345,12 +295,6 @@ class AuxiliaryBot:
         """Check if there are any pending membership probes."""
         with self._membership_lock:
             return bool(self._pending_probes)
-
-    def mark_disabled(self, reason: str = ""):
-        """Mark this bot as permanently disabled for this session."""
-        self.disabled = True
-        self._disable_reason = reason
-        logger.error("Auxiliary bot @%s (id=%d) disabled: %s", self.username, self.bot_id, reason)
 
     def bind_runtime(self, runtime: 'AsyncTelegramRuntime'):
         """Bind the runtime-backed sync facade used by the rest of ETM."""

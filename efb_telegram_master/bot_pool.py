@@ -245,24 +245,6 @@ class BotPool:
         except Exception as e:
             logger.warning("Failed to send auxiliary bot notification to admin: %s", e)
 
-    def get_pool_stats(self) -> Dict:
-        """Return per-bot status for monitoring/debugging."""
-        bot_list: list[Dict] = []
-        stats: Dict = {
-            'total_bots': len(self._bots),
-            'active_bots': sum(1 for b in self._bots if not b.disabled),
-            'bots': bot_list
-        }
-        for bot in self._bots:
-            bot_stats = {
-                'username': bot.username,
-                'bot_id': bot.bot_id,
-                'disabled': bot.disabled,
-                'membership_cache_size': len(bot._membership_cache),
-            }
-            stats['bots'].append(bot_stats)
-        return stats
-
     def shutdown(self):
         """Clean up resources during shutdown.
         Waits for pending membership probes to finish (with timeout)."""

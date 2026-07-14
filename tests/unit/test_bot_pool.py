@@ -11,8 +11,6 @@ def _make_aux_bot(bot_id, *, disabled=False, membership=True, delay=0.0, usernam
     aux_bot.username = username or f"bot{bot_id}"
     aux_bot.disabled = disabled
     aux_bot.check_membership_tri.return_value = membership
-    aux_bot.check_membership_sync.return_value = membership
-    aux_bot.check_membership.return_value = bool(membership)
     aux_bot.peek_delay.return_value = delay
     aux_bot.reservation = SlotReservation(bot_id, str(bot_id), 100, 100.0)
     aux_bot.reserve_slot.return_value = ReservationOutcome(delay, aux_bot.reservation)
@@ -205,12 +203,11 @@ def test_acquire_send_slot_skips_disabled_and_respects_max_delay():
     slow_bot.reserve_slot.assert_not_called()
 
 
-def test_unknown_membership_does_not_block_on_synchronous_probe():
+def test_unknown_membership_does_not_reserve_a_slot():
     unknown_bot = _make_aux_bot(1, membership=None)
     pool = BotPool([unknown_bot], _make_manager())
 
     assert pool.acquire_send_slot(100, max_delay=1.0) is None
-    unknown_bot.check_membership_sync.assert_not_called()
 
 
 def test_membership_updates_are_forwarded_to_bots():
@@ -246,16 +243,3 @@ def test_notify_admin_only_fires_once_per_chat():
 
     assert notify.call_count == 1
     assert len(started_targets) == 1
-
-
-def test_get_pool_stats_reports_disabled_and_cache_size():
-    aux_bot = _make_aux_bot(10, username="aux")
-    aux_bot._membership_cache = {1: (True, 0.0), 2: (False, 1.0)}
-    pool = BotPool([aux_bot], _make_manager())
-
-    stats = pool.get_pool_stats()
-
-    assert stats["total_bots"] == 1
-    assert stats["active_bots"] == 1
-    assert stats["bots"][0]["bot_id"] == 10
-    assert stats["bots"][0]["membership_cache_size"] == 2

@@ -261,7 +261,6 @@ class QueuedSendPlaceholder:
     date: int
     text: str
     task_id: str
-    is_queued: bool = True
     _queued_execution_pending: bool = True
     sender_bot_id: Optional[str] = None
 
@@ -276,7 +275,6 @@ class SendReceipt:
     sender_bot_id: Optional[str] = None
     queued: bool = False
     task_id: Optional[str] = None
-    manager: Optional["TelegramBotManager"] = None
     durable_db_logged: bool = False
 
     def __getattr__(self, item: str):
@@ -292,20 +290,6 @@ class SendReceipt:
     @property
     def message_id(self) -> int:
         return cast(ReplyTarget, self.message).message_id
-
-    def reply_text(self, text: str, **kwargs):
-        if self.manager is None:
-            raise RuntimeError("SendReceipt is detached from TelegramBotManager.")
-        return self.manager.send_message(
-            self.chat.id,
-            text=text,
-            reply_to_message_id=self.message_id,
-            **kwargs,
-        )
-
-    def reply_html(self, text: str, **kwargs):
-        kwargs.setdefault("parse_mode", "HTML")
-        return self.reply_text(text, **kwargs)
 
 
 def _has_callback_keyboard(reply_markup) -> bool:
@@ -968,7 +952,6 @@ class TelegramBotManager(LocaleMixin):
             sender_bot_id=sender_bot_id,
             queued=queued,
             task_id=task_id,
-            manager=self,
             durable_db_logged=durable_db_logged,
         )
 
@@ -2042,9 +2025,6 @@ class TelegramBotManager(LocaleMixin):
         )
 
     # ── Async-dispatch queued send worker ──────────────────────
-
-    def _dispatch_ready_send_tasks(self, now: float):
-        return self._outbound_scheduler.dispatch_ready(datetime.utcfromtimestamp(now))
 
     def _queued_send_worker(self):
         """Drive durable lane heads without blocking on Telegram HTTP calls."""

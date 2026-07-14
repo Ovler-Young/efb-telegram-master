@@ -5,56 +5,17 @@ from __future__ import annotations
 
 import collections
 import datetime
-import re
 import threading
 import time
 from typing import Callable, Iterable, Optional
 
-import telegram.error
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from prometheus_client.core import GaugeMetricFamily
 
 
 _SEND_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120)
 _WAIT_BUCKETS = (0.0, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 15, 30, 60, 120, 300)
 _LIFETIME_BUCKETS = (0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
-
-
-def metrics_method_name(function: Callable) -> str:
-    name = getattr(function, "__name__", "") or type(function).__name__
-    name = re.sub(r"[^A-Za-z0-9_:.]", "_", str(name))
-    return (name or "unknown")[:80]
-
-
-def telegram_error_type(error: Exception) -> str:
-    if isinstance(error, telegram.error.RetryAfter):
-        return "retry_after"
-    if isinstance(error, telegram.error.BadRequest):
-        return "bad_request"
-    if isinstance(error, telegram.error.TimedOut):
-        return "timed_out"
-    if isinstance(error, telegram.error.NetworkError):
-        return "network"
-    if isinstance(error, telegram.error.Forbidden):
-        return "forbidden"
-    return "other"
-
-
-def bad_request_reason_class(error: Exception) -> str:
-    message = f"{getattr(error, 'message', '')} {error}".lower()
-    if re.search(r"message (?:is )?too long|text (?:is )?too long|caption (?:is )?too long", message):
-        return "message_too_long"
-    if re.search(r"chat not found|chat_id|invalid chat|group chat was upgraded", message):
-        return "invalid_chat"
-    if re.search(r"reply|replied|message to reply|quote", message):
-        return "reply_target_missing"
-    if re.search(r"markup|keyboard|button|entities|parse|entity", message):
-        return "invalid_markup"
-    if re.search(r"media|photo|video|document|animation|audio|voice|sticker|file", message):
-        return "media_invalid"
-    if re.search(r"thread|topic", message):
-        return "thread_invalid"
-    return "unknown"
 
 
 class _TopNQueueCollector:
@@ -451,28 +412,10 @@ class Metrics:
             ["reason"],
             registry=self.registry,
         )
-        self.dropped = Counter(
-            f"{ns}_send_tasks_dropped_total",
-            "Tasks abandoned without delivery.",
-            ["reason"],
-            registry=self.registry,
-        )
         self.rate_limit_hits = Counter(
             f"{ns}_telegram_rate_limit_hits_total",
             "RetryAfter or 429 responses from Telegram.",
             ["sender"],
-            registry=self.registry,
-        )
-        self.send_failures_c = Counter(
-            f"{ns}_telegram_send_failures_total",
-            "Telegram send call failures by bounded error class and method.",
-            ["sender", "error_type", "method"],
-            registry=self.registry,
-        )
-        self.bad_requests_c = Counter(
-            f"{ns}_bad_request_total",
-            "Telegram BadRequest failures by bounded reason class and method.",
-            ["method", "reason_class"],
             registry=self.registry,
         )
         self.membership_probe_c = Counter(
@@ -683,23 +626,8 @@ class Metrics:
     def task_requeued(self, reason: str) -> None:
         self.requeued.labels(reason=reason).inc()
 
-    def task_dropped(self, reason: str) -> None:
-        self.dropped.labels(reason=reason).inc()
-
     def rate_limited(self, sender: str) -> None:
         self.rate_limit_hits.labels(sender=sender).inc()
-
-    def send_failure(self, sender: str, error_type: str, method: str) -> None:
-        self.send_failures_c.labels(sender=sender, error_type=error_type, method=method).inc()
-
-    def send_failure_from_exception(self, sender: str, function: Callable, error: Exception) -> None:
-        self.send_failure(sender, telegram_error_type(error), metrics_method_name(function))
-
-    def bad_request(self, method: str, reason_class: str) -> None:
-        self.bad_requests_c.labels(method=method, reason_class=reason_class).inc()
-
-    def bad_request_from_exception(self, function: Callable, error: Exception) -> None:
-        self.bad_request(metrics_method_name(function), bad_request_reason_class(error))
 
     def membership_probe(self, bot_id: object, username: str, outcome: str) -> None:
         self.membership_probe_c.labels(bot_id=str(bot_id), username=str(username), outcome=outcome).inc()
@@ -755,10 +683,6 @@ class Metrics:
             aux_pool_size=len(aux_bots),
             aux_disabled=sum(1 for bot in aux_bots if getattr(bot, 'disabled', False)),
         )
-
-    def render(self) -> bytes:
-        return generate_latest(self.registry)
-
 
 def start_metrics_server(host: str, port: int, registry) -> object:
     """Start a daemon WSGI server exposing the registry."""

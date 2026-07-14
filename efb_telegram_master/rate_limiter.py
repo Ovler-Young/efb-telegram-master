@@ -133,16 +133,6 @@ class SlidingWindowRateLimiter:
                 self._global_timestamps.pop(idx)
             self._cleanup()
 
-    def has_reservation(self, reservation: SlotReservation) -> bool:
-        """Return whether an exact token is still present in both windows."""
-        with self._lock:
-            self._cleanup()
-            entry = (reservation.reserved_at, reservation.token_id)
-            return (
-                entry in self._global_timestamps
-                and entry in self._chat_timestamps.get(reservation.chat_id, ())
-            )
-
     def get_counts(self, chat_id: int) -> Tuple[int, int]:
         """Return ``(chat_count, global_count)`` for diagnostics."""
         with self._lock:

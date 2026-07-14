@@ -1,4 +1,10 @@
+from prometheus_client import generate_latest
+
 from efb_telegram_master.etm_metrics import Metrics
+
+
+def _render(metrics: Metrics) -> str:
+    return generate_latest(metrics.registry).decode()
 
 
 def test_manager_state_exporter_preserves_source_lane_labels_for_shared_chat(tmp_path):
@@ -63,7 +69,7 @@ def test_topn_queue_collector_caps_rows_and_omits_zero_depths():
     metrics = Metrics(top_n=3)
     metrics.register_topn(lambda: rows)
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
     assert 'source_key="slave.24"' in rendered
     assert 'chat_id="24"' in rendered
@@ -82,7 +88,7 @@ def test_topn_queue_collector_returns_empty_family_on_snapshot_error():
 
     metrics.register_topn(broken_snapshot)
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
     assert "etm_send_queue_target_depth" in rendered
     assert "source_key=" not in rendered
@@ -93,9 +99,9 @@ def test_topn_queue_collector_recomputes_each_scrape_without_stale_labels():
     metrics = Metrics(top_n=20)
     metrics.register_topn(lambda: rows)
 
-    first = metrics.render().decode()
+    first = _render(metrics)
     rows[:] = [("slave.c", 3, "blocking", 7)]
-    second = metrics.render().decode()
+    second = _render(metrics)
 
     assert 'source_key="slave.a"' in first
     assert 'source_key="slave.a"' not in second
@@ -108,7 +114,7 @@ def test_topn_queue_age_collector_caps_rows_and_omits_zero_ages():
     metrics = Metrics(top_n=2)
     metrics.register_queue_oldest_age_topn(lambda: rows)
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
     assert "etm_send_queue_target_oldest_age_seconds" in rendered
     assert 'source_key="slave.24"' in rendered
@@ -128,7 +134,7 @@ def test_bot_chat_occupancy_collector_renders_distribution_rows():
         ]
     )
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
     assert "etm_bot_chat_rate_limit_occupancy_chats" in rendered
     assert 'bot_id="123"' in rendered
@@ -143,9 +149,9 @@ def test_bot_chat_occupancy_collector_recomputes_each_scrape_without_stale_label
     metrics = Metrics()
     metrics.register_bot_chat_occupancy(lambda: rows)
 
-    first = metrics.render().decode()
+    first = _render(metrics)
     rows[:] = [("aux", 456, "botB", 2, 18, "available", 3)]
-    second = metrics.render().decode()
+    second = _render(metrics)
 
     assert 'bot_id="123"' in first
     assert 'bot_id="123"' not in second
@@ -160,23 +166,19 @@ def test_bot_chat_occupancy_collector_returns_empty_family_on_snapshot_error():
 
     metrics.register_bot_chat_occupancy(broken_snapshot)
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
     assert "etm_bot_chat_rate_limit_occupancy_chats" in rendered
     assert "bot_id=" not in rendered
 
 
-def test_debug_event_metrics_render_bounded_labels():
+def test_membership_probe_metric_renders_bounded_labels():
     metrics = Metrics()
 
-    metrics.send_failure("main", "bad_request", "send_message")
-    metrics.bad_request("send_message", "invalid_markup")
     metrics.membership_probe(123, "botA", "ok_member")
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
-    assert 'etm_telegram_send_failures_total{error_type="bad_request",method="send_message",sender="main"} 1.0' in rendered
-    assert 'etm_bad_request_total{method="send_message",reason_class="invalid_markup"} 1.0' in rendered
     assert 'etm_membership_probe_total{bot_id="123",outcome="ok_member",username="botA"} 1.0' in rendered
 
 
@@ -202,7 +204,7 @@ def test_state_collectors_render_current_rows_without_zero_membership_or_cooldow
         ]
     )
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
     assert 'etm_bot_chat_cooldown_chats{bot_id="123",sender="aux",username="botA"} 2.0' in rendered
     assert 'etm_bot_chat_cooldown_max_seconds{bot_id="123",sender="aux",username="botA"} 15.5' in rendered
@@ -228,7 +230,7 @@ def test_snapshot_updates_queue_oldest_age_gauge():
         worker_alive=True,
     )
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
     assert "etm_send_queue_oldest_age_seconds 12.5" in rendered
     assert "etm_retry_targets 0.0" in rendered
@@ -246,7 +248,7 @@ def test_outbound_lifecycle_metrics_render_lane_and_recovery_events():
     metrics.workflow_terminal("dead")
     metrics.lease_heartbeat(3)
 
-    rendered = metrics.render().decode()
+    rendered = _render(metrics)
 
     assert 'etm_send_tasks_enqueued_total{priority="normal"} 1.0' in rendered
     assert 'etm_send_tasks_enqueued_total{priority="blocking"} 1.0' in rendered

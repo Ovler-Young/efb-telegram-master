@@ -100,30 +100,6 @@ def test_check_membership_tri_returns_stale_value_while_refreshing():
     start_probe.assert_called_once_with(2000)
 
 
-def test_check_membership_sync_waits_for_probe_completion():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
-        aux_bot = AuxiliaryBot("123:token")
-
-    state = {"pending": True, "sleep_calls": 0}
-
-    def fake_start(chat_id):
-        with aux_bot._membership_lock:
-            aux_bot._pending_probes.add(chat_id)
-
-    def fake_sleep(_):
-        state["sleep_calls"] += 1
-        with aux_bot._membership_lock:
-            aux_bot._pending_probes.clear()
-            aux_bot._membership_cache[3000] = (True, 100.0)
-
-    with patch.object(aux_bot, "_start_membership_probe", side_effect=fake_start), \
-         patch("efb_telegram_master.auxiliary_bot.time.time", side_effect=[0.0, 0.1, 0.2, 0.3]), \
-         patch("efb_telegram_master.auxiliary_bot.time.sleep", side_effect=fake_sleep):
-        assert aux_bot.check_membership_sync(3000, timeout=1.0) is True
-
-    assert state["sleep_calls"] == 1
-
-
 def test_probe_membership_marks_non_member_on_bad_request():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
         bot = bot_cls.return_value
@@ -132,7 +108,7 @@ def test_probe_membership_marks_non_member_on_bad_request():
         aux_bot.bot_id = 123
 
     aux_bot._probe_membership(4000)
-    assert aux_bot.check_membership(4000) is False
+    assert aux_bot.check_membership_tri(4000) is False
 
 
 def test_membership_cache_snapshot_counts_cached_and_pending_states():
@@ -166,25 +142,6 @@ def test_probe_membership_records_bad_request_metric():
     metrics.membership_probe.assert_called_once_with(123, "botA", "bad_request")
 
 
-def test_check_membership_sync_records_timeout_metric():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
-        aux_bot = AuxiliaryBot("123:token")
-        aux_bot.bot_id = 123
-        aux_bot.username = "botA"
-        metrics = Mock()
-        aux_bot.bind_metrics(metrics)
-
-    def fake_start(chat_id):
-        with aux_bot._membership_lock:
-            aux_bot._pending_probes.add(chat_id)
-
-    with patch.object(aux_bot, "_start_membership_probe", side_effect=fake_start), \
-         patch("efb_telegram_master.auxiliary_bot.time.time", side_effect=[0.0, 2.0, 2.0]):
-        assert aux_bot.check_membership_sync(3000, timeout=1.0) is False
-
-    metrics.membership_probe.assert_called_once_with(123, "botA", "timeout")
-
-
 def test_probe_membership_forbidden_marks_non_member_without_disabling():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
         bot = bot_cls.return_value
@@ -194,14 +151,5 @@ def test_probe_membership_forbidden_marks_non_member_without_disabling():
 
     aux_bot._probe_membership(4000)
 
-    assert aux_bot.check_membership(4000) is False
+    assert aux_bot.check_membership_tri(4000) is False
     assert aux_bot.disabled is False
-
-
-def test_mark_disabled_sets_reason():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
-        aux_bot = AuxiliaryBot("123:token")
-
-    aux_bot.mark_disabled("rate limit")
-    assert aux_bot.disabled is True
-    assert aux_bot._disable_reason == "rate limit"

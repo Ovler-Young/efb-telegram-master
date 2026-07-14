@@ -1043,7 +1043,6 @@ def test_retry_after_rotates_old_row_without_cross_chat_cooldown():
         disabled=False,
         bot=object(),
         check_membership_tri=lambda _chat_id: True,
-        check_membership_sync=lambda _chat_id, timeout: True,
         peek_delay=aux_limiter.peek_delay,
         reserve_slot=aux_limiter.reserve_slot,
         release_slot=aux_limiter.release_slot,
@@ -1097,7 +1096,6 @@ def test_unknown_aux_membership_uses_bounded_recheck_without_blocking_probe():
         disabled=False,
         bot=object(),
         check_membership_tri=Mock(return_value=None),
-        check_membership_sync=Mock(return_value=False),
         peek_delay=Mock(return_value=0.0),
         reserve_slot=Mock(),
         get_chat_send_count=Mock(return_value=0),
@@ -1115,7 +1113,6 @@ def test_unknown_aux_membership_uses_bounded_recheck_without_blocking_probe():
     assert result.selection is None
     assert result.retry_at is not None
     assert 0 < (result.retry_at - now).total_seconds() <= 0.25
-    unknown_bot.check_membership_sync.assert_not_called()
 
 
 def test_successful_send_resets_sender_chat_retry_failure_count():
