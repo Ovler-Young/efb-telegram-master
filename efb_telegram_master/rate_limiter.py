@@ -24,7 +24,7 @@ class _CallableMonotonicClock(AbstractClock):
         self._now = now
 
     def now(self) -> int:
-        return int(self._now() * 1000)
+        return round(self._now() * 1000)
 
 
 class SlidingWindowRateLimiter:
