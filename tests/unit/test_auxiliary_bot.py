@@ -62,18 +62,19 @@ def test_initialize_disables_bot_on_forbidden():
         assert aux_bot.disabled is True
 
 
-def test_rate_limit_peek_and_reserve():
+def test_rate_limit_peek_and_acquire_uses_auxiliary_limiter() -> None:
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
-        aux_bot = AuxiliaryBot("123:token", global_limit=3, global_window=10.0, chat_limit=3, chat_window=10.0)
+        aux_bot = AuxiliaryBot("123:token")
 
-    chat_id = 100
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert aux_bot.peek_delay(chat_id) == 0.0
-        assert aux_bot.reserve_slot(chat_id).delay == 0.0
-        assert aux_bot.reserve_slot(chat_id).delay > 0.0
+    limiter = Mock()
+    limiter.peek_delay.return_value = 1.5
+    limiter.try_acquire.return_value = False
+    aux_bot._rate_limiter = limiter
 
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert aux_bot.peek_delay(chat_id) > 0.0
+    assert aux_bot.peek_delay(100) == 1.5
+    assert aux_bot.try_acquire_limits(100) is False
+    limiter.peek_delay.assert_called_once_with(100)
+    limiter.try_acquire.assert_called_once_with(100)
 
 
 def test_check_membership_tri_starts_probe_for_unknown():
@@ -86,7 +87,7 @@ def test_check_membership_tri_starts_probe_for_unknown():
     start_probe.assert_called_once_with(1000)
 
 
-def test_check_membership_tri_returns_stale_value_while_refreshing():
+def test_check_membership_tri_returns_unknown_while_refreshing_stale_entry():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token")
 
@@ -95,7 +96,7 @@ def test_check_membership_tri_returns_stale_value_while_refreshing():
 
     with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), \
          patch.object(aux_bot, "_start_membership_probe") as start_probe:
-        assert aux_bot.check_membership_tri(2000) is True
+        assert aux_bot.check_membership_tri(2000) is None
 
     start_probe.assert_called_once_with(2000)
 

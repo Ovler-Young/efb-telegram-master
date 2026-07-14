@@ -24,7 +24,9 @@ class _CallableMonotonicClock(AbstractClock):
         self._now = now
 
     def now(self) -> int:
-        return round(self._now() * 1000)
+        # Truncation cannot advance the current rate-limit window. Rounding
+        # would make a time just below a millisecond boundary appear later.
+        return int(self._now() * 1000)
 
 
 class SlidingWindowRateLimiter:

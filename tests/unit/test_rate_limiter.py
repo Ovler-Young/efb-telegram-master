@@ -29,7 +29,10 @@ def test_global_capacity_is_28_acquisitions_per_bot_per_second() -> None:
     assert limiter.global_delay() > 0.0
     assert not limiter.try_acquire_global()
 
-    clock.value = 1.001
+    clock.value = 1.0004
+    assert not limiter.try_acquire_global()
+
+    clock.value = 1.002
     assert limiter.try_acquire_global()
 
 

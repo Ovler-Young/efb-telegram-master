@@ -74,10 +74,10 @@ class AuxiliaryBot:
         from .rate_limiter import SlidingWindowRateLimiter
         self._rate_limiter = SlidingWindowRateLimiter()
 
-        # Membership cache: chat_id -> (is_member, timestamp)
+        # Membership cache: chat_id -> (is_member, wall-clock timestamp)
         self._membership_cache: Dict[int, Tuple[bool, float]] = {}
         self._membership_lock = threading.Lock()
-        self._pending_probes: set = set()
+        self._pending_probes: set[int] = set()
         self._metrics = None
         self._membership_changed_callback: Optional[Callable[[], None]] = None
 
@@ -193,11 +193,10 @@ class AuxiliaryBot:
         if metrics:
             metrics.membership_probe(self.bot_id, self.username, outcome)
 
-    def check_membership_tri(self, chat_id: int):
+    def check_membership_tri(self, chat_id: int) -> Optional[bool]:
         """Tri-state membership check: True (member), False (confirmed not member),
         None (unknown / probe in progress).
         """
-        stale_value = None
         need_probe = False
         with self._membership_lock:
             entry = self._membership_cache.get(chat_id)
@@ -208,23 +207,22 @@ class AuxiliaryBot:
                 if age < ttl:
                     return is_member
                 need_probe = True
-                stale_value = is_member
 
         if need_probe:
             self._start_membership_probe(chat_id)
-            return stale_value
+            return None
 
         self._start_membership_probe(chat_id)
         return None
 
-    def update_membership(self, chat_id: int, is_member: bool):
+    def update_membership(self, chat_id: int, is_member: bool) -> None:
         """Update the membership cache directly (e.g. from chat_left handler)."""
         with self._membership_lock:
             self._membership_cache[chat_id] = (is_member, time.time())
         if self._membership_changed_callback is not None:
             self._membership_changed_callback()
 
-    def _start_membership_probe(self, chat_id: int):
+    def _start_membership_probe(self, chat_id: int) -> None:
         """Start a background thread to check membership via get_chat_member API."""
         with self._membership_lock:
             if chat_id in self._pending_probes:
@@ -239,7 +237,7 @@ class AuxiliaryBot:
         )
         thread.start()
 
-    def _probe_membership(self, chat_id: int):
+    def _probe_membership(self, chat_id: int) -> None:
         """Background probe: call get_chat_member and update cache."""
         try:
             member: telegram.ChatMember = cast(
@@ -272,12 +270,12 @@ class AuxiliaryBot:
         with self._membership_lock:
             return bool(self._pending_probes)
 
-    def bind_runtime(self, runtime: 'AsyncTelegramRuntime'):
+    def bind_runtime(self, runtime: 'AsyncTelegramRuntime') -> None:
         """Bind the runtime-backed sync facade used by the rest of ETM."""
         from .bot_manager import SyncBotFacade
 
         self._runtime = runtime
         self.bot = SyncBotFacade(self.async_bot, runtime)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"AuxiliaryBot(@{self.username}, id={self.bot_id}, disabled={self.disabled})"
