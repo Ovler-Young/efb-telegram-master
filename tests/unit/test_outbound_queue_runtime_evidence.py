@@ -10,11 +10,13 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from prometheus_client import generate_latest
 from telegram.error import NetworkError, RetryAfter, TelegramError
 
 import efb_telegram_master.outbound as outbound
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.bot_pool import BotPool
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 from efb_telegram_master.outbound import (
     ExecutorSubmitError,
@@ -269,6 +271,66 @@ def test_retry_after_failure_does_not_reenqueue_and_defers_only_later_sender_cha
     scheduler.dispatch_once()
     assert len(executor.submissions) == 2
     assert first_id not in {row.id for row in retained_queue.heads()}
+
+
+def test_submitted_future_completion_wakes_scheduler(retained_queue: OutboundQueue) -> None:
+    _row_id, _waiter = enqueue(retained_queue, 43, "completion wake")
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    scheduler.wake_event.clear()
+    executor.submissions[0][2].set_result("sent")
+
+    assert scheduler.wake_event.is_set()
+
+
+def test_scheduler_publishes_metrics_for_actual_dequeue_and_completion(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path)
+    queue.metrics = metrics
+    row_id, waiter = enqueue(queue, 47, "metrics")
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_result("sent")
+    scheduler.harvest_completed()
+
+    assert waiter.result() == "sent"
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_enqueued_total{operation="send_message",priority="normal"} 1.0' in rendered
+    assert "etm_outbound_queue_depth 0.0" in rendered
+    assert 'etm_outbound_queue_removals_total{operation="send_message",outcome="submitted",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_dequeued_total{operation="send_message",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_in_flight{operation="send_message",priority="normal",sender_kind="main"} 0.0' in rendered
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="success",priority="normal",sender_kind="main"} 1.0' in rendered
+    assert row_id not in scheduler.in_flight
+    queue.close()
+
+
+def test_queue_metrics_start_from_retained_rows_and_publish_terminal_discard(tmp_path: Path) -> None:
+    retained = OutboundQueue(tmp_path)
+    enqueue(retained, 53, "retained")
+    retained.close()
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    queue.connection.execute(
+        "INSERT INTO outbound_queue "
+        "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, created_at) "
+        "VALUES (1, 53, 'send_message', X'02', NULL, NULL, 0)"
+    )
+    queue.connection.commit()
+    queue.refresh_depth()
+    scheduler = OutboundQueueScheduler(queue, RecordingAdapter(), ControlledExecutor(), worker_count=1)
+
+    scheduler.dispatch_once()
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert "etm_outbound_queue_depth 1.0" in rendered
+    assert 'etm_outbound_queue_removals_total{operation="send_message",outcome="terminal_discard",priority="blocking"} 1.0' in rendered
+    assert 'etm_outbound_queue_residence_seconds_count{operation="send_message",outcome="terminal_discard",priority="blocking"} 1.0' in rendered
+    queue.close()
 
 
 @pytest.mark.parametrize("failure", [TelegramError("telegram"), NetworkError("network"), CancelledError()])

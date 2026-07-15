@@ -119,15 +119,42 @@ class QueueAdapter(Protocol):
         ...
 
 
+class QueueMetrics(Protocol):
+    def record_enqueued(self, priority: int, operation: str) -> None:
+        ...
+
+    def set_queue_depth(self, depth: int) -> None:
+        ...
+
+    def record_removal(self, priority: int, operation: str, outcome: str, residence_seconds: float) -> None:
+        ...
+
+    def record_dequeued(self, priority: int, operation: str) -> None:
+        ...
+
+    def record_dispatch_failure(self, priority: int, operation: str) -> None:
+        ...
+
+    def increment_in_flight(self, priority: int, operation: str, sender_kind: str) -> None:
+        ...
+
+    def decrement_in_flight(self, priority: int, operation: str, sender_kind: str) -> None:
+        ...
+
+    def record_completion(self, priority: int, operation: str, sender_kind: str, outcome: str) -> None:
+        ...
+
+
 class OutboundQueue:
     """Own the queue connection, codec, and transactional row mutations."""
 
     filename = "outbound-queue.sqlite3"
 
-    def __init__(self, channel_data_path: Path | str):
+    def __init__(self, channel_data_path: Path | str, metrics: Optional[QueueMetrics] = None):
         self.path = Path(channel_data_path) / self.filename
         self._lock = threading.RLock()
         self._connection: Optional[sqlite3.Connection] = None
+        self.metrics = metrics
         self.waiters: dict[int, Future] = {}
         self._open()
 
@@ -155,6 +182,7 @@ class OutboundQueue:
             )
             connection.commit()
             self._connection = connection
+            self.refresh_depth()
         except Exception:
             if connection is not None:
                 try:
@@ -174,6 +202,16 @@ class OutboundQueue:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+
+    def refresh_depth(self) -> None:
+        if self.metrics is not None:
+            depth = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
+            self.metrics.set_queue_depth(int(depth))
+
+    def record_removal(self, row: QueuedCall, outcome: str) -> None:
+        if self.metrics is not None:
+            self.metrics.record_removal(row.priority, row.operation, outcome, time.time() - row.created_at)
+        self.refresh_depth()
 
     @staticmethod
     def encode_payload(args: tuple, kwargs: dict) -> bytes:
@@ -278,6 +316,10 @@ class OutboundQueue:
                 except sqlite3.Error:
                     pass
                 raise QueueEnqueueError("Unable to commit queued Telegram call.") from error
+            if self.metrics is not None:
+                for operation, _args, _kwargs, _chat_id, priority, _slave_id, _required_sender, _payload in prepared:
+                    self.metrics.record_enqueued(priority, operation)
+            self.refresh_depth()
             waiter: Future = Future()
             self.waiters[identifiers[0]] = waiter
             return identifiers[0], waiter
@@ -339,6 +381,21 @@ class OutboundQueueScheduler:
         self.in_flight_destinations: set[int] = set()
         self.next_deadline: Optional[float] = None
 
+    @staticmethod
+    def _sender_kind(selection: SenderSelection) -> str:
+        return "main" if selection.sender_bot_id is None else "auxiliary"
+
+    def _record_submitted_removal(self, row: QueuedCall) -> None:
+        self.queue.record_removal(row, "submitted")
+        if self.queue.metrics is not None:
+            self.queue.metrics.record_dequeued(row.priority, row.operation)
+
+    def _record_terminal_discard(self, row: QueuedCall) -> None:
+        self.queue.record_removal(row, "terminal_discard")
+
+    def _wake_on_future_completion(self, _future: Future) -> None:
+        self.wake_event.set()
+
     def _stop_for_persistence_error(self, error: Exception) -> None:
         persistence_error = QueuePersistenceError("Outbound queue deletion failed.")
         persistence_error.__cause__ = error
@@ -363,6 +420,7 @@ class OutboundQueueScheduler:
                     except Exception as delete_error:
                         self._stop_for_persistence_error(delete_error)
                         return
+                    self._record_terminal_discard(row)
                     self.queue.fail_waiter(row.id, error)
                     continue
                 if not self._permits.acquire(blocking=False):
@@ -376,6 +434,7 @@ class OutboundQueueScheduler:
                     except Exception as delete_error:
                         self._stop_for_persistence_error(delete_error)
                         return
+                    self._record_terminal_discard(row)
                     self.queue.fail_waiter(row.id, RequiredSenderUnavailableError(decision.terminal_error_class))
                     continue
                 if decision.selection is None:
@@ -392,16 +451,24 @@ class OutboundQueueScheduler:
                     self._permits.release()
                     self._stop_for_persistence_error(delete_error)
                     return
+                self._record_submitted_removal(row)
                 try:
                     future = self.executor.submit(
                         self.adapter.execute_queued_call, row, args, kwargs, decision.selection
                     )
                 except Exception as error:
                     self._permits.release()
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_dispatch_failure(row.priority, row.operation)
                     self.queue.fail_waiter(row.id, ExecutorSubmitError("Unable to submit queued Telegram call."))
                     continue
+                future.add_done_callback(self._wake_on_future_completion)
                 self.in_flight[row.id] = SubmittedCall(row, decision.selection, future)
                 self.in_flight_destinations.add(row.telegram_chat_id)
+                if self.queue.metrics is not None:
+                    self.queue.metrics.increment_in_flight(
+                        row.priority, row.operation, self._sender_kind(decision.selection)
+                    )
 
     def harvest_completed(self) -> None:
         with self._lock:
@@ -411,16 +478,30 @@ class OutboundQueueScheduler:
                 self.in_flight.pop(row_id)
                 self.in_flight_destinations.remove(submitted.row.telegram_chat_id)
                 self._permits.release()
+                if self.queue.metrics is not None:
+                    self.queue.metrics.decrement_in_flight(
+                        submitted.row.priority, submitted.row.operation, self._sender_kind(submitted.selection)
+                    )
                 try:
                     result = submitted.future.result()
                 except BaseException as error:
                     self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
                     self.queue.fail_waiter(row_id, error)
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_completion(
+                            submitted.row.priority, submitted.row.operation,
+                            self._sender_kind(submitted.selection), "failure"
+                        )
                 else:
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
                     waiter = self.queue.waiters.pop(row_id, None)
                     if waiter is not None and not waiter.done():
                         waiter.set_result(result)
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_completion(
+                            submitted.row.priority, submitted.row.operation,
+                            self._sender_kind(submitted.selection), "success"
+                        )
             self.wake_event.set()
 
     def stop_and_drain(self, timeout: float = 5.0) -> None:
@@ -446,4 +527,8 @@ class OutboundQueueScheduler:
                 self.in_flight.pop(row_id)
                 self.in_flight_destinations.discard(submitted.row.telegram_chat_id)
                 self._permits.release()
+                if self.queue.metrics is not None:
+                    self.queue.metrics.decrement_in_flight(
+                        submitted.row.priority, submitted.row.operation, self._sender_kind(submitted.selection)
+                    )
                 self.queue.fail_waiter(row_id, SchedulerStoppedError("Outbound scheduler stopped."))
