@@ -46,6 +46,12 @@ def _bind_db_update_helpers(manager):
     return manager
 
 
+@pytest.fixture
+def formatted_channel(channel):
+    _bind_blocking_enqueue_helper(channel.bot_manager)
+    return channel
+
+
 def test_sync_bot_facade_preserves_telegram_method_signature():
     async def send_message(chat_id, text):
         return chat_id, text
@@ -58,11 +64,11 @@ def test_sync_bot_facade_preserves_telegram_method_signature():
     }
 
 
-def test_text_prefix_suffix(channel, bot_admin):
-    message = channel.bot_manager.send_message(bot_admin, 'Message', prefix='Prefix', suffix='Suffix')
+def test_text_prefix_suffix(formatted_channel, bot_admin):
+    message = formatted_channel.bot_manager.send_message(bot_admin, 'Message', prefix='Prefix', suffix='Suffix')
     assert message.text == 'Prefix\nMessage\nSuffix'
 
-    edited = channel.bot_manager.edit_message_text(
+    edited = formatted_channel.bot_manager.edit_message_text(
         text="Edited text", prefix="Edited prefix", suffix="Edited suffix",
         chat_id=message.chat_id, message_id=message.message_id)
     assert edited.chat_id == message.chat_id
@@ -77,11 +83,11 @@ def image() -> Iterator[BinaryIO]:
     f.close()
 
 
-def test_caption_prefix_suffix(channel, bot_admin, image):
-    message = channel.bot_manager.send_photo(bot_admin, image, caption='Message', prefix='Prefix', suffix='Suffix')
+def test_caption_prefix_suffix(formatted_channel, bot_admin, image):
+    message = formatted_channel.bot_manager.send_photo(bot_admin, image, caption='Message', prefix='Prefix', suffix='Suffix')
     assert message.caption == 'Prefix\nMessage\nSuffix'
 
-    edited = channel.bot_manager.edit_message_caption(
+    edited = formatted_channel.bot_manager.edit_message_caption(
         caption="Edited text", prefix="Edited prefix", suffix="Edited suffix",
         chat_id=message.chat_id, message_id=message.message_id)
     assert edited.chat_id == message.chat_id
@@ -89,17 +95,17 @@ def test_caption_prefix_suffix(channel, bot_admin, image):
     assert edited.caption == "Edited prefix\nEdited text\nEdited suffix"
 
 
-def test_message_truncation(channel, bot_admin):
+def test_message_truncation(formatted_channel, bot_admin):
     msg_body = ''.join(random.choice(string.ascii_letters) for _ in range(100000))
     with patch('telegram.Bot.send_document') as mock_send_document:
-        message = channel.bot_manager.send_message(bot_admin, msg_body, prefix='Prefix')
+        message = formatted_channel.bot_manager.send_message(bot_admin, msg_body, prefix='Prefix')
         assert message.text.startswith('Prefix\n' + msg_body[:50])
         mock_send_document.assert_called()
         assert mock_send_document.call_args[1]['filename'].endswith('txt')
 
         # Edit message text
         msg_body = ''.join(random.choice(string.ascii_letters) for _ in range(100000))
-        edited = channel.bot_manager.edit_message_text(
+        edited = formatted_channel.bot_manager.edit_message_text(
             text=msg_body, prefix='Prefix',
             chat_id=message.chat_id, message_id=message.message_id
         )
@@ -108,33 +114,33 @@ def test_message_truncation(channel, bot_admin):
         assert mock_send_document.call_args[1]['filename'].endswith('txt')
 
 
-def test_caption_truncation(channel, bot_admin, image):
+def test_caption_truncation(formatted_channel, bot_admin, image):
     msg_body = ''.join(random.choice(string.ascii_letters) for _ in range(100000))
     with patch('telegram.Bot.send_document') as mock_send_document:
-        message = channel.bot_manager.send_photo(bot_admin, image, caption=msg_body, prefix='Prefix')
+        message = formatted_channel.bot_manager.send_photo(bot_admin, image, caption=msg_body, prefix='Prefix')
         assert message.caption.startswith('Prefix\n' + msg_body[:50])
         mock_send_document.assert_called()
         assert mock_send_document.call_args[1]['filename'].endswith('txt')
 
         # Edit message text
         msg_body = ''.join(random.choice(string.ascii_letters) for _ in range(100000))
-        edited = channel.bot_manager.edit_message_caption(
+        edited = formatted_channel.bot_manager.edit_message_caption(
             caption=msg_body, prefix='Prefix',
             chat_id=message.chat_id, message_id=message.message_id
         )
         assert edited.caption.startswith('Prefix\n' + msg_body[:50])
 
 
-def test_malformed_markdown_text(channel, bot_admin):
-    channel.bot_manager.send_message(
+def test_malformed_markdown_text(formatted_channel, bot_admin):
+    formatted_channel.bot_manager.send_message(
         bot_admin,
         "*some _strange_ styling* with [an *incomplete* link](https://example.com/this.is.a.(link",
         parse_mode="markdown"
     )
 
 
-def test_malformed_markdown_caption(channel, bot_admin, image):
-    channel.bot_manager.send_photo(
+def test_malformed_markdown_caption(formatted_channel, bot_admin, image):
+    formatted_channel.bot_manager.send_photo(
         bot_admin,
         image,
         caption="*some _strange_ styling* with [an *incomplete* link](https://example.com/this.is.a.(link",
@@ -142,16 +148,16 @@ def test_malformed_markdown_caption(channel, bot_admin, image):
     )
 
 
-def test_malformed_html_text(channel, bot_admin):
-    channel.bot_manager.send_message(
+def test_malformed_html_text(formatted_channel, bot_admin):
+    formatted_channel.bot_manager.send_message(
         bot_admin,
         '<b>Bold and <i>italics</i> text</b> and <abbr title="unknown tag to Telegram">UTTT</abbr> and an <a href="https://example.com">incomplete link</a',
         parse_mode="html"
     )
 
 
-def test_malformed_html_caption(channel, bot_admin, image):
-    channel.bot_manager.send_photo(
+def test_malformed_html_caption(formatted_channel, bot_admin, image):
+    formatted_channel.bot_manager.send_photo(
         bot_admin,
         image,
         caption='<b>Bold and <i>italics</i> text</b> and <abbr title="unknown tag to Telegram">UTTT</abbr> and an <a href="https://example.com">incomplete link</a',
