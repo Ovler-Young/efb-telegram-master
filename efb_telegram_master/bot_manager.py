@@ -45,7 +45,7 @@ from .outbound import (
     SenderSelectionResult,
 )
 from .ptb_compat import Filters
-from .rate_limiter import CHAT_LIMIT, GLOBAL_LIMIT, SlidingWindowRateLimiter
+from .rate_limiter import SlidingWindowRateLimiter
 from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
@@ -357,164 +357,10 @@ class TelegramBotManager(LocaleMixin):
     class Decorators:
         logger = logging.getLogger(__name__)
 
-        enable_retry = False
-
         @classmethod
         def exception_filter(cls, exception: Exception):
             cls.logger.exception("Exception: %s while sending request to Telegram server.", exception)
             return isinstance(exception, telegram.error.TimedOut)
-
-        @classmethod
-        def rate_limit_decorator(cls, fn: Callable):
-            """Queue only the supported outbound Telegram operation set."""
-            @wraps(fn)
-            def rate_limit_wrapper(self: 'TelegramBotManager', *args, **kwargs):
-                operation = fn.__name__
-                is_edit_method = operation in {
-                    'edit_message_text', 'edit_message_caption', 'edit_message_media',
-                }
-
-                sender_bot_id = kwargs.pop('_sender_bot_id', None)
-                slave_id = kwargs.pop('_slave_id', None)
-                send_mode = kwargs.pop('_send_mode', 'blocking')
-                force_main_bot = kwargs.pop('_force_main_bot', False)
-                required_sender_bot_id = str(sender_bot_id) if sender_bot_id and is_edit_method else None
-
-                if operation not in QUEUED_OPERATIONS:
-                    return self._make_send_receipt(fn(self, *args, **kwargs))
-
-                if send_mode not in {'blocking', 'eventual'}:
-                    raise QueueEnqueueError("_send_mode must be 'blocking' or 'eventual'.")
-
-                chat_id: object = None
-                if args:
-                    chat_id = args[0]
-                elif 'chat_id' in kwargs:
-                    chat_id = kwargs['chat_id']
-                normalized_chat_id = self._normalize_telegram_chat_id(chat_id)
-                has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
-                cleanup_tls = getattr(self, '_cleanup_tls', None)
-                cleanup_files = getattr(cleanup_tls, 'pending_cleanup', [])[:]
-                if cleanup_tls is not None:
-                    cleanup_tls.pending_cleanup = []
-
-                if send_mode == 'eventual' and slave_id and not is_edit_method and not has_callback:
-                    return self._enqueue_eventual_send(
-                        str(slave_id),
-                        normalized_chat_id,
-                        fn,
-                        (self,) + args,
-                        kwargs,
-                        cleanup_files=cleanup_files,
-                    )
-
-                blocking_kwargs = dict(kwargs)
-                if required_sender_bot_id is not None:
-                    blocking_kwargs['_required_sender_bot_id'] = required_sender_bot_id
-                if force_main_bot or (has_callback and not is_edit_method) or (
-                    is_edit_method and required_sender_bot_id is None
-                ):
-                    blocking_kwargs['_required_sender_bot_id'] = "__main__"
-
-                return self._enqueue_blocking_send_and_wait(
-                    str(slave_id) if slave_id else None,
-                    normalized_chat_id,
-                    fn,
-                    (self,) + args,
-                    blocking_kwargs,
-                    cleanup_files=cleanup_files,
-                )
-
-            return rate_limit_wrapper
-
-        @classmethod
-        def handle_rate_limit_error(cls, fn: Callable):
-            """Handle Telegram flood limits.
-
-            ``RetryAfter`` is always retried (honours ``retry_after`` seconds from Telegram).
-            Broader heuristic retries for other rate-limit signals require ``retry_on_error``.
-            """
-            @wraps(fn)
-            def rate_limit_error_handler(self: 'TelegramBotManager', *args, **kwargs):
-                max_retries = 3
-                # Extract chat_id from arguments for logging
-                chat_id = None
-                if args:
-                    chat_id = args[0]
-                elif 'chat_id' in kwargs:
-                    chat_id = kwargs['chat_id']
-
-                # Get recent timestamps for debugging
-                def get_timestamp_info():
-                    if not (chat_id and hasattr(self, '_rate_limiter')):
-                        return ""
-                    chat_count, global_count = self._rate_limiter.get_counts(chat_id)
-                    return f" [chat: {chat_count}/{CHAT_LIMIT}, global: {global_count}/{GLOBAL_LIMIT}]"
-
-                for attempt in range(max_retries + 1):
-                    try:
-                        return fn(self, *args, **kwargs)
-                    except telegram.error.RetryAfter as e:
-                        timestamp_info = get_timestamp_info()
-                        if attempt >= max_retries:
-                            cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
-                            raise
-
-                        retry_after_value = e.retry_after
-                        if isinstance(retry_after_value, timedelta):
-                            retry_after = retry_after_value.total_seconds()
-                        else:
-                            retry_after = float(retry_after_value)
-                        cls.logger.warning(f"Rate limit hit, waiting {retry_after}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
-
-                        # Use interruptible sleep for rate limit waits
-                        if hasattr(self, '_send_worker_stop'):
-                            # Sleep in small chunks to allow for interruption during shutdown
-                            remaining_seconds = retry_after
-                            while remaining_seconds > 0 and not self._send_worker_stop.is_set():
-                                sleep_chunk = min(1.0, remaining_seconds)
-                                time.sleep(sleep_chunk)
-                                remaining_seconds -= sleep_chunk
-                        else:
-                            time.sleep(retry_after)
-                    except telegram.error.TelegramError as e:
-                        if not cls.enable_retry:
-                            raise
-                        if "Too Many Requests" in str(e) or "429" in str(e) or "Flood" in str(e):
-                            timestamp_info = get_timestamp_info()
-                            if attempt >= max_retries:
-                                cls.logger.error(f"Max retries exceeded for rate limit error: {e} (chat_id: {chat_id}){timestamp_info}")
-                                raise
-
-                            delay = 60
-                            cls.logger.warning(f"Rate limit detected, waiting {delay}s before retry {attempt + 1}/{max_retries} (chat_id: {chat_id}){timestamp_info}")
-
-                            # Use interruptible sleep for rate limit waits
-                            if hasattr(self, '_send_worker_stop'):
-                                # Sleep in small chunks to allow for interruption during shutdown
-                                remaining_seconds = float(delay)
-                                while remaining_seconds > 0 and not self._send_worker_stop.is_set():
-                                    sleep_chunk = min(1.0, remaining_seconds)
-                                    time.sleep(sleep_chunk)
-                                    remaining_seconds -= sleep_chunk
-                            else:
-                                time.sleep(delay)
-                        else:
-                            raise
-
-                return fn(self, *args, **kwargs)
-
-            return rate_limit_error_handler
-
-        @classmethod
-        def skip_on_rate_limit(cls, fn: Callable):
-            """Keep non-queued calls outside outbound queue state and limits."""
-
-            @wraps(fn)
-            def skip_wrapper(self: 'TelegramBotManager', *args, **kwargs):
-                return fn(self, *args, **kwargs)
-
-            return skip_wrapper
 
         @classmethod
         def retry_on_chat_migration(cls, fn: Callable):
@@ -667,7 +513,6 @@ class TelegramBotManager(LocaleMixin):
 
         self.logger.debug("Adding base dispatchers...")
         self._add_base_dispatchers()
-        self.Decorators.enable_retry = channel.flag('retry_on_error')
         self.logger.debug("Base dispatchers added...")
 
     @staticmethod
@@ -1481,8 +1326,6 @@ class TelegramBotManager(LocaleMixin):
             finally:
                 self._outbound_queue.close()
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_message(self, *args, prefix: str = '', suffix: str = '', **kwargs):
         """
@@ -1500,8 +1343,6 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._route_queued_operation("send_message", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_text(self, prefix='', suffix='', **kwargs):
         """
@@ -1518,8 +1359,6 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._route_queued_operation("edit_message_text", (), kwargs, eventual_capable=False)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_audio(self, *args, **kwargs):
         """
@@ -1539,8 +1378,6 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._route_queued_operation("send_audio", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_voice(self, *args, **kwargs):
         """
@@ -1560,8 +1397,6 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._route_queued_operation("send_voice", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_video(self, *args, **kwargs):
         """
@@ -1581,8 +1416,6 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._route_queued_operation("send_video", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_document(self, *args, **kwargs):
         """
@@ -1600,8 +1433,6 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._route_queued_operation("send_document", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_animation(self, *args, **kwargs):
         """
@@ -1619,8 +1450,6 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._route_queued_operation("send_animation", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_photo(self, *args, **kwargs):
         """
@@ -1638,13 +1467,10 @@ class TelegramBotManager(LocaleMixin):
         """
         return self._route_queued_operation("send_photo", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_media_group(self, *args, **kwargs):
         return self._route_queued_operation("send_media_group", args, kwargs, eventual_capable=True)
 
-    @Decorators.skip_on_rate_limit
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
         message_thread_id = kwargs.pop('message_thread_id', None)
@@ -1652,44 +1478,30 @@ class TelegramBotManager(LocaleMixin):
             kwargs['api_kwargs'] = { "message_thread_id":  message_thread_id}
         return self._bot.send_chat_action(*args, **kwargs)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_reply_markup(self, *args, **kwargs):
         return self._call_direct_operation("edit_message_reply_markup", args, kwargs)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_location(self, *args, **kwargs):
         return self._call_direct_operation("send_location", args, kwargs)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_venue(self, *args, **kwargs):
         return self._call_direct_operation("send_venue", args, kwargs)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_sticker(self, *args, **kwargs):
         return self._route_queued_operation("send_sticker", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def forward_message(self, *args, **kwargs):
         return self._route_queued_operation("forward_message", args, kwargs, eventual_capable=True)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def copy_message(self, *args, **kwargs):
         return self._route_queued_operation("copy_message", args, kwargs, eventual_capable=True)
 
-    @Decorators.handle_rate_limit_error
-    @Decorators.retry_on_chat_migration
     def get_me(self, *args, **kwargs):
         return self._call_direct_operation("get_me", args, kwargs)
 
@@ -1703,14 +1515,10 @@ class TelegramBotManager(LocaleMixin):
                                chat_id=update.effective_chat.id,
                                message_id=update.effective_message.message_id)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
         return self._route_queued_operation("edit_message_caption", args, kwargs, eventual_capable=False)
 
-    @Decorators.rate_limit_decorator
-    @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
         return self._route_queued_operation("edit_message_media", args, kwargs, eventual_capable=False)
