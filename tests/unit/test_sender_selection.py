@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,6 +7,7 @@ import pytest
 
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.bot_pool import BotPool
+from efb_telegram_master.outbound import SenderSelection
 
 
 class Limiter:
@@ -51,8 +51,8 @@ def _task(*, required_sender_bot_id: str | None = None, slave_id: str | None = N
     )
 
 
-def _now() -> datetime:
-    return datetime(2026, 7, 14, tzinfo=timezone.utc)
+def _now() -> float:
+    return 1_000.0
 
 
 @pytest.mark.parametrize("required_sender_bot_id", ["9", "10"])
@@ -85,7 +85,7 @@ def test_required_sender_unknown_membership_rechecks_after_250ms() -> None:
     result = manager.select_sender(_task(required_sender_bot_id="10"), now)
 
     assert result.selection is None
-    assert result.retry_at == now + timedelta(seconds=0.25)
+    assert result.retry_at == now + 0.25
 
 
 def test_unknown_auxiliary_membership_blocks_affinity_only_selection_for_250ms() -> None:
@@ -96,8 +96,7 @@ def test_unknown_auxiliary_membership_blocks_affinity_only_selection_for_250ms()
     result = manager.select_sender(_task(), now)
 
     assert result.selection is None
-    assert result.retry_at is not None
-    assert (result.retry_at - now).total_seconds() == 0.25
+    assert result.retry_at == now + 0.25
 
 
 def test_affinity_wins_ties_then_main_wins_without_affinity() -> None:
@@ -123,11 +122,12 @@ def test_affinity_mapping_changes_only_after_successful_auxiliary_completion() -
     assert manager.bot_pool is not None
     assert manager.bot_pool.preferred_sender("slave-a") is None
 
-    manager.record_successful_sender(task, selection_result.selection)
+    assert selection_result.selection is not None
+    manager.record_queued_success(task, object(), selection_result.selection)
     assert manager.bot_pool.preferred_sender("slave-a") is None
 
-    auxiliary_selection = SimpleNamespace(sender_bot_id="10")
-    manager.record_successful_sender(task, auxiliary_selection)
+    auxiliary_selection = SenderSelection(auxiliary.bot, "10")
+    manager.record_queued_success(task, object(), auxiliary_selection)
     assert manager.bot_pool.preferred_sender("slave-a") is auxiliary
 
 
@@ -139,7 +139,9 @@ def test_confirmed_non_member_removes_only_the_triggering_affinity() -> None:
     manager.bot_pool.record_successful_auxiliary_send("slave-a", 10)
     manager.bot_pool.record_successful_auxiliary_send("slave-b", 10)
 
-    manager.remove_confirmed_non_member_affinity(_task(slave_id="slave-a"), "10")
+    task = _task(slave_id="slave-a")
+    manager.record_queued_failure(task, Exception("membership probe pending"), SenderSelection(first.bot, "10"))
+    manager.remove_confirmed_non_member_affinity_for_sender_chat("10", task.telegram_chat_id)
 
     assert manager.bot_pool.preferred_sender("slave-a") is None
     assert manager.bot_pool.preferred_sender("slave-b") is first
