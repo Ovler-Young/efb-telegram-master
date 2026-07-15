@@ -6,7 +6,6 @@ import threading
 import pytest
 
 from efb_telegram_master.outbound import (
-    ExecutorSubmitError,
     InvalidQueuedPayloadError,
     OutboundQueue,
     OutboundQueueScheduler,
@@ -147,9 +146,16 @@ def test_multi_call_is_atomic_ordered_and_returns_only_first_waiter(tmp_path):
     assert not waiter.done()
 
 
+class CompletionDecision:
+    def __init__(self, kind, retry_at=None):
+        self.kind = kind
+        self.retry_at = retry_at
+
+
 class Adapter:
-    def __init__(self, block=False):
+    def __init__(self, block=False, acquire=True):
         self.block = block
+        self.acquire = acquire
         self.started = threading.Event()
         self.release = threading.Event()
         self.calls = []
@@ -158,7 +164,7 @@ class Adapter:
         return SenderSelectionResult(selection=SenderSelection(object(), None))
 
     def acquire_sender_limits(self, selection, telegram_chat_id):
-        return True
+        return self.acquire
 
     def execute_queued_call(self, row, args, kwargs, selection):
         self.calls.append((row.id, row.telegram_chat_id, row.operation))
@@ -171,7 +177,7 @@ class Adapter:
         raise AssertionError(f"unexpected failure: {error}")
 
     def record_queued_success(self, row, result, selection):
-        pass
+        return CompletionDecision("success")
 
 
 def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(tmp_path):
@@ -198,7 +204,9 @@ def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(t
 
 def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch):
     queue = OutboundQueue(tmp_path)
-    _row_id, waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "text"}))
+    _row_id, waiter = enqueue(queue, QueueRequest("send_message", (), {
+        "chat_id": 7, "text": "text", "_send_mode": "blocking"
+    }))
     adapter = Adapter()
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
@@ -208,6 +216,21 @@ def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch)
         with pytest.raises(Exception, match="deletion failed"):
             waiter.result()
         assert adapter.calls == []
+
+
+def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path, monkeypatch):
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 8, "text": "text"}))
+    adapter = Adapter(acquire=False)
+    scheduler = OutboundQueueScheduler(queue, adapter, ThreadPoolExecutor(max_workers=1), worker_count=1)
+    monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: 10.0)
+
+    scheduler.dispatch_once()
+
+    assert [row.id for row in queue.heads()] == [row_id]
+    assert not waiter.done()
+    assert scheduler.next_deadline == 10.25
+    assert adapter.calls == []
 
 
 def test_shutdown_keeps_queued_row_and_fails_abandoned_waiter(tmp_path):
