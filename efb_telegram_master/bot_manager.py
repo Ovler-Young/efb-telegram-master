@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import collections.abc
+from enum import Enum
 import html
 import io
 import logging
@@ -49,6 +50,20 @@ from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
 BotChatKey: TypeAlias = Tuple[Optional[str], int]
+
+
+class QueuedCompletionKind(str, Enum):
+    RETRY_EVENTUAL = "retry_eventual"
+    TERMINAL_FAILURE = "terminal_failure"
+    SUCCESS = "success"
+
+
+@dataclass(frozen=True)
+class QueuedCompletionDecision:
+    """The scheduler-facing terminal state for one completed queued call."""
+
+    kind: QueuedCompletionKind
+    retry_at: Optional[float] = None
 
 
 class QueuedDbLogContext(NamedTuple):
@@ -1209,21 +1224,46 @@ class TelegramBotManager(LocaleMixin):
         method = getattr(selection.sender, row.operation)
         return method(*args, **kwargs)
 
-    def record_queued_success(self, row, result: object, selection: SenderSelection) -> None:
+    def record_queued_success(
+        self, row, result: object, selection: SenderSelection
+    ) -> QueuedCompletionDecision:
+        if row.priority == 0:
+            self._bot_chat_retry_failures.pop((selection.sender_bot_id, row.telegram_chat_id), None)
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
+        return QueuedCompletionDecision(QueuedCompletionKind.SUCCESS)
 
-    def record_queued_failure(self, row, error: BaseException, selection: SenderSelection) -> None:
+    def record_queued_failure(
+        self, row, error: BaseException, selection: SenderSelection
+    ) -> QueuedCompletionDecision:
+        key = (selection.sender_bot_id, row.telegram_chat_id)
         if selection.sender_bot_id is not None and row.slave_id:
             affinities = getattr(self, "_membership_failure_affinities", None)
             if affinities is None:
                 affinities = self._membership_failure_affinities = {}
-            affinities.setdefault((selection.sender_bot_id, row.telegram_chat_id), set()).add(row.slave_id)
+            affinities.setdefault(key, set()).add(row.slave_id)
+
+        if row.priority == 0 and isinstance(error, telegram.error.RetryAfter):
+            retry_after = self._retry_after_seconds(error)
+            failure_count = self._bot_chat_retry_failures.get(key, 0) + 1
+            self._bot_chat_retry_failures[key] = failure_count
+            delay = retry_after + self.TELEGRAM_RETRY_AFTER_GRACE_SECONDS
+            if failure_count >= 2:
+                delay = max(
+                    delay,
+                    self.TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS * 2 ** (failure_count - 2),
+                )
+            delay = min(delay, self.TELEGRAM_RETRY_AFTER_BACKOFF_CAP_SECONDS)
+            retry_at = time.monotonic() + delay
+            self._bot_chat_disabled_until[key] = retry_at
+            return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
+
         retry_after = self._rate_limit_retry_after_seconds(cast(Exception, error))
         if retry_after is not None:
-            self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = (
-                time.monotonic() + retry_after
-            )
+            self._bot_chat_disabled_until[key] = time.monotonic() + retry_after
+        if row.priority == 0:
+            self._bot_chat_retry_failures.pop(key, None)
+        return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
     def remove_confirmed_non_member_affinity_for_sender_chat(
         self, sender_bot_id: str, telegram_chat_id: int
@@ -1250,15 +1290,19 @@ class TelegramBotManager(LocaleMixin):
             self.logger.debug("Outbound queue worker stopped")
 
     @staticmethod
-    def _rate_limit_retry_after_seconds(error: Exception) -> Optional[float]:
+    def _retry_after_seconds(error: telegram.error.RetryAfter) -> float:
+        retry_after_value = error.retry_after
+        if isinstance(retry_after_value, timedelta):
+            return retry_after_value.total_seconds()
+        return float(retry_after_value)
+
+    @classmethod
+    def _rate_limit_retry_after_seconds(cls, error: Exception) -> Optional[float]:
         if isinstance(error, telegram.error.RetryAfter):
-            retry_after_value = error.retry_after
-            if isinstance(retry_after_value, timedelta):
-                return retry_after_value.total_seconds()
-            return float(retry_after_value)
+            return cls._retry_after_seconds(error)
         response = getattr(getattr(error, "__cause__", None), "response", None)
         if getattr(response, "status_code", None) == 429:
-            return 60.0
+            return cls.TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS
         for error_text in (getattr(error, "message", None), str(error)):
             if not error_text:
                 continue
@@ -1270,7 +1314,7 @@ class TelegramBotManager(LocaleMixin):
             if retry_after_match:
                 return float(retry_after_match.group(1))
             if re.search(r"Too Many Requests|\b429\b|Flood", error_text, re.IGNORECASE):
-                return 60.0
+                return cls.TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS
         return None
 
     def _run_database_update_callback(self, on_complete: Optional[Callable[[], None]]):

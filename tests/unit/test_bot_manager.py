@@ -219,6 +219,45 @@ def test_default_connection_pool_size_uses_worker_count_multiplier(monkeypatch):
     assert TelegramBotManager._default_connection_pool_size({}) == 4
 
 
+def test_queued_failure_decision_retries_only_eventual_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_disabled_until = {("10", 100): 1_111.0}
+    manager._bot_chat_retry_failures = {("10", 100): 2}
+    manager.bot_pool = None
+    task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
+    selection = SimpleNamespace(sender_bot_id="10")
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 1_000.0)
+
+    retry = manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+    assert retry.kind.name == "RETRY_EVENTUAL"
+    assert retry.retry_at == 1_120.0
+    assert manager._bot_chat_retry_failures == {("10", 100): 3}
+
+    blocking = manager.record_queued_failure(
+        SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=1),
+        telegram.error.RetryAfter(20),
+        selection,
+    )
+    assert blocking.kind.name == "TERMINAL_FAILURE"
+    assert manager._bot_chat_retry_failures == {("10", 100): 3}
+
+
+def test_terminal_eventual_failure_clears_streak_without_clearing_cooldown() -> None:
+    manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_disabled_until = {("10", 100): 1_025.0}
+    manager._bot_chat_retry_failures = {("10", 100): 1}
+    manager.bot_pool = None
+    task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
+
+    decision = manager.record_queued_failure(task, Exception("send failed"), SimpleNamespace(sender_bot_id="10"))
+
+    assert decision.kind.name == "TERMINAL_FAILURE"
+    assert manager._bot_chat_retry_failures == {}
+    assert manager._bot_chat_disabled_until == {("10", 100): 1_025.0}
+
+
 def test_rate_limit_decorator_queues_new_message_without_required_sender():
     manager = _make_queueing_manager()
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(send_message)

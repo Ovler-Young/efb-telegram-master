@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import telegram.error
 
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.bot_pool import BotPool
@@ -39,15 +40,23 @@ def _manager(*auxiliaries: Mock) -> TelegramBotManager:
     manager._bot = object()
     manager._rate_limiter = Limiter()
     manager._bot_chat_disabled_until = {}
+    manager._bot_chat_retry_failures = {}
     manager.bot_pool = BotPool(list(auxiliaries), manager) if auxiliaries else None
     return manager
 
 
-def _task(*, required_sender_bot_id: str | None = None, slave_id: str | None = None) -> SimpleNamespace:
+def _task(
+    *,
+    required_sender_bot_id: str | None = None,
+    slave_id: str | None = None,
+    chat_id: int = 100,
+    priority: int = 0,
+) -> SimpleNamespace:
     return SimpleNamespace(
-        telegram_chat_id=100,
+        telegram_chat_id=chat_id,
         required_sender_bot_id=required_sender_bot_id,
         slave_id=slave_id,
+        priority=priority,
     )
 
 
@@ -155,3 +164,53 @@ def test_confirmed_non_member_removes_only_the_triggering_affinity() -> None:
 
     assert manager.bot_pool.preferred_sender("slave-a") is None
     assert manager.bot_pool.preferred_sender("slave-b") is first
+
+
+def test_eventual_retry_after_uses_exact_sender_chat_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _manager()
+    task = _task()
+    selection = SenderSelection(object(), "10")
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", _now)
+
+    first = manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+    second = manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+    third = manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+    capped = manager.record_queued_failure(task, telegram.error.RetryAfter(1_000), selection)
+
+    assert [decision.retry_at for decision in (first, second, third, capped)] == [
+        1_025.0,
+        1_060.0,
+        1_120.0,
+        1_900.0,
+    ]
+    assert manager._bot_chat_retry_failures == {("10", 100): 4}
+
+
+def test_retry_after_cooldown_leaves_another_sender_for_the_same_chat_selectable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _auxiliary(10)
+    second = _auxiliary(20)
+    manager = _manager(first, second)
+    manager._rate_limiter.delay = 30.0
+    task = _task()
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", _now)
+
+    manager.record_queued_failure(task, telegram.error.RetryAfter(20), SenderSelection(first.bot, "10"))
+    selection = manager.select_sender(task, _now())
+
+    assert manager._bot_chat_retry_failures == {("10", 100): 1}
+    assert selection.selection is not None
+    assert selection.selection.sender_bot_id == "20"
+
+
+def test_eventual_success_resets_only_its_sender_chat_retry_streak() -> None:
+    manager = _manager()
+    first = _task(chat_id=100)
+    second = _task(chat_id=200)
+    manager._bot_chat_retry_failures = {("10", 100): 3, ("10", 200): 2}
+
+    decision = manager.record_queued_success(first, object(), SenderSelection(object(), "10"))
+
+    assert decision.kind.name == "SUCCESS"
+    assert manager._bot_chat_retry_failures == {("10", 200): 2}
