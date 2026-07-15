@@ -19,7 +19,6 @@ from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 from efb_telegram_master.outbound import (
-    ExecutorSubmitError,
     InvalidQueuedPayloadError,
     OutboundQueue,
     OutboundQueueScheduler,
@@ -57,6 +56,12 @@ class ControlledExecutor:
         return future
 
 
+@dataclass(frozen=True)
+class CompletionDecision:
+    kind: str
+    retry_at: float | None = None
+
+
 class AlwaysAvailableLimiter:
     def try_acquire(self, _chat_id: int) -> bool:
         return True
@@ -86,6 +91,7 @@ def manager_adapter() -> TelegramBotManager:
     manager._bot = object()
     manager._rate_limiter = AlwaysAvailableLimiter()
     manager._bot_chat_disabled_until = {}
+    manager._bot_chat_retry_failures = {}
     manager.bot_pool = None
     return manager
 
@@ -97,7 +103,7 @@ def test_membership_publication_not_telegram_failure_removes_only_triggering_aff
     manager.bot_pool = BotPool([auxiliary], manager)
     manager.bot_pool.record_successful_auxiliary_send("slave-a", 17)
     manager.bot_pool.record_successful_auxiliary_send("slave-b", 17)
-    row = SimpleNamespace(telegram_chat_id=211, slave_id="slave-a")
+    row = SimpleNamespace(telegram_chat_id=211, slave_id="slave-a", priority=0)
     selection = SenderSelection(auxiliary.bot, "17")
 
     manager.record_queued_failure(row, TelegramError("send failed"), selection)
@@ -199,6 +205,7 @@ def test_enqueue_commit_finishing_under_scheduler_lock_precedes_shutdown(
 class RecordingAdapter:
     retry_at: float | None = None
     terminal: bool = False
+    failure_decision: CompletionDecision = CompletionDecision("terminal_failure")
 
     def __post_init__(self) -> None:
         self.failures: list[tuple[object, BaseException]] = []
@@ -219,11 +226,17 @@ class RecordingAdapter:
         self.executed.append(row.id)
         return row.id
 
-    def record_queued_failure(self, row, error: BaseException, _selection: SenderSelection) -> None:
+    def record_queued_failure(
+        self, row, error: BaseException, _selection: SenderSelection
+    ) -> CompletionDecision:
         self.failures.append((row, error))
+        return self.failure_decision
 
-    def record_queued_success(self, row, result: object, _selection: SenderSelection) -> None:
+    def record_queued_success(
+        self, row, result: object, _selection: SenderSelection
+    ) -> CompletionDecision:
         self.successes.append((row, result))
+        return CompletionDecision("success")
 
 
 @pytest.fixture
@@ -235,10 +248,10 @@ def retained_queue(tmp_path: Path) -> OutboundQueue:
     restarted.close()
 
 
-def test_retry_after_failure_does_not_reenqueue_and_defers_only_later_sender_chat_work(
+def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo(
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A RetryAfter is a completed failure, while later work observes its cooldown."""
+    """A RetryAfter keeps its original durable row until a later success."""
     first_id, first_waiter = enqueue(retained_queue, 41, "first")
     second_id, second_waiter = enqueue(retained_queue, 41, "second")
     executor = ControlledExecutor()
@@ -247,30 +260,109 @@ def test_retry_after_failure_does_not_reenqueue_and_defers_only_later_sender_cha
 
     clock = {"now": 100.0}
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+    first_row = next(row for row in retained_queue.heads() if row.id == first_id)
+    first_snapshot = (first_row.id, first_row.priority, first_row.payload, first_row.created_at)
+    second_snapshot = retained_queue.connection.execute(
+        "SELECT id, priority, payload, created_at FROM outbound_queue WHERE id = ?", (second_id,)
+    ).fetchone()
     scheduler.dispatch_once()
-    assert [row.id for row in retained_queue.heads()] == [second_id]
+    assert [row.id for row in retained_queue.heads()] == [first_id]
     assert len(executor.submissions) == 1
 
     retry_after = RetryAfter(10)
     executor.submissions[0][2].set_exception(retry_after)
     scheduler.harvest_completed()
     assert scheduler.wake_event.is_set()
-    with pytest.raises(RetryAfter):
-        first_waiter.result()
+    assert not first_waiter.done()
     assert not first_waiter.cancelled()
     assert not second_waiter.done()
+    rows_after_retry = retained_queue.connection.execute(
+        "SELECT id, priority, payload, created_at FROM outbound_queue ORDER BY id"
+    ).fetchall()
+    assert rows_after_retry == [first_snapshot, second_snapshot]
 
-    # The manager records the deadline during failure harvest.  The next pass
-    # must retain the later row until it expires rather than dispatching it.
+    # The original row remains the same-priority destination head during cooldown.
     scheduler.dispatch_once()
     assert len(executor.submissions) == 1
-    assert scheduler.next_deadline == 110.0
-    assert [row.id for row in retained_queue.heads()] == [second_id]
+    assert scheduler.next_deadline == 115.0
+    assert [row.id for row in retained_queue.heads()] == [first_id]
 
-    clock["now"] = 110.0
+    clock["now"] = 115.0
     scheduler.dispatch_once()
     assert len(executor.submissions) == 2
-    assert first_id not in {row.id for row in retained_queue.heads()}
+    assert executor.submissions[1][1][0].id == first_id
+    assert [row.id for row in retained_queue.heads()] == [first_id]
+
+    executor.submissions[1][2].set_result("sent")
+    scheduler.harvest_completed()
+    assert first_waiter.result() == "sent"
+    assert [row.id for row in retained_queue.heads()] == [second_id]
+
+
+def test_blocking_retry_after_is_terminal(retained_queue: OutboundQueue) -> None:
+    row_id, waiter = retained_queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": 67, "text": "blocking", "_send_mode": "blocking"})],
+        lambda _operation: send_message,
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, manager_adapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(10))
+    scheduler.harvest_completed()
+
+    with pytest.raises(RetryAfter):
+        waiter.result()
+    assert row_id not in {row.id for row in retained_queue.heads()}
+
+
+def test_later_blocking_row_overtakes_retained_normal_row_after_cooldown(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    eventual_id, _eventual_waiter = enqueue(retained_queue, 68, "eventual")
+    executor = ControlledExecutor()
+    adapter = manager_adapter()
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(10))
+    scheduler.harvest_completed()
+    blocking_id, blocking_waiter = retained_queue.enqueue_many(
+        [QueueRequest("send_message", (), {
+            "chat_id": 68, "text": "blocking", "_send_mode": "blocking"
+        })],
+        lambda _operation: send_message,
+    )
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    clock["now"] = 115.0
+    scheduler.dispatch_once()
+    assert executor.submissions[1][1][0].id == blocking_id
+
+    executor.submissions[1][2].set_result("blocking sent")
+    scheduler.harvest_completed()
+    assert blocking_waiter.result() == "blocking sent"
+    scheduler.dispatch_once()
+    assert executor.submissions[2][1][0].id == eventual_id
+
+
+def test_terminal_eventual_failure_removes_original_row(retained_queue: OutboundQueue) -> None:
+    row_id, waiter = enqueue(retained_queue, 69, "terminal")
+    executor = ControlledExecutor()
+    adapter = RecordingAdapter()
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    failure = TelegramError("terminal")
+    executor.submissions[0][2].set_exception(failure)
+    scheduler.harvest_completed()
+
+    with pytest.raises(TelegramError, match="terminal"):
+        waiter.result()
+    assert row_id not in {row.id for row in retained_queue.heads()}
 
 
 def test_submitted_future_completion_wakes_scheduler(retained_queue: OutboundQueue) -> None:
@@ -380,11 +472,10 @@ def test_dequeued_call_failures_release_destination_without_reenqueue(
     assert not second_waiter.done()
 
 
-def test_executor_submit_failure_loses_dequeued_row_and_releases_destination(
+def test_executor_submit_failure_retains_eventual_row_and_waiter(
     retained_queue: OutboundQueue,
 ) -> None:
     first_id, first_waiter = enqueue(retained_queue, 89, "first")
-    second_id, _second_waiter = enqueue(retained_queue, 89, "second")
     adapter = RecordingAdapter()
     scheduler = OutboundQueueScheduler(
         retained_queue, adapter, ControlledExecutor(RuntimeError("executor unavailable")), worker_count=1
@@ -392,15 +483,18 @@ def test_executor_submit_failure_loses_dequeued_row_and_releases_destination(
 
     scheduler.dispatch_once()
 
-    with pytest.raises(ExecutorSubmitError):
-        first_waiter.result()
-    assert first_id not in {row.id for row in retained_queue.heads()}
+    assert not first_waiter.done()
+    assert first_id in {row.id for row in retained_queue.heads()}
     assert 89 not in scheduler.in_flight_destinations
     assert scheduler.in_flight == {}
 
-    scheduler.executor = ControlledExecutor()
+    executor = ControlledExecutor()
+    scheduler.executor = executor
     scheduler.dispatch_once()
-    assert second_id in scheduler.in_flight
+    assert first_id in scheduler.in_flight
+    executor.submissions[0][2].set_result("sent")
+    scheduler.harvest_completed()
+    assert first_waiter.result() == "sent"
 
 
 class DeleteStatementFailureConnection(sqlite3.Connection):
@@ -457,18 +551,20 @@ def test_delete_failures_rollback_fail_stop_and_retain_sqlite_file(
     scheduler = OutboundQueueScheduler(queue, RecordingAdapter(), executor, worker_count=2)
 
     scheduler.dispatch_once()
+    executor.submissions[0][2].set_result("sent")
+    scheduler.harvest_completed()
 
     assert scheduler.stopping
     assert isinstance(scheduler.failure, QueuePersistenceError)
     assert connection_type.rollbacks >= 1
     assert queue.path.exists()
-    assert executor.submissions == []
+    assert len(executor.submissions) == 2
     for waiter in (first_waiter, second_waiter):
         with pytest.raises(QueuePersistenceError):
             waiter.result()
     assert not queue.waiters
     scheduler.dispatch_once()
-    assert executor.submissions == []
+    assert len(executor.submissions) == 2
     assert first_id in {row.id for row in queue.heads()}
     queue.close()
 
@@ -524,7 +620,7 @@ def test_invalid_payload_is_terminally_discarded_without_worker_or_sender_acquis
     assert scheduler.in_flight == {}
 
 
-def test_shutdown_final_snapshot_abandons_only_dequeued_work_and_keeps_later_row(
+def test_shutdown_final_snapshot_keeps_retained_eventual_rows(
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first_id, first_waiter = enqueue(retained_queue, 173, "first")
@@ -554,7 +650,9 @@ def test_shutdown_final_snapshot_abandons_only_dequeued_work_and_keeps_later_row
     assert not retained_queue.waiters
     assert first_id not in scheduler.in_flight
     assert 173 not in scheduler.in_flight_destinations
-    assert [row.id for row in retained_queue.heads()] == [second_id]
+    assert [row[0] for row in retained_queue.connection.execute(
+        "SELECT id FROM outbound_queue ORDER BY id"
+    ).fetchall()] == [first_id, second_id]
 
     executor.submissions[0][2].set_result("late")
     scheduler.harvest_completed()
