@@ -50,19 +50,8 @@ jobs:
         mypy -p efb_telegram_master --ignore-missing-imports
     - name: Test with pytest on commits
       if: ${{ github.event_name == 'push' }}
-      env:
-        TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
-        GROUPS: ${{ secrets.TELEGRAM_GROUPS }}
-        CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
-        TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
-        AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
-        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
-        USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
-        API_ID: ${{ secrets.TELEGRAM_API_ID }}
-        API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       run: |
-        pytest -vv -r a -l --color=yes
+        pytest -vv -r a -l --color=yes --mode=unit
     - name: Test with pytest on pull requests
       if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
       env:
