@@ -267,7 +267,10 @@ class OutboundQueue:
                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (priority, chat_id, operation, payload, slave_id, required_sender, now),
                     )
-                    identifiers.append(int(cursor.lastrowid))
+                    identifier = cursor.lastrowid
+                    if identifier is None:
+                        raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
+                    identifiers.append(identifier)
                 self.connection.commit()
             except Exception as error:
                 try:

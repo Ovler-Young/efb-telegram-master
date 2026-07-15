@@ -7,6 +7,7 @@ import collections.abc
 import html
 import io
 import logging
+import numbers
 import os
 import re
 import threading
@@ -369,11 +370,12 @@ class TelegramBotManager(LocaleMixin):
                 if send_mode not in {'blocking', 'eventual'}:
                     raise QueueEnqueueError("_send_mode must be 'blocking' or 'eventual'.")
 
-                chat_id = None
+                chat_id: object = None
                 if args:
                     chat_id = args[0]
                 elif 'chat_id' in kwargs:
                     chat_id = kwargs['chat_id']
+                normalized_chat_id = self._normalize_telegram_chat_id(chat_id)
                 has_callback = _has_callback_keyboard(kwargs.get('reply_markup'))
                 cleanup_tls = getattr(self, '_cleanup_tls', None)
                 cleanup_files = getattr(cleanup_tls, 'pending_cleanup', [])[:]
@@ -383,7 +385,7 @@ class TelegramBotManager(LocaleMixin):
                 if send_mode == 'eventual' and slave_id and not is_edit_method and not has_callback:
                     return self._enqueue_eventual_send(
                         str(slave_id),
-                        chat_id,
+                        normalized_chat_id,
                         fn,
                         (self,) + args,
                         kwargs,
@@ -400,7 +402,7 @@ class TelegramBotManager(LocaleMixin):
 
                 return self._enqueue_blocking_send_and_wait(
                     str(slave_id) if slave_id else None,
-                    chat_id,
+                    normalized_chat_id,
                     fn,
                     (self,) + args,
                     blocking_kwargs,
@@ -619,9 +621,8 @@ class TelegramBotManager(LocaleMixin):
         self._bot_chat_retry_failures: dict[BotChatKey, int] = {}
         self._last_metrics_snapshot = 0.0
         from .etm_metrics import Metrics, start_metrics_server
-        metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
-        self._metrics = Metrics(namespace="etm", top_n=metrics_top_n)
-        self._metrics.register_manager_state(self)
+        _metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
+        self._metrics = Metrics(namespace="etm")
         self._metrics_httpd = None
         if metrics_endpoint is not None:
             metrics_host, metrics_port = metrics_endpoint
@@ -898,6 +899,12 @@ class TelegramBotManager(LocaleMixin):
         )
 
     @staticmethod
+    def _normalize_telegram_chat_id(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise QueueEnqueueError("chat_id must be a non-Boolean integral value.")
+        return int(value)
+
+    @staticmethod
     def _parse_metrics_config(metrics_cfg: object, logger) -> tuple[int, Optional[tuple[str, int]]]:
         top_n = 20
         if metrics_cfg is None:
@@ -1122,7 +1129,9 @@ class TelegramBotManager(LocaleMixin):
         self, operation: str, args: tuple, kwargs: Mapping[str, object]
     ) -> object:
         return self._enqueue_blocking_api_operation(
-            target_chat_id=int(args[0] if args else kwargs["chat_id"]),
+            target_chat_id=self._normalize_telegram_chat_id(
+                args[0] if args else kwargs["chat_id"]
+            ),
             operation=operation,
             args=args,
             kwargs=kwargs,
