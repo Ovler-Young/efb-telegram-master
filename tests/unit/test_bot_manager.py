@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import string
 import random
 import threading
@@ -11,7 +12,7 @@ import pytest
 import telegram.error
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
+from efb_telegram_master.bot_manager import SendReceipt, SyncBotFacade, TelegramBotManager
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 
 
@@ -43,6 +44,18 @@ def _bind_db_update_helpers(manager):
         TelegramBotManager,
     )
     return manager
+
+
+def test_sync_bot_facade_preserves_telegram_method_signature():
+    async def send_message(chat_id, text):
+        return chat_id, text
+
+    facade = SyncBotFacade(SimpleNamespace(send_message=send_message), Mock())
+
+    assert inspect.signature(facade.send_message).bind(42, "message").arguments == {
+        "chat_id": 42,
+        "text": "message",
+    }
 
 
 def test_text_prefix_suffix(channel, bot_admin):

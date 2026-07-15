@@ -244,6 +244,7 @@ class SyncBotFacade:
         if not callable(attr):
             raise AttributeError(f"{type(self._bot).__name__}.{item} is not callable")
 
+        @wraps(attr)
         def wrapper(*args: object, **kwargs: object) -> object:
             return self._runtime.call(cast(Coroutine[object, object, object], attr(*args, **kwargs)))
 
