@@ -600,11 +600,12 @@ def test_stop_worker_join_covers_outbound_drain_deadline():
     assert join_timeout > manager.SHUTDOWN_DRAIN_TIMEOUT
 
 
-def test_stop_worker_finalizes_resources_once_after_observing_late_worker_exit():
+def test_worker_finalizes_resources_once_after_stop_join_timeout():
     manager = object.__new__(TelegramBotManager)
     manager.logger = Mock()
     manager._send_worker_stop = threading.Event()
     manager._outbound_scheduler = SimpleNamespace(
+        stopping=True,
         stop_and_drain=Mock(),
         wake_event=threading.Event(),
     )
@@ -613,21 +614,25 @@ def test_stop_worker_finalizes_resources_once_after_observing_late_worker_exit()
     manager._outbound_finalization_lock = threading.Lock()
     manager._outbound_resources_finalized = False
     manager._send_worker_thread = Mock()
-    manager._send_worker_thread.is_alive.side_effect = [True, True, False, False]
+    manager._send_worker_thread.is_alive.side_effect = [True, True, False]
 
     manager.stop_queued_worker()
 
     manager._send_executor.shutdown.assert_not_called()
     manager._outbound_queue.close.assert_not_called()
 
-    manager.stop_queued_worker()
+    manager._queued_send_worker()
+
+    manager._send_executor.shutdown.assert_called_once_with(wait=False)
+    manager._outbound_queue.close.assert_called_once_with()
+
     manager.stop_queued_worker()
 
     manager._send_executor.shutdown.assert_called_once_with(wait=False)
     manager._outbound_queue.close.assert_called_once_with()
 
 
-def test_queued_worker_does_not_finalize_outbound_resources():
+def test_queued_worker_finalizes_resources_after_stop_timeout():
     manager = object.__new__(TelegramBotManager)
     manager.logger = Mock()
     manager._send_worker_stop = threading.Event()
@@ -637,12 +642,14 @@ def test_queued_worker_does_not_finalize_outbound_resources():
     )
     manager._send_executor = Mock()
     manager._outbound_queue = Mock()
+    manager._outbound_finalization_lock = threading.Lock()
+    manager._outbound_resources_finalized = False
 
     manager._queued_send_worker()
 
     manager._outbound_scheduler.stop_and_drain.assert_called_once_with(manager.SHUTDOWN_DRAIN_TIMEOUT)
-    manager._send_executor.shutdown.assert_not_called()
-    manager._outbound_queue.close.assert_not_called()
+    manager._send_executor.shutdown.assert_called_once_with(wait=False)
+    manager._outbound_queue.close.assert_called_once_with()
 
 
 def test_parse_metrics_config_defaults_and_disables_invalid_endpoint_options():

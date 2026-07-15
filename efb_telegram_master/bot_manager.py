@@ -1236,15 +1236,18 @@ class TelegramBotManager(LocaleMixin):
 
     def _queued_send_worker(self):
         self.logger.debug("Outbound queue worker started")
-        while not self._send_worker_stop.is_set() and not self._outbound_scheduler.stopping:
-            self._outbound_scheduler.harvest_completed()
-            self._outbound_scheduler.dispatch_once()
-            deadline = self._outbound_scheduler.next_deadline
-            timeout = 0.25 if deadline is None else max(0.0, min(0.25, deadline - time.monotonic()))
-            self._outbound_scheduler.wake_event.wait(timeout=timeout)
-            self._outbound_scheduler.wake_event.clear()
-        self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
-        self.logger.debug("Outbound queue worker stopped")
+        try:
+            while not self._send_worker_stop.is_set() and not self._outbound_scheduler.stopping:
+                self._outbound_scheduler.harvest_completed()
+                self._outbound_scheduler.dispatch_once()
+                deadline = self._outbound_scheduler.next_deadline
+                timeout = 0.25 if deadline is None else max(0.0, min(0.25, deadline - time.monotonic()))
+                self._outbound_scheduler.wake_event.wait(timeout=timeout)
+                self._outbound_scheduler.wake_event.clear()
+        finally:
+            self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
+            self._finalize_outbound_resources()
+            self.logger.debug("Outbound queue worker stopped")
 
     @staticmethod
     def _rate_limit_retry_after_seconds(error: Exception) -> Optional[float]:
