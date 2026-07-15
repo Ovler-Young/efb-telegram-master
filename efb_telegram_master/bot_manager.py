@@ -615,6 +615,7 @@ class TelegramBotManager(LocaleMixin):
 
         self._send_worker_stop = threading.Event()
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
+        self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
         self._bot_chat_retry_failures: dict[BotChatKey, int] = {}
         self._last_metrics_snapshot = 0.0
         from .etm_metrics import Metrics, start_metrics_server
@@ -1132,7 +1133,7 @@ class TelegramBotManager(LocaleMixin):
         chat_id = row.telegram_chat_id
         required = row.required_sender_bot_id
         if required == "__main__":
-            return SenderSelectionResult(selection=SenderSelection(self._bot, None))
+            return self._select_available_sender(SenderSelection(self._bot, None), chat_id, now)
         if required is not None:
             auxiliary = self.bot_pool.get_bot_by_id(required) if self.bot_pool else None
             if auxiliary is None or auxiliary.disabled:
@@ -1142,24 +1143,68 @@ class TelegramBotManager(LocaleMixin):
                 return SenderSelectionResult(retry_at=now + self.MEMBERSHIP_RECHECK_SECONDS)
             if membership is not True:
                 return SenderSelectionResult(terminal_error_class="required_sender_unavailable")
-            return SenderSelectionResult(selection=SenderSelection(auxiliary.bot, str(auxiliary.bot_id)))
+            return self._select_available_sender(
+                SenderSelection(auxiliary.bot, str(auxiliary.bot_id)), chat_id, now
+            )
 
-        candidates: list[SenderSelection] = [SenderSelection(self._bot, None)]
-        unknown_auxiliary = False
+        candidates: list[tuple[int, str, SenderSelection, float]] = []
+        main_selection = SenderSelection(self._bot, None)
+        main_result = self._select_available_sender(main_selection, chat_id, now)
+        if main_result.selection is not None:
+            candidates.append((1, "", main_selection, now))
+        elif main_result.retry_at is not None:
+            candidates.append((1, "", main_selection, main_result.retry_at))
+
+        membership_retry_at: Optional[float] = None
         if self.bot_pool:
             for auxiliary, membership in self.bot_pool.candidate_bots(chat_id):
                 if membership is None:
-                    unknown_auxiliary = True
+                    retry_at = now + self.MEMBERSHIP_RECHECK_SECONDS
+                    membership_retry_at = (
+                        retry_at
+                        if membership_retry_at is None
+                        else min(membership_retry_at, retry_at)
+                    )
                 elif membership:
-                    candidates.append(SenderSelection(auxiliary.bot, str(auxiliary.bot_id)))
-        if unknown_auxiliary:
-            return SenderSelectionResult(retry_at=now + self.MEMBERSHIP_RECHECK_SECONDS)
-        preferred = self.bot_pool.preferred_sender(row.slave_id) if self.bot_pool and row.slave_id else None
-        if preferred is not None:
-            for candidate in candidates:
-                if candidate.sender_bot_id == str(preferred.bot_id):
-                    return SenderSelectionResult(selection=candidate)
-        return SenderSelectionResult(selection=min(candidates, key=lambda item: item.sender_bot_id or ""))
+                    selection = SenderSelection(auxiliary.bot, str(auxiliary.bot_id))
+                    candidate_result = self._select_available_sender(selection, chat_id, now)
+                    if candidate_result.selection is not None:
+                        deadline = now
+                    elif candidate_result.retry_at is not None:
+                        deadline = candidate_result.retry_at
+                    else:
+                        continue
+                    preferred = self.bot_pool.preferred_sender(row.slave_id) if row.slave_id else None
+                    affinity_rank = 0 if preferred is auxiliary else 2
+                    candidates.append((affinity_rank, str(auxiliary.bot_id), selection, deadline))
+        if membership_retry_at is not None:
+            return SenderSelectionResult(retry_at=membership_retry_at)
+
+        selectable = [candidate for candidate in candidates if candidate[3] <= now]
+        if selectable:
+            _rank, _bot_id, selection, _deadline = min(selectable, key=lambda candidate: candidate[:2])
+            return SenderSelectionResult(selection=selection)
+        retry_deadlines = [candidate[3] for candidate in candidates]
+        if retry_deadlines:
+            return SenderSelectionResult(retry_at=min(retry_deadlines))
+        return SenderSelectionResult(retry_at=now + self.MEMBERSHIP_RECHECK_SECONDS)
+
+    def _select_available_sender(
+        self, selection: SenderSelection, chat_id: int, now: float
+    ) -> SenderSelectionResult:
+        cooldown_until = self._bot_chat_disabled_until.get((selection.sender_bot_id, chat_id), 0.0)
+        limiter_delay = self._sender_limiter_delay(selection, chat_id)
+        retry_at = max(cooldown_until, now + limiter_delay)
+        if retry_at > now:
+            return SenderSelectionResult(retry_at=retry_at)
+        return SenderSelectionResult(selection=selection)
+
+    def _sender_limiter_delay(self, selection: SenderSelection, chat_id: int) -> float:
+        if selection.sender_bot_id is None:
+            peek_delay = getattr(self._rate_limiter, "peek_delay", None)
+            return 0.0 if peek_delay is None else float(peek_delay(chat_id))
+        auxiliary = self.bot_pool.get_bot_by_id(selection.sender_bot_id) if self.bot_pool else None
+        return 0.0 if auxiliary is None else float(auxiliary.peek_delay(chat_id))
 
     def acquire_sender_limits(self, selection: SenderSelection, telegram_chat_id: int) -> bool:
         if selection.sender_bot_id is None:
@@ -1176,11 +1221,25 @@ class TelegramBotManager(LocaleMixin):
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
 
     def record_queued_failure(self, row, error: BaseException, selection: SenderSelection) -> None:
+        if selection.sender_bot_id is not None and row.slave_id:
+            affinities = getattr(self, "_membership_failure_affinities", None)
+            if affinities is None:
+                affinities = self._membership_failure_affinities = {}
+            affinities.setdefault((selection.sender_bot_id, row.telegram_chat_id), set()).add(row.slave_id)
         retry_after = self._rate_limit_retry_after_seconds(cast(Exception, error))
         if retry_after is not None:
             self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = (
                 time.monotonic() + retry_after
             )
+
+    def remove_confirmed_non_member_affinity_for_sender_chat(
+        self, sender_bot_id: str, telegram_chat_id: int
+    ) -> None:
+        affinities = getattr(self, "_membership_failure_affinities", {})
+        slave_ids = affinities.pop((sender_bot_id, telegram_chat_id), set())
+        if self.bot_pool:
+            for slave_id in slave_ids:
+                self.bot_pool.remove_failed_membership_affinity(slave_id, sender_bot_id)
 
     def _queued_send_worker(self):
         self.logger.debug("Outbound queue worker started")

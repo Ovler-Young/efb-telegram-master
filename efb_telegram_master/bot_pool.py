@@ -75,9 +75,13 @@ class BotPool:
         self._lock = threading.Lock()
         self._preferred_sender_by_slave_id: dict[str, int] = {}
         for bot in self._bots:
-            bot._membership_changed_callback = self._wake_scheduler
+            bot._membership_changed_callback = self._membership_changed
 
-    def _wake_scheduler(self) -> None:
+    def _membership_changed(self, bot: AuxiliaryBot, chat_id: int, is_member: bool) -> None:
+        if not is_member:
+            self._bot_manager.remove_confirmed_non_member_affinity_for_sender_chat(
+                str(bot.bot_id), chat_id
+            )
         scheduler = getattr(self._bot_manager, "_outbound_scheduler", None)
         wake_event = getattr(scheduler, "wake_event", None)
         if wake_event is not None:

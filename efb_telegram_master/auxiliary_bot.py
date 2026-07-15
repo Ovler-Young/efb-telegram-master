@@ -79,7 +79,7 @@ class AuxiliaryBot:
         self._membership_lock = threading.Lock()
         self._pending_probes: set[int] = set()
         self._metrics = None
-        self._membership_changed_callback: Optional[Callable[[], None]] = None
+        self._membership_changed_callback: Optional[Callable[['AuxiliaryBot', int, bool], None]] = None
 
     def _create_bot(self) -> telegram.Bot:
         request = self._build_request() if self._request_kwargs else None
@@ -220,7 +220,7 @@ class AuxiliaryBot:
         with self._membership_lock:
             self._membership_cache[chat_id] = (is_member, time.time())
         if self._membership_changed_callback is not None:
-            self._membership_changed_callback()
+            self._membership_changed_callback(self, chat_id, is_member)
 
     def _start_membership_probe(self, chat_id: int) -> None:
         """Start a background thread to check membership via get_chat_member API."""
