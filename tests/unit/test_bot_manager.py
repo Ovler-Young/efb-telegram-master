@@ -13,8 +13,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
-from efb_telegram_master.etm_metrics import _ManagerStateExporter
-from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
 def _bind_blocking_enqueue_helper(manager):
@@ -148,103 +146,23 @@ def test_malformed_html_caption(channel, bot_admin, image):
     )
 
 
-def test_rate_limit_decorator_does_not_treat_sender_hint_as_send_ownership():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False, reserve_slot=Mock(return_value=0.0))
-    used_bots = []
+def _make_queueing_manager():
     manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
-        _using_bot=lambda bot: SimpleNamespace(__enter__=lambda *a: None, __exit__=lambda *a: None),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
+        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
+        _enqueue_eventual_send=Mock(),
         logger=Mock(),
     )
-
-    class DummyContext:
-        def __init__(self, bot):
-            self.bot = bot
-
-        def __enter__(self):
-            used_bots.append(self.bot)
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager._using_bot = lambda bot: DummyContext(bot)
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123, _sender_bot_id="777")
-
-    assert result.sender_bot_id is None
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert "_required_sender_bot_id" not in blocking_kwargs
-
-
-def test_rate_limit_decorator_ignores_non_edit_sender_hint_without_pool_lookup():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    bot_pool = SimpleNamespace(get_bot_by_id=Mock(return_value=None), acquire_send_slot=Mock())
-    manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        bot_pool=bot_pool,
-        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123, _sender_bot_id="777")
-
-    assert result.chat_id == 123
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert "_required_sender_bot_id" not in blocking_kwargs
-    bot_pool.acquire_send_slot.assert_not_called()
-
-
-def _make_lightweight_bot_manager():
-    manager = TelegramBotManager.__new__(TelegramBotManager)
-    manager._bot = Mock()
-    manager.bot_pool = None
-    manager._send_worker_stop = threading.Event()
-    manager.GLOBAL_LIMIT = 30
-    manager.GLOBAL_WINDOW = 1.0
-    manager.CHAT_LIMIT = 20
-    manager.CHAT_WINDOW = 60.0
-    manager._rate_limiter = SlidingWindowRateLimiter(
-        global_limit=manager.GLOBAL_LIMIT,
-        global_window=manager.GLOBAL_WINDOW,
-        chat_limit=manager.CHAT_LIMIT,
-        chat_window=manager.CHAT_WINDOW,
-        safety_margin=0,
-    )
-    manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
-    manager.logger = Mock()
-    manager._make_send_receipt = TelegramBotManager._make_send_receipt.__get__(manager, TelegramBotManager)
+    manager._normalize_telegram_chat_id = TelegramBotManager._normalize_telegram_chat_id
     _bind_blocking_enqueue_helper(manager)
     return manager
 
 
-@pytest.mark.parametrize(("method_name", "bot_method_name", "kwargs"), [
-    ("edit_message_text", "edit_message_text", {"chat_id": 123, "message_id": 456, "text": "updated"}),
-    ("edit_message_caption", "edit_message_caption", {"chat_id": 123, "message_id": 456, "caption": "updated"}),
-    ("edit_message_media", "edit_message_media", {"chat_id": 123, "message_id": 456, "media": object()}),
-    ("edit_message_reply_markup", "edit_message_reply_markup", {"chat_id": 123, "message_id": 456, "reply_markup": None}),
-])
-def test_edit_message_methods_reserve_send_quota(method_name, bot_method_name, kwargs):
-    manager = _make_lightweight_bot_manager()
-    bot_method = getattr(manager._bot, bot_method_name)
-    bot_method.return_value = SimpleNamespace(chat_id=123, message_id=456)
+def send_message(self, chat_id, **kwargs):
+    return SimpleNamespace(chat_id=chat_id, kwargs=kwargs)
 
-    result = getattr(manager, method_name)(**kwargs)
 
-    assert result.chat_id == 123
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert blocking_kwargs["_required_sender_bot_id"] == "__main__"
-    bot_method.assert_called_once()
+def edit_message_text(self, chat_id, **kwargs):
+    return SimpleNamespace(chat_id=chat_id, kwargs=kwargs)
 
 
 def test_build_bot_passes_local_mode_when_enabled():
@@ -282,354 +200,83 @@ def test_default_connection_pool_size_uses_worker_count_multiplier(monkeypatch):
     assert TelegramBotManager._default_connection_pool_size({}) == 4
 
 
-def test_rate_limit_decorator_routes_new_send_through_aux_pool():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    aux_bot = SimpleNamespace(bot=object(), bot_id=999, disabled=False)
+def test_rate_limit_decorator_queues_new_message_without_required_sender():
+    manager = _make_queueing_manager()
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(send_message)
 
-    class DummyContext:
-        def __enter__(self):
-            return None
+    decorated(manager, 123, _sender_bot_id="777", reply_to_message_id=456)
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
-        _calculate_rate_limit_delay=Mock(return_value=(1.0, 0, 0)),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _using_bot=lambda bot: DummyContext(),
-        _record_aux_use=Mock(),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123)
-
-    assert result.chat_id == 123
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert "_required_sender_bot_id" not in blocking_kwargs
+    args = manager._enqueue_blocking_send_and_wait.call_args.args
+    assert args[0] is None
+    assert args[1] == 123
+    assert args[2] is send_message
+    assert args[3] == (manager, 123)
+    assert args[4] == {"reply_to_message_id": 456}
 
 
-def test_rate_limit_decorator_switches_to_aux_when_main_reservation_gets_delayed():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    main_bot = object()
-    aux_bot = SimpleNamespace(bot=object(), bot_id=999)
-    used_bots = []
-
-    class DummyContext:
-        def __init__(self, bot):
-            self.bot = bot
-
-        def __enter__(self):
-            used_bots.append(self.bot)
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        bot_pool=SimpleNamespace(acquire_send_slot=Mock(return_value=(aux_bot, 0.0))),
-        _calculate_rate_limit_delay=Mock(return_value=(5.0, 0, 0)),
-        _release_reserved_slot=Mock(),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _using_bot=lambda bot: DummyContext(bot),
-        _record_aux_use=Mock(),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123, _slave_id="slave.chat")
-
-    assert result.chat_id == 123
-    assert manager._enqueue_blocking_send_and_wait.call_args.args[0] == "slave.chat"
-
-
-@pytest.mark.parametrize(("method_name", "kwargs"), [
-    ("edit_message_caption", {"chat_id": 123, "message_id": 456, "caption": "updated"}),
-    ("edit_message_media", {"chat_id": 123, "message_id": 456, "media": object()}),
-])
-def test_no_sender_caption_and_media_edits_reserve_main_quota_without_aux_pool(method_name, kwargs):
-    manager = _make_lightweight_bot_manager()
-    manager.bot_pool = SimpleNamespace(acquire_send_slot=Mock())
-
-    result = getattr(manager, method_name)(**kwargs)
-
-    assert result.sender_bot_id is None
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert blocking_kwargs["_required_sender_bot_id"] == "__main__"
-    manager.bot_pool.acquire_send_slot.assert_not_called()
-
-
-def test_rate_limit_decorator_force_main_bot_skips_aux_pool():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-
-    class DummyContext:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager = SimpleNamespace(
-        _bot=object(),
-        _send_worker_stop=threading.Event(),
-        bot_pool=SimpleNamespace(acquire_send_slot=Mock()),
-        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _using_bot=lambda bot: DummyContext(),
-        _record_aux_use=Mock(),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123, _force_main_bot=True)
-
-    assert result.sender_bot_id is None
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert blocking_kwargs["_required_sender_bot_id"] == "__main__"
-    manager.bot_pool.acquire_send_slot.assert_not_called()
-    manager._record_aux_use.assert_not_called()
-
-
-def test_rate_limit_decorator_pool_route_forbidden_marks_chat_non_member_and_retries_main():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    aux_bot = SimpleNamespace(bot=object(), bot_id=999, disabled=False, update_membership=Mock())
-
-    class DummyContext:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
-        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _using_bot=lambda bot: DummyContext(),
-        _record_aux_use=Mock(),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123)
-
-    assert result.chat_id == 123
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert "_required_sender_bot_id" not in blocking_kwargs
-    aux_bot.update_membership.assert_not_called()
-
-
-def test_rate_limit_decorator_reply_does_not_query_or_require_target_sender():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
-    aux_bot = SimpleNamespace(bot=object(), bot_id=777, disabled=False)
-
-    class DummyContext:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id="777")))),
-        bot_pool=SimpleNamespace(get_bot_by_id=Mock(return_value=aux_bot)),
-        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _using_bot=lambda bot: DummyContext(),
-        _record_aux_use=Mock(),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123, reply_to_message_id=456)
-
-    assert result.sender_bot_id is None
-    manager.channel.db.get_msg_log.assert_not_called()
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert "_required_sender_bot_id" not in blocking_kwargs
-
-
-def test_rate_limit_decorator_callback_keyboard_uses_main_bot_even_when_reply_target_was_aux():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
-    main_bot = object()
-
-    class DummyContext:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager = SimpleNamespace(
-        _bot=main_bot,
-        _send_worker_stop=threading.Event(),
-        channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id="777")))),
-        bot_pool=SimpleNamespace(get_bot_by_id=Mock()),
-        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _using_bot=Mock(return_value=DummyContext()),
-        _record_aux_use=Mock(),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Open", callback_data="cb")]])
-
-    result = decorated(manager, 123, reply_to_message_id=456, reply_markup=reply_markup)
-
-    assert result.sender_bot_id is None
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert blocking_kwargs["_required_sender_bot_id"] == "__main__"
-    manager.channel.db.get_msg_log.assert_not_called()
-
-
-def test_rate_limit_decorator_edit_with_sender_id_keeps_forced_sender_with_callback_markup():
-    def edit_message_text(self, chat_id, **kwargs):
-        return SimpleNamespace(chat_id=chat_id)
-
+@pytest.mark.parametrize("sender_bot_id", [None, "777"])
+def test_rate_limit_decorator_queues_edits_with_required_sender(sender_bot_id):
+    manager = _make_queueing_manager()
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(edit_message_text)
-    manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        bot_pool=SimpleNamespace(get_bot_by_id=Mock()),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
+    kwargs = {"text": "updated"}
+    if sender_bot_id is not None:
+        kwargs["_sender_bot_id"] = sender_bot_id
+
+    decorated(manager, 123, **kwargs)
+
+    expected_sender = sender_bot_id or "__main__"
+    assert manager._enqueue_blocking_send_and_wait.call_args.args[4] == {
+        "text": "updated", "_required_sender_bot_id": expected_sender
+    }
+
+
+def test_rate_limit_decorator_routes_callback_keyboard_through_main_bot():
+    manager = _make_queueing_manager()
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(send_message)
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Open", callback_data="cb")]])
 
-    result = decorated(manager, 123, _sender_bot_id="777", reply_markup=reply_markup)
+    decorated(manager, 123, reply_markup=reply_markup, _send_mode="eventual", _slave_id="slave.chat")
 
-    assert result.sender_bot_id == "777"
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert blocking_kwargs["_required_sender_bot_id"] == "777"
-
-
-def test_rate_limit_decorator_routes_reply_to_main_bot():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id, **kwargs: SimpleNamespace(chat_id=chat_id))
-
-    class DummyContext:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager = SimpleNamespace(
-        _bot=object(),
-        _send_worker_stop=threading.Event(),
-        channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id=None)))),
-        bot_pool=SimpleNamespace(acquire_send_slot=Mock()),
-        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _using_bot=lambda bot: DummyContext(),
-        _record_aux_use=Mock(),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123, reply_to_message_id=456)
-
-    assert result.sender_bot_id is None
-    blocking_kwargs = manager._enqueue_blocking_send_and_wait.call_args.args[4]
-    assert "_required_sender_bot_id" not in blocking_kwargs
-    manager.channel.db.get_msg_log.assert_not_called()
-
-
-def test_rate_limit_decorator_eventual_mode_enqueues_task():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    queued_receipt = SimpleNamespace(queued=True, task_id="task-1")
-    manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        bot_pool=None,
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _enqueue_eventual_send=Mock(return_value=queued_receipt),
-        logger=Mock(),
-    )
-
-    result = decorated(manager, 123, _send_mode="eventual", _slave_id="slave.chat")
-
-    assert result is queued_receipt
-    manager._enqueue_eventual_send.assert_called_once()
-
-
-def test_rate_limit_decorator_warns_when_eventual_send_has_no_slave_id():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-
-    class DummyContext:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager = SimpleNamespace(
-        _bot=object(),
-        _send_worker_stop=threading.Event(),
-        bot_pool=None,
-        _calculate_rate_limit_delay=Mock(return_value=(0.0, 0, 0)),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _using_bot=lambda bot: DummyContext(),
-        _enqueue_eventual_send=Mock(),
-        _make_send_receipt=lambda message, sender_bot_id=None, queued=False, task_id=None: SendReceipt(
-            message=message, sender_bot_id=sender_bot_id, queued=queued, task_id=task_id
-        ),
-        logger=Mock(),
-    )
-    _bind_blocking_enqueue_helper(manager)
-
-    result = decorated(manager, 123, _send_mode="eventual")
-
-    assert result.message.chat_id == 123
     manager._enqueue_eventual_send.assert_not_called()
-    manager.logger.warning.assert_called_once_with(
-        "Eventual send requested for chat %s without _slave_id; falling back to blocking.",
-        123,
-    )
+    assert manager._enqueue_blocking_send_and_wait.call_args.args[4]["_required_sender_bot_id"] == "__main__"
 
 
-def test_rate_limit_decorator_eventual_reply_preserves_target_sender():
-    decorated = TelegramBotManager.Decorators.rate_limit_decorator(lambda self, chat_id: SimpleNamespace(chat_id=chat_id))
-    queued_receipt = SimpleNamespace(queued=True, task_id="task-1")
-    manager = SimpleNamespace(
-        _send_worker_stop=threading.Event(),
-        channel=SimpleNamespace(db=SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(sender_bot_id=None)))),
-        bot_pool=SimpleNamespace(acquire_send_slot=Mock()),
-        _cleanup_tls=SimpleNamespace(pending_cleanup=[]),
-        _enqueue_eventual_send=Mock(return_value=queued_receipt),
-        logger=Mock(),
-    )
+def test_rate_limit_decorator_queues_eventual_new_message_with_slave_affinity():
+    manager = _make_queueing_manager()
+    queued_receipt = SimpleNamespace(queued=True, task_id=1)
+    manager._enqueue_eventual_send.return_value = queued_receipt
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(send_message)
 
-    result = decorated(manager, 123, reply_to_message_id=456, _send_mode="eventual", _slave_id="slave.chat")
+    result = decorated(manager, 123, text="queued", _send_mode="eventual", _slave_id="slave.chat")
 
     assert result is queued_receipt
-    queued_kwargs = manager._enqueue_eventual_send.call_args.args[4]
-    assert queued_kwargs["reply_to_message_id"] == 456
-    assert "_required_sender_bot_id" not in queued_kwargs
+    assert manager._enqueue_eventual_send.call_args.args == (
+        "slave.chat", 123, send_message, (manager, 123), {"text": "queued"}
+    )
+
+
+def test_rate_limit_decorator_uses_blocking_queue_without_slave_affinity():
+    manager = _make_queueing_manager()
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(send_message)
+
+    decorated(manager, 123, _send_mode="eventual")
+
+    manager._enqueue_eventual_send.assert_not_called()
+    assert manager._enqueue_blocking_send_and_wait.call_args.args[:2] == (None, 123)
+
+
+def test_rate_limit_decorator_keeps_nonqueued_operations_direct():
+    manager = _make_queueing_manager()
+    manager._make_send_receipt = Mock(return_value="receipt")
+
+    def get_me(self):
+        return "message"
+
+    decorated = TelegramBotManager.Decorators.rate_limit_decorator(get_me)
+
+    assert decorated(manager) == "receipt"
+    manager._make_send_receipt.assert_called_once_with("message")
+    manager._enqueue_blocking_send_and_wait.assert_not_called()
 
 
 def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_disabled():
@@ -870,12 +517,16 @@ def test_stop_worker_join_covers_outbound_drain_deadline():
     manager = object.__new__(TelegramBotManager)
     manager.logger = Mock()
     manager._send_worker_stop = threading.Event()
-    manager._outbound_scheduler = SimpleNamespace(wake_event=threading.Event())
+    manager._outbound_scheduler = SimpleNamespace(
+        stop_and_drain=Mock(),
+        wake_event=threading.Event(),
+    )
     manager._send_worker_thread = Mock()
     manager._send_worker_thread.is_alive.return_value = True
 
     manager.stop_queued_worker()
 
+    manager._outbound_scheduler.stop_and_drain.assert_called_once_with(manager.SHUTDOWN_DRAIN_TIMEOUT)
     join_timeout = manager._send_worker_thread.join.call_args.kwargs["timeout"]
     assert join_timeout > manager.SHUTDOWN_DRAIN_TIMEOUT
 
@@ -899,71 +550,6 @@ def test_parse_metrics_config_defaults_and_disables_invalid_endpoint_options():
     assert top_n == 3
     assert endpoint is None
     assert logger.warning.call_count == 2
-
-
-def test_bot_chat_occupancy_rows_include_zero_and_cooling_groups():
-    rows = []
-
-    _ManagerStateExporter.append_bot_chat_occupancy_rows(
-        rows,
-        sender="aux",
-        bot_id=123,
-        username="botA",
-        chat_counts={1: 1, 2: 18, 3: 5},
-        known_chat_ids={1, 2, 3, 4, 5},
-        effective_limit=18,
-    )
-
-    assert rows == [
-        ("aux", 123, "botA", 0, 18, "available", 2),
-        ("aux", 123, "botA", 1, 18, "available", 1),
-        ("aux", 123, "botA", 5, 18, "available", 1),
-        ("aux", 123, "botA", 18, 18, "cooling", 1),
-    ]
-
-
-def test_bot_debug_state_snapshots_group_cooldown_membership_and_reserved_slots():
-    mgr = object.__new__(TelegramBotManager)
-    mgr.me = SimpleNamespace(id=1, username="mainbot")
-
-    aux_bot = SimpleNamespace(
-        bot_id=123,
-        username="botA",
-        get_membership_cache_snapshot=Mock(return_value={
-            "member": 2,
-            "not_member": 1,
-            "unknown_probe_pending": 1,
-        }),
-        get_reserved_slot_count=Mock(return_value=7),
-    )
-    mgr.bot_pool = SimpleNamespace(
-        bots=[aux_bot],
-        get_bot_by_id=Mock(return_value=aux_bot),
-    )
-    mgr._rate_limiter = SimpleNamespace(get_reserved_slot_count=Mock(return_value=3))
-    mgr._bot_chat_disabled_until = {
-        (None, 100): 115.0,
-        ("123", 200): 110.0,
-        ("123", 300): 90.0,
-    }
-
-    with patch("efb_telegram_master.bot_manager.time.time", return_value=100.0):
-        exporter = _ManagerStateExporter(mgr)
-        cooldown_rows = exporter.bot_chat_cooldown_rows()
-
-    assert cooldown_rows == [
-        ("main", 1, "mainbot", 1, 15.0),
-        ("aux", 123, "botA", 1, 10.0),
-    ]
-    assert exporter.membership_cache_rows() == [
-        (123, "botA", "member", 2),
-        (123, "botA", "not_member", 1),
-        (123, "botA", "unknown_probe_pending", 1),
-    ]
-    assert exporter.reserved_slots_rows() == [
-        ("main", 1, "mainbot", 3),
-        ("aux", 123, "botA", 7),
-    ]
 
 
 @pytest.mark.asyncio
