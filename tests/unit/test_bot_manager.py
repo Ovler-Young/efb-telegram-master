@@ -274,6 +274,35 @@ def test_rate_limit_decorator_queues_eventual_new_message_with_slave_affinity():
     )
 
 
+def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():
+    manager = object.__new__(TelegramBotManager)
+    manager._enqueue_requests = Mock(return_value=("row-1", Mock()))
+    manager._create_queued_message_placeholder = Mock(return_value=Mock())
+    manager._make_send_receipt = Mock()
+
+    def send_message(_manager, chat_id, text):
+        return chat_id, text
+
+    TelegramBotManager._enqueue_eventual_send(
+        manager,
+        "slave.chat",
+        123,
+        send_message,
+        (manager, 123, "queued"),
+        {"text": "queued"},
+    )
+
+    request = manager._enqueue_requests.call_args.args[0][0]
+    assert request.kwargs == {
+        "text": "queued",
+        "_slave_id": "slave.chat",
+        "_send_mode": "eventual",
+    }
+    assert {"target", "db_log_context", "priority", "waiter"}.isdisjoint(
+        inspect.signature(TelegramBotManager._enqueue_send_task).parameters
+    )
+
+
 def test_rate_limit_decorator_uses_blocking_queue_without_slave_affinity():
     manager = _make_queueing_manager()
     decorated = TelegramBotManager.Decorators.rate_limit_decorator(send_message)
@@ -296,6 +325,27 @@ def test_rate_limit_decorator_keeps_nonqueued_operations_direct():
     assert decorated(manager) == "receipt"
     manager._make_send_receipt.assert_called_once_with("message")
     manager._enqueue_blocking_send_and_wait.assert_not_called()
+
+
+def test_retry_diagnostics_use_rate_limiter_constants_without_manager_defaults():
+    manager = SimpleNamespace(
+        _rate_limiter=SimpleNamespace(get_counts=Mock(return_value=(18, 28))),
+        _send_worker_stop=threading.Event(),
+    )
+    manager._send_worker_stop.set()
+
+    def rate_limited(_manager, _chat_id):
+        raise telegram.error.RetryAfter(1)
+
+    handler = TelegramBotManager.Decorators.handle_rate_limit_error(rate_limited)
+    logger = Mock()
+
+    with patch.object(TelegramBotManager.Decorators, "logger", logger):
+        with pytest.raises(telegram.error.RetryAfter):
+            handler(manager, 123)
+
+    assert "/18" in logger.warning.call_args.args[0]
+    assert "/28" in logger.warning.call_args.args[0]
 
 
 def test_handle_rate_limit_error_retries_retry_after_even_when_generic_retry_disabled():
@@ -548,6 +598,51 @@ def test_stop_worker_join_covers_outbound_drain_deadline():
     manager._outbound_scheduler.stop_and_drain.assert_called_once_with(manager.SHUTDOWN_DRAIN_TIMEOUT)
     join_timeout = manager._send_worker_thread.join.call_args.kwargs["timeout"]
     assert join_timeout > manager.SHUTDOWN_DRAIN_TIMEOUT
+
+
+def test_stop_worker_finalizes_resources_once_after_observing_late_worker_exit():
+    manager = object.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._send_worker_stop = threading.Event()
+    manager._outbound_scheduler = SimpleNamespace(
+        stop_and_drain=Mock(),
+        wake_event=threading.Event(),
+    )
+    manager._send_executor = Mock()
+    manager._outbound_queue = Mock()
+    manager._outbound_finalization_lock = threading.Lock()
+    manager._outbound_resources_finalized = False
+    manager._send_worker_thread = Mock()
+    manager._send_worker_thread.is_alive.side_effect = [True, True, False, False]
+
+    manager.stop_queued_worker()
+
+    manager._send_executor.shutdown.assert_not_called()
+    manager._outbound_queue.close.assert_not_called()
+
+    manager.stop_queued_worker()
+    manager.stop_queued_worker()
+
+    manager._send_executor.shutdown.assert_called_once_with(wait=False)
+    manager._outbound_queue.close.assert_called_once_with()
+
+
+def test_queued_worker_does_not_finalize_outbound_resources():
+    manager = object.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._send_worker_stop = threading.Event()
+    manager._outbound_scheduler = SimpleNamespace(
+        stopping=True,
+        stop_and_drain=Mock(),
+    )
+    manager._send_executor = Mock()
+    manager._outbound_queue = Mock()
+
+    manager._queued_send_worker()
+
+    manager._outbound_scheduler.stop_and_drain.assert_called_once_with(manager.SHUTDOWN_DRAIN_TIMEOUT)
+    manager._send_executor.shutdown.assert_not_called()
+    manager._outbound_queue.close.assert_not_called()
 
 
 def test_parse_metrics_config_defaults_and_disables_invalid_endpoint_options():

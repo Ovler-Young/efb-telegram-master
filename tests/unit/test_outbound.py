@@ -109,6 +109,27 @@ def test_internal_keys_are_validated_and_absent_from_payload(tmp_path):
         }))
 
 
+def test_send_message_main_bot_sentinel_persists_but_other_required_sender_is_rejected(tmp_path):
+    queue = OutboundQueue(tmp_path)
+
+    row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {
+        "chat_id": 7,
+        "text": "text",
+        "_required_sender_bot_id": "__main__",
+    }))
+
+    row = queue.heads()[0]
+    assert row.id == row_id
+    assert row.required_sender_bot_id == "__main__"
+    assert queue.decode_payload(row.payload)[1] == {"chat_id": 7, "text": "text"}
+    with pytest.raises(QueueEnqueueError):
+        enqueue(queue, QueueRequest("send_message", (), {
+            "chat_id": 7,
+            "text": "text",
+            "_required_sender_bot_id": "auxiliary-1",
+        }))
+
+
 def test_multi_call_is_atomic_ordered_and_returns_only_first_waiter(tmp_path):
     queue = OutboundQueue(tmp_path)
     first, waiter = enqueue(queue,

@@ -44,10 +44,10 @@ from .outbound import (
     SenderSelectionResult,
 )
 from .ptb_compat import Filters
+from .rate_limiter import CHAT_LIMIT, GLOBAL_LIMIT, SlidingWindowRateLimiter
 from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
-SendTarget: TypeAlias = Tuple[str, int]
 BotChatKey: TypeAlias = Tuple[Optional[str], int]
 
 
@@ -434,7 +434,7 @@ class TelegramBotManager(LocaleMixin):
                     if not (chat_id and hasattr(self, '_rate_limiter')):
                         return ""
                     chat_count, global_count = self._rate_limiter.get_counts(chat_id)
-                    return f" [chat: {chat_count}/{self.CHAT_LIMIT}, global: {global_count}/{self.GLOBAL_LIMIT}]"
+                    return f" [chat: {chat_count}/{CHAT_LIMIT}, global: {global_count}/{GLOBAL_LIMIT}]"
 
                 for attempt in range(max_retries + 1):
                     try:
@@ -592,11 +592,6 @@ class TelegramBotManager(LocaleMixin):
         self.dispatcher = self.application
 
         # Each bot owns independent in-memory global and bot-chat limits.
-        from .rate_limiter import SlidingWindowRateLimiter
-        self.GLOBAL_LIMIT = 28    # acquisitions per second
-        self.GLOBAL_WINDOW = 1.0
-        self.CHAT_LIMIT = 18      # acquisitions per minute per chat
-        self.CHAT_WINDOW = 60.0
         self._rate_limiter = SlidingWindowRateLimiter()
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
@@ -638,6 +633,8 @@ class TelegramBotManager(LocaleMixin):
         self._send_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._send_worker_count, thread_name_prefix="ETM-send",
         )
+        self._outbound_finalization_lock = threading.Lock()
+        self._outbound_resources_finalized = False
         self._outbound_scheduler = OutboundQueueScheduler(
             self._outbound_queue,
             self,
@@ -1011,32 +1008,17 @@ class TelegramBotManager(LocaleMixin):
 
     def _enqueue_send_task(
         self,
-        target: SendTarget,
         function: Callable,
         args: tuple,
         kwargs: dict,
         cleanup_files: Optional[list] = None,
-        db_log_context: Optional[QueuedDbLogContext] = None,
-        priority: bool = False,
-        waiter: Optional[Future] = None,
     ) -> str:
-        del target, db_log_context
         operation = function.__name__
         telegram_args = args[1:] if args and args[0] is self else args
         queued_kwargs = dict(kwargs)
-        queued_kwargs["_send_mode"] = "blocking" if priority else "eventual"
-        row_id, queue_waiter = self._enqueue_requests([
+        row_id, _ = self._enqueue_requests([
             QueueRequest(operation=operation, args=telegram_args, kwargs=queued_kwargs)
         ])
-        if waiter is not None:
-            def transfer(source: Future) -> None:
-                if waiter.done():
-                    return
-                try:
-                    waiter.set_result(source.result())
-                except BaseException as error:
-                    waiter.set_exception(error)
-            queue_waiter.add_done_callback(transfer)
         for path in cleanup_files or ():
             try:
                 os.unlink(path)
@@ -1056,8 +1038,9 @@ class TelegramBotManager(LocaleMixin):
     ) -> SendReceipt:
         queued_kwargs = dict(kwargs)
         queued_kwargs["_slave_id"] = slave_id
+        queued_kwargs["_send_mode"] = "eventual"
         row_id = self._enqueue_send_task(
-            (slave_id, chat_id), function, args, queued_kwargs, cleanup_files=cleanup_files
+            function, args, queued_kwargs, cleanup_files=cleanup_files
         )
         return self._make_send_receipt(
             self._create_queued_message_placeholder(chat_id, row_id), queued=True, task_id=row_id
@@ -1261,8 +1244,6 @@ class TelegramBotManager(LocaleMixin):
             self._outbound_scheduler.wake_event.wait(timeout=timeout)
             self._outbound_scheduler.wake_event.clear()
         self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
-        self._send_executor.shutdown(wait=False)
-        self._outbound_queue.close()
         self.logger.debug("Outbound queue worker stopped")
 
     @staticmethod
@@ -1354,16 +1335,29 @@ class TelegramBotManager(LocaleMixin):
         if hasattr(self, '_outbound_scheduler'):
             self._outbound_scheduler.wake_event.set()
 
-        if hasattr(self, '_send_worker_thread') and self._send_worker_thread.is_alive():
+        worker_thread = getattr(self, '_send_worker_thread', None)
+        if worker_thread is not None and worker_thread.is_alive():
             self.logger.debug("Waiting for durable outbound worker to stop...")
-            self._send_worker_thread.join(
+            worker_thread.join(
                 timeout=self.SHUTDOWN_DRAIN_TIMEOUT + self.SHUTDOWN_JOIN_GRACE
             )
 
-            if self._send_worker_thread.is_alive():
+            if worker_thread.is_alive():
                 self.logger.warning("Durable outbound worker did not stop within timeout")
-            else:
-                self.logger.debug("Durable outbound worker stopped")
+                return
+        self._finalize_outbound_resources()
+        self.logger.debug("Durable outbound worker stopped")
+
+    def _finalize_outbound_resources(self) -> None:
+        """Close caller-owned scheduler resources after the worker has exited."""
+        with self._outbound_finalization_lock:
+            if self._outbound_resources_finalized:
+                return
+            self._outbound_resources_finalized = True
+            try:
+                self._send_executor.shutdown(wait=False)
+            finally:
+                self._outbound_queue.close()
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error

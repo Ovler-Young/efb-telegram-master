@@ -88,6 +88,16 @@ def test_required_sender_unknown_membership_rechecks_after_250ms() -> None:
     assert result.retry_at == now + 0.25
 
 
+def test_main_bot_sentinel_selects_main_bot_without_sender_id() -> None:
+    manager = _manager()
+
+    result = manager.select_sender(_task(required_sender_bot_id="__main__"), _now())
+
+    assert result.selection is not None
+    assert result.selection.sender is manager._bot
+    assert result.selection.sender_bot_id is None
+
+
 def test_unknown_auxiliary_membership_blocks_affinity_only_selection_for_250ms() -> None:
     unknown = _auxiliary(10, membership=None)
     manager = _manager(unknown)

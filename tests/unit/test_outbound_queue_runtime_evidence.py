@@ -285,6 +285,25 @@ def test_submitted_future_completion_wakes_scheduler(retained_queue: OutboundQue
     assert scheduler.wake_event.is_set()
 
 
+def test_harvest_completed_signals_only_after_removing_a_completed_future(
+    retained_queue: OutboundQueue,
+) -> None:
+    _row_id, _waiter = enqueue(retained_queue, 45, "harvest wake")
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.wake_event.clear()
+    scheduler.harvest_completed()
+    assert not scheduler.wake_event.is_set()
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_result("sent")
+    scheduler.wake_event.clear()
+    scheduler.harvest_completed()
+
+    assert scheduler.wake_event.is_set()
+
+
 def test_scheduler_publishes_metrics_for_actual_dequeue_and_completion(tmp_path: Path) -> None:
     metrics = Metrics()
     queue = OutboundQueue(tmp_path)

@@ -256,7 +256,7 @@ class OutboundQueue:
         if operation in REQUIRED_SENDER_OPERATIONS:
             if required_sender is None:
                 raise QueueEnqueueError(f"{operation} requires _required_sender_bot_id.")
-        elif required_sender is not None:
+        elif required_sender is not None and required_sender != "__main__":
             raise QueueEnqueueError(f"{operation} cannot require a sender.")
         return telegram_kwargs, priority, slave_id, required_sender
 
@@ -326,6 +326,8 @@ class OutboundQueue:
 
     def heads(self) -> list[QueuedCall]:
         with self._lock:
+            # The current bounded queue is read in sort order so Python can
+            # preserve priority/FIFO semantics while selecting one row per destination.
             rows = self.connection.execute(
                 "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
                 "required_sender_bot_id, created_at FROM outbound_queue "
@@ -410,7 +412,7 @@ class OutboundQueueScheduler:
                 return
             self.next_deadline = None
             for row in self.queue.heads():
-                if self.stopping or row.telegram_chat_id in self.in_flight_destinations:
+                if row.telegram_chat_id in self.in_flight_destinations:
                     continue
                 try:
                     args, kwargs = self.queue.decode_payload(row.payload)
@@ -472,9 +474,11 @@ class OutboundQueueScheduler:
 
     def harvest_completed(self) -> None:
         with self._lock:
+            any_harvested = False
             for row_id, submitted in tuple(self.in_flight.items()):
                 if not submitted.future.done():
                     continue
+                any_harvested = True
                 self.in_flight.pop(row_id)
                 self.in_flight_destinations.remove(submitted.row.telegram_chat_id)
                 self._permits.release()
@@ -502,7 +506,8 @@ class OutboundQueueScheduler:
                             submitted.row.priority, submitted.row.operation,
                             self._sender_kind(submitted.selection), "success"
                         )
-            self.wake_event.set()
+            if any_harvested:
+                self.wake_event.set()
 
     def stop_and_drain(self, timeout: float = 5.0) -> None:
         with self._lock:
