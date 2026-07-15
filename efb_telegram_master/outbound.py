@@ -1,8 +1,4 @@
-"""SQLite-backed outbound Telegram call queue.
-
-Rows are durable only until their delete transaction commits.  The scheduler
-never retries or reconstructs a dequeued call.
-"""
+"""SQLite-backed outbound Telegram call queue."""
 
 from __future__ import annotations
 
@@ -91,6 +87,16 @@ class SenderSelectionResult:
     terminal_error_class: Optional[str] = None
 
 
+class QueuedCompletionDecision(Protocol):
+    @property
+    def kind(self) -> str:
+        ...
+
+    @property
+    def retry_at(self) -> Optional[float]:
+        ...
+
+
 @dataclass
 class SubmittedCall:
     row: QueuedCall
@@ -112,10 +118,12 @@ class QueueAdapter(Protocol):
 
     def record_queued_failure(
         self, row: QueuedCall, error: BaseException, selection: SenderSelection
-    ) -> None:
+    ) -> QueuedCompletionDecision:
         ...
 
-    def record_queued_success(self, row: QueuedCall, result: object, selection: SenderSelection) -> None:
+    def record_queued_success(
+        self, row: QueuedCall, result: object, selection: SenderSelection
+    ) -> QueuedCompletionDecision:
         ...
 
 
@@ -368,7 +376,7 @@ class OutboundQueue:
 
 
 class OutboundQueueScheduler:
-    """Delete queue rows before execution and retain one in-flight call per chat."""
+    """Schedule one in-flight call per chat and retain eventual rows through retries."""
 
     def __init__(self, queue: OutboundQueue, adapter: QueueAdapter, executor: Executor, worker_count: int):
         self.queue = queue
@@ -394,6 +402,9 @@ class OutboundQueueScheduler:
 
     def _record_terminal_discard(self, row: QueuedCall) -> None:
         self.queue.record_removal(row, "terminal_discard")
+
+    def _schedule_retry(self, retry_at: float) -> None:
+        self.next_deadline = min(self.next_deadline, retry_at) if self.next_deadline else retry_at
 
     def _wake_on_future_completion(self, _future: Future) -> None:
         self.wake_event.set()
@@ -442,18 +453,21 @@ class OutboundQueueScheduler:
                 if decision.selection is None:
                     self._permits.release()
                     if decision.retry_at is not None:
-                        self.next_deadline = min(self.next_deadline, decision.retry_at) if self.next_deadline else decision.retry_at
+                        self._schedule_retry(decision.retry_at)
                     continue
                 if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
                     self._permits.release()
+                    self._schedule_retry(now + 0.25)
                     continue
-                try:
-                    self.queue.delete(row.id)
-                except Exception as delete_error:
-                    self._permits.release()
-                    self._stop_for_persistence_error(delete_error)
-                    return
-                self._record_submitted_removal(row)
+                retained = row.priority == 0
+                if not retained:
+                    try:
+                        self.queue.delete(row.id)
+                    except Exception as delete_error:
+                        self._permits.release()
+                        self._stop_for_persistence_error(delete_error)
+                        return
+                    self._record_submitted_removal(row)
                 try:
                     future = self.executor.submit(
                         self.adapter.execute_queued_call, row, args, kwargs, decision.selection
@@ -462,7 +476,10 @@ class OutboundQueueScheduler:
                     self._permits.release()
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_dispatch_failure(row.priority, row.operation)
-                    self.queue.fail_waiter(row.id, ExecutorSubmitError("Unable to submit queued Telegram call."))
+                    if retained:
+                        self._schedule_retry(now + 0.25)
+                    else:
+                        self.queue.fail_waiter(row.id, ExecutorSubmitError("Unable to submit queued Telegram call."))
                     continue
                 future.add_done_callback(self._wake_on_future_completion)
                 self.in_flight[row.id] = SubmittedCall(row, decision.selection, future)
@@ -489,7 +506,19 @@ class OutboundQueueScheduler:
                 try:
                     result = submitted.future.result()
                 except BaseException as error:
-                    self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
+                    decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
+                    if decision.kind == "retry_eventual" and submitted.row.priority == 0:
+                        if decision.retry_at is None:
+                            raise RuntimeError("Retry decision requires a retry deadline.")
+                        self._schedule_retry(decision.retry_at)
+                        continue
+                    if submitted.row.priority == 0:
+                        try:
+                            self.queue.delete(row_id)
+                        except Exception as delete_error:
+                            self._stop_for_persistence_error(delete_error)
+                            return
+                        self._record_terminal_discard(submitted.row)
                     self.queue.fail_waiter(row_id, error)
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_completion(
@@ -498,6 +527,13 @@ class OutboundQueueScheduler:
                         )
                 else:
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
+                    if submitted.row.priority == 0:
+                        try:
+                            self.queue.delete(row_id)
+                        except Exception as delete_error:
+                            self._stop_for_persistence_error(delete_error)
+                            return
+                        self._record_submitted_removal(submitted.row)
                     waiter = self.queue.waiters.pop(row_id, None)
                     if waiter is not None and not waiter.done():
                         waiter.set_result(result)
