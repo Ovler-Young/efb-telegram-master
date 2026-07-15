@@ -918,6 +918,81 @@ class TelegramBotManager(LocaleMixin):
         return int(value)
 
     @staticmethod
+    def _strip_private_queue_metadata(kwargs: Mapping[str, object]) -> dict[str, object]:
+        return {key: value for key, value in kwargs.items() if key not in _INTERNAL_KWARGS}
+
+    def _queued_operation_callable(self, operation: str) -> Callable[..., object]:
+        method = self._queue_operation(operation)
+
+        def queued_operation(*args: object, **kwargs: object) -> object:
+            telegram_args = args[1:] if args and args[0] is self else args
+            return method(*telegram_args, **kwargs)
+
+        queued_operation.__name__ = operation
+        return queued_operation
+
+    def _route_queued_operation(
+        self,
+        operation: str,
+        args: tuple,
+        kwargs: Mapping[str, object],
+        *,
+        eventual_capable: bool,
+    ) -> SendReceipt:
+        if operation not in QUEUED_OPERATIONS:
+            raise QueueEnqueueError(f"Unsupported queued operation: {operation}")
+        queued_kwargs = dict(kwargs)
+        sender_bot_id = queued_kwargs.pop("_sender_bot_id", None)
+        slave_id = queued_kwargs.pop("_slave_id", None)
+        send_mode = queued_kwargs.pop("_send_mode", "blocking")
+        force_main_bot = queued_kwargs.pop("_force_main_bot", False)
+        queued_kwargs.pop("_required_sender_bot_id", None)
+        if send_mode not in {"blocking", "eventual"}:
+            raise QueueEnqueueError("_send_mode must be 'blocking' or 'eventual'.")
+
+        chat_id = args[0] if args else queued_kwargs.get("chat_id")
+        normalized_chat_id = self._normalize_telegram_chat_id(chat_id)
+        has_callback = _has_callback_keyboard(queued_kwargs.get("reply_markup"))
+        cleanup_tls = getattr(self, "_cleanup_tls", None)
+        cleanup_files = getattr(cleanup_tls, "pending_cleanup", [])[:]
+        if cleanup_tls is not None:
+            cleanup_tls.pending_cleanup = []
+
+        function = self._queued_operation_callable(operation)
+        function_args = (self,) + args
+        if eventual_capable and send_mode == "eventual" and slave_id and not has_callback:
+            return self._enqueue_eventual_send(
+                str(slave_id),
+                normalized_chat_id,
+                function,
+                function_args,
+                queued_kwargs,
+                cleanup_files=cleanup_files,
+            )
+
+        blocking_kwargs = dict(queued_kwargs)
+        required_sender_bot_id = str(sender_bot_id) if sender_bot_id and not eventual_capable else None
+        if required_sender_bot_id is not None:
+            blocking_kwargs["_required_sender_bot_id"] = required_sender_bot_id
+        if force_main_bot or (eventual_capable and has_callback) or (
+            not eventual_capable and required_sender_bot_id is None
+        ):
+            blocking_kwargs["_required_sender_bot_id"] = "__main__"
+        return self._enqueue_blocking_send_and_wait(
+            str(slave_id) if slave_id else None,
+            normalized_chat_id,
+            function,
+            function_args,
+            blocking_kwargs,
+            cleanup_files=cleanup_files,
+        )
+
+    def _call_direct_operation(
+        self, operation: str, args: tuple, kwargs: Mapping[str, object]
+    ) -> object:
+        return getattr(self._bot, operation)(*args, **self._strip_private_queue_metadata(kwargs))
+
+    @staticmethod
     def _parse_metrics_config(metrics_cfg: object, logger) -> tuple[int, Optional[tuple[str, int]]]:
         top_n = 20
         if metrics_cfg is None:
@@ -1423,7 +1498,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._bot.send_message(*args, **kwargs)
+        return self._route_queued_operation("send_message", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
@@ -1441,7 +1516,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._bot.edit_message_text(**kwargs)
+        return self._route_queued_operation("edit_message_text", (), kwargs, eventual_capable=False)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
@@ -1462,7 +1537,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._bot.send_audio(*args, **kwargs)
+        return self._route_queued_operation("send_audio", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
@@ -1483,7 +1558,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._bot.send_voice(*args, **kwargs)
+        return self._route_queued_operation("send_voice", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
@@ -1504,7 +1579,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._bot.send_video(*args, **kwargs)
+        return self._route_queued_operation("send_video", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
@@ -1523,7 +1598,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._bot.send_document(*args, **kwargs)
+        return self._route_queued_operation("send_document", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
@@ -1542,7 +1617,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._bot.send_animation(*args, **kwargs)
+        return self._route_queued_operation("send_animation", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
@@ -1561,13 +1636,13 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._bot.send_photo(*args, **kwargs)
+        return self._route_queued_operation("send_photo", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_media_group(self, *args, **kwargs):
-        return self._bot.send_media_group(*args, **kwargs)
+        return self._route_queued_operation("send_media_group", args, kwargs, eventual_capable=True)
 
     @Decorators.skip_on_rate_limit
     @Decorators.retry_on_chat_migration
@@ -1581,42 +1656,42 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_reply_markup(self, *args, **kwargs):
-        return self._bot.edit_message_reply_markup(*args, **kwargs)
+        return self._call_direct_operation("edit_message_reply_markup", args, kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_location(self, *args, **kwargs):
-        return self._bot.send_location(*args, **kwargs)
+        return self._call_direct_operation("send_location", args, kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_venue(self, *args, **kwargs):
-        return self._bot.send_venue(*args, **kwargs)
+        return self._call_direct_operation("send_venue", args, kwargs)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def send_sticker(self, *args, **kwargs):
-        return self._bot.send_sticker(*args, **kwargs)
+        return self._route_queued_operation("send_sticker", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def forward_message(self, *args, **kwargs):
-        return self._bot.forward_message(*args, **kwargs)
+        return self._route_queued_operation("forward_message", args, kwargs, eventual_capable=True)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def copy_message(self, *args, **kwargs):
-        return self._bot.copy_message(*args, **kwargs)
+        return self._route_queued_operation("copy_message", args, kwargs, eventual_capable=True)
 
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def get_me(self, *args, **kwargs):
-        return self._bot.get_me(*args, **kwargs)
+        return self._call_direct_operation("get_me", args, kwargs)
 
     def session_expired(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
@@ -1632,13 +1707,13 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
-        return self._bot.edit_message_caption(*args, **kwargs)
+        return self._route_queued_operation("edit_message_caption", args, kwargs, eventual_capable=False)
 
     @Decorators.rate_limit_decorator
     @Decorators.handle_rate_limit_error
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
-        return self._bot.edit_message_media(*args, **kwargs)
+        return self._route_queued_operation("edit_message_media", args, kwargs, eventual_capable=False)
 
     def reply_error(self, update, errmsg):
         """
