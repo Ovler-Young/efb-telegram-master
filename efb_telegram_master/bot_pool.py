@@ -6,8 +6,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
 from .auxiliary_bot import AuxiliaryBot
@@ -16,53 +15,6 @@ if TYPE_CHECKING:
     from .bot_manager import TelegramBotManager
 
 logger = logging.getLogger(__name__)
-
-
-MEMBERSHIP_RECHECK_SECONDS = 0.25
-
-
-@dataclass(frozen=True)
-class AuxiliarySenderState:
-    """Read-only auxiliary sender input for one scheduler arbitration pass.
-
-    The scheduler supplies the monotonic cooldown deadline, because cooldowns
-    are owned by its RetryAfter handling. ``tie_key`` orders auxiliaries around
-    the main sender: preferred auxiliary (0), main sender (1, supplied by the
-    scheduler), then other auxiliaries (2, ascending string bot ID).
-    """
-
-    bot: Optional[AuxiliaryBot]
-    bot_id: str
-    membership: Optional[bool]
-    limiter_delay: float
-    cooldown_until: float
-    affinity_rank: int
-
-    @property
-    def is_terminal(self) -> bool:
-        """Whether a required-sender task can never use this auxiliary."""
-        return self.bot is None or self.bot.disabled or self.membership is False
-
-    @property
-    def tie_key(self) -> tuple[int, str]:
-        """Return the deterministic auxiliary portion of sender ordering."""
-        return (self.affinity_rank, self.bot_id)
-
-    def is_selectable(self, now: float) -> bool:
-        """Return whether membership, cooldown, and limiter allow acquisition."""
-        return (
-            not self.is_terminal
-            and self.membership is True
-            and self.limiter_delay <= 0.0
-            and self.cooldown_until <= now
-        )
-
-    def next_deadline(self, now: float) -> float:
-        """Return the next monotonic recheck time, or infinity when terminal."""
-        if self.is_terminal:
-            return float("inf")
-        membership_deadline = now + MEMBERSHIP_RECHECK_SECONDS if self.membership is None else now
-        return max(membership_deadline, now + self.limiter_delay, self.cooldown_until)
 
 
 class BotPool:
@@ -106,74 +58,6 @@ class BotPool:
             if not bot.disabled:
                 candidates.append((bot, bot.check_membership_tri(chat_id)))
         return candidates
-
-    def required_sender_state(
-        self,
-        bot_id: str | int | None,
-        chat_id: int,
-        *,
-        cooldown_until: float,
-        now: float,
-    ) -> AuxiliarySenderState:
-        """Return the required auxiliary's availability and next-deadline inputs.
-
-        Missing and disabled bots are terminal. A membership value of ``None``
-        means the existing asynchronous probe has been requested and the
-        scheduler must recheck after ``MEMBERSHIP_RECHECK_SECONDS``.
-        """
-        bot = self.get_bot_by_id(bot_id)
-        normalized_bot_id = str(bot_id)
-        if bot is None or bot.disabled:
-            return AuxiliarySenderState(
-                bot=bot,
-                bot_id=normalized_bot_id if bot is None else str(bot.bot_id),
-                membership=False,
-                limiter_delay=0.0,
-                cooldown_until=cooldown_until,
-                affinity_rank=2,
-            )
-        membership = bot.check_membership_tri(chat_id)
-        return AuxiliarySenderState(
-            bot=bot,
-            bot_id=str(bot.bot_id),
-            membership=membership,
-            limiter_delay=bot.peek_delay(chat_id),
-            cooldown_until=cooldown_until,
-            affinity_rank=2,
-        )
-
-    def affinity_sender_states(
-        self,
-        chat_id: int,
-        slave_id: Optional[str],
-        *,
-        cooldown_until_for_bot: Callable[[str, int], float],
-        now: float,
-    ) -> list[AuxiliarySenderState]:
-        """Return enabled auxiliary state for affinity-only arbitration.
-
-        The result retains unknown-membership auxiliaries so the scheduler can
-        wait for their 250 ms deadline. Confirmed non-members and disabled bots
-        are omitted because they are not affinity-only candidates.
-        """
-        preferred = self.preferred_sender(slave_id)
-        preferred_bot_id = None if preferred is None else str(preferred.bot_id)
-        states: list[AuxiliarySenderState] = []
-        for bot, membership in self.candidate_bots(chat_id):
-            if membership is False:
-                continue
-            bot_id = str(bot.bot_id)
-            states.append(
-                AuxiliarySenderState(
-                    bot=bot,
-                    bot_id=bot_id,
-                    membership=membership,
-                    limiter_delay=bot.peek_delay(chat_id),
-                    cooldown_until=cooldown_until_for_bot(bot_id, chat_id),
-                    affinity_rank=0 if bot_id == preferred_bot_id else 2,
-                )
-            )
-        return states
 
     def preferred_sender(self, slave_id: Optional[str]) -> Optional[AuxiliaryBot]:
         """Return the stored affinity bot when it remains enabled."""
