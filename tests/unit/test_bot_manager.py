@@ -272,6 +272,85 @@ def test_public_send_message_routes_eligible_requests_as_eventual():
     assert manager._enqueue_eventual_send.call_args.args[3:] == ((manager, 123), {"text": "queued"})
 
 
+def test_queued_routes_apply_text_and_caption_affixes_before_enqueue():
+    manager = _make_queueing_manager()
+
+    manager.send_message(
+        123,
+        "message",
+        prefix="Prefix",
+        suffix="Suffix",
+        _send_mode="eventual",
+        _slave_id="slave.chat",
+    )
+    assert manager._enqueue_eventual_send.call_args.args[3:] == (
+        (manager, 123, "Prefix\nmessage\nSuffix"),
+        {},
+    )
+
+    manager.send_photo(
+        123,
+        "photo",
+        caption="caption",
+        prefix="Prefix",
+        suffix="Suffix",
+        _send_mode="eventual",
+        _slave_id="slave.chat",
+    )
+    assert manager._enqueue_eventual_send.call_args.args[3:] == (
+        (manager, 123, "photo"),
+        {"caption": "Prefix\ncaption\nSuffix"},
+    )
+
+
+def test_queued_execution_retries_entity_parse_failure_without_parse_mode():
+    manager = object.__new__(TelegramBotManager)
+    sender = Mock()
+    sender.send_message.side_effect = [
+        telegram.error.BadRequest("Can't parse entities"),
+        SimpleNamespace(message_id=7),
+    ]
+    row = SimpleNamespace(operation="send_message")
+    selection = SimpleNamespace(sender=sender)
+
+    result = manager.execute_queued_call(
+        row,
+        (123,),
+        {"text": "<broken>", "parse_mode": "HTML"},
+        selection,
+    )
+
+    assert result.message_id == 7
+    assert sender.send_message.call_args_list == [
+        call(123, text="<broken>", parse_mode="HTML"),
+        call(123, text="<broken>"),
+    ]
+
+
+def test_queued_execution_sends_full_oversized_text_as_attachment():
+    manager = object.__new__(TelegramBotManager)
+    sender = Mock()
+    sender.send_message.return_value = SimpleNamespace(message_id=7)
+    row = SimpleNamespace(operation="send_message")
+    selection = SimpleNamespace(sender=sender)
+    full_text = "x" * (int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH) + 1)
+
+    result = manager.execute_queued_call(row, (123,), {"text": full_text}, selection)
+
+    assert result.message_id == 7
+    assert sender.send_message.call_args == call(
+        123,
+        text=full_text[:100] + "\n...\n" + full_text[-100:],
+    )
+    attachment = sender.send_document.call_args.args[1]
+    assert attachment.getvalue() == full_text.encode("utf-8")
+    assert sender.send_document.call_args.kwargs == {
+        "filename": "123_7.txt",
+        "reply_to_message_id": 7,
+        "caption": "Message is truncated due to its length. Full message is sent as attachment.",
+    }
+
+
 def test_queued_route_defers_db_mapping_context_outside_telegram_kwargs():
     manager = _make_queueing_manager()
     db_context = QueuedDbLogContext(Mock(), None, Mock())
