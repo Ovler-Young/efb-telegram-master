@@ -39,6 +39,10 @@ def send_document(chat_id: int, document: object) -> tuple[int, object]:
     return chat_id, document
 
 
+def send_video(chat_id: int, video: object, **kwargs) -> tuple[int, object, dict]:
+    return chat_id, video, kwargs
+
+
 def enqueue(queue: OutboundQueue, chat_id: int, text: str = "message") -> tuple[int, Future]:
     return queue.enqueue_many(
         [QueueRequest("send_message", (), {"chat_id": chat_id, "text": text})],
@@ -314,6 +318,41 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     scheduler.harvest_completed()
     assert first_waiter.result() == "sent"
     assert [row.id for row in retained_queue.heads()] == [second_id]
+
+
+def test_video_cover_retry_reconstructs_a_fresh_offset_zero_value(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = io.BufferedReader(io.BytesIO(b"retry cover"))
+    row_id, waiter = retained_queue.enqueue_many(
+        [QueueRequest("send_video", (41, b"video"), {"cover": source})],
+        lambda _operation: send_video,
+    )
+    source.close()
+    executor = ControlledExecutor()
+    adapter = manager_adapter()
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    first_cover = executor.submissions[0][1][2]["cover"]
+    assert first_cover.tell() == 0
+    assert first_cover.read() == b"retry cover"
+    executor.submissions[0][2].set_exception(RetryAfter(10))
+    scheduler.harvest_completed()
+
+    clock["now"] = 115.0
+    scheduler.dispatch_once()
+    retry_cover = executor.submissions[1][1][2]["cover"]
+    assert executor.submissions[1][1][0].id == row_id
+    assert retry_cover is not first_cover
+    assert retry_cover.tell() == 0
+    assert retry_cover.read() == b"retry cover"
+
+    executor.submissions[1][2].set_result("sent")
+    scheduler.harvest_completed()
+    assert waiter.result() == "sent"
 
 
 def test_blocking_retry_after_is_terminal(retained_queue: OutboundQueue) -> None:

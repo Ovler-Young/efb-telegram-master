@@ -228,6 +228,80 @@ def test_thumbnail_keyword_enqueues_an_inline_snapshot(tmp_path):
     assert decoded_thumbnail.read() == b"thumbnail"
 
 
+@pytest.mark.parametrize(
+    ("kind", "expected_filename"),
+    [
+        ("stream", "stream-cover.jpg"),
+        ("bytes", None),
+        ("input-file", "input-cover.jpg"),
+        ("local-string", "string-cover.jpg"),
+        ("local-path", "path-cover.jpg"),
+    ],
+)
+def test_video_cover_enqueues_an_inline_version_one_snapshot(
+    tmp_path, kind, expected_filename
+):
+    queue = OutboundQueue(tmp_path)
+    content = f"{kind} cover".encode()
+    source = None
+    local_path = None
+    if kind == "stream":
+        local_path = tmp_path / expected_filename
+        local_path.write_bytes(content)
+        source = local_path.open("rb")
+        source.seek(2)
+        cover = source
+    elif kind == "bytes":
+        cover = content
+    elif kind == "input-file":
+        cover = InputFile(content, filename=expected_filename)
+    else:
+        local_path = tmp_path / expected_filename
+        local_path.write_bytes(content)
+        cover = str(local_path) if kind == "local-string" else local_path
+
+    queue.enqueue_many(
+        [QueueRequest(
+            "send_video",
+            (100, b"video"),
+            {"cover": cover, "disable_notification": True},
+        )],
+        lambda _name: media_operation,
+    )
+
+    if source is not None:
+        assert source.tell() == 2
+        assert not source.closed
+        source.close()
+    if local_path is not None:
+        local_path.unlink()
+    row = queue.heads()[0]
+    decoded_cover = queue.decode_payload(row.payload)[1]["cover"]
+    assert row.payload[0] == 1
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 1
+    if isinstance(decoded_cover, bytes):
+        assert decoded_cover == content
+    elif isinstance(decoded_cover, InputFile):
+        assert decoded_cover.input_file_content == content
+        assert decoded_cover.filename == expected_filename
+    else:
+        assert decoded_cover.tell() == 0
+        assert decoded_cover.read() == content
+        assert getattr(decoded_cover, "name", None) == expected_filename
+
+
+def test_malformed_video_cover_commits_zero_rows(tmp_path):
+    queue = OutboundQueue(tmp_path)
+
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        queue.enqueue_many(
+            [QueueRequest("send_video", (100, b"video"), {"cover": object()})],
+            lambda _name: media_operation,
+        )
+
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("keyword", [False, True], ids=["positional", "keyword"])
 @pytest.mark.parametrize(
     ("media_type", "content", "filename"),
