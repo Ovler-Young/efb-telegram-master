@@ -17,7 +17,8 @@ from typing import Callable, Iterable, Mapping, Optional, Protocol
 
 from telegram import (
     Animation, Audio, Document, InputFile, InputMedia, InputMediaAnimation, InputMediaAudio,
-    InputMediaDocument, InputMediaPhoto, InputMediaVideo, PhotoSize, Sticker, Video, Voice,
+    InputMediaDocument, InputMediaLivePhoto, InputMediaPhoto, InputMediaVideo, PhotoSize,
+    Sticker, Video, Voice,
 )
 
 
@@ -58,8 +59,20 @@ _NESTED_MEDIA_TYPES = {
     InputMediaAnimation: Animation,
     InputMediaAudio: Audio,
     InputMediaDocument: Document,
+    InputMediaLivePhoto: PhotoSize,
     InputMediaPhoto: PhotoSize,
     InputMediaVideo: Video,
+}
+_MEDIA_GROUP_TYPES = frozenset({
+    InputMediaAudio, InputMediaDocument, InputMediaLivePhoto, InputMediaPhoto, InputMediaVideo,
+})
+_INPUT_MEDIA_ATTACHMENT_FIELDS = {
+    InputMediaAnimation: ("thumbnail",),
+    InputMediaAudio: ("thumbnail",),
+    InputMediaDocument: ("thumbnail",),
+    InputMediaLivePhoto: ("photo",),
+    InputMediaPhoto: (),
+    InputMediaVideo: ("thumbnail", "cover"),
 }
 
 
@@ -381,11 +394,13 @@ class OutboundQueue:
         cls._validate_media_value(value.media, _NESTED_MEDIA_TYPES.get(type(value)))
         if cls._needs_media_snapshot(value.media):
             object.__setattr__(normalized, "media", cls._snapshot_media_value(value.media))
-        thumbnail = getattr(value, "thumbnail", None)
-        if thumbnail is not None:
-            cls._validate_media_value(thumbnail)
-            if cls._needs_media_snapshot(thumbnail):
-                object.__setattr__(normalized, "thumbnail", cls._snapshot_media_value(thumbnail))
+        for field in _INPUT_MEDIA_ATTACHMENT_FIELDS.get(type(value), ()):
+            attachment = getattr(value, field, None)
+            if attachment is None:
+                continue
+            cls._validate_media_value(attachment)
+            if cls._needs_media_snapshot(attachment):
+                object.__setattr__(normalized, field, cls._snapshot_media_value(attachment))
         return normalized
 
     @classmethod
@@ -433,7 +448,7 @@ class OutboundQueue:
         normalized: object
         if operation == "send_media_group":
             if not isinstance(value, (list, tuple)) or not value or not all(
-                isinstance(item, InputMedia) for item in value
+                type(item) in _MEDIA_GROUP_TYPES for item in value
             ):
                 raise QueueEnqueueError("Unable to serialize queued Telegram call.")
             normalized = type(value)(cls._normalize_input_media(item) for item in value)
