@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from prometheus_client import generate_latest
+from telegram import InputMediaDocument
 from telegram.error import NetworkError, RetryAfter, TelegramError
 
 import efb_telegram_master.outbound as outbound
@@ -41,6 +42,10 @@ def send_document(chat_id: int, document: object) -> tuple[int, object]:
 
 def send_video(chat_id: int, video: object, **kwargs) -> tuple[int, object, dict]:
     return chat_id, video, kwargs
+
+
+def send_media_group(chat_id: int, media: object) -> tuple[int, object]:
+    return chat_id, media
 
 
 def enqueue(queue: OutboundQueue, chat_id: int, text: str = "message") -> tuple[int, Future]:
@@ -353,6 +358,60 @@ def test_video_cover_retry_reconstructs_a_fresh_offset_zero_value(
     executor.submissions[1][2].set_result("sent")
     scheduler.harvest_completed()
     assert waiter.result() == "sent"
+
+
+def test_nested_local_media_reopen_and_retry_reconstruct_distinct_offset_zero_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_path = tmp_path / "nested-retry.bin"
+    local_path.write_bytes(b"nested retry media")
+    source = local_path.open("rb")
+    source.seek(4)
+    media = InputMediaDocument(local_path)
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = queue.enqueue_many(
+        [QueueRequest("send_media_group", (41, [media]), {})],
+        lambda _operation: send_media_group,
+    )
+    assert source.tell() == 4
+    source.close()
+    moved_path = tmp_path / "nested-moved.bin"
+    local_path.rename(moved_path)
+    moved_path.unlink()
+    queue.close()
+
+    reopened = OutboundQueue(tmp_path)
+    row = reopened.heads()[0]
+    reopen_media = reopened.decode_payload(row.payload)[0][1][0].media
+    assert row.id == row_id
+    assert reopen_media.tell() == 0
+    assert reopen_media.read() == b"nested retry media"
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(
+        reopened, manager_adapter(), executor, worker_count=1
+    )
+    clock = {"now": 100.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    first_media = executor.submissions[0][1][1][1][0].media
+    assert first_media is not reopen_media
+    assert first_media.tell() == 0
+    assert first_media.read() == b"nested retry media"
+    executor.submissions[0][2].set_exception(RetryAfter(10))
+    scheduler.harvest_completed()
+
+    clock["now"] = 115.0
+    scheduler.dispatch_once()
+    retry_media = executor.submissions[1][1][1][1][0].media
+    assert retry_media is not first_media
+    assert retry_media is not reopen_media
+    assert retry_media.tell() == 0
+    assert retry_media.read() == b"nested retry media"
+    executor.submissions[1][2].set_result("sent")
+    scheduler.harvest_completed()
+    assert reopened.heads() == []
+    reopened.close()
 
 
 def test_blocking_retry_after_is_terminal(retained_queue: OutboundQueue) -> None:

@@ -448,6 +448,76 @@ def test_media_group_rejects_input_media_animation_before_insert(tmp_path):
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    ("kind", "expected_filename"),
+    [
+        ("explicit", "explicit.bin"),
+        ("input-file", "input.bin"),
+        ("local-basename", "local.bin"),
+        ("none", None),
+    ],
+)
+def test_nested_input_media_preserves_bytes_filename_precedence_and_attachment_link(
+    tmp_path, kind, expected_filename
+):
+    content = f"nested {kind}".encode()
+    expected_attach_name = None
+    local_path = None
+    if kind == "explicit":
+        media = InputMediaDocument(
+            io.BufferedReader(io.BytesIO(content)), filename=expected_filename
+        )
+        expected_attach_name = media.media.attach_name
+    elif kind == "input-file":
+        upload = InputFile(content, filename=expected_filename, attach=True)
+        expected_attach_name = upload.attach_name
+        media = InputMediaDocument(upload)
+    elif kind == "local-basename":
+        local_path = tmp_path / expected_filename
+        local_path.write_bytes(content)
+        media = InputMediaDocument(local_path)
+    else:
+        media = InputMediaDocument("placeholder")
+        object.__setattr__(media, "media", io.BufferedReader(io.BytesIO(content)))
+    queue = OutboundQueue(tmp_path)
+
+    queue.enqueue_many(
+        [QueueRequest("send_media_group", (100, [media]), {})],
+        lambda _name: media_operation,
+    )
+
+    if local_path is not None:
+        local_path.unlink()
+    delivered = queue.decode_payload(queue.heads()[0].payload)[0][1][0].media
+    if isinstance(delivered, InputFile):
+        assert delivered.input_file_content == content
+        assert delivered.filename == expected_filename
+        assert delivered.attach_name == expected_attach_name
+    else:
+        assert delivered.tell() == 0
+        assert delivered.read() == content
+        assert getattr(delivered, "name", None) == expected_filename
+
+
+def test_nested_local_media_read_failure_commits_zero_rows(tmp_path, monkeypatch):
+    local_path = tmp_path / "nested-unreadable.bin"
+    local_path.write_bytes(b"nested media")
+    media = InputMediaDocument(local_path)
+    queue = OutboundQueue(tmp_path)
+
+    def failing_open(_path, *_args, **_kwargs):
+        raise OSError("nested read failed")
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        queue.enqueue_many(
+            [QueueRequest("send_media_group", (100, [media]), {})],
+            lambda _name: media_operation,
+        )
+
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+
+
 def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
     queue = OutboundQueue(tmp_path)
     source = io.BufferedReader(io.BytesIO(b"reopened media"))
