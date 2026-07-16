@@ -83,6 +83,8 @@ P = ParamSpec("P")
 T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
 _INTERNAL_KWARGS = frozenset({
+    'prefix',
+    'suffix',
     '_sender_bot_id',
     '_slave_id',
     '_send_mode',
@@ -1207,37 +1209,78 @@ class TelegramBotManager(LocaleMixin):
             if callable(seek):
                 seek(0)
 
+    @staticmethod
+    def _queued_content_argument(
+        args: tuple,
+        kwargs: Mapping[str, object],
+        content_key: str,
+        content_index: int,
+    ) -> tuple[Optional[str], bool]:
+        if len(args) > content_index:
+            content = args[content_index]
+            return (content, True) if isinstance(content, str) else (None, True)
+        content = kwargs.get(content_key)
+        return (content, False) if isinstance(content, str) else (None, False)
+
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
         telegram_kwargs = self._strip_private_queue_metadata(kwargs)
-        content_key = "text" if row.operation in {"send_message", "edit_message_text"} else "caption"
-        content_limit = (
-            int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)
-            if content_key == "text"
-            else int(telegram.constants.MessageLimit.CAPTION_LENGTH)
-        )
-        full_content = telegram_kwargs.get(content_key)
+        telegram_args = args
+        content_spec = {
+            "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
+            "edit_message_text": ("text", 2, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
+            "send_audio": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_voice": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_video": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_document": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_animation": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_photo": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "edit_message_caption": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+        }.get(row.operation)
         attachment: Optional[io.BytesIO] = None
-        if isinstance(full_content, str) and len(full_content) >= content_limit:
-            attachment = io.BytesIO(full_content.encode("utf-8"))
-            telegram_kwargs[content_key] = full_content[:100] + "\n...\n" + full_content[-100:]
+        content_key: Optional[str] = None
+        original_parse_mode = str(telegram_kwargs.get("parse_mode", "")).lower()
+        if content_spec is not None:
+            content_key, content_index, content_limit = content_spec
+            full_content, is_positional = self._queued_content_argument(
+                telegram_args, telegram_kwargs, content_key, content_index
+            )
+            if full_content is not None and len(full_content) >= content_limit:
+                attachment_content = full_content
+                if original_parse_mode == "html":
+                    attachment_content = (
+                        "<html><head><meta charset='utf-8'></head>"
+                        "<body><pre style='white-space:pre-wrap'>"
+                        + full_content
+                        + "</pre></body></html>"
+                    )
+                attachment = io.BytesIO(attachment_content.encode("utf-8"))
+                truncated = full_content[:100] + "\n...\n" + full_content[-100:]
+                if is_positional:
+                    mutable_args = list(telegram_args)
+                    mutable_args[content_index] = truncated
+                    telegram_args = tuple(mutable_args)
+                else:
+                    telegram_kwargs[content_key] = truncated
         try:
-            result = method(*args, **telegram_kwargs)
+            result = method(*telegram_args, **telegram_kwargs)
         except telegram.error.BadRequest as error:
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
             telegram_kwargs.pop("parse_mode")
-            self._rewind_queued_files(args, telegram_kwargs)
-            result = method(*args, **telegram_kwargs)
-        if attachment is None:
+            self._rewind_queued_files(telegram_args, telegram_kwargs)
+            result = method(*telegram_args, **telegram_kwargs)
+        if attachment is None or content_key is None:
             return result
-        chat_id = args[0] if args else telegram_kwargs.get("chat_id")
+        chat_id = telegram_args[0] if telegram_args else telegram_kwargs.get("chat_id")
         message_id = getattr(result, "message_id", None)
         if chat_id is None or message_id is None:
             return result
-        parse_mode = str(telegram_kwargs.get("parse_mode", "")).lower()
-        extension = ".md" if parse_mode == "markdown" else ".html" if parse_mode == "html" else ".txt"
+        extension = (
+            ".md" if original_parse_mode == "markdown"
+            else ".html" if original_parse_mode == "html" else ".txt"
+        )
         label = "Message" if content_key == "text" else "Caption"
         sender.send_document(
             chat_id,
