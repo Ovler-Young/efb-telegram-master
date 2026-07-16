@@ -764,7 +764,7 @@ class DatabaseManager:
                 (MsgLog.master_msg_id_alt == old_message_id_str)
             )
             if row is not None:
-                master_msg_id = row.master_msg_id
+                master_msg_id = TgChatMsgIDStr(row.master_msg_id)
                 master_msg_id_alt = (
                     sent_message_id if sent_message_id != master_msg_id else row.master_msg_id_alt
                 )

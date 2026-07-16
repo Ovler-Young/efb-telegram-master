@@ -750,3 +750,59 @@ def test_telegram_origin_reaction_updates_and_retraction_edit_bot_alternate():
     ]
     assert [(call.args, call.kwargs) for call in processor.dispatch_message.call_args_list] == expected
     assert old_msg.reactions == {}
+
+
+def test_restarted_reactions_route_edits_to_persisted_auxiliary_sender():
+    cases = (
+        ("tests.mocks.slave", "100.11", 11),
+        ("blueset.telegram", "100.11", 10),
+    )
+
+    for delivered_to, alternate_id, expected_message_id in cases:
+        processor = build_slave_message_processor()
+        processor.REACTION_DB_WAIT_TIMEOUT = 0
+        processor.chat_manager = Mock()
+        processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+        processor.html_substitutions = Mock(return_value="message")
+        old_msg = SimpleNamespace(
+            uid=MessageID("__msg_id_reaction__"),
+            type=MsgType.Text,
+            reactions={},
+            vendor_specific=None,
+            chat=SimpleNamespace(module_id="tests.mocks.slave"),
+            deliver_to=SimpleNamespace(channel_id=delivered_to),
+        )
+        old_msg_db = SimpleNamespace(
+            master_msg_id="100.10",
+            master_msg_id_alt=alternate_id,
+            sender_bot_id="777",
+            build_etm_msg=Mock(return_value=old_msg),
+        )
+        processor.db = Mock()
+        processor.db.get_msg_log.return_value = old_msg_db
+
+        def edit_reaction(msg, template, old_msg_id, destination, thread_id):
+            return processor.slave_message_text(
+                msg, destination, thread_id, template, "__reactions__", old_msg_id=old_msg_id,
+            )
+
+        processor.dispatch_message = Mock(side_effect=edit_reaction)
+        status = SimpleNamespace(
+            chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+            msg_id="__msg_id_reaction__",
+            reactions={"R0": [object()]},
+        )
+
+        SlaveMessageProcessor.update_reactions(processor, status)
+
+        old_msg_db.build_etm_msg.assert_called_once_with(chat_manager=processor.chat_manager)
+        processor.bot.edit_message_text.assert_called_once_with(
+            chat_id=100,
+            message_id=expected_message_id,
+            text="message",
+            prefix="__template__",
+            suffix="__reactions__",
+            parse_mode="HTML",
+            reply_markup=None,
+            _sender_bot_id="777",
+        )
