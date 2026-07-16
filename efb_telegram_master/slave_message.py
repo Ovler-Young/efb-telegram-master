@@ -41,6 +41,7 @@ from .constants import Emoji
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import get_msg_type
+from .ptb_compat import sync_reply_text
 from .utils import TelegramChatID, TelegramTopicID, TelegramMessageID, OldMsgID
 
 if TYPE_CHECKING:
@@ -257,14 +258,16 @@ class SlaveMessageProcessor(LocaleMixin):
                          tg_dest: TelegramChatID,
                          thread_id: Optional[TelegramTopicID],
                          silent: bool = False,
-                         dedupe_key: Optional[Tuple[str, str]] = None):
+                         dedupe_key: Optional[Tuple[str, str]] = None,
+                         database_old_msg_id: Optional[OldMsgID] = None,
+                         target_msg_id_override: Optional[TelegramMessageID] = None):
         """Dispatch with header, destination and Telegram message ID and destinations."""
 
         xid = msg.uid
 
         # When targeting a message (reply to)
-        target_msg_id: Optional[TelegramMessageID] = None
-        if isinstance(msg.target, Message):
+        target_msg_id = target_msg_id_override
+        if target_msg_id is None and isinstance(msg.target, Message):
             self.logger.debug("[%s] Message is replying to %s.", msg.uid, msg.target)
             log = self.db.get_msg_log(
                 slave_msg_id=msg.target.uid,
@@ -367,7 +370,7 @@ class SlaveMessageProcessor(LocaleMixin):
             if not hasattr(tg_msg, 'task_id'):
                 self.logger.warning("[%s] Queued message missing task_id, cannot track database update", xid)
                 self._release_pending_slave_message(dedupe_key)
-        else:
+        elif not getattr(tg_msg, 'durable_db_logged', False):
             # Normal (blocking) execution: send already succeeded, then
             # write the DB mapping once. DB failures are logged only.
             self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
@@ -378,7 +381,8 @@ class SlaveMessageProcessor(LocaleMixin):
             sender_bot_id = getattr(tg_msg, 'sender_bot_id', None)
 
             self.bot.write_db_mapping(
-                etm_msg, tg_msg, old_msg_id, sender_bot_id=sender_bot_id, on_complete=on_db_complete,
+                etm_msg, tg_msg, database_old_msg_id or old_msg_id,
+                sender_bot_id=sender_bot_id, on_complete=on_db_complete,
             )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
@@ -509,10 +513,8 @@ class SlaveMessageProcessor(LocaleMixin):
             '_send_mode': send_mode,
             '_slave_id': utils.chat_id_to_str(chat=msg.chat),
         }
-        if send_mode == 'eventual' and on_complete is not self._NO_DB_CALLBACK:
+        if on_complete is not self._NO_DB_CALLBACK:
             db_on_complete = cast(Optional[Callable[[], None]], on_complete)
-            # This is a DB metadata snapshot. Send file handles are cloned when
-            # the Telegram call enters the FIFO queue.
             kwargs['_queued_db_log_context'] = QueuedDbLogContext(
                 ETMMsg.from_efbmsg(msg, self.chat_manager),
                 old_msg_id,
@@ -807,7 +809,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -908,7 +910,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -996,7 +998,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                         **self._make_send_kwargs(
                                                             msg, mode='blocking', on_complete=on_db_complete,
                                                         ))
-                        message.reply_text(file_too_large)
+                        sync_reply_text(self.bot, message, file_too_large, quote=True)
                         return message
 
                 try:
@@ -1136,7 +1138,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -1198,7 +1200,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -1313,7 +1315,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -1474,6 +1476,13 @@ class SlaveMessageProcessor(LocaleMixin):
             return old_msg_db.master_msg_id or old_msg_db.master_msg_id_alt
         return old_msg_db.master_msg_id_alt or old_msg_db.master_msg_id
 
+    @staticmethod
+    def _reaction_edit_target_missing(error: telegram.error.BadRequest) -> bool:
+        message = (error.message or '').strip().casefold()
+        if message.startswith('bad request: '):
+            message = message.removeprefix('bad request: ').strip()
+        return message in {'message to edit not found', 'message not found'}
+
     def update_reactions(self, status: MessageReactionsUpdate):
         """Update reactions to a Telegram message."""
         slave_origin_uid = utils.chat_id_to_str(chat=status.chat)
@@ -1507,7 +1516,38 @@ class SlaveMessageProcessor(LocaleMixin):
         effective_msg = self._reaction_target_message_id(old_msg, old_msg_db)
         chat_id, msg_id = utils.message_id_str_to_id(effective_msg)
 
-        self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
+        telegram_origin = bool(
+            old_msg.deliver_to and old_msg.deliver_to.channel_id == old_msg.chat.module_id
+        )
+        if telegram_origin and not old_msg_db.master_msg_id_alt:
+            old_msg.edit = False
+            old_msg.vendor_specific = old_msg.vendor_specific or {}
+            old_msg.vendor_specific['_force_send_mode'] = 'blocking'
+            self.dispatch_message(
+                old_msg, msg_template, None, tg_dest, thread_id,
+                database_old_msg_id=(chat_id, msg_id), target_msg_id_override=msg_id,
+            )
+            return
+
+        try:
+            self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
+        except telegram.error.BadRequest as error:
+            if not (
+                telegram_origin and old_msg_db.master_msg_id_alt and
+                self._reaction_edit_target_missing(error)
+            ):
+                raise
+
+            primary_chat_id, primary_msg_id = utils.message_id_str_to_id(
+                utils.TgChatMsgIDStr(old_msg_db.master_msg_id)
+            )
+            old_msg.edit = False
+            old_msg.vendor_specific = old_msg.vendor_specific or {}
+            old_msg.vendor_specific['_force_send_mode'] = 'blocking'
+            self.dispatch_message(
+                old_msg, msg_template, None, primary_chat_id, thread_id,
+                database_old_msg_id=(chat_id, msg_id), target_msg_id_override=primary_msg_id,
+            )
 
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name

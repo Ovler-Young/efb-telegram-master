@@ -695,9 +695,11 @@ class TelegramChannel(MasterChannel):
     def void_callback_handler(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
         assert update.effective_message
+        assert update.effective_chat
         assert update.callback_query
         self.bot_manager.answer_callback_query(update.callback_query.id,
                                                text=self._("This button does nothing."),
+                                               chat_id=update.effective_chat.id,
                                                message_id=update.effective_message.message_id,
                                                cache_time=180)
 

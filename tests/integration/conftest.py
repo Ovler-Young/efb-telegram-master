@@ -144,8 +144,17 @@ def poll_bot_factory():
             while time.time() < deadline:
                 if polling_errors:
                     raise polling_errors[0]
-                if channel.bot_manager._runtime._ready.wait(timeout=0.1):
-                    time.sleep(1)
+                runtime_ready = channel.bot_manager._runtime._ready.wait(timeout=0.1)
+                application = channel.bot_manager.application
+                updater = application.updater
+                if (
+                    runtime_ready
+                    and updater is not None
+                    and updater.running
+                    and application.running
+                ):
+                    if polling_errors:
+                        raise polling_errors[0]
                     state["channel"] = channel
                     state["thread"] = polling_thread
                     state["errors"] = polling_errors

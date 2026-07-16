@@ -1,11 +1,13 @@
+from io import BytesIO
 import threading
 import time
+import pytest
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from typing import cast
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from ehforwarderbot import Message, Chat
 from ehforwarderbot.constants import MsgType
@@ -102,6 +104,10 @@ def build_slave_message_processor() -> SlaveMessageProcessor:
     processor.flag = Mock(side_effect=lambda flag_name: "emoji" if flag_name == "default_media_prompt" else False)
     processor.logger = Mock()
     processor.channel = cast(TelegramChannel, SimpleNamespace(config={"admins": [1]}, flag=processor.flag))
+    processor._make_send_kwargs = Mock(return_value={
+        "_send_mode": "blocking",
+        "_slave_id": "tests.mocks.slave __chat_id__",
+    })
     return processor
 
 
@@ -663,3 +669,323 @@ def test_update_reactions_waits_for_queued_database_log():
     assert old_msg.reactions == status.reactions
     processor.dispatch_message.assert_called_once_with(old_msg, "__template__", (100, 10), 100, None)
     processor.logger.error.assert_not_called()
+
+
+def test_first_telegram_origin_reaction_replies_to_user_message():
+    processor = Mock(spec=SlaveMessageProcessor)
+    processor.REACTION_DB_WAIT_TIMEOUT = 0
+    processor.chat_manager = Mock()
+    processor.dispatch_message = Mock()
+    processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+    processor.logger = Mock()
+    processor._reaction_target_message_id = SlaveMessageProcessor._reaction_target_message_id
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        reactions={},
+        vendor_specific=None,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt=None,
+        sender_bot_id=None,
+        build_etm_msg=Mock(return_value=old_msg),
+    )
+    processor.db = Mock()
+    processor.db.get_msg_log.return_value = old_msg_db
+    status = SimpleNamespace(
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+        msg_id="__msg_id_reaction__",
+        reactions={"R0": [object()]},
+    )
+
+    SlaveMessageProcessor.update_reactions(processor, status)
+
+    processor.dispatch_message.assert_called_once_with(
+        old_msg,
+        "__template__",
+        None,
+        100,
+        None,
+        database_old_msg_id=(100, 10),
+        target_msg_id_override=10,
+    )
+    assert old_msg.vendor_specific["_force_send_mode"] == "blocking"
+
+
+def test_telegram_origin_reaction_updates_and_retraction_edit_bot_alternate():
+    processor = Mock(spec=SlaveMessageProcessor)
+    processor.REACTION_DB_WAIT_TIMEOUT = 0
+    processor.chat_manager = Mock()
+    processor.dispatch_message = Mock()
+    processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+    processor.logger = Mock()
+    processor._reaction_target_message_id = SlaveMessageProcessor._reaction_target_message_id
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        reactions={},
+        vendor_specific=None,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt="100.11",
+        sender_bot_id=None,
+        build_etm_msg=Mock(return_value=old_msg),
+    )
+    processor.db = Mock()
+    processor.db.get_msg_log.return_value = old_msg_db
+
+    for reactions in ({"R0": [object()]}, {}):
+        status = SimpleNamespace(
+            chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+            msg_id="__msg_id_reaction__",
+            reactions=reactions,
+        )
+        SlaveMessageProcessor.update_reactions(processor, status)
+
+    expected = [
+        ((old_msg, "__template__", (100, 11), 100, None), {}),
+        ((old_msg, "__template__", (100, 11), 100, None), {}),
+    ]
+    assert [(call.args, call.kwargs) for call in processor.dispatch_message.call_args_list] == expected
+    assert old_msg.reactions == {}
+
+
+def test_restarted_reactions_route_edits_to_persisted_auxiliary_sender():
+    cases = (
+        ("tests.mocks.slave", "100.11", 11),
+        ("blueset.telegram", "100.11", 10),
+    )
+
+    for delivered_to, alternate_id, expected_message_id in cases:
+        processor = build_slave_message_processor()
+        processor.REACTION_DB_WAIT_TIMEOUT = 0
+        processor.chat_manager = Mock()
+        processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+        processor.html_substitutions = Mock(return_value="message")
+        old_msg = SimpleNamespace(
+            uid=MessageID("__msg_id_reaction__"),
+            type=MsgType.Text,
+            reactions={},
+            vendor_specific=None,
+            chat=SimpleNamespace(module_id="tests.mocks.slave"),
+            deliver_to=SimpleNamespace(channel_id=delivered_to),
+        )
+        old_msg_db = SimpleNamespace(
+            master_msg_id="100.10",
+            master_msg_id_alt=alternate_id,
+            sender_bot_id="777",
+            build_etm_msg=Mock(return_value=old_msg),
+        )
+        processor.db = Mock()
+        processor.db.get_msg_log.return_value = old_msg_db
+
+        def edit_reaction(msg, template, old_msg_id, destination, thread_id):
+            return processor.slave_message_text(
+                msg, destination, thread_id, template, "__reactions__", old_msg_id=old_msg_id,
+            )
+
+        processor.dispatch_message = Mock(side_effect=edit_reaction)
+        status = SimpleNamespace(
+            chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+            msg_id="__msg_id_reaction__",
+            reactions={"R0": [object()]},
+        )
+
+        SlaveMessageProcessor.update_reactions(processor, status)
+
+        old_msg_db.build_etm_msg.assert_called_once_with(chat_manager=processor.chat_manager)
+        processor.bot.edit_message_text.assert_called_once_with(
+            chat_id=100,
+            message_id=expected_message_id,
+            text="message",
+            prefix="__template__",
+            suffix="__reactions__",
+            parse_mode="HTML",
+            reply_markup=None,
+            _sender_bot_id="777",
+        )
+
+
+def build_reaction_failure_processor(error):
+    processor = Mock(spec=SlaveMessageProcessor)
+    processor.REACTION_DB_WAIT_TIMEOUT = 0
+    processor.chat_manager = Mock()
+    processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+    processor.logger = Mock()
+    processor._reaction_target_message_id = SlaveMessageProcessor._reaction_target_message_id
+    processor._reaction_edit_target_missing = SlaveMessageProcessor._reaction_edit_target_missing
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        reactions={},
+        vendor_specific=None,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt="100.11",
+        sender_bot_id="777",
+        build_etm_msg=Mock(return_value=old_msg),
+    )
+    processor.db = Mock()
+    processor.db.get_msg_log.return_value = old_msg_db
+    processor.dispatch_message = Mock(side_effect=error)
+    status = SimpleNamespace(
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+        msg_id="__msg_id_reaction__",
+        reactions={"R0": [object()]},
+    )
+    return processor, old_msg, old_msg_db, status
+
+
+def test_missing_reaction_alternate_creates_one_replacement_reply():
+    processor, old_msg, old_msg_db, status = build_reaction_failure_processor(
+        BadRequest("Message to edit not found")
+    )
+    processor.dispatch_message.side_effect = [BadRequest("Message to edit not found"), None]
+
+    SlaveMessageProcessor.update_reactions(processor, status)
+
+    assert processor.dispatch_message.call_args_list[0].args[2] == (100, 11)
+    assert processor.dispatch_message.call_args_list[1].args == (
+        old_msg, "__template__", None, 100, None,
+    )
+    assert processor.dispatch_message.call_args_list[1].kwargs == {
+        "database_old_msg_id": (100, 11),
+        "target_msg_id_override": 10,
+    }
+    assert old_msg.vendor_specific == {"_sender_bot_id": "777", "_force_send_mode": "blocking"}
+    assert (old_msg_db.master_msg_id, old_msg_db.master_msg_id_alt) == ("100.10", "100.11")
+
+
+def test_nonrecoverable_reaction_edit_failures_do_not_create_reply():
+    errors = (
+        BadRequest("Not enough rights to edit this message"),
+        BadRequest("Can't parse entities"),
+        BadRequest("Bot is not a member of the supergroup chat"),
+        RetryAfter(1),
+        NetworkError("transport failed"),
+        TelegramError("other edit failure"),
+    )
+
+    for error in errors:
+        processor, _old_msg, old_msg_db, status = build_reaction_failure_processor(error)
+        with pytest.raises(type(error)):
+            SlaveMessageProcessor.update_reactions(processor, status)
+
+        assert processor.dispatch_message.call_count == 1
+        assert (old_msg_db.master_msg_id, old_msg_db.master_msg_id_alt) == ("100.10", "100.11")
+
+
+def test_first_reaction_db_failure_retries_reply_without_editing_user_message():
+    processor, _old_msg, old_msg_db, status = build_reaction_failure_processor(TelegramError("unused"))
+    old_msg_db.master_msg_id_alt = None
+    old_msg_db.sender_bot_id = None
+
+    def dispatch_after_failed_write(*args, **kwargs):
+        if processor.dispatch_message.call_count == 2:
+            old_msg_db.master_msg_id_alt = "100.12"
+            old_msg_db.sender_bot_id = "888"
+
+    processor.dispatch_message = Mock(side_effect=dispatch_after_failed_write)
+    for reactions in ({"R0": [object()]}, {"R1": [object()]}, {"R2": [object()]}):
+        status.reactions = reactions
+        SlaveMessageProcessor.update_reactions(processor, status)
+
+    old_ids = [call.args[2] for call in processor.dispatch_message.call_args_list]
+    assert old_ids == [None, None, (100, 12)]
+    assert (100, 10) not in old_ids
+    assert processor.dispatch_message.call_args_list[0].kwargs["database_old_msg_id"] == (100, 10)
+    assert processor.dispatch_message.call_args_list[1].kwargs["database_old_msg_id"] == (100, 10)
+
+
+def test_replacement_db_failure_retries_deleted_alternate_then_edits_replacement():
+    processor, _old_msg, old_msg_db, status = build_reaction_failure_processor(
+        BadRequest("Message to edit not found")
+    )
+    replacement_replies = 0
+
+    def dispatch_after_failed_replacement(_msg, _template, old_msg_id, _destination, _thread_id, **_kwargs):
+        nonlocal replacement_replies
+        if old_msg_id == (100, 11):
+            raise BadRequest("Message to edit not found")
+        if old_msg_id is None:
+            replacement_replies += 1
+            if replacement_replies == 2:
+                old_msg_db.master_msg_id_alt = "100.13"
+                old_msg_db.sender_bot_id = "999"
+
+    processor.dispatch_message = Mock(side_effect=dispatch_after_failed_replacement)
+    for reactions in ({"R0": [object()]}, {"R1": [object()]}, {"R2": [object()]}):
+        status.reactions = reactions
+        SlaveMessageProcessor.update_reactions(processor, status)
+
+    old_ids = [call.args[2] for call in processor.dispatch_message.call_args_list]
+    assert old_ids == [(100, 11), None, (100, 11), None, (100, 13)]
+    assert (100, 10) not in old_ids
+    replacement_calls = [call for call in processor.dispatch_message.call_args_list if call.args[2] is None]
+    assert [call.kwargs["database_old_msg_id"] for call in replacement_calls] == [(100, 11), (100, 11)]
+    assert [call.kwargs["target_msg_id_override"] for call in replacement_calls] == [10, 10]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "message_type"),
+    (
+        ("slave_message_image", MsgType.Image),
+        ("slave_message_animation", MsgType.Animation),
+        ("slave_message_sticker", MsgType.Sticker),
+        ("slave_message_file", MsgType.File),
+        ("slave_message_voice", MsgType.Voice),
+        ("slave_message_video", MsgType.Video),
+    ),
+)
+def test_all_oversize_branches_use_one_sync_quoted_reply(method_name, message_type):
+    processor = build_slave_message_processor()
+    processor.check_file_size = Mock(return_value="__file_too_large__")
+    processor.html_substitutions = Mock(return_value="__text__")
+    processor.build_chat_info_inline_keyboard = Mock(return_value=None)
+    processor._cleanup_pending_local_api_files = Mock()
+    placeholder = SimpleNamespace(
+        chat=SimpleNamespace(id=100),
+        message_id=501,
+        message_thread_id=77,
+        reply_text=AsyncMock(),
+    )
+    processor.bot.send_message.side_effect = [placeholder, SimpleNamespace(message_id=502)]
+    file = BytesIO(b"oversize")
+    msg = SimpleNamespace(
+        uid=MessageID("__oversize__"),
+        type=message_type,
+        path=None,
+        mime="application/octet-stream",
+        text="__text__",
+        file=file,
+        filename="oversize.bin",
+        edit_media=False,
+        vendor_specific={},
+    )
+
+    result = getattr(processor, method_name)(
+        msg,
+        100,
+        77,
+        "__template__",
+        "__reactions__",
+        target_msg_id=42,
+    )
+
+    assert result is placeholder
+    assert processor.bot.send_message.call_count == 2
+    reply_call = processor.bot.send_message.call_args_list[1]
+    assert reply_call.args == (100,)
+    assert reply_call.kwargs == {
+        "text": "__file_too_large__",
+        "message_thread_id": 77,
+        "reply_to_message_id": 501,
+    }
+    placeholder.reply_text.assert_not_called()
+    assert file.closed

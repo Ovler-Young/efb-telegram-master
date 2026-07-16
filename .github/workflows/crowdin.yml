@@ -9,6 +9,7 @@ on:
 jobs:
   crowdin:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
     - uses: actions/checkout@v1
     - name: Set up Python 3.10

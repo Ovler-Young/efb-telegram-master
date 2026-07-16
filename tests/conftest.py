@@ -23,7 +23,10 @@ pytestmark = [pytest.mark.xfail(raises=TimedOut), pytest.mark.xfail(raises=Netwo
 
 @pytest.fixture(scope='session')
 def bot_info():
-    return get_bot()
+    try:
+        return get_bot()
+    except ValueError as error:
+        pytest.skip(str(error))
 
 
 @pytest.fixture(scope='session')
