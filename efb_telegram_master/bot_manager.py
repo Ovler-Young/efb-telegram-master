@@ -476,6 +476,8 @@ class TelegramBotManager(LocaleMixin):
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
         self._bot_chat_retry_failures: dict[BotChatKey, int] = {}
+        self._queued_db_log_contexts: dict[int, QueuedDbLogContext] = {}
+        self._queued_db_log_context_lock = threading.Lock()
         self._last_metrics_snapshot = 0.0
         from .etm_metrics import Metrics, start_metrics_server
         _metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
@@ -792,6 +794,7 @@ class TelegramBotManager(LocaleMixin):
         send_mode = queued_kwargs.pop("_send_mode", "blocking")
         force_main_bot = queued_kwargs.pop("_force_main_bot", False)
         queued_kwargs.pop("_required_sender_bot_id", None)
+        db_log_context = queued_kwargs.pop("_queued_db_log_context", None)
         if send_mode not in {"blocking", "eventual"}:
             raise QueueEnqueueError("_send_mode must be 'blocking' or 'eventual'.")
 
@@ -813,6 +816,7 @@ class TelegramBotManager(LocaleMixin):
                 function_args,
                 queued_kwargs,
                 cleanup_files=cleanup_files,
+                db_log_context=db_log_context,
             )
 
         blocking_kwargs = dict(queued_kwargs)
@@ -930,7 +934,12 @@ class TelegramBotManager(LocaleMixin):
             raise QueueEnqueueError(f"Telegram bot has no queued operation {operation!r}.")
         return cast(Callable[..., object], method)
 
-    def _enqueue_requests(self, requests: list[QueueRequest]) -> tuple[str, Future]:
+    def _enqueue_requests(
+        self,
+        requests: list[QueueRequest],
+        *,
+        db_log_context: Optional[QueuedDbLogContext] = None,
+    ) -> tuple[str, Future]:
         with self._outbound_scheduler._lock:
             if self._outbound_scheduler.stopping:
                 error = self._outbound_scheduler.failure or SchedulerStoppedError(
@@ -938,6 +947,9 @@ class TelegramBotManager(LocaleMixin):
                 )
                 raise error
             row_id, waiter = self._outbound_queue.enqueue_many(requests, self._queue_operation)
+            if db_log_context is not None:
+                with self._queued_db_log_context_lock:
+                    self._queued_db_log_contexts[row_id] = db_log_context
             self._outbound_scheduler.wake_event.set()
             return str(row_id), waiter
 
@@ -947,13 +959,15 @@ class TelegramBotManager(LocaleMixin):
         args: tuple,
         kwargs: dict,
         cleanup_files: Optional[list] = None,
+        *,
+        db_log_context: Optional[QueuedDbLogContext] = None,
     ) -> str:
         operation = function.__name__
         telegram_args = args[1:] if args and args[0] is self else args
         queued_kwargs = dict(kwargs)
         row_id, _ = self._enqueue_requests([
             QueueRequest(operation=operation, args=telegram_args, kwargs=queued_kwargs)
-        ])
+        ], db_log_context=db_log_context)
         for path in cleanup_files or ():
             try:
                 os.unlink(path)
@@ -970,12 +984,17 @@ class TelegramBotManager(LocaleMixin):
         kwargs: dict,
         *,
         cleanup_files: Optional[list] = None,
+        db_log_context: Optional[QueuedDbLogContext] = None,
     ) -> SendReceipt:
         queued_kwargs = dict(kwargs)
         queued_kwargs["_slave_id"] = slave_id
         queued_kwargs["_send_mode"] = "eventual"
         row_id = self._enqueue_send_task(
-            function, args, queued_kwargs, cleanup_files=cleanup_files
+            function,
+            args,
+            queued_kwargs,
+            cleanup_files=cleanup_files,
+            db_log_context=db_log_context,
         )
         return self._make_send_receipt(
             self._create_queued_message_placeholder(chat_id, row_id), queued=True, task_id=row_id
@@ -1105,13 +1124,12 @@ class TelegramBotManager(LocaleMixin):
                     preferred = self.bot_pool.preferred_sender(row.slave_id) if row.slave_id else None
                     affinity_rank = 0 if preferred is auxiliary else 2
                     candidates.append((affinity_rank, str(auxiliary.bot_id), selection, deadline))
-        if membership_retry_at is not None:
-            return SenderSelectionResult(retry_at=membership_retry_at)
-
         selectable = [candidate for candidate in candidates if candidate[3] <= now]
         if selectable:
             _rank, _bot_id, selection, _deadline = min(selectable, key=lambda candidate: candidate[:2])
             return SenderSelectionResult(selection=selection)
+        if membership_retry_at is not None:
+            return SenderSelectionResult(retry_at=membership_retry_at)
         retry_deadlines = [candidate[3] for candidate in candidates]
         if retry_deadlines:
             return SenderSelectionResult(retry_at=min(retry_deadlines))
@@ -1142,11 +1160,47 @@ class TelegramBotManager(LocaleMixin):
 
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
         method = getattr(selection.sender, row.operation)
-        return method(*args, **kwargs)
+        return method(*args, **self._strip_private_queue_metadata(kwargs))
+
+    def _pop_queued_db_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
+        if not isinstance(row_id, int):
+            return None
+        contexts = getattr(self, "_queued_db_log_contexts", None)
+        context_lock = getattr(self, "_queued_db_log_context_lock", None)
+        if contexts is None or context_lock is None:
+            return None
+        with context_lock:
+            return contexts.pop(row_id, None)
+
+    def _finish_queued_database_update(
+        self,
+        row_id: object,
+        real_tg_msg: Optional[TelegramMessage] = None,
+        *,
+        sender_bot_id: Optional[str] = None,
+    ) -> None:
+        db_log_context = self._pop_queued_db_log_context(row_id)
+        if db_log_context is None:
+            return
+        if real_tg_msg is None:
+            self._run_database_update_callback(db_log_context.on_complete)
+            return
+        self._write_database_update(
+            db_log_context.etm_msg,
+            db_log_context.old_msg_id,
+            real_tg_msg,
+            sender_bot_id=sender_bot_id,
+            on_complete=db_log_context.on_complete,
+        )
 
     def record_queued_success(
         self, row, result: object, selection: SenderSelection
     ) -> QueuedCompletionDecision:
+        self._finish_queued_database_update(
+            getattr(row, "id", None),
+            cast(TelegramMessage, result),
+            sender_bot_id=selection.sender_bot_id,
+        )
         if row.priority == 0:
             self._bot_chat_retry_failures.pop((selection.sender_bot_id, row.telegram_chat_id), None)
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
@@ -1183,6 +1237,7 @@ class TelegramBotManager(LocaleMixin):
             self._bot_chat_disabled_until[key] = time.monotonic() + retry_after
         if row.priority == 0:
             self._bot_chat_retry_failures.pop(key, None)
+        self._finish_queued_database_update(getattr(row, "id", None))
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
     def remove_confirmed_non_member_affinity_for_sender_chat(

@@ -107,15 +107,27 @@ def test_main_bot_sentinel_selects_main_bot_without_sender_id() -> None:
     assert result.selection.sender_bot_id is None
 
 
-def test_unknown_auxiliary_membership_blocks_affinity_only_selection_for_250ms() -> None:
+def test_unknown_auxiliary_membership_does_not_block_selectable_main_sender() -> None:
     unknown = _auxiliary(10, membership=None)
     manager = _manager(unknown)
     now = _now()
 
     result = manager.select_sender(_task(), now)
 
-    assert result.selection is None
-    assert result.retry_at == now + 0.25
+    assert result.selection is not None
+    assert result.selection.sender is manager._bot
+
+
+def test_unknown_auxiliary_membership_does_not_block_selectable_auxiliary_sender() -> None:
+    unknown = _auxiliary(10, membership=None)
+    selectable = _auxiliary(20, membership=True)
+    manager = _manager(unknown, selectable)
+    manager._rate_limiter.delay = 1.0
+
+    result = manager.select_sender(_task(), _now())
+
+    assert result.selection is not None
+    assert result.selection.sender_bot_id == "20"
 
 
 def test_affinity_wins_ties_then_main_wins_without_affinity() -> None:

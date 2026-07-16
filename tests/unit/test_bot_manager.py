@@ -12,7 +12,12 @@ import pytest
 import telegram.error
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from efb_telegram_master.bot_manager import SendReceipt, SyncBotFacade, TelegramBotManager
+from efb_telegram_master.bot_manager import (
+    QueuedDbLogContext,
+    SendReceipt,
+    SyncBotFacade,
+    TelegramBotManager,
+)
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 
 
@@ -266,6 +271,98 @@ def test_public_send_message_routes_eligible_requests_as_eventual():
     assert manager._enqueue_eventual_send.call_args.args[3:] == ((manager, 123), {"text": "queued"})
 
 
+def test_queued_route_defers_db_mapping_context_outside_telegram_kwargs():
+    manager = _make_queueing_manager()
+    db_context = QueuedDbLogContext(Mock(), None, Mock())
+
+    manager.send_message(
+        123,
+        text="queued",
+        _send_mode="eventual",
+        _slave_id="slave.chat",
+        _queued_db_log_context=db_context,
+    )
+
+    eventual_call = manager._enqueue_eventual_send.call_args
+    assert eventual_call.args[4] == {"text": "queued"}
+    assert eventual_call.kwargs["db_log_context"] is db_context
+
+
+def test_queued_success_writes_deferred_db_mapping_once():
+    manager = object.__new__(TelegramBotManager)
+    etm_msg = Mock()
+    old_msg_id = Mock()
+    on_complete = Mock()
+    manager._queued_db_log_contexts = {7: QueuedDbLogContext(etm_msg, old_msg_id, on_complete)}
+    manager._queued_db_log_context_lock = threading.Lock()
+    manager._bot_chat_retry_failures = {}
+    manager.bot_pool = None
+    manager._write_database_update = Mock()
+    row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
+    result = Mock()
+
+    TelegramBotManager.record_queued_success(manager, row, result, SimpleNamespace(sender_bot_id="10"))
+
+    manager._write_database_update.assert_called_once_with(
+        etm_msg,
+        old_msg_id,
+        result,
+        sender_bot_id="10",
+        on_complete=on_complete,
+    )
+    assert manager._queued_db_log_contexts == {}
+
+
+def test_enqueue_registers_deferred_mapping_before_waking_worker():
+    manager = object.__new__(TelegramBotManager)
+    db_context = QueuedDbLogContext(Mock(), None, Mock())
+    manager._queued_db_log_contexts = {}
+    manager._queued_db_log_context_lock = threading.Lock()
+    wake_event = Mock()
+    manager._outbound_scheduler = SimpleNamespace(
+        _lock=threading.RLock(),
+        stopping=False,
+        wake_event=wake_event,
+    )
+    manager._outbound_queue = SimpleNamespace(enqueue_many=Mock(return_value=(7, Mock())))
+    manager._queue_operation = Mock()
+
+    def assert_context_registered() -> None:
+        assert manager._queued_db_log_contexts == {7: db_context}
+
+    wake_event.set.side_effect = assert_context_registered
+    row_id, _waiter = TelegramBotManager._enqueue_requests(
+        manager,
+        [Mock()],
+        db_log_context=db_context,
+    )
+
+    assert row_id == "7"
+    wake_event.set.assert_called_once_with()
+
+
+def test_terminal_queued_failure_releases_deferred_mapping_callback():
+    manager = object.__new__(TelegramBotManager)
+    on_complete = Mock()
+    manager._queued_db_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
+    manager._queued_db_log_context_lock = threading.Lock()
+    manager._bot_chat_disabled_until = {}
+    manager._bot_chat_retry_failures = {}
+    manager.bot_pool = None
+    row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
+
+    decision = TelegramBotManager.record_queued_failure(
+        manager,
+        row,
+        Exception("send failed"),
+        SimpleNamespace(sender_bot_id="10"),
+    )
+
+    assert decision.kind.name == "TERMINAL_FAILURE"
+    on_complete.assert_called_once_with()
+    assert manager._queued_db_log_contexts == {}
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -347,7 +444,7 @@ def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():
         "_slave_id": "slave.chat",
         "_send_mode": "eventual",
     }
-    assert {"target", "db_log_context", "priority", "waiter"}.isdisjoint(
+    assert {"target", "priority", "waiter"}.isdisjoint(
         inspect.signature(TelegramBotManager._enqueue_send_task).parameters
     )
 
