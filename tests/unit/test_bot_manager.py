@@ -19,17 +19,19 @@ from efb_telegram_master.bot_manager import (
     TelegramBotManager,
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
-from efb_telegram_master.outbound import QueueEnqueueError
+from efb_telegram_master.outbound import QueueEnqueueError, SenderSelection
 
 
 def _bind_blocking_enqueue_helper(manager):
     if "_enqueue_blocking_send_and_wait" not in getattr(manager, "__dict__", {}):
         def _enqueue_blocking_send_and_wait(slave_id, chat_id, fn, args, kwargs, cleanup_files=None):
-            send_kwargs = {
-                key: value for key, value in kwargs.items()
-                if not key.startswith("_")
-            }
-            result = fn(*args, **send_kwargs)
+            queued_args = args[1:] if args and args[0] is manager else args
+            result = manager.execute_queued_call(
+                SimpleNamespace(operation=fn.__name__),
+                queued_args,
+                kwargs,
+                SenderSelection(sender=manager._bot, sender_bot_id=None),
+            )
             sender_bot_id = None
             required_sender = kwargs.get("_required_sender_bot_id")
             if required_sender not in {None, "__main__"}:
@@ -178,6 +180,28 @@ def _make_queueing_manager() -> TelegramBotManager:
     manager._enqueue_eventual_send = Mock()
     manager._enqueue_blocking_send_and_wait = Mock()
     return manager
+
+
+def test_blocking_enqueue_helper_executes_queued_send_preparation():
+    manager = _make_queueing_manager()
+    result_message = SimpleNamespace(message_id=7)
+    manager._bot.send_message.return_value = result_message
+    del manager._enqueue_blocking_send_and_wait
+    _bind_blocking_enqueue_helper(manager)
+    body = "x" * int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)
+
+    receipt = manager._enqueue_blocking_send_and_wait(
+        None,
+        123,
+        manager._queued_operation_callable("send_message"),
+        (manager, 123, body),
+        {"_required_sender_bot_id": "__main__"},
+    )
+
+    assert receipt.message is result_message
+    manager._bot.send_message.assert_called_once_with(123, body[:100] + "\n...\n" + body[-100:])
+    manager._bot.send_document.assert_called_once()
+    assert manager._bot.send_document.call_args.kwargs["filename"] == "123_7.txt"
 
 
 def test_build_bot_passes_local_mode_when_enabled():
