@@ -6,7 +6,16 @@ import tempfile
 import threading
 
 import pytest
-from telegram import InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo, PhotoSize
+from telegram import (
+    InputFile,
+    InputMediaAnimation,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaLivePhoto,
+    InputMediaPhoto,
+    InputMediaVideo,
+    PhotoSize,
+)
 
 from efb_telegram_master.outbound import (
     InvalidQueuedPayloadError,
@@ -365,6 +374,78 @@ def test_media_group_snapshots_nested_files_thumbnails_and_attach_names(tmp_path
             decoded[1].thumbnail.attach_name) == attach_names
     assert (decoded[0].media.input_file_content, decoded[1].media.input_file_content,
             decoded[1].thumbnail.input_file_content) == (b"photo", b"video", b"thumb")
+
+
+@pytest.mark.parametrize(
+    ("media_type", "attachment_fields"),
+    [
+        (InputMediaAudio, ("media", "thumbnail")),
+        (InputMediaDocument, ("media", "thumbnail")),
+        (InputMediaPhoto, ("media",)),
+        (InputMediaVideo, ("media", "thumbnail", "cover")),
+        (InputMediaLivePhoto, ("media", "photo")),
+    ],
+    ids=["audio", "document", "photo", "video", "live-photo"],
+)
+def test_media_group_accepts_exact_supported_subtypes_and_normalizes_upload_fields(
+    tmp_path, media_type, attachment_fields
+):
+    uploads = {}
+    sources = []
+    expected = {}
+    for field in attachment_fields:
+        content = f"{media_type.__name__} {field}".encode()
+        filename = f"{media_type.__name__}-{field}.bin"
+        upload, source = _open_input_file(content, filename)
+        uploads[field] = upload
+        sources.append(source)
+        expected[field] = (content, filename, upload.attach_name)
+    constructor_kwargs = {
+        field: uploads[field] for field in attachment_fields if field != "media"
+    }
+    media = media_type(
+        uploads["media"], caption="preserved caption", **constructor_kwargs
+    )
+    queue = OutboundQueue(tmp_path)
+
+    queue.enqueue_many(
+        [QueueRequest(
+            "send_media_group",
+            (100, [media]),
+            {"disable_notification": True, "protect_content": True},
+        )],
+        lambda _name: media_operation,
+    )
+
+    assert [source.tell() for source in sources] == [1] * len(sources)
+    assert all(not source.closed for source in sources)
+    for source in sources:
+        source.close()
+    decoded_args, decoded_kwargs = queue.decode_payload(queue.heads()[0].payload)
+    decoded = decoded_args[1][0]
+    assert type(decoded) is media_type
+    assert decoded.caption == "preserved caption"
+    assert decoded_kwargs == {"disable_notification": True, "protect_content": True}
+    for field, (content, filename, attach_name) in expected.items():
+        delivered = getattr(decoded, field)
+        assert delivered.input_file_content == content
+        assert delivered.filename == filename
+        assert delivered.attach_name == attach_name
+
+
+def test_media_group_rejects_input_media_animation_before_insert(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    animation = InputMediaAnimation(
+        InputFile(b"animation", filename="animation.gif", attach=True)
+    )
+
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        queue.enqueue_many(
+            [QueueRequest("send_media_group", (100, [animation]), {})],
+            lambda _name: media_operation,
+        )
+
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
 
 
 def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
