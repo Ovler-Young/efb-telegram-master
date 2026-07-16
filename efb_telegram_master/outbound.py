@@ -26,6 +26,15 @@ REQUIRED_SENDER_OPERATIONS = frozenset({
     "edit_message_text", "edit_message_caption", "edit_message_media", "delete_message",
 })
 SCHEDULER_KEYS = frozenset({"_send_mode", "_slave_id", "_required_sender_bot_id"})
+_DIRECT_MEDIA_ARGUMENTS = {
+    "send_animation": (1, "animation"),
+    "send_audio": (1, "audio"),
+    "send_document": (1, "document"),
+    "send_photo": (1, "photo"),
+    "send_sticker": (1, "sticker"),
+    "send_video": (1, "video"),
+    "send_voice": (1, "voice"),
+}
 
 
 class QueueError(RuntimeError):
@@ -272,6 +281,29 @@ class OutboundQueue:
         filename = Path(source_name).name if isinstance(source_name, (str, Path)) else None
         return _InlineMediaSnapshot(content, filename or None)
 
+    @classmethod
+    def _normalize_direct_media(
+        cls, operation: str, args: tuple, kwargs: dict
+    ) -> tuple[tuple, dict]:
+        argument = _DIRECT_MEDIA_ARGUMENTS.get(operation)
+        if argument is None:
+            return args, kwargs
+        index, keyword = argument
+        positional = len(args) > index
+        if not positional and keyword not in kwargs:
+            return args, kwargs
+        value = args[index] if positional else kwargs[keyword]
+        if not any(callable(getattr(value, name, None)) for name in ("tell", "seek", "read")):
+            return args, kwargs
+        snapshot = cls._snapshot_media_value(value)
+        if positional:
+            normalized_args = list(args)
+            normalized_args[index] = snapshot
+            return tuple(normalized_args), kwargs
+        normalized_kwargs = dict(kwargs)
+        normalized_kwargs[keyword] = snapshot
+        return args, normalized_kwargs
+
     @staticmethod
     def encode_payload(args: tuple, kwargs: dict) -> bytes:
         try:
@@ -338,9 +370,12 @@ class OutboundQueue:
         telegram_kwargs, priority, slave_id, required_sender = self._validate_metadata(
             request.operation, request.kwargs
         )
-        chat_id = self._destination(operation, request.args, telegram_kwargs)
-        payload = self.encode_payload(request.args, telegram_kwargs)
-        return request.operation, request.args, telegram_kwargs, chat_id, priority, slave_id, required_sender, payload
+        telegram_args, telegram_kwargs = self._normalize_direct_media(
+            request.operation, request.args, telegram_kwargs
+        )
+        chat_id = self._destination(operation, telegram_args, telegram_kwargs)
+        payload = self.encode_payload(telegram_args, telegram_kwargs)
+        return request.operation, telegram_args, telegram_kwargs, chat_id, priority, slave_id, required_sender, payload
 
     def enqueue_many(
         self, requests: Iterable[QueueRequest], operation_resolver: Callable[[str], Callable[..., object]]

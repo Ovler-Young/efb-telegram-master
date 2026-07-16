@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import io
 from pathlib import Path
 import sqlite3
+import tempfile
 import threading
 
 import pytest
@@ -28,6 +29,10 @@ def edit_message_text(chat_id, message_id, text):
 
 def operation(name):
     return {"send_message": send_message, "edit_message_text": edit_message_text}[name]
+
+
+def media_operation(chat_id, media=None, **kwargs):
+    return chat_id, media, kwargs
 
 
 def enqueue(queue, *requests):
@@ -125,6 +130,74 @@ def test_media_snapshot_restores_position_after_read_failure():
         OutboundQueue._snapshot_media_value(stream)
 
     assert stream.tell() == 2
+
+
+def _buffered_media(content, random_access):
+    if random_access:
+        stream = tempfile.TemporaryFile()
+        stream.write(content)
+        stream.seek(0)
+        return stream
+    return io.BufferedReader(io.BytesIO(content))
+
+
+@pytest.mark.parametrize("keyword", [False, True], ids=["positional", "keyword"])
+@pytest.mark.parametrize(
+    ("operation_name", "media_key", "content", "random_access"),
+    [
+        ("send_photo", "photo", b"small image", False),
+        ("send_document", "document", b"large image", True),
+        ("send_sticker", "sticker", b"sticker", False),
+        ("send_document", "document", b"file", True),
+        ("send_video", "video", b"video", False),
+        ("send_voice", "voice", b"voice", True),
+    ],
+    ids=["small-image", "large-image", "sticker", "file", "video", "voice"],
+)
+def test_initial_send_media_streams_enqueue_as_inline_version_one_snapshots(
+    tmp_path, operation_name, media_key, content, random_access, keyword
+):
+    queue = OutboundQueue(tmp_path)
+    caller_stream = _buffered_media(content, random_access)
+    caller_stream.seek(2)
+    args = () if keyword else (100, caller_stream)
+    kwargs = {
+        "disable_notification": True,
+        **({"chat_id": 100, media_key: caller_stream} if keyword else {}),
+    }
+
+    queue.enqueue_many(
+        [QueueRequest(operation_name, args, kwargs)],
+        lambda _name: media_operation,
+    )
+
+    assert caller_stream.tell() == 2
+    assert not caller_stream.closed
+    caller_stream.close()
+    row = queue.heads()[0]
+    decoded_args, decoded_kwargs = queue.decode_payload(row.payload)
+    decoded_media = decoded_kwargs[media_key] if keyword else decoded_args[1]
+    assert row.payload[0] == 1
+    assert decoded_media.tell() == 0
+    assert decoded_media.read() == content
+    assert decoded_kwargs["disable_notification"] is True
+
+
+def test_direct_media_normalization_failure_and_non_media_stream_commit_zero_rows(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    requests = [
+        QueueRequest("send_photo", (100, _UnreadableStream(b"photo")), {}),
+        QueueRequest("send_message", (100, io.BufferedReader(io.BytesIO(b"not text"))), {}),
+    ]
+
+    for request in requests:
+        resolver = (lambda _name: media_operation) if request.operation == "send_photo" else operation
+        with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+            queue.enqueue_many([request], resolver)
+
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+    for request in requests:
+        request.args[1].close()
 
 
 @pytest.mark.parametrize(
