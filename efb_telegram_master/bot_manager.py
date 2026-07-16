@@ -770,6 +770,13 @@ class TelegramBotManager(LocaleMixin):
     def _strip_private_queue_metadata(kwargs: Mapping[str, object]) -> dict[str, object]:
         return {key: value for key, value in kwargs.items() if key not in _INTERNAL_KWARGS}
 
+    @staticmethod
+    def _queued_chat_id_argument(
+        operation: str, args: tuple, kwargs: Mapping[str, object]
+    ) -> object:
+        chat_id_index = 1 if operation == "edit_message_text" else 0
+        return args[chat_id_index] if len(args) > chat_id_index else kwargs.get("chat_id")
+
     def _queued_operation_callable(self, operation: str) -> Callable[..., object]:
         method = self._queue_operation(operation)
 
@@ -842,7 +849,7 @@ class TelegramBotManager(LocaleMixin):
         if send_mode not in {"blocking", "eventual"}:
             raise QueueEnqueueError("_send_mode must be 'blocking' or 'eventual'.")
 
-        chat_id = args[0] if args else queued_kwargs.get("chat_id")
+        chat_id = self._queued_chat_id_argument(operation, args, queued_kwargs)
         normalized_chat_id = self._normalize_telegram_chat_id(chat_id)
         has_callback = _has_callback_keyboard(queued_kwargs.get("reply_markup"))
         cleanup_tls = getattr(self, "_cleanup_tls", None)
@@ -1229,14 +1236,14 @@ class TelegramBotManager(LocaleMixin):
         telegram_args = args
         content_spec = {
             "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
-            "edit_message_text": ("text", 2, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
+            "edit_message_text": ("text", 0, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
             "send_audio": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
             "send_voice": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
             "send_video": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
             "send_document": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
             "send_animation": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
             "send_photo": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "edit_message_caption": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "edit_message_caption": ("caption", 3, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
         }.get(row.operation)
         attachment: Optional[io.BytesIO] = None
         content_key: Optional[str] = None
@@ -1273,7 +1280,7 @@ class TelegramBotManager(LocaleMixin):
             result = method(*telegram_args, **telegram_kwargs)
         if attachment is None or content_key is None:
             return result
-        chat_id = telegram_args[0] if telegram_args else telegram_kwargs.get("chat_id")
+        chat_id = self._queued_chat_id_argument(row.operation, telegram_args, telegram_kwargs)
         message_id = getattr(result, "message_id", None)
         if chat_id is None or message_id is None:
             return result
@@ -1531,7 +1538,7 @@ class TelegramBotManager(LocaleMixin):
         )
 
     @Decorators.retry_on_chat_migration
-    def edit_message_text(self, prefix='', suffix='', **kwargs):
+    def edit_message_text(self, *args, prefix='', suffix='', **kwargs):
         """
         Edit text message.
         Takes exactly same parameters as telegram.bot.edit_message_text,
@@ -1545,8 +1552,8 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message
         """
         return self._route_affixed_queued_operation(
-            "edit_message_text", (), kwargs, eventual_capable=False,
-            content_key="text", content_index=2, prefix=prefix, suffix=suffix,
+            "edit_message_text", args, kwargs, eventual_capable=False,
+            content_key="text", content_index=0, prefix=prefix, suffix=suffix,
         )
 
     @Decorators.retry_on_chat_migration
@@ -1720,7 +1727,7 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
         return self._route_affixed_queued_operation(
-            "edit_message_caption", args, kwargs, eventual_capable=False, content_key="caption", content_index=2
+            "edit_message_caption", args, kwargs, eventual_capable=False, content_key="caption", content_index=3
         )
 
     @Decorators.retry_on_chat_migration
