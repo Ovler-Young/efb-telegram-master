@@ -422,6 +422,176 @@ def test_queued_execution_retries_entity_parse_failure_once_without_parse_mode(
     assert sender_calls[1].kwargs == kwargs
 
 
+def _blocking_queued_payload(manager: TelegramBotManager) -> tuple[tuple, dict]:
+    enqueue_call = manager._enqueue_blocking_send_and_wait.call_args
+    return enqueue_call.args[3][1:], enqueue_call.args[4]
+
+
+def _assert_raw_ptb_kwargs(kwargs: dict) -> None:
+    assert "prefix" not in kwargs
+    assert "suffix" not in kwargs
+    assert all(not key.startswith("_") for key in kwargs)
+
+
+@pytest.mark.parametrize(
+    ("operation", "positional_args", "keyword_kwargs", "content_key", "content_index"),
+    [
+        ("edit_message_text", ("positional text", 123, 456), {"text": "keyword text", "chat_id": 123, "message_id": 456}, "text", 0),
+        (
+            "edit_message_caption",
+            (123, 456, "inline-positional", "positional caption"),
+            {"caption": "keyword caption", "chat_id": 123, "message_id": 456},
+            "caption",
+            3,
+        ),
+    ],
+)
+def test_queued_edits_apply_affixes_for_positional_and_keyword_content(
+    operation,
+    positional_args,
+    keyword_kwargs,
+    content_key,
+    content_index,
+):
+    manager = _make_queueing_manager()
+    sender = Mock()
+
+    for args, kwargs, expected_content in (
+        (positional_args, {}, positional_args[content_index]),
+        ((), keyword_kwargs, keyword_kwargs[content_key]),
+    ):
+        getattr(manager, operation)(
+            *args,
+            **kwargs,
+            prefix="Prefix",
+            suffix="Suffix",
+            _send_mode="eventual",
+        )
+        queued_args, queued_kwargs = _blocking_queued_payload(manager)
+        manager.execute_queued_call(
+            SimpleNamespace(operation=operation),
+            queued_args,
+            queued_kwargs,
+            SimpleNamespace(sender=sender),
+        )
+        raw_call = getattr(sender, operation).call_args
+        delivered_content = raw_call.args[content_index] if args else raw_call.kwargs[content_key]
+        assert delivered_content == f"Prefix\n{expected_content}\nSuffix"
+        if operation == "edit_message_caption" and args:
+            assert raw_call.args[2] == "inline-positional"
+        _assert_raw_ptb_kwargs(raw_call.kwargs)
+        manager._enqueue_blocking_send_and_wait.reset_mock()
+        getattr(sender, operation).reset_mock()
+
+
+@pytest.mark.parametrize(
+    ("operation", "positional", "content_key", "content_index"),
+    [
+        ("edit_message_text", True, "text", 0),
+        ("edit_message_text", False, "text", 0),
+        ("edit_message_caption", True, "caption", 3),
+        ("edit_message_caption", False, "caption", 3),
+    ],
+)
+def test_queued_edit_overflow_attaches_the_actual_prepared_content(
+    operation,
+    positional,
+    content_key,
+    content_index,
+):
+    manager = _make_queueing_manager()
+    content_limit = (
+        int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)
+        if content_key == "text"
+        else int(telegram.constants.MessageLimit.CAPTION_LENGTH)
+    )
+    content = "x" * (content_limit + 1)
+    if operation == "edit_message_text":
+        args = (content, 123, 456) if positional else ()
+        kwargs = {} if positional else {"text": content, "chat_id": 123, "message_id": 456}
+    else:
+        args = (123, 456, "inline-positional", content) if positional else ()
+        kwargs = {} if positional else {"caption": content, "chat_id": 123, "message_id": 456}
+
+    getattr(manager, operation)(
+        *args,
+        **kwargs,
+        prefix="Prefix",
+        suffix="Suffix",
+        _send_mode="eventual",
+    )
+    queued_args, queued_kwargs = _blocking_queued_payload(manager)
+    full_content = f"Prefix\n{content}\nSuffix"
+    sender = Mock()
+    getattr(sender, operation).return_value = SimpleNamespace(message_id=789)
+
+    manager.execute_queued_call(
+        SimpleNamespace(operation=operation),
+        queued_args,
+        queued_kwargs,
+        SimpleNamespace(sender=sender),
+    )
+
+    raw_call = getattr(sender, operation).call_args
+    delivered_content = raw_call.args[content_index] if positional else raw_call.kwargs[content_key]
+    assert delivered_content == full_content[:100] + "\n...\n" + full_content[-100:]
+    if operation == "edit_message_caption" and positional:
+        assert raw_call.args[2] == "inline-positional"
+    _assert_raw_ptb_kwargs(raw_call.kwargs)
+    attachment = sender.send_document.call_args.args[1]
+    assert attachment.getvalue() == full_content.encode("utf-8")
+    _assert_raw_ptb_kwargs(sender.send_document.call_args.kwargs)
+
+
+@pytest.mark.parametrize(
+    ("operation", "args", "kwargs", "content_key", "content_index"),
+    [
+        ("edit_message_text", ("<broken>", 123, 456), {}, "text", 0),
+        ("edit_message_caption", (123, 456, "inline-positional", "<broken>"), {}, "caption", 3),
+    ],
+)
+def test_queued_edits_retry_malformed_entities_once_without_parse_mode(
+    operation,
+    args,
+    kwargs,
+    content_key,
+    content_index,
+):
+    manager = _make_queueing_manager()
+    getattr(manager, operation)(
+        *args,
+        **kwargs,
+        prefix="Prefix",
+        suffix="Suffix",
+        parse_mode="HTML",
+        _send_mode="eventual",
+    )
+    queued_args, queued_kwargs = _blocking_queued_payload(manager)
+    sender = Mock()
+    getattr(sender, operation).side_effect = [
+        telegram.error.BadRequest("Can't parse entities"),
+        SimpleNamespace(message_id=789),
+    ]
+
+    manager.execute_queued_call(
+        SimpleNamespace(operation=operation),
+        queued_args,
+        queued_kwargs,
+        SimpleNamespace(sender=sender),
+    )
+
+    raw_calls = getattr(sender, operation).call_args_list
+    assert len(raw_calls) == 2
+    expected_content = "Prefix\n" + args[content_index] + "\nSuffix"
+    for raw_call in raw_calls:
+        assert raw_call.args[content_index] == expected_content
+        _assert_raw_ptb_kwargs(raw_call.kwargs)
+    assert raw_calls[0].kwargs["parse_mode"] == "HTML"
+    assert "parse_mode" not in raw_calls[1].kwargs
+    if operation == "edit_message_caption":
+        assert raw_calls[1].args[2] == "inline-positional"
+
+
 def test_queued_route_defers_db_mapping_context_outside_telegram_kwargs():
     manager = _make_queueing_manager()
     db_context = QueuedDbLogContext(Mock(), None, Mock())
