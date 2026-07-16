@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass
+import io
 from pathlib import Path
 import sqlite3
 import threading
@@ -32,6 +33,10 @@ from efb_telegram_master.outbound import (
 
 def send_message(chat_id: int, text: str) -> tuple[int, str]:
     return chat_id, text
+
+
+def send_document(chat_id: int, document: object) -> tuple[int, object]:
+    return chat_id, document
 
 
 def enqueue(queue: OutboundQueue, chat_id: int, text: str = "message") -> tuple[int, Future]:
@@ -252,7 +257,12 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A RetryAfter keeps its original durable row until a later success."""
-    first_id, first_waiter = enqueue(retained_queue, 41, "first")
+    source = io.BufferedReader(io.BytesIO(b"retry media"))
+    first_id, first_waiter = retained_queue.enqueue_many(
+        [QueueRequest("send_document", (41, source), {})],
+        lambda _operation: send_document,
+    )
+    source.close()
     second_id, second_waiter = enqueue(retained_queue, 41, "second")
     executor = ControlledExecutor()
     adapter = manager_adapter()
@@ -268,6 +278,9 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     scheduler.dispatch_once()
     assert [row.id for row in retained_queue.heads()] == [first_id]
     assert len(executor.submissions) == 1
+    first_media = executor.submissions[0][1][1][1]
+    assert first_media.tell() == 0
+    assert first_media.read() == b"retry media"
 
     retry_after = RetryAfter(10)
     executor.submissions[0][2].set_exception(retry_after)
@@ -291,6 +304,10 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     scheduler.dispatch_once()
     assert len(executor.submissions) == 2
     assert executor.submissions[1][1][0].id == first_id
+    retry_media = executor.submissions[1][1][1][1]
+    assert retry_media is not first_media
+    assert retry_media.tell() == 0
+    assert retry_media.read() == b"retry media"
     assert [row.id for row in retained_queue.heads()] == [first_id]
 
     executor.submissions[1][2].set_result("sent")

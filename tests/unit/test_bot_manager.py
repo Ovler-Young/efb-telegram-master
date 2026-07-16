@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import inspect
+import io
 import string
 import random
 import threading
@@ -10,7 +12,7 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import telegram.error
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 
 from efb_telegram_master.bot_manager import (
     QueuedDbLogContext,
@@ -19,7 +21,7 @@ from efb_telegram_master.bot_manager import (
     TelegramBotManager,
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
-from efb_telegram_master.outbound import QueueEnqueueError, SenderSelection
+from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
 
 
 def _bind_blocking_enqueue_helper(manager):
@@ -202,6 +204,80 @@ def test_blocking_enqueue_helper_executes_queued_send_preparation():
     manager._bot.send_message.assert_called_once_with(123, body[:100] + "\n...\n" + body[-100:])
     manager._bot.send_document.assert_called_once()
     assert manager._bot.send_document.call_args.kwargs["filename"] == "123_7.txt"
+
+
+def _queued_send_document(chat_id, document, **kwargs):
+    return chat_id, document, kwargs
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_filename"),
+    [("explicit", "explicit.bin"), ("input-file", "input.bin"),
+     ("source-name", "source.bin"), ("none", None)],
+)
+def test_queued_document_filename_precedence(tmp_path, kind, expected_filename):
+    queue = OutboundQueue(tmp_path)
+    kwargs = {}
+    if kind in {"explicit", "input-file"}:
+        media = InputFile(b"media", filename="input.bin")
+        if kind == "explicit":
+            kwargs["filename"] = "explicit.bin"
+        source = None
+    elif kind == "source-name":
+        path = tmp_path / "source.bin"
+        path.write_bytes(b"media")
+        source = path.open("rb")
+        media = source
+    else:
+        source = io.BufferedReader(io.BytesIO(b"media"))
+        media = source
+    queue.enqueue_many(
+        [QueueRequest("send_document", (100, media), kwargs)],
+        lambda _name: _queued_send_document,
+    )
+    if source is not None:
+        source.close()
+
+    args, decoded_kwargs = queue.decode_payload(queue.heads()[0].payload)
+    delivered = args[1]
+    if expected_filename is None:
+        assert not hasattr(delivered, "name")
+        assert "filename" not in decoded_kwargs
+    else:
+        actual_filename = delivered.filename if isinstance(delivered, InputFile) else delivered.name
+        assert actual_filename == expected_filename
+        assert decoded_kwargs.get("filename") == ("explicit.bin" if kind == "explicit" else None)
+
+
+@pytest.mark.parametrize(
+    ("operation", "encoded"),
+    [
+        ("send_message", "AYAFlSoAAAAAAAAASyqMBWhlbGxvlIaUfZSMFGRpc2FibGVfbm90aWZpY2F0aW9ulIhzhpQu"),
+        ("send_photo", "AYAFlRgAAAAAAAAASyqMDEFnQUMtZmlsZS1pZJSGlH2UhpQu"),
+        ("send_photo", "AYAFlSkAAAAAAAAASyqMHWh0dHBzOi8vZXhhbXBsZS5jb20vcGhvdG8uanBnlIaUfZSGlC4="),
+        ("send_document", "AYAFlTEAAAAAAAAASypDDGxlZ2FjeS1ieXRlc5SGlH2UjAhmaWxlbmFtZZSMCmxlZ2FjeS5iaW6Uc4aULg=="),
+    ],
+    ids=["non-media", "file-id", "url", "bytes"],
+)
+def test_prechange_version_one_payloads_decode_and_execute_without_reencoding(
+    operation, encoded, monkeypatch
+):
+    payload = base64.b64decode(encoded)
+    assert payload[0] == 1
+    encoder = Mock(side_effect=AssertionError("legacy payload must not be re-encoded"))
+    monkeypatch.setattr(OutboundQueue, "encode_payload", encoder)
+    args, kwargs = OutboundQueue.decode_payload(payload)
+    manager = object.__new__(TelegramBotManager)
+    sender = Mock()
+
+    manager.execute_queued_call(
+        SimpleNamespace(operation=operation), args, kwargs,
+        SenderSelection(sender=sender, sender_bot_id=None),
+    )
+
+    getattr(sender, operation).assert_called_once_with(*args, **kwargs)
+    encoder.assert_not_called()
+    assert payload == base64.b64decode(encoded)
 
 
 def test_build_bot_passes_local_mode_when_enabled():

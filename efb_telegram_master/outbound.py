@@ -15,7 +15,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Protocol
 
-from telegram import InputFile, InputMedia
+from telegram import (
+    Animation, Audio, Document, InputFile, InputMedia, PhotoSize, Sticker, Video, Voice,
+)
+
+
+@dataclass(frozen=True)
+class _DirectMediaArgument:
+    index: int
+    keyword: str
+    telegram_type: type
 
 
 QUEUED_OPERATIONS = frozenset({
@@ -30,13 +39,13 @@ REQUIRED_SENDER_OPERATIONS = frozenset({
 })
 SCHEDULER_KEYS = frozenset({"_send_mode", "_slave_id", "_required_sender_bot_id"})
 _DIRECT_MEDIA_ARGUMENTS = {
-    "send_animation": (1, "animation"),
-    "send_audio": (1, "audio"),
-    "send_document": (1, "document"),
-    "send_photo": (1, "photo"),
-    "send_sticker": (1, "sticker"),
-    "send_video": (1, "video"),
-    "send_voice": (1, "voice"),
+    "send_animation": _DirectMediaArgument(1, "animation", Animation),
+    "send_audio": _DirectMediaArgument(1, "audio", Audio),
+    "send_document": _DirectMediaArgument(1, "document", Document),
+    "send_photo": _DirectMediaArgument(1, "photo", PhotoSize),
+    "send_sticker": _DirectMediaArgument(1, "sticker", Sticker),
+    "send_video": _DirectMediaArgument(1, "video", Video),
+    "send_voice": _DirectMediaArgument(1, "voice", Voice),
 }
 _THUMBNAIL_OPERATIONS = frozenset({"send_animation", "send_audio", "send_document", "send_video"})
 _NESTED_MEDIA_ARGUMENTS = {
@@ -325,6 +334,16 @@ class OutboundQueue:
         )
 
     @classmethod
+    def _validate_media_value(cls, value: object, telegram_type: Optional[type] = None) -> None:
+        if isinstance(value, (bytes, str, Path, InputFile)):
+            return
+        if telegram_type is not None and isinstance(value, telegram_type):
+            return
+        if cls._needs_media_snapshot(value):
+            return
+        raise QueueEnqueueError("Unable to serialize queued Telegram call.")
+
+    @classmethod
     def _normalize_input_media(cls, value: object) -> object:
         if not isinstance(value, InputMedia):
             return value
@@ -342,14 +361,22 @@ class OutboundQueue:
         argument = _DIRECT_MEDIA_ARGUMENTS.get(operation)
         if argument is None:
             return args, kwargs
-        index, keyword = argument
+        index, keyword = argument.index, argument.keyword
         positional = len(args) > index
         if not positional and keyword not in kwargs:
             return args, kwargs
         value = args[index] if positional else kwargs[keyword]
+        cls._validate_media_value(value, argument.telegram_type)
         if not cls._needs_media_snapshot(value):
             return args, kwargs
         snapshot = cls._snapshot_media_value(value)
+        explicit_filename = kwargs.get("filename")
+        if explicit_filename is not None and not isinstance(explicit_filename, str):
+            raise QueueEnqueueError("Unable to serialize queued Telegram call.")
+        if isinstance(snapshot, _InlineMediaSnapshot) and snapshot.input_file and explicit_filename:
+            snapshot = _InlineMediaSnapshot(
+                snapshot.content, explicit_filename, True, snapshot.attach_name, None
+            )
         if positional:
             normalized_args = list(args)
             normalized_args[index] = snapshot
@@ -369,9 +396,15 @@ class OutboundQueue:
             return args, kwargs
         value = args[index] if positional else kwargs[keyword]
         normalized: object
-        if operation == "send_media_group" and isinstance(value, (list, tuple)):
+        if operation == "send_media_group":
+            if not isinstance(value, (list, tuple)) or not value or not all(
+                isinstance(item, InputMedia) for item in value
+            ):
+                raise QueueEnqueueError("Unable to serialize queued Telegram call.")
             normalized = type(value)(cls._normalize_input_media(item) for item in value)
         else:
+            if not isinstance(value, InputMedia):
+                raise QueueEnqueueError("Unable to serialize queued Telegram call.")
             normalized = cls._normalize_input_media(value)
         if positional:
             normalized_args = list(args)
@@ -384,7 +417,10 @@ class OutboundQueue:
     @classmethod
     def _normalize_thumbnail(cls, operation: str, kwargs: dict) -> dict:
         thumbnail = kwargs.get("thumbnail")
-        if operation not in _THUMBNAIL_OPERATIONS or not cls._needs_media_snapshot(thumbnail):
+        if operation not in _THUMBNAIL_OPERATIONS or thumbnail is None:
+            return kwargs
+        cls._validate_media_value(thumbnail)
+        if not cls._needs_media_snapshot(thumbnail):
             return kwargs
         normalized_kwargs = dict(kwargs)
         normalized_kwargs["thumbnail"] = cls._snapshot_media_value(thumbnail)

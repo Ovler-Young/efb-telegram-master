@@ -293,6 +293,45 @@ def test_media_group_snapshots_nested_files_thumbnails_and_attach_names(tmp_path
             decoded[1].thumbnail.input_file_content) == (b"photo", b"video", b"thumb")
 
 
+def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    source = io.BufferedReader(io.BytesIO(b"reopened media"))
+    row_id, _waiter = queue.enqueue_many(
+        [QueueRequest("send_document", (100, source), {})],
+        lambda _name: media_operation,
+    )
+    persisted_payload = queue.heads()[0].payload
+    source.close()
+    queue.close()
+
+    reopened = OutboundQueue(tmp_path)
+    row = reopened.heads()[0]
+    media = reopened.decode_payload(row.payload)[0][1]
+    assert row.id == row_id
+    assert row.payload == persisted_payload
+    assert media.tell() == 0
+    assert media.read() == b"reopened media"
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    "queue_request",
+    [
+        QueueRequest("send_photo", (100, object()), {}),
+        QueueRequest("send_document", (100, b"document"), {"thumbnail": object()}),
+        QueueRequest("send_media_group", (100, [object()]), {}),
+    ],
+    ids=["direct", "thumbnail", "media-group"],
+)
+def test_unsupported_media_values_commit_zero_rows(tmp_path, queue_request):
+    queue = OutboundQueue(tmp_path)
+
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        queue.enqueue_many([queue_request], lambda _name: media_operation)
+
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+
+
 @pytest.mark.parametrize(
     ("args", "kwargs", "valid"),
     [
