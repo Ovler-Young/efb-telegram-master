@@ -283,6 +283,18 @@ def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
         assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.11", "777")
         assert row.pickle is None
 
+        message.reactions = {"R1": [reactor]}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=12),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(11)),
+            sender_bot_id="888",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.12", "888")
+        assert pickle.loads(bytes(row.pickle))["reactions"] == {"R1": ("tests.mocks.slave reactor",)}
+
 
 @pytest.mark.skipif(
     not os.getenv("TEST_POSTGRES_HOST"),

@@ -1,8 +1,9 @@
 import threading
 import time
+import pytest
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from typing import cast
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -806,3 +807,74 @@ def test_restarted_reactions_route_edits_to_persisted_auxiliary_sender():
             reply_markup=None,
             _sender_bot_id="777",
         )
+
+
+def build_reaction_failure_processor(error):
+    processor = Mock(spec=SlaveMessageProcessor)
+    processor.REACTION_DB_WAIT_TIMEOUT = 0
+    processor.chat_manager = Mock()
+    processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+    processor.logger = Mock()
+    processor._reaction_target_message_id = SlaveMessageProcessor._reaction_target_message_id
+    processor._reaction_edit_target_missing = SlaveMessageProcessor._reaction_edit_target_missing
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        reactions={},
+        vendor_specific=None,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt="100.11",
+        sender_bot_id="777",
+        build_etm_msg=Mock(return_value=old_msg),
+    )
+    processor.db = Mock()
+    processor.db.get_msg_log.return_value = old_msg_db
+    processor.dispatch_message = Mock(side_effect=error)
+    status = SimpleNamespace(
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+        msg_id="__msg_id_reaction__",
+        reactions={"R0": [object()]},
+    )
+    return processor, old_msg, old_msg_db, status
+
+
+def test_missing_reaction_alternate_creates_one_replacement_reply():
+    processor, old_msg, old_msg_db, status = build_reaction_failure_processor(
+        BadRequest("Message to edit not found")
+    )
+    processor.dispatch_message.side_effect = [BadRequest("Message to edit not found"), None]
+
+    SlaveMessageProcessor.update_reactions(processor, status)
+
+    assert processor.dispatch_message.call_args_list[0].args[2] == (100, 11)
+    assert processor.dispatch_message.call_args_list[1].args == (
+        old_msg, "__template__", None, 100, None,
+    )
+    assert processor.dispatch_message.call_args_list[1].kwargs == {
+        "database_old_msg_id": (100, 11),
+        "target_msg_id_override": 10,
+    }
+    assert old_msg.vendor_specific == {"_sender_bot_id": "777", "_force_send_mode": "blocking"}
+    assert (old_msg_db.master_msg_id, old_msg_db.master_msg_id_alt) == ("100.10", "100.11")
+
+
+def test_nonrecoverable_reaction_edit_failures_do_not_create_reply():
+    errors = (
+        BadRequest("Not enough rights to edit this message"),
+        BadRequest("Can't parse entities"),
+        BadRequest("Bot is not a member of the supergroup chat"),
+        RetryAfter(1),
+        NetworkError("transport failed"),
+        TelegramError("other edit failure"),
+    )
+
+    for error in errors:
+        processor, _old_msg, old_msg_db, status = build_reaction_failure_processor(error)
+        with pytest.raises(type(error)):
+            SlaveMessageProcessor.update_reactions(processor, status)
+
+        assert processor.dispatch_message.call_count == 1
+        assert (old_msg_db.master_msg_id, old_msg_db.master_msg_id_alt) == ("100.10", "100.11")

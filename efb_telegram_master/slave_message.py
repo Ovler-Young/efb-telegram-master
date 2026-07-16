@@ -1475,6 +1475,13 @@ class SlaveMessageProcessor(LocaleMixin):
             return old_msg_db.master_msg_id or old_msg_db.master_msg_id_alt
         return old_msg_db.master_msg_id_alt or old_msg_db.master_msg_id
 
+    @staticmethod
+    def _reaction_edit_target_missing(error: telegram.error.BadRequest) -> bool:
+        message = (error.message or '').strip().casefold()
+        if message.startswith('bad request: '):
+            message = message.removeprefix('bad request: ').strip()
+        return message in {'message to edit not found', 'message not found'}
+
     def update_reactions(self, status: MessageReactionsUpdate):
         """Update reactions to a Telegram message."""
         slave_origin_uid = utils.chat_id_to_str(chat=status.chat)
@@ -1521,7 +1528,25 @@ class SlaveMessageProcessor(LocaleMixin):
             )
             return
 
-        self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
+        try:
+            self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
+        except telegram.error.BadRequest as error:
+            if not (
+                telegram_origin and old_msg_db.master_msg_id_alt and
+                self._reaction_edit_target_missing(error)
+            ):
+                raise
+
+            primary_chat_id, primary_msg_id = utils.message_id_str_to_id(
+                utils.TgChatMsgIDStr(old_msg_db.master_msg_id)
+            )
+            old_msg.edit = False
+            old_msg.vendor_specific = old_msg.vendor_specific or {}
+            old_msg.vendor_specific['_force_send_mode'] = 'blocking'
+            self.dispatch_message(
+                old_msg, msg_template, None, primary_chat_id, thread_id,
+                database_old_msg_id=(chat_id, msg_id), target_msg_id_override=primary_msg_id,
+            )
 
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name
