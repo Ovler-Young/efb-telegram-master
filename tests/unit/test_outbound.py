@@ -388,6 +388,88 @@ def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
     reopened.close()
 
 
+@pytest.mark.parametrize("input_kind", ["string", "path"])
+@pytest.mark.parametrize("after_enqueue", ["mutate", "move", "delete"])
+def test_local_file_media_is_owned_inline_after_enqueue_and_reopen(
+    tmp_path, input_kind, after_enqueue
+):
+    source_path = tmp_path / f"{input_kind}-{after_enqueue}.bin"
+    original_content = f"original {input_kind} {after_enqueue}".encode()
+    source_path.write_bytes(original_content)
+    media = str(source_path) if input_kind == "string" else source_path
+    queue = OutboundQueue(tmp_path)
+
+    row_id, _waiter = queue.enqueue_many(
+        [QueueRequest("send_document", (100, media), {})],
+        lambda _name: media_operation,
+    )
+
+    if after_enqueue == "mutate":
+        source_path.write_bytes(b"mutated")
+        source_path.unlink()
+    elif after_enqueue == "move":
+        moved_path = tmp_path / "moved.bin"
+        source_path.rename(moved_path)
+        moved_path.unlink()
+    else:
+        source_path.unlink()
+    queue.close()
+    reopened = OutboundQueue(tmp_path)
+    row = reopened.heads()[0]
+    decoded_media = reopened.decode_payload(row.payload)[0][1]
+    assert row.id == row_id
+    assert decoded_media.tell() == 0
+    assert decoded_media.read() == original_content
+    assert decoded_media.name == source_path.name
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    "remote_value",
+    [
+        "http://example.com/media.bin",
+        "https://example.com/media.bin",
+        "BQACAgQAAxkBAAIBQ2telegram-file-id",
+    ],
+    ids=["http-url", "https-url", "telegram-file-id"],
+)
+def test_remote_string_media_stays_opaque(remote_value, tmp_path):
+    queue = OutboundQueue(tmp_path)
+
+    queue.enqueue_many(
+        [QueueRequest("send_document", (100, remote_value), {})],
+        lambda _name: media_operation,
+    )
+
+    decoded_media = queue.decode_payload(queue.heads()[0].payload)[0][1]
+    assert decoded_media == remote_value
+
+
+@pytest.mark.parametrize("failure", ["open", "read"])
+def test_local_file_media_failure_commits_zero_rows(tmp_path, monkeypatch, failure):
+    source_path = tmp_path / "unreadable.bin"
+    source_path.write_bytes(b"media")
+    original_open = Path.open
+
+    def failing_open(path, *args, **kwargs):
+        if path == source_path:
+            if failure == "open":
+                raise OSError("open failed")
+            return _UnreadableStream(b"media")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    queue = OutboundQueue(tmp_path)
+
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        queue.enqueue_many(
+            [QueueRequest("send_document", (100, source_path), {})],
+            lambda _name: media_operation,
+        )
+
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+
+
 @pytest.mark.parametrize(
     "queue_request",
     [

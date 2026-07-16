@@ -213,7 +213,7 @@ def _queued_send_document(chat_id, document, **kwargs):
 @pytest.mark.parametrize(
     ("kind", "expected_filename"),
     [("explicit", "explicit.bin"), ("input-file", "input.bin"),
-     ("source-name", "source.bin"), ("none", None)],
+     ("local-basename", "source.bin"), ("none", None)],
 )
 def test_queued_document_filename_precedence(tmp_path, kind, expected_filename):
     queue = OutboundQueue(tmp_path)
@@ -223,11 +223,11 @@ def test_queued_document_filename_precedence(tmp_path, kind, expected_filename):
         if kind == "explicit":
             kwargs["filename"] = "explicit.bin"
         source = None
-    elif kind == "source-name":
+    elif kind == "local-basename":
         path = tmp_path / "source.bin"
         path.write_bytes(b"media")
-        source = path.open("rb")
-        media = source
+        source = None
+        media = path
     else:
         source = io.BufferedReader(io.BytesIO(b"media"))
         media = source
@@ -237,9 +237,16 @@ def test_queued_document_filename_precedence(tmp_path, kind, expected_filename):
     )
     if source is not None:
         source.close()
+    if kind == "local-basename":
+        path.unlink()
 
     args, decoded_kwargs = queue.decode_payload(queue.heads()[0].payload)
     delivered = args[1]
+    if isinstance(delivered, InputFile):
+        assert delivered.input_file_content == b"media"
+    else:
+        assert delivered.tell() == 0
+        assert delivered.read() == b"media"
     if expected_filename is None:
         assert not hasattr(delivered, "name")
         assert "filename" not in decoded_kwargs
