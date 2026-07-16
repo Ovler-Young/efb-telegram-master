@@ -467,7 +467,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     stream_metrics_before = _queue_metrics_snapshot(bot_manager)
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
-    await asyncio.to_thread(stream_thread.join, STREAM_DURATION_SECONDS + 15.0)
+    await asyncio.to_thread(stream_thread.join, STREAM_SETTLE_TIMEOUT)
 
     assert not stream_thread.is_alive(), "Mock stream did not finish in time."
     assert not stream_errors, f"Mock stream failed: {stream_errors!r}"
