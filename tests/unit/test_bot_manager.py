@@ -19,6 +19,7 @@ from efb_telegram_master.bot_manager import (
     TelegramBotManager,
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
+from efb_telegram_master.outbound import QueueEnqueueError
 
 
 def _bind_blocking_enqueue_helper(manager):
@@ -286,6 +287,19 @@ def test_queued_route_defers_db_mapping_context_outside_telegram_kwargs():
     eventual_call = manager._enqueue_eventual_send.call_args
     assert eventual_call.args[4] == {"text": "queued"}
     assert eventual_call.kwargs["db_log_context"] is db_context
+
+
+def test_queued_route_rejects_invalid_db_mapping_context():
+    manager = _make_queueing_manager()
+
+    with pytest.raises(QueueEnqueueError, match="QueuedDbLogContext"):
+        manager.send_message(
+            123,
+            text="queued",
+            _send_mode="eventual",
+            _slave_id="slave.chat",
+            _queued_db_log_context=object(),
+        )
 
 
 def test_queued_success_writes_deferred_db_mapping_once():

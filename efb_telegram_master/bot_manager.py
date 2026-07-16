@@ -795,6 +795,8 @@ class TelegramBotManager(LocaleMixin):
         force_main_bot = queued_kwargs.pop("_force_main_bot", False)
         queued_kwargs.pop("_required_sender_bot_id", None)
         db_log_context = queued_kwargs.pop("_queued_db_log_context", None)
+        if db_log_context is not None and not isinstance(db_log_context, QueuedDbLogContext):
+            raise QueueEnqueueError("_queued_db_log_context must be a QueuedDbLogContext when supplied.")
         if send_mode not in {"blocking", "eventual"}:
             raise QueueEnqueueError("_send_mode must be 'blocking' or 'eventual'.")
 
@@ -1232,9 +1234,9 @@ class TelegramBotManager(LocaleMixin):
             self._bot_chat_disabled_until[key] = retry_at
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
 
-        retry_after = self._rate_limit_retry_after_seconds(cast(Exception, error))
-        if retry_after is not None:
-            self._bot_chat_disabled_until[key] = time.monotonic() + retry_after
+        cooldown_seconds = self._rate_limit_retry_after_seconds(cast(Exception, error))
+        if cooldown_seconds is not None:
+            self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
         if row.priority == 0:
             self._bot_chat_retry_failures.pop(key, None)
         self._finish_queued_database_update(getattr(row, "id", None))
