@@ -6,6 +6,7 @@ import tempfile
 import threading
 
 import pytest
+from telegram import InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 
 from efb_telegram_master.outbound import (
     InvalidQueuedPayloadError,
@@ -33,6 +34,10 @@ def operation(name):
 
 def media_operation(chat_id, media=None, **kwargs):
     return chat_id, media, kwargs
+
+
+def edit_media_operation(media, chat_id, message_id, **kwargs):
+    return media, chat_id, message_id, kwargs
 
 
 def enqueue(queue, *requests):
@@ -198,6 +203,94 @@ def test_direct_media_normalization_failure_and_non_media_stream_commit_zero_row
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
     for request in requests:
         request.args[1].close()
+
+
+def _open_input_file(content, filename):
+    stream = io.BufferedReader(io.BytesIO(content))
+    stream.seek(1)
+    return InputFile(stream, filename=filename, attach=True, read_file_handle=False), stream
+
+
+def test_thumbnail_keyword_enqueues_an_inline_snapshot(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    thumbnail = io.BufferedReader(io.BytesIO(b"thumbnail"))
+    thumbnail.seek(3)
+
+    queue.enqueue_many(
+        [QueueRequest("send_document", (100, b"document"), {"thumbnail": thumbnail})],
+        lambda _name: media_operation,
+    )
+
+    assert thumbnail.tell() == 3
+    thumbnail.close()
+    decoded_thumbnail = queue.decode_payload(queue.heads()[0].payload)[1]["thumbnail"]
+    assert decoded_thumbnail.tell() == 0
+    assert decoded_thumbnail.read() == b"thumbnail"
+
+
+@pytest.mark.parametrize("keyword", [False, True], ids=["positional", "keyword"])
+@pytest.mark.parametrize(
+    ("media_type", "content", "filename"),
+    [
+        (InputMediaPhoto, b"edited photo", "edited.jpg"),
+        (InputMediaDocument, b"edited document", "edited.bin"),
+        (InputMediaVideo, b"edited video", "edited.mp4"),
+    ],
+    ids=["photo", "document", "video"],
+)
+def test_edit_media_snapshots_nested_input_file_and_attach_name(
+    tmp_path, keyword, media_type, content, filename
+):
+    queue = OutboundQueue(tmp_path)
+    uploaded, source = _open_input_file(content, filename)
+    media = media_type(uploaded, caption="caption")
+    attach_name = uploaded.attach_name
+    args = () if keyword else (media, 100, 7)
+    kwargs = {"media": media, "chat_id": 100, "message_id": 7} if keyword else {}
+    kwargs["_required_sender_bot_id"] = "__main__"
+
+    queue.enqueue_many(
+        [QueueRequest("edit_message_media", args, kwargs)],
+        lambda _name: edit_media_operation,
+    )
+
+    assert source.tell() == 1
+    source.close()
+    decoded_args, decoded_kwargs = queue.decode_payload(queue.heads()[0].payload)
+    decoded = decoded_kwargs["media"] if keyword else decoded_args[0]
+    assert decoded.caption == "caption"
+    assert decoded.media.attach_name == attach_name
+    assert decoded.media.input_file_content == content
+
+
+@pytest.mark.parametrize("keyword", [False, True], ids=["positional", "keyword"])
+def test_media_group_snapshots_nested_files_thumbnails_and_attach_names(tmp_path, keyword):
+    queue = OutboundQueue(tmp_path)
+    photo, photo_source = _open_input_file(b"photo", "photo.jpg")
+    video, video_source = _open_input_file(b"video", "video.mp4")
+    thumbnail, thumbnail_source = _open_input_file(b"thumb", "thumb.jpg")
+    media = [InputMediaPhoto(photo), InputMediaVideo(video, thumbnail=thumbnail)]
+    attach_names = (photo.attach_name, video.attach_name, thumbnail.attach_name)
+    args = () if keyword else (100, media)
+    kwargs = {"disable_notification": True}
+    if keyword:
+        kwargs.update(chat_id=100, media=media)
+
+    queue.enqueue_many(
+        [QueueRequest("send_media_group", args, kwargs)],
+        lambda _name: media_operation,
+    )
+
+    assert [stream.tell() for stream in (photo_source, video_source, thumbnail_source)] == [1, 1, 1]
+    for stream in (photo_source, video_source, thumbnail_source):
+        stream.close()
+    decoded_args, decoded_kwargs = queue.decode_payload(queue.heads()[0].payload)
+    decoded = decoded_kwargs["media"] if keyword else decoded_args[1]
+    assert decoded_kwargs["disable_notification"] is True
+    assert (decoded[0].media.attach_name, decoded[1].media.attach_name,
+            decoded[1].thumbnail.attach_name) == attach_names
+    assert (decoded[0].media.input_file_content, decoded[1].media.input_file_content,
+            decoded[1].thumbnail.input_file_content) == (b"photo", b"video", b"thumb")
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import io
 import numbers
@@ -13,6 +14,8 @@ from concurrent.futures import Executor, Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Protocol
+
+from telegram import InputFile, InputMedia
 
 
 QUEUED_OPERATIONS = frozenset({
@@ -34,6 +37,11 @@ _DIRECT_MEDIA_ARGUMENTS = {
     "send_sticker": (1, "sticker"),
     "send_video": (1, "video"),
     "send_voice": (1, "voice"),
+}
+_THUMBNAIL_OPERATIONS = frozenset({"send_animation", "send_audio", "send_document", "send_video"})
+_NESTED_MEDIA_ARGUMENTS = {
+    "edit_message_media": (0, "media"),
+    "send_media_group": (1, "media"),
 }
 
 
@@ -114,7 +122,19 @@ class SubmittedCall:
     future: Future
 
 
-def _restore_inline_media(content: bytes, filename: Optional[str]) -> io.BytesIO:
+def _restore_inline_media(
+    content: bytes,
+    filename: Optional[str],
+    input_file: bool = False,
+    attach_name: Optional[str] = None,
+    mimetype: Optional[str] = None,
+) -> object:
+    if input_file:
+        restored = InputFile(content, filename=filename, attach=attach_name is not None)
+        restored.attach_name = attach_name
+        if mimetype is not None:
+            restored.mimetype = mimetype
+        return restored
     stream = io.BytesIO(content)
     if filename is not None:
         stream.name = filename
@@ -125,9 +145,14 @@ def _restore_inline_media(content: bytes, filename: Optional[str]) -> io.BytesIO
 class _InlineMediaSnapshot:
     content: bytes
     filename: Optional[str]
+    input_file: bool = False
+    attach_name: Optional[str] = None
+    mimetype: Optional[str] = None
 
     def __reduce__(self):
-        return _restore_inline_media, (self.content, self.filename)
+        return _restore_inline_media, (
+            self.content, self.filename, self.input_file, self.attach_name, self.mimetype
+        )
 
 
 class QueueAdapter(Protocol):
@@ -251,6 +276,18 @@ class OutboundQueue:
     def _snapshot_media_value(value: object) -> object:
         if isinstance(value, (bytes, str, Path)):
             return value
+        if isinstance(value, InputFile):
+            stored_content = value.input_file_content
+            if isinstance(stored_content, bytes):
+                input_content = stored_content
+            else:
+                captured = OutboundQueue._snapshot_media_value(stored_content)
+                if not isinstance(captured, _InlineMediaSnapshot):
+                    raise QueueEnqueueError("Unable to serialize queued Telegram call.")
+                input_content = captured.content
+            return _InlineMediaSnapshot(
+                input_content, value.filename, True, value.attach_name, value.mimetype
+            )
         tell = getattr(value, "tell", None)
         seek = getattr(value, "seek", None)
         read = getattr(value, "read", None)
@@ -281,6 +318,23 @@ class OutboundQueue:
         filename = Path(source_name).name if isinstance(source_name, (str, Path)) else None
         return _InlineMediaSnapshot(content, filename or None)
 
+    @staticmethod
+    def _needs_media_snapshot(value: object) -> bool:
+        return isinstance(value, InputFile) or any(
+            callable(getattr(value, name, None)) for name in ("tell", "seek", "read")
+        )
+
+    @classmethod
+    def _normalize_input_media(cls, value: object) -> object:
+        if not isinstance(value, InputMedia):
+            return value
+        normalized = copy.copy(value)
+        for attribute in ("media", "thumbnail"):
+            attachment = getattr(value, attribute, None)
+            if attachment is not None and cls._needs_media_snapshot(attachment):
+                object.__setattr__(normalized, attribute, cls._snapshot_media_value(attachment))
+        return normalized
+
     @classmethod
     def _normalize_direct_media(
         cls, operation: str, args: tuple, kwargs: dict
@@ -293,7 +347,7 @@ class OutboundQueue:
         if not positional and keyword not in kwargs:
             return args, kwargs
         value = args[index] if positional else kwargs[keyword]
-        if not any(callable(getattr(value, name, None)) for name in ("tell", "seek", "read")):
+        if not cls._needs_media_snapshot(value):
             return args, kwargs
         snapshot = cls._snapshot_media_value(value)
         if positional:
@@ -303,6 +357,38 @@ class OutboundQueue:
         normalized_kwargs = dict(kwargs)
         normalized_kwargs[keyword] = snapshot
         return args, normalized_kwargs
+
+    @classmethod
+    def _normalize_nested_media(cls, operation: str, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        argument = _NESTED_MEDIA_ARGUMENTS.get(operation)
+        if argument is None:
+            return args, kwargs
+        index, keyword = argument
+        positional = len(args) > index
+        if not positional and keyword not in kwargs:
+            return args, kwargs
+        value = args[index] if positional else kwargs[keyword]
+        normalized: object
+        if operation == "send_media_group" and isinstance(value, (list, tuple)):
+            normalized = type(value)(cls._normalize_input_media(item) for item in value)
+        else:
+            normalized = cls._normalize_input_media(value)
+        if positional:
+            normalized_args = list(args)
+            normalized_args[index] = normalized
+            return tuple(normalized_args), kwargs
+        normalized_kwargs = dict(kwargs)
+        normalized_kwargs[keyword] = normalized
+        return args, normalized_kwargs
+
+    @classmethod
+    def _normalize_thumbnail(cls, operation: str, kwargs: dict) -> dict:
+        thumbnail = kwargs.get("thumbnail")
+        if operation not in _THUMBNAIL_OPERATIONS or not cls._needs_media_snapshot(thumbnail):
+            return kwargs
+        normalized_kwargs = dict(kwargs)
+        normalized_kwargs["thumbnail"] = cls._snapshot_media_value(thumbnail)
+        return normalized_kwargs
 
     @staticmethod
     def encode_payload(args: tuple, kwargs: dict) -> bytes:
@@ -373,6 +459,10 @@ class OutboundQueue:
         telegram_args, telegram_kwargs = self._normalize_direct_media(
             request.operation, request.args, telegram_kwargs
         )
+        telegram_args, telegram_kwargs = self._normalize_nested_media(
+            request.operation, telegram_args, telegram_kwargs
+        )
+        telegram_kwargs = self._normalize_thumbnail(request.operation, telegram_kwargs)
         chat_id = self._destination(operation, telegram_args, telegram_kwargs)
         payload = self.encode_payload(telegram_args, telegram_kwargs)
         return request.operation, telegram_args, telegram_kwargs, chat_id, priority, slave_id, required_sender, payload
