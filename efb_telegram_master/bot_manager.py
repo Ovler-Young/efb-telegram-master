@@ -466,6 +466,8 @@ class TelegramBotManager(LocaleMixin):
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
         self._shutdown_complete_event = threading.Event()
+        self._graceful_stop_lock = threading.Lock()
+        self._graceful_stop_complete = False
         self._manual_polling_stop_event: Optional[asyncio.Event] = None
         self._aux_recent_use: dict[int, float] = {}  # chat_id -> timestamp of last aux bot use
         self.logger.debug("Rate limiter initialized...")
@@ -1850,6 +1852,17 @@ class TelegramBotManager(LocaleMixin):
 
     def graceful_stop(self):
         """Gracefully stop the bot"""
+        graceful_stop_lock = getattr(self, '_graceful_stop_lock', None)
+        if graceful_stop_lock is None:
+            graceful_stop_lock = self._graceful_stop_lock = threading.Lock()
+
+        with graceful_stop_lock:
+            if getattr(self, '_graceful_stop_complete', False):
+                return
+            TelegramBotManager._graceful_stop(self)
+            self._graceful_stop_complete = True
+
+    def _graceful_stop(self) -> None:
         if not hasattr(self, '_stopping') or not hasattr(self._stopping, 'set'):
             self._stopping = threading.Event()
         self._stopping.set()

@@ -987,6 +987,29 @@ def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
     manager._runtime.shutdown.assert_not_called()
 
 
+def test_graceful_stop_is_idempotent_after_outbound_queue_closes():
+    shutdown_complete_event = threading.Event()
+    shutdown_complete_event.set()
+    connection = Mock()
+    connection.execute.return_value.fetchone.return_value = (0,)
+    manager = SimpleNamespace(
+        logger=Mock(),
+        _stopping=threading.Event(),
+        _graceful_stop_lock=threading.Lock(),
+        _graceful_stop_complete=False,
+        _outbound_queue=SimpleNamespace(connection=connection),
+        stop_queued_worker=Mock(),
+        bot_pool=None,
+        _shutdown_complete_event=shutdown_complete_event,
+    )
+
+    TelegramBotManager.graceful_stop(manager)
+    TelegramBotManager.graceful_stop(manager)
+
+    connection.execute.assert_called_once_with("SELECT COUNT(*) FROM outbound_queue")
+    manager.stop_queued_worker.assert_called_once_with()
+
+
 def test_channel_is_stopping_reads_manager_event():
     from efb_telegram_master import TelegramChannel
 
