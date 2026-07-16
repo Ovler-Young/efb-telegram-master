@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import io
 from pathlib import Path
 import sqlite3
 import threading
@@ -60,6 +61,70 @@ def test_payload_version_round_trip_and_invalid_shapes(tmp_path):
             queue.decode_payload(invalid)
     with pytest.raises(QueueEnqueueError):
         queue.encode_payload((), {"value": threading.Lock()})
+
+
+def test_media_snapshot_preserves_caller_stream_lifecycle_and_decodes_fresh_values(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    caller_stream = io.BufferedReader(io.BytesIO(b"complete media"))
+    caller_stream.seek(5)
+
+    snapshot = queue._snapshot_media_value(caller_stream)
+    payload = queue.encode_payload((), {"media": snapshot})
+
+    assert caller_stream.tell() == 5
+    assert not caller_stream.closed
+    caller_stream.close()
+
+    first = queue.decode_payload(payload)[1]["media"]
+    second = queue.decode_payload(payload)[1]["media"]
+    assert first is not second
+    assert first.tell() == second.tell() == 0
+    assert first.read() == second.read() == b"complete media"
+
+
+class _UnreadableStream(io.BytesIO):
+    def __init__(self, content):
+        super().__init__(content)
+        self.seek(2)
+
+    def read(self, size=-1):
+        raise OSError("read failed")
+
+
+class _UntellableStream(io.BytesIO):
+    def tell(self):
+        raise OSError("tell failed")
+
+
+class _UnrestorableStream(io.BytesIO):
+    def __init__(self, content):
+        super().__init__(content)
+        super().seek(2)
+
+    def seek(self, offset, whence=0):
+        if offset == 2 and whence == 0:
+            raise OSError("restore failed")
+        return super().seek(offset, whence)
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [_UntellableStream(b"media"), _UnreadableStream(b"media"), _UnrestorableStream(b"media")],
+)
+def test_media_snapshot_classifies_stream_read_and_restore_failures(stream):
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        OutboundQueue._snapshot_media_value(stream)
+
+    assert not stream.closed
+
+
+def test_media_snapshot_restores_position_after_read_failure():
+    stream = _UnreadableStream(b"media")
+
+    with pytest.raises(QueueEnqueueError):
+        OutboundQueue._snapshot_media_value(stream)
+
+    assert stream.tell() == 2
 
 
 @pytest.mark.parametrize(

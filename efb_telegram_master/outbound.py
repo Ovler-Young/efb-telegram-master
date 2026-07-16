@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import io
 import numbers
 import pickle
 import sqlite3
@@ -102,6 +103,22 @@ class SubmittedCall:
     row: QueuedCall
     selection: SenderSelection
     future: Future
+
+
+def _restore_inline_media(content: bytes, filename: Optional[str]) -> io.BytesIO:
+    stream = io.BytesIO(content)
+    if filename is not None:
+        stream.name = filename
+    return stream
+
+
+@dataclass(frozen=True)
+class _InlineMediaSnapshot:
+    content: bytes
+    filename: Optional[str]
+
+    def __reduce__(self):
+        return _restore_inline_media, (self.content, self.filename)
 
 
 class QueueAdapter(Protocol):
@@ -220,6 +237,40 @@ class OutboundQueue:
         if self.metrics is not None:
             self.metrics.record_removal(row.priority, row.operation, outcome, time.time() - row.created_at)
         self.refresh_depth()
+
+    @staticmethod
+    def _snapshot_media_value(value: object) -> object:
+        if isinstance(value, (bytes, str, Path)):
+            return value
+        tell = getattr(value, "tell", None)
+        seek = getattr(value, "seek", None)
+        read = getattr(value, "read", None)
+        if not callable(tell) or not callable(seek) or not callable(read):
+            raise QueueEnqueueError("Unable to serialize queued Telegram call.")
+
+        previous_position: Optional[int] = None
+        read_error: Optional[Exception] = None
+        content: object = None
+        try:
+            previous_position = tell()
+            seek(0)
+            content = read()
+        except Exception as error:
+            read_error = error
+        finally:
+            if previous_position is not None:
+                try:
+                    seek(previous_position)
+                except Exception as error:
+                    raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
+        if read_error is not None:
+            raise QueueEnqueueError("Unable to serialize queued Telegram call.") from read_error
+        if not isinstance(content, bytes):
+            raise QueueEnqueueError("Unable to serialize queued Telegram call.")
+
+        source_name = getattr(value, "name", None)
+        filename = Path(source_name).name if isinstance(source_name, (str, Path)) else None
+        return _InlineMediaSnapshot(content, filename or None)
 
     @staticmethod
     def encode_payload(args: tuple, kwargs: dict) -> bytes:
