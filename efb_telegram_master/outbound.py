@@ -292,7 +292,16 @@ class OutboundQueue:
 
     @staticmethod
     def _snapshot_media_value(value: object) -> object:
-        if isinstance(value, (bytes, str, Path)):
+        if isinstance(value, bytes):
+            return value
+        local_path = OutboundQueue._local_media_path(value)
+        if local_path is not None:
+            try:
+                with local_path.open("rb") as source:
+                    return OutboundQueue._snapshot_media_value(source)
+            except (OSError, QueueEnqueueError) as error:
+                raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
+        if isinstance(value, str):
             return value
         if isinstance(value, InputFile):
             stored_content = value.input_file_content
@@ -337,8 +346,20 @@ class OutboundQueue:
         return _InlineMediaSnapshot(content, filename or None)
 
     @staticmethod
-    def _needs_media_snapshot(value: object) -> bool:
-        return isinstance(value, InputFile) or any(
+    def _local_media_path(value: object) -> Optional[Path]:
+        if isinstance(value, Path):
+            return value
+        if not isinstance(value, str) or value.startswith(("http://", "https://")):
+            return None
+        try:
+            path = Path(value)
+            return path if path.is_file() else None
+        except OSError:
+            return None
+
+    @classmethod
+    def _needs_media_snapshot(cls, value: object) -> bool:
+        return cls._local_media_path(value) is not None or isinstance(value, InputFile) or any(
             callable(getattr(value, name, None)) for name in ("tell", "seek", "read")
         )
 
@@ -386,9 +407,10 @@ class OutboundQueue:
         explicit_filename = kwargs.get("filename")
         if explicit_filename is not None and not isinstance(explicit_filename, str):
             raise QueueEnqueueError("Unable to serialize queued Telegram call.")
-        if isinstance(snapshot, _InlineMediaSnapshot) and snapshot.input_file and explicit_filename:
+        if isinstance(snapshot, _InlineMediaSnapshot) and explicit_filename is not None:
             snapshot = _InlineMediaSnapshot(
-                snapshot.content, explicit_filename, True, snapshot.attach_name, None
+                snapshot.content, explicit_filename, snapshot.input_file,
+                snapshot.attach_name, None if snapshot.input_file else snapshot.mimetype
             )
         if positional:
             normalized_args = list(args)
@@ -448,24 +470,9 @@ class OutboundQueue:
             if value is None:
                 continue
             cls._validate_media_value(value)
-            snapshot_required = cls._needs_media_snapshot(value)
-            if isinstance(value, Path):
-                snapshot_required = True
-            elif isinstance(value, str):
-                try:
-                    snapshot_required = Path(value).is_file()
-                except OSError:
-                    snapshot_required = False
-            if not snapshot_required:
+            if not cls._needs_media_snapshot(value):
                 continue
-            if isinstance(value, (str, Path)):
-                try:
-                    with Path(value).open("rb") as source:
-                        snapshot = cls._snapshot_media_value(source)
-                except (OSError, QueueEnqueueError) as error:
-                    raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
-            else:
-                snapshot = cls._snapshot_media_value(value)
+            snapshot = cls._snapshot_media_value(value)
             if normalized_kwargs is kwargs:
                 normalized_kwargs = dict(kwargs)
             normalized_kwargs[keyword] = snapshot
