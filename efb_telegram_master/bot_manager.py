@@ -778,6 +778,46 @@ class TelegramBotManager(LocaleMixin):
         queued_operation.__name__ = operation
         return queued_operation
 
+    @staticmethod
+    def _affix_queued_content(content: object, prefix: object, suffix: object, parse_mode: object) -> str:
+        text = str(content)
+        prefix_text = f"{prefix}\n" if prefix else ""
+        suffix_text = f"\n{suffix}" if suffix else ""
+        if str(parse_mode).lower() == "html":
+            prefix_text = html.escape(prefix_text)
+            suffix_text = html.escape(suffix_text)
+        return prefix_text + text + suffix_text
+
+    def _route_affixed_queued_operation(
+        self,
+        operation: str,
+        args: tuple,
+        kwargs: Mapping[str, object],
+        *,
+        eventual_capable: bool,
+        content_key: str,
+        content_index: int,
+        prefix: object = "",
+        suffix: object = "",
+    ) -> SendReceipt:
+        queued_kwargs = dict(kwargs)
+        prefix = queued_kwargs.pop("prefix", prefix)
+        suffix = queued_kwargs.pop("suffix", suffix)
+        queued_args = list(args)
+        if len(queued_args) > content_index:
+            content = queued_args[content_index]
+            queued_args[content_index] = self._affix_queued_content(
+                content, prefix, suffix, queued_kwargs.get("parse_mode", "")
+            )
+        else:
+            content = queued_kwargs.get(content_key, "")
+            queued_kwargs[content_key] = self._affix_queued_content(
+                content, prefix, suffix, queued_kwargs.get("parse_mode", "")
+            )
+        return self._route_queued_operation(
+            operation, tuple(queued_args), queued_kwargs, eventual_capable=eventual_capable
+        )
+
     def _route_queued_operation(
         self,
         operation: str,
@@ -1160,9 +1200,53 @@ class TelegramBotManager(LocaleMixin):
         auxiliary = self.bot_pool.get_bot_by_id(selection.sender_bot_id) if self.bot_pool else None
         return auxiliary is not None and auxiliary.try_acquire_limits(telegram_chat_id)
 
+    @staticmethod
+    def _rewind_queued_files(args: tuple, kwargs: Mapping[str, object]) -> None:
+        for value in (*args, *kwargs.values()):
+            seek = getattr(value, "seek", None)
+            if callable(seek):
+                seek(0)
+
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
-        method = getattr(selection.sender, row.operation)
-        return method(*args, **self._strip_private_queue_metadata(kwargs))
+        sender = cast(SyncBotProtocol, selection.sender)
+        method = getattr(sender, row.operation)
+        telegram_kwargs = self._strip_private_queue_metadata(kwargs)
+        content_key = "text" if row.operation in {"send_message", "edit_message_text"} else "caption"
+        content_limit = (
+            int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)
+            if content_key == "text"
+            else int(telegram.constants.MessageLimit.CAPTION_LENGTH)
+        )
+        full_content = telegram_kwargs.get(content_key)
+        attachment: Optional[io.BytesIO] = None
+        if isinstance(full_content, str) and len(full_content) >= content_limit:
+            attachment = io.BytesIO(full_content.encode("utf-8"))
+            telegram_kwargs[content_key] = full_content[:100] + "\n...\n" + full_content[-100:]
+        try:
+            result = method(*args, **telegram_kwargs)
+        except telegram.error.BadRequest as error:
+            if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
+                raise
+            telegram_kwargs.pop("parse_mode")
+            self._rewind_queued_files(args, telegram_kwargs)
+            result = method(*args, **telegram_kwargs)
+        if attachment is None:
+            return result
+        chat_id = args[0] if args else telegram_kwargs.get("chat_id")
+        message_id = getattr(result, "message_id", None)
+        if chat_id is None or message_id is None:
+            return result
+        parse_mode = str(telegram_kwargs.get("parse_mode", "")).lower()
+        extension = ".md" if parse_mode == "markdown" else ".html" if parse_mode == "html" else ".txt"
+        label = "Message" if content_key == "text" else "Caption"
+        sender.send_document(
+            chat_id,
+            attachment,
+            filename=f"{chat_id}_{message_id}{extension}",
+            reply_to_message_id=message_id,
+            caption=f"{label} is truncated due to its length. Full message is sent as attachment.",
+        )
+        return result
 
     def _pop_queued_db_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
         if not isinstance(row_id, int):
@@ -1398,7 +1482,10 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_queued_operation("send_message", args, kwargs, eventual_capable=True)
+        return self._route_affixed_queued_operation(
+            "send_message", args, kwargs, eventual_capable=True,
+            content_key="text", content_index=1, prefix=prefix, suffix=suffix,
+        )
 
     @Decorators.retry_on_chat_migration
     def edit_message_text(self, prefix='', suffix='', **kwargs):
@@ -1414,7 +1501,10 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_queued_operation("edit_message_text", (), kwargs, eventual_capable=False)
+        return self._route_affixed_queued_operation(
+            "edit_message_text", (), kwargs, eventual_capable=False,
+            content_key="text", content_index=2, prefix=prefix, suffix=suffix,
+        )
 
     @Decorators.retry_on_chat_migration
     def send_audio(self, *args, **kwargs):
@@ -1433,7 +1523,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_queued_operation("send_audio", args, kwargs, eventual_capable=True)
+        return self._route_affixed_queued_operation(
+            "send_audio", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
+        )
 
     @Decorators.retry_on_chat_migration
     def send_voice(self, *args, **kwargs):
@@ -1452,7 +1544,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_queued_operation("send_voice", args, kwargs, eventual_capable=True)
+        return self._route_affixed_queued_operation(
+            "send_voice", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
+        )
 
     @Decorators.retry_on_chat_migration
     def send_video(self, *args, **kwargs):
@@ -1471,7 +1565,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_queued_operation("send_video", args, kwargs, eventual_capable=True)
+        return self._route_affixed_queued_operation(
+            "send_video", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
+        )
 
     @Decorators.retry_on_chat_migration
     def send_document(self, *args, **kwargs):
@@ -1488,7 +1584,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_queued_operation("send_document", args, kwargs, eventual_capable=True)
+        return self._route_affixed_queued_operation(
+            "send_document", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
+        )
 
     @Decorators.retry_on_chat_migration
     def send_animation(self, *args, **kwargs):
@@ -1505,7 +1603,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_queued_operation("send_animation", args, kwargs, eventual_capable=True)
+        return self._route_affixed_queued_operation(
+            "send_animation", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
+        )
 
     @Decorators.retry_on_chat_migration
     def send_photo(self, *args, **kwargs):
@@ -1522,7 +1622,9 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_queued_operation("send_photo", args, kwargs, eventual_capable=True)
+        return self._route_affixed_queued_operation(
+            "send_photo", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
+        )
 
     @Decorators.retry_on_chat_migration
     def send_media_group(self, *args, **kwargs):
@@ -1574,7 +1676,9 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
-        return self._route_queued_operation("edit_message_caption", args, kwargs, eventual_capable=False)
+        return self._route_affixed_queued_operation(
+            "edit_message_caption", args, kwargs, eventual_capable=False, content_key="caption", content_index=2
+        )
 
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
