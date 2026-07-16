@@ -667,3 +667,86 @@ def test_update_reactions_waits_for_queued_database_log():
     assert old_msg.reactions == status.reactions
     processor.dispatch_message.assert_called_once_with(old_msg, "__template__", (100, 10), 100, None)
     processor.logger.error.assert_not_called()
+
+
+def test_first_telegram_origin_reaction_replies_to_user_message():
+    processor = Mock(spec=SlaveMessageProcessor)
+    processor.REACTION_DB_WAIT_TIMEOUT = 0
+    processor.chat_manager = Mock()
+    processor.dispatch_message = Mock()
+    processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+    processor.logger = Mock()
+    processor._reaction_target_message_id = SlaveMessageProcessor._reaction_target_message_id
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        reactions={},
+        vendor_specific=None,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt=None,
+        sender_bot_id=None,
+        build_etm_msg=Mock(return_value=old_msg),
+    )
+    processor.db = Mock()
+    processor.db.get_msg_log.return_value = old_msg_db
+    status = SimpleNamespace(
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+        msg_id="__msg_id_reaction__",
+        reactions={"R0": [object()]},
+    )
+
+    SlaveMessageProcessor.update_reactions(processor, status)
+
+    processor.dispatch_message.assert_called_once_with(
+        old_msg,
+        "__template__",
+        None,
+        100,
+        None,
+        database_old_msg_id=(100, 10),
+        target_msg_id_override=10,
+    )
+    assert old_msg.vendor_specific["_force_send_mode"] == "blocking"
+
+
+def test_telegram_origin_reaction_updates_and_retraction_edit_bot_alternate():
+    processor = Mock(spec=SlaveMessageProcessor)
+    processor.REACTION_DB_WAIT_TIMEOUT = 0
+    processor.chat_manager = Mock()
+    processor.dispatch_message = Mock()
+    processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))
+    processor.logger = Mock()
+    processor._reaction_target_message_id = SlaveMessageProcessor._reaction_target_message_id
+    old_msg = SimpleNamespace(
+        type=MsgType.Text,
+        reactions={},
+        vendor_specific=None,
+        chat=SimpleNamespace(module_id="tests.mocks.slave"),
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+    )
+    old_msg_db = SimpleNamespace(
+        master_msg_id="100.10",
+        master_msg_id_alt="100.11",
+        sender_bot_id=None,
+        build_etm_msg=Mock(return_value=old_msg),
+    )
+    processor.db = Mock()
+    processor.db.get_msg_log.return_value = old_msg_db
+
+    for reactions in ({"R0": [object()]}, {}):
+        status = SimpleNamespace(
+            chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat__"),
+            msg_id="__msg_id_reaction__",
+            reactions=reactions,
+        )
+        SlaveMessageProcessor.update_reactions(processor, status)
+
+    expected = [
+        ((old_msg, "__template__", (100, 11), 100, None), {}),
+        ((old_msg, "__template__", (100, 11), 100, None), {}),
+    ]
+    assert [(call.args, call.kwargs) for call in processor.dispatch_message.call_args_list] == expected
+    assert old_msg.reactions == {}

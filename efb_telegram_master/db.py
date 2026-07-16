@@ -749,20 +749,32 @@ class DatabaseManager:
                                   old_message_id: Optional[OldMsgID] = None,
                                   sender_bot_id: Optional[str] = None):
         """Add or update a message into the database."""
-        master_msg_id = message_id_to_str(TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id))
+        sent_message_id = message_id_to_str(
+            TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)
+        )
+        master_msg_id = sent_message_id
         master_msg_id_alt = None
         self.logger.debug("[%s] Received message logging request of %s", master_msg_id, msg.uid)
 
+        row: Optional[MsgLog] = None
         if old_message_id is not None:
             old_message_id_str = message_id_to_str(*old_message_id)
-            if master_msg_id != old_message_id_str:
-                self.logger.debug("[%s] Message has an old ID: %s", master_msg_id, old_message_id_str)
-                master_msg_id, master_msg_id_alt = old_message_id_str, master_msg_id
+            row = MsgLog.get_or_none(
+                (MsgLog.master_msg_id == old_message_id_str) |
+                (MsgLog.master_msg_id_alt == old_message_id_str)
+            )
+            if row is not None:
+                master_msg_id = row.master_msg_id
+                master_msg_id_alt = (
+                    sent_message_id if sent_message_id != master_msg_id else row.master_msg_id_alt
+                )
+            elif sent_message_id != old_message_id_str:
+                self.logger.debug("[%s] Message has an old ID: %s", sent_message_id, old_message_id_str)
+                master_msg_id, master_msg_id_alt = old_message_id_str, sent_message_id
 
-        row: MsgLog
-        r = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
-        if r is not None:
-            row = r
+        if row is None:
+            row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
+        if row is not None:
             save = row.save
             self.logger.debug("[%s] Message record is found in database, update it", master_msg_id)
         else:
@@ -784,8 +796,7 @@ class DatabaseManager:
         row.mime = msg.mime
         row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
         pickle_data = self.pickle_misc_msg(msg)
-        if pickle_data:
-            row.pickle = pickle_data
+        row.pickle = pickle_data
 
         result = save()
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)

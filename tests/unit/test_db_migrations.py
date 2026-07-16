@@ -1,5 +1,6 @@
 import os
 import logging
+import pickle
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -225,6 +226,62 @@ def test_build_etm_msg_restores_sender_bot_id(channel, slave):
     assert restored.sender_bot_id == "888"
 
     row.delete_instance()
+
+
+def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
+    message = SimpleNamespace(
+        uid=MessageID("reaction-message"),
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"),
+        text="message",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+        file_id=None,
+        file_unique_id=None,
+        mime=None,
+        is_system=False,
+        attributes=None,
+        commands=None,
+        substitutions=None,
+        target=None,
+        sender_bot_id=None,
+        reactions={},
+    )
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=10))
+
+        message.reactions = {"R0": [reactor]}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=11),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(10)),
+            sender_bot_id="777",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.11", "777")
+        assert pickle.loads(bytes(row.pickle))["reactions"] == {"R0": ("tests.mocks.slave reactor",)}
+
+        message.reactions = {}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=11),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(11)),
+            sender_bot_id="777",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.11", "777")
+        assert row.pickle is None
 
 
 @pytest.mark.skipif(

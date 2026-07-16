@@ -257,14 +257,16 @@ class SlaveMessageProcessor(LocaleMixin):
                          tg_dest: TelegramChatID,
                          thread_id: Optional[TelegramTopicID],
                          silent: bool = False,
-                         dedupe_key: Optional[Tuple[str, str]] = None):
+                         dedupe_key: Optional[Tuple[str, str]] = None,
+                         database_old_msg_id: Optional[OldMsgID] = None,
+                         target_msg_id_override: Optional[TelegramMessageID] = None):
         """Dispatch with header, destination and Telegram message ID and destinations."""
 
         xid = msg.uid
 
         # When targeting a message (reply to)
-        target_msg_id: Optional[TelegramMessageID] = None
-        if isinstance(msg.target, Message):
+        target_msg_id = target_msg_id_override
+        if target_msg_id is None and isinstance(msg.target, Message):
             self.logger.debug("[%s] Message is replying to %s.", msg.uid, msg.target)
             log = self.db.get_msg_log(
                 slave_msg_id=msg.target.uid,
@@ -378,7 +380,8 @@ class SlaveMessageProcessor(LocaleMixin):
             sender_bot_id = getattr(tg_msg, 'sender_bot_id', None)
 
             self.bot.write_db_mapping(
-                etm_msg, tg_msg, old_msg_id, sender_bot_id=sender_bot_id, on_complete=on_db_complete,
+                etm_msg, tg_msg, database_old_msg_id or old_msg_id,
+                sender_bot_id=sender_bot_id, on_complete=on_db_complete,
             )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
@@ -1504,6 +1507,19 @@ class SlaveMessageProcessor(LocaleMixin):
 
         effective_msg = self._reaction_target_message_id(old_msg, old_msg_db)
         chat_id, msg_id = utils.message_id_str_to_id(effective_msg)
+
+        telegram_origin = bool(
+            old_msg.deliver_to and old_msg.deliver_to.channel_id == old_msg.chat.module_id
+        )
+        if telegram_origin and not old_msg_db.master_msg_id_alt:
+            old_msg.edit = False
+            old_msg.vendor_specific = old_msg.vendor_specific or {}
+            old_msg.vendor_specific['_force_send_mode'] = 'blocking'
+            self.dispatch_message(
+                old_msg, msg_template, None, tg_dest, thread_id,
+                database_old_msg_id=(chat_id, msg_id), target_msg_id_override=msg_id,
+            )
+            return
 
         self.dispatch_message(old_msg, msg_template, (chat_id, msg_id), tg_dest, thread_id)
 
