@@ -49,6 +49,7 @@ _DIRECT_MEDIA_ARGUMENTS = {
     "send_voice": _DirectMediaArgument(1, "voice", Voice),
 }
 _THUMBNAIL_OPERATIONS = frozenset({"send_animation", "send_audio", "send_document", "send_video"})
+_KEYWORD_MEDIA_ARGUMENTS = {"send_video": ("cover",)}
 _NESTED_MEDIA_ARGUMENTS = {
     "edit_message_media": (0, "media"),
     "send_media_group": (1, "media"),
@@ -438,6 +439,38 @@ class OutboundQueue:
         normalized_kwargs["thumbnail"] = cls._snapshot_media_value(thumbnail)
         return normalized_kwargs
 
+    @classmethod
+    def _normalize_keyword_media(cls, operation: str, kwargs: dict) -> dict:
+        keywords = _KEYWORD_MEDIA_ARGUMENTS.get(operation, ())
+        normalized_kwargs = kwargs
+        for keyword in keywords:
+            value = normalized_kwargs.get(keyword)
+            if value is None:
+                continue
+            cls._validate_media_value(value)
+            snapshot_required = cls._needs_media_snapshot(value)
+            if isinstance(value, Path):
+                snapshot_required = True
+            elif isinstance(value, str):
+                try:
+                    snapshot_required = Path(value).is_file()
+                except OSError:
+                    snapshot_required = False
+            if not snapshot_required:
+                continue
+            if isinstance(value, (str, Path)):
+                try:
+                    with Path(value).open("rb") as source:
+                        snapshot = cls._snapshot_media_value(source)
+                except (OSError, QueueEnqueueError) as error:
+                    raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
+            else:
+                snapshot = cls._snapshot_media_value(value)
+            if normalized_kwargs is kwargs:
+                normalized_kwargs = dict(kwargs)
+            normalized_kwargs[keyword] = snapshot
+        return normalized_kwargs
+
     @staticmethod
     def encode_payload(args: tuple, kwargs: dict) -> bytes:
         try:
@@ -511,6 +544,7 @@ class OutboundQueue:
             request.operation, telegram_args, telegram_kwargs
         )
         telegram_kwargs = self._normalize_thumbnail(request.operation, telegram_kwargs)
+        telegram_kwargs = self._normalize_keyword_media(request.operation, telegram_kwargs)
         chat_id = self._destination(operation, telegram_args, telegram_kwargs)
         payload = self.encode_payload(telegram_args, telegram_kwargs)
         return request.operation, telegram_args, telegram_kwargs, chat_id, priority, slave_id, required_sender, payload
