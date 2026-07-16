@@ -14,6 +14,7 @@ from concurrent.futures import Executor, Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Protocol
+from urllib.parse import unquote, urlsplit
 
 from telegram import (
     Animation, Audio, Document, InputFile, InputMedia, InputMediaAnimation, InputMediaAudio,
@@ -312,7 +313,7 @@ class OutboundQueue:
             try:
                 with local_path.open("rb") as source:
                     return OutboundQueue._snapshot_media_value(source)
-            except (OSError, QueueEnqueueError) as error:
+            except (OSError, ValueError, QueueEnqueueError) as error:
                 raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
         if isinstance(value, str):
             return value
@@ -364,6 +365,14 @@ class OutboundQueue:
             return value
         if not isinstance(value, str) or value.startswith(("http://", "https://")):
             return None
+        try:
+            uri = urlsplit(value)
+        except ValueError:
+            return None
+        if uri.scheme.lower() == "file":
+            if uri.netloc or uri.query or uri.fragment or not uri.path.startswith("/"):
+                return None
+            return Path(unquote(uri.path))
         try:
             path = Path(value)
             return path if path.is_file() else None
