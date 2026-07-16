@@ -16,6 +16,7 @@ from telethon.tl.types import Channel, Chat as TelethonChat
 from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
+from efb_telegram_master.db import HistoryMigrationEntry
 from .helper.filters import has_button, in_chats
 
 pytestmark = pytest.mark.asyncio
@@ -293,6 +294,32 @@ def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricS
     )
 
 
+def _migration_activity_completed(*, activity_observed: bool, expected: Set[int],
+                                  db_indices: List[int], telegram_indices: List[int],
+                                  target_entry_count: int, queue_completed: bool) -> bool:
+    expected_count = len(expected)
+    return (
+        activity_observed
+        and queue_completed
+        and target_entry_count == 0
+        and set(db_indices) == expected
+        and len(db_indices) == expected_count
+        and set(telegram_indices) == expected
+        and len(telegram_indices) == expected_count
+    )
+
+
+def _target_migration_entry_count(slave_chat_id: str, target_chat_id: int) -> int:
+    return int(
+        HistoryMigrationEntry.select()
+        .where(
+            (HistoryMigrationEntry.slave_chat_id == slave_chat_id)
+            & (HistoryMigrationEntry.target_chat_id == str(target_chat_id))
+        )
+        .count()
+    )
+
+
 def _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix: str):
     slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
     return [
@@ -350,25 +377,55 @@ async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_cha
     raise AssertionError(f"Timed out waiting for stream to settle: {last_debug}")
 
 
-async def _wait_for_migrated_stream_indices(client, chat_id: int, prefix: str, expected_count: int, *,
-                                            min_message_id: int, timeout: float = BACKFILL_WAIT_TIMEOUT):
+async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client, chat, chat_id: int,
+                                             prefix: str, expected_count: int, *, min_message_id: int,
+                                             metrics_before: QueueMetricSnapshot,
+                                             timeout: float = BACKFILL_WAIT_TIMEOUT):
     expected = _expected_stream_indices(expected_count)
+    slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
     deadline = time.time() + timeout
+    activity_observed = False
 
     last_debug = ""
     while time.time() < deadline:
         recent = await _messages_since_id(client, chat_id, min_message_id)
-        found = {
+        telegram_indices = [
             idx
             for message in recent
             for idx in _extract_stream_indices(message.raw_text or "", prefix)
-        }
-        last_debug = f"migrated_idx={len(found)}/{expected_count}, messages_scanned={len(recent)}"
-        if found == expected:
-            return
+        ]
+        db_logs = _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix)
+        db_indices = [
+            idx
+            for log in db_logs
+            for idx in _extract_stream_indices(log.text or "", prefix)
+        ]
+        metrics_current = _queue_metrics_snapshot(channel_with_auxiliary_bots.bot_manager)
+        enqueue_delta = metrics_current.enqueued - metrics_before.enqueued
+        activity_observed = activity_observed or enqueue_delta > 0 or bool(telegram_indices)
+        target_entry_count = _target_migration_entry_count(slave_chat_id, chat_id)
+        queue_completed = _queue_activity_completed(
+            metrics_before,
+            metrics_current,
+            expected_count=expected_count,
+        )
+        last_debug = (
+            f"migration_observed={activity_observed}, db_idx={len(db_indices)}/{expected_count}, "
+            f"tg_idx={len(telegram_indices)}/{expected_count}, target_entries={target_entry_count}, "
+            f"metrics_before={metrics_before!r}, metrics_current={metrics_current!r}"
+        )
+        if _migration_activity_completed(
+            activity_observed=activity_observed,
+            expected=expected,
+            db_indices=db_indices,
+            telegram_indices=telegram_indices,
+            target_entry_count=target_entry_count,
+            queue_completed=queue_completed,
+        ):
+            return recent, metrics_current
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-    raise AssertionError(f"Timed out waiting for migrated stream indices: {last_debug}")
+    raise AssertionError(f"Timed out waiting for migrated stream terminal state: {last_debug}")
 
 
 async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_bots, helper, client, bot_id,
@@ -453,14 +510,24 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     target_group_id = bot_topic_group
     try:
+        migration_metrics_before = _queue_metrics_snapshot(bot_manager)
         relink_true_message = await _link_chat(client, helper, bot_id, chat.uid, target_group_id, flag="true")
-        await _wait_for_migrated_stream_indices(
+        _, migration_metrics_after = await _wait_for_migrated_stream_terminal(
+            channel_with_auxiliary_bots,
             client,
+            chat,
             target_group_id,
             prefix,
             STREAM_MESSAGE_COUNT,
             min_message_id=relink_true_message.id,
+            metrics_before=migration_metrics_before,
         )
+        assert _queue_activity_completed(
+            migration_metrics_before,
+            migration_metrics_after,
+            expected_count=STREAM_MESSAGE_COUNT,
+        )
+        assert _target_migration_entry_count(slave_uid, target_group_id) == 0
 
         recent_messages = await _messages_since_id(client, target_group_id, relink_true_message.id)
         assert not any(

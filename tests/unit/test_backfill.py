@@ -16,6 +16,7 @@ from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 from tests.integration.test_backfill_history import (
+    _migration_activity_completed,
     _queue_activity_completed,
     _queue_metrics_snapshot,
 )
@@ -71,6 +72,42 @@ def test_backfill_queue_activity_requires_exact_success_without_failure_or_in_fl
     metrics.increment_in_flight("normal", "send_message", "main")
     in_flight = _queue_metrics_snapshot(manager)
     assert not _queue_activity_completed(failed, in_flight, expected_count=0)
+
+
+def test_backfill_migration_terminal_requires_observed_activity_and_empty_target_entries():
+    expected = {0, 1}
+    assert not _migration_activity_completed(
+        activity_observed=False,
+        expected=expected,
+        db_indices=[0, 1],
+        telegram_indices=[0, 1],
+        target_entry_count=0,
+        queue_completed=True,
+    )
+    assert not _migration_activity_completed(
+        activity_observed=True,
+        expected=expected,
+        db_indices=[0, 1],
+        telegram_indices=[0, 1, 1],
+        target_entry_count=0,
+        queue_completed=True,
+    )
+    assert not _migration_activity_completed(
+        activity_observed=True,
+        expected=expected,
+        db_indices=[0, 1],
+        telegram_indices=[0, 1],
+        target_entry_count=1,
+        queue_completed=True,
+    )
+    assert _migration_activity_completed(
+        activity_observed=True,
+        expected=expected,
+        db_indices=[0, 1],
+        telegram_indices=[0, 1],
+        target_entry_count=0,
+        queue_completed=True,
+    )
 
 
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
