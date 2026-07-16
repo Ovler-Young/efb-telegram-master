@@ -16,6 +16,7 @@ from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 from tests.integration.test_backfill_history import (
+    _expected_relink_send_count,
     _migration_activity_completed,
     _queue_activity_completed,
     _queue_metrics_snapshot,
@@ -72,6 +73,33 @@ def test_backfill_queue_activity_requires_exact_success_without_failure_or_in_fl
     metrics.increment_in_flight("normal", "send_message", "main")
     in_flight = _queue_metrics_snapshot(manager)
     assert not _queue_activity_completed(failed, in_flight, expected_count=0)
+
+
+def test_backfill_relink_counts_status_send_separately_from_migrated_content():
+    metrics = Metrics()
+    manager = SimpleNamespace(_metrics=metrics)
+    before = _queue_metrics_snapshot(manager)
+    migrated_count = 2
+
+    for _ in range(migrated_count + 1):
+        metrics.record_enqueued("normal", "send_message")
+        metrics.record_completion("normal", "send_message", "main", "success")
+    after = _queue_metrics_snapshot(manager)
+
+    assert _expected_relink_send_count(migrated_count) == 3
+    assert _queue_activity_completed(
+        before,
+        after,
+        expected_count=_expected_relink_send_count(migrated_count),
+    )
+    assert _migration_activity_completed(
+        activity_observed=True,
+        expected={0, 1},
+        db_indices=[0, 1],
+        telegram_indices=[0, 1],
+        target_entry_count=0,
+        queue_completed=True,
+    )
 
 
 def test_backfill_migration_terminal_requires_observed_activity_and_empty_target_entries():
