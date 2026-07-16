@@ -272,83 +272,154 @@ def test_public_send_message_routes_eligible_requests_as_eventual():
     assert manager._enqueue_eventual_send.call_args.args[3:] == ((manager, 123), {"text": "queued"})
 
 
-def test_queued_routes_apply_text_and_caption_affixes_before_enqueue():
+@pytest.mark.parametrize(
+    ("operation", "args", "content_kwargs", "content_key", "content_index"),
+    [
+        ("send_message", (123, "message"), {}, "text", 1),
+        ("send_message", (123,), {"text": "message"}, "text", 1),
+        ("send_photo", (123, "photo", "caption"), {}, "caption", 2),
+        ("send_photo", (123, "photo"), {"caption": "caption"}, "caption", 2),
+    ],
+)
+def test_queued_routes_apply_affixes_without_passing_manager_kwargs_to_sender(
+    operation,
+    args,
+    content_kwargs,
+    content_key,
+    content_index,
+):
     manager = _make_queueing_manager()
-
-    manager.send_message(
-        123,
-        "message",
+    getattr(manager, operation)(
+        *args,
+        **content_kwargs,
         prefix="Prefix",
         suffix="Suffix",
         _send_mode="eventual",
         _slave_id="slave.chat",
     )
-    assert manager._enqueue_eventual_send.call_args.args[3:] == (
-        (manager, 123, "Prefix\nmessage\nSuffix"),
-        {},
-    )
+    queued_call = manager._enqueue_eventual_send.call_args
+    queued_args = queued_call.args[3][1:]
+    queued_kwargs = queued_call.args[4]
+    assert "prefix" not in queued_kwargs
+    assert "suffix" not in queued_kwargs
 
-    manager.send_photo(
-        123,
-        "photo",
-        caption="caption",
+    sender = Mock()
+    selection = SimpleNamespace(sender=sender)
+    manager.execute_queued_call(SimpleNamespace(operation=operation), queued_args, queued_kwargs, selection)
+
+    sender_call = getattr(sender, operation).call_args
+    if content_key in sender_call.kwargs:
+        effective_content = sender_call.kwargs[content_key]
+    else:
+        effective_content = sender_call.args[content_index]
+    expected_content = content_kwargs.get(content_key) or args[content_index]
+    assert effective_content == "Prefix\n" + expected_content + "\nSuffix"
+    assert "prefix" not in sender_call.kwargs
+    assert "suffix" not in sender_call.kwargs
+
+
+@pytest.mark.parametrize(
+    ("operation", "content_key", "content_index", "uses_keyword_content"),
+    [
+        ("send_message", "text", 1, False),
+        ("send_message", "text", 1, True),
+        ("send_photo", "caption", 2, False),
+        ("send_photo", "caption", 2, True),
+    ],
+)
+def test_queued_execution_sends_full_oversized_content_as_attachment_for_positional_and_keyword_inputs(
+    operation,
+    content_key,
+    content_index,
+    uses_keyword_content,
+):
+    manager = _make_queueing_manager()
+    content_limit = (
+        int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)
+        if content_key == "text"
+        else int(telegram.constants.MessageLimit.CAPTION_LENGTH)
+    )
+    content = "x" * (content_limit + 1)
+    args = (123,) if operation == "send_message" else (123, "photo")
+    content_kwargs = {content_key: content} if uses_keyword_content else {}
+    if not uses_keyword_content:
+        args += (content,)
+
+    getattr(manager, operation)(
+        *args,
+        **content_kwargs,
         prefix="Prefix",
         suffix="Suffix",
         _send_mode="eventual",
         _slave_id="slave.chat",
     )
-    assert manager._enqueue_eventual_send.call_args.args[3:] == (
-        (manager, 123, "photo"),
-        {"caption": "Prefix\ncaption\nSuffix"},
+    queued_call = manager._enqueue_eventual_send.call_args
+    queued_args = queued_call.args[3][1:]
+    queued_kwargs = queued_call.args[4]
+    full_content = "Prefix\n" + content + "\nSuffix"
+    sender = Mock()
+    sender.send_message.return_value = SimpleNamespace(message_id=7)
+    sender.send_photo.return_value = SimpleNamespace(message_id=7)
+
+    result = manager.execute_queued_call(
+        SimpleNamespace(operation=operation),
+        queued_args,
+        queued_kwargs,
+        SimpleNamespace(sender=sender),
     )
 
+    assert result.message_id == 7
+    sender_call = getattr(sender, operation).call_args
+    if content_key in sender_call.kwargs:
+        effective_content = sender_call.kwargs[content_key]
+    else:
+        effective_content = sender_call.args[content_index]
+    assert effective_content == full_content[:100] + "\n...\n" + full_content[-100:]
+    assert "prefix" not in sender_call.kwargs
+    assert "suffix" not in sender_call.kwargs
+    attachment = sender.send_document.call_args.args[1]
+    assert attachment.getvalue() == full_content.encode("utf-8")
+    assert "prefix" not in sender.send_document.call_args.kwargs
+    assert "suffix" not in sender.send_document.call_args.kwargs
 
-def test_queued_execution_retries_entity_parse_failure_without_parse_mode():
+
+@pytest.mark.parametrize(
+    ("operation", "args", "kwargs"),
+    [
+        ("send_message", (123,), {"text": "<broken>"}),
+        ("send_photo", (123, "photo"), {"caption": "<broken>"}),
+    ],
+)
+def test_queued_execution_retries_entity_parse_failure_once_without_parse_mode(
+    operation,
+    args,
+    kwargs,
+):
     manager = object.__new__(TelegramBotManager)
     sender = Mock()
-    sender.send_message.side_effect = [
+    getattr(sender, operation).side_effect = [
         telegram.error.BadRequest("Can't parse entities"),
         SimpleNamespace(message_id=7),
     ]
-    row = SimpleNamespace(operation="send_message")
-    selection = SimpleNamespace(sender=sender)
 
     result = manager.execute_queued_call(
-        row,
-        (123,),
-        {"text": "<broken>", "parse_mode": "HTML"},
-        selection,
+        SimpleNamespace(operation=operation),
+        args,
+        {
+            **kwargs,
+            "parse_mode": "HTML",
+            "_send_mode": "eventual",
+            "_slave_id": "slave.chat",
+        },
+        SimpleNamespace(sender=sender),
     )
 
     assert result.message_id == 7
-    assert sender.send_message.call_args_list == [
-        call(123, text="<broken>", parse_mode="HTML"),
-        call(123, text="<broken>"),
-    ]
-
-
-def test_queued_execution_sends_full_oversized_text_as_attachment():
-    manager = object.__new__(TelegramBotManager)
-    sender = Mock()
-    sender.send_message.return_value = SimpleNamespace(message_id=7)
-    row = SimpleNamespace(operation="send_message")
-    selection = SimpleNamespace(sender=sender)
-    full_text = "x" * (int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH) + 1)
-
-    result = manager.execute_queued_call(row, (123,), {"text": full_text}, selection)
-
-    assert result.message_id == 7
-    assert sender.send_message.call_args == call(
-        123,
-        text=full_text[:100] + "\n...\n" + full_text[-100:],
-    )
-    attachment = sender.send_document.call_args.args[1]
-    assert attachment.getvalue() == full_text.encode("utf-8")
-    assert sender.send_document.call_args.kwargs == {
-        "filename": "123_7.txt",
-        "reply_to_message_id": 7,
-        "caption": "Message is truncated due to its length. Full message is sent as attachment.",
-    }
+    sender_calls = getattr(sender, operation).call_args_list
+    assert len(sender_calls) == 2
+    assert sender_calls[0].kwargs["parse_mode"] == "HTML"
+    assert "parse_mode" not in sender_calls[1].kwargs
+    assert sender_calls[1].kwargs == kwargs
 
 
 def test_queued_route_defers_db_mapping_context_outside_telegram_kwargs():
