@@ -754,6 +754,47 @@ def test_public_edit_message_text_is_blocking_and_requires_its_sender(sender_bot
     )
 
 
+def test_public_positional_edit_retries_chat_migration_without_replacing_text():
+    manager = _make_queueing_manager()
+    old_chat_id = 123
+    new_chat_id = 456
+    message_id = 789
+    later_argument = "inline-message-id"
+    result_message = SimpleNamespace(message_id=message_id)
+    manager._bot.edit_message_text.side_effect = [
+        telegram.error.ChatMigrated(new_chat_id),
+        result_message,
+    ]
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+
+    def send_and_wait(_slave_id, _chat_id, fn, args, kwargs, cleanup_files=None):
+        send_kwargs = {key: value for key, value in kwargs.items() if not key.startswith("_")}
+        return SendReceipt(message=fn(*args, **send_kwargs))
+
+    manager._enqueue_blocking_send_and_wait = Mock(side_effect=send_and_wait)
+
+    receipt = manager.edit_message_text(
+        "body",
+        old_chat_id,
+        message_id,
+        later_argument,
+        parse_mode="HTML",
+    )
+
+    assert receipt.message is result_message
+    calls = manager._bot.edit_message_text.call_args_list
+    assert len(calls) == 2
+    assert calls[0].args == ("body", old_chat_id, message_id, later_argument)
+    assert calls[0].kwargs == {"parse_mode": "HTML"}
+    assert calls[1].args[0] == "body"
+    assert calls[1].args[1] == new_chat_id
+    assert calls[1].args[2:] == (message_id, later_argument)
+    assert calls[1].kwargs == {"parse_mode": "HTML"}
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(old_chat_id, new_chat_id)
+
+
 def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():
     manager = object.__new__(TelegramBotManager)
     manager._enqueue_requests = Mock(return_value=("row-1", Mock()))
