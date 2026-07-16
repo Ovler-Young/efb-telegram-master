@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Protocol
 
 from telegram import (
-    Animation, Audio, Document, InputFile, InputMedia, PhotoSize, Sticker, Video, Voice,
+    Animation, Audio, Document, InputFile, InputMedia, InputMediaAnimation, InputMediaAudio,
+    InputMediaDocument, InputMediaPhoto, InputMediaVideo, PhotoSize, Sticker, Video, Voice,
 )
 
 
@@ -51,6 +52,13 @@ _THUMBNAIL_OPERATIONS = frozenset({"send_animation", "send_audio", "send_documen
 _NESTED_MEDIA_ARGUMENTS = {
     "edit_message_media": (0, "media"),
     "send_media_group": (1, "media"),
+}
+_NESTED_MEDIA_TYPES = {
+    InputMediaAnimation: Animation,
+    InputMediaAudio: Audio,
+    InputMediaDocument: Document,
+    InputMediaPhoto: PhotoSize,
+    InputMediaVideo: Video,
 }
 
 
@@ -348,10 +356,14 @@ class OutboundQueue:
         if not isinstance(value, InputMedia):
             return value
         normalized = copy.copy(value)
-        for attribute in ("media", "thumbnail"):
-            attachment = getattr(value, attribute, None)
-            if attachment is not None and cls._needs_media_snapshot(attachment):
-                object.__setattr__(normalized, attribute, cls._snapshot_media_value(attachment))
+        cls._validate_media_value(value.media, _NESTED_MEDIA_TYPES.get(type(value)))
+        if cls._needs_media_snapshot(value.media):
+            object.__setattr__(normalized, "media", cls._snapshot_media_value(value.media))
+        thumbnail = getattr(value, "thumbnail", None)
+        if thumbnail is not None:
+            cls._validate_media_value(thumbnail)
+            if cls._needs_media_snapshot(thumbnail):
+                object.__setattr__(normalized, "thumbnail", cls._snapshot_media_value(thumbnail))
         return normalized
 
     @classmethod

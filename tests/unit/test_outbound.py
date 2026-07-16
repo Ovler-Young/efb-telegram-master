@@ -6,7 +6,7 @@ import tempfile
 import threading
 
 import pytest
-from telegram import InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo
+from telegram import InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo, PhotoSize
 
 from efb_telegram_master.outbound import (
     InvalidQueuedPayloadError,
@@ -330,6 +330,54 @@ def test_unsupported_media_values_commit_zero_rows(tmp_path, queue_request):
         queue.enqueue_many([queue_request], lambda _name: media_operation)
 
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("operation_name", ["edit_message_media", "send_media_group"])
+@pytest.mark.parametrize("field", ["media", "thumbnail"])
+def test_unsupported_nested_media_values_commit_zero_rows(tmp_path, operation_name, field):
+    queue = OutboundQueue(tmp_path)
+    nested = (
+        InputMediaPhoto(object())
+        if field == "media"
+        else InputMediaVideo("video-id", thumbnail=object())
+    )
+    if operation_name == "edit_message_media":
+        request = QueueRequest(
+            operation_name, (nested, 100, 7), {"_required_sender_bot_id": "__main__"}
+        )
+        resolved_operation = edit_media_operation
+    else:
+        request = QueueRequest(operation_name, (100, [InputMediaPhoto("photo-id"), nested]), {})
+        resolved_operation = media_operation
+
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        queue.enqueue_many([request], lambda _name: resolved_operation)
+
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+
+
+def test_nested_media_accepts_file_ids_urls_bytes_and_matching_telegram_objects(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    photo_size = PhotoSize("photo-size-id", "unique-id", 10, 10)
+    telegram_media = InputMediaPhoto("placeholder")
+    object.__setattr__(telegram_media, "media", photo_size)
+    media = [
+        InputMediaPhoto("photo-id"),
+        InputMediaPhoto("https://example.com/photo.jpg"),
+        InputMediaPhoto(b"photo-bytes"),
+        telegram_media,
+    ]
+
+    queue.enqueue_many(
+        [QueueRequest("send_media_group", (100, media), {})],
+        lambda _name: media_operation,
+    )
+
+    decoded = queue.decode_payload(queue.heads()[0].payload)[0][1]
+    assert decoded[0].media == "photo-id"
+    assert decoded[1].media == "https://example.com/photo.jpg"
+    assert decoded[2].media.input_file_content == b"photo-bytes"
+    assert decoded[3].media == photo_size
 
 
 @pytest.mark.parametrize(
