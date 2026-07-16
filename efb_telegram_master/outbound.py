@@ -508,6 +508,9 @@ class OutboundQueueScheduler:
                 except BaseException as error:
                     decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
                     if decision.kind == "retry_eventual" and submitted.row.priority == 0:
+                        if self.stopping:
+                            self.queue.fail_waiter(row_id, SchedulerStoppedError("Outbound scheduler stopped."))
+                            continue
                         if decision.retry_at is None:
                             raise RuntimeError("Retry decision requires a retry deadline.")
                         self._schedule_retry(decision.retry_at)

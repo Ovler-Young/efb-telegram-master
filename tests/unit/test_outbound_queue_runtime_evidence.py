@@ -659,6 +659,38 @@ def test_shutdown_final_snapshot_keeps_retained_eventual_rows(
     assert not retained_queue.waiters
 
 
+def test_shutdown_resolves_retained_eventual_retry_after_waiter(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row_id, waiter = enqueue(retained_queue, 174, "retry during shutdown")
+    executor = ControlledExecutor()
+    adapter = RecordingAdapter(failure_decision=CompletionDecision("retry_eventual", retry_at=20.0))
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+    scheduler.dispatch_once()
+
+    clock = {"value": 0.0}
+
+    def monotonic() -> float:
+        return clock["value"]
+
+    def sleep(_seconds: float) -> None:
+        executor.submissions[0][2].set_exception(RetryAfter(10))
+        clock["value"] = 1.0
+
+    monkeypatch.setattr(outbound.time, "monotonic", monotonic)
+    monkeypatch.setattr(outbound.time, "sleep", sleep)
+
+    scheduler.stop_and_drain(timeout=5.0)
+
+    assert waiter.done()
+    with pytest.raises(SchedulerStoppedError):
+        waiter.result()
+    assert [row.id for row in retained_queue.heads()] == [row_id]
+    assert row_id not in retained_queue.waiters
+    assert scheduler.in_flight == {}
+    assert 174 not in scheduler.in_flight_destinations
+
+
 class InitializationFailureConnection(sqlite3.Connection):
     instances: list["InitializationFailureConnection"] = []
 
