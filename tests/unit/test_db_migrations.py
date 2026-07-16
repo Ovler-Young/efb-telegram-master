@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -294,6 +294,77 @@ def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
         assert MsgLog.select().count() == 1
         assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.12", "888")
         assert pickle.loads(bytes(row.pickle))["reactions"] == {"R1": ("tests.mocks.slave reactor",)}
+
+
+def test_reaction_alternate_db_failures_preserve_then_update_canonical_row():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
+    message = SimpleNamespace(
+        uid=MessageID("reaction-message"), chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"), text="message", type=MsgType.Text,
+        type_telegram=TGMsgType.Text, deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+        file_id=None, file_unique_id=None, mime=None, is_system=False, attributes=None, commands=None,
+        substitutions=None, target=None, sender_bot_id=None, reactions={"NEW": [reactor]},
+    )
+    scenarios = (
+        (None, 10, 11, 12),
+        ("100.11", 11, 12, 13),
+    )
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        for initial_alt, old_id, failed_id, success_id in scenarios:
+            MsgLog.delete().execute()
+            MsgLog.create(
+                master_msg_id="100.10", master_msg_id_alt=initial_alt, slave_message_id="reaction-message",
+                text="old", slave_origin_uid="tests.mocks.slave chat",
+                slave_member_uid="tests.mocks.slave author", msg_type=MsgType.Text.name,
+                sent_to="tests.mocks.slave", sender_bot_id="700",
+                pickle=pickle.dumps({"reactions": {"OLD": ("tests.mocks.slave reactor",)}}),
+            )
+
+            with patch.object(MsgLog, "save", side_effect=RuntimeError("db failed")):
+                with pytest.raises(RuntimeError, match="db failed"):
+                    manager.add_or_update_message_log(
+                        message, SimpleNamespace(chat_id=100, message_id=failed_id),
+                        old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="800",
+                    )
+
+            row = MsgLog.get()
+            assert (row.master_msg_id_alt, row.sender_bot_id) == (initial_alt, "700")
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "OLD": ("tests.mocks.slave reactor",),
+            }
+
+            manager.add_or_update_message_log(
+                message, SimpleNamespace(chat_id=100, message_id=success_id),
+                old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="900",
+            )
+            row = MsgLog.get()
+            assert MsgLog.select().count() == 1
+            assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == (
+                "100.10", f"100.{success_id}", "900",
+            )
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "NEW": ("tests.mocks.slave reactor",),
+            }
+
+            message.reactions = {"FINAL": [reactor]}
+            manager.add_or_update_message_log(
+                message, SimpleNamespace(chat_id=100, message_id=success_id),
+                old_message_id=(TelegramChatID(100), TelegramMessageID(success_id)), sender_bot_id="900",
+            )
+            row = MsgLog.get()
+            assert MsgLog.select().count() == 1
+            assert row.master_msg_id_alt == f"100.{success_id}"
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "FINAL": ("tests.mocks.slave reactor",),
+            }
+            message.reactions = {"NEW": [reactor]}
 
 
 @pytest.mark.skipif(

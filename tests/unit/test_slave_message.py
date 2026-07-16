@@ -878,3 +878,54 @@ def test_nonrecoverable_reaction_edit_failures_do_not_create_reply():
 
         assert processor.dispatch_message.call_count == 1
         assert (old_msg_db.master_msg_id, old_msg_db.master_msg_id_alt) == ("100.10", "100.11")
+
+
+def test_first_reaction_db_failure_retries_reply_without_editing_user_message():
+    processor, _old_msg, old_msg_db, status = build_reaction_failure_processor(TelegramError("unused"))
+    old_msg_db.master_msg_id_alt = None
+    old_msg_db.sender_bot_id = None
+
+    def dispatch_after_failed_write(*args, **kwargs):
+        if processor.dispatch_message.call_count == 2:
+            old_msg_db.master_msg_id_alt = "100.12"
+            old_msg_db.sender_bot_id = "888"
+
+    processor.dispatch_message = Mock(side_effect=dispatch_after_failed_write)
+    for reactions in ({"R0": [object()]}, {"R1": [object()]}, {"R2": [object()]}):
+        status.reactions = reactions
+        SlaveMessageProcessor.update_reactions(processor, status)
+
+    old_ids = [call.args[2] for call in processor.dispatch_message.call_args_list]
+    assert old_ids == [None, None, (100, 12)]
+    assert (100, 10) not in old_ids
+    assert processor.dispatch_message.call_args_list[0].kwargs["database_old_msg_id"] == (100, 10)
+    assert processor.dispatch_message.call_args_list[1].kwargs["database_old_msg_id"] == (100, 10)
+
+
+def test_replacement_db_failure_retries_deleted_alternate_then_edits_replacement():
+    processor, _old_msg, old_msg_db, status = build_reaction_failure_processor(
+        BadRequest("Message to edit not found")
+    )
+    replacement_replies = 0
+
+    def dispatch_after_failed_replacement(_msg, _template, old_msg_id, _destination, _thread_id, **_kwargs):
+        nonlocal replacement_replies
+        if old_msg_id == (100, 11):
+            raise BadRequest("Message to edit not found")
+        if old_msg_id is None:
+            replacement_replies += 1
+            if replacement_replies == 2:
+                old_msg_db.master_msg_id_alt = "100.13"
+                old_msg_db.sender_bot_id = "999"
+
+    processor.dispatch_message = Mock(side_effect=dispatch_after_failed_replacement)
+    for reactions in ({"R0": [object()]}, {"R1": [object()]}, {"R2": [object()]}):
+        status.reactions = reactions
+        SlaveMessageProcessor.update_reactions(processor, status)
+
+    old_ids = [call.args[2] for call in processor.dispatch_message.call_args_list]
+    assert old_ids == [(100, 11), None, (100, 11), None, (100, 13)]
+    assert (100, 10) not in old_ids
+    replacement_calls = [call for call in processor.dispatch_message.call_args_list if call.args[2] is None]
+    assert [call.kwargs["database_old_msg_id"] for call in replacement_calls] == [(100, 11), (100, 11)]
+    assert [call.kwargs["target_msg_id_override"] for call in replacement_calls] == [10, 10]
