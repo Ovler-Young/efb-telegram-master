@@ -1138,7 +1138,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -1200,7 +1200,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -1315,7 +1315,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:

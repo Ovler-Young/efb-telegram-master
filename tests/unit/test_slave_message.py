@@ -938,9 +938,12 @@ def test_replacement_db_failure_retries_deleted_alternate_then_edits_replacement
         ("slave_message_image", MsgType.Image),
         ("slave_message_animation", MsgType.Animation),
         ("slave_message_sticker", MsgType.Sticker),
+        ("slave_message_file", MsgType.File),
+        ("slave_message_voice", MsgType.Voice),
+        ("slave_message_video", MsgType.Video),
     ),
 )
-def test_first_three_oversize_branches_use_one_sync_quoted_reply(method_name, message_type):
+def test_all_oversize_branches_use_one_sync_quoted_reply(method_name, message_type):
     processor = build_slave_message_processor()
     processor.check_file_size = Mock(return_value="__file_too_large__")
     processor.html_substitutions = Mock(return_value="__text__")
