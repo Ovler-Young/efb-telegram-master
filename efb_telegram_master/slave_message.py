@@ -41,6 +41,7 @@ from .constants import Emoji
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import get_msg_type
+from .ptb_compat import sync_reply_text
 from .utils import TelegramChatID, TelegramTopicID, TelegramMessageID, OldMsgID
 
 if TYPE_CHECKING:
@@ -808,7 +809,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -909,7 +910,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                     **self._make_send_kwargs(
                                                         msg, mode='blocking', on_complete=on_db_complete,
                                                     ))
-                    message.reply_text(file_too_large)
+                    sync_reply_text(self.bot, message, file_too_large, quote=True)
                     return message
 
             if old_msg_id:
@@ -997,7 +998,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                                         **self._make_send_kwargs(
                                                             msg, mode='blocking', on_complete=on_db_complete,
                                                         ))
-                        message.reply_text(file_too_large)
+                        sync_reply_text(self.bot, message, file_too_large, quote=True)
                         return message
 
                 try:
