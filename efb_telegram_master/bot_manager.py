@@ -358,6 +358,9 @@ class TelegramBotManager(LocaleMixin):
 
     class Decorators:
         logger = logging.getLogger(__name__)
+        _POSITIONAL_CHAT_ID_INDICES = {
+            'edit_message_text': 1,
+        }
 
         @classmethod
         def exception_filter(cls, exception: Exception):
@@ -377,10 +380,14 @@ class TelegramBotManager(LocaleMixin):
                         kwargs['chat_id'] = e.new_chat_id
                         return fn(self, *args, **kwargs)
                     else:
-                        args
-                        chat_id = args[0]
+                        chat_id_index = cls._POSITIONAL_CHAT_ID_INDICES.get(fn.__name__, 0)
+                        chat_id = args[chat_id_index]
                         self.channel.chat_binding.chat_migration_by_id(chat_id, e.new_chat_id)
-                        args = (e.new_chat_id, *args[1:])
+                        args = (
+                            *args[:chat_id_index],
+                            e.new_chat_id,
+                            *args[chat_id_index + 1:],
+                        )
                         return fn(self, *args, **kwargs)
 
             return retry_on_chat_migration_wrap
