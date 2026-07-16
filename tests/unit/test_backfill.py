@@ -13,7 +13,12 @@ from ehforwarderbot.types import ChatID
 from efb_telegram_master import utils
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from tests.integration.test_backfill_history import (
+    _queue_activity_completed,
+    _queue_metrics_snapshot,
+)
 
 
 def _build_link_update(chat_id, *, is_forum=False):
@@ -44,6 +49,28 @@ def _sent_link_message(chat_id, message_id, sender_bot_id=None):
     sent_message.reply_text = Mock()
     sent_message.sender_bot_id = sender_bot_id
     return sent_message
+
+
+def test_backfill_queue_activity_requires_exact_success_without_failure_or_in_flight():
+    metrics = Metrics()
+    manager = SimpleNamespace(_metrics=metrics)
+    before = _queue_metrics_snapshot(manager)
+
+    for _ in range(2):
+        metrics.record_enqueued("normal", "send_message")
+    metrics.record_completion("normal", "send_message", "main", "success")
+    metrics.record_completion("normal", "send_message", "auxiliary", "success")
+    after = _queue_metrics_snapshot(manager)
+
+    assert _queue_activity_completed(before, after, expected_count=2)
+
+    metrics.record_completion("normal", "send_message", "auxiliary", "failure")
+    failed = _queue_metrics_snapshot(manager)
+    assert not _queue_activity_completed(before, failed, expected_count=2)
+
+    metrics.increment_in_flight("normal", "send_message", "main")
+    in_flight = _queue_metrics_snapshot(manager)
+    assert not _queue_activity_completed(failed, in_flight, expected_count=0)
 
 
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):

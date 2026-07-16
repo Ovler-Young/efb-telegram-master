@@ -2,6 +2,7 @@ import asyncio
 import re
 import threading
 import time
+from dataclasses import dataclass
 from itertools import chain
 from typing import List, Sequence, Set
 from uuid import uuid4
@@ -226,11 +227,69 @@ def _expected_stream_indices(expected_count: int) -> Set[int]:
     return set(range(expected_count))
 
 
-def _queued_state(bot_manager):
-    return int(
-        bot_manager._outbound_queue.connection.execute(
-            "SELECT COUNT(*) FROM outbound_queue"
-        ).fetchone()[0]
+@dataclass(frozen=True)
+class QueueMetricSnapshot:
+    enqueued: float
+    main_successes: float
+    auxiliary_successes: float
+    main_failures: float
+    auxiliary_failures: float
+    queue_depth: float
+    main_in_flight: float
+    auxiliary_in_flight: float
+
+
+def _queue_metrics_snapshot(bot_manager) -> QueueMetricSnapshot:
+    metrics = bot_manager._metrics
+    registry = metrics.registry
+    prefix = f"{metrics.namespace}_outbound"
+    common = {"priority": "normal", "operation": "send_message"}
+
+    def sample(name: str, labels=None) -> float:
+        value = registry.get_sample_value(name, labels or {})
+        return float(value) if value is not None else 0.0
+
+    def completion(sender_kind: str, outcome: str) -> float:
+        return sample(
+            f"{prefix}_completions_total",
+            {**common, "sender_kind": sender_kind, "outcome": outcome},
+        )
+
+    def in_flight(sender_kind: str) -> float:
+        return sample(
+            f"{prefix}_in_flight",
+            {**common, "sender_kind": sender_kind},
+        )
+
+    return QueueMetricSnapshot(
+        enqueued=sample(f"{prefix}_enqueued_total", common),
+        main_successes=completion("main", "success"),
+        auxiliary_successes=completion("auxiliary", "success"),
+        main_failures=completion("main", "failure"),
+        auxiliary_failures=completion("auxiliary", "failure"),
+        queue_depth=sample(f"{prefix}_queue_depth"),
+        main_in_flight=in_flight("main"),
+        auxiliary_in_flight=in_flight("auxiliary"),
+    )
+
+
+def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricSnapshot, *,
+                              expected_count: int) -> bool:
+    success_delta = (
+        current.main_successes + current.auxiliary_successes
+        - before.main_successes - before.auxiliary_successes
+    )
+    failure_delta = (
+        current.main_failures + current.auxiliary_failures
+        - before.main_failures - before.auxiliary_failures
+    )
+    return (
+        current.enqueued - before.enqueued == expected_count
+        and success_delta == expected_count
+        and failure_delta == 0
+        and current.queue_depth == 0
+        and current.main_in_flight == 0
+        and current.auxiliary_in_flight == 0
     )
 
 
@@ -243,18 +302,19 @@ def _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix: str):
 
 
 async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_chat_id: int, chat, prefix: str,
-                                  expected_count: int, min_message_id: int):
+                                  expected_count: int, min_message_id: int,
+                                  metrics_before: QueueMetricSnapshot):
     expected = _expected_stream_indices(expected_count)
     deadline = time.time() + STREAM_SETTLE_TIMEOUT
 
     last_debug = ""
     while time.time() < deadline:
         db_logs = _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix)
-        db_indices = {
+        db_indices = [
             idx
             for log in db_logs
             for idx in _extract_stream_indices(log.text or "", prefix)
-        }
+        ]
 
         group_messages = await _messages_with_prefix(
             client,
@@ -263,21 +323,27 @@ async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_cha
             min_message_id=min_message_id,
             limit=max(2000, expected_count + 400),
         )
-        group_indices = {
+        group_indices = [
             idx
             for message in group_messages
             for idx in _extract_stream_indices(message.raw_text or "", prefix)
-        }
+        ]
 
-        queue_len = _queued_state(channel_with_auxiliary_bots.bot_manager)
+        metrics_current = _queue_metrics_snapshot(channel_with_auxiliary_bots.bot_manager)
         last_debug = (
             f"db={len(db_logs)} (idx={len(db_indices)}/{expected_count}), "
             f"tg={len(group_messages)} (idx={len(group_indices)}/{expected_count}), "
-            f"queued_tasks={queue_len}"
+            f"metrics_before={metrics_before!r}, metrics_current={metrics_current!r}"
         )
 
-        if db_indices == expected and group_indices == expected and queue_len == 0:
-            return db_logs, group_messages
+        if (
+            set(db_indices) == expected
+            and len(db_indices) == expected_count
+            and set(group_indices) == expected
+            and len(group_indices) == expected_count
+            and _queue_activity_completed(metrics_before, metrics_current, expected_count=expected_count)
+        ):
+            return db_logs, group_messages, metrics_current
 
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
@@ -335,7 +401,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id)
 
     bot_manager = channel_with_auxiliary_bots.bot_manager
-    task_counter_before = bot_manager._tasks_enqueued
+    stream_metrics_before = _queue_metrics_snapshot(bot_manager)
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
     await asyncio.to_thread(stream_thread.join, STREAM_DURATION_SECONDS + 15.0)
@@ -344,7 +410,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     assert not stream_errors, f"Mock stream failed: {stream_errors!r}"
     assert len(sent_texts) == STREAM_MESSAGE_COUNT
 
-    db_logs, group_messages = await _wait_for_stream_stable(
+    db_logs, group_messages, stream_metrics_after = await _wait_for_stream_stable(
         channel_with_auxiliary_bots,
         client,
         tg_chat_id=source_group_id,
@@ -352,6 +418,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         prefix=prefix,
         expected_count=STREAM_MESSAGE_COUNT,
         min_message_id=command_message.id,
+        metrics_before=stream_metrics_before,
     )
 
     # 1) Telegram: received all 120 (no missing/duplicate indices).
@@ -375,9 +442,12 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     group_sender_ids = {message.sender_id for message in group_messages if message.sender_id is not None}
     assert group_sender_ids & set(working_aux_bot_ids), "Expected auxiliary bot messages in the linked group."
 
-    # 4) Queued send path was used, and there is no queued send residue.
-    assert bot_manager._tasks_enqueued - task_counter_before >= STREAM_MESSAGE_COUNT
-    assert _queued_state(bot_manager) == 0
+    # 4) Exact queue activity completed without a failed or in-flight send.
+    assert _queue_activity_completed(
+        stream_metrics_before,
+        stream_metrics_after,
+        expected_count=STREAM_MESSAGE_COUNT,
+    )
 
     # ---- Relink/migration checks (same stream history) ----
 
