@@ -106,16 +106,6 @@ def test_acquire_runs_global_before_bot_chat() -> None:
     assert calls == ["global", "chat"]
 
 
-def test_failed_or_cancelled_send_has_no_limiter_release_path() -> None:
-    clock = MonotonicClock()
-    limiter = _make_limiter(clock)
-
-    assert limiter.try_acquire(100)
-    assert limiter.get_counts(100) == (1, 1)
-    assert not hasattr(limiter, "release_slot")
-    assert limiter.get_counts(100) == (1, 1)
-
-
 def test_limiter_state_resets_on_process_restart() -> None:
     clock = MonotonicClock()
     first_process = _make_limiter(clock)

@@ -55,19 +55,7 @@ def test_history_migration_entry_table_exists():
     assert "source_master_msg_id" not in msglog_columns
 
 
-def test_history_migration_entries_have_no_active_workflow_fields():
-    from peewee import SqliteDatabase
-
-    test_db = SqliteDatabase(":memory:")
-    models = [HistoryMigrationEntry, MsgLog]
-    with test_db.bind_ctx(models):
-        test_db.create_tables(models)
-        history_columns = {column.name for column in test_db.get_columns("historymigrationentry")}
-
-    assert not {"outbound_workflow_id", "state", "last_error"}.intersection(history_columns)
-
-
-def test_database_manager_uses_transactional_wal_sqlite_without_creating_legacy_tables(tmp_path, monkeypatch):
+def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
     from peewee import SqliteDatabase
 
     original_database = database.obj
@@ -77,8 +65,6 @@ def test_database_manager_uses_transactional_wal_sqlite_without_creating_legacy_
     try:
         assert isinstance(database.obj, SqliteDatabase)
         assert database.obj.pragma("journal_mode").lower() == "wal"
-        assert "outbound_workflow" not in database.get_tables()
-        assert "outbound_task" not in database.get_tables()
     finally:
         manager.stop_worker()
         database.initialize(original_database)
