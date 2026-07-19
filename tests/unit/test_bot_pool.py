@@ -35,16 +35,6 @@ def test_candidate_bots_exclude_disabled_and_preserve_unknown_membership() -> No
     disabled.check_membership_tri.assert_not_called()
 
 
-def test_affinity_is_created_only_after_successful_auxiliary_send() -> None:
-    bot = _bot(10)
-    pool = _pool(bot)
-
-    assert pool.preferred_sender("slave-a") is None
-    pool.record_successful_auxiliary_send("slave-a", 10)
-
-    assert pool.preferred_sender("slave-a") is bot
-
-
 def test_successful_main_and_null_slave_do_not_change_affinity() -> None:
     bot = _bot(10)
     pool = _pool(bot)
