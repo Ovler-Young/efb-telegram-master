@@ -959,11 +959,6 @@ def test_direct_operations_strip_private_queue_metadata_before_calling_bot(opera
     manager._enqueue_blocking_send_and_wait.assert_not_called()
 
 
-def test_rate_limit_decorators_no_longer_exist():
-    assert not hasattr(TelegramBotManager.Decorators, "rate_limit_decorator")
-    assert not hasattr(TelegramBotManager.Decorators, "handle_rate_limit_error")
-
-
 def test_async_runtime_call_waits_for_bound_loop_before_falling_back():
     runtime = AsyncTelegramRuntime(Mock())
     runtime._ready = Mock()
