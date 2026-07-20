@@ -27,7 +27,7 @@ def _manager_with_adapter_stubs():
 @pytest.mark.parametrize(
     "operation",
     sorted(QUEUED_OPERATIONS - {
-        "delete_message", "send_chat_action", "edit_message_reply_markup",
+        "delete_message", "edit_message_reply_markup",
         "send_location", "send_venue", "create_forum_topic", "edit_forum_topic",
         "reopen_forum_topic", "set_chat_title", "set_chat_photo", "pin_chat_message",
         "set_chat_description",
@@ -64,7 +64,6 @@ def test_queued_wrapper_rejects_an_unknown_send_mode_before_enqueue():
 @pytest.mark.parametrize(
     ("operation", "arguments"),
     [
-        ("send_chat_action", (100, "typing")),
         ("edit_message_reply_markup", (100,)),
         ("send_location", (100, 1.0, 2.0)),
         ("send_venue", (100, 1.0, 2.0, "title", "address")),
@@ -88,16 +87,39 @@ def test_chat_mutations_enqueue_with_the_main_sender(operation, arguments):
     assert manager._enqueue_main_chat_mutation.call_args.args[:2] == (operation, arguments)
 
 
-def test_send_chat_action_preserves_thread_id_without_mutating_caller_kwargs():
+def test_send_chat_action_is_direct_and_preserves_thread_id_without_mutating_caller_kwargs():
     manager = _manager_with_adapter_stubs()
-    manager._enqueue_main_chat_mutation = Mock(return_value=True)
+    manager._bot.send_chat_action.return_value = True
     kwargs = {"message_thread_id": 7, "api_kwargs": {"keep": "value"}}
 
     assert manager.send_chat_action(100, "typing", **kwargs) is True
 
     assert kwargs == {"message_thread_id": 7, "api_kwargs": {"keep": "value"}}
-    queued_kwargs = manager._enqueue_main_chat_mutation.call_args.args[2]
-    assert queued_kwargs == {"api_kwargs": {"keep": "value", "message_thread_id": 7}}
+    manager._bot.send_chat_action.assert_called_once_with(
+        100, "typing", api_kwargs={"keep": "value", "message_thread_id": 7}
+    )
+    manager._enqueue_blocking_send_and_wait.assert_not_called()
+    manager._enqueue_blocking_api_operation.assert_not_called()
+    assert "send_chat_action" not in QUEUED_OPERATIONS
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("edit_message_text", ("updated",)),
+        ("edit_message_reply_markup", (100,)),
+    ],
+)
+def test_edit_operations_still_enqueue_for_delivery_limiting(operation, arguments):
+    manager = _manager_with_adapter_stubs()
+    manager._enqueue_main_chat_mutation = Mock(return_value=True)
+
+    getattr(manager, operation)(*arguments, chat_id=100)
+
+    if operation == "edit_message_text":
+        manager._enqueue_blocking_send_and_wait.assert_called_once()
+    else:
+        manager._enqueue_main_chat_mutation.assert_called_once_with(operation, arguments, {"chat_id": 100})
 
 
 def test_main_chat_mutation_binds_positional_and_keyword_chat_ids_and_strips_metadata():
