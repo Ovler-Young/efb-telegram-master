@@ -119,9 +119,9 @@ class TelegramIntegrationTestHelper:
         Raises:
             :exc:`asyncio.TimeoutError`: when the request timed out
         """
-        t = time.time() + timeout
-        while t > time.time():
-            time_left = t - time.time()
+        deadline = time.monotonic() + timeout
+        while deadline > time.monotonic():
+            time_left = deadline - time.monotonic()
             # print("START TO WAIT FOR EVENTS")
             value = await asyncio.wait_for(self.queue.get(), time_left)
             self.queue.task_done()

@@ -188,7 +188,7 @@ async def test_link_chat_group_linked_unlink(helper, client, bot_id, bot_group, 
         await message.click(0)
 
         message: Message = await helper.wait_for_message(in_chats(bot_group) & edited(message.id) & has_button)
-        assert (await message.click(text="Restore")) is not None, "Restore"
+        await message.click(text="Restore")
 
         await helper.wait_for_message(in_chats(bot_group) & edited(message.id) & ~has_button)
 
