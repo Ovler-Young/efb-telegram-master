@@ -728,6 +728,35 @@ def test_chat_id_binds_after_scheduler_metadata_is_removed(tmp_path, args, kwarg
             enqueue(queue, request)
 
 
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [
+        ((7, "text"), {}),
+        ((), {"chat_id": 7, "text": "text"}),
+    ],
+)
+def test_chat_id_binding_strips_all_routing_metadata_without_mutating_caller(tmp_path, args, kwargs):
+    queue = OutboundQueue(tmp_path)
+    request_kwargs = {
+        **kwargs,
+        "_send_mode": "blocking",
+        "_slave_id": "slave.chat",
+        "_required_sender_bot_id": "__main__",
+    }
+    original_kwargs = dict(request_kwargs)
+
+    row_id, _waiter = enqueue(queue, QueueRequest("send_message", args, request_kwargs))
+
+    row = queue.heads()[0]
+    assert row.id == row_id
+    assert row.telegram_chat_id == 7
+    assert row.priority == 1
+    assert row.slave_id == "slave.chat"
+    assert row.required_sender_bot_id == "__main__"
+    assert queue.decode_payload(row.payload)[1] == kwargs
+    assert request_kwargs == original_kwargs
+
+
 def test_internal_keys_are_validated_and_absent_from_payload(tmp_path):
     queue = OutboundQueue(tmp_path)
     row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {
