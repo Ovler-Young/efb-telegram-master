@@ -27,7 +27,7 @@ from telegram import (
 class _DirectMediaArgument:
     index: int
     keyword: str
-    telegram_type: type
+    telegram_type: Optional[type]
 
 
 QUEUED_OPERATIONS = frozenset({
@@ -35,7 +35,10 @@ QUEUED_OPERATIONS = frozenset({
     "send_video", "send_animation", "send_voice", "send_sticker",
     "send_media_group", "copy_message", "forward_message",
     "edit_message_text", "edit_message_caption", "edit_message_media",
-    "delete_message",
+    "delete_message", "send_chat_action", "edit_message_reply_markup",
+    "send_location", "send_venue", "create_forum_topic", "edit_forum_topic",
+    "reopen_forum_topic", "set_chat_title", "set_chat_photo", "pin_chat_message",
+    "set_chat_description",
 })
 REQUIRED_SENDER_OPERATIONS = frozenset({
     "edit_message_text", "edit_message_caption", "edit_message_media", "delete_message",
@@ -49,6 +52,7 @@ _DIRECT_MEDIA_ARGUMENTS = {
     "send_sticker": _DirectMediaArgument(1, "sticker", Sticker),
     "send_video": _DirectMediaArgument(1, "video", Video),
     "send_voice": _DirectMediaArgument(1, "voice", Voice),
+    "set_chat_photo": _DirectMediaArgument(1, "photo", None),
 }
 _THUMBNAIL_OPERATIONS = frozenset({"send_animation", "send_audio", "send_document", "send_video"})
 _KEYWORD_MEDIA_ARGUMENTS = {"send_video": ("cover",)}

@@ -1123,13 +1123,15 @@ class TelegramBotManager(LocaleMixin):
     def _enqueue_main_chat_mutation(
         self, operation: str, args: tuple, kwargs: Mapping[str, object]
     ) -> object:
+        telegram_kwargs = self._strip_private_queue_metadata(kwargs)
+        target_chat_id = OutboundQueue._destination(
+            self._queue_operation(operation), args, telegram_kwargs
+        )
         return self._enqueue_blocking_api_operation(
-            target_chat_id=self._normalize_telegram_chat_id(
-                args[0] if args else kwargs["chat_id"]
-            ),
+            target_chat_id=target_chat_id,
             operation=operation,
             args=args,
-            kwargs=kwargs,
+            kwargs=telegram_kwargs,
             required_sender_bot_id="__main__",
         )
 
@@ -1675,22 +1677,27 @@ class TelegramBotManager(LocaleMixin):
 
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
-        message_thread_id = kwargs.pop('message_thread_id', None)
-        if message_thread_id != None:
-            kwargs['api_kwargs'] = { "message_thread_id":  message_thread_id}
-        return self._bot.send_chat_action(*args, **kwargs)
+        queued_kwargs = dict(kwargs)
+        message_thread_id = queued_kwargs.pop('message_thread_id', None)
+        if message_thread_id is not None:
+            api_kwargs = dict(cast(Mapping[str, object], queued_kwargs.get('api_kwargs', {})))
+            api_kwargs['message_thread_id'] = message_thread_id
+            queued_kwargs['api_kwargs'] = api_kwargs
+        return self._enqueue_main_chat_mutation("send_chat_action", args, queued_kwargs)
 
     @Decorators.retry_on_chat_migration
     def edit_message_reply_markup(self, *args, **kwargs):
-        return self._call_direct_operation("edit_message_reply_markup", args, kwargs)
+        if (args and args[0] is None) or (not args and kwargs.get("chat_id") is None):
+            return self._call_direct_operation("edit_message_reply_markup", args, kwargs)
+        return self._enqueue_main_chat_mutation("edit_message_reply_markup", args, kwargs)
 
     @Decorators.retry_on_chat_migration
     def send_location(self, *args, **kwargs):
-        return self._call_direct_operation("send_location", args, kwargs)
+        return self._enqueue_main_chat_mutation("send_location", args, kwargs)
 
     @Decorators.retry_on_chat_migration
     def send_venue(self, *args, **kwargs):
-        return self._call_direct_operation("send_venue", args, kwargs)
+        return self._enqueue_main_chat_mutation("send_venue", args, kwargs)
 
     @Decorators.retry_on_chat_migration
     def send_sticker(self, *args, **kwargs):
@@ -1777,25 +1784,25 @@ class TelegramBotManager(LocaleMixin):
         return self._bot.get_chat(*args, **kwargs)
 
     def create_forum_topic(self, *args, **kwargs) -> ForumTopic:
-        return cast(ForumTopic, self._bot.create_forum_topic(*args, **kwargs))
+        return cast(ForumTopic, self._enqueue_main_chat_mutation("create_forum_topic", args, kwargs))
 
     def edit_forum_topic(self, *args, **kwargs):
-        return self._bot.edit_forum_topic(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("edit_forum_topic", args, kwargs)
 
     def reopen_forum_topic(self, *args, **kwargs) -> bool:
-        return cast(bool, self._bot.reopen_forum_topic(*args, **kwargs))
+        return cast(bool, self._enqueue_main_chat_mutation("reopen_forum_topic", args, kwargs))
 
     def set_chat_title(self, *args, **kwargs):
-        return self._bot.set_chat_title(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("set_chat_title", args, kwargs)
 
     def set_chat_photo(self, *args, **kwargs):
-        return self._bot.set_chat_photo(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("set_chat_photo", args, kwargs)
 
     def pin_chat_message(self, *args, **kwargs):
-        return self._bot.pin_chat_message(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("pin_chat_message", args, kwargs)
 
     def set_chat_description(self, *args, **kwargs):
-        return self._bot.set_chat_description(*args, **kwargs)
+        return self._enqueue_main_chat_mutation("set_chat_description", args, kwargs)
 
     def polling(self, drop_pending_updates: bool = False, timeout: int | timedelta = 10):
         """

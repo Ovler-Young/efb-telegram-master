@@ -71,7 +71,7 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
 
 
 def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
-    chat = slave.chat_with_alias
+    chat = channel.chat_manager.update_chat_obj(slave.chat_with_alias)
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(106))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key, backfill_mode=None)

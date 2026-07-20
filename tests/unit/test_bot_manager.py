@@ -924,21 +924,17 @@ def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():
     )
 
 
-@pytest.mark.parametrize(
-    ("operation", "args"),
-    [
-        ("edit_message_reply_markup", ()),
-        ("send_location", (123, 1.0, 2.0)),
-        ("send_venue", (123, 1.0, 2.0, "title", "address")),
-        ("get_me", ()),
-    ],
-)
-def test_direct_operations_strip_private_queue_metadata_before_calling_bot(operation, args):
+def test_queued_chat_mutation_strips_private_queue_metadata_before_enqueue():
     manager = _make_queueing_manager()
-    getattr(manager._bot, operation).return_value = operation
 
-    result = getattr(manager, operation)(
-        *args,
+    def send_location(chat_id, latitude, longitude):
+        return chat_id, latitude, longitude
+
+    manager._bot.send_location = send_location
+    manager._enqueue_blocking_api_operation = Mock(return_value=True)
+
+    result = manager.send_location(
+        123, 1.0, 2.0,
         _sender_bot_id="777",
         _slave_id="slave.chat",
         _send_mode="eventual",
@@ -947,9 +943,19 @@ def test_direct_operations_strip_private_queue_metadata_before_calling_bot(opera
         _queued_db_log_context=Mock(),
     )
 
-    assert result == operation
-    getattr(manager._bot, operation).assert_called_once_with(*args)
-    manager._enqueue_blocking_send_and_wait.assert_not_called()
+    assert result is True
+    request = manager._enqueue_blocking_api_operation.call_args.kwargs
+    assert request["kwargs"] == {}
+    assert request["required_sender_bot_id"] == "__main__"
+
+
+def test_direct_operation_strips_private_queue_metadata_before_calling_bot():
+    manager = _make_queueing_manager()
+    manager._bot.get_me.return_value = "bot"
+
+    assert manager.get_me(_send_mode="eventual") == "bot"
+
+    manager._bot.get_me.assert_called_once_with()
 
 
 def test_async_runtime_call_waits_for_bound_loop_before_falling_back():

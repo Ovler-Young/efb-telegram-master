@@ -539,6 +539,24 @@ def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
     reopened.close()
 
 
+def test_set_chat_photo_snapshots_an_open_file_before_persistence(tmp_path):
+    def set_chat_photo(chat_id, photo):
+        return True
+
+    queue = OutboundQueue(tmp_path)
+    photo = io.BufferedReader(io.BytesIO(b"chat photo"))
+    row_id, _waiter = queue.enqueue_many(
+        [QueueRequest("set_chat_photo", (100, photo), {"_send_mode": "blocking"})],
+        lambda _name: set_chat_photo,
+    )
+    photo.close()
+
+    row = queue.heads()[0]
+    restored_photo = queue.decode_payload(row.payload)[0][1]
+    assert row.id == row_id
+    assert restored_photo.read() == b"chat photo"
+
+
 @pytest.mark.parametrize("input_kind", ["string", "path"])
 @pytest.mark.parametrize("after_enqueue", ["mutate", "move", "delete"])
 def test_local_file_media_is_owned_inline_after_enqueue_and_reopen(
