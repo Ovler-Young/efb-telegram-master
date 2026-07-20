@@ -12,12 +12,6 @@ on:
       - 'tests/**.py'
       - 'setup.py'
   workflow_dispatch:
-    inputs:
-      run_postgres_tests:
-        description: "Run optional PostgreSQL-backed test job"
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
@@ -27,6 +21,20 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: efb_telegram
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d efb_telegram"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     strategy:
       fail-fast: true
       max-parallel: 1
@@ -41,7 +49,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install '.[tests,tgs]'
+        pip install '.[tests,tgs,postgresql]'
         mypy --install-types --non-interactive -p efb_telegram_master
     - name: Install binary dependencies
       run: |
@@ -63,6 +71,11 @@ jobs:
         USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        TEST_POSTGRES_HOST: 127.0.0.1
+        TEST_POSTGRES_PORT: "5432"
+        TEST_POSTGRES_DB: efb_telegram
+        TEST_POSTGRES_USER: postgres
+        TEST_POSTGRES_PASSWORD: postgres
       run: |
         pytest -vv -r a -l --color=yes
     - name: Test with pytest on pull requests
@@ -78,47 +91,10 @@ jobs:
         USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      run: |
-        pytest -vv -r a -l --color=yes --mode=both
-
-  postgres-tests:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_postgres_tests }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_DB: efb_telegram
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d efb_telegram"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-    - uses: actions/checkout@v1
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v6
-      with:
-        python-version: "3.12"
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install '.[tests,tgs]'
-    - name: Install binary dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y ffmpeg libmagic-dev libwebp-dev
-    - name: Run PostgreSQL-focused tests
-      env:
         TEST_POSTGRES_HOST: 127.0.0.1
         TEST_POSTGRES_PORT: "5432"
         TEST_POSTGRES_DB: efb_telegram
         TEST_POSTGRES_USER: postgres
         TEST_POSTGRES_PASSWORD: postgres
       run: |
-        pytest -vv -r a -l --color=yes --mode=unit tests/unit/test_db_migrations.py
+        pytest -vv -r a -l --color=yes --mode=both

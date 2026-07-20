@@ -1,11 +1,14 @@
 import asyncio
+import inspect
 import logging
 import threading
 import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Set
 
 import pytest
+import pytest_asyncio
 from telethon import TelegramClient
 
 from .helper.helper import TelegramIntegrationTestHelper
@@ -13,8 +16,13 @@ from ..bot import get_user_session
 
 pytest.register_assert_rewrite("tests.integration.utils")
 
-TELEGRAM_MEDIA_RATE_LIMIT_DELAY = 11.0
 
+def pytest_collection_modifyitems(items):
+    """Keep the shared Telethon client and its consumers on one event loop."""
+    integration_directory = Path(__file__).parent
+    for item in items:
+        if integration_directory in item.path.parents and inspect.iscoroutinefunction(item.obj):
+            item.add_marker(pytest.mark.asyncio(loop_scope="session"), append=False)
 
 @pytest.fixture(scope="session")
 def user_session_info():
@@ -48,7 +56,7 @@ def filter_chats(bot_id, bot_groups, bot_channels, bot_topic_group) -> Set[int]:
     return chats
 
 
-@pytest.fixture(scope="function")
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def helper_wrap(user_session, api_id, api_hash, bot_id,
                       filter_chats, aux_bot_ids) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
     loop = asyncio.get_running_loop()
@@ -69,18 +77,6 @@ async def helper(helper_wrap, slave) -> AsyncGenerator[TelegramIntegrationTestHe
     slave.clear_statuses()
     assert slave.statuses.empty()
     yield helper_wrap
-
-
-@pytest.fixture(scope="function", autouse=True)
-async def rate_limit_delay():
-    """
-    Telegram Bot API rate limits are easy to hit in CI.
-    The live API requested a 10-second media retry window in CI. Keep the
-    next test outside that window so API throttling is not misreported as a
-    delivery assertion failure.
-    """
-    yield
-    await asyncio.sleep(TELEGRAM_MEDIA_RATE_LIMIT_DELAY)
 
 
 @pytest.fixture(scope="session")
