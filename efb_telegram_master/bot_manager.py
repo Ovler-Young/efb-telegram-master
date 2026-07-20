@@ -1371,6 +1371,13 @@ class TelegramBotManager(LocaleMixin):
         self._finish_queued_database_update(getattr(row, "id", None))
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
+    def record_queued_retry_after(
+        self, row, error: telegram.error.RetryAfter, selection: SenderSelection
+    ) -> None:
+        """Record a sender/chat cooldown without completing the queued database update."""
+        retry_at = time.monotonic() + self._retry_after_seconds(error)
+        self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = retry_at
+
     def remove_confirmed_non_member_affinity_for_sender_chat(
         self, sender_bot_id: str, telegram_chat_id: int
     ) -> None:
@@ -1683,7 +1690,7 @@ class TelegramBotManager(LocaleMixin):
             api_kwargs = dict(cast(Mapping[str, object], queued_kwargs.get('api_kwargs', {})))
             api_kwargs['message_thread_id'] = message_thread_id
             queued_kwargs['api_kwargs'] = api_kwargs
-        return self._enqueue_main_chat_mutation("send_chat_action", args, queued_kwargs)
+        return self._call_direct_operation("send_chat_action", args, queued_kwargs)
 
     @Decorators.retry_on_chat_migration
     def edit_message_reply_markup(self, *args, **kwargs):
