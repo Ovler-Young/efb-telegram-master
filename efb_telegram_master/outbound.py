@@ -576,8 +576,14 @@ class OutboundQueue:
 
     @staticmethod
     def _destination(operation: Callable[..., object], args: tuple, kwargs: dict) -> int:
+        # Queue routing metadata belongs to the scheduler, not the PTB callable.
+        # Keep this defensive because destination extraction also serves command
+        # observation after a row has been enqueued.
+        telegram_kwargs = {
+            key: value for key, value in kwargs.items() if key not in SCHEDULER_KEYS
+        }
         try:
-            bound = inspect.signature(operation).bind(*args, **kwargs)
+            bound = inspect.signature(operation).bind(*args, **telegram_kwargs)
         except (TypeError, ValueError) as error:
             raise QueueEnqueueError("Queued arguments do not bind to the Telegram operation.") from error
         if "chat_id" not in bound.arguments:

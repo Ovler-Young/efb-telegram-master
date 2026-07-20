@@ -232,7 +232,14 @@ async def test_async_callback_context_does_not_reach_independent_queue_thread(mo
     assert independent_context == [None]
 
 
-def test_enqueue_registers_only_the_current_inbound_command_row():
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [
+        ((100, "reply"), {}),
+        ((), {"chat_id": 100, "text": "reply"}),
+    ],
+)
+def test_enqueue_registers_command_row_with_routing_metadata(args, kwargs):
     manager = object.__new__(TelegramBotManager)
     manager._command_outbound_observer = CommandOutboundObserver()
     manager._outbound_scheduler = SimpleNamespace(
@@ -244,11 +251,18 @@ def test_enqueue_registers_only_the_current_inbound_command_row():
         return chat_id, text
 
     manager._queue_operation = Mock(return_value=send_message)
+    request_kwargs = {
+        **kwargs,
+        "_send_mode": "blocking",
+        "_slave_id": "slave.chat",
+        "_required_sender_bot_id": "__main__",
+    }
+    original_kwargs = dict(request_kwargs)
     token = _inbound_command_context.set(InboundCommandKey(10, 20))
     try:
         TelegramBotManager._enqueue_requests(
             manager, [
-                SimpleNamespace(operation="send_message", args=(), kwargs={"chat_id": 100, "text": "reply"})
+                SimpleNamespace(operation="send_message", args=args, kwargs=request_kwargs)
             ],
         )
     finally:
@@ -259,3 +273,4 @@ def test_enqueue_registers_only_the_current_inbound_command_row():
     )
     assert outcome is not None
     assert outcome.row_id == 7
+    assert request_kwargs == original_kwargs
