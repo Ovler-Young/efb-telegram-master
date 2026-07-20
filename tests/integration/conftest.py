@@ -76,7 +76,10 @@ async def helper(helper_wrap, slave) -> AsyncGenerator[TelegramIntegrationTestHe
     assert slave.messages.empty()
     slave.clear_statuses()
     assert slave.statuses.empty()
-    yield helper_wrap
+    try:
+        yield helper_wrap
+    finally:
+        helper_wrap.clear_queue()
 
 
 @pytest.fixture(scope="session")

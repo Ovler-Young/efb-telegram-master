@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from asyncio import QueueEmpty
-from typing import Tuple, Optional, Dict, Iterable, Sequence, Union
+from typing import Tuple, Optional, Dict, Iterable, List, Sequence, Union
 
 from telethon import TelegramClient
 from telethon.events import NewMessage, UserUpdate, MessageDeleted, MessageEdited, ChatAction
@@ -59,6 +59,9 @@ class TelegramIntegrationTestHelper:
 
         # Queue for incoming messages
         self.queue: "asyncio.queues.Queue[EventCommon]" = asyncio.queues.Queue()
+        # Events may arrive in a different order than the assertions that
+        # consume them. Keep unmatched events for a later, compatible wait.
+        self.pending_events: List[EventCommon] = []
 
         # Collect mappings from message ID to its chat (as Telegram API is not sending them)
         self.message_chat_map: Dict[int, TypeInputPeer] = dict()
@@ -82,6 +85,7 @@ class TelegramIntegrationTestHelper:
         await self.queue.put(event)
 
     def clear_queue(self):
+        self.pending_events.clear()
         while not self.queue.empty():
             try:
                 self.queue.get_nowait()
@@ -119,6 +123,10 @@ class TelegramIntegrationTestHelper:
         Raises:
             :exc:`asyncio.TimeoutError`: when the request timed out
         """
+        for index, value in enumerate(self.pending_events):
+            if event_filter is None or event_filter(value):
+                return self.pending_events.pop(index)
+
         deadline = time.monotonic() + timeout
         while deadline > time.monotonic():
             time_left = deadline - time.monotonic()
@@ -126,10 +134,9 @@ class TelegramIntegrationTestHelper:
             value = await asyncio.wait_for(self.queue.get(), time_left)
             self.queue.task_done()
             # print("EVENT", time.time(), value)
-            if callable(event_filter) and event_filter(value):
+            if event_filter is None or event_filter(value):
                 return value
-            elif event_filter is None:
-                return value
+            self.pending_events.append(value)
 
     async def wait_for_message(self, event_filter: BaseFilter = filters.everything,
                                timeout: float = 20.0) -> Message:
