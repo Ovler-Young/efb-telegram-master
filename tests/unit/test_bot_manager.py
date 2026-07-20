@@ -327,7 +327,6 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
 ) -> None:
     manager = object.__new__(TelegramBotManager)
     manager._bot_chat_disabled_until = {("10", 100): 1_111.0}
-    manager._bot_chat_retry_failures = {("10", 100): 2}
     manager.bot_pool = None
     task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
     selection = SimpleNamespace(sender_bot_id="10")
@@ -335,8 +334,7 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
 
     retry = manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
     assert retry.kind.name == "RETRY_EVENTUAL"
-    assert retry.retry_at == 1_120.0
-    assert manager._bot_chat_retry_failures == {("10", 100): 3}
+    assert retry.retry_at == 1_020.0
 
     blocking = manager.record_queued_failure(
         SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=1),
@@ -344,20 +342,17 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
         selection,
     )
     assert blocking.kind.name == "TERMINAL_FAILURE"
-    assert manager._bot_chat_retry_failures == {("10", 100): 3}
 
 
-def test_terminal_eventual_failure_clears_streak_without_clearing_cooldown() -> None:
+def test_terminal_eventual_failure_does_not_clear_existing_cooldown() -> None:
     manager = object.__new__(TelegramBotManager)
     manager._bot_chat_disabled_until = {("10", 100): 1_025.0}
-    manager._bot_chat_retry_failures = {("10", 100): 1}
     manager.bot_pool = None
     task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
 
     decision = manager.record_queued_failure(task, Exception("send failed"), SimpleNamespace(sender_bot_id="10"))
 
     assert decision.kind.name == "TERMINAL_FAILURE"
-    assert manager._bot_chat_retry_failures == {}
     assert manager._bot_chat_disabled_until == {("10", 100): 1_025.0}
 
 
@@ -736,7 +731,6 @@ def test_queued_success_writes_deferred_db_mapping_once():
     on_complete = Mock()
     manager._queued_db_log_contexts = {7: QueuedDbLogContext(etm_msg, old_msg_id, on_complete)}
     manager._queued_db_log_context_lock = threading.Lock()
-    manager._bot_chat_retry_failures = {}
     manager.bot_pool = None
     manager._write_database_update = Mock()
     row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
@@ -788,7 +782,6 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     manager._queued_db_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
     manager._queued_db_log_context_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
-    manager._bot_chat_retry_failures = {}
     manager.bot_pool = None
     row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
 

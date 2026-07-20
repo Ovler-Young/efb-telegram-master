@@ -105,7 +105,6 @@ def manager_adapter() -> TelegramBotManager:
     manager._bot = object()
     manager._rate_limiter = AlwaysAvailableLimiter()
     manager._bot_chat_disabled_until = {}
-    manager._bot_chat_retry_failures = {}
     manager.bot_pool = None
     return manager
 
@@ -306,10 +305,10 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     # The original row remains the same-priority destination head during cooldown.
     scheduler.dispatch_once()
     assert len(executor.submissions) == 1
-    assert scheduler.next_deadline == 115.0
+    assert scheduler.next_deadline == 110.0
     assert [row.id for row in retained_queue.heads()] == [first_id]
 
-    clock["now"] = 115.0
+    clock["now"] = 110.0
     scheduler.dispatch_once()
     assert len(executor.submissions) == 2
     assert executor.submissions[1][1][0].id == first_id

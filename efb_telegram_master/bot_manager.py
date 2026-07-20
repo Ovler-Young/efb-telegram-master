@@ -336,9 +336,7 @@ class TelegramBotManager(LocaleMixin):
     HTTPX_POOL_MULTIPLIER_ENV = "ETM_HTTPX_POOL_MULTIPLIER"
     BLOCKING_SEND_TIMEOUT = 300.0
     BLOCKING_SEND_TARGET_SLAVE_ID = "__blocking__"
-    TELEGRAM_RETRY_AFTER_GRACE_SECONDS = 5.0
-    TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS = 60.0
-    TELEGRAM_RETRY_AFTER_BACKOFF_CAP_SECONDS = 900.0
+    TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS = 60.0
     MEMBERSHIP_RECHECK_SECONDS = 0.25
     SHUTDOWN_DRAIN_TIMEOUT = 5.0
     SHUTDOWN_JOIN_GRACE = 1.0
@@ -486,7 +484,6 @@ class TelegramBotManager(LocaleMixin):
         self._send_worker_stop = threading.Event()
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
-        self._bot_chat_retry_failures: dict[BotChatKey, int] = {}
         self._queued_db_log_contexts: dict[int, QueuedDbLogContext] = {}
         self._queued_db_log_context_lock = threading.Lock()
         self._last_metrics_snapshot = 0.0
@@ -1346,8 +1343,6 @@ class TelegramBotManager(LocaleMixin):
             cast(TelegramMessage, result),
             sender_bot_id=selection.sender_bot_id,
         )
-        if row.priority == 0:
-            self._bot_chat_retry_failures.pop((selection.sender_bot_id, row.telegram_chat_id), None)
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
         return QueuedCompletionDecision(QueuedCompletionKind.SUCCESS)
@@ -1364,24 +1359,13 @@ class TelegramBotManager(LocaleMixin):
 
         if row.priority == 0 and isinstance(error, telegram.error.RetryAfter):
             retry_after = self._retry_after_seconds(error)
-            failure_count = self._bot_chat_retry_failures.get(key, 0) + 1
-            self._bot_chat_retry_failures[key] = failure_count
-            delay = retry_after + self.TELEGRAM_RETRY_AFTER_GRACE_SECONDS
-            if failure_count >= 2:
-                delay = max(
-                    delay,
-                    self.TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS * 2 ** (failure_count - 2),
-                )
-            delay = min(delay, self.TELEGRAM_RETRY_AFTER_BACKOFF_CAP_SECONDS)
-            retry_at = time.monotonic() + delay
+            retry_at = time.monotonic() + retry_after
             self._bot_chat_disabled_until[key] = retry_at
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
 
         cooldown_seconds = self._rate_limit_retry_after_seconds(cast(Exception, error))
         if cooldown_seconds is not None:
             self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
-        if row.priority == 0:
-            self._bot_chat_retry_failures.pop(key, None)
         self._finish_queued_database_update(getattr(row, "id", None))
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
@@ -1422,7 +1406,7 @@ class TelegramBotManager(LocaleMixin):
             return cls._retry_after_seconds(error)
         response = getattr(getattr(error, "__cause__", None), "response", None)
         if getattr(response, "status_code", None) == 429:
-            return cls.TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS
+            return cls.TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS
         for error_text in (getattr(error, "message", None), str(error)):
             if not error_text:
                 continue
@@ -1434,7 +1418,7 @@ class TelegramBotManager(LocaleMixin):
             if retry_after_match:
                 return float(retry_after_match.group(1))
             if re.search(r"Too Many Requests|\b429\b|Flood", error_text, re.IGNORECASE):
-                return cls.TELEGRAM_RETRY_AFTER_REPEATED_FLOOR_SECONDS
+                return cls.TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS
         return None
 
     def _run_database_update_callback(self, on_complete: Optional[Callable[[], None]]):
