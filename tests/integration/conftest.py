@@ -13,6 +13,8 @@ from ..bot import get_user_session
 
 pytest.register_assert_rewrite("tests.integration.utils")
 
+TELEGRAM_MEDIA_RATE_LIMIT_DELAY = 11.0
+
 
 @pytest.fixture(scope="session")
 def user_session_info():
@@ -73,10 +75,12 @@ async def helper(helper_wrap, slave) -> AsyncGenerator[TelegramIntegrationTestHe
 async def rate_limit_delay():
     """
     Telegram Bot API rate limits are easy to hit in CI.
-    Add a small delay between integration tests to reduce flakiness.
+    The live API requested a 10-second media retry window in CI. Keep the
+    next test outside that window so API throttling is not misreported as a
+    delivery assertion failure.
     """
     yield
-    await asyncio.sleep(6)
+    await asyncio.sleep(TELEGRAM_MEDIA_RATE_LIMIT_DELAY)
 
 
 @pytest.fixture(scope="session")
