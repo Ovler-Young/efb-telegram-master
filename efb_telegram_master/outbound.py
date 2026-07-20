@@ -701,6 +701,7 @@ class OutboundQueueScheduler:
         self.wake_event = threading.Event()
         self.stopping = False
         self.failure: Optional[QueuePersistenceError] = None
+        self._stop_notification_error: Optional[BaseException] = None
         self.in_flight: dict[int, SubmittedCall] = {}
         self.in_flight_destinations: set[int] = set()
         self.blocking_media_retries: dict[int, BlockingMediaRetry] = {}
@@ -723,6 +724,22 @@ class OutboundQueueScheduler:
 
     def _wake_on_future_completion(self, _future: Future) -> None:
         self.wake_event.set()
+
+    def _notify_adapter(self, method: str, *args: object) -> None:
+        callback = getattr(self.adapter, method, None)
+        if callable(callback):
+            callback(*args)
+
+    def _notify_scheduler_stopped(self, error: BaseException) -> None:
+        """Notify adapters once when pending rows can no longer complete here.
+
+        This hook is intentionally optional so queue adapters predating command
+        observation retain their existing interface.
+        """
+        if self._stop_notification_error is not None:
+            return
+        self._stop_notification_error = error
+        self._notify_adapter("_record_queued_scheduler_stop", error)
 
     @staticmethod
     def _retry_after_seconds(error: RetryAfter) -> float:
@@ -820,10 +837,14 @@ class OutboundQueueScheduler:
                 )
 
     def _stop_for_persistence_error(self, error: Exception) -> None:
-        persistence_error = QueuePersistenceError("Outbound queue deletion failed.")
-        persistence_error.__cause__ = error
-        self.failure = persistence_error
+        if self.failure is None:
+            persistence_error = QueuePersistenceError("Outbound queue deletion failed.")
+            persistence_error.__cause__ = error
+            self.failure = persistence_error
+        else:
+            persistence_error = self.failure
         self.stopping = True
+        self._notify_scheduler_stopped(persistence_error)
         self.queue.fail_all_waiters(persistence_error)
         self.wake_event.set()
 
@@ -849,6 +870,7 @@ class OutboundQueueScheduler:
                         return
                     self._record_terminal_discard(row)
                     self.queue.fail_waiter(row.id, error)
+                    self._notify_adapter("_record_queued_terminal", row, error)
                     continue
                 if not self._permits.acquire(blocking=False):
                     continue
@@ -862,16 +884,21 @@ class OutboundQueueScheduler:
                         self._stop_for_persistence_error(delete_error)
                         return
                     self._record_terminal_discard(row)
-                    self.queue.fail_waiter(row.id, RequiredSenderUnavailableError(decision.terminal_error_class))
+                    unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
+                    self.queue.fail_waiter(row.id, unavailable_error)
+                    self._notify_adapter("_record_queued_terminal", row, unavailable_error)
                     continue
                 if decision.selection is None:
                     self._permits.release()
                     if decision.retry_at is not None:
                         self._schedule_retry(decision.retry_at)
+                        self._notify_adapter("_record_queued_deferred", row, decision.retry_at)
                     continue
                 if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
                     self._permits.release()
-                    self._schedule_retry(now + 0.25)
+                    retry_at = now + 0.25
+                    self._schedule_retry(retry_at)
+                    self._notify_adapter("_record_queued_deferred", row, retry_at)
                     continue
                 retained = row.priority == 0
                 if not retained:
@@ -893,7 +920,9 @@ class OutboundQueueScheduler:
                     if retained:
                         self._schedule_retry(now + 0.25)
                     else:
-                        self.queue.fail_waiter(row.id, ExecutorSubmitError("Unable to submit queued Telegram call."))
+                        error = ExecutorSubmitError("Unable to submit queued Telegram call.")
+                        self.queue.fail_waiter(row.id, error)
+                        self._notify_adapter("_record_queued_terminal", row, error)
                     continue
                 future.add_done_callback(self._wake_on_future_completion)
                 self.in_flight[row.id] = SubmittedCall(row, decision.selection, future)
@@ -979,7 +1008,8 @@ class OutboundQueueScheduler:
     def stop_and_drain(self, timeout: float = 5.0) -> None:
         with self._lock:
             self.stopping = True
-            stopped_error = SchedulerStoppedError("Outbound scheduler stopped.")
+            stopped_error = self.failure or SchedulerStoppedError("Outbound scheduler stopped.")
+            self._notify_scheduler_stopped(stopped_error)
             for retry in tuple(self.blocking_media_retries.values()):
                 self._fail_blocking_retry(retry, stopped_error)
             for row_id in tuple(self.queue.waiters):

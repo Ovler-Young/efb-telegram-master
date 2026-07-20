@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import collections.abc
+import contextvars
 from enum import Enum
 import html
 import io
@@ -32,6 +33,11 @@ from telegram.request import HTTPXRequest
 
 from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
+from .command_observer import (
+    CommandOutboundObserver,
+    CommandOutboundOutcome,
+    InboundCommandKey,
+)
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
 from .outbound import (
@@ -50,6 +56,9 @@ from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
 BotChatKey: TypeAlias = Tuple[Optional[str], int]
+_inbound_command_context: contextvars.ContextVar[Optional[InboundCommandKey]] = contextvars.ContextVar(
+    "inbound_command_context", default=None
+)
 
 
 class QueuedCompletionKind(str, Enum):
@@ -486,6 +495,7 @@ class TelegramBotManager(LocaleMixin):
         self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
         self._queued_db_log_contexts: dict[int, QueuedDbLogContext] = {}
         self._queued_db_log_context_lock = threading.Lock()
+        self._command_outbound_observer = CommandOutboundObserver()
         self._last_metrics_snapshot = 0.0
         from .etm_metrics import Metrics, start_metrics_server
         _metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
@@ -732,9 +742,27 @@ class TelegramBotManager(LocaleMixin):
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-            return await asyncio.to_thread(callback, *args, **kwargs)
+            update = args[0] if args else kwargs.get("update")
+            inbound = self._inbound_command_key(update)
+            if inbound is None:
+                return await asyncio.to_thread(callback, *args, **kwargs)
+            token = _inbound_command_context.set(inbound)
+            try:
+                return await asyncio.to_thread(callback, *args, **kwargs)
+            finally:
+                _inbound_command_context.reset(token)
 
         return wrapper
+
+    @staticmethod
+    def _inbound_command_key(update: object) -> Optional[InboundCommandKey]:
+        if not isinstance(update, Update):
+            return None
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return None
+        return InboundCommandKey(chat.id, message.message_id)
 
     def _add_base_dispatchers(self):
         whitelist_filter = ~Filters.user(user_id=self.admins)
@@ -1004,11 +1032,54 @@ class TelegramBotManager(LocaleMixin):
                 )
                 raise error
             row_id, waiter = self._outbound_queue.enqueue_many(requests, self._queue_operation)
+            inbound = _inbound_command_context.get()
+            if inbound is not None:
+                request = requests[0]
+                target_chat_id = OutboundQueue._destination(
+                    self._queue_operation(request.operation), request.args, request.kwargs
+                )
+                self._command_outbound_observer.register(
+                    inbound, row_id, request.operation, target_chat_id
+                )
             if db_log_context is not None:
                 with self._queued_db_log_context_lock:
                     self._queued_db_log_contexts[row_id] = db_log_context
             self._outbound_scheduler.wake_event.set()
             return str(row_id), waiter
+
+    async def _wait_for_command_outbound(
+        self,
+        inbound_chat_id: int,
+        inbound_message_id: int,
+        operation: str,
+        target_chat_id: int,
+        *,
+        timeout: float,
+    ) -> CommandOutboundOutcome:
+        """Await one exact command-created queue row for integration assertions."""
+        return await asyncio.to_thread(
+            self._command_outbound_observer.wait_for_completion,
+            InboundCommandKey(inbound_chat_id, inbound_message_id),
+            operation,
+            target_chat_id,
+            timeout,
+        )
+
+    def _record_queued_deferred(self, row: object, retry_at: float) -> None:
+        observer = getattr(self, "_command_outbound_observer", None)
+        if observer is not None:
+            observer.retry(getattr(row, "id", -1), retry_at)
+
+    def _record_queued_terminal(self, row: object, error: BaseException) -> None:
+        observer = getattr(self, "_command_outbound_observer", None)
+        if observer is not None:
+            observer.fail(getattr(row, "id", -1), error)
+
+    def _record_queued_scheduler_stop(self, error: BaseException) -> None:
+        """Terminalize observed command rows when the scheduler cannot finish them."""
+        observer = getattr(self, "_command_outbound_observer", None)
+        if observer is not None:
+            observer.shutdown(error)
 
     def _enqueue_send_task(
         self,
@@ -1347,6 +1418,9 @@ class TelegramBotManager(LocaleMixin):
         )
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
+        observer = getattr(self, "_command_outbound_observer", None)
+        if observer is not None:
+            observer.succeed(getattr(row, "id", -1))
         return QueuedCompletionDecision(QueuedCompletionKind.SUCCESS)
 
     def record_queued_failure(
@@ -1363,12 +1437,18 @@ class TelegramBotManager(LocaleMixin):
             retry_after = self._retry_after_seconds(error)
             retry_at = time.monotonic() + retry_after
             self._bot_chat_disabled_until[key] = retry_at
+            observer = getattr(self, "_command_outbound_observer", None)
+            if observer is not None:
+                observer.retry(getattr(row, "id", -1), retry_at)
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
 
         cooldown_seconds = self._rate_limit_retry_after_seconds(cast(Exception, error))
         if cooldown_seconds is not None:
             self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
         self._finish_queued_database_update(getattr(row, "id", None))
+        observer = getattr(self, "_command_outbound_observer", None)
+        if observer is not None:
+            observer.fail(getattr(row, "id", -1), error)
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
     def record_queued_retry_after(
@@ -1377,6 +1457,9 @@ class TelegramBotManager(LocaleMixin):
         """Record a sender/chat cooldown without completing the queued database update."""
         retry_at = time.monotonic() + self._retry_after_seconds(error)
         self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = retry_at
+        observer = getattr(self, "_command_outbound_observer", None)
+        if observer is not None:
+            observer.retry(getattr(row, "id", -1), retry_at)
 
     def remove_confirmed_non_member_affinity_for_sender_chat(
         self, sender_bot_id: str, telegram_chat_id: int
@@ -1487,7 +1570,6 @@ class TelegramBotManager(LocaleMixin):
     def stop_queued_worker(self):
         """Set the queue stop boundary, then wait for its bounded drain."""
         self.logger.debug("Stopping outbound queue worker...")
-
         if hasattr(self, '_outbound_scheduler'):
             self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
         if hasattr(self, '_send_worker_stop'):
