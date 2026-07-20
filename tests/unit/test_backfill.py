@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
+import pytest
 import telegram
 from telegram import Update
 
@@ -12,6 +13,7 @@ from ehforwarderbot.types import ChatID
 
 from efb_telegram_master import utils
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
+from efb_telegram_master.constants import Flags
 from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 def _build_link_update(chat_id, *, is_forum=False):
@@ -49,6 +51,9 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    ChatBindingManager._set_conversation_state(
+        channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC
+    )
     update = _build_link_update(bot_group)
 
     sent_message = _sent_link_message(bot_group, 500)
@@ -61,7 +66,27 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
 
     migrate_chat_history.assert_called_once()
     send_history_link.assert_not_called()
+    assert storage_key not in channel.chat_binding.link_handler._conversations
     _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(106))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    ChatBindingManager._set_conversation_state(
+        channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC
+    )
+    update = _build_link_update(bot_group)
+
+    with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 506)), \
+         patch.object(chat, "link", side_effect=RuntimeError("link failed")):
+        with pytest.raises(RuntimeError, match="link failed"):
+            channel.chat_binding.link_chat(update, [token])
+
+    assert storage_key in channel.chat_binding.msg_storage
+    assert channel.chat_binding.link_handler._conversations[storage_key] == Flags.LINK_EXEC
 
 
 def test_link_chat_edits_status_message_with_sender_bot(channel, slave, bot_group):
