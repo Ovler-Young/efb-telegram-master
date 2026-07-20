@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -18,6 +19,7 @@ from .utils import parse_socks5_link
 
 
 CLIENT_START_TIMEOUT = 60
+CLIENT_STOP_TIMEOUT = 10
 
 
 class TelegramIntegrationTestHelper:
@@ -155,6 +157,12 @@ class TelegramIntegrationTestHelper:
                 f"{CLIENT_START_TIMEOUT} seconds"
             ) from exc
 
+    async def _disconnect_client(self) -> None:
+        await asyncio.wait_for(self.client.disconnect(), timeout=CLIENT_STOP_TIMEOUT)
+        disconnected = getattr(self.client, "disconnected", None)
+        if inspect.isawaitable(disconnected):
+            await asyncio.wait_for(disconnected, timeout=CLIENT_STOP_TIMEOUT)
+
     async def __aenter__(self) -> 'TelegramIntegrationTestHelper':
         try:
             await self._startup_step("client connect", self.client.connect())
@@ -164,9 +172,10 @@ class TelegramIntegrationTestHelper:
             # Fill the entity cache
             await self._startup_step("client get_dialogs", self.client.get_dialogs())
         except BaseException:
-            if self.client.is_connected():
-                await self.client.disconnect()
-                await self.client.disconnected
+            try:
+                await self._disconnect_client()
+            except BaseException:
+                self.logger.exception("Failed to clean up Telegram client after startup failure")
             raise
 
         return self
@@ -182,8 +191,7 @@ class TelegramIntegrationTestHelper:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.client.disconnect()
-        await self.client.disconnected
+        await self._disconnect_client()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Trigger the event to end the main async task."""
