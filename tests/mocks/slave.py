@@ -1,7 +1,9 @@
 import random
 import threading
 import time
+from copy import copy
 from contextlib import contextmanager
+from io import BytesIO
 from logging import getLogger
 from pathlib import Path
 from queue import Queue
@@ -274,10 +276,25 @@ class MockSlaveChannel(SlaveChannel):
             "Received message: uid=%r type=%r chat=%r edit=%r edit_media=%r",
             msg.uid, msg.type, getattr(msg.chat, "uid", None), msg.edit, msg.edit_media,
         )
-        self.messages.put(msg)
         msg.uid = MessageID(str(uuid4()))
         self._store_message(msg)
+        self.messages.put(self._snapshot_message(msg))
         return msg
+
+    @staticmethod
+    def _snapshot_message(message: Message) -> Message:
+        """Detach queued test observations from files the producer owns."""
+        snapshot = copy(message)
+        if message.file is None:
+            return snapshot
+
+        position = message.file.tell()
+        try:
+            message.file.seek(0)
+            snapshot.file = BytesIO(message.file.read())
+        finally:
+            message.file.seek(position)
+        return snapshot
 
     def stop_polling(self):
         self.polling.set()
