@@ -25,7 +25,7 @@ retry_on_message_id_invalid_error = mark.flaky(
 pytestmark = [mark.asyncio, retry_on_message_id_invalid_error]
 
 
-async def test_link_chat_cancel(helper, client, bot_id, slave, channel):
+async def test_link_chat_cancel(helper, client, bot_id, slave):
     await client.send_message(bot_id, "/link")
     message = await helper.wait_for_message(in_chats(bot_id) & has_button)
 
