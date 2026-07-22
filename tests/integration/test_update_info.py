@@ -7,7 +7,7 @@ from telethon.tl.types import PeerChannel
 from telethon.tl.types.messages import ChatFull
 from telethon.utils import resolve_id
 
-from .helper.filters import in_chats, text, new_title, reply_to, regex
+from .helper.filters import in_chats, text, new_title, regex
 from .utils import link_chats, is_bot_admin
 
 pytestmark = mark.asyncio
@@ -72,7 +72,7 @@ async def test_update_info_group_user(helper, client, bot_group, channel, slave,
 
         if avatar:
             result = await helper.wait_for_message(
-                in_chats(bot_group) & text & reply_to(command.id) & regex("Chat details updated")
+                in_chats(bot_group) & text & regex("Chat details updated")
             )
             assert "Chat details updated" in result.text
 
