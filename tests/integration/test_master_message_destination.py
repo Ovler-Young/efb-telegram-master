@@ -7,10 +7,11 @@ Only testing with text messages, as everything else shall follow suit.
 """
 
 import asyncio
+import re
 import time
 from contextlib import suppress
 from typing import List
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from pytest import mark, raises
 from telethon.tl.custom import Message, MessageButton
@@ -68,7 +69,9 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
     content = "test_master_master_quick_reply send new message with quick reply"
     text = await private_response(
         lambda: client.send_message(bot_id, content),
-        lambda timeout: helper.wait_for_message_text(in_chats(bot_id), timeout),
+        lambda timeout: helper.wait_for_message_text(
+            in_chats(bot_id) & regex(re.escape(chat.display_name)), timeout
+        ),
     )
     assert chat.display_name in text, f"{text!r} is not a warning message for {chat}"
     message = slave.messages.get(timeout=5)
@@ -96,7 +99,9 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
 
     text = await private_response(
         send_incoming_message,
-        lambda timeout: helper.wait_for_message_text(in_chats(bot_id), timeout),
+        lambda timeout: helper.wait_for_message_text(
+            in_chats(bot_id) & regex(re.escape(message.text if message else "")), timeout
+        ),
     )
     assert message is not None
     assert message.text in text  # there might be message header in ``text``
@@ -127,14 +132,17 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
     slave.messages.get(timeout=5)
     slave.messages.task_done()
 
-    now = time.time()
-    with patch("efb_telegram_master.chat_destination_cache.time.time", MagicMock(return_value=now + 86400)):
-        content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
-        message = await private_response(
-            lambda: client.send_message(bot_id, content),
-            lambda timeout: helper.wait_for_message(in_chats(bot_id) & text, timeout),
-        )
-        assert slave.messages.empty()
+    # Mutate only the cache entry. Patching ``time.time`` changes the shared
+    # module object Telethon also uses for its transport deadlines.
+    channel.chat_dest_cache.weak[str(bot_id)].expiry = time.time() - 1
+    content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
+    message = await private_response(
+        lambda: client.send_message(bot_id, content),
+        lambda timeout: helper.wait_for_message(
+            in_chats(bot_id) & text & regex("Error: No recipient specified"), timeout
+        ),
+    )
+    assert slave.messages.empty()
     await cancel_destination_suggestion(helper, message)
 
 

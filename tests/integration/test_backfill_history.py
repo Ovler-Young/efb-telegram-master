@@ -16,6 +16,7 @@ from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.db import HistoryMigrationEntry
+from .helper.helper import wait_for_private_response
 from .utils import get_start_token
 
 pytestmark = pytest.mark.asyncio
@@ -44,6 +45,19 @@ async def helper(helper_wrap, slave_with_auxiliary_bots):
     slave_with_auxiliary_bots.clear_statuses()
     assert slave_with_auxiliary_bots.statuses.empty()
     yield helper_wrap
+
+
+@pytest.fixture
+def private_response(channel_with_auxiliary_bots, bot_id):
+    """Wait for primary-bot replies using the auxiliary channel's limiter."""
+    limiter_delay = lambda: (
+        channel_with_auxiliary_bots.bot_manager._rate_limiter.peek_delay(bot_id)
+    )
+
+    async def wait(trigger, receive):
+        return await wait_for_private_response(limiter_delay, trigger, receive)
+
+    return wait
 
 
 async def _wait_for_text_in_chat(client, chat_id: int, text_fragment: str, *,
@@ -451,10 +465,8 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
     bot_manager = channel_with_auxiliary_bots.bot_manager
-    def auxiliary_private_response(trigger, receive):
-        return private_response(trigger, receive, target_channel=channel_with_auxiliary_bots)
     command_message = await _link_chat(
-        client, helper, bot_id, chat.uid, source_group_id, auxiliary_private_response
+        client, helper, bot_id, chat.uid, source_group_id, private_response
     )
 
     stream_metrics_before = _queue_metrics_snapshot(bot_manager)
@@ -506,7 +518,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     try:
         migration_metrics_before = _queue_metrics_snapshot(bot_manager)
         relink_true_message = await _link_chat(
-            client, helper, bot_id, chat.uid, target_group_id, auxiliary_private_response, flag="true"
+            client, helper, bot_id, chat.uid, target_group_id, private_response, flag="true"
         )
         _, migration_metrics_after = await _wait_for_migrated_stream_terminal(
             channel_with_auxiliary_bots,
@@ -532,7 +544,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         ), "Relink with true should migrate history instead of sending the history-link notice."
 
         relink_false_message = await _link_chat(
-            client, helper, bot_id, chat.uid, source_group_id, auxiliary_private_response, flag="false"
+            client, helper, bot_id, chat.uid, source_group_id, private_response, flag="false"
         )
         await asyncio.sleep(10)
         recent_source_messages = await _messages_since_id(client, source_group_id, relink_false_message.id)
