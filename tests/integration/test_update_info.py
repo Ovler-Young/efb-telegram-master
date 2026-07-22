@@ -13,11 +13,12 @@ from .utils import link_chats, is_bot_admin
 pytestmark = mark.asyncio
 
 
-async def test_update_info_private(helper, client, bot_id):
-    await client.send_message(bot_id, "/update_info")
-    await helper.wait_for_event(text & in_chats(bot_id))
-    # Should receive a text with instructions.
-    # No assertions needed.
+async def test_update_info_private_guidance(helper, client, bot_id, private_response):
+    content = await private_response(
+        lambda: client.send_message(bot_id, "/update_info"),
+        lambda timeout: helper.wait_for_message_text(text & in_chats(bot_id), timeout),
+    )
+    assert "Send /update_info to a group" in content
 
 
 async def test_update_info_group_empty(helper, client, bot_group):

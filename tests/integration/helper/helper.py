@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from asyncio import QueueEmpty
-from typing import Tuple, Optional, Dict, Iterable, List, Sequence, Union
+from typing import Awaitable, Callable, Tuple, Optional, Dict, Iterable, List, Sequence, TypeVar, Union
 
 from telethon import TelegramClient
 from telethon.events import NewMessage, UserUpdate, MessageDeleted, MessageEdited, ChatAction
@@ -20,6 +20,40 @@ from .utils import parse_socks5_link
 
 CLIENT_START_TIMEOUT = 60
 CLIENT_STOP_TIMEOUT = 10
+PRIVATE_RESPONSE_WAIT_CAP = 65.0
+Response = TypeVar("Response")
+
+
+async def wait_for_limiter_slot(peek_delay: Callable[[], float], *,
+                                cap: float = PRIVATE_RESPONSE_WAIT_CAP) -> None:
+    """Wait for one outbound limiter slot, never beyond its 60-second window plus margin."""
+    deadline = time.monotonic() + cap
+    while True:
+        delay = max(0.0, peek_delay())
+        if delay == 0.0:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(f"Outbound limiter did not free a slot within {cap:g} seconds")
+        await asyncio.sleep(min(delay, remaining))
+
+
+async def wait_for_private_response(
+        peek_delay: Callable[[], float], trigger: Callable[[], Awaitable[object]],
+        receive: Callable[[float], Awaitable[Response]], *,
+        cap: float = PRIVATE_RESPONSE_WAIT_CAP,
+) -> Response:
+    """Use one deadline for the limiter wait, command, and its response."""
+    async def wait() -> Response:
+        deadline = time.monotonic() + cap
+        await wait_for_limiter_slot(peek_delay, cap=deadline - time.monotonic())
+        await trigger()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(f"Private response did not arrive within {cap:g} seconds")
+        return await receive(remaining)
+
+    return await asyncio.wait_for(wait(), timeout=cap)
 
 
 class TelegramIntegrationTestHelper:
