@@ -134,7 +134,9 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
 
     # Mutate only the cache entry. Patching ``time.time`` changes the shared
     # module object Telethon also uses for its transport deadlines.
-    channel.chat_dest_cache.weak[str(bot_id)].expiry = time.time() - 1
+    human_chat_cache_key = str((await client.get_me()).id)
+    assert human_chat_cache_key in channel.chat_dest_cache.weak
+    channel.chat_dest_cache.weak[human_chat_cache_key].expiry = time.time() - 1
     content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
     message = await private_response(
         lambda: client.send_message(bot_id, content),
