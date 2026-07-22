@@ -147,3 +147,61 @@ def test_helper_clear_queue_discards_pending_events() -> None:
     test_helper.clear_queue()
 
     assert not test_helper.pending_events
+
+
+@pytest.mark.asyncio
+async def test_private_response_uses_one_deadline_for_limiter_and_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caps, received = [], []
+
+    async def wait_for_slot(_, *, cap):
+        caps.append(cap)
+
+    async def trigger():
+        return None
+
+    async def receive(timeout):
+        received.append(timeout)
+        return "reply"
+
+    monkeypatch.setattr(helper_module, "wait_for_limiter_slot", wait_for_slot)
+    monotonic = iter((100.0, 100.0, 110.0)).__next__
+    monkeypatch.setattr(helper_module, "time", SimpleNamespace(monotonic=monotonic))
+    assert await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive) == "reply"
+    assert caps == [65.0]
+    assert received == [55.0]
+
+
+@pytest.mark.asyncio
+async def test_private_response_deadline_includes_trigger() -> None:
+    response_received = False
+
+    async def trigger() -> None:
+        await asyncio.Future()
+
+    async def receive(_) -> None:
+        nonlocal response_received
+        response_received = True
+
+    with pytest.raises(asyncio.TimeoutError):
+        await helper_module.wait_for_private_response(
+            lambda: 0.0, trigger, receive, cap=0.01
+        )
+
+    assert not response_received
+
+
+@pytest.mark.asyncio
+async def test_wait_for_limiter_slot_caps_wait_at_65_seconds(
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_values = iter((0.0, 0.0, 65.0))
+    sleeps = []
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+    monkeypatch.setattr(helper_module, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
+    monkeypatch.setattr(helper_module.asyncio, "sleep", sleep)
+    with pytest.raises(TimeoutError, match="65 seconds"):
+        await helper_module.wait_for_limiter_slot(lambda: 70.0)
+    assert sleeps == [65.0]

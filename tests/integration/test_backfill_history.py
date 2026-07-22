@@ -3,7 +3,6 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from itertools import chain
 from typing import List, Sequence, Set
 from uuid import uuid4
 
@@ -17,7 +16,7 @@ from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.db import HistoryMigrationEntry
-from .helper.filters import has_button, in_chats
+from .utils import get_start_token
 
 pytestmark = pytest.mark.asyncio
 
@@ -45,20 +44,6 @@ async def helper(helper_wrap, slave_with_auxiliary_bots):
     slave_with_auxiliary_bots.clear_statuses()
     assert slave_with_auxiliary_bots.statuses.empty()
     yield helper_wrap
-
-
-async def _get_start_token(client, helper, bot_id, chat_uid):
-    await client.send_message(bot_id, f"/link {chat_uid}")
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
-    await message.buttons[0][0].click()
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
-    url = None
-    for button in chain.from_iterable(message.buttons):
-        if button.url:
-            url = button.url
-            break
-    assert url
-    return re.search(r"\?startgroup=(.+)", url).groups()[0]
 
 
 async def _wait_for_text_in_chat(client, chat_id: int, text_fragment: str, *,
@@ -202,20 +187,30 @@ async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id:
     return working_bot_ids, statuses
 
 
-async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, *,
+async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, private_response, *,
                      flag: str | None = None):
-    token = await _get_start_token(client, helper, bot_id, chat_uid)
+    token = await get_start_token(client, helper, bot_id, chat_uid, private_response)
     command = f"/start {token}"
     if flag is not None:
         command += f" {flag}"
-    command_message = await client.send_message(dest_chat_id, command)
-    await _wait_for_text_in_chat(
-        client,
-        dest_chat_id,
-        "is now linked.",
-        min_message_id=command_message.id,
-        timeout=30.0,
-    )
+    command_message = None
+
+    async def trigger():
+        nonlocal command_message
+        command_message = await client.send_message(dest_chat_id, command)
+
+    async def receive(timeout):
+        assert command_message is not None
+        return await _wait_for_text_in_chat(
+            client,
+            dest_chat_id,
+            "is now linked.",
+            min_message_id=command_message.id,
+            timeout=timeout,
+        )
+
+    await private_response(trigger, receive)
+    assert command_message is not None
     return command_message
 
 
@@ -431,7 +426,7 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
 
 async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_bots, helper, client, bot_id,
                                                          bot_group, bot_topic_group, aux_bot_ids,
-                                                         slave_with_auxiliary_bots):
+                                                         slave_with_auxiliary_bots, private_response):
     if bot_topic_group is None:
         pytest.skip("TOPIC_GROUP is required for backfill history relink coverage.")
 
@@ -449,16 +444,19 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     chat = slave_with_auxiliary_bots.chat_with_alias
     slave_uid = etm_utils.chat_id_to_str(chat=chat)
 
-    # Ensure a clean link state (DB + cached chat object).
     etm_chat = channel_with_auxiliary_bots.chat_manager.get_chat(chat.module_id, chat.uid)
     assert etm_chat is not None
     etm_chat.unlink()
     channel_with_auxiliary_bots.db.remove_topic_assoc(slave_uid=slave_uid)
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
-    command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id)
-
     bot_manager = channel_with_auxiliary_bots.bot_manager
+    def auxiliary_private_response(trigger, receive):
+        return private_response(trigger, receive, target_channel=channel_with_auxiliary_bots)
+    command_message = await _link_chat(
+        client, helper, bot_id, chat.uid, source_group_id, auxiliary_private_response
+    )
+
     stream_metrics_before = _queue_metrics_snapshot(bot_manager)
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
@@ -479,17 +477,14 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         metrics_before=stream_metrics_before,
     )
 
-    # 1) Telegram: received all 120 (no missing/duplicate indices).
     group_indices = [idx for msg in group_messages for idx in _extract_stream_indices(msg.raw_text or "", prefix)]
     assert set(group_indices) == _expected_stream_indices(STREAM_MESSAGE_COUNT)
     assert len(group_indices) == STREAM_MESSAGE_COUNT, "Expected exactly 120 stream messages in the Telegram group."
 
-    # 2) DB: all 120 are logged (no missing/duplicate indices).
     db_indices = [idx for log in db_logs for idx in _extract_stream_indices(log.text or "", prefix)]
     assert set(db_indices) == _expected_stream_indices(STREAM_MESSAGE_COUNT)
     assert len(db_indices) == STREAM_MESSAGE_COUNT, "Expected exactly 120 logged stream messages in DB."
 
-    # 3) aux actually participated in sending.
     db_sender_ids = {
         int(log.sender_bot_id)
         for log in db_logs
@@ -500,19 +495,19 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     group_sender_ids = {message.sender_id for message in group_messages if message.sender_id is not None}
     assert group_sender_ids & set(working_aux_bot_ids), "Expected auxiliary bot messages in the linked group."
 
-    # 4) Exact queue activity completed without a failed or in-flight send.
     assert _queue_activity_completed(
         stream_metrics_before,
         stream_metrics_after,
         expected_count=STREAM_MESSAGE_COUNT,
     )
 
-    # ---- Relink/migration checks (same stream history) ----
 
     target_group_id = bot_topic_group
     try:
         migration_metrics_before = _queue_metrics_snapshot(bot_manager)
-        relink_true_message = await _link_chat(client, helper, bot_id, chat.uid, target_group_id, flag="true")
+        relink_true_message = await _link_chat(
+            client, helper, bot_id, chat.uid, target_group_id, auxiliary_private_response, flag="true"
+        )
         _, migration_metrics_after = await _wait_for_migrated_stream_terminal(
             channel_with_auxiliary_bots,
             client,
@@ -536,7 +531,9 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             for message in recent_messages
         ), "Relink with true should migrate history instead of sending the history-link notice."
 
-        relink_false_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, flag="false")
+        relink_false_message = await _link_chat(
+            client, helper, bot_id, chat.uid, source_group_id, auxiliary_private_response, flag="false"
+        )
         await asyncio.sleep(10)
         recent_source_messages = await _messages_since_id(client, source_group_id, relink_false_message.id)
         assert not any(prefix in (message.raw_text or "") for message in recent_source_messages), (
@@ -547,5 +544,4 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             for message in recent_source_messages
         ), "Relink with false should skip both history migration and the history-link notice."
     finally:
-        # Keep cached chat state consistent across tests.
         etm_chat.unlink()

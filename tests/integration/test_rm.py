@@ -8,9 +8,9 @@ from tests.integration.utils import link_chats
 pytestmark = mark.asyncio
 
 
-async def test_rm_command_help(helper, client, bot_id):
-    await client.send_message(bot_id, "/rm")
-    content = await helper.wait_for_message_text(in_chats(bot_id))
+async def test_rm_command_help(helper, client, bot_group):
+    await client.send_message(bot_group, "/rm")
+    content = await helper.wait_for_message_text(in_chats(bot_group))
     assert "/rm" in content, f"{content!r} is not an error message for /rm."
 
 
@@ -21,12 +21,10 @@ async def test_rm_command_removal(helper, client, bot_group, slave, channel):
         with slave.set_message_removal(False):
             tg_msg = await helper.wait_for_message(in_chats(bot_group) & regex(message.text))
             await tg_msg.reply("/rm")
-            # wait for error message
             await helper.wait_for_message(in_chats(bot_group))
             assert slave.statuses.empty(), "Message removal should be failed."
 
         await tg_msg.reply("/rm")
-        # wait for message removal prompt
         await helper.wait_for_message(in_chats(bot_group))
         removal_status = slave.statuses.get(timeout=5)
         assert isinstance(removal_status, MessageRemoval)
@@ -42,7 +40,6 @@ async def test_rm_edit(helper, client, bot_group, slave, channel):
         message = slave.messages.get(timeout=5)
         await tg_msg.edit(text=f"rm`{tg_msg.text}")
 
-        # wait for message removal prompt
         await helper.wait_for_message(in_chats(bot_group))
         removal_status = slave.statuses.get(timeout=5)
         assert isinstance(removal_status, MessageRemoval)
@@ -50,14 +47,15 @@ async def test_rm_edit(helper, client, bot_group, slave, channel):
         assert removal_status.message.uid == message.uid
 
 
-async def test_rm_command_delete(helper, client, bot_id, bot_group, slave, channel):
+async def test_rm_command_delete(helper, client, bot_id, bot_group, slave, channel,
+                                 private_response):
     chat = slave.chat_with_alias
     with patch.dict(channel.flag.config, prevent_message_removal=False):
-        # successful case: send to private chat
 
-        # get chat head
-        await client.send_message(bot_id, f"/chat {chat.uid}")
-        tg_msg = await helper.wait_for_message(in_chats(bot_id) & has_button)
+        tg_msg = await private_response(
+            lambda: client.send_message(bot_id, f"/chat {chat.uid}"),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+        )
         await tg_msg.click(0)
         tg_msg = await helper.wait_for_message(in_chats(bot_id) & ~has_button)
         content = "test_rm_command_delete message to be removed from Telegram in private chat"
