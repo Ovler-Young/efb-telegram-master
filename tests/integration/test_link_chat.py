@@ -14,7 +14,7 @@ from telethon.tl.types import MessageEntityCode, Updates, Chat as TelethonChat
 from telethon.utils import get_peer_id
 
 from ehforwarderbot import Chat
-from .helper.filters import in_chats, has_button, edited, regex, text
+from .helper.filters import in_chats, has_button, edited, regex
 from .utils import link_chats, assert_is_linked, unlink_all_chats
 
 retry_on_message_id_invalid_error = mark.flaky(
@@ -49,6 +49,7 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
     assert "manual" in manual_button.text.lower()
     await manual_button.click()
     message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
+    manual_session_message_id = message.id
 
     command: str = next(
         txt
@@ -61,7 +62,9 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
     assert token == match.group(1), "URL token matches manual token"
 
     await client.send_message(bot_group, command)
-    await helper.wait_for_message(in_chats(bot_id) & text)
+    completion = await helper.wait_for_message(
+        in_chats(bot_id) & edited(manual_session_message_id) & ~has_button
+    )
     assert_is_linked(channel, (chat_0,), bot_group)
     unlink_all_chats(channel, bot_group)
 
@@ -79,7 +82,14 @@ async def test_unlink_unavailable_chat(helper, client, bot_group, slave, channel
         message = await helper.wait_for_message(in_chats(bot_group) & has_button)
 
         assert message.button_count == 3, f"{message.buttons} should be one known, one unknown, one cancel"
-        await message.click(i=1, j=0)  # click the unknown chat
+        unknown_chat_buttons = [
+            button
+            for row in message.buttons
+            for button in row
+            if slave.unknown_chat.display_name in button.text
+        ]
+        assert len(unknown_chat_buttons) == 1, message.buttons
+        await unknown_chat_buttons[0].click()
 
         message = await helper.wait_for_message(in_chats(bot_group) & has_button)
         await message.click(text="Restore")
@@ -194,8 +204,11 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
             await client.send_message(command_chat, f"/link {chat.uid}")
     receive = lambda timeout: helper.wait_for_message(in_chats(command_chat) & has_button, timeout)
     message = await private_response(trigger, receive)
+    session_message_id = message.id
     await message.buttons[0][0].click()  # choose chat
-    message = await helper.wait_for_message(in_chats(command_chat) & has_button)  # operation panel
+    message = await helper.wait_for_message(
+        in_chats(command_chat) & edited(session_message_id) & has_button
+    )  # operation panel
     url = None
     # print("STIMULATE_LINK_CHAT_MESSAGE_DICT", message.to_dict())
     for i in chain.from_iterable(message.buttons):
@@ -212,7 +225,9 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
         await message.forward_to(dest_chat)
     else:
         await client.send_message(dest_chat, command)
-    await helper.wait_for_message(in_chats(command_chat) & text)
+    completion = await helper.wait_for_message(
+        in_chats(command_chat) & edited(session_message_id) & ~has_button
+    )
 
 
 async def test_group_chat_migration(client, helper, channel, slave, bot_id):
