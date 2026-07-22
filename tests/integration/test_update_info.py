@@ -7,7 +7,7 @@ from telethon.tl.types import PeerChannel
 from telethon.tl.types.messages import ChatFull
 from telethon.utils import resolve_id
 
-from .helper.filters import in_chats, text, new_photo, new_title
+from .helper.filters import in_chats, text, new_title, reply_to, regex
 from .utils import link_chats, is_bot_admin
 
 pytestmark = mark.asyncio
@@ -63,7 +63,7 @@ async def test_update_info_group_user(helper, client, bot_group, channel, slave,
                                 change_info=True, is_admin=True, delete_messages=False)
 
     with link_chats(channel, (chat,), bot_group):
-        await client.send_message(bot_group, "/update_info")
+        command = await client.send_message(bot_group, "/update_info")
         title = (await helper.wait_for_event(in_chats(bot_group) & new_title)).new_title
         if alias:
             assert chat.alias in title
@@ -71,23 +71,31 @@ async def test_update_info_group_user(helper, client, bot_group, channel, slave,
             assert chat.name in title
 
         if avatar:
-            await helper.wait_for_event(in_chats(bot_group) & new_photo)
+            result = await helper.wait_for_message(
+                in_chats(bot_group) & text & reply_to(command.id) & regex("Chat details updated")
+            )
+            assert "Chat details updated" in result.text
 
         if chat_type == "GroupChat":
-            # Telegram may take a short moment to propagate the updated description.
-            await asyncio.sleep(2)
-            # Get group description
             bot_group_t, peer_type = resolve_id(bot_group)
-            if peer_type == PeerChannel:
-                group: ChatFull = await client(GetFullChannelRequest(bot_group_t))
-            else:
-                group: ChatFull = await client(GetFullChatRequest(bot_group_t))
-            desc = group.full_chat.about
+            deadline = asyncio.get_running_loop().time() + 20
+            while True:
+                if peer_type == PeerChannel:
+                    group: ChatFull = await client(GetFullChannelRequest(bot_group_t))
+                else:
+                    group = await client(GetFullChatRequest(bot_group_t))
+                desc = group.full_chat.about
 
-            chats_found = sum(int(
-                (i.name in desc) and  # Original name is found, and
-                (i.alias is None or i.alias in desc)  # alias is found too if available
-            ) for i in chat.members)
+                chats_found = sum(int(
+                    (i.name in desc) and  # Original name is found, and
+                    (i.alias is None or i.alias in desc)  # alias is found too if available
+                ) for i in chat.members)
 
-            assert len(chat.members) >= 5
-            assert chats_found >= 5, f"At least 5 members shall be found in the description: {desc}"
+                assert len(chat.members) >= 5
+                if chats_found >= 5:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    assert chats_found >= 5, (
+                        f"At least 5 members shall be found in the description: {desc}"
+                    )
+                await asyncio.sleep(0.1)

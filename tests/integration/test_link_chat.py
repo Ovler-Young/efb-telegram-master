@@ -82,14 +82,14 @@ async def test_unlink_unavailable_chat(helper, client, bot_group, slave, channel
         message = await helper.wait_for_message(in_chats(bot_group) & has_button)
 
         assert message.button_count == 3, f"{message.buttons} should be one known, one unknown, one cancel"
-        unknown_chat_buttons = [
+        unavailable_chat_buttons = [
             button
             for row in message.buttons
             for button in row
-            if slave.unknown_chat.display_name in button.text
+            if str(slave.unknown_chat.uid) in button.text
         ]
-        assert len(unknown_chat_buttons) == 1, message.buttons
-        await unknown_chat_buttons[0].click()
+        assert len(unavailable_chat_buttons) == 1, message.buttons
+        await unavailable_chat_buttons[0].click()
 
         message = await helper.wait_for_message(in_chats(bot_group) & has_button)
         await message.click(text="Restore")
@@ -145,11 +145,12 @@ async def test_link_chat_group_linked_relink(helper, client, bot_id, bot_group, 
                                               private_response):
     chat = slave.chat_with_alias
     with link_chats(channel, (chat,), bot_channel):
-        await simulate_link_chat(
-            client, helper, chat, bot_id, bot_group, command_channel=bot_channel, private_response=private_response
-        )
-        assert_is_linked(channel, tuple(), bot_channel)
-        assert_is_linked(channel, (chat,), bot_group)
+        with link_chats(channel, tuple(), bot_group):
+            await simulate_link_chat(
+                client, helper, chat, bot_id, bot_group, command_channel=bot_channel, private_response=private_response
+            )
+            assert_is_linked(channel, tuple(), bot_channel)
+            assert_is_linked(channel, (chat,), bot_group)
 
 
 async def test_link_chat_channel(helper, client, bot_id, bot_group, bot_channel, slave, channel,
@@ -255,10 +256,19 @@ async def test_group_chat_migration(client, helper, channel, slave, bot_id):
         else:
             mega_chat = await client.get_entity(get_peer_id(chat))
 
-        await asyncio.sleep(10)
-
-        assert_is_linked(channel, slave_chats, get_peer_id(mega_chat))
-        assert_is_linked(channel, tuple(), get_peer_id(chat))
+        deadline = asyncio.get_running_loop().time() + 20
+        while True:
+            migrated = get_peer_id(mega_chat)
+            original = get_peer_id(chat)
+            try:
+                assert_is_linked(channel, slave_chats, migrated)
+                assert_is_linked(channel, tuple(), original)
+            except AssertionError:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise
+                await asyncio.sleep(0.1)
+            else:
+                break
 
     # Clean up
     unlink_all_chats(channel, get_peer_id(mega_chat))
