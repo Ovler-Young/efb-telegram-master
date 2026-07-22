@@ -12,7 +12,8 @@ async def test_unlink_all_private_guidance(helper, client, bot_id, private_respo
         lambda: client.send_message(bot_id, "/unlink_all"),
         lambda timeout: helper.wait_for_message_text(in_chats(bot_id), timeout),
     )
-    assert "Send `/unlink_all` to a group" in content
+    assert "/unlink_all" in content
+    assert "group to unlink all remote chats" in content
 
 
 async def test_unlink_all_group_empty(helper, client, bot_group, slave, channel):
