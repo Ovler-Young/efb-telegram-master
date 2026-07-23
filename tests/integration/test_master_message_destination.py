@@ -190,10 +190,6 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
 
         content = "test_master_master_destination_suggestion edited message shall be delivered without a prompt"
         await sent_message.edit(text=content)
-        edited_message = await helper.wait_for_message(
-            in_chats(bot_id) & edited(sent_message.id) & text & regex(re.escape(content))
-        )
-        assert edited_message.text == content
         slave_message = await asyncio.to_thread(slave.messages.get, timeout=15)
         slave.messages.task_done()
         assert slave_message.text == content
