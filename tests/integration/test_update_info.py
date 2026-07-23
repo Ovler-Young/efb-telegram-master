@@ -7,7 +7,7 @@ from telethon.tl.types import PeerChannel
 from telethon.tl.types.messages import ChatFull
 from telethon.utils import resolve_id
 
-from .helper.filters import in_chats, text, new_title, regex
+from .helper.filters import in_chats, new_photo, new_title, regex, text
 from .utils import link_chats, is_bot_admin
 
 pytestmark = mark.asyncio
@@ -81,30 +81,35 @@ async def test_update_info_group_user(helper, client, bot_group, channel, slave,
                 in_chats(bot_group) & new_title, timeout
             )).new_title
             if not avatar:
-                return title, None
+                return title
 
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0.0:
                 raise TimeoutError("Chat details update did not arrive within the response budget")
-            result = await helper.wait_for_message(
+            await helper.wait_for_event(in_chats(bot_group) & new_photo, remaining)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0.0:
+                raise TimeoutError("Chat details feedback did not arrive within the response budget")
+            feedback = await helper.wait_for_message(
                 in_chats(bot_group) & text & regex("Chat details updated"), remaining
             )
-            return title, result
+            return title, feedback
 
-        title, result = await private_response(
+        update = await private_response(
             lambda: client.send_message(bot_group, "/update_info"),
             receive_update,
             source_channel=channel,
             target_chat_id=bot_group,
         )
+        if avatar:
+            title, feedback = update
+            assert "Chat details updated" in feedback.text
+        else:
+            title = update
         if alias:
             assert chat.alias in title
         else:
             assert chat.name in title
-
-        if avatar:
-            assert result is not None
-            assert "Chat details updated" in result.text
 
         if chat_type == "GroupChat":
             bot_group_t, peer_type = resolve_id(bot_group)
