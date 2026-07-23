@@ -21,31 +21,43 @@ async def test_update_info_private_guidance(helper, client, bot_id, private_resp
     assert "Send /update_info to a group" in content
 
 
-async def test_update_info_group_empty(helper, client, bot_group):
-    await client.send_message(bot_group, "/update_info")
-    await helper.wait_for_event(text & in_chats(bot_group))
+async def test_update_info_group_empty(helper, client, bot_group, channel, private_response):
+    await private_response(
+        lambda: client.send_message(bot_group, "/update_info"),
+        lambda timeout: helper.wait_for_event(text & in_chats(bot_group), timeout),
+        source_channel=channel,
+        target_chat_id=bot_group,
+    )
     # Should receive a text with error messages.
     # No assertions needed.
 
 
-async def test_update_info_group_multi(helper, client, bot_group, channel, slave):
+async def test_update_info_group_multi(helper, client, bot_group, channel, slave, private_response):
     with link_chats(
             channel,
             slave.get_chats_by_criteria(alias=True),
             bot_group
     ):
-        await client.send_message(bot_group, "/update_info")
-        await helper.wait_for_event(text & in_chats(bot_group))
+        await private_response(
+            lambda: client.send_message(bot_group, "/update_info"),
+            lambda timeout: helper.wait_for_event(text & in_chats(bot_group), timeout),
+            source_channel=channel,
+            target_chat_id=bot_group,
+        )
         # Should receive a text with error messages.
         # No assertions needed.
 
 
-async def test_update_info_no_permission(helper, client, bot_group, bot_id):
+async def test_update_info_no_permission(helper, client, bot_group, bot_id, channel, private_response):
     if not await is_bot_admin(client, bot_id, bot_group):
         await client.edit_admin(bot_group, bot_id,
                                 change_info=False, is_admin=False, edit_messages=False)
-    await client.send_message(bot_group, "/update_info")
-    await helper.wait_for_event(text & in_chats(bot_group))
+    await private_response(
+        lambda: client.send_message(bot_group, "/update_info"),
+        lambda timeout: helper.wait_for_event(text & in_chats(bot_group), timeout),
+        source_channel=channel,
+        target_chat_id=bot_group,
+    )
     # Should receive a text with error messages.
     # No assertions needed.
 
@@ -54,7 +66,7 @@ async def test_update_info_no_permission(helper, client, bot_group, bot_id):
 @mark.parametrize("alias", [False, True], ids=['no alias', 'alias'])
 @mark.parametrize("avatar", [False, True], ids=['no avatar', 'avatar'])
 async def test_update_info_group_user(helper, client, bot_group, channel, slave,
-                                      bot_id, chat_type, alias, avatar):
+                                      bot_id, chat_type, alias, avatar, private_response):
     chat = slave.get_chat_by_criteria(chat_type=chat_type, alias=alias, avatar=avatar)
 
     # Set bot as admin if needed
@@ -63,17 +75,35 @@ async def test_update_info_group_user(helper, client, bot_group, channel, slave,
                                 change_info=True, is_admin=True, delete_messages=False)
 
     with link_chats(channel, (chat,), bot_group):
-        command = await client.send_message(bot_group, "/update_info")
-        title = (await helper.wait_for_event(in_chats(bot_group) & new_title)).new_title
+        async def receive_update(timeout):
+            deadline = asyncio.get_running_loop().time() + timeout
+            title = (await helper.wait_for_event(
+                in_chats(bot_group) & new_title, timeout
+            )).new_title
+            if not avatar:
+                return title, None
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0.0:
+                raise TimeoutError("Chat details update did not arrive within the response budget")
+            result = await helper.wait_for_message(
+                in_chats(bot_group) & text & regex("Chat details updated"), remaining
+            )
+            return title, result
+
+        title, result = await private_response(
+            lambda: client.send_message(bot_group, "/update_info"),
+            receive_update,
+            source_channel=channel,
+            target_chat_id=bot_group,
+        )
         if alias:
             assert chat.alias in title
         else:
             assert chat.name in title
 
         if avatar:
-            result = await helper.wait_for_message(
-                in_chats(bot_group) & text & regex("Chat details updated")
-            )
+            assert result is not None
             assert "Chat details updated" in result.text
 
         if chat_type == "GroupChat":

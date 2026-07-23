@@ -11,6 +11,8 @@ import pytest
 import pytest_asyncio
 from telethon import TelegramClient
 
+from efb_telegram_master import TelegramChannel
+
 from .helper.helper import TelegramIntegrationTestHelper, wait_for_private_response
 from ..bot import get_user_session
 
@@ -189,19 +191,17 @@ async def client(helper_wrap) -> AsyncGenerator[TelegramClient, None]:
     yield helper_wrap.client
 
 
-def _primary_bot_limiter_delay(channel, bot_id):
+def _primary_bot_limiter_delay(channel: TelegramChannel, target_chat_id: int) -> float:
     """Local integration seam for observing the primary bot's outbound limiter."""
-    return channel.bot_manager._rate_limiter.peek_delay(bot_id)
+    return channel.bot_manager._rate_limiter.peek_delay(target_chat_id)
 
 
 @pytest.fixture
-def private_response(channel, bot_id):
+def private_response(channel: TelegramChannel, bot_id: int):
     """Wait for a private response within one deadline."""
-    def peek_delay(target_channel):
-        return lambda: _primary_bot_limiter_delay(target_channel, bot_id)
-
-    async def wait(trigger, receive, *, target_channel=None):
-        limiter_delay = peek_delay(target_channel or channel)
+    async def wait(trigger, receive, *, source_channel: TelegramChannel = channel,
+                   target_chat_id: int = bot_id):
+        limiter_delay = lambda: _primary_bot_limiter_delay(source_channel, target_chat_id)
         return await wait_for_private_response(limiter_delay, trigger, receive)
 
     return wait

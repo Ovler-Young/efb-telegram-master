@@ -182,12 +182,23 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         # await buttons[-1][0].click()  # Cancel the error message.
 
         await chat_buttons[0].click()  # deliver the message
+        slave_message = await asyncio.to_thread(slave.messages.get, timeout=15)
+        slave.messages.task_done()
+        assert slave_message.text == content
+        assert slave_message.chat == chat
         slave.clear_messages()
 
         content = "test_master_master_destination_suggestion edited message shall be delivered without a prompt"
         await sent_message.edit(text=content)
+        edited_message = await helper.wait_for_message(
+            in_chats(bot_id) & edited(sent_message.id) & text & regex(re.escape(content))
+        )
+        assert edited_message.text == content
         slave_message = await asyncio.to_thread(slave.messages.get, timeout=15)
+        slave.messages.task_done()
         assert slave_message.text == content
+        assert slave_message.chat == chat
+        assert slave_message.edit
 
 
 
