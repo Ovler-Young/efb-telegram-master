@@ -182,6 +182,10 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         # await buttons[-1][0].click()  # Cancel the error message.
 
         await chat_buttons[0].click()  # deliver the message
+        await helper.wait_for_message(
+            in_chats(bot_id) & edited(message.id) & text
+            & regex(r"^Delivering the message to .+\.$")
+        )
         slave_message = await asyncio.to_thread(slave.messages.get, timeout=15)
         slave.messages.task_done()
         assert slave_message.text == content
