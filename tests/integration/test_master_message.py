@@ -21,10 +21,10 @@ Send another message of same kind, quoting the previous one
 import asyncio
 import random
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Tuple
 from uuid import uuid4
 
-from pytest import mark, approx, param
+from pytest import mark, approx, param, xfail
 from telethon import TelegramClient
 from telethon.tl.custom import Message
 from telethon.tl.types import InputMediaGeoPoint, InputGeoPoint, InputMediaGeoLive, \
@@ -39,6 +39,13 @@ from .utils import link_chats
 pytestmark = mark.asyncio
 
 TELEGRAM_OPERATION_TIMEOUT = 90
+LIVE_LOCATION_DELIVERY_TIMEOUT = 5
+LIVE_LOCATION_RESPONSE_FAILURE = "'SendMediaRequest' object has no attribute 'id'"
+LIVE_LOCATION_XFAIL_REASON = (
+    "Telethon _get_response_message: Telegram returns UpdateEditChannelMessage for "
+    "live-location sendMedia in supergroups; Telethon expects EditMessageRequest.id "
+    "(AttributeError on SendMediaRequest)."
+)
 
 # region Message factory classes
 
@@ -128,11 +135,15 @@ class LiveLocationMessageFactory(MessageFactory):
 
     test_quote = False
 
+    def __init__(self):
+        self.location: Optional[Tuple[float, float]] = None
+
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
+        self.location = random.uniform(0.0, 90.0), random.uniform(0.0, 90.0)
         return await client.send_message(
             chat_id,
             file=InputMediaGeoLive(
-                InputGeoPoint(random.uniform(0.0, 90.0), random.uniform(0.0, 90.0)), stopped=False, period=3600),
+                InputGeoPoint(*self.location), stopped=False, period=3600),
             reply_to=target
         )
 
@@ -443,17 +454,51 @@ class DiceMessageFactory(MessageFactory):
 # endregion Message factory classes
 
 
+async def consume_live_location_delivery(slave, chat, factory: LiveLocationMessageFactory) -> None:
+    """Consume the accepted delivery that Telethon fails to return to the sender."""
+    assert factory.location is not None
+    efb_msg = await asyncio.to_thread(
+        slave.messages.get, timeout=LIVE_LOCATION_DELIVERY_TIMEOUT
+    )
+    try:
+        assert efb_msg.chat == chat
+        assert isinstance(efb_msg.author, SelfChatMember)
+        assert efb_msg.deliver_to is slave
+        assert efb_msg.type == MsgType.Location
+        assert not efb_msg.edit
+        assert not efb_msg.edit_media
+        assert isinstance(efb_msg.attributes, LocationAttribute)
+        latitude, longitude = factory.location
+        assert efb_msg.attributes.latitude == approx(latitude, abs=1e-3)
+        assert efb_msg.attributes.longitude == approx(longitude, abs=1e-3)
+    finally:
+        slave.messages.task_done()
+
+
+async def test_consume_live_location_delivery_removes_correlated_message():
+    from tests.mocks.slave import MockSlaveChannel
+
+    slave = MockSlaveChannel()
+    chat = slave.chat_without_alias
+    factory = LiveLocationMessageFactory()
+    factory.location = 12.345, 67.89
+    slave.messages.put(EFBMessage(
+        chat=chat,
+        author=chat.self,
+        type=MsgType.Location,
+        attributes=LocationAttribute(latitude=12.345, longitude=67.89),
+        deliver_to=slave,
+    ))
+
+    await consume_live_location_delivery(slave, chat, factory)
+
+    assert slave.messages.empty()
+
+
 @mark.parametrize("factory", [
     TextMessageFactory(), LocationMessageFactory(),
     param(
         LiveLocationMessageFactory(),
-        marks=mark.xfail(
-            reason=(
-                "Telethon _get_response_message: Telegram returns UpdateEditChannelMessage for "
-                "live-location sendMedia in supergroups; Telethon expects EditMessageRequest.id "
-                "(AttributeError on SendMediaRequest)."
-            ),
-        ),
     ),
     ContactMessageFactory(),
     StickerMessageFactory(),
@@ -473,9 +518,16 @@ async def test_master_message(helper, client, bot_group, slave, channel, factory
 
     with link_chats(channel, (chat, ), bot_group):
         # Send message
-        tg_msg = await run_telegram_operation(
-            factory, "initial send", factory.send_message(client, bot_group)
-        )
+        try:
+            tg_msg = await run_telegram_operation(
+                factory, "initial send", factory.send_message(client, bot_group)
+            )
+        except AttributeError as exc:
+            if (not isinstance(factory, LiveLocationMessageFactory)
+                    or str(exc) != LIVE_LOCATION_RESPONSE_FAILURE):
+                raise
+            await consume_live_location_delivery(slave, chat, factory)
+            xfail(LIVE_LOCATION_XFAIL_REASON)
         efb_msg = slave.messages.get(timeout=5)
         assert efb_msg.chat == chat
         assert isinstance(efb_msg.author, SelfChatMember)
