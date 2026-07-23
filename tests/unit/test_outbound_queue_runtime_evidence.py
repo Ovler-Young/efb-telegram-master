@@ -1226,6 +1226,7 @@ def test_shutdown_resolves_retained_eventual_retry_after_waiter(
     assert row_id not in retained_queue.waiters
     assert scheduler.in_flight == {}
     assert 174 not in scheduler.in_flight_destinations
+    assert len(executor.submissions) == 1
 
 
 class InitializationFailureConnection(sqlite3.Connection):

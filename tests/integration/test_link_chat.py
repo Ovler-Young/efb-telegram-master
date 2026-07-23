@@ -1,7 +1,7 @@
 import asyncio
 import re
 from itertools import chain
-from typing import Optional
+from typing import List, Optional
 from uuid import uuid4
 
 from pytest import mark
@@ -23,6 +23,28 @@ retry_on_message_id_invalid_error = mark.flaky(
 """Retry on ``MessageIdInvalidError`` due to flaky behavior of MTProto API"""
 
 pytestmark = [mark.asyncio, retry_on_message_id_invalid_error]
+
+
+async def test_link_chat_pagination(helper, client, bot_id, slave, private_response):
+    message: Message = await private_response(
+        lambda: client.send_message(bot_id, "/link"),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+    )
+    assert slave.channel_emoji in message.text
+    assert slave.channel_name in message.text
+
+    buttons: List[List[MessageButton]] = message.buttons
+    assert message.button_count > 2, "more than two buttons are shown in the chat list"
+    assert ">" in buttons[-1][-1].text, "next-page button is available"
+
+    await buttons[-1][-1].click()
+    message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
+    buttons = message.buttons
+    assert "<" in buttons[-1][0].text, "previous-page button is available after navigating"
+
+    await buttons[-1][0].click()
+    message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
+    await message.click(text="Cancel")
 
 
 async def test_link_chat_private(helper, client, bot_id, bot_group, slave, channel,

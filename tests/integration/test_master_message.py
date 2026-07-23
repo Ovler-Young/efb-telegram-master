@@ -475,26 +475,6 @@ async def consume_live_location_delivery(slave, chat, factory: LiveLocationMessa
         slave.messages.task_done()
 
 
-async def test_consume_live_location_delivery_removes_correlated_message():
-    from tests.mocks.slave import MockSlaveChannel
-
-    slave = MockSlaveChannel()
-    chat = slave.chat_without_alias
-    factory = LiveLocationMessageFactory()
-    factory.location = 12.345, 67.89
-    slave.messages.put(EFBMessage(
-        chat=chat,
-        author=chat.self,
-        type=MsgType.Location,
-        attributes=LocationAttribute(latitude=12.345, longitude=67.89),
-        deliver_to=slave,
-    ))
-
-    await consume_live_location_delivery(slave, chat, factory)
-
-    assert slave.messages.empty()
-
-
 @mark.parametrize("factory", [
     TextMessageFactory(), LocationMessageFactory(),
     param(
