@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from prometheus_client import generate_latest
 
 from ehforwarderbot import Message, MsgType
 from ehforwarderbot.types import MessageID
@@ -23,6 +24,7 @@ from efb_telegram_master.db import (
     database,
 )
 from efb_telegram_master.message import ETMMsg
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 
@@ -33,6 +35,26 @@ def test_msglog_schema_has_sender_bot_id(channel):
         from efb_telegram_master.db import database
         columns = {column.name for column in database.get_columns("msglog")}
     assert "sender_bot_id" in columns
+
+
+def test_database_method_metrics_record_success_failure_and_bounded_labels(channel):
+    metrics = Metrics()
+    channel.db.set_metrics(metrics)
+
+    assert channel.db.get_chat_assoc(master_uid="metrics-master") == []
+    with pytest.raises(ValueError, match="mutual exclusive"):
+        channel.db.get_msg_log()
+    with pytest.raises(ValueError, match="database method is invalid"):
+        metrics.record_database_method_call("SELECT * FROM msglog", 0.1, "success")
+
+    rendered = generate_latest(metrics.registry).decode()
+
+    assert 'etm_database_method_duration_seconds_count{method="get_chat_assoc"} 1.0' in rendered
+    assert 'etm_database_method_duration_seconds_sum{method="get_chat_assoc"}' in rendered
+    assert 'etm_database_method_duration_seconds_count{method="get_msg_log"} 1.0' in rendered
+    assert 'etm_database_method_failures_total{method="get_msg_log"} 1.0' in rendered
+    assert "metrics-master" not in rendered
+    assert "SELECT * FROM msglog" not in rendered
 
 
 def test_history_migration_entry_table_exists():

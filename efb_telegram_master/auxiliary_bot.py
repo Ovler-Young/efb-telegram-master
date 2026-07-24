@@ -164,6 +164,10 @@ class AuxiliaryBot:
         chat_count, _global_count = self._rate_limiter.get_counts(chat_id)
         return chat_count
 
+    def rate_limit_occupancy_snapshot(self) -> Dict[str, float]:
+        """Return aggregate rate-limit occupancy without exposing chat identities."""
+        return self._rate_limiter.occupancy_snapshot()
+
     def get_known_member_chat_ids(self) -> set[int]:
         """Return chat IDs where this bot is currently cached as a member."""
         with self._membership_lock:

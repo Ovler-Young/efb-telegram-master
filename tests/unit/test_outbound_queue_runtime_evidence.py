@@ -32,6 +32,7 @@ from efb_telegram_master.outbound import (
     SenderSelection,
     SenderSelectionResult,
 )
+from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
 def send_message(chat_id: int, text: str) -> tuple[int, str]:
@@ -727,6 +728,8 @@ def test_blocking_media_edit_retry_exceeding_original_deadline_is_terminal(
     clock = {"monotonic": 100.0, "wall": 1000.0}
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    metrics = Metrics()
+    retained_queue.metrics = metrics
     row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
@@ -738,6 +741,10 @@ def test_blocking_media_edit_retry_exceeding_original_deadline_is_terminal(
     with pytest.raises(RetryAfter):
         waiter.result()
     assert row_id not in scheduler.blocking_media_retries
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="edit_message_media",outcome="failure",priority="blocking",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="edit_message_media",outcome="failure",priority="blocking"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="edit_message_media",outcome="failure",priority="blocking"} 1.0' in rendered
 
 
 def test_repeated_blocking_media_edit_retry_cannot_extend_original_deadline(
@@ -953,7 +960,73 @@ def test_scheduler_publishes_metrics_for_actual_dequeue_and_completion(tmp_path:
     assert 'etm_outbound_dequeued_total{operation="send_message",priority="normal"} 1.0' in rendered
     assert 'etm_outbound_in_flight{operation="send_message",priority="normal",sender_kind="main"} 0.0' in rendered
     assert 'etm_outbound_completions_total{operation="send_message",outcome="success",priority="normal",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_queue_dispatches_total{outcome="submitted"} 1.0' in rendered
+    assert 'etm_outbound_queue_wait_seconds_count{operation="send_message",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
     assert row_id not in scheduler.in_flight
+    queue.close()
+
+
+def test_scheduler_records_attempt_failure_and_only_terminal_success_after_retry(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    _row_id, waiter = enqueue(queue, 49, "retry metrics")
+    adapter = RecordingAdapter(failure_decision=CompletionDecision("retry_eventual", retry_at=10.0))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(1))
+    scheduler.harvest_completed()
+
+    assert not waiter.done()
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="failure",priority="normal",sender_kind="main"}' not in rendered
+    assert 'etm_outbound_retries_total{operation="send_message",priority="normal",reason="rate_limit"} 1.0' in rendered
+    assert 'etm_outbound_failures_total{operation="send_message",priority="normal",stage="execution"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="failure",priority="normal"} 1.0' in rendered
+
+    scheduler.dispatch_once()
+    executor.submissions[1][2].set_result("sent")
+    scheduler.harvest_completed()
+
+    assert waiter.result() == "sent"
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="success",priority="normal",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="failure",priority="normal",sender_kind="main"}' not in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="failure",priority="normal"}' not in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    queue.close()
+
+
+def test_manager_registers_runtime_snapshot_collectors_with_configured_destination_cap(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    enqueue(queue, 61, "first")
+    enqueue(queue, 61, "second")
+    enqueue(queue, 62, "third")
+    metrics = Metrics()
+    manager = object.__new__(TelegramBotManager)
+    manager._metrics = metrics
+    manager._outbound_queue = queue
+    manager._outbound_scheduler = SimpleNamespace(in_flight_count=lambda: 3)
+    manager._send_worker_thread = SimpleNamespace(is_alive=lambda: True)
+    manager._bot_chat_disabled_until = {(None, 61): outbound.time.monotonic() + 1.0}
+    manager._rate_limiter = SlidingWindowRateLimiter()
+    manager.bot_pool = None
+
+    manager._register_runtime_metric_collectors(top_n=1)
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_destination_queue_depth{destination="rank_1"} 2.0' in rendered
+    assert 'etm_outbound_destination_queue_depth{destination="rank_2"}' not in rendered
+    assert "etm_outbound_worker_healthy 1.0" in rendered
+    assert "etm_outbound_worker_in_flight 3.0" in rendered
+    assert 'etm_outbound_cooldown_seconds{sender_kind="main"}' in rendered
+    assert 'etm_auxiliary_bots{state="enabled"} 0.0' in rendered
+    assert 'etm_auxiliary_membership_cache_entries{state="member"} 0.0' in rendered
+    assert 'etm_rate_limit_occupancy{scope="global"} 0.0' in rendered
     queue.close()
 
 
