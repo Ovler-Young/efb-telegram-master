@@ -340,6 +340,7 @@ class TelegramBotManager(LocaleMixin):
     MEMBERSHIP_RECHECK_SECONDS = 0.25
     SHUTDOWN_DRAIN_TIMEOUT = 5.0
     SHUTDOWN_JOIN_GRACE = 1.0
+    _bot_chat_state_lock_initialization_lock = threading.Lock()
 
     # Type declarations for instance attributes assigned in __init__
     application: Application
@@ -482,22 +483,20 @@ class TelegramBotManager(LocaleMixin):
         from concurrent.futures import ThreadPoolExecutor
 
         self._send_worker_stop = threading.Event()
+        self._bot_chat_state_lock = threading.Lock()
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
         self._queued_db_log_contexts: dict[int, QueuedDbLogContext] = {}
         self._queued_db_log_context_lock = threading.Lock()
         self._last_metrics_snapshot = 0.0
         from .etm_metrics import Metrics, start_metrics_server
-        _metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
+        metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
         self._metrics = Metrics(namespace="etm")
+        channel.db.set_metrics(self._metrics)
+        if self.bot_pool:
+            for auxiliary in self.bot_pool.bots:
+                auxiliary.bind_metrics(self._metrics)
         self._metrics_httpd = None
-        if metrics_endpoint is not None:
-            metrics_host, metrics_port = metrics_endpoint
-            self._metrics_httpd = start_metrics_server(
-                metrics_host,
-                metrics_port,
-                registry=self._metrics.registry,
-            )
 
         self._send_worker_count = self.DEFAULT_SEND_WORKER_COUNT
         self._outbound_queue = OutboundQueue(channel.db._base_path, metrics=self._metrics)
@@ -512,6 +511,15 @@ class TelegramBotManager(LocaleMixin):
             executor=self._send_executor,
             worker_count=self._send_worker_count,
         )
+        self._register_runtime_metric_collectors(metrics_top_n)
+
+        if metrics_endpoint is not None:
+            metrics_host, metrics_port = metrics_endpoint
+            self._metrics_httpd = start_metrics_server(
+                metrics_host,
+                metrics_port,
+                registry=self._metrics.registry,
+            )
 
         self._send_worker_thread = threading.Thread(
             target=self._queued_send_worker,
@@ -930,6 +938,68 @@ class TelegramBotManager(LocaleMixin):
 
         return top_n, (host, port)
 
+    def _register_runtime_metric_collectors(self, top_n: int) -> None:
+        """Bind bounded scrape callbacks after all outbound runtime state exists."""
+        from .etm_metrics import DestinationQueueSnapshot, WorkerSnapshot
+
+        def destination_snapshot() -> list[DestinationQueueSnapshot]:
+            return [
+                DestinationQueueSnapshot(destination, depth, oldest_age)
+                for destination, depth, oldest_age in self._outbound_queue.destination_snapshot()
+            ]
+
+        def worker_snapshot() -> WorkerSnapshot:
+            worker = getattr(self, "_send_worker_thread", None)
+            return WorkerSnapshot(
+                healthy=bool(worker is not None and worker.is_alive()),
+                in_flight=self._outbound_scheduler.in_flight_count(),
+            )
+
+        self._metrics.register_destination_queue_collector(destination_snapshot, top_n)
+        self._metrics.register_worker_collector(worker_snapshot)
+        self._metrics.register_cooldown_collector(self._cooldown_snapshot)
+        self._metrics.register_auxiliary_count_collector(self._auxiliary_count_snapshot)
+        self._metrics.register_membership_cache_collector(self._membership_cache_snapshot)
+        self._metrics.register_rate_limit_occupancy_collector(self._rate_limit_occupancy_snapshot)
+
+    def _get_bot_chat_state_lock(self):
+        lock = getattr(self, "_bot_chat_state_lock", None)
+        if lock is not None:
+            return lock
+        with self._bot_chat_state_lock_initialization_lock:
+            lock = getattr(self, "_bot_chat_state_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._bot_chat_state_lock = lock
+            return lock
+
+    def _cooldown_snapshot(self) -> dict[str, float]:
+        now = time.monotonic()
+        cooldowns = {"main": 0.0, "auxiliary": 0.0}
+        with self._get_bot_chat_state_lock():
+            cooldown_entries = tuple(self._bot_chat_disabled_until.items())
+        for (sender_bot_id, _chat_id), deadline in cooldown_entries:
+            sender_kind = "main" if sender_bot_id is None else "auxiliary"
+            cooldowns[sender_kind] = max(cooldowns[sender_kind], max(0.0, deadline - now))
+        return cooldowns
+
+    def _auxiliary_count_snapshot(self) -> dict[str, int]:
+        if not self.bot_pool:
+            return {"enabled": 0, "disabled": 0}
+        return self.bot_pool.auxiliary_count_snapshot()
+
+    def _membership_cache_snapshot(self) -> dict[str, int]:
+        if not self.bot_pool:
+            return {"member": 0, "not_member": 0, "unknown_probe_pending": 0}
+        return self.bot_pool.membership_cache_snapshot()
+
+    def _rate_limit_occupancy_snapshot(self) -> dict[str, float]:
+        occupancy = self._rate_limiter.occupancy_snapshot()
+        if self.bot_pool:
+            for scope, value in self.bot_pool.rate_limit_occupancy_snapshot().items():
+                occupancy[scope] = max(occupancy[scope], value)
+        return occupancy
+
     def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
         """Initialize the auxiliary bot pool from config."""
         req_kwargs = {
@@ -1197,7 +1267,8 @@ class TelegramBotManager(LocaleMixin):
     def _select_available_sender(
         self, selection: SenderSelection, chat_id: int, now: float
     ) -> SenderSelectionResult:
-        cooldown_until = self._bot_chat_disabled_until.get((selection.sender_bot_id, chat_id), 0.0)
+        with self._get_bot_chat_state_lock():
+            cooldown_until = self._bot_chat_disabled_until.get((selection.sender_bot_id, chat_id), 0.0)
         limiter_delay = self._sender_limiter_delay(selection, chat_id)
         retry_at = max(cooldown_until, now + limiter_delay)
         if retry_at > now:
@@ -1354,20 +1425,23 @@ class TelegramBotManager(LocaleMixin):
     ) -> QueuedCompletionDecision:
         key = (selection.sender_bot_id, row.telegram_chat_id)
         if selection.sender_bot_id is not None and row.slave_id:
-            affinities = getattr(self, "_membership_failure_affinities", None)
-            if affinities is None:
-                affinities = self._membership_failure_affinities = {}
-            affinities.setdefault(key, set()).add(row.slave_id)
+            with self._get_bot_chat_state_lock():
+                affinities = getattr(self, "_membership_failure_affinities", None)
+                if affinities is None:
+                    affinities = self._membership_failure_affinities = {}
+                affinities.setdefault(key, set()).add(row.slave_id)
 
         if row.priority == 0 and isinstance(error, telegram.error.RetryAfter):
             retry_after = self._retry_after_seconds(error)
             retry_at = time.monotonic() + retry_after
-            self._bot_chat_disabled_until[key] = retry_at
+            with self._get_bot_chat_state_lock():
+                self._bot_chat_disabled_until[key] = retry_at
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
 
         cooldown_seconds = self._rate_limit_retry_after_seconds(cast(Exception, error))
         if cooldown_seconds is not None:
-            self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
+            with self._get_bot_chat_state_lock():
+                self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
         self._finish_queued_database_update(getattr(row, "id", None))
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
@@ -1376,13 +1450,15 @@ class TelegramBotManager(LocaleMixin):
     ) -> None:
         """Record a sender/chat cooldown without completing the queued database update."""
         retry_at = time.monotonic() + self._retry_after_seconds(error)
-        self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = retry_at
+        with self._get_bot_chat_state_lock():
+            self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = retry_at
 
     def remove_confirmed_non_member_affinity_for_sender_chat(
         self, sender_bot_id: str, telegram_chat_id: int
     ) -> None:
-        affinities = getattr(self, "_membership_failure_affinities", {})
-        slave_ids = affinities.pop((sender_bot_id, telegram_chat_id), set())
+        with self._get_bot_chat_state_lock():
+            affinities = getattr(self, "_membership_failure_affinities", {})
+            slave_ids = affinities.pop((sender_bot_id, telegram_chat_id), set())
         if self.bot_pool:
             for slave_id in slave_ids:
                 self.bot_pool.remove_failed_membership_affinity(slave_id, sender_bot_id)
@@ -1878,10 +1954,7 @@ class TelegramBotManager(LocaleMixin):
         # Stop the queued send worker first
         self.stop_queued_worker()
 
-        metrics_httpd = getattr(self, '_metrics_httpd', None)
-        if metrics_httpd:
-            metrics_httpd.shutdown()
-            metrics_httpd.server_close()
+        TelegramBotManager._stop_metrics_server(self)
 
         # Shut down auxiliary bot pool
         if self.bot_pool:
@@ -1949,6 +2022,21 @@ class TelegramBotManager(LocaleMixin):
             else:
                 self._runtime.clear_loop()
         self.logger.info("Graceful shutdown completed")
+
+    def _stop_metrics_server(self) -> None:
+        """Stop the serving metrics thread without joining an unstarted thread."""
+        metrics_httpd = getattr(self, '_metrics_httpd', None)
+        if metrics_httpd is None:
+            return
+        self._metrics_httpd = None
+        thread = getattr(metrics_httpd, 'thread', None)
+        try:
+            if thread is not None and thread.is_alive():
+                metrics_httpd.shutdown()
+        finally:
+            metrics_httpd.server_close()
+        if thread is not None and thread.is_alive() and thread.ident != threading.get_ident():
+            thread.join(timeout=self.SHUTDOWN_JOIN_GRACE)
 
     def __del__(self):
         """Ensure cleanup on object destruction"""

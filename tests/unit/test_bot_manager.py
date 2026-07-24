@@ -13,6 +13,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 import telegram.error
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from prometheus_client import generate_latest
 
 from efb_telegram_master.bot_manager import (
     QueuedDbLogContext,
@@ -21,6 +22,7 @@ from efb_telegram_master.bot_manager import (
     TelegramBotManager,
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
 
 
@@ -326,6 +328,7 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {("10", 100): 1_111.0}
     manager.bot_pool = None
     task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
@@ -346,6 +349,7 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
 
 def test_terminal_eventual_failure_does_not_clear_existing_cooldown() -> None:
     manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {("10", 100): 1_025.0}
     manager.bot_pool = None
     task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
@@ -781,6 +785,7 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     on_complete = Mock()
     manager._queued_db_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
     manager._queued_db_log_context_lock = threading.Lock()
+    manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
     manager.bot_pool = None
     row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
@@ -795,6 +800,81 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     assert decision.kind.name == "TERMINAL_FAILURE"
     on_complete.assert_called_once_with()
     assert manager._queued_db_log_contexts == {}
+
+
+def test_cooldown_metrics_snapshot_blocks_mutation_until_iteration_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingCooldowns(dict):
+        def __init__(self) -> None:
+            super().__init__({(None, 100): 1_020.0})
+            self.snapshot_started = threading.Event()
+            self.allow_iteration = threading.Event()
+
+        def items(self):
+            iterator = iter(super().items())
+            self.snapshot_started.set()
+            assert self.allow_iteration.wait(timeout=1)
+            return iterator
+
+    class TrackingLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._acquire_count = 0
+            self._count_lock = threading.Lock()
+            self.second_acquire_attempted = threading.Event()
+
+        def __enter__(self):
+            with self._count_lock:
+                self._acquire_count += 1
+                if self._acquire_count == 2:
+                    self.second_acquire_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            self._lock.release()
+
+    manager = object.__new__(TelegramBotManager)
+    cooldowns = BlockingCooldowns()
+    lock = TrackingLock()
+    manager._bot_chat_state_lock = lock
+    manager._bot_chat_disabled_until = cooldowns
+    metrics = Metrics()
+    metrics.register_cooldown_collector(manager._cooldown_snapshot)
+    rendered: list[bytes] = []
+    errors: list[BaseException] = []
+
+    def render_metrics() -> None:
+        try:
+            rendered.append(generate_latest(metrics.registry))
+        except BaseException as error:
+            errors.append(error)
+
+    def record_cooldown() -> None:
+        manager.record_queued_retry_after(
+            SimpleNamespace(telegram_chat_id=200),
+            telegram.error.RetryAfter(20),
+            SimpleNamespace(sender_bot_id="10"),
+        )
+
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 1_000.0)
+    snapshot_thread = threading.Thread(target=render_metrics)
+    snapshot_thread.start()
+    assert cooldowns.snapshot_started.wait(timeout=1)
+
+    mutation_thread = threading.Thread(target=record_cooldown)
+    mutation_thread.start()
+    assert lock.second_acquire_attempted.wait(timeout=1)
+
+    cooldowns.allow_iteration.set()
+    snapshot_thread.join(timeout=1)
+    mutation_thread.join(timeout=1)
+
+    assert not snapshot_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert errors == []
+    assert b'etm_outbound_cooldown_seconds{sender_kind="main"} 20.0' in rendered[0]
 
 
 @pytest.mark.parametrize(
@@ -1169,7 +1249,10 @@ def test_graceful_stop_signals_manual_event_on_event_loop_when_runtime_loop_miss
 def test_graceful_stop_shuts_down_metrics_server():
     shutdown_complete_event = threading.Event()
     shutdown_complete_event.set()
-    metrics_httpd = Mock()
+    metrics_thread = Mock()
+    metrics_thread.is_alive.side_effect = [True, False]
+    metrics_thread.ident = -1
+    metrics_httpd = Mock(thread=metrics_thread)
     manager = SimpleNamespace(
         logger=Mock(),
         stop_queued_worker=Mock(),
@@ -1192,6 +1275,22 @@ def test_graceful_stop_shuts_down_metrics_server():
 
     metrics_httpd.shutdown.assert_called_once_with()
     metrics_httpd.server_close.assert_called_once_with()
+    metrics_thread.join.assert_not_called()
+    assert manager._metrics_httpd is None
+
+
+def test_metrics_server_stop_closes_unstarted_server_without_shutdown_or_join():
+    metrics_thread = Mock()
+    metrics_thread.is_alive.return_value = False
+    metrics_httpd = Mock(thread=metrics_thread)
+    manager = SimpleNamespace(_metrics_httpd=metrics_httpd, SHUTDOWN_JOIN_GRACE=1.0)
+
+    TelegramBotManager._stop_metrics_server(manager)
+    TelegramBotManager._stop_metrics_server(manager)
+
+    metrics_httpd.shutdown.assert_not_called()
+    metrics_httpd.server_close.assert_called_once_with()
+    metrics_thread.join.assert_not_called()
 
 
 def test_stop_worker_join_covers_outbound_drain_deadline():

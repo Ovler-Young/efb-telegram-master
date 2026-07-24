@@ -94,3 +94,17 @@ def test_limiter_state_resets_on_process_restart() -> None:
     restarted_process = _make_limiter(clock)
     assert restarted_process.global_delay() == 0.0
     assert restarted_process.try_acquire_global()
+
+
+def test_occupancy_snapshot_is_aggregate_and_leaks_expired_entries() -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+
+    for _ in range(14):
+        assert limiter.try_acquire_global()
+    for _ in range(9):
+        assert limiter.try_acquire_chat(100)
+
+    assert limiter.occupancy_snapshot() == {"global": 0.5, "chat": 0.5}
+    clock.value = 61.0
+    assert limiter.occupancy_snapshot() == {"global": 0.0, "chat": 0.0}

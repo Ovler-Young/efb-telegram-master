@@ -157,6 +157,7 @@ class SubmittedCall:
     row: QueuedCall
     selection: SenderSelection
     future: Future
+    dispatched_at: float
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,26 @@ class QueueMetrics(Protocol):
         ...
 
     def record_completion(self, priority: int, operation: str, sender_kind: str, outcome: str) -> None:
+        ...
+
+    def record_queue_dispatch(self, outcome: str) -> None:
+        ...
+
+    def record_queue_wait(self, priority: int, operation: str, seconds: float) -> None:
+        ...
+
+    def record_executor_attempt_duration(
+        self, priority: int, operation: str, outcome: str, seconds: float
+    ) -> None:
+        ...
+
+    def record_queue_lifetime(self, priority: int, operation: str, outcome: str, seconds: float) -> None:
+        ...
+
+    def record_retry(self, priority: int, operation: str, reason: str) -> None:
+        ...
+
+    def record_failure(self, priority: int, operation: str, stage: str) -> None:
         ...
 
 
@@ -664,6 +685,19 @@ class OutboundQueue:
             heads.append(QueuedCall(*row))
         return heads
 
+    def destination_snapshot(self) -> list[tuple[str, int, float]]:
+        """Return ranked queue destinations without exposing Telegram chat IDs."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT telegram_chat_id, COUNT(*), MIN(created_at) FROM outbound_queue "
+                "GROUP BY telegram_chat_id ORDER BY COUNT(*) DESC, telegram_chat_id ASC"
+            ).fetchall()
+        now = time.time()
+        return [
+            (f"rank_{rank}", int(depth), max(0.0, now - float(oldest_created_at)))
+            for rank, (_chat_id, depth, oldest_created_at) in enumerate(rows, start=1)
+        ]
+
     def delete(self, row_id: int) -> None:
         with self._lock:
             try:
@@ -710,6 +744,10 @@ class OutboundQueueScheduler:
     def _sender_kind(selection: SenderSelection) -> str:
         return "main" if selection.sender_bot_id is None else "auxiliary"
 
+    @staticmethod
+    def _expected_sender_kind(row: QueuedCall) -> str:
+        return "auxiliary" if row.required_sender_bot_id is not None else "main"
+
     def _record_submitted_removal(self, row: QueuedCall) -> None:
         self.queue.record_removal(row, "submitted")
         if self.queue.metrics is not None:
@@ -717,6 +755,48 @@ class OutboundQueueScheduler:
 
     def _record_terminal_discard(self, row: QueuedCall) -> None:
         self.queue.record_removal(row, "terminal_discard")
+
+    def _record_dispatch(self, outcome: str) -> None:
+        if self.queue.metrics is not None:
+            self.queue.metrics.record_queue_dispatch(outcome)
+
+    def _record_dispatch_attempt(self, row: QueuedCall) -> float:
+        dispatched_at = time.monotonic()
+        if self.queue.metrics is not None:
+            self.queue.metrics.record_queue_wait(
+                row.priority, row.operation, max(0.0, time.time() - row.created_at)
+            )
+        return dispatched_at
+
+    def _record_executor_attempt_duration(self, submitted: SubmittedCall, outcome: str) -> None:
+        if self.queue.metrics is None:
+            return
+        self.queue.metrics.record_executor_attempt_duration(
+            submitted.row.priority,
+            submitted.row.operation,
+            outcome,
+            max(0.0, time.monotonic() - submitted.dispatched_at),
+        )
+
+    def _record_terminal_completion(
+        self, row: QueuedCall, selection: SenderSelection | None, outcome: str
+    ) -> None:
+        if self.queue.metrics is None:
+            return
+        sender_kind = self._sender_kind(selection) if selection is not None else self._expected_sender_kind(row)
+        self.queue.metrics.record_completion(
+            row.priority,
+            row.operation,
+            sender_kind,
+            outcome,
+        )
+        self.queue.metrics.record_queue_lifetime(
+            row.priority, row.operation, outcome, max(0.0, time.time() - row.created_at)
+        )
+
+    def in_flight_count(self) -> int:
+        with self._lock:
+            return len(self.in_flight)
 
     def _schedule_retry(self, retry_at: float) -> None:
         self.next_deadline = min(self.next_deadline, retry_at) if self.next_deadline else retry_at
@@ -746,10 +826,8 @@ class OutboundQueueScheduler:
         self.adapter.record_queued_failure(retry.row, error, retry.selection)
         self.queue.fail_waiter(retry.row.id, error)
         if self.queue.metrics is not None:
-            self.queue.metrics.record_completion(
-                retry.row.priority, retry.row.operation,
-                self._sender_kind(retry.selection), "failure"
-            )
+            self.queue.metrics.record_failure(retry.row.priority, retry.row.operation, "terminal")
+        self._record_terminal_completion(retry.row, retry.selection, "failure")
 
     def _schedule_blocking_retry_before_deadline(
         self, retry: BlockingMediaRetry, retry_at: Optional[float] = None
@@ -776,17 +854,22 @@ class OutboundQueueScheduler:
                 self._schedule_blocking_retry_before_deadline(retry)
                 continue
             if not self._permits.acquire(blocking=False):
+                self._record_dispatch("deferred")
+                if self.queue.metrics is not None:
+                    self.queue.metrics.record_retry(retry.row.priority, retry.row.operation, "worker_capacity")
                 self._schedule_blocking_retry_before_deadline(retry)
                 continue
             decision = self.adapter.select_sender(retry.row, now)
             if decision.terminal_error_class is not None:
                 self._permits.release()
+                self._record_dispatch("failed")
                 self._fail_blocking_retry(
                     retry, RequiredSenderUnavailableError(decision.terminal_error_class)
                 )
                 continue
             if decision.selection is None:
                 self._permits.release()
+                self._record_dispatch("deferred")
                 if decision.retry_at is not None:
                     self._schedule_blocking_retry_before_deadline(retry, decision.retry_at)
                 continue
@@ -795,24 +878,33 @@ class OutboundQueueScheduler:
                 or decision.selection.sender_bot_id != retry.selection.sender_bot_id
             ):
                 self._permits.release()
+                self._record_dispatch("failed")
                 self._fail_blocking_retry(retry, retry.error)
                 continue
             if not self.adapter.acquire_sender_limits(retry.selection, retry.row.telegram_chat_id):
                 self._permits.release()
+                self._record_dispatch("deferred")
+                if self.queue.metrics is not None:
+                    self.queue.metrics.record_retry(retry.row.priority, retry.row.operation, "rate_limit")
                 self._schedule_blocking_retry_before_deadline(retry, now + 0.25)
                 continue
             try:
                 args, kwargs = self.queue.decode_payload(retry.row.payload)
+                dispatched_at = self._record_dispatch_attempt(retry.row)
                 future = self.executor.submit(
                     self.adapter.execute_queued_call, retry.row, args, kwargs, retry.selection
                 )
             except BaseException as error:
                 self._permits.release()
+                self._record_dispatch("failed")
+                if self.queue.metrics is not None:
+                    self.queue.metrics.record_failure(retry.row.priority, retry.row.operation, "dispatch")
                 self._fail_blocking_retry(retry, error)
                 continue
             self.blocking_media_retries.pop(row_id, None)
+            self._record_dispatch("submitted")
             future.add_done_callback(self._wake_on_future_completion)
-            self.in_flight[row_id] = SubmittedCall(retry.row, retry.selection, future)
+            self.in_flight[row_id] = SubmittedCall(retry.row, retry.selection, future, dispatched_at)
             self.in_flight_destinations.add(retry.row.telegram_chat_id)
             if self.queue.metrics is not None:
                 self.queue.metrics.increment_in_flight(
@@ -851,9 +943,16 @@ class OutboundQueueScheduler:
                         self._stop_for_persistence_error(delete_error)
                         return
                     self._record_terminal_discard(row)
+                    self._record_dispatch("failed")
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
+                    self._record_terminal_completion(row, None, "failure")
                     self.queue.fail_waiter(row.id, error)
                     continue
                 if not self._permits.acquire(blocking=False):
+                    self._record_dispatch("deferred")
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_retry(row.priority, row.operation, "worker_capacity")
                     continue
                 now = time.monotonic()
                 decision = self.adapter.select_sender(row, now)
@@ -865,16 +964,24 @@ class OutboundQueueScheduler:
                         self._stop_for_persistence_error(delete_error)
                         return
                     self._record_terminal_discard(row)
+                    self._record_dispatch("failed")
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
                     unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
+                    self._record_terminal_completion(row, None, "failure")
                     self.queue.fail_waiter(row.id, unavailable_error)
                     continue
                 if decision.selection is None:
                     self._permits.release()
+                    self._record_dispatch("deferred")
                     if decision.retry_at is not None:
                         self._schedule_retry(decision.retry_at)
                     continue
                 if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
                     self._permits.release()
+                    self._record_dispatch("deferred")
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_retry(row.priority, row.operation, "rate_limit")
                     retry_at = now + 0.25
                     self._schedule_retry(retry_at)
                     continue
@@ -888,21 +995,26 @@ class OutboundQueueScheduler:
                         return
                     self._record_submitted_removal(row)
                 try:
+                    dispatched_at = self._record_dispatch_attempt(row)
                     future = self.executor.submit(
                         self.adapter.execute_queued_call, row, args, kwargs, decision.selection
                     )
                 except Exception as error:
                     self._permits.release()
+                    self._record_dispatch("failed")
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_dispatch_failure(row.priority, row.operation)
+                        self.queue.metrics.record_failure(row.priority, row.operation, "dispatch")
                     if retained:
                         self._schedule_retry(now + 0.25)
                     else:
                         error = ExecutorSubmitError("Unable to submit queued Telegram call.")
+                        self._record_terminal_completion(row, decision.selection, "failure")
                         self.queue.fail_waiter(row.id, error)
                     continue
+                self._record_dispatch("submitted")
                 future.add_done_callback(self._wake_on_future_completion)
-                self.in_flight[row.id] = SubmittedCall(row, decision.selection, future)
+                self.in_flight[row.id] = SubmittedCall(row, decision.selection, future, dispatched_at)
                 self.in_flight_destinations.add(row.telegram_chat_id)
                 if self.queue.metrics is not None:
                     self.queue.metrics.increment_in_flight(
@@ -926,6 +1038,11 @@ class OutboundQueueScheduler:
                 try:
                     result = submitted.future.result()
                 except BaseException as error:
+                    self._record_executor_attempt_duration(submitted, "failure")
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_failure(
+                            submitted.row.priority, submitted.row.operation, "execution"
+                        )
                     if self._is_blocking_media_retry(submitted.row, error):
                         assert isinstance(error, RetryAfter)
                         retry_after = self._retry_after_seconds(error)
@@ -939,6 +1056,10 @@ class OutboundQueueScheduler:
                                 submitted.row, submitted.selection, retry_at, deadline, error
                             )
                             self._schedule_retry(retry_at)
+                            if self.queue.metrics is not None:
+                                self.queue.metrics.record_retry(
+                                    submitted.row.priority, submitted.row.operation, "rate_limit"
+                                )
                             continue
                     decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
                     if decision.kind == "retry_eventual" and submitted.row.priority == 0:
@@ -948,6 +1069,11 @@ class OutboundQueueScheduler:
                         if decision.retry_at is None:
                             raise RuntimeError("Retry decision requires a retry deadline.")
                         self._schedule_retry(decision.retry_at)
+                        if self.queue.metrics is not None:
+                            self.queue.metrics.record_retry(
+                                submitted.row.priority, submitted.row.operation,
+                                "rate_limit" if isinstance(error, RetryAfter) else "membership"
+                            )
                         continue
                     if submitted.row.priority == 0:
                         try:
@@ -958,11 +1084,12 @@ class OutboundQueueScheduler:
                         self._record_terminal_discard(submitted.row)
                     self.queue.fail_waiter(row_id, error)
                     if self.queue.metrics is not None:
-                        self.queue.metrics.record_completion(
-                            submitted.row.priority, submitted.row.operation,
-                            self._sender_kind(submitted.selection), "failure"
+                        self.queue.metrics.record_failure(
+                            submitted.row.priority, submitted.row.operation, "terminal"
                         )
+                    self._record_terminal_completion(submitted.row, submitted.selection, "failure")
                 else:
+                    self._record_executor_attempt_duration(submitted, "success")
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
                     if submitted.row.priority == 0:
                         try:
@@ -974,11 +1101,7 @@ class OutboundQueueScheduler:
                     waiter = self.queue.waiters.pop(row_id, None)
                     if waiter is not None and not waiter.done():
                         waiter.set_result(result)
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_completion(
-                            submitted.row.priority, submitted.row.operation,
-                            self._sender_kind(submitted.selection), "success"
-                        )
+                    self._record_terminal_completion(submitted.row, submitted.selection, "success")
             if any_harvested:
                 self.wake_event.set()
 
