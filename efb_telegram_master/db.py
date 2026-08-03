@@ -148,7 +148,7 @@ class MsgLog(BaseModel):
     """Module ID of the message sent to."""
     sender_bot_id = TextField(null=True)
     """Telegram bot user ID that sent this message. NULL means the main bot."""
-    delivery_queue_id = TextField(null=True, unique=True)
+    delivery_queue_id = TextField(null=True)
     """Durable outbound queue identifier associated with a delivered Telegram receipt."""
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
@@ -247,6 +247,7 @@ class TopicRecoveryEntry(BaseModel):
     target_message_id = IntegerField(null=True)
     error = TextField(null=True)
     idempotency_key = TextField(unique=True)
+    delivery_queue_id = TextField(null=True, unique=True)
     updated_at = DateTimeField(default=datetime.datetime.now)
 
     class Meta:
@@ -502,6 +503,10 @@ class DatabaseManager:
             self._migrate(5)
         elif "topicrecoveryscan" not in database.get_tables() or "topicrecoveryentry" not in database.get_tables():
             self._migrate(6)
+        elif "delivery_queue_id" not in {
+            column.name for column in database.get_columns("topicrecoveryentry")
+        }:
+            self._migrate(7)
 
     def _migrate(self, i: int):
         """
@@ -551,6 +556,10 @@ class DatabaseManager:
             )
         if i <= 6:
             database.create_tables([TopicRecoveryScan, TopicRecoveryEntry], safe=True)
+        if i == 7:
+            migrator.add_column(
+                "topicrecoveryentry", "delivery_queue_id", TopicRecoveryEntry.delivery_queue_id,
+            )
 
     def _observe_legacy_outbound_rows(self) -> None:
         """Report retained workflow rows without loading or changing them."""
@@ -1171,7 +1180,7 @@ class DatabaseManager:
     def save_topic_recovery_entry(
         self, *, scan_id: int, source_message_id: int, classification: str,
         status: str, idempotency_key: str, target_message_id: Optional[int] = None,
-        error: Optional[str] = None,
+        error: Optional[str] = None, delivery_queue_id: Optional[str] = None,
     ) -> TopicRecoveryEntry:
         entry, _created = TopicRecoveryEntry.get_or_create(
             scan_id=scan_id, source_message_id=source_message_id,
@@ -1182,9 +1191,48 @@ class DatabaseManager:
         entry.status = status
         entry.target_message_id = target_message_id
         entry.error = error
+        if delivery_queue_id is not None:
+            entry.delivery_queue_id = delivery_queue_id
         entry.updated_at = datetime.datetime.now()
         entry.save()
         return entry
+
+    @observe_database_method("get_incomplete_topic_recovery_scans")
+    def get_incomplete_topic_recovery_scans(self) -> List[TopicRecoveryScan]:
+        return list(
+            TopicRecoveryScan.select()
+            .where(TopicRecoveryScan.status.in_(("pending", "retryable-error")))
+            .order_by(TopicRecoveryScan.updated_at.asc(), TopicRecoveryScan.id.asc())
+        )
+
+    @observe_database_method("reconcile_topic_recovery_delivery")
+    def reconcile_topic_recovery_delivery(
+        self, *, scan_id: int, source_chat_id: int, source_message_id: int,
+        target_chat_id: int, target_message_id: Optional[int], slave_chat_id: EFBChannelChatIDStr,
+        text: str, idempotency_key: str, delivery_queue_id: str,
+    ) -> None:
+        with database.atomic():
+            entry = TopicRecoveryEntry.get_or_none(
+                (TopicRecoveryEntry.scan_id == scan_id) &
+                (TopicRecoveryEntry.source_message_id == source_message_id)
+            )
+            if entry is None:
+                raise ValueError(f"Topic recovery entry {scan_id}:{source_message_id} is missing")
+            if entry.delivery_queue_id not in (None, delivery_queue_id):
+                raise ValueError(f"Topic recovery entry {scan_id}:{source_message_id} has another queue ID")
+            entry.classification = "accepted"
+            entry.status = "accepted"
+            entry.target_message_id = target_message_id
+            entry.error = None
+            entry.idempotency_key = idempotency_key
+            entry.delivery_queue_id = delivery_queue_id
+            entry.updated_at = datetime.datetime.now()
+            entry.save()
+            self.add_topic_recovery_msg_log(
+                source_chat_id=source_chat_id, source_message_id=source_message_id,
+                target_chat_id=target_chat_id, target_message_id=target_message_id,
+                slave_chat_id=slave_chat_id, text=text,
+            )
 
     @observe_database_method("advance_topic_recovery_scan")
     def advance_topic_recovery_scan(

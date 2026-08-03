@@ -11,6 +11,7 @@ from efb_telegram_master.mtproto import (
     MTProtoClient,
     MTProtoConfig,
     MTProtoFloodWaitError,
+    MTProtoMediaDescriptor,
     MTProtoMediaLimitError,
     MTProtoRetryableError,
     MTProtoSessionOwnershipError,
@@ -294,6 +295,36 @@ async def test_large_media_send_uses_uploaded_stream_and_normalizes_receipt(tmp_
     })]
     stream.read.assert_not_called()
     await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_media_descriptor_reopens_a_path_without_materializing_file(tmp_path: Path):
+    source = tmp_path / "large.bin"
+    source.write_bytes(b"streamed-data")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="caption", reply_to=9,
+            force_document=True, supports_streaming=False, silent=True,
+            media_name="document", mime_type="application/octet-stream",
+        )
+    client = MTProtoClient(enabled_config(), "bot-token", tmp_path, client_factory=FakeClient)
+    await client.connect()
+
+    receipt = await client.send_media_descriptor(77, descriptor)
+
+    assert (receipt.chat_id, receipt.message_id) == (77, 44)
+    uploaded, file_size = client.client.uploaded
+    assert file_size == source.stat().st_size
+    assert uploaded.closed
+    await client.disconnect()
+
+
+def test_media_descriptor_rejects_non_reopenable_stream():
+    with pytest.raises(ValueError, match="path-backed"):
+        MTProtoMediaDescriptor.from_stream(
+            object(), file_size=1, caption="", reply_to=None, force_document=True,
+            supports_streaming=False, silent=False, media_name="document", mime_type=None,
+        )
 
 
 @pytest.mark.asyncio

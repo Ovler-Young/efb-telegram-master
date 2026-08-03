@@ -1,4 +1,8 @@
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 from efb_telegram_master import utils
+from efb_telegram_master.chat_binding import ChatBindingManager
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
 
@@ -41,6 +45,27 @@ def test_chat_pagination_filters_groups_users_and_invalid_regex(channel, slave):
         (TelegramChatID(0), TelegramMessageID(7)), pattern="("
     )
     assert len(buttons) == 1
+
+
+def test_resume_pending_topic_recoveries_reconstructs_requests_and_skips_complete_scans():
+    recovery = Mock()
+    manager = SimpleNamespace(
+        db=SimpleNamespace(get_incomplete_topic_recovery_scans=Mock(return_value=[
+            SimpleNamespace(
+                source_chat_id="10", source_thread_id="7", target_chat_id="20",
+                target_thread_id="8", slave_chat_id="tests.mocks.slave.chat", scan_boundary=99,
+            ),
+        ])),
+        recover_topic_history=recovery,
+        logger=Mock(),
+    )
+
+    ChatBindingManager.resume_pending_topic_recoveries(manager)
+
+    recovery.assert_called_once_with(
+        source_chat_id=10, source_thread_id=7, target_chat_id=20, target_thread_id=8,
+        slave_chat_id="tests.mocks.slave.chat", scan_boundary=99,
+    )
 
 
 def test_truncate_ellipsis(channel):

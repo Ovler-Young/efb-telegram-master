@@ -60,6 +60,83 @@ class MTProtoReceipt:
     message_id: int
 
 
+@dataclass(frozen=True)
+class MTProtoMediaDescriptor:
+    """Versioned, reopenable input for one durable MTProto media request."""
+
+    version: int
+    path: str
+    file_size: int
+    caption: str
+    reply_to: Optional[int]
+    force_document: bool
+    supports_streaming: bool
+    silent: bool
+    media_name: str
+    mime_type: Optional[str]
+
+    VERSION = 1
+
+    @classmethod
+    def from_stream(
+        cls,
+        stream: object,
+        *,
+        file_size: int,
+        caption: str,
+        reply_to: Optional[int],
+        force_document: bool,
+        supports_streaming: bool,
+        silent: bool,
+        media_name: str,
+        mime_type: Optional[str],
+    ) -> "MTProtoMediaDescriptor":
+        name = getattr(stream, "name", None)
+        if not isinstance(name, (str, os.PathLike)):
+            raise ValueError("MTProto durable media requires a path-backed file.")
+        path = Path(name).expanduser().resolve(strict=True)
+        descriptor = cls(
+            cls.VERSION, str(path), file_size, caption, reply_to, force_document,
+            supports_streaming, silent, media_name, mime_type,
+        )
+        descriptor.validate()
+        return descriptor
+
+    def validate(self) -> None:
+        if self.version != self.VERSION:
+            raise ValueError("MTProto media descriptor has an unknown version.")
+        if not isinstance(self.path, str) or not self.path:
+            raise ValueError("MTProto media descriptor requires a file path.")
+        if isinstance(self.file_size, bool) or not isinstance(self.file_size, int) or self.file_size < 0:
+            raise ValueError("MTProto media descriptor has an invalid file size.")
+        if not isinstance(self.caption, str) or self.media_name not in {"document", "photo", "video", "animation"}:
+            raise ValueError("MTProto media descriptor has invalid metadata.")
+        if self.reply_to is not None and (isinstance(self.reply_to, bool) or not isinstance(self.reply_to, int)):
+            raise ValueError("MTProto media descriptor has an invalid reply target.")
+        if not all(isinstance(value, bool) for value in (
+            self.force_document, self.supports_streaming, self.silent,
+        )):
+            raise ValueError("MTProto media descriptor has invalid flags.")
+        if self.mime_type is not None and not isinstance(self.mime_type, str):
+            raise ValueError("MTProto media descriptor has an invalid MIME type.")
+        path = Path(self.path)
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("MTProto media descriptor cannot reopen the original file.") from error
+        if (
+            not path.is_absolute()
+            or resolved != path
+            or not path.is_file()
+            or path.stat().st_size != self.file_size
+        ):
+            raise ValueError("MTProto media descriptor cannot reopen the original file.")
+
+    def open(self):
+        self.validate()
+        return Path(self.path).open("rb")
+
+
 class MTProtoSessionOwnershipError(RuntimeError):
     """Raised when a second local client attempts to use the MTProto session."""
 
@@ -321,6 +398,21 @@ class MTProtoClient:
         if len(receipts) != 1:
             raise ValueError("MTProto media send returned an unexpected number of receipts")
         return receipts[0]
+
+    async def send_media_descriptor(self, chat_id: int, descriptor: MTProtoMediaDescriptor) -> MTProtoReceipt:
+        """Reopen a queued media file only for the duration of its streamed upload."""
+        descriptor.validate()
+        with descriptor.open() as stream:
+            return await self.send_media_stream(
+                chat_id,
+                stream,
+                file_size=descriptor.file_size,
+                caption=descriptor.caption,
+                reply_to=descriptor.reply_to,
+                force_document=descriptor.force_document,
+                supports_streaming=descriptor.supports_streaming,
+                silent=descriptor.silent,
+            )
 
     async def download_message_media(self, chat_id: int, message_id: int, destination: object) -> None:
         """Write a message's media to a caller-owned file one Telethon chunk at a time."""

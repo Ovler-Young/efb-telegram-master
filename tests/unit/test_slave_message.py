@@ -1016,7 +1016,7 @@ def test_all_oversize_branches_use_one_sync_quoted_reply(method_name, message_ty
     assert file.closed
 
 
-def test_mtproto_large_file_preserves_caption_topic_reply_and_receipt():
+def test_mtproto_large_file_rejects_non_durable_stream():
     class LargeStream(BytesIO):
         def tell(self):
             if super().tell() == len(self.getvalue()):
@@ -1035,25 +1035,17 @@ def test_mtproto_large_file_preserves_caption_topic_reply_and_receipt():
 
     processor = build_slave_message_processor()
     processor.channel.mtproto = MTProto()
-    processor.bot._runtime = SimpleNamespace(call=lambda coroutine: asyncio.run(coroutine))
     processor.bot._affix_queued_content = lambda content, prefix, suffix, _mode: f"{prefix}\n{content}\n{suffix}"
     processor.html_substitutions = Mock(return_value="caption")
-    processor._cleanup_pending_local_api_files = Mock()
     msg = SimpleNamespace(
         type=MsgType.File, file=LargeStream(b"not-read-as-a-whole"), text="caption",
         edit_media=False, commands=None,
     )
 
     assert processor._uses_mtproto_media(msg)
-    receipt = processor._send_mtproto_media(msg, 100, 77, "header", "footer", None, 42, None, True)
+    with pytest.raises(EFBMessageError, match="path-backed"):
+        processor._send_mtproto_media(msg, 100, 77, "header", "footer", None, 42, None, True)
 
-    assert (receipt.chat.id, receipt.message_id) == (100, 501)
-    args, kwargs = processor.channel.mtproto.kwargs
-    assert args[:2] == (100, msg.file)
-    assert kwargs == {
-        "file_size": 100 * 1024 * 1024 + 1, "caption": "header\ncaption\nfooter",
-        "reply_to": 42, "force_document": True, "supports_streaming": False, "silent": True,
-    }
     assert msg.file.closed
 
 

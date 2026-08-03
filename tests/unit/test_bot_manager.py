@@ -5,6 +5,7 @@ import io
 import string
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Iterator, BinaryIO
 from types import SimpleNamespace
@@ -20,11 +21,15 @@ from efb_telegram_master.bot_manager import (
     SendReceipt,
     SyncBotFacade,
     TelegramBotManager,
+    TopicRecoveryQueueContext,
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.mtproto import MTProtoFloodWaitError
-from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
+from efb_telegram_master.mtproto import MTProtoFloodWaitError, MTProtoMediaDescriptor, MTProtoReceipt
+from efb_telegram_master.outbound import (
+    OutboundQueue, OutboundQueueScheduler, QueueEnqueueError, QueueRequest, SenderSelection,
+    SenderSelectionResult,
+)
 
 
 class DurableMessage:
@@ -853,6 +858,76 @@ def test_mtproto_flood_wait_uses_eventual_durable_retry(monkeypatch: pytest.Monk
     assert decision.retry_at == 27.0
 
 
+def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path, monkeypatch):
+    class MTProto:
+        def __init__(self):
+            self.calls = 0
+
+        async def send_media_descriptor(self, chat_id, descriptor):
+            self.calls += 1
+            assert chat_id == 123
+            with descriptor.open() as stream:
+                assert stream.read(1) == b"m"
+            if self.calls == 1:
+                raise MTProtoFloodWaitError("wait", retry_after=1)
+            return MTProtoReceipt(chat_id=123, message_id=456)
+
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"media")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="caption", reply_to=7,
+            force_document=True, supports_streaming=False, silent=False,
+            media_name="document", mime_type="application/octet-stream",
+        )
+
+    manager = object.__new__(TelegramBotManager)
+    queue = OutboundQueue(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1)
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
+    manager._outbound_queue = queue
+    manager._outbound_scheduler = scheduler
+    manager._runtime = SimpleNamespace(call=lambda coroutine: asyncio.run(coroutine))
+    manager.channel = SimpleNamespace(mtproto=MTProto(), db=SimpleNamespace(add_or_update_message_log=Mock()))
+    manager.logger = Mock()
+    manager.bot_pool = None
+    manager._bot_chat_state_lock = threading.Lock()
+    manager._bot_chat_disabled_until = {}
+    manager._membership_failure_affinities = {}
+    manager._queued_blocking_log_contexts = {}
+    manager._queued_completion_callbacks = {}
+    manager._queued_log_context_lock = threading.Lock()
+    manager.TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS = 60.0
+    manager.select_sender = lambda _row, _now: SenderSelectionResult(
+        selection=SenderSelection(object(), None)
+    )
+    manager.acquire_sender_limits = lambda _selection, _chat_id: True
+    monkeypatch.setattr("efb_telegram_master.bot_manager.get_msg_type", lambda _message: "document")
+
+    receipt = manager.enqueue_mtproto_media(
+        chat_id=123, descriptor=descriptor, slave_id="slave",
+        db_log_context=QueuedDbLogContext(DurableMessage()),
+    )
+    row_id = int(receipt.task_id)
+    scheduler.dispatch_once()
+    with pytest.raises(MTProtoFloodWaitError):
+        scheduler.in_flight[row_id].future.result(timeout=1)
+    scheduler.harvest_completed()
+
+    assert manager.channel.mtproto.calls == 1
+    assert [row.id for row in queue.heads()] == [row_id]
+    manager.channel.db.add_or_update_message_log.assert_not_called()
+
+    scheduler.dispatch_once()
+    scheduler.in_flight[row_id].future.result(timeout=1)
+    scheduler.harvest_completed()
+
+    assert manager.channel.mtproto.calls == 2
+    assert queue.heads() == []
+    assert manager.channel.db.add_or_update_message_log.call_count == 1
+    executor.shutdown()
+
+
 def test_durable_reconciliation_keeps_receipt_when_application_db_fails(monkeypatch: pytest.MonkeyPatch):
     manager = object.__new__(TelegramBotManager)
     etm_msg = DurableMessage()
@@ -883,6 +958,34 @@ def test_durable_reconciliation_keeps_receipt_when_application_db_fails(monkeypa
     assert TelegramBotManager.reconcile_queued_delivery(manager, row)
     assert manager.channel.db.add_or_update_message_log.call_count == 2
     assert manager._queued_completion_callbacks == {}
+
+
+def test_topic_recovery_reconciliation_uses_queue_id_and_retries_without_resend():
+    manager = object.__new__(TelegramBotManager)
+    database = SimpleNamespace(reconcile_topic_recovery_delivery=Mock(
+        side_effect=[RuntimeError("database unavailable"), None]
+    ))
+    manager.channel = SimpleNamespace(db=database)
+    manager.logger = Mock()
+    context = TelegramBotManager.encode_topic_recovery_log_context(
+        TopicRecoveryQueueContext(1, 10, 1, 20, "tests.mocks.slave.chat", "text", "1:1")
+    )
+    row = SimpleNamespace(
+        id=7, queue_id="queue-7", log_context=context,
+        completion_receipt=TelegramBotManager.encode_queued_completion_receipt(
+            SimpleNamespace(message_id=900), SenderSelection(object(), None)
+        ),
+    )
+
+    assert not TelegramBotManager.reconcile_queued_delivery(manager, row)
+    assert TelegramBotManager.reconcile_queued_delivery(manager, row)
+    assert database.reconcile_topic_recovery_delivery.call_count == 2
+    assert database.reconcile_topic_recovery_delivery.call_args.kwargs == {
+        "scan_id": 1, "source_chat_id": 10, "source_message_id": 1,
+        "target_chat_id": 20, "target_message_id": 900,
+        "slave_chat_id": "tests.mocks.slave.chat", "text": "text",
+        "idempotency_key": "1:1", "delivery_queue_id": "queue-7",
+    }
 
 
 def test_cooldown_metrics_snapshot_blocks_mutation_until_iteration_is_safe(
@@ -1475,6 +1578,29 @@ async def test_shutdown_ptb_application_signals_stop_running():
     await TelegramBotManager._shutdown_ptb_application(manager)
 
     application.stop_running.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_post_init_resumes_topic_recovery_after_mtproto_connects():
+    events = []
+
+    async def connect():
+        events.append("connect")
+
+    manager = SimpleNamespace(
+        _runtime=SimpleNamespace(bind_loop=Mock()), bot_pool=None,
+        _shutdown_complete_event=threading.Event(),
+        channel=SimpleNamespace(
+            mtproto=SimpleNamespace(connect=connect),
+            chat_binding=SimpleNamespace(
+                resume_pending_topic_recoveries=lambda: events.append("resume"),
+            ),
+        ),
+    )
+
+    await TelegramBotManager._post_init(manager, object())
+
+    assert events == ["connect", "resume"]
 
 
 def test_polling_passes_custom_timeout_to_manual_lifecycle():

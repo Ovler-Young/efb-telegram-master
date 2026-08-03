@@ -36,6 +36,7 @@ from ehforwarderbot.status import ChatUpdates, MemberUpdates, MessageRemoval, Me
 from ehforwarderbot.types import MessageID
 from . import utils
 from .bot_manager import QueuedDbLogContext
+from .mtproto import MTProtoMediaDescriptor
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import ETMCommandMsgStorage
@@ -309,14 +310,10 @@ class SlaveMessageProcessor(LocaleMixin):
         if self._uses_mtproto_media(msg):
             tg_msg = self._send_mtproto_media(
                 msg, tg_dest, thread_id, msg_template, reactions, old_msg_id,
-                target_msg_id, reply_markup, silent,
+                target_msg_id, reply_markup, silent, database_old_msg_id or old_msg_id, on_db_complete,
             )
             if tg_msg is None:
                 self._release_pending_slave_message(dedupe_key)
-                return
-            etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
-            self.bot.write_db_mapping(etm_msg, tg_msg, database_old_msg_id or old_msg_id,
-                                      on_complete=on_db_complete)
             return
 
         # Type dispatching
@@ -558,7 +555,9 @@ class SlaveMessageProcessor(LocaleMixin):
     def _send_mtproto_media(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                             old_msg_id: Optional[OldMsgID], target_msg_id: Optional[TelegramMessageID],
-                            reply_markup: Optional[ReplyMarkup], silent: bool) -> telegram.Message:
+                            reply_markup: Optional[ReplyMarkup], silent: bool,
+                            database_old_msg_id: Optional[OldMsgID] = None,
+                            on_db_complete: Optional[Callable[[], None]] = None) -> telegram.Message:
         if old_msg_id is not None or msg.edit_media:
             raise EFBMessageError("MTProto oversized-media edits are not supported.")
         if reply_markup is not None or msg.commands:
@@ -579,26 +578,28 @@ class SlaveMessageProcessor(LocaleMixin):
         caption = self.bot._affix_queued_content(self.html_substitutions(msg), msg_template, reactions, "HTML")
         reply_to = target_msg_id or thread_id
         try:
-            receipt = self.bot._runtime.call(
-                self.channel.mtproto.send_media_stream(
-                    int(tg_dest), file, file_size=size, caption=caption, reply_to=reply_to,
-                    force_document=force_document, supports_streaming=supports_streaming, silent=silent,
-                )
+            media_name = {
+                MsgType.File: "document",
+                MsgType.Image: "photo",
+                MsgType.Video: "video",
+                MsgType.Animation: "animation",
+            }[msg.type]
+            descriptor = MTProtoMediaDescriptor.from_stream(
+                file, file_size=size, caption=caption, reply_to=reply_to,
+                force_document=force_document, supports_streaming=supports_streaming, silent=silent,
+                media_name=media_name, mime_type=getattr(msg, "mime", None),
             )
+        except ValueError as error:
+            raise EFBMessageError(str(error)) from error
         finally:
             file.close()
-            self._cleanup_pending_local_api_files()
-        media = SimpleNamespace(file_id=None, file_unique_id=None, mime_type=getattr(msg, "mime", None))
-        media_name = {
-            MsgType.File: "document",
-            MsgType.Image: "photo",
-            MsgType.Video: "video",
-            MsgType.Animation: "animation",
-        }[msg.type]
-        media_value = [media] if media_name == "photo" else media
-        return cast(telegram.Message, SimpleNamespace(
-            chat=SimpleNamespace(id=receipt.chat_id), chat_id=receipt.chat_id,
-            message_id=receipt.message_id, **{media_name: media_value},
+        return cast(telegram.Message, self.bot.enqueue_mtproto_media(
+            chat_id=int(tg_dest), descriptor=descriptor,
+            slave_id=utils.chat_id_to_str(chat=msg.chat),
+            db_log_context=QueuedDbLogContext(
+                ETMMsg.from_efbmsg(msg, self.chat_manager), database_old_msg_id,
+                on_db_complete,
+            ),
         ))
 
     @classmethod

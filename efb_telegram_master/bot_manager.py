@@ -18,6 +18,7 @@ from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import wraps
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, BinaryIO, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import url2pathname
@@ -35,7 +36,7 @@ from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
-from .mtproto import MTProtoRetryableError
+from .mtproto import MTProtoMediaDescriptor, MTProtoRetryableError
 from .outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
@@ -74,6 +75,17 @@ class QueuedDbLogContext(NamedTuple):
     etm_msg: 'ETMMsg'
     old_msg_id: Optional['OldMsgID'] = None
     on_complete: Optional[Callable[[], None]] = None
+
+
+class TopicRecoveryQueueContext(NamedTuple):
+    """Durable data required to reconcile one copied topic message."""
+    scan_id: int
+    source_chat_id: int
+    source_message_id: int
+    target_chat_id: int
+    slave_chat_id: str
+    text: str
+    idempotency_key: str
 
 
 if TYPE_CHECKING:
@@ -652,6 +664,9 @@ class TelegramBotManager(LocaleMixin):
             aux_bot.bind_runtime(self._runtime)
         self._shutdown_complete_event.clear()
         await self.channel.mtproto.connect()
+        chat_binding = getattr(self.channel, "chat_binding", None)
+        if chat_binding is not None:
+            chat_binding.resume_pending_topic_recoveries()
 
 
     async def _post_shutdown(self, application: Application):
@@ -1064,10 +1079,17 @@ class TelegramBotManager(LocaleMixin):
 
     # Queue rows remain durable only until the scheduler commits their deletion.
     def _queue_operation(self, operation: str) -> Callable[..., object]:
+        if operation == "send_mtproto_media":
+            return self._queued_mtproto_media_operation
         method = getattr(self._bot, operation, None)
         if not callable(method):
             raise QueueEnqueueError(f"Telegram bot has no queued operation {operation!r}.")
         return cast(Callable[..., object], method)
+
+    @staticmethod
+    def _queued_mtproto_media_operation(chat_id: int, descriptor: MTProtoMediaDescriptor) -> None:
+        """Provide the queue with the concrete signature of its MTProto-only operation."""
+        del chat_id, descriptor
 
     def _enqueue_requests(
         self,
@@ -1182,6 +1204,27 @@ class TelegramBotManager(LocaleMixin):
             ) from error
         return self._make_send_receipt(result, task_id=row_id)
 
+    def enqueue_mtproto_media(
+        self,
+        *,
+        chat_id: int,
+        descriptor: MTProtoMediaDescriptor,
+        slave_id: str,
+        db_log_context: QueuedDbLogContext,
+    ) -> SendReceipt:
+        """Persist an oversized media transfer before the MTProto request is submitted."""
+        if not isinstance(descriptor, MTProtoMediaDescriptor):
+            raise QueueEnqueueError("MTProto media requires a durable media descriptor.")
+        _row_id, waiter = self._enqueue_requests([
+            QueueRequest(
+                "send_mtproto_media", (chat_id, descriptor),
+                {"_send_mode": "eventual", "_slave_id": slave_id, "_required_sender_bot_id": "__main__"},
+            )
+        ], db_log_context=db_log_context)
+        return self._make_send_receipt(
+            self._create_queued_message_placeholder(chat_id, _row_id), queued=True, task_id=_row_id
+        )
+
     def enqueue_history_operation(
         self,
         *,
@@ -1191,12 +1234,15 @@ class TelegramBotManager(LocaleMixin):
         args: tuple,
         kwargs: Mapping[str, object],
         history_entry_ids: Collection[int],
+        log_context: Optional[bytes] = None,
     ) -> Future:
         del target_chat_id, history_entry_ids
         request_kwargs = dict(kwargs)
         request_kwargs["_slave_id"] = f"history:{source_key}"
         request_kwargs["_send_mode"] = "eventual"
-        _row_id, waiter = self._enqueue_requests([QueueRequest(operation, args, request_kwargs)])
+        _row_id, waiter = self._enqueue_requests([
+            QueueRequest(operation, args, request_kwargs, log_context=log_context)
+        ])
         return waiter
 
     def _enqueue_blocking_api_operation(
@@ -1335,6 +1381,21 @@ class TelegramBotManager(LocaleMixin):
         return (content, False) if isinstance(content, str) else (None, False)
 
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
+        if row.operation == "send_mtproto_media":
+            if selection.sender_bot_id is not None:
+                raise QueueEnqueueError("MTProto media must use the main bot session.")
+            if len(args) != 2 or not isinstance(args[1], MTProtoMediaDescriptor):
+                raise QueueEnqueueError("Queued MTProto media payload is invalid.")
+            chat_id, descriptor = args
+            if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+                raise QueueEnqueueError("Queued MTProto media chat_id is invalid.")
+            receipt = self._runtime.call(self.channel.mtproto.send_media_descriptor(chat_id, descriptor))
+            media = SimpleNamespace(file_id=None, file_unique_id=None, mime_type=descriptor.mime_type)
+            media_value = [media] if descriptor.media_name == "photo" else media
+            return SimpleNamespace(
+                chat=SimpleNamespace(id=receipt.chat_id), chat_id=receipt.chat_id,
+                message_id=receipt.message_id, **{descriptor.media_name: media_value},
+            )
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
         telegram_kwargs = self._strip_private_queue_metadata(kwargs)
@@ -1423,6 +1484,25 @@ class TelegramBotManager(LocaleMixin):
         return cast('ETMMsg', value[0]), cast(Optional['OldMsgID'], value[1])
 
     @staticmethod
+    def encode_topic_recovery_log_context(context: TopicRecoveryQueueContext) -> bytes:
+        try:
+            return b"\x02" + pickle.dumps(context, protocol=5)
+        except Exception as error:
+            raise QueueEnqueueError("Unable to serialize topic recovery queue context.") from error
+
+    @staticmethod
+    def _decode_topic_recovery_log_context(payload: object) -> TopicRecoveryQueueContext:
+        if not isinstance(payload, bytes) or not payload or payload[0] != 2:
+            raise QueuePersistenceError("Topic recovery queue context has an unknown version.")
+        try:
+            value = pickle.loads(payload[1:])
+        except Exception as error:
+            raise QueuePersistenceError("Topic recovery queue context cannot be decoded.") from error
+        if not isinstance(value, TopicRecoveryQueueContext):
+            raise QueuePersistenceError("Topic recovery queue context has an invalid shape.")
+        return value
+
+    @staticmethod
     def encode_queued_completion_receipt(result: object, selection: SenderSelection) -> bytes:
         try:
             return b"\x01" + pickle.dumps((result, selection.sender_bot_id), protocol=5)
@@ -1486,9 +1566,22 @@ class TelegramBotManager(LocaleMixin):
         """Write a persisted eventual-send receipt to the application database once."""
         if row.log_context is None or row.completion_receipt is None:
             return False
-        etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
         real_tg_msg, sender_bot_id = self._decode_queued_completion_receipt(row.completion_receipt)
         try:
+            if row.log_context[0] == 2:
+                context = self._decode_topic_recovery_log_context(row.log_context)
+                target_message_id = getattr(real_tg_msg, "message_id", None)
+                if not isinstance(target_message_id, int) or isinstance(target_message_id, bool):
+                    target_message_id = None
+                self.channel.db.reconcile_topic_recovery_delivery(
+                    scan_id=context.scan_id, source_chat_id=context.source_chat_id,
+                    source_message_id=context.source_message_id, target_chat_id=context.target_chat_id,
+                    target_message_id=target_message_id, slave_chat_id=context.slave_chat_id,
+                    text=context.text, idempotency_key=context.idempotency_key,
+                    delivery_queue_id=row.queue_id,
+                )
+                return True
+            etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
             etm_msg.type_telegram = get_msg_type(real_tg_msg)
             etm_msg.put_telegram_file(real_tg_msg)
             self.channel.db.add_or_update_message_log(

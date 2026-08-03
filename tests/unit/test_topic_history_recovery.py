@@ -1,6 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from efb_telegram_master.bot_manager import TelegramBotManager, TopicRecoveryQueueContext
+from efb_telegram_master.chat_binding import ChatBindingManager
+from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest, SenderSelection, SenderSelectionResult
 from efb_telegram_master.topic_history_recovery import TopicHistoryRecovery, TopicRecoveryRequest
 
 
@@ -15,7 +19,7 @@ def test_topic_recovery_models_create_required_durable_columns():
         entry_columns = {column.name for column in database.get_columns("topicrecoveryentry")}
 
     assert {"scan_boundary", "cursor", "status", "error"}.issubset(scan_columns)
-    assert {"classification", "target_message_id", "idempotency_key"}.issubset(entry_columns)
+    assert {"classification", "target_message_id", "idempotency_key", "delivery_queue_id"}.issubset(entry_columns)
 
 
 class FakeDatabase:
@@ -82,6 +86,101 @@ def test_recovery_requests_ascending_batches_and_records_target_receipts():
     assert len(database.msglog_receipts) == 205
 
 
+def test_recovery_copy_uses_a_versioned_durable_completion_context():
+    database = FakeDatabase()
+    database.scan.scan_boundary = 1
+    bot = SimpleNamespace(enqueue_history_operation=Mock(
+        return_value=SimpleNamespace(result=lambda: SimpleNamespace(message_id=900))
+    ))
+
+    TopicHistoryRecovery(database, bot, FakeMTProto()).recover(
+        TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 1)
+    )
+
+    context = TelegramBotManager._decode_topic_recovery_log_context(
+        bot.enqueue_history_operation.call_args.kwargs["log_context"]
+    )
+    assert context == (1, 10, 1, 20, "tests.mocks.slave.chat", "", "1:1")
+
+
+def test_recovery_receipt_reconciles_after_restart_without_copying_twice(tmp_path):
+    database = SimpleNamespace(attempts=0, entries=[], msglogs=[])
+
+    def reconcile_topic_recovery_delivery(**kwargs):
+        database.attempts += 1
+        if database.attempts == 1:
+            raise RuntimeError("application database unavailable")
+        database.entries.append(kwargs["delivery_queue_id"])
+        database.msglogs.append((kwargs["source_message_id"], kwargs["target_message_id"]))
+
+    database.reconcile_topic_recovery_delivery = reconcile_topic_recovery_delivery
+    manager = object.__new__(TelegramBotManager)
+    manager.channel = SimpleNamespace(db=database)
+    manager.logger = Mock()
+
+    class Adapter:
+        def __init__(self):
+            self.calls = []
+
+        def select_sender(self, row, now):
+            return SenderSelectionResult(selection=SenderSelection(object(), None))
+
+        def acquire_sender_limits(self, selection, telegram_chat_id):
+            return True
+
+        def execute_queued_call(self, row, args, kwargs, selection):
+            self.calls.append(row.id)
+            return SimpleNamespace(message_id=900)
+
+        def encode_queued_completion_receipt(self, result, selection):
+            return TelegramBotManager.encode_queued_completion_receipt(result, selection)
+
+        def reconcile_queued_delivery(self, row):
+            return TelegramBotManager.reconcile_queued_delivery(manager, row)
+
+        def record_queued_success(self, row, result, selection):
+            return None
+
+        def record_queued_failure(self, row, error, selection):
+            raise AssertionError(error)
+
+    context = TelegramBotManager.encode_topic_recovery_log_context(
+        TopicRecoveryQueueContext(1, 10, 1, 20, "tests.mocks.slave.chat", "text", "1:1")
+    )
+
+    def copy_message(*, chat_id, from_chat_id, message_id, message_thread_id):
+        return None
+
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = queue.enqueue_many(
+        [QueueRequest("copy_message", (), {
+            "chat_id": 20, "from_chat_id": 10, "message_id": 1, "message_thread_id": 8,
+        }, log_context=context)],
+        lambda _operation: copy_message,
+    )
+    first_adapter = Adapter()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, first_adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    assert first_adapter.calls == [row_id]
+    assert [row.id for row in queue.sent_pending()] == [row_id]
+    queue.close()
+
+    restarted = OutboundQueue(tmp_path)
+    second_adapter = Adapter()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        OutboundQueueScheduler(restarted, second_adapter, executor, worker_count=1).dispatch_once()
+
+    assert second_adapter.calls == []
+    assert len(database.entries) == 1
+    assert database.msglogs == [(1, 900)]
+    assert database.attempts == 2
+    assert restarted.sent_pending() == []
+
+
 def test_recovery_rejects_non_topic_deleted_service_protected_and_cross_topic_messages():
     database = FakeDatabase()
     database.scan.scan_boundary = 5
@@ -124,6 +223,32 @@ def test_recovery_resumes_without_repeating_accepted_transfers():
     TopicHistoryRecovery(database, bot, mtproto).recover(
         TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 2)
     )
+
+    assert mtproto.calls == [(10, [2])]
+    bot.enqueue_history_operation.assert_not_called()
+
+
+def test_startup_resumes_partial_scan_from_cursor_without_duplicate_transfer():
+    database = FakeDatabase()
+    database.scan.cursor = 1
+    database.scan.scan_boundary = 2
+    database.scan.source_chat_id = "10"
+    database.scan.source_thread_id = "7"
+    database.scan.target_chat_id = "20"
+    database.scan.target_thread_id = "8"
+    database.scan.slave_chat_id = "tests.mocks.slave.chat"
+    database.entries[(1, 2)] = SimpleNamespace(status="accepted")
+    mtproto = FakeMTProto()
+    bot = SimpleNamespace(enqueue_history_operation=Mock())
+    binding = SimpleNamespace(db=database, logger=Mock())
+
+    def recover_topic_history(**kwargs):
+        TopicHistoryRecovery(database, bot, mtproto).recover(TopicRecoveryRequest(**kwargs))
+
+    binding.recover_topic_history = recover_topic_history
+    database.get_incomplete_topic_recovery_scans = Mock(return_value=[database.scan])
+
+    ChatBindingManager.resume_pending_topic_recoveries(binding)
 
     assert mtproto.calls == [(10, [2])]
     bot.enqueue_history_operation.assert_not_called()

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from .db import DatabaseManager
+from .bot_manager import TelegramBotManager, TopicRecoveryQueueContext
 from .mtproto import MTProtoRetryableError
 from .utils import EFBChannelChatIDStr
 
@@ -75,7 +76,6 @@ class TopicHistoryRecovery:
                 target_message_id=existing.target_message_id,
             )
             return
-
         classification = self._classify(message, request.source_thread_id)
         if classification != "accepted":
             self.db.save_topic_recovery_entry(
@@ -97,6 +97,14 @@ class TopicHistoryRecovery:
             status="prepared", idempotency_key=key,
         )
         try:
+            context = TelegramBotManager.encode_topic_recovery_log_context(
+                TopicRecoveryQueueContext(
+                    scan_id=scan.id, source_chat_id=request.source_chat_id,
+                    source_message_id=message_id, target_chat_id=request.target_chat_id,
+                    slave_chat_id=str(request.slave_chat_id),
+                    text=str(getattr(message, "message", "") or ""), idempotency_key=key,
+                )
+            )
             waiter = self.bot.enqueue_history_operation(
                 source_key=str(request.slave_chat_id), target_chat_id=request.target_chat_id,
                 operation="copy_message", args=(),
@@ -108,6 +116,7 @@ class TopicHistoryRecovery:
                     "disable_notification": True,
                 },
                 history_entry_ids=[],
+                log_context=context,
             )
             receipt = waiter.result()
             target_message_id = self._receipt_message_id(receipt)
@@ -118,15 +127,17 @@ class TopicHistoryRecovery:
                 idempotency_key=key, error=str(error),
             )
             raise
-        self.db.save_topic_recovery_entry(
-            scan_id=scan.id, source_message_id=message_id, classification="accepted",
-            status="delivered", idempotency_key=key, target_message_id=target_message_id,
-        )
-        self._record_msglog(request, message_id, message, target_message_id)
-        self.db.save_topic_recovery_entry(
-            scan_id=scan.id, source_message_id=message_id, classification="accepted",
-            status="accepted", idempotency_key=key, target_message_id=target_message_id,
-        )
+        existing = self.db.get_topic_recovery_entry(scan.id, message_id)
+        if existing is None or existing.status != "accepted":
+            self.db.save_topic_recovery_entry(
+                scan_id=scan.id, source_message_id=message_id, classification="accepted",
+                status="delivered", idempotency_key=key, target_message_id=target_message_id,
+            )
+            self._record_msglog(request, message_id, message, target_message_id)
+            self.db.save_topic_recovery_entry(
+                scan_id=scan.id, source_message_id=message_id, classification="accepted",
+                status="accepted", idempotency_key=key, target_message_id=target_message_id,
+            )
 
     def _record_msglog(
         self, request: TopicRecoveryRequest, message_id: int, message: object,

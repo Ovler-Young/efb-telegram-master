@@ -17,6 +17,7 @@ from telegram import (
     PhotoSize,
 )
 
+from efb_telegram_master.mtproto import MTProtoMediaDescriptor
 from efb_telegram_master.outbound import (
     InvalidQueuedPayloadError,
     OutboundQueue,
@@ -37,8 +38,16 @@ def edit_message_text(chat_id, message_id, text):
     return (chat_id, message_id, text)
 
 
+def mtproto_media_operation(chat_id, descriptor):
+    return chat_id, descriptor
+
+
 def operation(name):
-    return {"send_message": send_message, "edit_message_text": edit_message_text}[name]
+    return {
+        "send_message": send_message,
+        "edit_message_text": edit_message_text,
+        "send_mtproto_media": mtproto_media_operation,
+    }[name]
 
 
 def media_operation(chat_id, media=None, **kwargs):
@@ -69,6 +78,70 @@ def test_queue_schema_wal_and_restart_retention(tmp_path):
     restarted.delete(row_id)
     restarted.close()
     assert OutboundQueue(tmp_path).heads() == []
+
+
+def test_mtproto_media_descriptor_survives_queue_restart_without_file_buffering(tmp_path):
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"streamed-data")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="caption", reply_to=9,
+            force_document=True, supports_streaming=False, silent=False,
+            media_name="document", mime_type="application/octet-stream",
+        )
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest(
+        "send_mtproto_media", (123, descriptor),
+        {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+    ))
+    queue.close()
+
+    restarted = OutboundQueue(tmp_path)
+    row = restarted.heads()[0]
+    assert row.id == row_id
+    _chat_id, restored = restarted.decode_payload(row.payload)[0]
+    assert restored == descriptor
+    with restored.open() as stream:
+        assert stream.read(1) == b"s"
+
+
+def test_queue_migrates_operation_constraint_for_durable_mtproto_media(tmp_path):
+    connection = sqlite3.connect(tmp_path / OutboundQueue.filename)
+    connection.execute(
+        "CREATE TABLE outbound_queue ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, queue_id TEXT UNIQUE, "
+        "priority INTEGER NOT NULL CHECK (priority IN (0, 1)), "
+        "telegram_chat_id INTEGER NOT NULL, "
+        "operation TEXT NOT NULL CHECK (operation IN ('send_message')), "
+        "payload BLOB NOT NULL, slave_id TEXT NULL, required_sender_bot_id TEXT NULL, "
+        "created_at REAL NOT NULL, log_context BLOB NULL, "
+        "delivery_state TEXT NOT NULL DEFAULT 'queued', completion_receipt BLOB NULL)"
+    )
+    connection.execute(
+        "INSERT INTO outbound_queue "
+        "(queue_id, priority, telegram_chat_id, operation, payload, created_at) "
+        "VALUES ('legacy', 0, 1, 'send_message', X'01', 1)"
+    )
+    connection.commit()
+    connection.close()
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"streamed-data")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="", reply_to=None,
+            force_document=True, supports_streaming=False, silent=False,
+            media_name="document", mime_type=None,
+        )
+
+    queue = OutboundQueue(tmp_path)
+    enqueue(queue, QueueRequest(
+        "send_mtproto_media", (123, descriptor),
+        {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+    ))
+
+    assert "send_mtproto_media" in queue.connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbound_queue'"
+    ).fetchone()[0]
 
 
 def test_queue_migrates_legacy_rows_before_creating_queue_id_index(tmp_path):
@@ -891,6 +964,38 @@ def test_sent_pending_rows_survive_restart_without_telegram_resend(tmp_path):
     assert restarted.sent_pending() == []
     assert second_adapter.calls == []
     second_executor.shutdown()
+
+
+def test_sent_pending_row_blocks_later_destination_row_until_reconciled(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    first_id, _waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "first"}, log_context=b"\x01context",
+    ))
+    second_id, _waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "second"}, log_context=b"\x01context",
+    ))
+    adapter = DurableAdapter(reconcile=False)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        scheduler.in_flight[first_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+        assert [row.id for row in queue.sent_pending()] == [first_id]
+        scheduler.dispatch_once()
+        assert second_id not in scheduler.in_flight
+        assert adapter.calls == [(first_id, 7, "send_message")]
+
+        adapter.reconcile = True
+        assert scheduler.reconcile_sent_pending() == {first_id}
+        scheduler.dispatch_once()
+        scheduler.in_flight[second_id].future.result(timeout=1)
+
+    assert adapter.calls == [
+        (first_id, 7, "send_message"),
+        (second_id, 7, "send_message"),
+    ]
 
 
 def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(tmp_path):

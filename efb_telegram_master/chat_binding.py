@@ -1509,6 +1509,19 @@ class ChatBindingManager(LocaleMixin):
         except Exception as e:
             self.logger.warning("Failed to check pending history migrations: %s", e)
 
+    def resume_pending_topic_recoveries(self) -> None:
+        try:
+            scans = self.db.get_incomplete_topic_recovery_scans()
+        except Exception as error:
+            self.logger.warning("Failed to load incomplete topic recoveries: %s", error)
+            return
+        for scan in scans:
+            self.recover_topic_history(
+                source_chat_id=int(scan.source_chat_id), source_thread_id=int(scan.source_thread_id),
+                target_chat_id=int(scan.target_chat_id), target_thread_id=int(scan.target_thread_id),
+                slave_chat_id=EFBChannelChatIDStr(scan.slave_chat_id), scan_boundary=scan.scan_boundary,
+            )
+
     def _start_history_migration_worker(self):
         existing_thread = self._history_migration_thread
         if existing_thread is not None and existing_thread.is_alive():

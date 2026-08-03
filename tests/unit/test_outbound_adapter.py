@@ -30,7 +30,7 @@ def _manager_with_adapter_stubs():
         "delete_message", "edit_message_reply_markup",
         "send_location", "send_venue", "create_forum_topic", "edit_forum_topic",
         "reopen_forum_topic", "set_chat_title", "set_chat_photo", "pin_chat_message",
-        "set_chat_description",
+        "set_chat_description", "send_mtproto_media",
     }),
 )
 def test_closed_operations_enqueue_through_the_public_adapter(operation):

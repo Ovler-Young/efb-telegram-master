@@ -24,6 +24,8 @@ from telegram import (
 )
 from telegram.error import RetryAfter
 
+from .mtproto import MTProtoMediaDescriptor
+
 
 @dataclass(frozen=True)
 class _DirectMediaArgument:
@@ -41,6 +43,7 @@ QUEUED_OPERATIONS = frozenset({
     "send_location", "send_venue", "create_forum_topic", "edit_forum_topic",
     "reopen_forum_topic", "set_chat_title", "set_chat_photo", "pin_chat_message",
     "set_chat_description",
+    "send_mtproto_media",
 })
 REQUIRED_SENDER_OPERATIONS = frozenset({
     "edit_message_text", "edit_message_caption", "edit_message_media", "delete_message",
@@ -355,6 +358,36 @@ class OutboundQueue:
             )
         if "completion_receipt" not in columns:
             connection.execute("ALTER TABLE outbound_queue ADD COLUMN completion_receipt BLOB NULL")
+        schema_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbound_queue'"
+        ).fetchone()
+        schema = "" if schema_row is None or schema_row[0] is None else str(schema_row[0])
+        if "send_mtproto_media" not in schema:
+            operations = ", ".join(repr(name) for name in sorted(QUEUED_OPERATIONS))
+            connection.execute("ALTER TABLE outbound_queue RENAME TO outbound_queue_legacy")
+            connection.execute(
+                "CREATE TABLE outbound_queue ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "queue_id TEXT UNIQUE, "
+                "priority INTEGER NOT NULL CHECK (priority IN (0, 1)), "
+                "telegram_chat_id INTEGER NOT NULL, "
+                f"operation TEXT NOT NULL CHECK (operation IN ({operations})), "
+                "payload BLOB NOT NULL, slave_id TEXT NULL, "
+                "required_sender_bot_id TEXT NULL, created_at REAL NOT NULL, "
+                "log_context BLOB NULL, "
+                "delivery_state TEXT NOT NULL DEFAULT 'queued' "
+                "CHECK (delivery_state IN ('queued', 'sent_pending')), "
+                "completion_receipt BLOB NULL)"
+            )
+            connection.execute(
+                "INSERT INTO outbound_queue "
+                "(id, queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
+                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt) "
+                "SELECT id, queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
+                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
+                "FROM outbound_queue_legacy"
+            )
+            connection.execute("DROP TABLE outbound_queue_legacy")
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS outbound_queue_queue_id ON outbound_queue (queue_id)"
         )
@@ -653,6 +686,16 @@ class OutboundQueue:
         )
         telegram_kwargs = self._normalize_thumbnail(request.operation, telegram_kwargs)
         telegram_kwargs = self._normalize_keyword_media(request.operation, telegram_kwargs)
+        if request.operation == "send_mtproto_media":
+            if len(telegram_args) != 2 or telegram_kwargs:
+                raise QueueEnqueueError("MTProto media requests require chat_id and a media descriptor.")
+            descriptor = telegram_args[1]
+            if not isinstance(descriptor, MTProtoMediaDescriptor):
+                raise QueueEnqueueError("MTProto media requests require a media descriptor.")
+            try:
+                descriptor.validate()
+            except ValueError as error:
+                raise QueueEnqueueError(str(error)) from error
         chat_id = self._destination(operation, telegram_args, telegram_kwargs)
         payload = self.encode_payload(telegram_args, telegram_kwargs)
         if request.log_context is not None and not isinstance(request.log_context, bytes):
@@ -710,13 +753,17 @@ class OutboundQueue:
 
     def heads(self) -> list[QueuedCall]:
         with self._lock:
-            # The current bounded queue is read in sort order so Python can
-            # preserve priority/FIFO semantics while selecting one row per destination.
+            # A prior durable completion must reconcile before later calls to
+            # the same destination are eligible for dispatch.
             rows = self.connection.execute(
                 "SELECT id, queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
                 "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
-                "FROM outbound_queue WHERE delivery_state = 'queued' "
-                "ORDER BY telegram_chat_id ASC, priority DESC, id ASC"
+                "FROM outbound_queue AS queued WHERE queued.delivery_state = 'queued' "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM outbound_queue AS earlier "
+                "WHERE earlier.telegram_chat_id = queued.telegram_chat_id "
+                "AND earlier.id < queued.id AND earlier.delivery_state = 'sent_pending'"
+                ") ORDER BY queued.telegram_chat_id ASC, queued.priority DESC, queued.id ASC"
             ).fetchall()
         heads: list[QueuedCall] = []
         destinations: set[int] = set()
