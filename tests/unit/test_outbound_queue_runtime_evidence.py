@@ -472,8 +472,8 @@ def _required_auxiliary(bot: object) -> SimpleNamespace:
 
 def _manager_with_required_auxiliary(auxiliary: SimpleNamespace) -> TelegramBotManager:
     manager = manager_adapter()
-    manager._queued_db_log_contexts = {}
-    manager._queued_db_log_context_lock = threading.Lock()
+    manager._queued_blocking_log_contexts = {}
+    manager._queued_log_context_lock = threading.Lock()
     manager.bot_pool = BotPool([auxiliary], manager)
     return manager
 
@@ -517,8 +517,8 @@ def test_blocking_media_retry_preserves_database_context_until_real_manager_succ
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
     manager = manager_adapter()
-    manager._queued_db_log_contexts = {}
-    manager._queued_db_log_context_lock = threading.Lock()
+    manager._queued_blocking_log_contexts = {}
+    manager._queued_log_context_lock = threading.Lock()
     manager._write_database_update = Mock()
     completed = Mock()
     row_id, waiter = retained_queue.enqueue_many(
@@ -528,7 +528,7 @@ def test_blocking_media_retry_preserves_database_context_until_real_manager_succ
         )],
         lambda _operation: edit_message_media,
     )
-    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    manager._queued_blocking_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
 
@@ -536,7 +536,7 @@ def test_blocking_media_retry_preserves_database_context_until_real_manager_succ
     executor.submissions[0][2].set_exception(RetryAfter(121))
     scheduler.harvest_completed()
 
-    assert manager._queued_db_log_contexts.keys() == {row_id}
+    assert manager._queued_blocking_log_contexts.keys() == {row_id}
     completed.assert_not_called()
     assert manager._bot_chat_disabled_until == {(None, 67): 221.0}
     clock.update(monotonic=221.0, wall=1121.0)
@@ -546,7 +546,7 @@ def test_blocking_media_retry_preserves_database_context_until_real_manager_succ
     scheduler.harvest_completed()
 
     assert waiter.result() is result
-    assert manager._queued_db_log_contexts == {}
+    assert manager._queued_blocking_log_contexts == {}
     manager._write_database_update.assert_called_once()
     completed.assert_not_called()
 
@@ -569,14 +569,14 @@ def test_blocking_media_retry_terminal_paths_finish_real_manager_database_contex
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
     manager = manager_adapter()
-    manager._queued_db_log_contexts = {}
-    manager._queued_db_log_context_lock = threading.Lock()
+    manager._queued_blocking_log_contexts = {}
+    manager._queued_log_context_lock = threading.Lock()
     manager._write_database_update = Mock()
     completed = Mock()
     row_id, waiter = _enqueue_blocking_media_edit(
         retained_queue, io.BufferedReader(io.BytesIO(b"media")), "__main__"
     )
-    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    manager._queued_blocking_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
 
@@ -597,7 +597,7 @@ def test_blocking_media_retry_terminal_paths_finish_real_manager_database_contex
     with pytest.raises(expected_error):
         waiter.result()
     scheduler.stop_and_drain(timeout=0.0)
-    assert manager._queued_db_log_contexts == {}
+    assert manager._queued_blocking_log_contexts == {}
     completed.assert_called_once_with()
     manager._write_database_update.assert_not_called()
 
@@ -701,7 +701,7 @@ def test_blocking_media_retry_fails_when_required_auxiliary_changes(
     row_id, waiter = _enqueue_blocking_media_edit(
         retained_queue, io.BufferedReader(io.BytesIO(b"media")), "10"
     )
-    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    manager._queued_blocking_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
     scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
 
     scheduler.dispatch_once()
@@ -718,7 +718,7 @@ def test_blocking_media_retry_fails_when_required_auxiliary_changes(
         waiter.result()
     assert len(executor.submissions) == 1
     assert manager._bot is not auxiliary.bot
-    assert manager._queued_db_log_contexts == {}
+    assert manager._queued_blocking_log_contexts == {}
     completed.assert_called_once_with()
 
 

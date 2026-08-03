@@ -71,6 +71,31 @@ def test_queue_schema_wal_and_restart_retention(tmp_path):
     assert OutboundQueue(tmp_path).heads() == []
 
 
+def test_queue_migrates_legacy_rows_before_creating_queue_id_index(tmp_path):
+    path = tmp_path / OutboundQueue.filename
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE outbound_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, priority INTEGER NOT NULL, "
+        "telegram_chat_id INTEGER NOT NULL, operation TEXT NOT NULL, payload BLOB NOT NULL, "
+        "slave_id TEXT NULL, required_sender_bot_id TEXT NULL, created_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO outbound_queue (priority, telegram_chat_id, operation, payload, created_at) "
+        "VALUES (0, 9, 'send_message', X'01', 1)"
+    )
+    connection.commit()
+    connection.close()
+
+    queue = OutboundQueue(tmp_path)
+
+    row = queue.heads()[0]
+    assert row.queue_id == f"legacy-{row.id}"
+    assert row.delivery_state == "queued"
+    assert queue.connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'outbound_queue_queue_id'"
+    ).fetchone()
+
+
 def test_payload_version_round_trip_and_invalid_shapes(tmp_path):
     queue = OutboundQueue(tmp_path)
     payload = queue.encode_payload((1,), {"chat_id": 2, "value": {"x": 1}})
@@ -821,6 +846,51 @@ class Adapter:
 
     def record_queued_success(self, row, result, selection):
         return CompletionDecision("success")
+
+
+class DurableAdapter(Adapter):
+    def __init__(self, reconcile: bool) -> None:
+        super().__init__()
+        self.reconcile = reconcile
+        self.reconciled: list[int] = []
+
+    def encode_queued_completion_receipt(self, result, selection):
+        return f"receipt:{result}".encode()
+
+    def reconcile_queued_delivery(self, row):
+        self.reconciled.append(row.id)
+        return self.reconcile
+
+
+def test_sent_pending_rows_survive_restart_without_telegram_resend(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "durable"}, log_context=b"\x01context",
+    ))
+    first_adapter = DurableAdapter(reconcile=False)
+    first_executor = ThreadPoolExecutor(max_workers=1)
+    scheduler = OutboundQueueScheduler(queue, first_adapter, first_executor, worker_count=1)
+    scheduler.dispatch_once()
+    scheduler.in_flight[row_id].future.result(timeout=1)
+    scheduler.harvest_completed()
+
+    assert first_adapter.calls == [(row_id, 7, "send_message")]
+    assert [row.id for row in queue.sent_pending()] == [row_id]
+    scheduler.dispatch_once()
+    assert first_adapter.calls == [(row_id, 7, "send_message")]
+    queue.close()
+    first_executor.shutdown()
+
+    restarted = OutboundQueue(tmp_path)
+    second_adapter = DurableAdapter(reconcile=True)
+    second_executor = ThreadPoolExecutor(max_workers=1)
+    OutboundQueueScheduler(restarted, second_adapter, second_executor, worker_count=1).dispatch_once()
+
+    assert second_adapter.reconciled == [row_id]
+    assert restarted.heads() == []
+    assert restarted.sent_pending() == []
+    assert second_adapter.calls == []
+    second_executor.shutdown()
 
 
 def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(tmp_path):

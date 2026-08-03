@@ -148,6 +148,8 @@ class MsgLog(BaseModel):
     """Module ID of the message sent to."""
     sender_bot_id = TextField(null=True)
     """Telegram bot user ID that sent this message. NULL means the main bot."""
+    delivery_queue_id = TextField(null=True, unique=True)
+    """Durable outbound queue identifier associated with a delivered Telegram receipt."""
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
@@ -212,6 +214,43 @@ class MsgLog(BaseModel):
                         reactions[rk].append(chat_manager.get_chat_member(module_id, group_id, chat_id, build_dummy=True))  # type: ignore
                 msg.reactions = reactions
         return msg
+
+
+class TopicRecoveryScan(BaseModel):
+    """Durable cursor for a bounded MTProto forum-topic recovery."""
+    id = AutoField()
+    source_chat_id = TextField()
+    source_thread_id = TextField()
+    target_chat_id = TextField()
+    target_thread_id = TextField()
+    slave_chat_id = TextField()
+    scan_boundary = IntegerField()
+    cursor = IntegerField(default=0)
+    status = TextField(default="pending")
+    error = TextField(null=True)
+    updated_at = DateTimeField(default=datetime.datetime.now)
+
+    class Meta:
+        indexes = ((
+            ("source_chat_id", "source_thread_id", "target_chat_id", "target_thread_id"),
+            True,
+        ),)
+
+
+class TopicRecoveryEntry(BaseModel):
+    """One source message and its idempotent recovery outcome."""
+    id = AutoField()
+    scan_id = IntegerField(index=True)
+    source_message_id = IntegerField()
+    classification = TextField()
+    status = TextField(default="pending")
+    target_message_id = IntegerField(null=True)
+    error = TextField(null=True)
+    idempotency_key = TextField(unique=True)
+    updated_at = DateTimeField(default=datetime.datetime.now)
+
+    class Meta:
+        indexes = ((("scan_id", "source_message_id"), True),)
 
 
 class HistoryMigrationEntry(BaseModel):
@@ -340,6 +379,7 @@ class DatabaseManager:
         """
         database.create_tables([
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            TopicRecoveryScan, TopicRecoveryEntry,
         ])
 
     @staticmethod
@@ -347,6 +387,7 @@ class DatabaseManager:
         """Create tables introduced after the original schema without touching existing data."""
         database.create_tables([
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            TopicRecoveryScan, TopicRecoveryEntry,
         ], safe=True)
 
     @staticmethod
@@ -376,6 +417,7 @@ class DatabaseManager:
 
         models = [
             ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry,
+            TopicRecoveryScan, TopicRecoveryEntry,
         ]
         with sqlite_db.bind_ctx(models):
             chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
@@ -398,7 +440,7 @@ class DatabaseManager:
                 MsgLog.text, MsgLog.slave_origin_uid, MsgLog.slave_origin_display_name,
                 MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
                 MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
-                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id,
+                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id, MsgLog.delivery_queue_id,
                 MsgLog.time,
             ])
             if HistoryMigrationEntry.table_exists():
@@ -455,6 +497,10 @@ class DatabaseManager:
             self._migrate(3)
         elif "sender_bot_id" not in msg_log_columns:
             self._migrate(4)
+        elif "delivery_queue_id" not in msg_log_columns:
+            self._migrate(5)
+        elif "topicrecoveryscan" not in database.get_tables() or "topicrecoveryentry" not in database.get_tables():
+            self._migrate(6)
 
     def _migrate(self, i: int):
         """
@@ -498,6 +544,12 @@ class DatabaseManager:
             migrate(
                 migrator.add_column("msglog", "sender_bot_id", MsgLog.sender_bot_id)
             )
+        if i <= 5:
+            migrate(
+                migrator.add_column("msglog", "delivery_queue_id", MsgLog.delivery_queue_id)
+            )
+        if i <= 6:
+            database.create_tables([TopicRecoveryScan, TopicRecoveryEntry], safe=True)
 
     def _observe_legacy_outbound_rows(self) -> None:
         """Report retained workflow rows without loading or changing them."""
@@ -788,7 +840,8 @@ class DatabaseManager:
                                   msg: ETMMsg,
                                   master_message: Message,
                                   old_message_id: Optional[OldMsgID] = None,
-                                  sender_bot_id: Optional[str] = None):
+                                  sender_bot_id: Optional[str] = None,
+                                  delivery_queue_id: Optional[str] = None):
         """Add or update a message into the database."""
         sent_message_id = message_id_to_str(
             TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)
@@ -798,7 +851,9 @@ class DatabaseManager:
         self.logger.debug("[%s] Received message logging request of %s", master_msg_id, msg.uid)
 
         row: Optional[MsgLog] = None
-        if old_message_id is not None:
+        if delivery_queue_id is not None:
+            row = MsgLog.get_or_none(MsgLog.delivery_queue_id == delivery_queue_id)
+        if row is None and old_message_id is not None:
             old_message_id_str = message_id_to_str(*old_message_id)
             row = MsgLog.get_or_none(
                 (MsgLog.master_msg_id == old_message_id_str) |
@@ -836,6 +891,8 @@ class DatabaseManager:
         row.file_unique_id = msg.file_unique_id
         row.mime = msg.mime
         row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
+        if delivery_queue_id is not None:
+            row.delivery_queue_id = delivery_queue_id
         pickle_data = self.pickle_misc_msg(msg)
         row.pickle = pickle_data
 
@@ -1085,3 +1142,81 @@ class DatabaseManager:
             .where(HistoryMigrationEntry.id == entry_id)
             .execute()
         )
+
+    @observe_database_method("get_or_create_topic_recovery_scan")
+    def get_or_create_topic_recovery_scan(
+        self, *, source_chat_id: int, source_thread_id: int, target_chat_id: int,
+        target_thread_id: int, slave_chat_id: EFBChannelChatIDStr, scan_boundary: int,
+    ) -> TopicRecoveryScan:
+        scan, created = TopicRecoveryScan.get_or_create(
+            source_chat_id=str(source_chat_id), source_thread_id=str(source_thread_id),
+            target_chat_id=str(target_chat_id), target_thread_id=str(target_thread_id),
+            defaults={"slave_chat_id": str(slave_chat_id), "scan_boundary": scan_boundary},
+        )
+        if not created and scan.scan_boundary < scan_boundary:
+            scan.scan_boundary = scan_boundary
+            scan.updated_at = datetime.datetime.now()
+            scan.save()
+        return scan
+
+    @observe_database_method("get_topic_recovery_entry")
+    def get_topic_recovery_entry(self, scan_id: int, source_message_id: int) -> Optional[TopicRecoveryEntry]:
+        return TopicRecoveryEntry.get_or_none(
+            (TopicRecoveryEntry.scan_id == scan_id) &
+            (TopicRecoveryEntry.source_message_id == source_message_id)
+        )
+
+    @observe_database_method("save_topic_recovery_entry")
+    def save_topic_recovery_entry(
+        self, *, scan_id: int, source_message_id: int, classification: str,
+        status: str, idempotency_key: str, target_message_id: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> TopicRecoveryEntry:
+        entry, _created = TopicRecoveryEntry.get_or_create(
+            scan_id=scan_id, source_message_id=source_message_id,
+            defaults={"classification": classification, "status": status,
+                      "idempotency_key": idempotency_key},
+        )
+        entry.classification = classification
+        entry.status = status
+        entry.target_message_id = target_message_id
+        entry.error = error
+        entry.updated_at = datetime.datetime.now()
+        entry.save()
+        return entry
+
+    @observe_database_method("advance_topic_recovery_scan")
+    def advance_topic_recovery_scan(
+        self, scan: TopicRecoveryScan, cursor: int, *, status: str = "pending",
+        error: Optional[str] = None,
+    ) -> None:
+        scan.cursor = cursor
+        scan.status = status
+        scan.error = error
+        scan.updated_at = datetime.datetime.now()
+        scan.save()
+
+    @observe_database_method("add_topic_recovery_msg_log")
+    def add_topic_recovery_msg_log(
+        self, *, source_chat_id: int, source_message_id: int, target_chat_id: int,
+        target_message_id: Optional[int], slave_chat_id: EFBChannelChatIDStr, text: str,
+    ) -> None:
+        """Persist the source-to-target receipt used by later MsgLog reconciliation."""
+        source_id = f"{source_chat_id}.{source_message_id}"
+        target_id = (
+            f"{target_chat_id}.{target_message_id}" if target_message_id is not None else None
+        )
+        MsgLog.insert(
+            master_msg_id=source_id,
+            master_msg_id_alt=target_id,
+            slave_message_id=f"mtproto-recovery:{source_id}",
+            text=text,
+            slave_origin_uid=str(slave_chat_id),
+            slave_member_uid=str(slave_chat_id),
+            media_type="Text",
+            msg_type="Text",
+            sent_to=self.channel.channel_id,
+        ).on_conflict(
+            conflict_target=[MsgLog.master_msg_id],
+            update={MsgLog.master_msg_id_alt: target_id, MsgLog.text: text},
+        ).execute()

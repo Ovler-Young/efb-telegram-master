@@ -23,7 +23,17 @@ from efb_telegram_master.bot_manager import (
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
+from efb_telegram_master.mtproto import MTProtoFloodWaitError
 from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
+
+
+class DurableMessage:
+    def __init__(self) -> None:
+        self.type_telegram = None
+        self.receipt = None
+
+    def put_telegram_file(self, receipt) -> None:
+        self.receipt = receipt
 
 
 def _bind_blocking_enqueue_helper(manager):
@@ -733,8 +743,8 @@ def test_queued_success_writes_deferred_db_mapping_once():
     etm_msg = Mock()
     old_msg_id = Mock()
     on_complete = Mock()
-    manager._queued_db_log_contexts = {7: QueuedDbLogContext(etm_msg, old_msg_id, on_complete)}
-    manager._queued_db_log_context_lock = threading.Lock()
+    manager._queued_blocking_log_contexts = {7: QueuedDbLogContext(etm_msg, old_msg_id, on_complete)}
+    manager._queued_log_context_lock = threading.Lock()
     manager.bot_pool = None
     manager._write_database_update = Mock()
     row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
@@ -749,14 +759,14 @@ def test_queued_success_writes_deferred_db_mapping_once():
         sender_bot_id="10",
         on_complete=on_complete,
     )
-    assert manager._queued_db_log_contexts == {}
+    assert manager._queued_blocking_log_contexts == {}
 
 
 def test_enqueue_registers_deferred_mapping_before_waking_worker():
     manager = object.__new__(TelegramBotManager)
     db_context = QueuedDbLogContext(Mock(), None, Mock())
-    manager._queued_db_log_contexts = {}
-    manager._queued_db_log_context_lock = threading.Lock()
+    manager._queued_blocking_log_contexts = {}
+    manager._queued_log_context_lock = threading.Lock()
     wake_event = Mock()
     manager._outbound_scheduler = SimpleNamespace(
         _lock=threading.RLock(),
@@ -767,12 +777,12 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
     manager._queue_operation = Mock()
 
     def assert_context_registered() -> None:
-        assert manager._queued_db_log_contexts == {7: db_context}
+        assert manager._queued_blocking_log_contexts == {7: db_context}
 
     wake_event.set.side_effect = assert_context_registered
     row_id, _waiter = TelegramBotManager._enqueue_requests(
         manager,
-        [Mock()],
+        [QueueRequest("send_message", (), {"_send_mode": "blocking"})],
         db_log_context=db_context,
     )
 
@@ -783,8 +793,9 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
 def test_terminal_queued_failure_releases_deferred_mapping_callback():
     manager = object.__new__(TelegramBotManager)
     on_complete = Mock()
-    manager._queued_db_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
-    manager._queued_db_log_context_lock = threading.Lock()
+    manager._queued_blocking_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
+    manager._queued_completion_callbacks = {}
+    manager._queued_log_context_lock = threading.Lock()
     manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
     manager.bot_pool = None
@@ -799,7 +810,79 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
 
     assert decision.kind.name == "TERMINAL_FAILURE"
     on_complete.assert_called_once_with()
-    assert manager._queued_db_log_contexts == {}
+    assert manager._queued_blocking_log_contexts == {}
+
+
+def test_history_queue_operation_preserves_source_affinity():
+    manager = object.__new__(TelegramBotManager)
+    waiter = Mock()
+    manager._enqueue_requests = Mock(return_value=("11", waiter))
+
+    result = TelegramBotManager.enqueue_history_operation(
+        manager,
+        source_key="source.chat",
+        target_chat_id=123,
+        operation="send_message",
+        args=(),
+        kwargs={"chat_id": 123, "text": "history"},
+        history_entry_ids=[1],
+    )
+
+    request = manager._enqueue_requests.call_args.args[0][0]
+    assert request.kwargs["_slave_id"] == "history:source.chat"
+    assert request.kwargs["_send_mode"] == "eventual"
+    assert result is waiter
+
+
+def test_mtproto_flood_wait_uses_eventual_durable_retry(monkeypatch: pytest.MonkeyPatch):
+    manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_state_lock = threading.Lock()
+    manager._bot_chat_disabled_until = {}
+    manager._membership_failure_affinities = {}
+    manager.TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS = 60.0
+    manager.bot_pool = None
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 10.0)
+    row = SimpleNamespace(id=1, priority=0, telegram_chat_id=123, slave_id=None)
+
+    decision = TelegramBotManager.record_queued_failure(
+        manager, row, MTProtoFloodWaitError("wait", retry_after=17),
+        SimpleNamespace(sender_bot_id=None),
+    )
+
+    assert decision.kind.name == "RETRY_EVENTUAL"
+    assert decision.retry_at == 27.0
+
+
+def test_durable_reconciliation_keeps_receipt_when_application_db_fails(monkeypatch: pytest.MonkeyPatch):
+    manager = object.__new__(TelegramBotManager)
+    etm_msg = DurableMessage()
+    real_tg_msg = SimpleNamespace(chat_id=123, message_id=9)
+    manager.channel = SimpleNamespace(db=SimpleNamespace(add_or_update_message_log=Mock(
+        side_effect=RuntimeError("database unavailable")
+    )))
+    manager.logger = Mock()
+    manager._queued_completion_callbacks = {7: Mock()}
+    manager._queued_log_context_lock = threading.Lock()
+    monkeypatch.setattr("efb_telegram_master.bot_manager.get_msg_type", lambda _message: "text")
+    row = SimpleNamespace(
+        id=7,
+        queue_id="queue-7",
+        log_context=TelegramBotManager._encode_queued_log_context(
+            QueuedDbLogContext(etm_msg, None)
+        ),
+        completion_receipt=TelegramBotManager.encode_queued_completion_receipt(
+            real_tg_msg, SenderSelection(object(), "10")
+        ),
+    )
+
+    assert not TelegramBotManager.reconcile_queued_delivery(manager, row)
+    assert manager.channel.db.add_or_update_message_log.call_count == 1
+    assert 7 in manager._queued_completion_callbacks
+
+    manager.channel.db.add_or_update_message_log.side_effect = None
+    assert TelegramBotManager.reconcile_queued_delivery(manager, row)
+    assert manager.channel.db.add_or_update_message_log.call_count == 2
+    assert manager._queued_completion_callbacks == {}
 
 
 def test_cooldown_metrics_snapshot_blocks_mutation_until_iteration_is_safe(

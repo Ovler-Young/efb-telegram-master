@@ -29,12 +29,12 @@ from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 
 
-def test_msglog_schema_has_sender_bot_id(channel):
+def test_msglog_schema_has_durable_delivery_queue_id(channel):
     columns = {column.name for column in channel.db.database.get_columns("msglog")} if hasattr(channel.db, "database") else None
     if columns is None:
         from efb_telegram_master.db import database
         columns = {column.name for column in database.get_columns("msglog")}
-    assert "sender_bot_id" in columns
+    assert {"sender_bot_id", "delivery_queue_id"}.issubset(columns)
 
 
 def test_database_method_metrics_record_success_failure_and_bounded_labels(channel):

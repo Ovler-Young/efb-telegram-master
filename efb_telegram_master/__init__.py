@@ -42,6 +42,7 @@ from .commands import CommandsManager
 from .db import DatabaseManager
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
+from .mtproto import MTProtoClient, MTProtoConfig
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .rpc_utils import RPCUtilities
@@ -127,6 +128,7 @@ class TelegramChannel(MasterChannel):
         # Initialize managers
         self.flag: ExperimentalFlagsManager = ExperimentalFlagsManager(self)
         self.db: DatabaseManager = DatabaseManager(self)
+        self.mtproto = MTProtoClient(self.mtproto_config, self.config['token'], self.db._base_path)
         self.chat_manager: ChatObjectCacheManager = ChatObjectCacheManager(self)
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
         self.bot_manager: TelegramBotManager = TelegramBotManager(self)
@@ -187,6 +189,9 @@ class TelegramChannel(MasterChannel):
             # Verify configuration
             if not isinstance(data.get('token', None), str):
                 raise ValueError(self._('Telegram bot token must be a string'))
+            self.mtproto_config = MTProtoConfig.from_mapping(data.get('mtproto'))
+            if self.mtproto_config.enabled and not data['token']:
+                raise ValueError(self._('MTProto requires a non-empty Telegram bot token'))
             if isinstance(data.get('admins', None), int):
                 data['admins'] = [data['admins']]
             if isinstance(data.get('admins', None), str) and data['admins'].isdigit():
