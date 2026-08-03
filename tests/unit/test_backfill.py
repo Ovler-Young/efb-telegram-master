@@ -5,10 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
 import telegram
+import pytest
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
-from ehforwarderbot.types import ChatID
+from ehforwarderbot.types import ChatID, ModuleID
 
 from efb_telegram_master import utils
 from efb_telegram_master.bot_manager import TelegramBotManager
@@ -16,7 +17,7 @@ from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import OutboundQueue
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 from tests.integration.test_backfill_history import (
     _expected_relink_send_count,
     _migration_activity_completed,
@@ -53,6 +54,38 @@ def _sent_link_message(chat_id, message_id, sender_bot_id=None):
     sent_message.reply_text = Mock()
     sent_message.sender_bot_id = sender_bot_id
     return sent_message
+
+
+def _build_link_manager(storage_key, chat):
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.channel = SimpleNamespace(
+        channel_id=ModuleID("blueset.telegram"),
+        flag=Mock(return_value=True),
+        _=lambda message: message,
+    )
+    manager.db = SimpleNamespace(remove_topic_assoc=Mock())
+    manager.bot = SimpleNamespace(
+        send_message=Mock(return_value=_sent_link_message(-100500, 600)),
+        edit_message_text=Mock(),
+    )
+    manager.msg_storage[storage_key] = SimpleNamespace(chats=[chat], backfill_mode=None)
+    return manager
+
+
+def _build_start_update(token):
+    return Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1,
+                "text": f"/start {token}",
+                "chat": {"id": -100500, "type": "supergroup", "title": "Test Group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Tester"},
+            },
+        },
+        None,
+    )
 
 
 def test_backfill_queue_activity_requires_exact_success_without_failure_or_in_flight():
@@ -169,6 +202,52 @@ def test_history_backfill_enqueues_with_its_source_key(tmp_path):
     queue.close()
 
 
+@pytest.mark.parametrize("backfill_override", [None, "true"], ids=["automatic", "true"])
+def test_link_chat_backfill_passes_original_storage_key(backfill_override):
+    storage_key = (TelegramChatID(-100123), TelegramMessageID(458))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(
+        module_id=ModuleID("tests.mocks.slave"),
+        uid=ChatID("chat"),
+        linked=False,
+        full_name="Test chat",
+        link=Mock(),
+    )
+    manager = _build_link_manager(storage_key, chat)
+
+    with patch("efb_telegram_master.chat_binding.coordinator.get_module_by_id"), \
+         patch.object(manager, "migrate_chat_history") as migrate_chat_history, \
+         patch.object(manager, "send_history_link") as send_history_link:
+        args = [token] if backfill_override is None else [token, backfill_override]
+        manager.link_chat(_build_start_update(token), args)
+
+    migrate_chat_history.assert_called_once_with(
+        "tests.mocks.slave chat", -100500, None, storage_key
+    )
+    send_history_link.assert_not_called()
+
+
+def test_link_chat_false_skips_backfill_and_history_notice():
+    storage_key = (TelegramChatID(-100123), TelegramMessageID(459))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(
+        module_id=ModuleID("tests.mocks.slave"),
+        uid=ChatID("chat"),
+        linked=False,
+        full_name="Test chat",
+        link=Mock(),
+    )
+    manager = _build_link_manager(storage_key, chat)
+
+    with patch("efb_telegram_master.chat_binding.coordinator.get_module_by_id"), \
+         patch.object(manager, "migrate_chat_history") as migrate_chat_history, \
+         patch.object(manager, "send_history_link") as send_history_link:
+        manager.link_chat(_build_start_update(token), [token, "false"])
+
+    migrate_chat_history.assert_not_called()
+    send_history_link.assert_not_called()
+
+
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
@@ -250,7 +329,9 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
          patch.object(channel.chat_binding, "send_history_link") as send_history_link:
         channel.chat_binding.link_chat(update, [token, "true"])
 
-    migrate_chat_history.assert_called_once()
+    migrate_chat_history.assert_called_once_with(
+        utils.chat_id_to_str(chat=chat), bot_group, None, storage_key
+    )
     send_history_link.assert_not_called()
     _cleanup_link_state(channel, chat, bot_group)
 
@@ -362,6 +443,67 @@ def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channe
         "copy_message",
     ]
     assert HistoryMigrationEntry.select().count() == 0
+
+
+def test_empty_history_backfill_sends_history_link_with_original_storage_key():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager._history_migration_lock = threading.Lock()
+    manager.logger = Mock()
+    manager.db = SimpleNamespace(
+        get_recent_messages=Mock(return_value=[]),
+        replace_history_migration_entries=Mock(return_value=0),
+    )
+    manager.send_history_link = Mock()
+    storage_key = (TelegramChatID(-100123), TelegramMessageID(456))
+    thread_id = TelegramTopicID(789)
+
+    ChatBindingManager._queue_and_process_history_migration(
+        manager,
+        "tests.mocks.slave.chat",
+        12345,
+        thread_id,
+        storage_key,
+    )
+
+    manager.send_history_link.assert_called_once_with(
+        "tests.mocks.slave.chat", 12345, storage_key, thread_id
+    )
+
+
+def test_populated_history_backfill_processes_entries_without_history_link():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager._history_migration_lock = threading.Lock()
+    manager.logger = Mock()
+    msg_log = Mock(
+        text="history",
+        media_type="Text",
+        master_msg_id="10.20",
+        time=datetime.now(),
+    )
+    msg_log.build_etm_msg.return_value = SimpleNamespace(
+        author=SimpleNamespace(display_name="author")
+    )
+    manager.db = SimpleNamespace(
+        get_recent_messages=Mock(return_value=[msg_log]),
+        replace_history_migration_entries=Mock(return_value=1),
+    )
+    manager.chat_manager = Mock()
+    manager.send_history_link = Mock()
+    manager._process_pending_history_migrations_locked = Mock()
+    storage_key = (TelegramChatID(-100123), TelegramMessageID(457))
+
+    ChatBindingManager._queue_and_process_history_migration(
+        manager,
+        "tests.mocks.slave.chat",
+        12345,
+        None,
+        storage_key,
+    )
+
+    manager._process_pending_history_migrations_locked.assert_called_once()
+    manager.send_history_link.assert_not_called()
+    entries = manager.db.replace_history_migration_entries.call_args.args[3]
+    assert entries[0]["source_master_msg_id"] == "10.20"
 
 
 def test_queue_history_migration_entries_persists_pending_rows():
