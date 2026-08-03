@@ -1100,8 +1100,10 @@ class TelegramBotManager(LocaleMixin):
         kwargs: Mapping[str, object],
         history_entry_ids: Collection[int],
     ) -> Future:
-        del source_key, target_chat_id, history_entry_ids
+        """Queue one history entry and let its completion drive entry deletion."""
+        del target_chat_id, history_entry_ids
         request_kwargs = dict(kwargs)
+        request_kwargs["_slave_id"] = f"history:{source_key}"
         request_kwargs["_send_mode"] = "eventual"
         _row_id, waiter = self._enqueue_requests([QueueRequest(operation, args, request_kwargs)])
         return waiter

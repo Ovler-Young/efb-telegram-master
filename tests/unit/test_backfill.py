@@ -11,9 +11,11 @@ from efb_telegram_master import TelegramChannel
 from ehforwarderbot.types import ChatID
 
 from efb_telegram_master import utils
+from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
 from efb_telegram_master.etm_metrics import Metrics
+from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 from tests.integration.test_backfill_history import (
     _expected_relink_send_count,
@@ -138,6 +140,35 @@ def test_backfill_migration_terminal_requires_observed_activity_and_empty_target
     )
 
 
+def test_history_backfill_enqueues_with_its_source_key(tmp_path):
+    manager = object.__new__(TelegramBotManager)
+    queue = OutboundQueue(tmp_path)
+    manager._outbound_queue = queue
+    manager._outbound_scheduler = SimpleNamespace(
+        _lock=threading.RLock(),
+        stopping=False,
+        wake_event=threading.Event(),
+    )
+    manager._queue_operation = lambda _operation: lambda chat_id, text: (chat_id, text)
+
+    waiter = manager.enqueue_history_operation(
+        source_key="tests.mocks.slave.chat",
+        target_chat_id=12345,
+        operation="send_message",
+        args=(),
+        kwargs={"chat_id": 12345, "text": "history"},
+        history_entry_ids=[1],
+    )
+
+    queued = queue.heads()
+    assert manager._outbound_scheduler.wake_event.is_set()
+    assert not waiter.done()
+    assert len(queued) == 1
+    assert queued[0].telegram_chat_id == 12345
+    assert queued[0].slave_id == "history:tests.mocks.slave.chat"
+    queue.close()
+
+
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
@@ -220,6 +251,24 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
         channel.chat_binding.link_chat(update, [token, "true"])
 
     migrate_chat_history.assert_called_once()
+    send_history_link.assert_not_called()
+    _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_link_chat_false_override_does_not_start_history_backfill(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(107))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    update = _build_link_update(bot_group)
+
+    with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 507)), \
+         patch.object(channel.bot_manager, "edit_message_text"), \
+         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
+         patch.object(channel.chat_binding, "send_history_link") as send_history_link:
+        channel.chat_binding.link_chat(update, [token, "false"])
+
+    migrate_chat_history.assert_not_called()
     send_history_link.assert_not_called()
     _cleanup_link_state(channel, chat, bot_group)
 
