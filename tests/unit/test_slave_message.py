@@ -1,4 +1,5 @@
 from io import BytesIO
+import asyncio
 import threading
 import time
 import pytest
@@ -13,6 +14,7 @@ from ehforwarderbot import Message, Chat
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.chat import ChatMember
 from ehforwarderbot.types import MessageID, ReactionName
+from ehforwarderbot.exceptions import EFBMessageError
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_message import SlaveMessageProcessor
@@ -1012,3 +1014,53 @@ def test_all_oversize_branches_use_one_sync_quoted_reply(method_name, message_ty
     }
     placeholder.reply_text.assert_not_called()
     assert file.closed
+
+
+def test_mtproto_large_file_preserves_caption_topic_reply_and_receipt():
+    class LargeStream(BytesIO):
+        def tell(self):
+            if super().tell() == len(self.getvalue()):
+                return 100 * 1024 * 1024 + 1
+            return super().tell()
+
+    class MTProto:
+        enabled = True
+
+        def __init__(self):
+            self.kwargs = None
+
+        async def send_media_stream(self, *args, **kwargs):
+            self.kwargs = (args, kwargs)
+            return SimpleNamespace(chat_id=100, message_id=501)
+
+    processor = build_slave_message_processor()
+    processor.channel.mtproto = MTProto()
+    processor.bot._runtime = SimpleNamespace(call=lambda coroutine: asyncio.run(coroutine))
+    processor.bot._affix_queued_content = lambda content, prefix, suffix, _mode: f"{prefix}\n{content}\n{suffix}"
+    processor.html_substitutions = Mock(return_value="caption")
+    processor._cleanup_pending_local_api_files = Mock()
+    msg = SimpleNamespace(
+        type=MsgType.File, file=LargeStream(b"not-read-as-a-whole"), text="caption",
+        edit_media=False, commands=None,
+    )
+
+    assert processor._uses_mtproto_media(msg)
+    receipt = processor._send_mtproto_media(msg, 100, 77, "header", "footer", None, 42, None, True)
+
+    assert (receipt.chat.id, receipt.message_id) == (100, 501)
+    args, kwargs = processor.channel.mtproto.kwargs
+    assert args[:2] == (100, msg.file)
+    assert kwargs == {
+        "file_size": 100 * 1024 * 1024 + 1, "caption": "header\ncaption\nfooter",
+        "reply_to": 42, "force_document": True, "supports_streaming": False, "silent": True,
+    }
+    assert msg.file.closed
+
+
+def test_mtproto_large_media_rejects_bot_api_only_markup():
+    processor = build_slave_message_processor()
+    processor.channel.mtproto = SimpleNamespace(enabled=True)
+    msg = SimpleNamespace(type=MsgType.File, file=BytesIO(b"file"), text="", edit_media=False, commands=None)
+
+    with pytest.raises(EFBMessageError, match="reply markup"):
+        processor._send_mtproto_media(msg, 100, None, "", "", None, None, object(), False)

@@ -9,6 +9,7 @@ import tempfile
 import time
 import traceback
 import urllib.parse
+from types import SimpleNamespace
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,6 +27,7 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 
 from ehforwarderbot import Message, Status, coordinator
+from ehforwarderbot.exceptions import EFBMessageError
 from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.message import LinkAttribute, LocationAttribute, MessageCommand, Reactions, \
@@ -304,6 +306,19 @@ class SlaveMessageProcessor(LocaleMixin):
         if dedupe_key is not None:
             on_db_complete = lambda: self._release_pending_slave_message(dedupe_key)
 
+        if self._uses_mtproto_media(msg):
+            tg_msg = self._send_mtproto_media(
+                msg, tg_dest, thread_id, msg_template, reactions, old_msg_id,
+                target_msg_id, reply_markup, silent,
+            )
+            if tg_msg is None:
+                self._release_pending_slave_message(dedupe_key)
+                return
+            etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
+            self.bot.write_db_mapping(etm_msg, tg_msg, database_old_msg_id or old_msg_id,
+                                      on_complete=on_db_complete)
+            return
+
         # Type dispatching
         if msg.type == MsgType.Text:
             tg_msg = self.slave_message_text(msg, tg_dest, thread_id, msg_template, reactions, old_msg_id, target_msg_id,
@@ -521,6 +536,70 @@ class SlaveMessageProcessor(LocaleMixin):
                 db_on_complete,
             )
         return kwargs
+
+    @staticmethod
+    def _file_size(file: Optional[IO[bytes]]) -> Optional[int]:
+        if file is None or getattr(file, "closed", True):
+            return None
+        file.seek(0, 2)
+        size = file.tell()
+        file.seek(0)
+        return size
+
+    def _uses_mtproto_media(self, msg: Message) -> bool:
+        size = self._file_size(msg.file)
+        mtproto = getattr(self.channel, "mtproto", None)
+        return bool(
+            size is not None
+            and size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD
+            and getattr(mtproto, "enabled", False)
+        )
+
+    def _send_mtproto_media(self, msg: Message, tg_dest: TelegramChatID,
+                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
+                            old_msg_id: Optional[OldMsgID], target_msg_id: Optional[TelegramMessageID],
+                            reply_markup: Optional[ReplyMarkup], silent: bool) -> object:
+        if old_msg_id is not None or msg.edit_media:
+            raise EFBMessageError("MTProto oversized-media edits are not supported.")
+        if reply_markup is not None or msg.commands:
+            raise EFBMessageError("MTProto oversized media does not support Bot API reply markup or commands.")
+        options = {
+            MsgType.File: (True, False),
+            MsgType.Image: (False, False),
+            MsgType.Video: (False, True),
+            MsgType.Animation: (False, True),
+        }
+        if msg.type not in options:
+            raise EFBMessageError(f"MTProto oversized-media transfer does not support {msg.type.name}.")
+        file = msg.file
+        size = self._file_size(file)
+        if file is None or size is None:
+            raise EFBMessageError("MTProto oversized-media transfer requires a readable file.")
+        force_document, supports_streaming = options[msg.type]
+        caption = self.bot._affix_queued_content(self.html_substitutions(msg), msg_template, reactions, "HTML")
+        reply_to = target_msg_id or thread_id
+        try:
+            receipt = self.bot._runtime.call(
+                self.channel.mtproto.send_media_stream(
+                    int(tg_dest), file, file_size=size, caption=caption, reply_to=reply_to,
+                    force_document=force_document, supports_streaming=supports_streaming, silent=silent,
+                )
+            )
+        finally:
+            file.close()
+            self._cleanup_pending_local_api_files()
+        media = SimpleNamespace(file_id=None, file_unique_id=None, mime_type=getattr(msg, "mime", None))
+        media_name = {
+            MsgType.File: "document",
+            MsgType.Image: "photo",
+            MsgType.Video: "video",
+            MsgType.Animation: "animation",
+        }[msg.type]
+        media_value = [media] if media_name == "photo" else media
+        return SimpleNamespace(
+            chat=SimpleNamespace(id=receipt.chat_id), chat_id=receipt.chat_id,
+            message_id=receipt.message_id, **{media_name: media_value},
+        )
 
     @classmethod
     def _remote_image_url(cls, msg: Message) -> Optional[str]:
@@ -1590,10 +1669,12 @@ class SlaveMessageProcessor(LocaleMixin):
         """
         if not file or getattr(file, "closed", True):
             return None
-        file.seek(0, 2)
-        file_size = file.tell()
-        file.seek(0)
-        if not self.channel.flag("local_tdlib_api") and file_size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD:
+        file_size = self._file_size(file)
+        if file_size is None:
+            return None
+        if not getattr(getattr(self.channel, "mtproto", None), "enabled", False) \
+                and not self.channel.flag("local_tdlib_api") \
+                and file_size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD:
             size_str = humanize.naturalsize(file_size)
             max_size_str = humanize.naturalsize(telegram.constants.FileSizeLimit.FILESIZE_UPLOAD)
             return self._(

@@ -44,6 +44,7 @@ class ETMMsg(Message):
     __file = None
     __path = None
     __filename = None
+    _mtproto_media_ref: Optional[tuple[int, int]] = None
 
     def __init__(self, attributes: Optional[MessageAttribute] = None, author: Optional[ChatMember] = None,
                  chat: Optional[Chat] = None,
@@ -64,43 +65,54 @@ class ETMMsg(Message):
         if self.file_id:
             # noinspection PyUnresolvedReferences
             bot_manager = coordinator.master.bot_manager
+            file_meta = None
+            if self._mtproto_media_ref is None:
+                # Route get_file through the correct bot based on sender_bot_id.
+                file_bot = None
+                if self.sender_bot_id:
+                    bot_pool = getattr(bot_manager, 'bot_pool', None)
+                    if bot_pool:
+                        aux_bot = bot_pool.get_bot_by_id(self.sender_bot_id)
+                        if aux_bot and not aux_bot.disabled:
+                            file_bot = aux_bot.bot
 
-            # Route get_file through the correct bot based on sender_bot_id
-            file_bot = None
-            if self.sender_bot_id:
-                bot_pool = getattr(bot_manager, 'bot_pool', None)
-                if bot_pool:
-                    aux_bot = bot_pool.get_bot_by_id(self.sender_bot_id)
-                    if aux_bot and not aux_bot.disabled:
-                        file_bot = aux_bot.bot
-
-            try:
-                if file_bot:
-                    file_meta = file_bot.get_file(self.file_id)
-                else:
-                    file_meta = bot_manager.get_file(self.file_id)
-            except BadRequest as e:
-                if file_bot:
-                    logger.warning("Failed to get file from aux bot, trying main bot: %s", e)
-                    try:
+                try:
+                    if file_bot:
+                        file_meta = file_bot.get_file(self.file_id)
+                    else:
                         file_meta = bot_manager.get_file(self.file_id)
-                    except BadRequest as e2:
-                        logger.exception("Bad request from main bot too: %s", e2)
+                except BadRequest as e:
+                    if file_bot:
+                        logger.warning("Failed to get file from aux bot, trying main bot: %s", e)
+                        try:
+                            file_meta = bot_manager.get_file(self.file_id)
+                        except BadRequest as e2:
+                            logger.exception("Bad request from main bot too: %s", e2)
+                            return
+                    else:
+                        logger.exception("Bad request while trying to get file metadata: %s", e)
                         return
-                else:
-                    logger.exception("Bad request while trying to get file metadata: %s", e)
-                    return
-            if not self.mime:
+            if self._mtproto_media_ref is not None:
+                chat_id, message_id = self._mtproto_media_ref
+                ext = mimetypes.guess_extension(self.mime or "", strict=False) or ""
+                file = tempfile.NamedTemporaryFile(suffix=ext)
+                bot_manager._runtime.call(
+                    coordinator.master.mtproto.download_message_media(chat_id, message_id, file),
+                    timeout=FILE_DOWNLOAD_TIMEOUT,
+                )
+            else:
+                assert file_meta is not None
                 ext = os.path.splitext(file_meta.file_path)[1]
+                file = tempfile.NamedTemporaryFile(suffix=ext)
+                bot_manager._runtime.call(
+                    file_meta.download_to_memory(out=file),
+                    timeout=FILE_DOWNLOAD_TIMEOUT,
+                )
+            if not self.mime:
+                assert file_meta is not None
                 mime = mimetypes.guess_type(file_meta.file_path, strict=False)[0]
             else:
-                ext = mimetypes.guess_extension(self.mime, strict=False)
                 mime = self.mime
-            file = tempfile.NamedTemporaryFile(suffix=ext)
-            bot_manager._runtime.call(
-                file_meta.download_to_memory(out=file),
-                timeout=FILE_DOWNLOAD_TIMEOUT,
-            )
             file.seek(0)
 
             if not mime:
@@ -150,6 +162,10 @@ class ETMMsg(Message):
                 self.__path = out_file.name
 
         self.__initialized = True
+
+    def set_mtproto_media_ref(self, chat_id: int, message_id: int) -> None:
+        """Select the streaming MTProto download path for this Bot API update."""
+        self._mtproto_media_ref = (chat_id, message_id)
 
     def get_file(self) -> Optional[BinaryIO]:
         if not self.__initialized:
