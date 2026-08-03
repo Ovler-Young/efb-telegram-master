@@ -558,7 +558,7 @@ class SlaveMessageProcessor(LocaleMixin):
     def _send_mtproto_media(self, msg: Message, tg_dest: TelegramChatID,
                             thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
                             old_msg_id: Optional[OldMsgID], target_msg_id: Optional[TelegramMessageID],
-                            reply_markup: Optional[ReplyMarkup], silent: bool) -> object:
+                            reply_markup: Optional[ReplyMarkup], silent: bool) -> telegram.Message:
         if old_msg_id is not None or msg.edit_media:
             raise EFBMessageError("MTProto oversized-media edits are not supported.")
         if reply_markup is not None or msg.commands:
@@ -596,10 +596,10 @@ class SlaveMessageProcessor(LocaleMixin):
             MsgType.Animation: "animation",
         }[msg.type]
         media_value = [media] if media_name == "photo" else media
-        return SimpleNamespace(
+        return cast(telegram.Message, SimpleNamespace(
             chat=SimpleNamespace(id=receipt.chat_id), chat_id=receipt.chat_id,
             message_id=receipt.message_id, **{media_name: media_value},
-        )
+        ))
 
     @classmethod
     def _remote_image_url(cls, msg: Message) -> Optional[str]:

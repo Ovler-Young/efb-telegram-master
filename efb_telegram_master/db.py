@@ -297,6 +297,7 @@ class DatabaseManager:
     )
 
     def __init__(self, channel: 'TelegramChannel'):
+        self.channel: 'TelegramChannel' = channel
         self._metrics: Optional[DatabaseMetrics] = None
         base_path = utils.get_data_path(channel.channel_id)
         self._base_path = base_path
