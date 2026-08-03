@@ -30,6 +30,7 @@ from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
+from .topic_history_recovery import TopicHistoryRecovery, TopicRecoveryRequest
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, TelegramTopicID
 
@@ -656,6 +657,9 @@ class ChatBindingManager(LocaleMixin):
         msg = self.bot.send_message(tg_chat_to_link.id, text=txt)
 
         chat.link(self.channel.channel_id, ChatID(str(tg_chat_to_link.id)), self.channel.flag("multiple_slave_chats"))
+        previous_thread_id = self.db.get_topic_thread_id(
+            slave_uid=chat_uid, topic_chat_id=TelegramChatID(tg_chat_to_link.id)
+        )
         self.db.remove_topic_assoc(
             slave_uid=chat_uid,
         )
@@ -706,6 +710,15 @@ class ChatBindingManager(LocaleMixin):
         if do_backfill:
             try:
                 self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
+                if backfill_override is True and previous_thread_id is not None and thread_id is not None:
+                    self.recover_topic_history(
+                        source_chat_id=tg_chat_to_link.id,
+                        source_thread_id=int(previous_thread_id),
+                        target_chat_id=tg_chat_to_link.id,
+                        target_thread_id=int(thread_id),
+                        slave_chat_id=chat_uid,
+                        scan_boundary=max(0, int(storage_key[1]) - 1),
+                    )
             except Exception as e:
                 self.logger.warning("History migration failed for %s: %s", chat_display_name, e)
                 try:
@@ -1453,6 +1466,30 @@ class ChatBindingManager(LocaleMixin):
             name=f"HistoryMigration-{slave_chat_id}"
         )
         migration_thread.start()
+
+    def recover_topic_history(
+        self,
+        *,
+        source_chat_id: int,
+        source_thread_id: int,
+        target_chat_id: int,
+        target_thread_id: int,
+        slave_chat_id: EFBChannelChatIDStr,
+        scan_boundary: int,
+    ) -> None:
+        """Start the MTProto supplement after the MsgLog migration was queued."""
+        recovery = TopicHistoryRecovery(self.db, self.bot, self.channel.mtproto)
+        thread = threading.Thread(
+            target=recovery.recover,
+            args=(TopicRecoveryRequest(
+                source_chat_id=source_chat_id, source_thread_id=source_thread_id,
+                target_chat_id=target_chat_id, target_thread_id=target_thread_id,
+                slave_chat_id=slave_chat_id, scan_boundary=scan_boundary,
+            ),),
+            daemon=True,
+            name=f"TopicRecovery-{slave_chat_id}",
+        )
+        thread.start()
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr,
                                        tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):

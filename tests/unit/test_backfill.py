@@ -155,6 +155,50 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
     _cleanup_link_state(channel, chat, bot_group)
 
 
+def test_link_chat_true_starts_topic_recovery_from_previous_topic(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(1030))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    channel.db.add_topic_assoc(TelegramChatID(bot_group), TelegramMessageID(77), utils.chat_id_to_str(chat=chat))
+    update = _build_link_update(bot_group, is_forum=True)
+
+    with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 502)), \
+         patch.object(channel.bot_manager, "edit_message_text"), \
+         patch.object(channel.chat_binding, "create_topic", return_value=TelegramMessageID(88)), \
+         patch.object(channel.chat_binding, "_update_single_topic_info"), \
+         patch.object(channel.chat_binding, "migrate_chat_history"), \
+         patch.object(channel.chat_binding, "recover_topic_history") as recover_topic_history:
+        channel.chat_binding.link_chat(update, [token, "true"])
+
+    recover_topic_history.assert_called_once_with(
+        source_chat_id=bot_group, source_thread_id=77,
+        target_chat_id=bot_group, target_thread_id=88,
+        slave_chat_id=utils.chat_id_to_str(chat=chat), scan_boundary=1029,
+    )
+    _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_link_chat_false_never_starts_topic_recovery(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(1031))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    update = _build_link_update(bot_group)
+
+    with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 503)), \
+         patch.object(channel.bot_manager, "edit_message_text"), \
+         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
+         patch.object(channel.chat_binding, "recover_topic_history") as recover_topic_history, \
+         patch.object(channel.chat_binding, "send_history_link") as send_history_link:
+        channel.chat_binding.link_chat(update, [token, "false"])
+
+    migrate_chat_history.assert_not_called()
+    recover_topic_history.assert_not_called()
+    send_history_link.assert_not_called()
+    _cleanup_link_state(channel, chat, bot_group)
+
+
 def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(104))
