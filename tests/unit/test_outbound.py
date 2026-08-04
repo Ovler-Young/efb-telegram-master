@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import io
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -167,6 +168,33 @@ def test_mtproto_media_enqueue_error_removes_queue_owned_artifact(tmp_path):
 
     assert list(queue.media_directory.iterdir()) == []
     queue.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions are unavailable")
+def test_mtproto_media_artifacts_ignore_umask_and_repair_existing_directory_mode(tmp_path):
+    media_directory = tmp_path / OutboundQueue.media_directory_name
+    media_directory.mkdir(mode=0o755)
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"streamed-data")
+    previous_umask = os.umask(0o022)
+    try:
+        queue = OutboundQueue(tmp_path)
+        assert os.stat(media_directory).st_mode & 0o777 == 0o700
+        with source.open("rb") as stream:
+            descriptor = MTProtoMediaDescriptor.from_stream(
+                stream, file_size=source.stat().st_size, caption="", reply_to=None,
+                force_document=True, supports_streaming=False, silent=False,
+                media_name="document", mime_type=None,
+            )
+            enqueue(queue, QueueRequest(
+                "send_mtproto_media", (123, descriptor),
+                {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+            ))
+        artifact = Path(queue.decode_payload(queue.heads()[0].payload)[0][1].path)
+        assert os.stat(artifact).st_mode & 0o777 == 0o600
+    finally:
+        os.umask(previous_umask)
+        queue.close()
 
 
 def test_queue_migrates_operation_constraint_for_durable_mtproto_media(tmp_path):

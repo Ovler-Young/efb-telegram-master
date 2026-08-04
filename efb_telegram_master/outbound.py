@@ -6,6 +6,7 @@ import copy
 import inspect
 import io
 import numbers
+import os
 import pickle
 import shutil
 import sqlite3
@@ -311,6 +312,7 @@ class OutboundQueue:
         connection: Optional[sqlite3.Connection] = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_media_directory_permissions(create=False)
             connection = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA busy_timeout=5000")
@@ -411,15 +413,27 @@ class OutboundQueue:
     def media_directory(self) -> Path:
         return self.path.parent / self.media_directory_name
 
+    def _ensure_media_directory_permissions(self, *, create: bool) -> Path:
+        """Create or repair the queue-owned media directory on POSIX hosts."""
+        directory = self.media_directory
+        if create:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name == "posix" and directory.exists():
+            directory.chmod(0o700)
+        return directory
+
     def _materialize_mtproto_media(self, descriptor: MTProtoMediaDescriptor) -> MTProtoMediaDescriptor:
         """Copy queued MTProto media into storage that outlives the source stream."""
-        destination_directory = self.media_directory
-        destination_directory.mkdir(parents=True, exist_ok=True)
+        destination_directory = self._ensure_media_directory_permissions(create=True)
         file_name = descriptor.media_filename()
         destination = destination_directory / f"{uuid.uuid4().hex}{Path(file_name).suffix}"
         try:
-            with descriptor.open() as source, destination.open("xb") as target:
-                shutil.copyfileobj(source, target, length=1024 * 1024)
+            with descriptor.open() as source:
+                descriptor_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor_fd, "wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+            if os.name == "posix":
+                destination.chmod(0o600)
             if destination.stat().st_size != descriptor.file_size:
                 raise QueueEnqueueError("MTProto media source changed while it was queued.")
             queued_descriptor = replace(descriptor, path=str(destination), file_name=file_name)

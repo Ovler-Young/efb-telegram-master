@@ -24,6 +24,7 @@ from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import url2pathname
 from unittest.mock import Mock, patch
 
+from ehforwarderbot import Message as EFBMessage
 import telegram.constants
 import telegram.error
 from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
@@ -1112,7 +1113,11 @@ class TelegramBotManager(LocaleMixin):
                 if blocking_context:
                     durable_requests = requests
                 else:
-                    context = self._encode_queued_log_context(db_log_context)
+                    context = (
+                        self._encode_mtproto_queued_log_context(db_log_context)
+                        if all(request.operation == "send_mtproto_media" for request in requests)
+                        else self._encode_queued_log_context(db_log_context)
+                    )
                     durable_requests = [
                         QueueRequest(request.operation, request.args, request.kwargs, context)
                         for request in requests
@@ -1473,8 +1478,52 @@ class TelegramBotManager(LocaleMixin):
             raise QueueEnqueueError("Unable to serialize queued database log context.") from error
 
     @staticmethod
+    def _snapshot_mtproto_log_message(etm_msg: 'ETMMsg') -> 'ETMMsg':
+        """Copy only the ETMMsg fields consumed by MsgLog reconciliation."""
+        from .message import ETMMsg
+
+        target = getattr(etm_msg, "target", None)
+        snapshot_target = None
+        if target is not None:
+            snapshot_target = EFBMessage()
+            snapshot_target.chat = target.chat
+            snapshot_target.uid = target.uid
+        snapshot = ETMMsg(
+            attributes=getattr(etm_msg, "attributes", None),
+            chat=getattr(etm_msg, "chat", None),
+            author=getattr(etm_msg, "author", None),
+            commands=getattr(etm_msg, "commands", None),
+            deliver_to=getattr(etm_msg, "deliver_to", None),
+            is_system=getattr(etm_msg, "is_system", False),
+            mime=getattr(etm_msg, "mime", None),
+            reactions=getattr(etm_msg, "reactions", None),
+            substitutions=getattr(etm_msg, "substitutions", None),
+            target=snapshot_target,
+            text=getattr(etm_msg, "text", ""),
+            type=etm_msg.type,
+            uid=getattr(etm_msg, "uid", None),
+        )
+        snapshot.type_telegram = getattr(etm_msg, "type_telegram", snapshot.type_telegram)
+        snapshot.file_id = getattr(etm_msg, "file_id", None)
+        snapshot.file_unique_id = getattr(etm_msg, "file_unique_id", None)
+        snapshot.sender_bot_id = getattr(etm_msg, "sender_bot_id", None)
+        return snapshot
+
+    @classmethod
+    def _encode_mtproto_queued_log_context(cls, context: QueuedDbLogContext) -> bytes:
+        try:
+            from .message import ETMMsg
+
+            etm_msg = context.etm_msg
+            if isinstance(etm_msg, ETMMsg):
+                etm_msg = cls._snapshot_mtproto_log_message(etm_msg)
+            return b"\x03" + pickle.dumps((etm_msg, context.old_msg_id), protocol=5)
+        except Exception as error:
+            raise QueueEnqueueError("Unable to serialize queued MTProto database log context.") from error
+
+    @staticmethod
     def _decode_queued_log_context(payload: object) -> tuple['ETMMsg', Optional['OldMsgID']]:
-        if not isinstance(payload, bytes) or not payload or payload[0] != 1:
+        if not isinstance(payload, bytes) or not payload or payload[0] not in {1, 3}:
             raise QueuePersistenceError("Queued database log context has an unknown version.")
         try:
             value = pickle.loads(payload[1:])

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import inspect
 import io
+import pickle
 import string
 import random
 import tempfile
@@ -16,6 +17,8 @@ from unittest.mock import Mock, call, patch
 import pytest
 import telegram.error
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from ehforwarderbot.constants import MsgType
+from ehforwarderbot.types import MessageID
 from prometheus_client import generate_latest
 
 from efb_telegram_master.bot_manager import (
@@ -28,6 +31,9 @@ from efb_telegram_master.bot_manager import (
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.mtproto import MTProtoFloodWaitError, MTProtoMediaDescriptor, MTProtoReceipt
+from efb_telegram_master.message import ETMMsg
+from efb_telegram_master.msg_type import TGMsgType
+from efb_telegram_master.slave_message import SlaveMessageProcessor
 from efb_telegram_master.outbound import (
     OutboundQueue, OutboundQueueScheduler, QueueEnqueueError, QueueRequest, SenderSelection,
     SenderSelectionResult,
@@ -902,21 +908,41 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
     with tempfile.NamedTemporaryFile(dir=tmp_path, delete=True) as stream:
         stream.write(b"media")
         stream.flush()
-        descriptor = MTProtoMediaDescriptor.from_stream(
-            stream, file_size=5, caption="caption", reply_to=7,
-            force_document=True, supports_streaming=False, silent=False,
-            media_name="document", mime_type="application/octet-stream",
+        source_chat = SimpleNamespace(module_id="tests.mocks.slave", uid="source-chat")
+        source_author = SimpleNamespace(module_id="tests.mocks.slave", uid="source-author")
+        log_message = ETMMsg(
+            uid=MessageID("source-message"), text="caption", type=MsgType.File,
+            type_telegram=TGMsgType.Document, file=stream, path=stream.name,
+            filename="source.bin", mime="application/octet-stream", chat=source_chat,
+            author=source_author,
         )
-        receipt = manager.enqueue_mtproto_media(
-            chat_id=123, descriptor=descriptor, slave_id="slave",
-            db_log_context=QueuedDbLogContext(DurableMessage()),
+        processor = object.__new__(SlaveMessageProcessor)
+        processor.bot = manager
+        processor.chat_manager = object()
+        processor.html_substitutions = Mock(return_value="caption")
+        manager._affix_queued_content = Mock(return_value="caption")
+        source_message = SimpleNamespace(
+            type=MsgType.File, file=stream, text="caption", mime="application/octet-stream",
+            chat=source_chat, edit_media=False,
+            commands=None,
         )
+        with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=log_message):
+            receipt = processor._send_mtproto_media(
+                source_message, 123, None, "", "", None, 7, None, False,
+            )
+        source_path = Path(stream.name)
     row_id = int(receipt.task_id)
-    queued_descriptor = queue.decode_payload(queue.heads()[0].payload)[0][1]
-    assert queued_descriptor.path != descriptor.path
+    queued_row = queue.heads()[0]
+    stored_message, _old_message_id = pickle.loads(queued_row.log_context[1:])
+    assert queued_row.log_context[0] == 3
+    assert stored_message.file is None
+    assert stored_message.path is None
+    assert str(source_path).encode() not in queued_row.log_context
+    queued_descriptor = queue.decode_payload(queued_row.payload)[0][1]
+    assert queued_descriptor.path != str(source_path)
     assert queued_descriptor.path.startswith(str(tmp_path / "outbound-media"))
 
-    assert not Path(descriptor.path).exists()
+    assert not source_path.exists()
     scheduler.dispatch_once()
     with pytest.raises(MTProtoFloodWaitError):
         scheduler.in_flight[row_id].future.result(timeout=1)
@@ -941,6 +967,16 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
     assert manager.channel.mtproto.calls == 2
     assert queue.heads() == []
     assert manager.channel.db.add_or_update_message_log.call_count == 1
+    reconciled_message = manager.channel.db.add_or_update_message_log.call_args.args[0]
+    assert reconciled_message.uid == MessageID("source-message")
+    assert reconciled_message.text == "caption"
+    assert reconciled_message.chat.module_id == "tests.mocks.slave"
+    assert reconciled_message.chat.uid == "source-chat"
+    assert reconciled_message.author.uid == "source-author"
+    assert reconciled_message.file is None
+    assert reconciled_message.path is None
+    assert reconciled_message.type_telegram == "document"
+    assert reconciled_message.mime == "application/octet-stream"
     assert not Path(queued_descriptor.path).exists()
     queue.close()
     executor.shutdown()
