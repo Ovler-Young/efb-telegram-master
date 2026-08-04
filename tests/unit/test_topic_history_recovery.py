@@ -1,13 +1,21 @@
 import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
+
+import pytest
 
 from efb_telegram_master.bot_manager import TelegramBotManager, TopicRecoveryQueueContext
 from efb_telegram_master.chat_binding import ChatBindingManager
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest, SenderSelection, SenderSelectionResult
 from efb_telegram_master.topic_history_recovery import TopicHistoryRecovery, TopicRecoveryRequest
+
+
+def completed_future(result):
+    waiter = Future()
+    waiter.set_result(result)
+    return waiter
 
 
 def test_topic_recovery_models_create_required_durable_columns():
@@ -95,7 +103,7 @@ def test_recovery_requests_ascending_batches_and_records_target_receipts():
     database = FakeDatabase()
     mtproto = FakeMTProto()
     bot = SimpleNamespace(enqueue_history_operation=Mock(
-        return_value=SimpleNamespace(result=lambda: SimpleNamespace(message_id=900))
+        return_value=completed_future(SimpleNamespace(message_id=900))
     ))
     runtime = FakeRuntime()
     recovery = TopicHistoryRecovery(database, bot, mtproto, runtime)
@@ -116,7 +124,7 @@ def test_recovery_copy_uses_a_versioned_durable_completion_context():
     database = FakeDatabase()
     database.scan.scan_boundary = 1
     bot = SimpleNamespace(enqueue_history_operation=Mock(
-        return_value=SimpleNamespace(result=lambda: SimpleNamespace(message_id=900))
+        return_value=completed_future(SimpleNamespace(message_id=900))
     ))
 
     TopicHistoryRecovery(database, bot, FakeMTProto(), FakeRuntime()).recover(
@@ -127,6 +135,55 @@ def test_recovery_copy_uses_a_versioned_durable_completion_context():
         bot.enqueue_history_operation.call_args.kwargs["log_context"]
     )
     assert context == (1, 10, 1, 20, "tests.mocks.slave.chat", "", "1:1")
+
+
+@pytest.mark.asyncio
+async def test_recovery_awaits_queue_completion_without_blocking_the_runtime_loop():
+    database = FakeDatabase()
+    database.scan.scan_boundary = 1
+    waiter: Future = Future()
+
+    class LoopScheduledBot:
+        def enqueue_history_operation(self, **_kwargs):
+            asyncio.get_running_loop().call_soon(
+                waiter.set_result, SimpleNamespace(message_id=900)
+            )
+            return waiter
+
+    recovery = TopicHistoryRecovery(database, LoopScheduledBot(), FakeMTProto(), FakeRuntime())
+
+    await asyncio.wait_for(
+        recovery._recover(TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 1)),
+        timeout=0.5,
+    )
+
+    assert database.entries[(1, 1)].status == "accepted"
+
+
+def test_recovery_caps_scan_boundary_before_creating_scan_state():
+    class CeilingDatabase(FakeDatabase):
+        def __init__(self):
+            super().__init__()
+            self.requested_boundary = None
+
+        def get_or_create_topic_recovery_scan(self, **kwargs):
+            self.requested_boundary = kwargs["scan_boundary"]
+            self.scan.scan_boundary = kwargs["scan_boundary"]
+            return self.scan
+
+    database = CeilingDatabase()
+    mtproto = FakeMTProto()
+    mtproto.config = SimpleNamespace(scan_ceiling=2)
+    bot = SimpleNamespace(enqueue_history_operation=Mock(
+        return_value=completed_future(SimpleNamespace(message_id=900))
+    ))
+
+    TopicHistoryRecovery(database, bot, mtproto, FakeRuntime()).recover(
+        TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 5)
+    )
+
+    assert database.requested_boundary == 2
+    assert mtproto.calls == [(10, [1, 2])]
 
 
 def test_recovery_receipt_reconciles_after_restart_without_copying_twice(tmp_path):

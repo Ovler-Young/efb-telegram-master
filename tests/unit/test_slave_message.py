@@ -2,6 +2,8 @@ from io import BytesIO
 import asyncio
 import threading
 import time
+import tempfile
+from pathlib import Path
 import pytest
 from pytest import fixture
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
@@ -17,6 +19,8 @@ from ehforwarderbot.types import MessageID, ReactionName
 from ehforwarderbot.exceptions import EFBMessageError
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.constants import Emoji
+from efb_telegram_master.message import ETMMsg
+from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 
 
@@ -1047,6 +1051,70 @@ def test_mtproto_large_file_rejects_non_durable_stream():
         processor._send_mtproto_media(msg, 100, 77, "header", "footer", None, 42, None, True)
 
     assert msg.file.closed
+
+
+def test_mtproto_media_is_materialized_before_a_delete_on_close_source_is_closed(tmp_path):
+    processor = build_slave_message_processor()
+    processor.chat_manager = object()
+    processor.html_substitutions = Mock(return_value="caption")
+    processor.bot._affix_queued_content = Mock(return_value="caption")
+    materialized = []
+
+    def enqueue_mtproto_media(*, descriptor, **_kwargs):
+        with descriptor.open() as source:
+            materialized.append(source.read())
+        return SimpleNamespace(message_id=900)
+
+    processor.bot.enqueue_mtproto_media.side_effect = enqueue_mtproto_media
+    msg = SimpleNamespace(
+        type=MsgType.File, text="caption", edit_media=False, commands=None,
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"), mime=None,
+    )
+
+    with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()):
+        with tempfile.NamedTemporaryFile(dir=tmp_path, delete=True) as source:
+            source.write(b"queued-media")
+            source.flush()
+            msg.file = source
+            result = processor._send_mtproto_media(msg, 100, None, "", "", None, None, None, False)
+            source_path = Path(source.name)
+
+    assert result.message_id == 900
+    assert materialized == [b"queued-media"]
+    assert not source_path.exists()
+
+
+def test_mtproto_download_without_mime_or_file_metadata_uses_filename_extension(monkeypatch):
+    class Runtime:
+        def call(self, coroutine, timeout):
+            return asyncio.run(coroutine)
+
+    class MTProto:
+        async def download_message_media(self, _chat_id, _message_id, destination):
+            destination.write(b"downloaded")
+
+    bot_manager = SimpleNamespace(_runtime=Runtime(), get_file=Mock())
+    monkeypatch.setattr(
+        "efb_telegram_master.message.coordinator.master",
+        SimpleNamespace(bot_manager=bot_manager, mtproto=MTProto()),
+        raising=False,
+    )
+    monkeypatch.setattr("efb_telegram_master.message.magic.from_buffer", lambda *_args, **_kwargs: "application/octet-stream")
+    message = ETMMsg(
+        type=MsgType.File, type_telegram=TGMsgType.Document, file_id="large-file",
+        filename="archive.bin", mime=None,
+    )
+    message.set_mtproto_media_ref(100, 200)
+
+    file = message.get_file()
+
+    assert file is not None
+    assert Path(file.name).suffix == ".bin"
+    file.seek(0)
+    assert file.read() == b"downloaded"
+    assert message.mime == "application/octet-stream"
+    bot_manager.get_file.assert_not_called()
+    file.close()
 
 
 def test_mtproto_large_media_rejects_bot_api_only_markup():

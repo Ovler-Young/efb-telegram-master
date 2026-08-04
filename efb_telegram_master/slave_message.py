@@ -589,18 +589,18 @@ class SlaveMessageProcessor(LocaleMixin):
                 force_document=force_document, supports_streaming=supports_streaming, silent=silent,
                 media_name=media_name, mime_type=getattr(msg, "mime", None),
             )
+            return cast(telegram.Message, self.bot.enqueue_mtproto_media(
+                chat_id=int(tg_dest), descriptor=descriptor,
+                slave_id=utils.chat_id_to_str(chat=msg.chat),
+                db_log_context=QueuedDbLogContext(
+                    ETMMsg.from_efbmsg(msg, self.chat_manager), database_old_msg_id,
+                    on_db_complete,
+                ),
+            ))
         except ValueError as error:
             raise EFBMessageError(str(error)) from error
         finally:
             file.close()
-        return cast(telegram.Message, self.bot.enqueue_mtproto_media(
-            chat_id=int(tg_dest), descriptor=descriptor,
-            slave_id=utils.chat_id_to_str(chat=msg.chat),
-            db_log_context=QueuedDbLogContext(
-                ETMMsg.from_efbmsg(msg, self.chat_manager), database_old_msg_id,
-                on_db_complete,
-            ),
-        ))
 
     @classmethod
     def _remote_image_url(cls, msg: Message) -> Optional[str]:

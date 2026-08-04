@@ -95,6 +95,8 @@ class ETMMsg(Message):
             if self._mtproto_media_ref is not None:
                 chat_id, message_id = self._mtproto_media_ref
                 ext = mimetypes.guess_extension(self.mime or "", strict=False) or ""
+                if not ext and isinstance(self.__filename, str):
+                    ext = Path(self.__filename).suffix
                 file = tempfile.NamedTemporaryFile(suffix=ext)
                 bot_manager._runtime.call(
                     coordinator.master.mtproto.download_message_media(chat_id, message_id, file),
@@ -109,8 +111,10 @@ class ETMMsg(Message):
                     timeout=FILE_DOWNLOAD_TIMEOUT,
                 )
             if not self.mime:
-                assert file_meta is not None
-                mime = mimetypes.guess_type(file_meta.file_path, strict=False)[0]
+                mime = (
+                    mimetypes.guess_type(file_meta.file_path, strict=False)[0]
+                    if file_meta is not None else None
+                )
             else:
                 mime = self.mime
             file.seek(0)

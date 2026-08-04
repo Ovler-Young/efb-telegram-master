@@ -1,7 +1,8 @@
 """Bounded, durable recovery of messages from a non-General forum topic."""
 
+import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from .db import DatabaseManager
@@ -33,6 +34,9 @@ class TopicHistoryRecovery:
     def recover(self, request: TopicRecoveryRequest) -> None:
         if request.source_thread_id <= 1:
             raise ValueError("General or ambiguous forum topic cannot be recovered")
+        scan_ceiling = getattr(getattr(self.mtproto, "config", None), "scan_ceiling", None)
+        if isinstance(scan_ceiling, int) and not isinstance(scan_ceiling, bool) and scan_ceiling > 0:
+            request = replace(request, scan_boundary=min(request.scan_boundary, scan_ceiling))
         if request.scan_boundary <= 0:
             return
         self.runtime.call(self._recover(request))
@@ -122,7 +126,7 @@ class TopicHistoryRecovery:
                 log_context=context,
                 queue_id=queue_id,
             )
-            receipt = waiter.result()
+            receipt = await asyncio.wrap_future(waiter)
             target_message_id = self._receipt_message_id(receipt)
         except BaseException as error:
             self.db.save_topic_recovery_entry(
