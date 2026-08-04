@@ -12,6 +12,30 @@ import efb_telegram_master.master_message as master_message
 from efb_telegram_master.master_message import MasterMessageProcessor
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
+from tests.integration import conftest as integration_conftest
+
+
+def test_integration_postgres_config_reads_required_environment(monkeypatch):
+    values = {
+        "TEST_POSTGRES_HOST": "postgres.example",
+        "TEST_POSTGRES_PORT": "5433",
+        "TEST_POSTGRES_DB": "etm_test",
+        "TEST_POSTGRES_USER": "etm",
+        "TEST_POSTGRES_PASSWORD": "secret",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    config = integration_conftest.integration_postgres_config.__wrapped__()
+
+    assert config == {
+        "type": "postgresql",
+        "host": "postgres.example",
+        "port": 5433,
+        "database": "etm_test",
+        "user": "etm",
+        "password": "secret",
+    }
 
 
 def test_sync_msglog_requires_admin_and_a_bound_forum_group():
