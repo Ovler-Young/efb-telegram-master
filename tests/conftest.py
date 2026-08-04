@@ -93,7 +93,8 @@ def dump_config(file_path: Path, data):
         yaml.dump(data, file)
 
 
-def build_channel_config(bot_token, bot_admins, *, topic_group=None, aux_bot_tokens=None):
+def build_channel_config(bot_token, bot_admins, *, topic_group=None, aux_bot_tokens=None,
+                         mtproto=None, database=None):
     config = {
         'token': bot_token,
         'admins': bot_admins,
@@ -102,6 +103,10 @@ def build_channel_config(bot_token, bot_admins, *, topic_group=None, aux_bot_tok
         config['topic_group'] = topic_group
     if aux_bot_tokens:
         config['auxiliary_bots'] = [{'token': token} for token in aux_bot_tokens]
+    if mtproto is not None:
+        config['mtproto'] = mtproto
+    if database is not None:
+        config['database'] = database
     return config
 
 
@@ -170,6 +175,33 @@ def coordinator_with_topic_group(tmp_path_factory, monkey_class, bot_token, bot_
 
 
 @pytest.fixture(scope="module")
+def coordinator_with_topic_group_and_mtproto(
+        tmp_path_factory, monkey_class, bot_token, bot_admins, bot_topic_group,
+        api_id, api_hash, integration_postgres_config,
+) -> Iterator[ModuleType]:
+    if bot_topic_group is None:
+        pytest.skip("TOPIC_GROUP is not configured")
+
+    coordinator_obj = load_test_coordinator(
+        tmp_path_factory,
+        monkey_class,
+        build_channel_config(
+            bot_token,
+            bot_admins,
+            topic_group=bot_topic_group,
+            mtproto={"enabled": True, "api_id": api_id, "api_hash": api_hash},
+            database=integration_postgres_config,
+        ),
+    )
+
+    yield coordinator_obj
+
+    coordinator_obj.master.stop_polling()
+    for i in coordinator_obj.slaves.values():
+        i.stop_polling()
+
+
+@pytest.fixture(scope="module")
 def coordinator_with_auxiliary_bots(tmp_path_factory, monkey_class, bot_token, bot_admins,
                                     aux_bot_tokens) -> Iterator[ModuleType]:
     if not aux_bot_tokens:
@@ -206,6 +238,16 @@ def channel_with_topic_group(coordinator_with_topic_group) -> TelegramChannel:
 @pytest.fixture(scope="module")
 def slave_with_topic_group(coordinator_with_topic_group) -> MockSlaveChannel:
     return coordinator_with_topic_group.slaves[MockSlaveChannel.channel_id]
+
+
+@pytest.fixture(scope="module")
+def channel_with_topic_group_and_mtproto(coordinator_with_topic_group_and_mtproto) -> TelegramChannel:
+    return coordinator_with_topic_group_and_mtproto.master
+
+
+@pytest.fixture(scope="module")
+def slave_with_topic_group_and_mtproto(coordinator_with_topic_group_and_mtproto) -> MockSlaveChannel:
+    return coordinator_with_topic_group_and_mtproto.slaves[MockSlaveChannel.channel_id]
 
 
 @pytest.fixture(scope="module")

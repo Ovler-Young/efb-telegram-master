@@ -5,7 +5,7 @@ import threading
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Set
+from typing import Dict, Set
 
 import pytest
 import pytest_asyncio
@@ -44,6 +44,24 @@ def api_id(user_session_info) -> int:
 @pytest.fixture(scope="session")
 def api_hash(user_session_info) -> str:
     return user_session_info['api_hash']
+
+
+@pytest.fixture(scope="session")
+def integration_postgres_config() -> Dict[str, object]:
+    required = (
+        "TEST_POSTGRES_HOST", "TEST_POSTGRES_PORT", "TEST_POSTGRES_DB",
+        "TEST_POSTGRES_USER", "TEST_POSTGRES_PASSWORD",
+    )
+    if any(not os.environ.get(name) for name in required):
+        pytest.skip("PostgreSQL integration environment is not configured")
+    return {
+        "type": "postgresql",
+        "host": os.environ["TEST_POSTGRES_HOST"],
+        "port": int(os.environ["TEST_POSTGRES_PORT"]),
+        "database": os.environ["TEST_POSTGRES_DB"],
+        "user": os.environ["TEST_POSTGRES_USER"],
+        "password": os.environ["TEST_POSTGRES_PASSWORD"],
+    }
 
 
 @pytest.fixture(scope="session")

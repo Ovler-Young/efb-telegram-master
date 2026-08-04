@@ -61,7 +61,7 @@ jobs:
         CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
         TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
         AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
-        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
+        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN2 }}
         USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -114,7 +114,7 @@ jobs:
         CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
         TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
         AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
-        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
+        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN2 }}
         USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
