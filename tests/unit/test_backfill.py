@@ -155,9 +155,12 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
     _cleanup_link_state(channel, chat, bot_group)
 
 
-def test_link_chat_true_starts_topic_recovery_from_previous_topic(channel, slave, bot_group):
+@pytest.mark.parametrize("storage_message_id", [1_030, 100_001])
+def test_link_chat_true_starts_topic_recovery_from_previous_topic(
+    channel, slave, bot_group, storage_message_id
+):
     chat = slave.chat_with_alias
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(1030))
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(storage_message_id))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key, backfill_mode=None)
     channel.db.add_topic_assoc(TelegramChatID(bot_group), TelegramMessageID(77), utils.chat_id_to_str(chat=chat))
@@ -174,7 +177,7 @@ def test_link_chat_true_starts_topic_recovery_from_previous_topic(channel, slave
     recover_topic_history.assert_called_once_with(
         source_chat_id=bot_group, source_thread_id=77,
         target_chat_id=bot_group, target_thread_id=88,
-        slave_chat_id=utils.chat_id_to_str(chat=chat), scan_boundary=1029,
+        slave_chat_id=utils.chat_id_to_str(chat=chat),
     )
     _cleanup_link_state(channel, chat, bot_group)
 

@@ -717,7 +717,6 @@ class ChatBindingManager(LocaleMixin):
                         target_chat_id=tg_chat_to_link.id,
                         target_thread_id=int(thread_id),
                         slave_chat_id=chat_uid,
-                        scan_boundary=max(0, int(storage_key[1]) - 1),
                     )
             except Exception as e:
                 self.logger.warning("History migration failed for %s: %s", chat_display_name, e)
@@ -1475,12 +1474,12 @@ class ChatBindingManager(LocaleMixin):
         target_chat_id: int,
         target_thread_id: int,
         slave_chat_id: EFBChannelChatIDStr,
-        scan_boundary: int,
     ) -> None:
         """Start the MTProto supplement after the MsgLog migration was queued."""
         mtproto = self.channel.mtproto
         if not getattr(mtproto, "enabled", False):
             return
+        scan_boundary = getattr(getattr(mtproto, "config", None), "scan_ceiling", 100_000)
         recovery = TopicHistoryRecovery(self.db, self.bot, mtproto, self.bot._runtime)
         request = recovery.prepare(TopicRecoveryRequest(
             source_chat_id=source_chat_id, source_thread_id=source_thread_id,
@@ -1532,7 +1531,7 @@ class ChatBindingManager(LocaleMixin):
             self.recover_topic_history(
                 source_chat_id=int(scan.source_chat_id), source_thread_id=int(scan.source_thread_id),
                 target_chat_id=int(scan.target_chat_id), target_thread_id=int(scan.target_thread_id),
-                slave_chat_id=EFBChannelChatIDStr(scan.slave_chat_id), scan_boundary=scan.scan_boundary,
+                slave_chat_id=EFBChannelChatIDStr(scan.slave_chat_id),
             )
 
     def _start_history_migration_worker(self):

@@ -47,13 +47,13 @@ def test_chat_pagination_filters_groups_users_and_invalid_regex(channel, slave):
     assert len(buttons) == 1
 
 
-def test_resume_pending_topic_recoveries_reconstructs_requests_and_skips_complete_scans():
+def test_resume_pending_topic_recoveries_reconstructs_requests_with_current_scan_policy():
     recovery = Mock()
     manager = SimpleNamespace(
         db=SimpleNamespace(get_incomplete_topic_recovery_scans=Mock(return_value=[
             SimpleNamespace(
                 source_chat_id="10", source_thread_id="7", target_chat_id="20",
-                target_thread_id="8", slave_chat_id="tests.mocks.slave.chat", scan_boundary=99,
+                target_thread_id="8", slave_chat_id="tests.mocks.slave.chat",
             ),
         ])),
         recover_topic_history=recovery,
@@ -65,7 +65,7 @@ def test_resume_pending_topic_recoveries_reconstructs_requests_and_skips_complet
 
     recovery.assert_called_once_with(
         source_chat_id=10, source_thread_id=7, target_chat_id=20, target_thread_id=8,
-        slave_chat_id="tests.mocks.slave.chat", scan_boundary=99,
+        slave_chat_id="tests.mocks.slave.chat",
     )
 
 

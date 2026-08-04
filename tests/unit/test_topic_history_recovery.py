@@ -103,7 +103,7 @@ class FakeRuntime:
             loop.close()
 
 
-def test_disconnected_enabled_recovery_persists_a_capped_scan_before_deferring():
+def test_disconnected_enabled_recovery_persists_the_configured_scan_ceiling_before_deferring():
     scan_calls = []
     manager = SimpleNamespace(
         db=SimpleNamespace(
@@ -125,7 +125,6 @@ def test_disconnected_enabled_recovery_persists_a_capped_scan_before_deferring()
         target_chat_id=20,
         target_thread_id=8,
         slave_chat_id="tests.mocks.slave.chat",
-        scan_boundary=205,
     )
 
     assert scan_calls == [{
@@ -491,12 +490,14 @@ def test_recovery_restart_after_interrupted_waiter_reconciles_and_continues_scan
     restarted_queue.close()
 
 
-def test_recovery_rejects_non_topic_deleted_service_protected_and_cross_topic_messages():
+def test_recovery_scans_every_id_up_to_the_boundary_and_filters_by_topic_membership():
     database = FakeDatabase()
     database.scan.scan_boundary = 5
 
     class FilteredMTProto(FakeMTProto):
         async def get_channel_messages(self, channel, ids):
+            self.calls.append((channel, ids))
+
             class MessageEmpty:
                 id = 1
 
@@ -509,10 +510,12 @@ def test_recovery_rejects_non_topic_deleted_service_protected_and_cross_topic_me
             ]
 
     bot = SimpleNamespace(enqueue_history_operation=Mock())
-    TopicHistoryRecovery(database, bot, FilteredMTProto(), FakeRuntime()).recover(
+    mtproto = FilteredMTProto()
+    TopicHistoryRecovery(database, bot, mtproto, FakeRuntime()).recover(
         TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 5)
     )
 
+    assert mtproto.calls == [(10, [1, 2, 3, 4, 5])]
     assert [database.entries[(1, index)].classification for index in range(1, 6)] == [
         "deleted", "service", "protected", "general-topic", "cross-topic",
     ]
@@ -553,11 +556,14 @@ def test_startup_resumes_partial_scan_from_cursor_without_duplicate_transfer():
     binding = SimpleNamespace(
         db=database,
         logger=Mock(),
-        channel=SimpleNamespace(mtproto=SimpleNamespace(enabled=True, connected=True)),
+        channel=SimpleNamespace(mtproto=SimpleNamespace(
+            enabled=True, connected=True, config=SimpleNamespace(scan_ceiling=2),
+        )),
     )
 
     def recover_topic_history(**kwargs):
-        TopicHistoryRecovery(database, bot, mtproto, FakeRuntime()).recover(TopicRecoveryRequest(**kwargs))
+        request = TopicRecoveryRequest(**kwargs, scan_boundary=2)
+        TopicHistoryRecovery(database, bot, mtproto, FakeRuntime()).recover(request)
 
     binding.recover_topic_history = recover_topic_history
     database.get_incomplete_topic_recovery_scans = Mock(return_value=[database.scan])
