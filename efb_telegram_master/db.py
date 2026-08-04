@@ -1170,7 +1170,7 @@ class DatabaseManager:
             target_chat_id=str(target_chat_id), target_thread_id=str(target_thread_id),
             defaults={"slave_chat_id": str(slave_chat_id), "scan_boundary": scan_boundary},
         )
-        if not created and scan.scan_boundary < scan_boundary:
+        if not created and scan.scan_boundary != scan_boundary:
             scan.scan_boundary = scan_boundary
             scan.updated_at = datetime.datetime.now()
             scan.save()
