@@ -30,7 +30,12 @@ from efb_telegram_master.bot_manager import (
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.mtproto import MTProtoFloodWaitError, MTProtoMediaDescriptor, MTProtoReceipt
+from efb_telegram_master.mtproto import (
+    MTProtoFloodWaitError,
+    MTProtoMediaDescriptor,
+    MTProtoNotConnectedError,
+    MTProtoReceipt,
+)
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
@@ -868,9 +873,10 @@ def test_mtproto_flood_wait_uses_eventual_durable_retry(monkeypatch: pytest.Monk
     assert decision.retry_at == 27.0
 
 
-def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path, monkeypatch):
+def test_disconnected_mtproto_media_stays_durable_until_reconnect_and_reconciles_one_log(tmp_path, monkeypatch):
     class MTProto:
         def __init__(self):
+            self.connected = False
             self.calls = 0
 
         async def send_media_descriptor(self, chat_id, descriptor):
@@ -878,8 +884,6 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
             assert chat_id == 123
             with descriptor.open() as stream:
                 assert stream.read(1) == b"m"
-            if self.calls == 1:
-                raise MTProtoFloodWaitError("wait", retry_after=1)
             return MTProtoReceipt(chat_id=123, message_id=456)
 
     manager = object.__new__(TelegramBotManager)
@@ -890,6 +894,7 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
     manager._outbound_scheduler = scheduler
     manager._runtime = SimpleNamespace(call=lambda coroutine: asyncio.run(coroutine))
     manager.channel = SimpleNamespace(mtproto=MTProto(), db=SimpleNamespace(add_or_update_message_log=Mock()))
+    manager.send_message = Mock()
     manager.logger = Mock()
     manager.bot_pool = None
     manager._bot_chat_state_lock = threading.Lock()
@@ -918,6 +923,7 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
         )
         processor = object.__new__(SlaveMessageProcessor)
         processor.bot = manager
+        processor.channel = manager.channel
         processor.chat_manager = object()
         processor.html_substitutions = Mock(return_value="caption")
         manager._affix_queued_content = Mock(return_value="caption")
@@ -944,27 +950,23 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
 
     assert not source_path.exists()
     scheduler.dispatch_once()
-    with pytest.raises(MTProtoFloodWaitError):
+    with pytest.raises(MTProtoNotConnectedError):
         scheduler.in_flight[row_id].future.result(timeout=1)
     scheduler.harvest_completed()
 
-    assert manager.channel.mtproto.calls == 1
+    assert manager.channel.mtproto.calls == 0
     assert [row.id for row in queue.heads()] == [row_id]
+    assert queue.unknown() == []
+    manager.send_message.assert_not_called()
     manager.channel.db.add_or_update_message_log.assert_not_called()
 
-    queue.close()
-    executor.shutdown()
-    queue = OutboundQueue(tmp_path)
-    executor = ThreadPoolExecutor(max_workers=1)
-    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
-    manager._outbound_queue = queue
-    manager._outbound_scheduler = scheduler
+    manager.channel.mtproto.connected = True
 
     scheduler.dispatch_once()
     scheduler.in_flight[row_id].future.result(timeout=1)
     scheduler.harvest_completed()
 
-    assert manager.channel.mtproto.calls == 2
+    assert manager.channel.mtproto.calls == 1
     assert queue.heads() == []
     assert manager.channel.db.add_or_update_message_log.call_count == 1
     reconciled_message = manager.channel.db.add_or_update_message_log.call_args.args[0]

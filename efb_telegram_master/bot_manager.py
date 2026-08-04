@@ -37,7 +37,7 @@ from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
-from .mtproto import MTProtoMediaDescriptor, MTProtoRetryableError
+from .mtproto import MTProtoMediaDescriptor, MTProtoNotConnectedError, MTProtoRetryableError
 from .outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
@@ -1405,7 +1405,10 @@ class TelegramBotManager(LocaleMixin):
             chat_id, descriptor = args
             if isinstance(chat_id, bool) or not isinstance(chat_id, int):
                 raise QueueEnqueueError("Queued MTProto media chat_id is invalid.")
-            receipt = self._runtime.call(self.channel.mtproto.send_media_descriptor(chat_id, descriptor))
+            mtproto = self.channel.mtproto
+            if not getattr(mtproto, "connected", False):
+                raise MTProtoNotConnectedError("MTProto client is not connected")
+            receipt = self._runtime.call(mtproto.send_media_descriptor(chat_id, descriptor))
             media = SimpleNamespace(file_id=None, file_unique_id=None, mime_type=descriptor.mime_type)
             media_value = [media] if descriptor.media_name == "photo" else media
             return SimpleNamespace(

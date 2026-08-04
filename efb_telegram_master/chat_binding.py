@@ -1479,17 +1479,22 @@ class ChatBindingManager(LocaleMixin):
     ) -> None:
         """Start the MTProto supplement after the MsgLog migration was queued."""
         mtproto = self.channel.mtproto
-        if not getattr(mtproto, "enabled", False) or not getattr(mtproto, "connected", False):
+        if not getattr(mtproto, "enabled", False):
+            return
+        recovery = TopicHistoryRecovery(self.db, self.bot, mtproto, self.bot._runtime)
+        request = recovery.prepare(TopicRecoveryRequest(
+            source_chat_id=source_chat_id, source_thread_id=source_thread_id,
+            target_chat_id=target_chat_id, target_thread_id=target_thread_id,
+            slave_chat_id=slave_chat_id, scan_boundary=scan_boundary,
+        ))
+        if request is None:
+            return
+        if not getattr(mtproto, "connected", False):
             self.logger.info("MTProto is unavailable; topic recovery remains pending.")
             return
-        recovery = TopicHistoryRecovery(self.db, self.bot, self.channel.mtproto, self.bot._runtime)
         thread = threading.Thread(
-            target=recovery.recover,
-            args=(TopicRecoveryRequest(
-                source_chat_id=source_chat_id, source_thread_id=source_thread_id,
-                target_chat_id=target_chat_id, target_thread_id=target_thread_id,
-                slave_chat_id=slave_chat_id, scan_boundary=scan_boundary,
-            ),),
+            target=recovery.recover_prepared,
+            args=(request,),
             daemon=True,
             name=f"TopicRecovery-{slave_chat_id}",
         )

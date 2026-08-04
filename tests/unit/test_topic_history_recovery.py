@@ -102,6 +102,41 @@ class FakeRuntime:
             loop.close()
 
 
+def test_disconnected_enabled_recovery_persists_a_capped_scan_before_deferring():
+    scan_calls = []
+    manager = SimpleNamespace(
+        db=SimpleNamespace(
+            get_or_create_topic_recovery_scan=lambda **kwargs: scan_calls.append(kwargs),
+        ),
+        bot=SimpleNamespace(_runtime=SimpleNamespace()),
+        logger=Mock(),
+        channel=SimpleNamespace(mtproto=SimpleNamespace(
+            enabled=True,
+            connected=False,
+            config=SimpleNamespace(scan_ceiling=100),
+        )),
+    )
+
+    ChatBindingManager.recover_topic_history(
+        manager,
+        source_chat_id=10,
+        source_thread_id=7,
+        target_chat_id=20,
+        target_thread_id=8,
+        slave_chat_id="tests.mocks.slave.chat",
+        scan_boundary=205,
+    )
+
+    assert scan_calls == [{
+        "source_chat_id": 10,
+        "source_thread_id": 7,
+        "target_chat_id": 20,
+        "target_thread_id": 8,
+        "slave_chat_id": "tests.mocks.slave.chat",
+        "scan_boundary": 100,
+    }]
+
+
 def test_recovery_requests_ascending_batches_and_records_target_receipts():
     database = FakeDatabase()
     mtproto = FakeMTProto()

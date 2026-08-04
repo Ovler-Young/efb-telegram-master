@@ -32,13 +32,31 @@ class TopicHistoryRecovery:
         self.logger = logging.getLogger(__name__)
 
     def recover(self, request: TopicRecoveryRequest) -> None:
+        prepared_request = self.prepare(request)
+        if prepared_request is None:
+            return
+        self.recover_prepared(prepared_request)
+
+    def prepare(self, request: TopicRecoveryRequest) -> Optional[TopicRecoveryRequest]:
+        """Persist a bounded recovery request before checking the MTProto connection."""
         if request.source_thread_id <= 1:
             raise ValueError("General or ambiguous forum topic cannot be recovered")
         scan_ceiling = getattr(getattr(self.mtproto, "config", None), "scan_ceiling", None)
         if isinstance(scan_ceiling, int) and not isinstance(scan_ceiling, bool) and scan_ceiling > 0:
             request = replace(request, scan_boundary=min(request.scan_boundary, scan_ceiling))
         if request.scan_boundary <= 0:
-            return
+            return None
+        self.db.get_or_create_topic_recovery_scan(
+            source_chat_id=request.source_chat_id,
+            source_thread_id=request.source_thread_id,
+            target_chat_id=request.target_chat_id,
+            target_thread_id=request.target_thread_id,
+            slave_chat_id=request.slave_chat_id,
+            scan_boundary=request.scan_boundary,
+        )
+        return request
+
+    def recover_prepared(self, request: TopicRecoveryRequest) -> None:
         self.runtime.call(self._recover(request))
 
     async def _recover(self, request: TopicRecoveryRequest) -> None:

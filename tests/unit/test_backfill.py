@@ -190,11 +190,13 @@ def test_link_chat_false_never_starts_topic_recovery(channel, slave, bot_group):
          patch.object(channel.bot_manager, "edit_message_text"), \
          patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
          patch.object(channel.chat_binding, "recover_topic_history") as recover_topic_history, \
+         patch.object(channel.db, "get_or_create_topic_recovery_scan") as create_scan, \
          patch.object(channel.chat_binding, "send_history_link") as send_history_link:
         channel.chat_binding.link_chat(update, [token, "false"])
 
     migrate_chat_history.assert_not_called()
     recover_topic_history.assert_not_called()
+    create_scan.assert_not_called()
     send_history_link.assert_not_called()
     _cleanup_link_state(channel, chat, bot_group)
 
