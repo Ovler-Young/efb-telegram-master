@@ -20,6 +20,7 @@ from efb_telegram_master.db import (
     DatabaseManager,
     HistoryMigrationEntry,
     MsgLog,
+    MsgLogIngestionScan,
     TopicAssoc,
     TopicRecoveryEntry,
     database,
@@ -36,6 +37,65 @@ def test_msglog_schema_has_durable_delivery_queue_id(channel):
         from efb_telegram_master.db import database
         columns = {column.name for column in database.get_columns("msglog")}
     assert {"sender_bot_id", "delivery_queue_id"}.issubset(columns)
+
+
+def test_msglog_ingestion_schema_has_live_provenance_and_durable_scan_state():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    with test_db.bind_ctx([MsgLog, MsgLogIngestionScan]):
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        MsgLog.create(
+            master_msg_id="100.1", slave_message_id="slave-1", text="first",
+            slave_origin_uid="tests.slave", msg_type="Text", sent_to="tests",
+        )
+        columns = {column.name for column in test_db.get_columns("msglogingestionscan")}
+        row = MsgLog.get()
+
+    assert row.provenance == "live"
+    assert {
+        "source_chat_id", "scan_boundary", "cursor", "existing_streak", "scanned_count",
+        "inserted_count", "existing_count", "skipped_count", "lease_owner",
+        "lease_expires_at", "status", "error",
+    }.issubset(columns)
+
+
+def test_msglog_ingestion_database_api_is_leased_and_idempotent():
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    manager = object.__new__(DatabaseManager)
+    manager.channel = SimpleNamespace(channel_id="tests")
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        scan = manager.get_or_create_msglog_ingestion_scan(100, 500)
+        assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
+        assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is None
+
+        content = SimpleNamespace(text="ingested", media_type="Text", mime=None, msg_type="Text")
+        assert manager.persist_msglog_ingestion_item(
+            scan, source_message_id=500, classification="eligible", slave_uid="tests.slave",
+            message=content, lease_owner="worker-a",
+        ) == "inserted"
+        assert manager.persist_msglog_ingestion_item(
+            scan, source_message_id=500, classification="eligible", slave_uid="tests.slave",
+            message=content, lease_owner="worker-a",
+        ) == "existing"
+        row = MsgLog.get(MsgLog.master_msg_id == "100.500")
+        assert row.provenance == "mtproto_ingested"
+        assert row.file_id is None
+        assert row.pickle is None
+
+        manager.finish_msglog_ingestion_scan(
+            scan, status="retryable-error", error="temporary", lease_owner="worker-a",
+        )
+        assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is not None
+    finally:
+        test_db.close()
+        database.initialize(original_database)
 
 
 def test_fresh_sqlite_msglog_rejects_duplicate_delivery_queue_id():
@@ -113,6 +173,85 @@ def test_sqlite_upgrade_creates_msglog_queue_id_index(tmp_path, monkeypatch):
     finally:
         upgraded.stop_worker()
         database.initialize(original_database)
+
+
+def test_sqlite_startup_adds_msglog_provenance_and_ingestion_scan(tmp_path, monkeypatch):
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    channel = SimpleNamespace(channel_id="tests.msglog-ingestion-migration", config={})
+    first = DatabaseManager(channel)
+    try:
+        MsgLogIngestionScan.drop_table()
+        MsgLog.drop_table()
+        database.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, master_msg_id_alt TEXT NULL, "
+            "slave_message_id TEXT NOT NULL, text TEXT NOT NULL, slave_origin_uid TEXT NOT NULL, "
+            "slave_origin_display_name TEXT NULL, slave_member_uid TEXT NULL, "
+            "slave_member_display_name TEXT NULL, media_type TEXT NULL, mime TEXT NULL, "
+            "file_id TEXT NULL, file_unique_id TEXT NULL, msg_type TEXT NOT NULL, pickle BLOB NULL, "
+            "sent_to TEXT NOT NULL, sender_bot_id TEXT NULL, delivery_queue_id TEXT NULL UNIQUE, "
+            "time DATETIME NULL)"
+        )
+        database.execute_sql(
+            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("100.1", "slave-1", "before upgrade", "tests.slave", "Text", "tests"),
+        )
+    finally:
+        first.stop_worker()
+
+    upgraded = DatabaseManager(channel)
+    try:
+        columns = {column.name for column in database.get_columns("msglog")}
+        scan_columns = {column.name for column in database.get_columns("msglogingestionscan")}
+        provenance = MsgLog.get(MsgLog.master_msg_id == "100.1").provenance
+    finally:
+        upgraded.stop_worker()
+        database.initialize(original_database)
+
+    assert "provenance" in columns
+    assert provenance == "live"
+    assert {"source_chat_id", "lease_owner", "existing_streak"}.issubset(scan_columns)
+
+
+def test_postgresql_msglog_ingestion_migration_adds_provenance_before_scan_table(monkeypatch):
+    operations = []
+
+    class FakeDatabase:
+        obj = object()
+
+        @staticmethod
+        def get_columns(_table_name):
+            return []
+
+        @staticmethod
+        def execute_sql(sql, _parameters=None):
+            operations.append(sql)
+
+        @staticmethod
+        def create_tables(models, safe=False):
+            operations.append(("create_tables", tuple(model.__name__ for model in models), safe))
+
+    class FakeMigrator:
+        def __init__(self, _database):
+            pass
+
+        @staticmethod
+        def add_column(table_name, column_name, _field):
+            operations.append(("add_column", table_name, column_name))
+            return "add-column"
+
+    manager = object.__new__(DatabaseManager)
+    manager._migrator_cls = FakeMigrator
+    monkeypatch.setattr(db_module, "database", FakeDatabase())
+    monkeypatch.setattr(db_module, "migrate", lambda *steps: operations.append(("migrate", steps)))
+
+    manager._migrate(8)
+
+    assert operations[0] == ("add_column", "msglog", "provenance")
+    assert operations[1][0] == "migrate"
+    assert operations[2] == "UPDATE msglog SET provenance = 'live' WHERE provenance IS NULL"
+    assert operations[3] == ("create_tables", ("MsgLogIngestionScan",), True)
 
 
 def test_postgresql_msglog_queue_id_migration_adds_column_before_unique_index(monkeypatch):

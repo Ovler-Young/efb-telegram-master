@@ -16,8 +16,10 @@ from peewee import (
     DatabaseProxy,
     DateTimeField,
     DoesNotExist,
+    IntegrityError,
     IntegerField,
     Model,
+    SQL,
     TextField,
     fn,
 )
@@ -150,6 +152,8 @@ class MsgLog(BaseModel):
     """Telegram bot user ID that sent this message. NULL means the main bot."""
     delivery_queue_id = TextField(null=True, unique=True)
     """Durable outbound queue identifier associated with a delivered Telegram receipt."""
+    provenance = TextField(default="live", constraints=[SQL("DEFAULT 'live'")])
+    """Origin of this record: ``live`` or ``mtproto_ingested``."""
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
@@ -252,6 +256,25 @@ class TopicRecoveryEntry(BaseModel):
 
     class Meta:
         indexes = ((("scan_id", "source_message_id"), True),)
+
+
+class MsgLogIngestionScan(BaseModel):
+    """One leased descending MTProto scan for a bound Telegram group."""
+    id = AutoField()
+    source_chat_id = TextField(unique=True)
+    scan_boundary = IntegerField()
+    cursor = IntegerField()
+    existing_streak = IntegerField(default=0)
+    scanned_count = IntegerField(default=0)
+    inserted_count = IntegerField(default=0)
+    existing_count = IntegerField(default=0)
+    skipped_count = IntegerField(default=0)
+    lease_owner = TextField(null=True)
+    lease_expires_at = DateTimeField(null=True)
+    status = TextField(default="pending")
+    error = TextField(null=True)
+    created_at = DateTimeField(default=datetime.datetime.now)
+    updated_at = DateTimeField(default=datetime.datetime.now)
 
 
 class HistoryMigrationEntry(BaseModel):
@@ -381,7 +404,7 @@ class DatabaseManager:
         """
         database.create_tables([
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
-            TopicRecoveryScan, TopicRecoveryEntry,
+            TopicRecoveryScan, TopicRecoveryEntry, MsgLogIngestionScan,
         ])
 
     @staticmethod
@@ -389,7 +412,7 @@ class DatabaseManager:
         """Create tables introduced after the original schema without touching existing data."""
         models = [
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
-            TopicRecoveryScan, TopicRecoveryEntry,
+            TopicRecoveryScan, TopicRecoveryEntry, MsgLogIngestionScan,
         ]
         existing_tables = set(database.get_tables())
         database.create_tables(
@@ -448,7 +471,7 @@ class DatabaseManager:
                 MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
                 MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
                 MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id, MsgLog.delivery_queue_id,
-                MsgLog.time,
+                MsgLog.provenance, MsgLog.time,
             ])
             if HistoryMigrationEntry.table_exists():
                 history_migration_entries = self._select_existing_columns(HistoryMigrationEntry, "historymigrationentry", [
@@ -515,6 +538,8 @@ class DatabaseManager:
                 column.name for column in database.get_columns("topicrecoveryentry")
             }:
                 self._migrate(7)
+            elif "provenance" not in msg_log_columns or "msglogingestionscan" not in database.get_tables():
+                self._migrate(8)
             else:
                 return
 
@@ -608,6 +633,12 @@ class DatabaseManager:
                 "CREATE UNIQUE INDEX IF NOT EXISTS topicrecoveryentry_delivery_queue_id "
                 "ON topicrecoveryentry (delivery_queue_id)"
             )
+        if i == 8:
+            msg_log_columns = {column.name for column in database.get_columns("msglog")}
+            if "provenance" not in msg_log_columns:
+                migrate(migrator.add_column("msglog", "provenance", MsgLog.provenance))
+            database.execute_sql("UPDATE msglog SET provenance = 'live' WHERE provenance IS NULL")
+            database.create_tables([MsgLogIngestionScan], safe=True)
 
     def _observe_legacy_outbound_rows(self) -> None:
         """Report retained workflow rows without loading or changing them."""
@@ -846,6 +877,136 @@ class DatabaseManager:
             return None
         except AttributeError:
             return None
+
+    def get_topic_assoc_slave_uid(
+        self, source_chat_id: int, topic_id: int,
+    ) -> Optional[EFBChannelChatIDStr]:
+        """Return the slave chat bound to one source forum topic."""
+        assoc = TopicAssoc.get_or_none(
+            (TopicAssoc.topic_chat_id == str(source_chat_id)) &
+            (TopicAssoc.message_thread_id == str(topic_id))
+        )
+        return EFBChannelChatIDStr(assoc.slave_uid) if assoc is not None else None
+
+    def get_or_create_msglog_ingestion_scan(
+        self, source_chat_id: int, scan_boundary: int,
+    ) -> MsgLogIngestionScan:
+        """Return the durable scan for one source group without changing its boundary."""
+        if scan_boundary <= 0:
+            raise ValueError("scan boundary must be positive")
+        source_id = str(source_chat_id)
+        scan = MsgLogIngestionScan.get_or_none(MsgLogIngestionScan.source_chat_id == source_id)
+        if scan is not None:
+            return scan
+        try:
+            return MsgLogIngestionScan.create(
+                source_chat_id=source_id,
+                scan_boundary=scan_boundary,
+                cursor=scan_boundary,
+            )
+        except IntegrityError:
+            return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == source_id)
+
+    def claim_msglog_ingestion_scan(
+        self, source_chat_id: int, lease_owner: str, lease_seconds: int,
+    ) -> Optional[MsgLogIngestionScan]:
+        """Claim a scan when no other unexpired worker owns its lease."""
+        if lease_seconds <= 0:
+            raise ValueError("lease seconds must be positive")
+        now = datetime.datetime.now()
+        lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
+        with database.atomic():
+            updated = MsgLogIngestionScan.update(
+                lease_owner=lease_owner,
+                lease_expires_at=lease_expires_at,
+                status="running",
+                error=None,
+                updated_at=now,
+            ).where(
+                (MsgLogIngestionScan.source_chat_id == str(source_chat_id)) &
+                (MsgLogIngestionScan.status != "complete") &
+                (
+                    MsgLogIngestionScan.lease_expires_at.is_null(True) |
+                    (MsgLogIngestionScan.lease_expires_at <= now) |
+                    (MsgLogIngestionScan.lease_owner == lease_owner)
+                )
+            ).execute()
+            if updated != 1:
+                return None
+            return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
+
+    def persist_msglog_ingestion_item(
+        self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str,
+        slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional[object] = None,
+        lease_owner: str,
+    ) -> str:
+        """Store one scan outcome and its cursor atomically."""
+        now = datetime.datetime.now()
+        with database.atomic():
+            current = MsgLogIngestionScan.get_by_id(scan.id)
+            if current.lease_owner != lease_owner or (
+                current.lease_expires_at is not None and current.lease_expires_at < now
+            ):
+                raise RuntimeError("MsgLog ingestion lease is no longer owned by this worker")
+            if current.status == "complete":
+                return "complete"
+
+            current.cursor = source_message_id - 1
+            current.scanned_count += 1
+            if classification != "eligible":
+                current.skipped_count += 1
+                outcome = "skipped"
+            else:
+                if slave_uid is None or message is None:
+                    raise ValueError("eligible ingestion record is missing its topic association or content")
+                master_msg_id = f"{current.source_chat_id}.{source_message_id}"
+                existing = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
+                if existing is not None:
+                    current.existing_count += 1
+                    current.existing_streak += 1
+                    outcome = "existing"
+                else:
+                    MsgLog.create(
+                        master_msg_id=master_msg_id,
+                        slave_message_id=f"mtproto-ingested:{master_msg_id}",
+                        text=str(getattr(message, "text")),
+                        slave_origin_uid=str(slave_uid),
+                        slave_member_uid=str(slave_uid),
+                        media_type=str(getattr(message, "media_type")),
+                        mime=getattr(message, "mime"),
+                        msg_type=str(getattr(message, "msg_type")),
+                        sent_to=self.channel.channel_id,
+                        provenance="mtproto_ingested",
+                    )
+                    current.inserted_count += 1
+                    current.existing_streak = 0
+                    outcome = "inserted"
+            if current.cursor <= 0 or current.existing_streak >= 500:
+                current.status = "complete"
+                current.lease_owner = None
+                current.lease_expires_at = None
+            current.updated_at = now
+            current.save()
+            scan.__data__.update(current.__data__)
+            return outcome
+
+    def finish_msglog_ingestion_scan(
+        self, scan: MsgLogIngestionScan, *, status: str, error: Optional[str] = None,
+        lease_owner: str,
+    ) -> None:
+        """Record a terminal or retryable scan state and release its lease."""
+        now = datetime.datetime.now()
+        with database.atomic():
+            current = MsgLogIngestionScan.get_by_id(scan.id)
+            if current.lease_owner not in (None, lease_owner):
+                raise RuntimeError("MsgLog ingestion lease is owned by another worker")
+            current.status = status
+            current.error = error
+            current.lease_owner = None
+            current.lease_expires_at = None
+            current.updated_at = now
+            current.save()
+            scan.__data__.update(current.__data__)
 
     @observe_database_method("get_topic_slaves")
     def get_topic_slaves(self, topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
