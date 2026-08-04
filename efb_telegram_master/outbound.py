@@ -6,13 +6,15 @@ import copy
 import inspect
 import io
 import numbers
+import os
 import pickle
+import shutil
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import Executor, Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Protocol
 from urllib.parse import unquote, urlsplit
@@ -295,6 +297,7 @@ class OutboundQueue:
     """Own the queue connection, codec, and transactional row mutations."""
 
     filename = "outbound-queue.sqlite3"
+    media_directory_name = "outbound-media"
 
     def __init__(self, channel_data_path: Path | str, metrics: Optional[QueueMetrics] = None):
         self.path = Path(channel_data_path) / self.filename
@@ -403,6 +406,55 @@ class OutboundQueue:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+
+    @property
+    def media_directory(self) -> Path:
+        return self.path.parent / self.media_directory_name
+
+    def _materialize_mtproto_media(self, descriptor: MTProtoMediaDescriptor) -> MTProtoMediaDescriptor:
+        """Copy queued MTProto media into storage that outlives the source stream."""
+        destination_directory = self.media_directory
+        destination_directory.mkdir(parents=True, exist_ok=True)
+        destination = destination_directory / uuid.uuid4().hex
+        temporary = destination.with_suffix(".tmp")
+        try:
+            with descriptor.open() as source, temporary.open("xb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+            if temporary.stat().st_size != descriptor.file_size:
+                raise QueueEnqueueError("MTProto media source changed while it was queued.")
+            os.replace(temporary, destination)
+            queued_descriptor = replace(descriptor, path=str(destination))
+            queued_descriptor.validate()
+            return queued_descriptor
+        except Exception:
+            for path in (temporary, destination):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+
+    def _artifact_path_from_payload(self, payload: bytes) -> Optional[Path]:
+        try:
+            args, _kwargs = self.decode_payload(payload)
+            descriptor = args[1] if len(args) == 2 else None
+            if not isinstance(descriptor, MTProtoMediaDescriptor):
+                return None
+            artifact = Path(descriptor.path).resolve()
+            if artifact.is_relative_to(self.media_directory.resolve()):
+                return artifact
+        except (InvalidQueuedPayloadError, OSError, TypeError):
+            pass
+        return None
+
+    @staticmethod
+    def _unlink_artifact(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
     def refresh_depth(self) -> None:
         if self.metrics is not None:
@@ -686,9 +738,12 @@ class OutboundQueue:
         )
         telegram_kwargs = self._normalize_thumbnail(request.operation, telegram_kwargs)
         telegram_kwargs = self._normalize_keyword_media(request.operation, telegram_kwargs)
+        artifact: Optional[Path] = None
         if request.operation == "send_mtproto_media":
             if len(telegram_args) != 2 or telegram_kwargs:
                 raise QueueEnqueueError("MTProto media requests require chat_id and a media descriptor.")
+            if priority != 0:
+                raise QueueEnqueueError("MTProto media requests require eventual delivery.")
             descriptor = telegram_args[1]
             if not isinstance(descriptor, MTProtoMediaDescriptor):
                 raise QueueEnqueueError("MTProto media requests require a media descriptor.")
@@ -696,12 +751,22 @@ class OutboundQueue:
                 descriptor.validate()
             except ValueError as error:
                 raise QueueEnqueueError(str(error)) from error
-        chat_id = self._destination(operation, telegram_args, telegram_kwargs)
-        payload = self.encode_payload(telegram_args, telegram_kwargs)
-        if request.log_context is not None and not isinstance(request.log_context, bytes):
-            raise QueueEnqueueError("Queued log context must be bytes when supplied.")
-        if request.log_context is not None and priority != 0:
-            raise QueueEnqueueError("Queued log context requires an eventual send.")
+            try:
+                queued_descriptor = self._materialize_mtproto_media(descriptor)
+            except (OSError, ValueError) as error:
+                raise QueueEnqueueError("Unable to persist queued MTProto media.") from error
+            telegram_args = (telegram_args[0], queued_descriptor)
+            artifact = Path(queued_descriptor.path)
+        try:
+            chat_id = self._destination(operation, telegram_args, telegram_kwargs)
+            payload = self.encode_payload(telegram_args, telegram_kwargs)
+            if request.log_context is not None and not isinstance(request.log_context, bytes):
+                raise QueueEnqueueError("Queued log context must be bytes when supplied.")
+            if request.log_context is not None and priority != 0:
+                raise QueueEnqueueError("Queued log context requires an eventual send.")
+        except Exception:
+            self._unlink_artifact(artifact)
+            raise
         return (
             request.operation, telegram_args, telegram_kwargs, chat_id, priority,
             slave_id, required_sender, payload, request.log_context,
@@ -713,9 +778,18 @@ class OutboundQueue:
         request_list = list(requests)
         if not request_list:
             raise QueueEnqueueError("Queued request sequence cannot be empty.")
-        prepared = [self._prepare(request, operation_resolver(request.operation)) for request in request_list]
+        prepared = []
+        try:
+            for request in request_list:
+                prepared.append(self._prepare(request, operation_resolver(request.operation)))
+        except Exception:
+            for item in prepared:
+                self._unlink_artifact(self._artifact_path_from_payload(item[7]))
+            raise
         destinations = {(item[3], item[4]) for item in prepared}
         if len(destinations) != 1:
+            for item in prepared:
+                self._unlink_artifact(self._artifact_path_from_payload(item[7]))
             raise QueueEnqueueError("Queued request sequence must share chat_id and priority.")
         with self._lock:
             try:
@@ -742,6 +816,8 @@ class OutboundQueue:
                     self.connection.rollback()
                 except sqlite3.Error:
                     pass
+                for item in prepared:
+                    self._unlink_artifact(self._artifact_path_from_payload(item[7]))
                 raise QueueEnqueueError("Unable to commit queued Telegram call.") from error
             if self.metrics is not None:
                 for operation, _args, _kwargs, _chat_id, priority, _slave_id, _required_sender, _payload, _log_context in prepared:
@@ -819,6 +895,10 @@ class OutboundQueue:
 
     def delete(self, row_id: int) -> None:
         with self._lock:
+            payload_row = self.connection.execute(
+                "SELECT payload FROM outbound_queue WHERE id = ?", (row_id,)
+            ).fetchone()
+            artifact = self._artifact_path_from_payload(payload_row[0]) if payload_row is not None else None
             try:
                 self.connection.execute("BEGIN")
                 cursor = self.connection.execute("DELETE FROM outbound_queue WHERE id = ?", (row_id,))
@@ -831,6 +911,10 @@ class OutboundQueue:
                 except sqlite3.Error:
                     pass
                 raise
+            try:
+                self._unlink_artifact(artifact)
+            except OSError as error:
+                raise QueuePersistenceError(f"Unable to remove queued media artifact {artifact}.") from error
 
     def fail_waiter(self, row_id: int, error: BaseException) -> None:
         waiter = self.waiters.pop(row_id, None)

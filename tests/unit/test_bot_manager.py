@@ -4,9 +4,11 @@ import inspect
 import io
 import string
 import random
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from pathlib import Path
 from typing import Iterator, BinaryIO
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -872,15 +874,6 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
                 raise MTProtoFloodWaitError("wait", retry_after=1)
             return MTProtoReceipt(chat_id=123, message_id=456)
 
-    source = tmp_path / "media.bin"
-    source.write_bytes(b"media")
-    with source.open("rb") as stream:
-        descriptor = MTProtoMediaDescriptor.from_stream(
-            stream, file_size=source.stat().st_size, caption="caption", reply_to=7,
-            force_document=True, supports_streaming=False, silent=False,
-            media_name="document", mime_type="application/octet-stream",
-        )
-
     manager = object.__new__(TelegramBotManager)
     queue = OutboundQueue(tmp_path)
     executor = ThreadPoolExecutor(max_workers=1)
@@ -904,11 +897,24 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
     manager.acquire_sender_limits = lambda _selection, _chat_id: True
     monkeypatch.setattr("efb_telegram_master.bot_manager.get_msg_type", lambda _message: "document")
 
-    receipt = manager.enqueue_mtproto_media(
-        chat_id=123, descriptor=descriptor, slave_id="slave",
-        db_log_context=QueuedDbLogContext(DurableMessage()),
-    )
+    with tempfile.NamedTemporaryFile(dir=tmp_path, delete=True) as stream:
+        stream.write(b"media")
+        stream.flush()
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=5, caption="caption", reply_to=7,
+            force_document=True, supports_streaming=False, silent=False,
+            media_name="document", mime_type="application/octet-stream",
+        )
+        receipt = manager.enqueue_mtproto_media(
+            chat_id=123, descriptor=descriptor, slave_id="slave",
+            db_log_context=QueuedDbLogContext(DurableMessage()),
+        )
     row_id = int(receipt.task_id)
+    queued_descriptor = queue.decode_payload(queue.heads()[0].payload)[0][1]
+    assert queued_descriptor.path != descriptor.path
+    assert queued_descriptor.path.startswith(str(tmp_path / "outbound-media"))
+
+    assert not Path(descriptor.path).exists()
     scheduler.dispatch_once()
     with pytest.raises(MTProtoFloodWaitError):
         scheduler.in_flight[row_id].future.result(timeout=1)
@@ -918,6 +924,14 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
     assert [row.id for row in queue.heads()] == [row_id]
     manager.channel.db.add_or_update_message_log.assert_not_called()
 
+    queue.close()
+    executor.shutdown()
+    queue = OutboundQueue(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1)
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
+    manager._outbound_queue = queue
+    manager._outbound_scheduler = scheduler
+
     scheduler.dispatch_once()
     scheduler.in_flight[row_id].future.result(timeout=1)
     scheduler.harvest_completed()
@@ -925,6 +939,8 @@ def test_queued_mtproto_media_retries_flood_wait_and_reconciles_one_log(tmp_path
     assert manager.channel.mtproto.calls == 2
     assert queue.heads() == []
     assert manager.channel.db.add_or_update_message_log.call_count == 1
+    assert not Path(queued_descriptor.path).exists()
+    queue.close()
     executor.shutdown()
 
 

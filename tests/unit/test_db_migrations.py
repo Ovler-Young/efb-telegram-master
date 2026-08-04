@@ -21,6 +21,7 @@ from efb_telegram_master.db import (
     HistoryMigrationEntry,
     MsgLog,
     TopicAssoc,
+    TopicRecoveryEntry,
     database,
 )
 from efb_telegram_master.message import ETMMsg
@@ -90,6 +91,38 @@ def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
     finally:
         manager.stop_worker()
         database.initialize(original_database)
+
+
+def test_sqlite_startup_upgrades_topic_recovery_entry_without_queue_id(tmp_path, monkeypatch):
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    channel = SimpleNamespace(channel_id="tests.topic-recovery-migration", config={})
+    first = DatabaseManager(channel)
+    try:
+        TopicRecoveryEntry.drop_table()
+        database.execute_sql("DROP INDEX IF EXISTS topicrecoveryentry_delivery_queue_id")
+        database.execute_sql(
+            "CREATE TABLE topicrecoveryentry ("
+            "id INTEGER PRIMARY KEY, scan_id INTEGER NOT NULL, source_message_id INTEGER NOT NULL, "
+            "classification TEXT NOT NULL, status TEXT NOT NULL, target_message_id INTEGER NULL, "
+            "error TEXT NULL, idempotency_key TEXT NOT NULL UNIQUE, updated_at DATETIME NOT NULL)"
+        )
+        assert "topicrecoveryentry_delivery_queue_id" not in {
+            index.name for index in database.get_indexes("topicrecoveryentry")
+        }
+    finally:
+        first.stop_worker()
+
+    upgraded = DatabaseManager(channel)
+    try:
+        columns = {column.name for column in database.get_columns("topicrecoveryentry")}
+        indexes = {index.name for index in database.get_indexes("topicrecoveryentry")}
+    finally:
+        upgraded.stop_worker()
+        database.initialize(original_database)
+
+    assert "delivery_queue_id" in columns
+    assert "topicrecoveryentry_delivery_queue_id" in indexes
 
 
 def test_startup_observes_raw_legacy_rows_without_mutating_them(tmp_path, monkeypatch, caplog):

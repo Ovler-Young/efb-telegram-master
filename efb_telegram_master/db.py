@@ -487,26 +487,29 @@ class DatabaseManager:
 
     def _check_and_run_migrations(self):
         """Check schema and run pending migrations."""
-        msg_log_columns = {i.name for i in database.get_columns("msglog")}
-        slave_chat_info_columns = {i.name for i in database.get_columns("slavechatinfo")}
-        if "file_id" not in msg_log_columns:
-            self._migrate(0)
-        elif "pickle" not in msg_log_columns:
-            self._migrate(1)
-        elif "slave_chat_group_id" not in slave_chat_info_columns:
-            self._migrate(2)
-        elif "file_unique_id" not in msg_log_columns:
-            self._migrate(3)
-        elif "sender_bot_id" not in msg_log_columns:
-            self._migrate(4)
-        elif "delivery_queue_id" not in msg_log_columns:
-            self._migrate(5)
-        elif "topicrecoveryscan" not in database.get_tables() or "topicrecoveryentry" not in database.get_tables():
-            self._migrate(6)
-        elif "delivery_queue_id" not in {
-            column.name for column in database.get_columns("topicrecoveryentry")
-        }:
-            self._migrate(7)
+        while True:
+            msg_log_columns = {i.name for i in database.get_columns("msglog")}
+            slave_chat_info_columns = {i.name for i in database.get_columns("slavechatinfo")}
+            if "file_id" not in msg_log_columns:
+                self._migrate(0)
+            elif "pickle" not in msg_log_columns:
+                self._migrate(1)
+            elif "slave_chat_group_id" not in slave_chat_info_columns:
+                self._migrate(2)
+            elif "file_unique_id" not in msg_log_columns:
+                self._migrate(3)
+            elif "sender_bot_id" not in msg_log_columns:
+                self._migrate(4)
+            elif "delivery_queue_id" not in msg_log_columns:
+                self._migrate(5)
+            elif "topicrecoveryscan" not in database.get_tables() or "topicrecoveryentry" not in database.get_tables():
+                self._migrate(6)
+            elif "delivery_queue_id" not in {
+                column.name for column in database.get_columns("topicrecoveryentry")
+            }:
+                self._migrate(7)
+            else:
+                return
 
     def _migrate(self, i: int):
         """
@@ -557,8 +560,12 @@ class DatabaseManager:
         if i <= 6:
             database.create_tables([TopicRecoveryScan, TopicRecoveryEntry], safe=True)
         if i == 7:
-            migrator.add_column(
-                "topicrecoveryentry", "delivery_queue_id", TopicRecoveryEntry.delivery_queue_id,
+            migrate(
+                migrator.add_column("topicrecoveryentry", "delivery_queue_id", TextField(null=True)),
+            )
+            database.execute_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS topicrecoveryentry_delivery_queue_id "
+                "ON topicrecoveryentry (delivery_queue_id)"
             )
 
     def _observe_legacy_outbound_rows(self) -> None:

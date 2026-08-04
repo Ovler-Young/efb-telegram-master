@@ -100,9 +100,35 @@ def test_mtproto_media_descriptor_survives_queue_restart_without_file_buffering(
     row = restarted.heads()[0]
     assert row.id == row_id
     _chat_id, restored = restarted.decode_payload(row.payload)[0]
-    assert restored == descriptor
+    assert restored.path != descriptor.path
+    assert restored.path.startswith(str(tmp_path / "outbound-media"))
     with restored.open() as stream:
         assert stream.read(1) == b"s"
+    restarted.delete(row_id)
+    assert not Path(restored.path).exists()
+    restarted.close()
+
+
+def test_mtproto_media_enqueue_error_removes_queue_owned_artifact(tmp_path):
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"streamed-data")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="", reply_to=None,
+            force_document=True, supports_streaming=False, silent=False,
+            media_name="document", mime_type=None,
+        )
+    queue = OutboundQueue(tmp_path)
+
+    with pytest.raises(QueueEnqueueError, match="log context"):
+        enqueue(queue, QueueRequest(
+            "send_mtproto_media", (123, descriptor),
+            {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+            log_context=object(),
+        ))
+
+    assert list(queue.media_directory.iterdir()) == []
+    queue.close()
 
 
 def test_queue_migrates_operation_constraint_for_durable_mtproto_media(tmp_path):
