@@ -186,6 +186,9 @@ class MasterMessageProcessor(LocaleMixin):
         if update.edited_message or update.edited_channel_post:
             self.logger.debug('[%s] Message is edited: %s', mid, message.edit_date)
             msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update))
+            if msg_log and msg_log.provenance == "mtproto_ingested":
+                self.logger.info("Ignoring edit for ingested synthetic message %s.", mid)
+                return
             if not msg_log or msg_log.slave_message_id == self.db.FAIL_FLAG:
                 sync_reply_text(self.bot, message,
                                 self._("Error: This message cannot be edited, and thus is not sent. (ME01)"),

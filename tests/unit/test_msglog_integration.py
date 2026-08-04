@@ -1,11 +1,14 @@
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 from threading import Lock
+from uuid import UUID
 
 from telegram import Update
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
+from efb_telegram_master.master_message import MasterMessageProcessor
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 
 
@@ -85,6 +88,63 @@ def test_msglog_ingestion_uses_the_bound_telegram_runtime_loop():
     ChatBindingManager._run_msglog_ingestion(manager, 100)
 
     assert len(runtime.calls) == 1
+
+
+def test_msglog_ingestion_worker_owners_are_unique_when_thread_ids_collide(monkeypatch):
+    owners = []
+
+    class RecordingService:
+        def __init__(self, _db, _mtproto):
+            pass
+
+        async def run(self, _source_chat_id, *, lease_owner):
+            owners.append(lease_owner)
+
+    class Runtime:
+        def call(self, coroutine):
+            asyncio.run(coroutine)
+
+    manager = object.__new__(ChatBindingManager)
+    manager.bot = SimpleNamespace(_runtime=Runtime())
+    manager.db = Mock()
+    manager.channel = SimpleNamespace(mtproto=SimpleNamespace())
+    manager.logger = Mock()
+    monkeypatch.setattr("efb_telegram_master.chat_binding.MsgLogIngestionService", RecordingService)
+    monkeypatch.setattr("efb_telegram_master.chat_binding.threading.get_ident", lambda: 42)
+
+    ChatBindingManager._run_msglog_ingestion(manager, 100)
+    ChatBindingManager._run_msglog_ingestion(manager, 100)
+
+    assert len(owners) == 2
+    assert owners[0] != owners[1]
+    assert all(UUID(owner).version == 4 for owner in owners)
+
+
+def test_ingested_master_edits_do_not_dispatch_or_remove_messages():
+    processor = object.__new__(MasterMessageProcessor)
+    processor.channel = SimpleNamespace(_=lambda text: text)
+    processor.channel_id = "tests.master"
+    processor.db = SimpleNamespace(
+        FAIL_FLAG="__fail__",
+        get_msg_log=Mock(return_value=SimpleNamespace(
+            provenance="mtproto_ingested", slave_message_id="mtproto-ingested:100.10",
+        )),
+    )
+    processor.logger = Mock()
+    processor.process_telegram_message = Mock()
+
+    for text in ("ordinary edit", "rm` remove remotely"):
+        message = Mock()
+        message.chat = SimpleNamespace(id=100, is_forum=False)
+        message.message_id = 10
+        message.text = text
+        message.to_dict.return_value = {}
+        update = Update(update_id=1, edited_message=message)
+
+        MasterMessageProcessor.msg(processor, update, None)
+
+    assert processor.db.get_msg_log.call_count == 2
+    processor.process_telegram_message.assert_not_called()
 
 
 def test_ingested_text_and_media_backfill_use_copy_message():
