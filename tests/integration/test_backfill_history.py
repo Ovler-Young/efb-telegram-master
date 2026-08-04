@@ -16,14 +16,14 @@ from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.db import HistoryMigrationEntry
-from efb_telegram_master.rate_limiter import CHAT_LIMIT
 from .helper.helper import wait_for_private_response
 from .utils import get_start_token
 
 pytestmark = pytest.mark.asyncio
 
 STREAM_INTERVAL_SECONDS = 0.5
-STREAM_MESSAGE_COUNT = CHAT_LIMIT + 2
+STREAM_DURATION_SECONDS = 60.0
+STREAM_MESSAGE_COUNT = int(STREAM_DURATION_SECONDS / STREAM_INTERVAL_SECONDS)
 STREAM_SETTLE_TIMEOUT = 8 * 60.0
 BACKFILL_WAIT_TIMEOUT = 6 * 60.0
 POLL_INTERVAL_SECONDS = 2.0
