@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Optional
 
 from .db import DatabaseManager
@@ -19,6 +20,7 @@ class IngestedMsgLog:
     mime: Optional[str]
     file_id: None = None
     pickle: None = None
+    time: Optional[datetime] = None
     provenance: str = "mtproto_ingested"
 
 
@@ -107,7 +109,11 @@ class MsgLogIngestionService:
         slave_uid = self.db.get_topic_assoc_slave_uid(source_chat_id, topic_id)
         if slave_uid is None:
             return "unbound-topic", None, None
-        return "eligible", slave_uid, self._content(message)
+        content = self._content(message)
+        source_time = getattr(message, "date", None)
+        if isinstance(source_time, datetime):
+            content = replace(content, time=source_time)
+        return "eligible", slave_uid, content
 
     @staticmethod
     def _message_id(message: object) -> Optional[int]:

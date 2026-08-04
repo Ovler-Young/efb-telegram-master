@@ -907,17 +907,21 @@ class DatabaseManager:
                     current.existing_streak += 1
                     outcome = "existing"
                 else:
+                    slave_channel_id, _, _ = chat_id_str_to_id(slave_uid)
+                    synthetic_member_uid = chat_id_to_str(slave_channel_id, ChatID("__self__"))
+                    source_time = getattr(message, "time", None)
                     MsgLog.create(
                         master_msg_id=master_msg_id,
                         slave_message_id=f"mtproto-ingested:{master_msg_id}",
                         text=str(getattr(message, "text")),
                         slave_origin_uid=str(slave_uid),
-                        slave_member_uid=str(slave_uid),
+                        slave_member_uid=str(synthetic_member_uid),
                         media_type=str(getattr(message, "media_type")),
                         mime=getattr(message, "mime"),
                         msg_type=str(getattr(message, "msg_type")),
                         sent_to=self.channel.channel_id,
                         provenance="mtproto_ingested",
+                        time=source_time if isinstance(source_time, datetime.datetime) else now,
                     )
                     current.inserted_count += 1
                     current.existing_streak = 0

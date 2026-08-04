@@ -74,19 +74,25 @@ def test_msglog_ingestion_database_api_is_leased_and_idempotent():
         assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
         assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is None
 
-        content = SimpleNamespace(text="ingested", media_type="Text", mime=None, msg_type="Text")
+        source_time = datetime(2026, 8, 4, 12, 30)
+        content = SimpleNamespace(
+            text="ingested", media_type="Text", mime=None, msg_type="Text", time=source_time,
+        )
         assert manager.persist_msglog_ingestion_item(
-            scan, source_message_id=500, classification="eligible", slave_uid="tests.slave",
+            scan, source_message_id=500, classification="eligible", slave_uid="tests.slave target",
             message=content, lease_owner="worker-a",
         ) == "inserted"
         assert manager.persist_msglog_ingestion_item(
-            scan, source_message_id=500, classification="eligible", slave_uid="tests.slave",
+            scan, source_message_id=500, classification="eligible", slave_uid="tests.slave target",
             message=content, lease_owner="worker-a",
         ) == "existing"
         row = MsgLog.get(MsgLog.master_msg_id == "100.500")
         assert row.provenance == "mtproto_ingested"
         assert row.file_id is None
         assert row.pickle is None
+        assert row.time == source_time
+        assert row.slave_member_uid == "tests.slave __self__"
+        assert utils.chat_id_str_to_id(row.slave_member_uid) == ("tests.slave", "__self__", None)
 
         manager.finish_msglog_ingestion_scan(
             scan, status="retryable-error", error="temporary", lease_owner="worker-a",

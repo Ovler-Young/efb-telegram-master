@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -73,10 +74,11 @@ class FakeMTProto:
         return [self.messages[message_id] for message_id in message_ids if message_id in self.messages]
 
 
-def topic_message(message_id, *, topic_id=10, media=None):
+def topic_message(message_id, *, topic_id=10, media=None, date=None):
     return SimpleNamespace(
         id=message_id,
         message=f"message {message_id}",
+        date=date,
         reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=topic_id),
         action=None,
         media=media,
@@ -127,7 +129,8 @@ def _five_hundred_rule(db, scan, *, source_message_id, classification, **_kwargs
 def test_ingestion_classifies_media_without_bot_file_ids_or_pickle_payloads():
     db = FakeDatabase(scan_boundary=1)
     media = SimpleNamespace(document=SimpleNamespace(mime_type="video/mp4", attributes=[]))
-    mtproto = FakeMTProto({1: topic_message(1, media=media)}, scan_ceiling=1)
+    source_time = datetime(2026, 8, 4, 12, 30, tzinfo=timezone.utc)
+    mtproto = FakeMTProto({1: topic_message(1, media=media, date=source_time)}, scan_ceiling=1)
 
     asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
 
@@ -138,6 +141,7 @@ def test_ingestion_classifies_media_without_bot_file_ids_or_pickle_payloads():
     assert stored.file_id is None
     assert stored.pickle is None
     assert stored.provenance == "mtproto_ingested"
+    assert stored.time == source_time
 
 
 def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_cursor():
