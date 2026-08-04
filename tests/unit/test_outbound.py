@@ -1265,7 +1265,7 @@ def test_unknown_row_blocks_its_destination_until_an_operator_requeues_or_resolv
 
 def test_sent_pending_rows_survive_restart_without_telegram_resend(tmp_path):
     queue = OutboundQueue(tmp_path)
-    row_id, _waiter = enqueue(queue, QueueRequest(
+    row_id, waiter = enqueue(queue, QueueRequest(
         "send_message", (), {"chat_id": 7, "text": "durable"}, log_context=b"\x01context",
     ))
     first_adapter = DurableAdapter(reconcile=False)
@@ -1277,6 +1277,8 @@ def test_sent_pending_rows_survive_restart_without_telegram_resend(tmp_path):
 
     assert first_adapter.calls == [(row_id, 7, "send_message")]
     assert [row.id for row in queue.sent_pending()] == [row_id]
+    assert not waiter.done()
+    assert queue.waiters[row_id] is waiter
     scheduler.dispatch_once()
     assert first_adapter.calls == [(row_id, 7, "send_message")]
     queue.close()
@@ -1292,6 +1294,26 @@ def test_sent_pending_rows_survive_restart_without_telegram_resend(tmp_path):
     assert restarted.sent_pending() == []
     assert second_adapter.calls == []
     second_executor.shutdown()
+
+
+def test_immediate_durable_reconciliation_resolves_and_removes_eventual_waiter(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "durable"}, log_context=b"\x01context",
+    ))
+    adapter = DurableAdapter(reconcile=True)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    assert waiter.result(timeout=1) == row_id
+    assert row_id not in queue.waiters
+    assert queue.sent_pending() == []
+    assert queue.heads() == []
+    queue.close()
 
 
 def test_sent_pending_row_blocks_later_destination_row_until_reconciled(tmp_path):

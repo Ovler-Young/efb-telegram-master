@@ -481,10 +481,12 @@ def test_recovery_restart_after_interrupted_waiter_reconciles_and_continues_scan
     assert not recovery_thread.is_alive()
     assert adapter.calls == [1, 2, 3]
     assert restarted_queue.heads() == []
+    assert restarted_queue.waiters == {}
     assert [database.entries[(1, message_id)].status for message_id in range(1, 4)] == [
         "accepted", "accepted", "accepted",
     ]
     assert len(database.msglog_receipts) == 3
+    assert database.scan.cursor == 3
     assert database.scan.status == "complete"
     restarted_queue.close()
 
