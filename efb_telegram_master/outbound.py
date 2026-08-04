@@ -6,7 +6,6 @@ import copy
 import inspect
 import io
 import numbers
-import os
 import pickle
 import shutil
 import sqlite3
@@ -416,23 +415,21 @@ class OutboundQueue:
         """Copy queued MTProto media into storage that outlives the source stream."""
         destination_directory = self.media_directory
         destination_directory.mkdir(parents=True, exist_ok=True)
-        destination = destination_directory / uuid.uuid4().hex
-        temporary = destination.with_suffix(".tmp")
+        file_name = descriptor.media_filename()
+        destination = destination_directory / f"{uuid.uuid4().hex}{Path(file_name).suffix}"
         try:
-            with descriptor.open() as source, temporary.open("xb") as target:
+            with descriptor.open() as source, destination.open("xb") as target:
                 shutil.copyfileobj(source, target, length=1024 * 1024)
-            if temporary.stat().st_size != descriptor.file_size:
+            if destination.stat().st_size != descriptor.file_size:
                 raise QueueEnqueueError("MTProto media source changed while it was queued.")
-            os.replace(temporary, destination)
-            queued_descriptor = replace(descriptor, path=str(destination))
+            queued_descriptor = replace(descriptor, path=str(destination), file_name=file_name)
             queued_descriptor.validate()
             return queued_descriptor
         except Exception:
-            for path in (temporary, destination):
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+            try:
+                destination.unlink()
+            except FileNotFoundError:
+                pass
             raise
 
     def _artifact_path_from_payload(self, payload: bytes) -> Optional[Path]:

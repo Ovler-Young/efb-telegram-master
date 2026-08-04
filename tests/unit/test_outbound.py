@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import io
 from pathlib import Path
 import sqlite3
@@ -115,11 +116,35 @@ def test_mtproto_media_descriptor_survives_queue_restart_without_file_buffering(
     _chat_id, restored = restarted.decode_payload(row.payload)[0]
     assert restored.path != descriptor.path
     assert restored.path.startswith(str(tmp_path / "outbound-media"))
+    assert Path(restored.path).suffix == ".bin"
+    assert restored.media_filename() == "media.bin"
     with restored.open() as stream:
         assert stream.read(1) == b"s"
     restarted.delete(row_id)
     assert not Path(restored.path).exists()
     restarted.close()
+
+
+def test_mtproto_queue_artifact_uses_only_a_safe_generated_filename(tmp_path):
+    source = tmp_path / "media.jpg"
+    source.write_bytes(b"streamed-data")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="", reply_to=None,
+            force_document=False, supports_streaming=False, silent=False,
+            media_name="photo", mime_type="image/jpeg",
+        )
+    descriptor = replace(descriptor, file_name="../../outside.jpg")
+    queue = OutboundQueue(tmp_path)
+
+    with pytest.raises(QueueEnqueueError, match="file name"):
+        enqueue(queue, QueueRequest(
+            "send_mtproto_media", (123, descriptor),
+            {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+        ))
+
+    assert not queue.media_directory.exists()
+    queue.close()
 
 
 def test_mtproto_media_enqueue_error_removes_queue_owned_artifact(tmp_path):

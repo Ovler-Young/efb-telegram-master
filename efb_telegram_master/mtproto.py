@@ -1,6 +1,8 @@
 """Request-only MTProto operations used alongside the Bot API client."""
 
+import mimetypes
 import os
+import re
 import threading
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -15,6 +17,50 @@ GetMessagesRequestFactory: TypeAlias = Callable[[object, list[int]], object]
 # ``document_size_max``.  It is the fallback used before that request is
 # available, and keeps oversized-media routing bounded at 2 GiB.
 PROJECT_MEDIA_LIMIT = 2 * 1024 * 1024 * 1024
+
+_MEDIA_DEFAULT_SUFFIXES = {
+    "photo": ".jpg",
+    "video": ".mp4",
+    "animation": ".gif",
+    "document": ".bin",
+}
+
+
+def _media_filename(name: str, media_name: str, mime_type: Optional[str]) -> str:
+    """Return a portable filename that Telethon can use for media inference."""
+    if not isinstance(name, str) or not name:
+        name = "upload"
+    base_name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", base_name).strip(".")
+    stem, suffix = os.path.splitext(sanitized)
+    if not stem:
+        stem = "upload"
+    if not suffix:
+        normalized_mime = mime_type.split(";", 1)[0].strip().lower() if mime_type else ""
+        suffix = mimetypes.guess_extension(normalized_mime) or _MEDIA_DEFAULT_SUFFIXES[media_name]
+    return f"{stem[:200]}{suffix.lower()}"
+
+
+def _telethon_media_attributes(
+    file_name: str, media_name: str, mime_type: Optional[str], supports_streaming: bool
+) -> list[object]:
+    """Build explicit document attributes so queued media does not depend on artifact paths."""
+    if media_name == "photo":
+        return []
+    from telethon.tl import types
+
+    attributes: list[object] = [types.DocumentAttributeFilename(file_name)]
+    is_video = media_name == "video" or (
+        media_name == "animation" and isinstance(mime_type, str)
+        and mime_type.split(";", 1)[0].strip().lower().startswith("video/")
+    )
+    if is_video:
+        attributes.append(types.DocumentAttributeVideo(
+            duration=0, w=1, h=1, supports_streaming=supports_streaming,
+        ))
+    if media_name == "animation":
+        attributes.append(types.DocumentAttributeAnimated())
+    return attributes
 
 _session_owners: set[Path] = set()
 _session_owners_lock = threading.Lock()
@@ -74,6 +120,7 @@ class MTProtoMediaDescriptor:
     silent: bool
     media_name: str
     mime_type: Optional[str]
+    file_name: str = ""
 
     VERSION = 1
 
@@ -98,6 +145,7 @@ class MTProtoMediaDescriptor:
         descriptor = cls(
             cls.VERSION, str(path), file_size, caption, reply_to, force_document,
             supports_streaming, silent, media_name, mime_type,
+            _media_filename(path.name, media_name, mime_type),
         )
         descriptor.validate()
         return descriptor
@@ -119,6 +167,15 @@ class MTProtoMediaDescriptor:
             raise ValueError("MTProto media descriptor has invalid flags.")
         if self.mime_type is not None and not isinstance(self.mime_type, str):
             raise ValueError("MTProto media descriptor has an invalid MIME type.")
+        file_name = getattr(self, "file_name", "")
+        if not isinstance(file_name, str):
+            raise ValueError("MTProto media descriptor has an invalid file name.")
+        if file_name and (
+            "/" in file_name
+            or "\\" in file_name
+            or file_name != _media_filename(file_name, self.media_name, self.mime_type)
+        ):
+            raise ValueError("MTProto media descriptor has an invalid file name.")
         path = Path(self.path)
         try:
             resolved = path.resolve(strict=True)
@@ -135,6 +192,14 @@ class MTProtoMediaDescriptor:
     def open(self):
         self.validate()
         return Path(self.path).open("rb")
+
+    def media_filename(self) -> str:
+        """Return the preserved name, or derive a safe legacy fallback."""
+        return _media_filename(
+            getattr(self, "file_name", "") or Path(self.path).name,
+            self.media_name,
+            self.mime_type,
+        )
 
 
 class MTProtoSessionOwnershipError(RuntimeError):
@@ -328,10 +393,12 @@ class MTProtoClient:
                 raise
             raise translated from error
 
-    async def upload_stream(self, stream: object, *, file_size: Optional[int] = None) -> object:
+    async def upload_stream(
+        self, stream: object, *, file_size: Optional[int] = None, file_name: Optional[str] = None
+    ) -> object:
         """Pass a caller-owned stream to Telethon without reading it into adapter memory."""
         try:
-            return await self.client.upload_file(stream, file_size=file_size)
+            return await self.client.upload_file(stream, file_size=file_size, file_name=file_name)
         except BaseException as error:
             translated = translate_mtproto_error(error)
             if translated is error:
@@ -370,6 +437,9 @@ class MTProtoClient:
         force_document: bool,
         supports_streaming: bool,
         silent: bool,
+        media_name: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        file_name: Optional[str] = None,
     ) -> MTProtoReceipt:
         """Upload a stream and send it, retaining only Telethon's input-file handle."""
         limit = await self.media_limit()
@@ -377,17 +447,27 @@ class MTProtoClient:
             raise MTProtoMediaLimitError(
                 f"Attachment is {file_size} bytes; MTProto allows at most {limit} bytes."
             )
-        uploaded = await self.upload_stream(stream, file_size=file_size)
+        uploaded = await self.upload_stream(stream, file_size=file_size, file_name=file_name)
         try:
+            send_kwargs: dict[str, object] = {
+                "caption": caption,
+                "parse_mode": "html",
+                "reply_to": reply_to,
+                "force_document": force_document,
+                "supports_streaming": supports_streaming,
+                "silent": silent,
+            }
+            if file_name is not None:
+                if media_name not in {"document", "photo", "video", "animation"}:
+                    raise ValueError("MTProto media has an invalid media name.")
+                send_kwargs["mime_type"] = mime_type
+                send_kwargs["attributes"] = _telethon_media_attributes(
+                    file_name, media_name, mime_type, supports_streaming,
+                )
             result = await self.client.send_file(
                 chat_id,
                 uploaded,
-                caption=caption,
-                parse_mode="html",
-                reply_to=reply_to,
-                force_document=force_document,
-                supports_streaming=supports_streaming,
-                silent=silent,
+                **send_kwargs,
             )
         except BaseException as error:
             translated = translate_mtproto_error(error)
@@ -412,6 +492,9 @@ class MTProtoClient:
                 force_document=descriptor.force_document,
                 supports_streaming=descriptor.supports_streaming,
                 silent=descriptor.silent,
+                media_name=descriptor.media_name,
+                mime_type=descriptor.mime_type,
+                file_name=descriptor.media_filename(),
             )
 
     async def download_message_media(self, chat_id: int, message_id: int, destination: object) -> None:

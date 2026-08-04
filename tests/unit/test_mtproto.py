@@ -6,6 +6,8 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from telethon import utils as telethon_utils
+from telethon.tl import types as telethon_types
 
 from efb_telegram_master.mtproto import (
     MTProtoClient,
@@ -13,6 +15,7 @@ from efb_telegram_master.mtproto import (
     MTProtoFloodWaitError,
     MTProtoMediaDescriptor,
     MTProtoMediaLimitError,
+    MTProtoReceipt,
     MTProtoRetryableError,
     MTProtoSessionOwnershipError,
     normalize_receipts,
@@ -68,8 +71,10 @@ class FakeClient:
         for chunk in self.download_chunks:
             yield chunk
 
-    async def upload_file(self, stream: object, *, file_size: int | None = None) -> object:
-        self.uploaded = (stream, file_size)
+    async def upload_file(
+        self, stream: object, *, file_size: int | None = None, file_name: str | None = None
+    ) -> object:
+        self.uploaded = (stream, file_size, file_name)
         return "uploaded"
 
     async def send_file(self, chat_id: int, uploaded: object, **kwargs: object) -> object:
@@ -270,7 +275,7 @@ async def test_media_transfer_streams_without_buffering(tmp_path: Path):
     assert [chunk async for chunk in client.iter_download("media", chunk_size=512)] == [b"first", b"second"]
     stream = object()
     assert await client.upload_stream(stream, file_size=10) == "uploaded"
-    assert client.client.uploaded == (stream, 10)
+    assert client.client.uploaded == (stream, 10, None)
     await client.disconnect()
 
 
@@ -288,12 +293,102 @@ async def test_large_media_send_uses_uploaded_stream_and_normalizes_receipt(tmp_
 
     assert receipt.chat_id == 77
     assert receipt.message_id == 44
-    assert client.client.uploaded == (stream, 512)
+    assert client.client.uploaded == (stream, 512, None)
     assert client.client.sent_files == [(77, "uploaded", {
         "caption": "caption", "parse_mode": "html", "reply_to": 9, "force_document": True,
         "supports_streaming": False, "silent": True,
     })]
     stream.read.assert_not_called()
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("media_name", "suffix", "mime_type", "force_document", "supports_streaming", "attribute_types"),
+    [
+        ("photo", ".jpg", "image/jpeg", False, False, ()),
+        (
+            "video", ".mp4", "video/mp4", False, True,
+            (telethon_types.DocumentAttributeFilename, telethon_types.DocumentAttributeVideo),
+        ),
+        (
+            "animation", ".gif", "image/gif", False, True,
+            (telethon_types.DocumentAttributeFilename, telethon_types.DocumentAttributeAnimated),
+        ),
+        ("document", ".bin", "application/octet-stream", True, False, (telethon_types.DocumentAttributeFilename,)),
+    ],
+)
+async def test_queued_media_restart_preserves_telethon_media_construction(
+    tmp_path: Path,
+    media_name: str,
+    suffix: str,
+    mime_type: str,
+    force_document: bool,
+    supports_streaming: bool,
+    attribute_types: tuple[type, ...],
+):
+    from efb_telegram_master.outbound import OutboundQueue, QueueRequest
+
+    source = tmp_path / f"original{suffix}"
+    source.write_bytes(b"streamed-data")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="caption", reply_to=9,
+            force_document=force_document, supports_streaming=supports_streaming, silent=True,
+            media_name=media_name, mime_type=mime_type,
+        )
+    queue = OutboundQueue(tmp_path)
+    queue.enqueue_many(
+        [QueueRequest(
+            "send_mtproto_media", (77, descriptor),
+            {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+        )],
+        lambda _operation: lambda chat_id, queued_descriptor: (chat_id, queued_descriptor),
+    )
+    queue.close()
+
+    restarted = OutboundQueue(tmp_path)
+    _chat_id, restored = restarted.decode_payload(restarted.heads()[0].payload)[0]
+    assert Path(restored.path).suffix == suffix
+    assert restored.media_filename() == f"original{suffix}"
+
+    client = MTProtoClient(enabled_config(), "bot-token", tmp_path, client_factory=FakeClient)
+    await client.connect()
+    receipt = await client.send_media_descriptor(77, restored)
+
+    assert receipt == MTProtoReceipt(chat_id=77, message_id=44)
+    assert client.client.uploaded[1:] == (source.stat().st_size, f"original{suffix}")
+    sent_kwargs = client.client.sent_files[0][2]
+    assert sent_kwargs["mime_type"] == mime_type
+    assert tuple(type(attribute) for attribute in sent_kwargs["attributes"]) == attribute_types
+    if media_name == "photo":
+        assert telethon_utils.is_image(f"original{suffix}")
+    if media_name == "video":
+        video = sent_kwargs["attributes"][1]
+        assert video.supports_streaming is True
+
+    await client.disconnect()
+    restarted.delete(restarted.heads()[0].id)
+    restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_extensionless_artifact_uses_descriptor_metadata(tmp_path: Path):
+    artifact = tmp_path / "legacy-artifact"
+    artifact.write_bytes(b"streamed-data")
+    descriptor = MTProtoMediaDescriptor(
+        MTProtoMediaDescriptor.VERSION, str(artifact), artifact.stat().st_size,
+        "caption", None, False, False, False, "photo", "image/jpeg",
+    )
+    client = MTProtoClient(enabled_config(), "bot-token", tmp_path, client_factory=FakeClient)
+    await client.connect()
+
+    await client.send_media_descriptor(77, descriptor)
+
+    assert client.client.uploaded[2] == "legacy-artifact.jpg"
+    sent_kwargs = client.client.sent_files[0][2]
+    assert sent_kwargs["mime_type"] == "image/jpeg"
+    assert sent_kwargs["attributes"] == []
     await client.disconnect()
 
 
@@ -313,8 +408,9 @@ async def test_media_descriptor_reopens_a_path_without_materializing_file(tmp_pa
     receipt = await client.send_media_descriptor(77, descriptor)
 
     assert (receipt.chat_id, receipt.message_id) == (77, 44)
-    uploaded, file_size = client.client.uploaded
+    uploaded, file_size, file_name = client.client.uploaded
     assert file_size == source.stat().st_size
+    assert file_name == "large.bin"
     assert uploaded.closed
     await client.disconnect()
 
