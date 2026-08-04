@@ -1,6 +1,5 @@
 """Bounded, durable recovery of messages from a non-General forum topic."""
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -24,10 +23,11 @@ class TopicRecoveryRequest:
 class TopicHistoryRecovery:
     """Recover one topic in ascending, idempotent MTProto batches."""
 
-    def __init__(self, db: DatabaseManager, bot: Any, mtproto: Any) -> None:
+    def __init__(self, db: DatabaseManager, bot: Any, mtproto: Any, runtime: Any) -> None:
         self.db = db
         self.bot = bot
         self.mtproto = mtproto
+        self.runtime = runtime
         self.logger = logging.getLogger(__name__)
 
     def recover(self, request: TopicRecoveryRequest) -> None:
@@ -35,7 +35,7 @@ class TopicHistoryRecovery:
             raise ValueError("General or ambiguous forum topic cannot be recovered")
         if request.scan_boundary <= 0:
             return
-        asyncio.run(self._recover(request))
+        self.runtime.call(self._recover(request))
 
     async def _recover(self, request: TopicRecoveryRequest) -> None:
         scan = self.db.get_or_create_topic_recovery_scan(
@@ -92,9 +92,12 @@ class TopicHistoryRecovery:
             )
             return
 
+        queue_id = getattr(existing, "delivery_queue_id", None) if existing is not None else None
+        if queue_id is None:
+            queue_id = f"topic-recovery:{scan.id}:{message_id}"
         self.db.save_topic_recovery_entry(
             scan_id=scan.id, source_message_id=message_id, classification="accepted",
-            status="prepared", idempotency_key=key,
+            status="prepared", idempotency_key=key, delivery_queue_id=queue_id,
         )
         try:
             context = TelegramBotManager.encode_topic_recovery_log_context(
@@ -117,6 +120,7 @@ class TopicHistoryRecovery:
                 },
                 history_entry_ids=[],
                 log_context=context,
+                queue_id=queue_id,
             )
             receipt = waiter.result()
             target_message_id = self._receipt_message_id(receipt)

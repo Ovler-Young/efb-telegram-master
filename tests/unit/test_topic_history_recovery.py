@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -36,6 +38,9 @@ class FakeDatabase:
         return self.entries.get((scan_id, source_message_id))
 
     def save_topic_recovery_entry(self, **kwargs):
+        previous = self.entries.get((kwargs["scan_id"], kwargs["source_message_id"]))
+        if "delivery_queue_id" not in kwargs and previous is not None:
+            kwargs["delivery_queue_id"] = getattr(previous, "delivery_queue_id", None)
         entry = SimpleNamespace(**kwargs)
         self.entries[(kwargs["scan_id"], kwargs["source_message_id"])] = entry
         return entry
@@ -54,11 +59,14 @@ class FakeDatabase:
 class FakeMTProto:
     def __init__(self):
         self.calls = []
+        self.loops = []
 
     async def get_input_channel(self, chat_id):
+        self.loops.append(asyncio.get_running_loop())
         return chat_id
 
     async def get_channel_messages(self, channel, ids):
+        self.loops.append(asyncio.get_running_loop())
         self.calls.append((channel, ids))
         return [
             SimpleNamespace(id=message_id, reply_to=SimpleNamespace(
@@ -68,13 +76,29 @@ class FakeMTProto:
         ]
 
 
+class FakeRuntime:
+    def __init__(self):
+        self.calls = []
+        self.loop = None
+
+    def call(self, coroutine):
+        self.calls.append(coroutine)
+        loop = asyncio.new_event_loop()
+        self.loop = loop
+        try:
+            return loop.run_until_complete(coroutine)
+        finally:
+            loop.close()
+
+
 def test_recovery_requests_ascending_batches_and_records_target_receipts():
     database = FakeDatabase()
     mtproto = FakeMTProto()
     bot = SimpleNamespace(enqueue_history_operation=Mock(
         return_value=SimpleNamespace(result=lambda: SimpleNamespace(message_id=900))
     ))
-    recovery = TopicHistoryRecovery(database, bot, mtproto)
+    runtime = FakeRuntime()
+    recovery = TopicHistoryRecovery(database, bot, mtproto, runtime)
 
     recovery.recover(TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 205))
 
@@ -84,6 +108,8 @@ def test_recovery_requests_ascending_batches_and_records_target_receipts():
     assert database.entries[(1, 205)].status == "accepted"
     assert database.entries[(1, 205)].target_message_id == 900
     assert len(database.msglog_receipts) == 205
+    assert len(runtime.calls) == 1
+    assert mtproto.loops and all(loop is runtime.loop for loop in mtproto.loops)
 
 
 def test_recovery_copy_uses_a_versioned_durable_completion_context():
@@ -93,7 +119,7 @@ def test_recovery_copy_uses_a_versioned_durable_completion_context():
         return_value=SimpleNamespace(result=lambda: SimpleNamespace(message_id=900))
     ))
 
-    TopicHistoryRecovery(database, bot, FakeMTProto()).recover(
+    TopicHistoryRecovery(database, bot, FakeMTProto(), FakeRuntime()).recover(
         TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 1)
     )
 
@@ -181,6 +207,115 @@ def test_recovery_receipt_reconciles_after_restart_without_copying_twice(tmp_pat
     assert restarted.sent_pending() == []
 
 
+def test_recovery_restart_after_queue_commit_reuses_one_copy_row_before_dispatch(tmp_path):
+    database = FakeDatabase()
+    database.scan.scan_boundary = 1
+
+    def copy_message(*, chat_id, from_chat_id, message_id, message_thread_id, disable_notification):
+        return chat_id, from_chat_id, message_id, message_thread_id, disable_notification
+
+    class QueueingBot:
+        def __init__(self, queue, interrupt_after_commit):
+            self.queue = queue
+            self.interrupt_after_commit = interrupt_after_commit
+            self.enqueued = threading.Event()
+
+        def enqueue_history_operation(self, *, operation, args, kwargs, log_context, queue_id, **_ignored):
+            row_id, waiter = self.queue.enqueue_many(
+                [QueueRequest(operation, args, dict(kwargs), log_context, queue_id)],
+                lambda _operation: copy_message,
+            )
+            self.enqueued.set()
+            if self.interrupt_after_commit:
+                raise RuntimeError("simulated restart before dispatcher submission")
+            return waiter
+
+    def reconcile_topic_recovery_delivery(**kwargs):
+        database.save_topic_recovery_entry(
+            scan_id=kwargs["scan_id"], source_message_id=kwargs["source_message_id"],
+            classification="accepted", status="accepted", idempotency_key=kwargs["idempotency_key"],
+            target_message_id=kwargs["target_message_id"], delivery_queue_id=kwargs["delivery_queue_id"],
+        )
+        database.add_topic_recovery_msg_log(
+            source_chat_id=kwargs["source_chat_id"], source_message_id=kwargs["source_message_id"],
+            target_chat_id=kwargs["target_chat_id"], target_message_id=kwargs["target_message_id"],
+            slave_chat_id=kwargs["slave_chat_id"], text=kwargs["text"],
+        )
+
+    database.reconcile_topic_recovery_delivery = reconcile_topic_recovery_delivery
+
+    first_queue = OutboundQueue(tmp_path)
+    first_bot = QueueingBot(first_queue, interrupt_after_commit=True)
+    request = TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 1)
+    TopicHistoryRecovery(database, first_bot, FakeMTProto(), FakeRuntime()).recover(request)
+
+    entry = database.entries[(1, 1)]
+    assert entry.status == "error"
+    assert entry.delivery_queue_id == "topic-recovery:1:1"
+    assert len(first_queue.heads()) == 1
+    first_queue.close()
+
+    restarted_queue = OutboundQueue(tmp_path)
+    restarted_bot = QueueingBot(restarted_queue, interrupt_after_commit=False)
+    recovery_thread = threading.Thread(
+        target=TopicHistoryRecovery(database, restarted_bot, FakeMTProto(), FakeRuntime()).recover,
+        args=(request,),
+    )
+    recovery_thread.start()
+    assert restarted_bot.enqueued.wait(timeout=1)
+    rows = restarted_queue.heads()
+    assert len(rows) == 1
+    assert rows[0].queue_id == "topic-recovery:1:1"
+
+    class Adapter:
+        def __init__(self):
+            self.calls = []
+
+        def select_sender(self, row, now):
+            return SenderSelectionResult(selection=SenderSelection(object(), None))
+
+        def acquire_sender_limits(self, selection, telegram_chat_id):
+            return True
+
+        def execute_queued_call(self, row, args, kwargs, selection):
+            self.calls.append(row.id)
+            return SimpleNamespace(message_id=900)
+
+        def encode_queued_completion_receipt(self, result, selection):
+            return TelegramBotManager.encode_queued_completion_receipt(result, selection)
+
+        def reconcile_queued_delivery(self, row):
+            context = TelegramBotManager._decode_topic_recovery_log_context(row.log_context)
+            database.reconcile_topic_recovery_delivery(
+                scan_id=context.scan_id, source_chat_id=context.source_chat_id,
+                source_message_id=context.source_message_id, target_chat_id=context.target_chat_id,
+                target_message_id=900, slave_chat_id=context.slave_chat_id, text=context.text,
+                idempotency_key=context.idempotency_key, delivery_queue_id=row.queue_id,
+            )
+            return True
+
+        def record_queued_success(self, row, result, selection):
+            return None
+
+        def record_queued_failure(self, row, error, selection):
+            raise AssertionError(error)
+
+    adapter = Adapter()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(restarted_queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        row_id = next(iter(scheduler.in_flight))
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+    recovery_thread.join(timeout=1)
+
+    assert not recovery_thread.is_alive()
+    assert adapter.calls == [row_id]
+    assert restarted_queue.heads() == []
+    assert len(database.msglog_receipts) == 1
+    restarted_queue.close()
+
+
 def test_recovery_rejects_non_topic_deleted_service_protected_and_cross_topic_messages():
     database = FakeDatabase()
     database.scan.scan_boundary = 5
@@ -199,7 +334,7 @@ def test_recovery_rejects_non_topic_deleted_service_protected_and_cross_topic_me
             ]
 
     bot = SimpleNamespace(enqueue_history_operation=Mock())
-    TopicHistoryRecovery(database, bot, FilteredMTProto()).recover(
+    TopicHistoryRecovery(database, bot, FilteredMTProto(), FakeRuntime()).recover(
         TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 5)
     )
 
@@ -220,7 +355,7 @@ def test_recovery_resumes_without_repeating_accepted_transfers():
     mtproto = FakeMTProto()
     bot = SimpleNamespace(enqueue_history_operation=Mock())
 
-    TopicHistoryRecovery(database, bot, mtproto).recover(
+    TopicHistoryRecovery(database, bot, mtproto, FakeRuntime()).recover(
         TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 2)
     )
 
@@ -243,7 +378,7 @@ def test_startup_resumes_partial_scan_from_cursor_without_duplicate_transfer():
     binding = SimpleNamespace(db=database, logger=Mock())
 
     def recover_topic_history(**kwargs):
-        TopicHistoryRecovery(database, bot, mtproto).recover(TopicRecoveryRequest(**kwargs))
+        TopicHistoryRecovery(database, bot, mtproto, FakeRuntime()).recover(TopicRecoveryRequest(**kwargs))
 
     binding.recover_topic_history = recover_topic_history
     database.get_incomplete_topic_recovery_scans = Mock(return_value=[database.scan])

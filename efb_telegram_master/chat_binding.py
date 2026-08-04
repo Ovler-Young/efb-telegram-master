@@ -1478,7 +1478,7 @@ class ChatBindingManager(LocaleMixin):
         scan_boundary: int,
     ) -> None:
         """Start the MTProto supplement after the MsgLog migration was queued."""
-        recovery = TopicHistoryRecovery(self.db, self.bot, self.channel.mtproto)
+        recovery = TopicHistoryRecovery(self.db, self.bot, self.channel.mtproto, self.bot._runtime)
         thread = threading.Thread(
             target=recovery.recover,
             args=(TopicRecoveryRequest(
@@ -1630,6 +1630,7 @@ class ChatBindingManager(LocaleMixin):
                     args=(),
                     kwargs=kwargs,
                     history_entry_ids=[entry.id],
+                    queue_id=f"history-migration:{entry.id}",
                 )
                 waiter.result()
                 completed_call_count += 1

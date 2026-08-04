@@ -122,6 +122,7 @@ class QueueRequest:
     args: tuple
     kwargs: dict
     log_context: Optional[bytes] = None
+    queue_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -795,21 +796,38 @@ class OutboundQueue:
             try:
                 self.connection.execute("BEGIN")
                 identifiers: list[int] = []
+                inserted: list[bool] = []
                 now = time.time()
-                for operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context in prepared:
+                for index, prepared_request in enumerate(prepared):
+                    operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context = prepared_request
+                    queue_id = request_list[index].queue_id or str(uuid.uuid4())
                     cursor = self.connection.execute(
                         "INSERT INTO outbound_queue "
                         "(queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
-                        "required_sender_bot_id, created_at, log_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "required_sender_bot_id, created_at, log_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(queue_id) DO NOTHING",
                         (
-                            str(uuid.uuid4()), priority, chat_id, operation, payload, slave_id,
+                            queue_id, priority, chat_id, operation, payload, slave_id,
                             required_sender, now, log_context,
                         ),
                     )
-                    identifier = cursor.lastrowid
-                    if identifier is None:
-                        raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
-                    identifiers.append(identifier)
+                    if cursor.rowcount == 1:
+                        identifier = cursor.lastrowid
+                        if identifier is None:
+                            raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
+                        identifiers.append(identifier)
+                        inserted.append(True)
+                        continue
+                    existing = self.connection.execute(
+                        "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
+                        "required_sender_bot_id, log_context FROM outbound_queue WHERE queue_id = ?",
+                        (queue_id,),
+                    ).fetchone()
+                    expected = (priority, chat_id, operation, payload, slave_id, required_sender, log_context)
+                    if existing is None or tuple(existing[1:]) != expected:
+                        raise QueueEnqueueError(f"Queue ID {queue_id!r} is already used by another request.")
+                    identifiers.append(int(existing[0]))
+                    inserted.append(False)
                 self.connection.commit()
             except Exception as error:
                 try:
@@ -820,11 +838,19 @@ class OutboundQueue:
                     self._unlink_artifact(self._artifact_path_from_payload(item[7]))
                 raise QueueEnqueueError("Unable to commit queued Telegram call.") from error
             if self.metrics is not None:
-                for operation, _args, _kwargs, _chat_id, priority, _slave_id, _required_sender, _payload, _log_context in prepared:
+                for did_insert, prepared_request in zip(inserted, prepared):
+                    (
+                        operation, _args, _kwargs, _chat_id, priority, _slave_id,
+                        _required_sender, _payload, _log_context,
+                    ) = prepared_request
+                    if not did_insert:
+                        continue
                     self.metrics.record_enqueued(priority, operation)
             self.refresh_depth()
-            waiter: Future = Future()
-            self.waiters[identifiers[0]] = waiter
+            waiter = self.waiters.get(identifiers[0])
+            if waiter is None:
+                waiter = Future()
+                self.waiters[identifiers[0]] = waiter
             return identifiers[0], waiter
 
     def heads(self) -> list[QueuedCall]:

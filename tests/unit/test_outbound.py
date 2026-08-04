@@ -80,6 +80,19 @@ def test_queue_schema_wal_and_restart_retention(tmp_path):
     assert OutboundQueue(tmp_path).heads() == []
 
 
+def test_enqueue_many_reuses_explicit_queue_id_without_inserting_another_row(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    request = QueueRequest("send_message", (), {"chat_id": 12, "text": "first"}, queue_id="recovery:1:1")
+
+    first_id, first_waiter = enqueue(queue, request)
+    repeated_id, repeated_waiter = enqueue(queue, request)
+
+    assert repeated_id == first_id
+    assert repeated_waiter is first_waiter
+    assert [row.queue_id for row in queue.heads()] == ["recovery:1:1"]
+    queue.close()
+
+
 def test_mtproto_media_descriptor_survives_queue_restart_without_file_buffering(tmp_path):
     source = tmp_path / "media.bin"
     source.write_bytes(b"streamed-data")

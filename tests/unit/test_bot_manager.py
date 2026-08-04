@@ -833,11 +833,13 @@ def test_history_queue_operation_preserves_source_affinity():
         args=(),
         kwargs={"chat_id": 123, "text": "history"},
         history_entry_ids=[1],
+        queue_id="history-migration:1",
     )
 
     request = manager._enqueue_requests.call_args.args[0][0]
     assert request.kwargs["_slave_id"] == "history:source.chat"
     assert request.kwargs["_send_mode"] == "eventual"
+    assert request.queue_id == "history-migration:1"
     assert result is waiter
 
 

@@ -1235,13 +1235,14 @@ class TelegramBotManager(LocaleMixin):
         kwargs: Mapping[str, object],
         history_entry_ids: Collection[int],
         log_context: Optional[bytes] = None,
+        queue_id: Optional[str] = None,
     ) -> Future:
         del target_chat_id, history_entry_ids
         request_kwargs = dict(kwargs)
         request_kwargs["_slave_id"] = f"history:{source_key}"
         request_kwargs["_send_mode"] = "eventual"
         _row_id, waiter = self._enqueue_requests([
-            QueueRequest(operation, args, request_kwargs, log_context=log_context)
+            QueueRequest(operation, args, request_kwargs, log_context=log_context, queue_id=queue_id)
         ])
         return waiter
 
