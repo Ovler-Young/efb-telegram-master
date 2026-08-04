@@ -510,6 +510,9 @@ class MasterMessageProcessor(LocaleMixin):
             self.logger.error("[%s] Quoted message not found in database, give up quoting.",
                               tg_msg.message_id)
             return etm_msg
+        if target_log.provenance == "mtproto_ingested":
+            self.logger.info("[%s] Ignoring quote to ingested synthetic message.", tg_msg.message_id)
+            return etm_msg
         target_channel, _, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(target_log.slave_origin_uid))
         if target_channel != channel:
             self.logger.error("[%s] Quoted message is sent to channel %s, but this message is sent to %s, give up quoting.",

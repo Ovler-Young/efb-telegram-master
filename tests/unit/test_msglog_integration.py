@@ -8,7 +8,9 @@ from uuid import UUID
 from telegram import Update
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
+import efb_telegram_master.master_message as master_message
 from efb_telegram_master.master_message import MasterMessageProcessor
+from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 
 
@@ -145,6 +147,65 @@ def test_ingested_master_edits_do_not_dispatch_or_remove_messages():
 
     assert processor.db.get_msg_log.call_count == 2
     processor.process_telegram_message.assert_not_called()
+
+
+def test_ingested_master_reply_dispatches_without_target(monkeypatch):
+    class CapturedMessage:
+        def __init__(self):
+            self.file = None
+            self.target = None
+
+        def put_telegram_file(self, _message):
+            pass
+
+    target_log = SimpleNamespace(
+        provenance="mtproto_ingested",
+        slave_origin_uid="tests.slave source",
+        build_etm_msg=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(uid="source"), uid="synthetic")),
+    )
+    sent_messages = []
+    slave = SimpleNamespace(
+        supported_message_types={master_message.MsgType.Text},
+        channel_name="Test slave",
+    )
+    monkeypatch.setattr(master_message, "ETMMsg", CapturedMessage)
+    monkeypatch.setattr(master_message, "get_msg_type", lambda _message: TGMsgType.Text)
+    monkeypatch.setattr(master_message, "coordinator", SimpleNamespace(
+        slaves={"tests.slave": slave},
+        send_message=lambda message: sent_messages.append(message),
+    ))
+
+    processor = object.__new__(MasterMessageProcessor)
+    processor.channel = SimpleNamespace(flag=Mock(return_value=False))
+    processor.bot = Mock()
+    processor.db = SimpleNamespace(
+        get_msg_log=Mock(return_value=target_log),
+        add_or_update_message_log=Mock(),
+    )
+    processor.chat_manager = SimpleNamespace(
+        get_chat=Mock(return_value=SimpleNamespace(self=SimpleNamespace())),
+    )
+    processor.logger = Mock()
+
+    reply = SimpleNamespace(chat=SimpleNamespace(id=100), message_id=9)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=100),
+        message_id=10,
+        reply_to_message=reply,
+        text="normal body",
+        text_markdown_v2="normal body",
+        caption=None,
+        caption_markdown_v2=None,
+    )
+
+    MasterMessageProcessor.process_telegram_message(
+        processor, Update(update_id=1, message=message), None, "tests.slave source", quote=True,
+    )
+
+    assert len(sent_messages) == 1
+    assert sent_messages[0].text == "normal body"
+    assert sent_messages[0].target is None
+    target_log.build_etm_msg.assert_not_called()
 
 
 def test_ingested_text_and_media_backfill_use_copy_message():
