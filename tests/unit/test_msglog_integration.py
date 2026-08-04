@@ -6,6 +6,7 @@ from threading import Lock
 from telegram import Update
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
+from efb_telegram_master.slave_message import SlaveMessageProcessor
 
 
 def test_sync_msglog_requires_admin_and_a_bound_forum_group():
@@ -87,3 +88,20 @@ def test_ingested_text_and_media_backfill_use_copy_message():
     assert [entry["formatted_text"] for entry in entries] == [None, None]
     assert [ChatBindingManager._prepare_history_migration_call(entry, 300, None)[0] for entry in
             map(SimpleNamespace, entries)] == ["copy_message", "copy_message"]
+
+
+def test_ingested_rows_are_not_remote_get_or_reaction_targets():
+    row = SimpleNamespace(provenance="mtproto_ingested")
+    chat = SimpleNamespace(module_id="tests.slave", uid="chat")
+    channel = object.__new__(TelegramChannel)
+    channel.db = SimpleNamespace(get_msg_log=Mock(return_value=row))
+    channel.chat_manager = Mock()
+
+    assert TelegramChannel.get_message_by_id(channel, chat, "mtproto-ingested:100.1") is None
+
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.db = SimpleNamespace(get_msg_log=Mock(return_value=row))
+    processor.logger = Mock()
+    processor.update_reactions(SimpleNamespace(chat=chat, msg_id="mtproto-ingested:100.1", reactions={}))
+
+    processor.logger.info.assert_called_once()
