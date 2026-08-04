@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
+from efb_telegram_master.db import MsgLogIngestionLeaseLostError
 from efb_telegram_master.mtproto import MTProtoRetryableError
 
 
@@ -153,3 +154,19 @@ def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_c
     assert db.scan.status == "retryable-error"
     assert db.scan.error == "temporary"
     assert db.scan.cursor == 5
+
+
+def test_ingestion_stops_when_another_worker_reclaims_its_lease():
+    class LeaseLossDatabase(FakeDatabase):
+        def persist_msglog_ingestion_item(self, *args, **kwargs):
+            raise MsgLogIngestionLeaseLostError("lease reclaimed")
+
+        def finish_msglog_ingestion_scan(self, *args, **kwargs):
+            raise AssertionError("a stale worker must not finish another worker's scan")
+
+    db = LeaseLossDatabase(scan_boundary=1)
+    mtproto = FakeMTProto({1: topic_message(1)}, scan_ceiling=1)
+
+    asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
+
+    assert db.scan.status == "pending"

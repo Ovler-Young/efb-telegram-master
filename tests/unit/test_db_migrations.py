@@ -103,6 +103,139 @@ def test_msglog_ingestion_database_api_is_leased_and_idempotent():
         database.initialize(original_database)
 
 
+def test_stale_msglog_ingestion_worker_cannot_finish_a_reclaimed_scan():
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    manager = object.__new__(DatabaseManager)
+    try:
+        test_db.create_tables([MsgLogIngestionScan])
+        stale_scan = manager.get_or_create_msglog_ingestion_scan(100, 500)
+        assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
+        MsgLogIngestionScan.update(
+            lease_expires_at=datetime.now() - timedelta(seconds=1),
+        ).where(MsgLogIngestionScan.id == stale_scan.id).execute()
+
+        current_scan = manager.claim_msglog_ingestion_scan(100, "worker-b", 60)
+        assert current_scan is not None
+        assert manager.finish_msglog_ingestion_scan(
+            current_scan, status="complete", lease_owner="worker-b",
+        ) is True
+        assert manager.finish_msglog_ingestion_scan(
+            stale_scan, status="error", error="stale worker", lease_owner="worker-a",
+        ) is False
+
+        stored = MsgLogIngestionScan.get_by_id(stale_scan.id)
+        assert (stored.status, stored.error, stored.lease_owner) == ("complete", None, None)
+
+        unowned_scan = manager.get_or_create_msglog_ingestion_scan(200, 500)
+        assert manager.finish_msglog_ingestion_scan(
+            unowned_scan, status="error", error="arbitrary worker", lease_owner="worker-c",
+        ) is False
+        unowned = MsgLogIngestionScan.get_by_id(unowned_scan.id)
+        assert (unowned.status, unowned.error, unowned.lease_owner) == ("pending", None, None)
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+
+def test_sqlite_to_postgresql_transfer_defaults_missing_msglog_provenance_to_live(tmp_path):
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    source_path = tmp_path / "legacy.db"
+    source_db = SqliteDatabase(source_path)
+    source_db.connect()
+    try:
+        source_db.execute_sql(
+            "CREATE TABLE chatassoc (master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "CREATE TABLE slavechatinfo (slave_channel_id TEXT NOT NULL, "
+            "slave_channel_emoji TEXT NOT NULL, slave_chat_uid TEXT NOT NULL, "
+            "slave_chat_name TEXT NOT NULL, slave_chat_type TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, "
+            "text TEXT NOT NULL, slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, "
+            "sent_to TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("100.1", "slave-1", "legacy", "tests.slave", "Text", "tests"),
+        )
+    finally:
+        source_db.close()
+
+    destination_db = SqliteDatabase(tmp_path / "destination.db")
+    database.initialize(destination_db)
+    destination_db.connect()
+    manager = object.__new__(DatabaseManager)
+    try:
+        manager._migrate_from_sqlite(source_path)
+        assert MsgLog.get(MsgLog.master_msg_id == "100.1").provenance == "live"
+        assert not source_path.exists()
+        assert source_path.with_suffix(".db.migrated").exists()
+    finally:
+        destination_db.close()
+        database.initialize(original_database)
+
+
+def test_sqlite_to_postgresql_transfer_preserves_msglog_provenance(tmp_path):
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    source_path = tmp_path / "legacy-with-provenance.db"
+    source_db = SqliteDatabase(source_path)
+    source_db.connect()
+    try:
+        source_db.execute_sql(
+            "CREATE TABLE chatassoc (master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "CREATE TABLE slavechatinfo (slave_channel_id TEXT NOT NULL, "
+            "slave_channel_emoji TEXT NOT NULL, slave_chat_uid TEXT NOT NULL, "
+            "slave_chat_name TEXT NOT NULL, slave_chat_type TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, "
+            "text TEXT NOT NULL, slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, "
+            "sent_to TEXT NOT NULL, provenance TEXT NULL)"
+        )
+        source_db.execute_sql(
+            "INSERT INTO msglog VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?), "
+            "(?, ?, ?, ?, ?, ?, ?)",
+            (
+                "100.1", "slave-1", "null", "tests.slave", "Text", "tests", None,
+                "100.2", "slave-2", "live", "tests.slave", "Text", "tests", "live",
+                "100.3", "slave-3", "ingested", "tests.slave", "Text", "tests", "mtproto_ingested",
+            ),
+        )
+    finally:
+        source_db.close()
+
+    destination_db = SqliteDatabase(tmp_path / "destination-with-provenance.db")
+    database.initialize(destination_db)
+    destination_db.connect()
+    manager = object.__new__(DatabaseManager)
+    try:
+        manager._migrate_from_sqlite(source_path)
+        rows = {
+            row.master_msg_id: row.provenance
+            for row in MsgLog.select(MsgLog.master_msg_id, MsgLog.provenance)
+        }
+        assert rows == {
+            "100.1": "live", "100.2": "live", "100.3": "mtproto_ingested",
+        }
+    finally:
+        destination_db.close()
+        database.initialize(original_database)
+
+
 def test_resumable_msglog_ingestion_scans_include_unleased_and_expired_running_jobs():
     from peewee import SqliteDatabase
 

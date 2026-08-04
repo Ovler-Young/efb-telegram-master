@@ -239,6 +239,10 @@ class MsgLogIngestionScan(BaseModel):
     updated_at = DateTimeField(default=datetime.datetime.now)
 
 
+class MsgLogIngestionLeaseLostError(RuntimeError):
+    """Raised when a worker no longer owns an active ingestion lease."""
+
+
 class HistoryMigrationEntry(BaseModel):
     id = AutoField()
     slave_chat_id = TextField()
@@ -430,6 +434,9 @@ class DatabaseManager:
                 MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id, MsgLog.delivery_queue_id,
                 MsgLog.provenance, MsgLog.time,
             ])
+            for msg_log in msg_logs:
+                if msg_log["provenance"] is None:
+                    msg_log["provenance"] = "live"
             if HistoryMigrationEntry.table_exists():
                 history_migration_entries = self._select_existing_columns(HistoryMigrationEntry, "historymigrationentry", [
                     HistoryMigrationEntry.slave_chat_id, HistoryMigrationEntry.target_chat_id,
@@ -883,12 +890,19 @@ class DatabaseManager:
     ) -> str:
         """Store one scan outcome and its cursor atomically."""
         now = datetime.datetime.now()
-        with database.atomic():
-            current = MsgLogIngestionScan.get_by_id(scan.id)
+        supports_for_update = bool(getattr(database.obj, "for_update", False))
+        transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
+        with transaction:
+            query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
+            if supports_for_update:
+                query = query.for_update()
+            current = query.get()
             if current.lease_owner != lease_owner or (
                 current.lease_expires_at is not None and current.lease_expires_at < now
             ):
-                raise RuntimeError("MsgLog ingestion lease is no longer owned by this worker")
+                raise MsgLogIngestionLeaseLostError(
+                    "MsgLog ingestion lease is no longer owned by this worker"
+                )
             if current.status == "complete":
                 return "complete"
 
@@ -938,20 +952,26 @@ class DatabaseManager:
     def finish_msglog_ingestion_scan(
         self, scan: MsgLogIngestionScan, *, status: str, error: Optional[str] = None,
         lease_owner: str,
-    ) -> None:
+    ) -> bool:
         """Record a terminal or retryable scan state and release its lease."""
         now = datetime.datetime.now()
         with database.atomic():
+            updated = MsgLogIngestionScan.update(
+                status=status,
+                error=error,
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=now,
+            ).where(
+                (MsgLogIngestionScan.id == scan.id) &
+                (MsgLogIngestionScan.lease_owner == lease_owner) &
+                MsgLogIngestionScan.lease_expires_at.is_null(False) &
+                (MsgLogIngestionScan.lease_expires_at > now)
+            ).execute()
             current = MsgLogIngestionScan.get_by_id(scan.id)
-            if current.lease_owner not in (None, lease_owner):
-                raise RuntimeError("MsgLog ingestion lease is owned by another worker")
-            current.status = status
-            current.error = error
-            current.lease_owner = None
-            current.lease_expires_at = None
-            current.updated_at = now
-            current.save()
-            scan.__data__.update(current.__data__)
+            if updated == 1 or current.status == "complete":
+                scan.__data__.update(current.__data__)
+            return updated == 1
 
     @observe_database_method("get_topic_slaves")
     def get_topic_slaves(self, topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:

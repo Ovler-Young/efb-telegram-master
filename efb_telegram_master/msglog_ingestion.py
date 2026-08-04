@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 
-from .db import DatabaseManager
+from .db import DatabaseManager, MsgLogIngestionLeaseLostError
 from .mtproto import MTProtoClient, MTProtoRetryableError
 from .utils import EFBChannelChatIDStr
 
@@ -82,6 +82,8 @@ class MsgLogIngestionService:
                         )
                         return
             self.db.finish_msglog_ingestion_scan(scan, status="complete", lease_owner=lease_owner)
+        except MsgLogIngestionLeaseLostError:
+            self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id)
         except MTProtoRetryableError as error:
             self.db.finish_msglog_ingestion_scan(
                 scan, status="retryable-error", error=str(error), lease_owner=lease_owner,
