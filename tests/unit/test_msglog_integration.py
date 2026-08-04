@@ -228,8 +228,9 @@ def test_ingested_text_and_media_backfill_use_copy_message():
 
     entries = manager.db.replace_history_migration_entries.call_args.args[3]
     assert [entry["formatted_text"] for entry in entries] == [None, None]
+    entry_namespaces = [SimpleNamespace(**entry) for entry in entries]
     assert [ChatBindingManager._prepare_history_migration_call(entry, 300, None)[0] for entry in
-            map(SimpleNamespace, entries)] == ["copy_message", "copy_message"]
+            entry_namespaces] == ["copy_message", "copy_message"]
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():
