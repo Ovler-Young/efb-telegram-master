@@ -298,6 +298,11 @@ class MTProtoClient:
         return self.config.enabled
 
     @property
+    def connected(self) -> bool:
+        is_connected = getattr(self._client, "is_connected", None)
+        return self._client is not None and (not callable(is_connected) or bool(is_connected()))
+
+    @property
     def client(self) -> Any:
         if self._client is None:
             raise RuntimeError("MTProto client is not connected")

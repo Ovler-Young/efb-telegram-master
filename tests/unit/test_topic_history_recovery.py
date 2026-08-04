@@ -432,7 +432,11 @@ def test_startup_resumes_partial_scan_from_cursor_without_duplicate_transfer():
     database.entries[(1, 2)] = SimpleNamespace(status="accepted")
     mtproto = FakeMTProto()
     bot = SimpleNamespace(enqueue_history_operation=Mock())
-    binding = SimpleNamespace(db=database, logger=Mock())
+    binding = SimpleNamespace(
+        db=database,
+        logger=Mock(),
+        channel=SimpleNamespace(mtproto=SimpleNamespace(enabled=True, connected=True)),
+    )
 
     def recover_topic_history(**kwargs):
         TopicHistoryRecovery(database, bot, mtproto, FakeRuntime()).recover(TopicRecoveryRequest(**kwargs))

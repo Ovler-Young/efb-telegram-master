@@ -44,10 +44,15 @@ def mtproto_media_operation(chat_id, descriptor):
     return chat_id, descriptor
 
 
+def copy_message(chat_id, from_chat_id, message_id, message_thread_id):
+    return chat_id, from_chat_id, message_id, message_thread_id
+
+
 def operation(name):
     return {
         "send_message": send_message,
         "edit_message_text": edit_message_text,
+        "copy_message": copy_message,
         "send_mtproto_media": mtproto_media_operation,
     }[name]
 
@@ -1025,6 +1030,70 @@ class DurableAdapter(Adapter):
     def reconcile_queued_delivery(self, row):
         self.reconciled.append(row.id)
         return self.reconcile
+
+
+@pytest.mark.parametrize("operation_name, args, kwargs", [
+    ("copy_message", (), {
+        "chat_id": 7, "from_chat_id": 8, "message_id": 9, "message_thread_id": 10,
+    }),
+    ("send_mtproto_media", None, {
+        "_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__",
+    }),
+])
+def test_restart_after_remote_success_before_receipt_keeps_row_unknown_without_resend(
+    tmp_path, operation_name, args, kwargs,
+):
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"media")
+    if operation_name == "send_mtproto_media":
+        with source.open("rb") as stream:
+            descriptor = MTProtoMediaDescriptor.from_stream(
+                stream, file_size=source.stat().st_size, caption="", reply_to=None,
+                force_document=True, supports_streaming=False, silent=False,
+                media_name="document", mime_type="application/octet-stream",
+            )
+        args = (7, descriptor)
+
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest(operation_name, args, kwargs, log_context=b"\x01context"))
+    first_adapter = DurableAdapter(reconcile=False)
+    executor = ThreadPoolExecutor(max_workers=1)
+    scheduler = OutboundQueueScheduler(queue, first_adapter, executor, worker_count=1)
+    scheduler.dispatch_once()
+    scheduler.in_flight[row_id].future.result(timeout=1)
+
+    queue.close()
+    executor.shutdown()
+
+    restarted = OutboundQueue(tmp_path)
+    second_adapter = DurableAdapter(reconcile=True)
+    with ThreadPoolExecutor(max_workers=1) as restarted_executor:
+        OutboundQueueScheduler(restarted, second_adapter, restarted_executor, worker_count=1).dispatch_once()
+
+    assert [row.id for row in restarted.unknown()] == [row_id]
+    assert restarted.heads() == []
+    assert second_adapter.calls == []
+
+
+def test_unknown_row_blocks_its_destination_until_an_operator_requeues_or_resolves_it(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    first_id, _waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "first"}, log_context=b"\x01context",
+    ))
+    second_id, _waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "second"}, log_context=b"\x01context",
+    ))
+    attempt_id = queue.begin_attempt(first_id)
+    queue.mark_attempt_unknown(first_id, attempt_id)
+
+    assert queue.heads() == []
+    queue.requeue_unknown(first_id)
+    assert [row.id for row in queue.heads()] == [first_id]
+    retry_attempt_id = queue.begin_attempt(first_id)
+    assert second_id not in {row.id for row in queue.heads()}
+    queue.mark_attempt_unknown(first_id, retry_attempt_id)
+    queue.resolve_unknown(first_id, b"receipt")
+    assert [row.id for row in queue.sent_pending()] == [first_id]
 
 
 def test_sent_pending_rows_survive_restart_without_telegram_resend(tmp_path):

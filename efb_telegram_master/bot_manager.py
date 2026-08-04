@@ -664,7 +664,17 @@ class TelegramBotManager(LocaleMixin):
         for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
             aux_bot.bind_runtime(self._runtime)
         self._shutdown_complete_event.clear()
-        await self.channel.mtproto.connect()
+        mtproto = self.channel.mtproto
+        if not getattr(mtproto, "enabled", False):
+            return
+        try:
+            await mtproto.connect()
+        except (ConnectionError, TimeoutError, OSError, MTProtoRetryableError) as error:
+            self.logger.warning("MTProto startup is unavailable; topic recovery remains pending: %s", error)
+            return
+        if not getattr(mtproto, "connected", False):
+            self.logger.warning("MTProto startup did not establish a connection; topic recovery remains pending.")
+            return
         chat_binding = getattr(self.channel, "chat_binding", None)
         if chat_binding is not None:
             chat_binding.resume_pending_topic_recoveries()

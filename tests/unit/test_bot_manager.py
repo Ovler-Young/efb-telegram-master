@@ -1641,11 +1641,18 @@ async def test_post_init_resumes_topic_recovery_after_mtproto_connects():
     async def connect():
         events.append("connect")
 
+    mtproto = SimpleNamespace(enabled=True, connected=False)
+
+    async def connect_and_mark_ready():
+        events.append("connect")
+        mtproto.connected = True
+
+    mtproto.connect = connect_and_mark_ready
     manager = SimpleNamespace(
         _runtime=SimpleNamespace(bind_loop=Mock()), bot_pool=None,
         _shutdown_complete_event=threading.Event(),
         channel=SimpleNamespace(
-            mtproto=SimpleNamespace(connect=connect),
+            mtproto=mtproto,
             chat_binding=SimpleNamespace(
                 resume_pending_topic_recoveries=lambda: events.append("resume"),
             ),
@@ -1655,6 +1662,45 @@ async def test_post_init_resumes_topic_recovery_after_mtproto_connects():
     await TelegramBotManager._post_init(manager, object())
 
     assert events == ["connect", "resume"]
+
+
+@pytest.mark.asyncio
+async def test_post_init_leaves_topic_recovery_pending_when_mtproto_is_disabled():
+    resume = Mock()
+    manager = SimpleNamespace(
+        _runtime=SimpleNamespace(bind_loop=Mock()), bot_pool=None,
+        _shutdown_complete_event=threading.Event(), logger=Mock(),
+        channel=SimpleNamespace(
+            mtproto=SimpleNamespace(enabled=False, connect=Mock()),
+            chat_binding=SimpleNamespace(resume_pending_topic_recoveries=resume),
+        ),
+    )
+
+    await TelegramBotManager._post_init(manager, object())
+
+    manager.channel.mtproto.connect.assert_not_called()
+    resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_init_retains_topic_recovery_when_mtproto_connection_is_unavailable():
+    async def unavailable():
+        raise ConnectionError("unavailable")
+
+    resume = Mock()
+    manager = SimpleNamespace(
+        _runtime=SimpleNamespace(bind_loop=Mock()), bot_pool=None,
+        _shutdown_complete_event=threading.Event(), logger=Mock(),
+        channel=SimpleNamespace(
+            mtproto=SimpleNamespace(enabled=True, connected=False, connect=unavailable),
+            chat_binding=SimpleNamespace(resume_pending_topic_recoveries=resume),
+        ),
+    )
+
+    await TelegramBotManager._post_init(manager, object())
+
+    resume.assert_not_called()
+    manager.logger.warning.assert_called_once()
 
 
 def test_polling_passes_custom_timeout_to_manual_lifecycle():

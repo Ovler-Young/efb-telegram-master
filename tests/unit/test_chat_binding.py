@@ -58,6 +58,7 @@ def test_resume_pending_topic_recoveries_reconstructs_requests_and_skips_complet
         ])),
         recover_topic_history=recovery,
         logger=Mock(),
+        channel=SimpleNamespace(mtproto=SimpleNamespace(enabled=True, connected=True)),
     )
 
     ChatBindingManager.resume_pending_topic_recoveries(manager)

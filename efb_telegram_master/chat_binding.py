@@ -1478,6 +1478,10 @@ class ChatBindingManager(LocaleMixin):
         scan_boundary: int,
     ) -> None:
         """Start the MTProto supplement after the MsgLog migration was queued."""
+        mtproto = self.channel.mtproto
+        if not getattr(mtproto, "enabled", False) or not getattr(mtproto, "connected", False):
+            self.logger.info("MTProto is unavailable; topic recovery remains pending.")
+            return
         recovery = TopicHistoryRecovery(self.db, self.bot, self.channel.mtproto, self.bot._runtime)
         thread = threading.Thread(
             target=recovery.recover,
@@ -1510,6 +1514,10 @@ class ChatBindingManager(LocaleMixin):
             self.logger.warning("Failed to check pending history migrations: %s", e)
 
     def resume_pending_topic_recoveries(self) -> None:
+        mtproto = self.channel.mtproto
+        if not getattr(mtproto, "enabled", False) or not getattr(mtproto, "connected", False):
+            self.logger.info("MTProto is unavailable; pending topic recoveries remain eligible.")
+            return
         try:
             scans = self.db.get_incomplete_topic_recovery_scans()
         except Exception as error:

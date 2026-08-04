@@ -93,14 +93,18 @@ class FakeServerError(Exception):
 
 class LifecycleMTProto:
     def __init__(self) -> None:
+        self.enabled = True
+        self.connected = False
         self.connect_calls = 0
         self.disconnect_calls = 0
 
     async def connect(self) -> None:
         self.connect_calls += 1
+        self.connected = True
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
+        self.connected = False
 
 
 def enabled_config() -> MTProtoConfig:
