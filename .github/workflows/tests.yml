@@ -8,6 +8,13 @@ on:
       - 'setup.py'
       - '.github/workflows/tests.yml'
       - 'pytest.ini'
+  pull_request:
+    paths:
+      - 'efb_telegram_master/**.py'
+      - 'tests/**.py'
+      - 'setup.py'
+      - '.github/workflows/tests.yml'
+      - 'pytest.ini'
   pull_request_target:
     paths:
       - 'efb_telegram_master/**.py'
@@ -69,7 +76,10 @@ jobs:
         pytest -vv -r a -l --color=yes --mode=unit
 
   integration:
-    if: github.event_name == 'pull_request_target'
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository)
     needs: unit
     runs-on: ubuntu-latest
     timeout-minutes: 60
