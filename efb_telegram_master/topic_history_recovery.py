@@ -80,7 +80,7 @@ class TopicHistoryRecovery:
                     self.db.advance_topic_recovery_scan(scan, message_id)
                 scan.cursor = upper
             self.db.advance_topic_recovery_scan(scan, scan.cursor, status="complete")
-        except BaseException as error:
+        except Exception as error:
             status = "retryable-error" if isinstance(error, MTProtoRetryableError) else "error"
             self.db.advance_topic_recovery_scan(scan, scan.cursor, status=status, error=str(error))
             self.logger.warning("Topic history recovery retained at cursor %s: %s", scan.cursor, error)
@@ -146,7 +146,7 @@ class TopicHistoryRecovery:
             )
             receipt = await asyncio.wrap_future(waiter)
             target_message_id = self._receipt_message_id(receipt)
-        except BaseException as error:
+        except Exception as error:
             self.db.save_topic_recovery_entry(
                 scan_id=scan.id, source_message_id=message_id, classification="accepted",
                 status="prepared", idempotency_key=key, error=str(error),

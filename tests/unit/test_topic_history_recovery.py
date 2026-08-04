@@ -9,6 +9,7 @@ import pytest
 
 from efb_telegram_master.bot_manager import TelegramBotManager, TopicRecoveryQueueContext
 from efb_telegram_master.chat_binding import ChatBindingManager
+from efb_telegram_master.mtproto import MTProtoRetryableError
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest, SenderSelection, SenderSelectionResult
 from efb_telegram_master.topic_history_recovery import TopicHistoryRecovery, TopicRecoveryRequest
 
@@ -196,6 +197,75 @@ async def test_recovery_awaits_queue_completion_without_blocking_the_runtime_loo
     )
 
     assert database.entries[(1, 1)].status == "accepted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_call", ["get_input_channel", "get_channel_messages"])
+async def test_recovery_cancellation_keeps_scan_pending_and_restart_resumes(blocked_call):
+    database = FakeDatabase()
+    database.scan.scan_boundary = 1
+    database.scan.status = "pending"
+    database.scan.error = None
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockedMTProto(FakeMTProto):
+        async def get_input_channel(self, chat_id):
+            if blocked_call == "get_input_channel":
+                started.set()
+                await release.wait()
+            return await super().get_input_channel(chat_id)
+
+        async def get_channel_messages(self, channel, ids):
+            if blocked_call == "get_channel_messages":
+                started.set()
+                await release.wait()
+            return await super().get_channel_messages(channel, ids)
+
+    bot = SimpleNamespace(enqueue_history_operation=Mock(
+        return_value=completed_future(SimpleNamespace(message_id=900))
+    ))
+    request = TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 1)
+    recovery = TopicHistoryRecovery(database, bot, BlockedMTProto(), FakeRuntime())
+    task = asyncio.create_task(recovery._recover(request))
+
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert database.scan.status == "pending"
+    assert database.scan.error is None
+    assert database.scan.cursor == 0
+    assert database.advances == []
+    assert database.entries == {}
+
+    await TopicHistoryRecovery(database, bot, FakeMTProto(), FakeRuntime())._recover(request)
+
+    assert database.scan.status == "complete"
+    assert database.scan.cursor == 1
+    assert database.entries[(1, 1)].status == "accepted"
+    assert len(bot.enqueue_history_operation.call_args_list) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [(RuntimeError("terminal"), "error"), (MTProtoRetryableError("retry"), "retryable-error")],
+)
+async def test_recovery_classifies_ordinary_failures_after_cancellation_handling(failure, expected_status):
+    class FailingMTProto(FakeMTProto):
+        async def get_input_channel(self, _chat_id):
+            raise failure
+
+    database = FakeDatabase()
+    database.scan.scan_boundary = 1
+    recovery = TopicHistoryRecovery(database, Mock(), FailingMTProto(), FakeRuntime())
+
+    await recovery._recover(TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 1))
+
+    assert database.scan.status == expected_status
+    assert database.scan.error == str(failure)
 
 
 def test_recovery_caps_scan_boundary_before_creating_scan_state():
