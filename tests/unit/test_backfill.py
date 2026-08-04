@@ -411,6 +411,7 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
                 "disable_notification": True,
             },
             history_entry_ids=[1],
+            queue_id="history-migration:1",
         ),
         call(
             source_key="tests.mocks.slave.chat",
@@ -424,6 +425,7 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
                 "disable_notification": True,
             },
             history_entry_ids=[2],
+            queue_id="history-migration:2",
         ),
         call(
             source_key="tests.mocks.slave.chat",
@@ -437,6 +439,7 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
                 "disable_notification": True,
             },
             history_entry_ids=[3],
+            queue_id="history-migration:3",
         ),
     ])
     assert events == [
