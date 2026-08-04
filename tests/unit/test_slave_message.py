@@ -1029,6 +1029,7 @@ def test_mtproto_large_file_rejects_non_durable_stream():
 
     class MTProto:
         enabled = True
+        connected = True
 
         def __init__(self):
             self.kwargs = None
@@ -1051,6 +1052,28 @@ def test_mtproto_large_file_rejects_non_durable_stream():
         processor._send_mtproto_media(msg, 100, 77, "header", "footer", None, 42, None, True)
 
     assert msg.file.closed
+
+
+def test_oversized_media_requires_a_connected_mtproto_client_before_routing():
+    class LargeStream(BytesIO):
+        def tell(self):
+            if super().tell() == len(self.getvalue()):
+                return 100 * 1024 * 1024 + 1
+            return super().tell()
+
+    mtproto = SimpleNamespace(enabled=True, connected=False)
+    processor = build_slave_message_processor()
+    processor.channel.mtproto = mtproto
+    processor.channel._ = lambda value: value
+    message = SimpleNamespace(file=LargeStream(b"not-read-as-a-whole"))
+
+    assert not processor._uses_mtproto_media(message)
+    assert processor.check_file_size(message.file) is not None
+
+    mtproto.connected = True
+
+    assert processor._uses_mtproto_media(message)
+    assert processor.check_file_size(message.file) is None
 
 
 def test_mtproto_media_is_materialized_before_a_delete_on_close_source_is_closed(tmp_path):

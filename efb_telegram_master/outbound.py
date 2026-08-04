@@ -26,7 +26,7 @@ from telegram import (
 )
 from telegram.error import RetryAfter
 
-from .mtproto import MTProtoFloodWaitError, MTProtoMediaDescriptor
+from .mtproto import MTProtoFloodWaitError, MTProtoMediaDescriptor, MTProtoNotConnectedError
 
 
 @dataclass(frozen=True)
@@ -1441,7 +1441,9 @@ class OutboundQueueScheduler:
                                 )
                             continue
                     decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
-                    known_not_sent = isinstance(error, (RetryAfter, MTProtoFloodWaitError))
+                    known_not_sent = isinstance(
+                        error, (RetryAfter, MTProtoFloodWaitError, MTProtoNotConnectedError)
+                    )
                     if (
                         decision.kind == "retry_eventual"
                         and submitted.row.priority == 0

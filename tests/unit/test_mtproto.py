@@ -15,6 +15,7 @@ from efb_telegram_master.mtproto import (
     MTProtoFloodWaitError,
     MTProtoMediaDescriptor,
     MTProtoMediaLimitError,
+    MTProtoNotConnectedError,
     MTProtoReceipt,
     MTProtoRetryableError,
     MTProtoSessionOwnershipError,
@@ -307,6 +308,39 @@ async def test_connect_translates_retryable_telethon_startup_errors_after_cleanu
     assert caught.value.retry_after == retry_after
     assert clients[0].disconnect_calls == 1
     assert client.connected is False
+
+
+@pytest.mark.asyncio
+async def test_media_transfer_waits_for_reconnection_after_retryable_startup_failure(tmp_path: Path):
+    clients: list[FakeClient] = []
+
+    def factory(session_path: Path, config: MTProtoConfig) -> FakeClient:
+        fake = FakeClient(session_path, config)
+        if not clients:
+            fake.connect_error = FakeServerError()
+        clients.append(fake)
+        return fake
+
+    client = MTProtoClient(enabled_config(), "bot-token", tmp_path, client_factory=factory)
+
+    with pytest.raises(MTProtoRetryableError):
+        await client.connect()
+    with pytest.raises(MTProtoNotConnectedError):
+        await client.send_media_stream(
+            77, object(), file_size=1, caption="", reply_to=None,
+            force_document=True, supports_streaming=False, silent=False,
+        )
+
+    await client.connect()
+    receipt = await client.send_media_stream(
+        77, object(), file_size=1, caption="", reply_to=None,
+        force_document=True, supports_streaming=False, silent=False,
+    )
+
+    assert len(clients) == 2
+    assert clients[0].uploaded is None
+    assert receipt == MTProtoReceipt(chat_id=77, message_id=44)
+    await client.disconnect()
 
 
 @pytest.mark.asyncio

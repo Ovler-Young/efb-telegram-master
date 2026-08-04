@@ -218,6 +218,10 @@ class MTProtoFloodWaitError(MTProtoRetryableError):
     """A Telegram-imposed request delay."""
 
 
+class MTProtoNotConnectedError(MTProtoRetryableError):
+    """A local availability failure raised before an MTProto request is submitted."""
+
+
 class MTProtoMediaLimitError(ValueError):
     """A media transfer exceeds the configured MTProto file limit."""
 
@@ -304,8 +308,8 @@ class MTProtoClient:
 
     @property
     def client(self) -> Any:
-        if self._client is None:
-            raise RuntimeError("MTProto client is not connected")
+        if not self.connected:
+            raise MTProtoNotConnectedError("MTProto client is not connected")
         return self._client
 
     @property
@@ -427,6 +431,8 @@ class MTProtoClient:
                 return self._media_limit
         except ImportError:
             pass
+        except MTProtoNotConnectedError:
+            raise
         except BaseException as error:
             translated = translate_mtproto_error(error)
             if translated is not error:

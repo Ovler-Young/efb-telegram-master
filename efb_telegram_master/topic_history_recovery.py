@@ -131,10 +131,12 @@ class TopicHistoryRecovery:
         except BaseException as error:
             self.db.save_topic_recovery_entry(
                 scan_id=scan.id, source_message_id=message_id, classification="accepted",
-                status="retryable-error" if isinstance(error, MTProtoRetryableError) else "error",
-                idempotency_key=key, error=str(error),
+                status="prepared", idempotency_key=key, error=str(error),
+                delivery_queue_id=queue_id,
             )
-            raise
+            if isinstance(error, MTProtoRetryableError):
+                raise
+            raise MTProtoRetryableError(str(error)) from error
         existing = self.db.get_topic_recovery_entry(scan.id, message_id)
         if existing is None or existing.status != "accepted":
             self.db.save_topic_recovery_entry(

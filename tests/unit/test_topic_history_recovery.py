@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -55,6 +56,8 @@ class FakeDatabase:
 
     def advance_topic_recovery_scan(self, scan, cursor, **kwargs):
         scan.cursor = cursor
+        for name, value in kwargs.items():
+            setattr(scan, name, value)
         self.advances.append((cursor, kwargs))
 
     def get_msg_log(self, **_kwargs):
@@ -264,9 +267,9 @@ def test_recovery_receipt_reconciles_after_restart_without_copying_twice(tmp_pat
     assert restarted.sent_pending() == []
 
 
-def test_recovery_restart_after_queue_commit_reuses_one_copy_row_before_dispatch(tmp_path):
+def test_recovery_restart_after_interrupted_waiter_reconciles_and_continues_scan(tmp_path):
     database = FakeDatabase()
-    database.scan.scan_boundary = 1
+    database.scan.scan_boundary = 3
 
     def copy_message(*, chat_id, from_chat_id, message_id, message_thread_id, disable_notification):
         return chat_id, from_chat_id, message_id, message_thread_id, disable_notification
@@ -303,12 +306,13 @@ def test_recovery_restart_after_queue_commit_reuses_one_copy_row_before_dispatch
 
     first_queue = OutboundQueue(tmp_path)
     first_bot = QueueingBot(first_queue, interrupt_after_commit=True)
-    request = TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 1)
+    request = TopicRecoveryRequest(10, 7, 20, 8, "tests.mocks.slave.chat", 3)
     TopicHistoryRecovery(database, first_bot, FakeMTProto(), FakeRuntime()).recover(request)
 
     entry = database.entries[(1, 1)]
-    assert entry.status == "error"
+    assert entry.status == "prepared"
     assert entry.delivery_queue_id == "topic-recovery:1:1"
+    assert database.scan.status == "retryable-error"
     assert len(first_queue.heads()) == 1
     first_queue.close()
 
@@ -335,7 +339,7 @@ def test_recovery_restart_after_queue_commit_reuses_one_copy_row_before_dispatch
             return True
 
         def execute_queued_call(self, row, args, kwargs, selection):
-            self.calls.append(row.id)
+            self.calls.append(kwargs["message_id"])
             return SimpleNamespace(message_id=900)
 
         def encode_queued_completion_receipt(self, result, selection):
@@ -360,16 +364,23 @@ def test_recovery_restart_after_queue_commit_reuses_one_copy_row_before_dispatch
     adapter = Adapter()
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(restarted_queue, adapter, executor, worker_count=1)
-        scheduler.dispatch_once()
-        row_id = next(iter(scheduler.in_flight))
-        scheduler.in_flight[row_id].future.result(timeout=1)
-        scheduler.harvest_completed()
+        deadline = time.monotonic() + 1
+        while recovery_thread.is_alive() and time.monotonic() < deadline:
+            scheduler.dispatch_once()
+            for submitted in tuple(scheduler.in_flight.values()):
+                submitted.future.result(timeout=1)
+            scheduler.harvest_completed()
+            time.sleep(0.01)
     recovery_thread.join(timeout=1)
 
     assert not recovery_thread.is_alive()
-    assert adapter.calls == [row_id]
+    assert adapter.calls == [1, 2, 3]
     assert restarted_queue.heads() == []
-    assert len(database.msglog_receipts) == 1
+    assert [database.entries[(1, message_id)].status for message_id in range(1, 4)] == [
+        "accepted", "accepted", "accepted",
+    ]
+    assert len(database.msglog_receipts) == 3
+    assert database.scan.status == "complete"
     restarted_queue.close()
 
 

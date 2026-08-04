@@ -550,6 +550,7 @@ class SlaveMessageProcessor(LocaleMixin):
             size is not None
             and size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD
             and getattr(mtproto, "enabled", False)
+            and getattr(mtproto, "connected", False)
         )
 
     def _send_mtproto_media(self, msg: Message, tg_dest: TelegramChatID,
@@ -1673,7 +1674,8 @@ class SlaveMessageProcessor(LocaleMixin):
         file_size = self._file_size(file)
         if file_size is None:
             return None
-        if not getattr(getattr(self.channel, "mtproto", None), "enabled", False) \
+        if not (getattr(getattr(self.channel, "mtproto", None), "enabled", False) \
+                and getattr(getattr(self.channel, "mtproto", None), "connected", False)) \
                 and not self.channel.flag("local_tdlib_api") \
                 and file_size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD:
             size_str = humanize.naturalsize(file_size)

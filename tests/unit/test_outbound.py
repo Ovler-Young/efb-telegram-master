@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 
 import pytest
 from telegram import (
@@ -19,7 +20,11 @@ from telegram import (
     PhotoSize,
 )
 
-from efb_telegram_master.mtproto import MTProtoMediaDescriptor, MTProtoRetryableError
+from efb_telegram_master.mtproto import (
+    MTProtoMediaDescriptor,
+    MTProtoNotConnectedError,
+    MTProtoRetryableError,
+)
 from efb_telegram_master.outbound import (
     InvalidQueuedPayloadError,
     OutboundQueue,
@@ -1041,6 +1046,15 @@ class TransportFailureAdapter(DurableAdapter):
         return CompletionDecision("terminal_failure")
 
 
+class DisconnectedMTProtoAdapter(DurableAdapter):
+    def execute_queued_call(self, row, args, kwargs, selection):
+        self.calls.append((row.id, row.telegram_chat_id, row.operation))
+        raise MTProtoNotConnectedError("MTProto client is not connected")
+
+    def record_queued_failure(self, row, error, selection):
+        return CompletionDecision("retry_eventual", time.monotonic())
+
+
 @pytest.mark.parametrize("operation_name, args, kwargs", [
     ("copy_message", (), {
         "chat_id": 7, "from_chat_id": 8, "message_id": 9, "message_thread_id": 10,
@@ -1126,6 +1140,35 @@ def test_durable_mtproto_transport_failure_after_submission_becomes_unknown_and_
     assert restarted.heads() == []
     assert second_adapter.calls == []
     restarted.close()
+
+
+def test_disconnected_mtproto_media_is_requeued_without_an_ambiguous_delivery(tmp_path):
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"media")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="", reply_to=None,
+            force_document=True, supports_streaming=False, silent=False,
+            media_name="document", mime_type="application/octet-stream",
+        )
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest(
+        "send_mtproto_media", (7, descriptor),
+        {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+        log_context=b"\x01context",
+    ))
+    adapter = DisconnectedMTProtoAdapter(reconcile=False)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        with pytest.raises(MTProtoNotConnectedError):
+            scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    assert adapter.calls == [(row_id, 7, "send_mtproto_media")]
+    assert [row.id for row in queue.heads()] == [row_id]
+    assert queue.unknown() == []
+    queue.close()
 
 
 def test_unknown_row_blocks_its_destination_until_an_operator_requeues_or_resolves_it(tmp_path):
