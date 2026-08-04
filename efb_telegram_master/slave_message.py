@@ -216,7 +216,9 @@ class SlaveMessageProcessor(LocaleMixin):
             if msg.edit:
                 old_msg = self.db.get_msg_log(slave_msg_id=msg.uid,
                                               slave_origin_uid=utils.chat_id_to_str(chat=msg.chat))
-                if old_msg:
+                if old_msg and old_msg.provenance == "mtproto_ingested":
+                    self.logger.info("Ignoring edit for ingested synthetic message %s from %s.", msg.uid, msg.chat)
+                elif old_msg:
                     _edit_sender_bot_id = old_msg.sender_bot_id
 
                     if old_msg.master_msg_id_alt:
@@ -1504,6 +1506,10 @@ class SlaveMessageProcessor(LocaleMixin):
                 slave_msg_id=status.message.uid,
                 slave_origin_uid=utils.chat_id_to_str(chat=status.message.chat))
             if old_msg:
+                if old_msg.provenance == "mtproto_ingested":
+                    self.logger.info("Ignoring removal for ingested synthetic message %s from %s.",
+                                     status.message.uid, status.message.chat)
+                    return
                 old_msg_id: OldMsgID = utils.message_id_str_to_id(
                     utils.TgChatMsgIDStr(old_msg.master_msg_id_alt or old_msg.master_msg_id)
                 )
@@ -1576,6 +1582,10 @@ class SlaveMessageProcessor(LocaleMixin):
         if old_msg_db is None:
             self.logger.error('Trying to update reactions of message, but message is not found in database. '
                               'Message ID %s from %s, status: %s.', status.msg_id, status.chat, status.reactions)
+            return
+        if old_msg_db.provenance == "mtproto_ingested":
+            self.logger.info("Ignoring reaction update for ingested synthetic message %s from %s.",
+                             status.msg_id, status.chat)
             return
 
         old_msg: ETMMsg = old_msg_db.build_etm_msg(chat_manager=self.chat_manager)

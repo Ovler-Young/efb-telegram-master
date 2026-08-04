@@ -220,44 +220,6 @@ class MsgLog(BaseModel):
         return msg
 
 
-class TopicRecoveryScan(BaseModel):
-    """Durable cursor for a bounded MTProto forum-topic recovery."""
-    id = AutoField()
-    source_chat_id = TextField()
-    source_thread_id = TextField()
-    target_chat_id = TextField()
-    target_thread_id = TextField()
-    slave_chat_id = TextField()
-    scan_boundary = IntegerField()
-    cursor = IntegerField(default=0)
-    status = TextField(default="pending")
-    error = TextField(null=True)
-    updated_at = DateTimeField(default=datetime.datetime.now)
-
-    class Meta:
-        indexes = ((
-            ("source_chat_id", "source_thread_id", "target_chat_id", "target_thread_id"),
-            True,
-        ),)
-
-
-class TopicRecoveryEntry(BaseModel):
-    """One source message and its idempotent recovery outcome."""
-    id = AutoField()
-    scan_id = IntegerField(index=True)
-    source_message_id = IntegerField()
-    classification = TextField()
-    status = TextField(default="pending")
-    target_message_id = IntegerField(null=True)
-    error = TextField(null=True)
-    idempotency_key = TextField(unique=True)
-    delivery_queue_id = TextField(null=True, unique=True)
-    updated_at = DateTimeField(default=datetime.datetime.now)
-
-    class Meta:
-        indexes = ((("scan_id", "source_message_id"), True),)
-
-
 class MsgLogIngestionScan(BaseModel):
     """One leased descending MTProto scan for a bound Telegram group."""
     id = AutoField()
@@ -403,16 +365,14 @@ class DatabaseManager:
         Initializing tables.
         """
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
-            TopicRecoveryScan, TopicRecoveryEntry, MsgLogIngestionScan,
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan,
         ])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
         models = [
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
-            TopicRecoveryScan, TopicRecoveryEntry, MsgLogIngestionScan,
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan,
         ]
         existing_tables = set(database.get_tables())
         database.create_tables(
@@ -445,10 +405,7 @@ class DatabaseManager:
         sqlite_db.start()
         sqlite_db.connect()
 
-        models = [
-            ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry,
-            TopicRecoveryScan, TopicRecoveryEntry,
-        ]
+        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry]
         with sqlite_db.bind_ctx(models):
             chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
@@ -532,12 +489,6 @@ class DatabaseManager:
                 self._migrate(5)
             elif not self._has_unique_column_index("msglog", "delivery_queue_id"):
                 self._migrate(5)
-            elif "topicrecoveryscan" not in database.get_tables() or "topicrecoveryentry" not in database.get_tables():
-                self._migrate(6)
-            elif "delivery_queue_id" not in {
-                column.name for column in database.get_columns("topicrecoveryentry")
-            }:
-                self._migrate(7)
             elif "provenance" not in msg_log_columns or "msglogingestionscan" not in database.get_tables():
                 self._migrate(8)
             else:
@@ -623,16 +574,6 @@ class DatabaseManager:
                     migrator.add_column("msglog", "delivery_queue_id", TextField(null=True))
                 )
             self._create_msglog_delivery_queue_id_index()
-        if i == 6:
-            database.create_tables([TopicRecoveryScan, TopicRecoveryEntry], safe=True)
-        if i == 7:
-            migrate(
-                migrator.add_column("topicrecoveryentry", "delivery_queue_id", TextField(null=True)),
-            )
-            database.execute_sql(
-                "CREATE UNIQUE INDEX IF NOT EXISTS topicrecoveryentry_delivery_queue_id "
-                "ON topicrecoveryentry (delivery_queue_id)"
-            )
         if i == 8:
             msg_log_columns = {column.name for column in database.get_columns("msglog")}
             if "provenance" not in msg_log_columns:
@@ -1362,119 +1303,10 @@ class DatabaseManager:
             .execute()
         )
 
-    @observe_database_method("get_or_create_topic_recovery_scan")
-    def get_or_create_topic_recovery_scan(
-        self, *, source_chat_id: int, source_thread_id: int, target_chat_id: int,
-        target_thread_id: int, slave_chat_id: EFBChannelChatIDStr, scan_boundary: int,
-    ) -> TopicRecoveryScan:
-        scan, created = TopicRecoveryScan.get_or_create(
-            source_chat_id=str(source_chat_id), source_thread_id=str(source_thread_id),
-            target_chat_id=str(target_chat_id), target_thread_id=str(target_thread_id),
-            defaults={"slave_chat_id": str(slave_chat_id), "scan_boundary": scan_boundary},
-        )
-        if not created and scan.scan_boundary != scan_boundary:
-            scan.scan_boundary = scan_boundary
-            scan.updated_at = datetime.datetime.now()
-            scan.save()
-        return scan
-
-    @observe_database_method("get_topic_recovery_entry")
-    def get_topic_recovery_entry(self, scan_id: int, source_message_id: int) -> Optional[TopicRecoveryEntry]:
-        return TopicRecoveryEntry.get_or_none(
-            (TopicRecoveryEntry.scan_id == scan_id) &
-            (TopicRecoveryEntry.source_message_id == source_message_id)
-        )
-
-    @observe_database_method("save_topic_recovery_entry")
-    def save_topic_recovery_entry(
-        self, *, scan_id: int, source_message_id: int, classification: str,
-        status: str, idempotency_key: str, target_message_id: Optional[int] = None,
-        error: Optional[str] = None, delivery_queue_id: Optional[str] = None,
-    ) -> TopicRecoveryEntry:
-        entry, _created = TopicRecoveryEntry.get_or_create(
-            scan_id=scan_id, source_message_id=source_message_id,
-            defaults={"classification": classification, "status": status,
-                      "idempotency_key": idempotency_key},
-        )
-        entry.classification = classification
-        entry.status = status
-        entry.target_message_id = target_message_id
-        entry.error = error
-        if delivery_queue_id is not None:
-            entry.delivery_queue_id = delivery_queue_id
-        entry.updated_at = datetime.datetime.now()
-        entry.save()
-        return entry
-
-    @observe_database_method("get_incomplete_topic_recovery_scans")
-    def get_incomplete_topic_recovery_scans(self) -> List[TopicRecoveryScan]:
+    @observe_database_method("get_resumable_msglog_ingestion_scans")
+    def get_resumable_msglog_ingestion_scans(self) -> List[MsgLogIngestionScan]:
         return list(
-            TopicRecoveryScan.select()
-            .where(TopicRecoveryScan.status.in_(("pending", "retryable-error")))
-            .order_by(TopicRecoveryScan.updated_at.asc(), TopicRecoveryScan.id.asc())
+            MsgLogIngestionScan.select()
+            .where(MsgLogIngestionScan.status.in_(("pending", "retryable-error")))
+            .order_by(MsgLogIngestionScan.updated_at.asc(), MsgLogIngestionScan.id.asc())
         )
-
-    @observe_database_method("reconcile_topic_recovery_delivery")
-    def reconcile_topic_recovery_delivery(
-        self, *, scan_id: int, source_chat_id: int, source_message_id: int,
-        target_chat_id: int, target_message_id: Optional[int], slave_chat_id: EFBChannelChatIDStr,
-        text: str, idempotency_key: str, delivery_queue_id: str,
-    ) -> None:
-        with database.atomic():
-            entry = TopicRecoveryEntry.get_or_none(
-                (TopicRecoveryEntry.scan_id == scan_id) &
-                (TopicRecoveryEntry.source_message_id == source_message_id)
-            )
-            if entry is None:
-                raise ValueError(f"Topic recovery entry {scan_id}:{source_message_id} is missing")
-            if entry.delivery_queue_id not in (None, delivery_queue_id):
-                raise ValueError(f"Topic recovery entry {scan_id}:{source_message_id} has another queue ID")
-            entry.classification = "accepted"
-            entry.status = "accepted"
-            entry.target_message_id = target_message_id
-            entry.error = None
-            entry.idempotency_key = idempotency_key
-            entry.delivery_queue_id = delivery_queue_id
-            entry.updated_at = datetime.datetime.now()
-            entry.save()
-            self.add_topic_recovery_msg_log(
-                source_chat_id=source_chat_id, source_message_id=source_message_id,
-                target_chat_id=target_chat_id, target_message_id=target_message_id,
-                slave_chat_id=slave_chat_id, text=text,
-            )
-
-    @observe_database_method("advance_topic_recovery_scan")
-    def advance_topic_recovery_scan(
-        self, scan: TopicRecoveryScan, cursor: int, *, status: str = "pending",
-        error: Optional[str] = None,
-    ) -> None:
-        scan.cursor = cursor
-        scan.status = status
-        scan.error = error
-        scan.updated_at = datetime.datetime.now()
-        scan.save()
-
-    @observe_database_method("add_topic_recovery_msg_log")
-    def add_topic_recovery_msg_log(
-        self, *, source_chat_id: int, source_message_id: int, target_chat_id: int,
-        target_message_id: Optional[int], slave_chat_id: EFBChannelChatIDStr, text: str,
-    ) -> None:
-        """Persist the source-to-target receipt used by later MsgLog reconciliation."""
-        source_id = f"{source_chat_id}.{source_message_id}"
-        target_id = (
-            f"{target_chat_id}.{target_message_id}" if target_message_id is not None else None
-        )
-        MsgLog.insert(
-            master_msg_id=source_id,
-            master_msg_id_alt=target_id,
-            slave_message_id=f"mtproto-recovery:{source_id}",
-            text=text,
-            slave_origin_uid=str(slave_chat_id),
-            slave_member_uid=str(slave_chat_id),
-            media_type="Text",
-            msg_type="Text",
-            sent_to=self.channel.channel_id,
-        ).on_conflict(
-            conflict_target=[MsgLog.master_msg_id],
-            update={MsgLog.master_msg_id_alt: target_id, MsgLog.text: text},
-        ).execute()

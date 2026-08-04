@@ -602,6 +602,10 @@ class MasterMessageProcessor(LocaleMixin):
             return self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."
             ))
+        if msg_log.provenance == "mtproto_ingested":
+            return self.bot.reply_error(update, self._(
+                "This recovered message cannot be removed from its remote chat."
+            ))
         try:
             etm_msg: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
         except UnpicklingError:

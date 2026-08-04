@@ -157,6 +157,9 @@ class TelegramChannel(MasterChannel):
         self.bot_manager.dispatcher.add_handler(
             CommandHandler("react", self.bot_manager.as_async_callback(self.react), filters=non_edit_filter)
         )
+        self.bot_manager.dispatcher.add_handler(
+            CommandHandler("sync_msglog", self.bot_manager.as_async_callback(self.sync_msglog), filters=non_edit_filter)
+        )
 
         # Register master message handlers after commands to prevent commands
         # commands to be delivered as messages
@@ -465,6 +468,10 @@ class TelegramChannel(MasterChannel):
                             self._("The message you replied to is not recorded in ETM database. "
                                    "You cannot react to this message."))
             return
+        if msg_log.provenance == "mtproto_ingested":
+            sync_reply_text(self.bot_manager, message,
+                            self._("This recovered message cannot be reacted to from its remote chat."))
+            return
 
         if not reaction:
             msg_log_obj: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
@@ -528,6 +535,27 @@ class TelegramChannel(MasterChannel):
                 prompt += "\n" + self._("You may want to try: {}").format(", ".join(channel.suggested_reactions[:10]))
             sync_reply_text(self.bot_manager, message, prompt)
             return
+
+    def sync_msglog(self, update: Update, context: CallbackContext):
+        """Schedule durable MsgLog ingestion for the current bound forum group."""
+        assert isinstance(update, Update)
+        if update.effective_message is None:
+            return
+        if update.effective_user is None or update.effective_user.id not in self.config['admins']:
+            sync_reply_text(self.bot_manager, update.effective_message, self._("This command is for ETM admins only."))
+            return
+        if update.effective_chat is None or not update.effective_chat.is_forum:
+            sync_reply_text(self.bot_manager, update.effective_message,
+                            self._("This command must be used in a bound forum group."))
+            return
+        group_id = TelegramChatID(update.effective_chat.id)
+        if not self.db.get_topic_slaves(group_id):
+            sync_reply_text(self.bot_manager, update.effective_message,
+                            self._("This forum group has no bound topics."))
+            return
+        state = self.chat_binding.schedule_msglog_ingestion(int(group_id))
+        sync_reply_text(self.bot_manager, update.effective_message,
+                        self._("MsgLog sync {state} for this group.").format(state=state))
 
     def help(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
@@ -691,7 +719,7 @@ class TelegramChannel(MasterChannel):
         origin_uid = etm_utils.chat_id_to_str(chat=chat)
         msg_log = self.db.get_msg_log(slave_origin_uid=origin_uid,
                                       slave_msg_id=msg_id)
-        if msg_log is not None:
+        if msg_log is not None and msg_log.provenance != "mtproto_ingested":
             return msg_log.build_etm_msg(self.chat_manager)
         else:
             # Message is not found.

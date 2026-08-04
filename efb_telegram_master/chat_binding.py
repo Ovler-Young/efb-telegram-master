@@ -8,6 +8,7 @@ import shlex
 import urllib.parse
 import threading
 import time
+import asyncio
 from contextlib import suppress
 from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Pattern, cast
 
@@ -30,7 +31,7 @@ from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
-from .topic_history_recovery import TopicHistoryRecovery, TopicRecoveryRequest
+from .msglog_ingestion import MsgLogIngestionService
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, TelegramTopicID
 
@@ -108,6 +109,8 @@ class ChatBindingManager(LocaleMixin):
         self._topic_mutex = threading.Lock()
         self._history_migration_lock = threading.Lock()
         self._history_migration_thread: Optional[threading.Thread] = None
+        self._msglog_ingestion_lock = threading.Lock()
+        self._msglog_ingestion_threads: Dict[int, threading.Thread] = {}
 
         # Link handler
         non_edit_filter = Filters.update.message | Filters.update.channel_post
@@ -710,14 +713,6 @@ class ChatBindingManager(LocaleMixin):
         if do_backfill:
             try:
                 self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
-                if backfill_override is True and previous_thread_id is not None and thread_id is not None:
-                    self.recover_topic_history(
-                        source_chat_id=tg_chat_to_link.id,
-                        source_thread_id=int(previous_thread_id),
-                        target_chat_id=tg_chat_to_link.id,
-                        target_thread_id=int(thread_id),
-                        slave_chat_id=chat_uid,
-                    )
             except Exception as e:
                 self.logger.warning("History migration failed for %s: %s", chat_display_name, e)
                 try:
@@ -1466,38 +1461,50 @@ class ChatBindingManager(LocaleMixin):
         )
         migration_thread.start()
 
-    def recover_topic_history(
-        self,
-        *,
-        source_chat_id: int,
-        source_thread_id: int,
-        target_chat_id: int,
-        target_thread_id: int,
-        slave_chat_id: EFBChannelChatIDStr,
-    ) -> None:
-        """Start the MTProto supplement after the MsgLog migration was queued."""
+    def schedule_msglog_ingestion(self, source_chat_id: int) -> str:
+        """Start one non-blocking durable scan for a bound source group."""
         mtproto = self.channel.mtproto
-        if not getattr(mtproto, "enabled", False):
+        if not getattr(mtproto, "enabled", False) or not getattr(mtproto, "connected", False):
+            return "unavailable"
+        with self._msglog_ingestion_lock:
+            existing = self._msglog_ingestion_threads.get(source_chat_id)
+            if existing is not None and existing.is_alive():
+                return "already running"
+            scan = self.db.get_or_create_msglog_ingestion_scan(
+                source_chat_id,
+                getattr(getattr(mtproto, "config", None), "scan_ceiling", 100_000),
+            )
+            if scan.status == "complete":
+                return "already complete"
+            state = "resumed" if scan.scanned_count else "started"
+            thread = threading.Thread(
+                target=self._run_msglog_ingestion,
+                args=(source_chat_id,),
+                daemon=True,
+                name=f"MsgLogIngestion-{source_chat_id}",
+            )
+            self._msglog_ingestion_threads[source_chat_id] = thread
+            thread.start()
+            return state
+
+    def _run_msglog_ingestion(self, source_chat_id: int) -> None:
+        try:
+            asyncio.run(MsgLogIngestionService(self.db, self.channel.mtproto).run(
+                source_chat_id, lease_owner=f"{threading.get_ident()}:{source_chat_id}",
+            ))
+        except Exception:
+            self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id)
+
+    def resume_pending_msglog_ingestions(self) -> None:
+        try:
+            scans = self.db.get_resumable_msglog_ingestion_scans()
+        except Exception as error:
+            self.logger.warning("Failed to load resumable MsgLog ingestions: %s", error)
             return
-        scan_boundary = getattr(getattr(mtproto, "config", None), "scan_ceiling", 100_000)
-        recovery = TopicHistoryRecovery(self.db, self.bot, mtproto, self.bot._runtime)
-        request = recovery.prepare(TopicRecoveryRequest(
-            source_chat_id=source_chat_id, source_thread_id=source_thread_id,
-            target_chat_id=target_chat_id, target_thread_id=target_thread_id,
-            slave_chat_id=slave_chat_id, scan_boundary=scan_boundary,
-        ))
-        if request is None:
-            return
-        if not getattr(mtproto, "connected", False):
-            self.logger.info("MTProto is unavailable; topic recovery remains pending.")
-            return
-        thread = threading.Thread(
-            target=recovery.recover_prepared,
-            args=(request,),
-            daemon=True,
-            name=f"TopicRecovery-{slave_chat_id}",
-        )
-        thread.start()
+        for scan in scans:
+            source_chat_id = int(scan.source_chat_id)
+            if self.db.get_topic_slaves(TelegramChatID(source_chat_id)):
+                self.schedule_msglog_ingestion(source_chat_id)
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr,
                                        tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
@@ -1516,23 +1523,6 @@ class ChatBindingManager(LocaleMixin):
                 self._start_history_migration_worker()
         except Exception as e:
             self.logger.warning("Failed to check pending history migrations: %s", e)
-
-    def resume_pending_topic_recoveries(self) -> None:
-        mtproto = self.channel.mtproto
-        if not getattr(mtproto, "enabled", False) or not getattr(mtproto, "connected", False):
-            self.logger.info("MTProto is unavailable; pending topic recoveries remain eligible.")
-            return
-        try:
-            scans = self.db.get_incomplete_topic_recovery_scans()
-        except Exception as error:
-            self.logger.warning("Failed to load incomplete topic recoveries: %s", error)
-            return
-        for scan in scans:
-            self.recover_topic_history(
-                source_chat_id=int(scan.source_chat_id), source_thread_id=int(scan.source_thread_id),
-                target_chat_id=int(scan.target_chat_id), target_thread_id=int(scan.target_thread_id),
-                slave_chat_id=EFBChannelChatIDStr(scan.slave_chat_id),
-            )
 
     def _start_history_migration_worker(self):
         existing_thread = self._history_migration_thread
@@ -1572,7 +1562,7 @@ class ChatBindingManager(LocaleMixin):
         for i, msg_log in enumerate(recent_messages):
             message_text = msg_log.text or ""
             formatted_text = None
-            if message_text.strip() and not (msg_log.media_type and msg_log.media_type != 'Text'):
+            if msg_log.provenance != "mtproto_ingested" and message_text.strip() and not (msg_log.media_type and msg_log.media_type != 'Text'):
                 etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
                 timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
                 author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"

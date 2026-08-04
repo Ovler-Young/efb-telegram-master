@@ -78,17 +78,6 @@ class QueuedDbLogContext(NamedTuple):
     on_complete: Optional[Callable[[], None]] = None
 
 
-class TopicRecoveryQueueContext(NamedTuple):
-    """Durable data required to reconcile one copied topic message."""
-    scan_id: int
-    source_chat_id: int
-    source_message_id: int
-    target_chat_id: int
-    slave_chat_id: str
-    text: str
-    idempotency_key: str
-
-
 if TYPE_CHECKING:
     from . import TelegramChannel
     from .message import ETMMsg
@@ -670,14 +659,14 @@ class TelegramBotManager(LocaleMixin):
         try:
             await mtproto.connect()
         except (ConnectionError, TimeoutError, OSError, MTProtoRetryableError) as error:
-            self.logger.warning("MTProto startup is unavailable; topic recovery remains pending: %s", error)
+            self.logger.warning("MTProto startup is unavailable; MsgLog ingestion remains pending: %s", error)
             return
         if not getattr(mtproto, "connected", False):
-            self.logger.warning("MTProto startup did not establish a connection; topic recovery remains pending.")
+            self.logger.warning("MTProto startup did not establish a connection; MsgLog ingestion remains pending.")
             return
         chat_binding = getattr(self.channel, "chat_binding", None)
         if chat_binding is not None:
-            chat_binding.resume_pending_topic_recoveries()
+            chat_binding.resume_pending_msglog_ingestions()
 
 
     async def _post_shutdown(self, application: Application):
@@ -1547,25 +1536,6 @@ class TelegramBotManager(LocaleMixin):
         return cast('ETMMsg', value[0]), cast(Optional['OldMsgID'], value[1])
 
     @staticmethod
-    def encode_topic_recovery_log_context(context: TopicRecoveryQueueContext) -> bytes:
-        try:
-            return b"\x02" + pickle.dumps(context, protocol=5)
-        except Exception as error:
-            raise QueueEnqueueError("Unable to serialize topic recovery queue context.") from error
-
-    @staticmethod
-    def _decode_topic_recovery_log_context(payload: object) -> TopicRecoveryQueueContext:
-        if not isinstance(payload, bytes) or not payload or payload[0] != 2:
-            raise QueuePersistenceError("Topic recovery queue context has an unknown version.")
-        try:
-            value = pickle.loads(payload[1:])
-        except Exception as error:
-            raise QueuePersistenceError("Topic recovery queue context cannot be decoded.") from error
-        if not isinstance(value, TopicRecoveryQueueContext):
-            raise QueuePersistenceError("Topic recovery queue context has an invalid shape.")
-        return value
-
-    @staticmethod
     def encode_queued_completion_receipt(result: object, selection: SenderSelection) -> bytes:
         try:
             return b"\x01" + pickle.dumps((result, selection.sender_bot_id), protocol=5)
@@ -1631,19 +1601,6 @@ class TelegramBotManager(LocaleMixin):
             return False
         real_tg_msg, sender_bot_id = self._decode_queued_completion_receipt(row.completion_receipt)
         try:
-            if row.log_context[0] == 2:
-                context = self._decode_topic_recovery_log_context(row.log_context)
-                target_message_id = getattr(real_tg_msg, "message_id", None)
-                if not isinstance(target_message_id, int) or isinstance(target_message_id, bool):
-                    target_message_id = None
-                self.channel.db.reconcile_topic_recovery_delivery(
-                    scan_id=context.scan_id, source_chat_id=context.source_chat_id,
-                    source_message_id=context.source_message_id, target_chat_id=context.target_chat_id,
-                    target_message_id=target_message_id, slave_chat_id=context.slave_chat_id,
-                    text=context.text, idempotency_key=context.idempotency_key,
-                    delivery_queue_id=row.queue_id,
-                )
-                return True
             etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
             etm_msg.type_telegram = get_msg_type(real_tg_msg)
             etm_msg.put_telegram_file(real_tg_msg)

@@ -26,7 +26,6 @@ from efb_telegram_master.bot_manager import (
     SendReceipt,
     SyncBotFacade,
     TelegramBotManager,
-    TopicRecoveryQueueContext,
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
@@ -1016,34 +1015,6 @@ def test_durable_reconciliation_keeps_receipt_when_application_db_fails(monkeypa
     assert manager._queued_completion_callbacks == {}
 
 
-def test_topic_recovery_reconciliation_uses_queue_id_and_retries_without_resend():
-    manager = object.__new__(TelegramBotManager)
-    database = SimpleNamespace(reconcile_topic_recovery_delivery=Mock(
-        side_effect=[RuntimeError("database unavailable"), None]
-    ))
-    manager.channel = SimpleNamespace(db=database)
-    manager.logger = Mock()
-    context = TelegramBotManager.encode_topic_recovery_log_context(
-        TopicRecoveryQueueContext(1, 10, 1, 20, "tests.mocks.slave.chat", "text", "1:1")
-    )
-    row = SimpleNamespace(
-        id=7, queue_id="queue-7", log_context=context,
-        completion_receipt=TelegramBotManager.encode_queued_completion_receipt(
-            SimpleNamespace(message_id=900), SenderSelection(object(), None)
-        ),
-    )
-
-    assert not TelegramBotManager.reconcile_queued_delivery(manager, row)
-    assert TelegramBotManager.reconcile_queued_delivery(manager, row)
-    assert database.reconcile_topic_recovery_delivery.call_count == 2
-    assert database.reconcile_topic_recovery_delivery.call_args.kwargs == {
-        "scan_id": 1, "source_chat_id": 10, "source_message_id": 1,
-        "target_chat_id": 20, "target_message_id": 900,
-        "slave_chat_id": "tests.mocks.slave.chat", "text": "text",
-        "idempotency_key": "1:1", "delivery_queue_id": "queue-7",
-    }
-
-
 def test_cooldown_metrics_snapshot_blocks_mutation_until_iteration_is_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1637,7 +1608,7 @@ async def test_shutdown_ptb_application_signals_stop_running():
 
 
 @pytest.mark.asyncio
-async def test_post_init_resumes_topic_recovery_after_mtproto_connects():
+async def test_post_init_resumes_msglog_ingestion_after_mtproto_connects():
     events = []
 
     async def connect():
@@ -1656,7 +1627,7 @@ async def test_post_init_resumes_topic_recovery_after_mtproto_connects():
         channel=SimpleNamespace(
             mtproto=mtproto,
             chat_binding=SimpleNamespace(
-                resume_pending_topic_recoveries=lambda: events.append("resume"),
+                resume_pending_msglog_ingestions=lambda: events.append("resume"),
             ),
         ),
     )
@@ -1667,14 +1638,14 @@ async def test_post_init_resumes_topic_recovery_after_mtproto_connects():
 
 
 @pytest.mark.asyncio
-async def test_post_init_leaves_topic_recovery_pending_when_mtproto_is_disabled():
+async def test_post_init_leaves_msglog_ingestion_pending_when_mtproto_is_disabled():
     resume = Mock()
     manager = SimpleNamespace(
         _runtime=SimpleNamespace(bind_loop=Mock()), bot_pool=None,
         _shutdown_complete_event=threading.Event(), logger=Mock(),
         channel=SimpleNamespace(
             mtproto=SimpleNamespace(enabled=False, connect=Mock()),
-            chat_binding=SimpleNamespace(resume_pending_topic_recoveries=resume),
+            chat_binding=SimpleNamespace(resume_pending_msglog_ingestions=resume),
         ),
     )
 
@@ -1685,7 +1656,7 @@ async def test_post_init_leaves_topic_recovery_pending_when_mtproto_is_disabled(
 
 
 @pytest.mark.asyncio
-async def test_post_init_retains_topic_recovery_when_mtproto_connection_is_unavailable():
+async def test_post_init_retains_msglog_ingestion_when_mtproto_connection_is_unavailable():
     async def unavailable():
         raise ConnectionError("unavailable")
 
@@ -1695,7 +1666,7 @@ async def test_post_init_retains_topic_recovery_when_mtproto_connection_is_unava
         _shutdown_complete_event=threading.Event(), logger=Mock(),
         channel=SimpleNamespace(
             mtproto=SimpleNamespace(enabled=True, connected=False, connect=unavailable),
-            chat_binding=SimpleNamespace(resume_pending_topic_recoveries=resume),
+            chat_binding=SimpleNamespace(resume_pending_msglog_ingestions=resume),
         ),
     )
 

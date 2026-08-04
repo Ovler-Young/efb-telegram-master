@@ -212,10 +212,10 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
 
 
 @pytest.mark.asyncio
-async def test_bot_lifecycle_keeps_topic_recovery_pending_for_retryable_mtproto_startup_failure():
+async def test_bot_lifecycle_keeps_msglog_ingestion_pending_for_retryable_mtproto_startup_failure():
     mtproto = LifecycleMTProto(MTProtoFloodWaitError("wait", retry_after=17))
     runtime = SimpleNamespace(bind_loop=Mock(), clear_loop=Mock())
-    chat_binding = SimpleNamespace(resume_pending_topic_recoveries=Mock())
+    chat_binding = SimpleNamespace(resume_pending_msglog_ingestions=Mock())
     logger = Mock()
     manager = SimpleNamespace(
         _runtime=runtime,
@@ -228,7 +228,7 @@ async def test_bot_lifecycle_keeps_topic_recovery_pending_for_retryable_mtproto_
     await TelegramBotManager._post_init(manager, object())
 
     runtime.bind_loop.assert_called_once()
-    chat_binding.resume_pending_topic_recoveries.assert_not_called()
+    chat_binding.resume_pending_msglog_ingestions.assert_not_called()
     logger.warning.assert_called_once()
 
 
