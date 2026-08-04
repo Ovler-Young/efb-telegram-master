@@ -391,6 +391,23 @@ def test_undelivered_slave_message_releases_pending_claim():
     processor.dispatch_message.assert_not_called()
 
 
+def test_ingested_slave_message_edit_has_no_telegram_side_effect():
+    processor = build_duplicate_test_processor()
+    processor.db.get_msg_log.return_value = SimpleNamespace(provenance="mtproto_ingested")
+    message = build_duplicate_test_message("mtproto-ingested:100.1")
+    message.edit = True
+
+    result = SlaveMessageProcessor.send_message(processor, message)
+
+    assert result is message
+    processor.db.get_msg_log.assert_called_once_with(
+        slave_msg_id="mtproto-ingested:100.1", slave_origin_uid="tests.mocks.slave __chat_id__",
+    )
+    processor.get_slave_msg_dest.assert_not_called()
+    processor.is_silent.assert_not_called()
+    processor.dispatch_message.assert_not_called()
+
+
 def test_slave_message_generate_common_private(generate_message_template, private):
     message = build_dummy_message(private, private.other)
     header = generate_message_template(message, False)

@@ -182,10 +182,16 @@ class SlaveMessageProcessor(LocaleMixin):
         tg_dest = None
         thread_id = None
         xid = msg.uid
+        old_msg = None
         try:
             self.logger.debug("[%s] Slave message delivered to ETM.\n%s", xid, msg)
 
             slave_origin_uid = utils.chat_id_to_str(chat=msg.chat)
+            if msg.edit:
+                old_msg = self.db.get_msg_log(slave_msg_id=msg.uid, slave_origin_uid=slave_origin_uid)
+                if old_msg and old_msg.provenance == "mtproto_ingested":
+                    self.logger.info("Ignoring edit for ingested synthetic message %s from %s.", msg.uid, msg.chat)
+                    return msg
             dedupe_key = self._dedupe_key(msg, slave_origin_uid)
             if dedupe_key is not None:
                 # In-memory only; process restarts can redeliver duplicates.
@@ -214,11 +220,7 @@ class SlaveMessageProcessor(LocaleMixin):
             old_msg_id: Optional[OldMsgID] = None
             _edit_sender_bot_id: Optional[str] = None
             if msg.edit:
-                old_msg = self.db.get_msg_log(slave_msg_id=msg.uid,
-                                              slave_origin_uid=utils.chat_id_to_str(chat=msg.chat))
-                if old_msg and old_msg.provenance == "mtproto_ingested":
-                    self.logger.info("Ignoring edit for ingested synthetic message %s from %s.", msg.uid, msg.chat)
-                elif old_msg:
+                if old_msg:
                     _edit_sender_bot_id = old_msg.sender_bot_id
 
                     if old_msg.master_msg_id_alt:

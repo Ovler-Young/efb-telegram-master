@@ -8,7 +8,6 @@ import shlex
 import urllib.parse
 import threading
 import time
-import asyncio
 from contextlib import suppress
 from typing import Tuple, Dict, Optional, List, TYPE_CHECKING, IO, Union, Pattern, cast
 
@@ -1489,7 +1488,7 @@ class ChatBindingManager(LocaleMixin):
 
     def _run_msglog_ingestion(self, source_chat_id: int) -> None:
         try:
-            asyncio.run(MsgLogIngestionService(self.db, self.channel.mtproto).run(
+            self.bot._runtime.call(MsgLogIngestionService(self.db, self.channel.mtproto).run(
                 source_chat_id, lease_owner=f"{threading.get_ident()}:{source_chat_id}",
             ))
         except Exception:

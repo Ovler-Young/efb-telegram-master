@@ -2,7 +2,7 @@ import os
 import logging
 import pickle
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -98,6 +98,39 @@ def test_msglog_ingestion_database_api_is_leased_and_idempotent():
             scan, status="retryable-error", error="temporary", lease_owner="worker-a",
         )
         assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is not None
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+
+def test_resumable_msglog_ingestion_scans_include_unleased_and_expired_running_jobs():
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    manager = object.__new__(DatabaseManager)
+    now = datetime.now()
+    try:
+        test_db.create_tables([MsgLogIngestionScan])
+        MsgLogIngestionScan.insert_many([
+            {"source_chat_id": "100", "scan_boundary": 10, "cursor": 10, "status": "pending",
+             "lease_expires_at": None},
+            {"source_chat_id": "200", "scan_boundary": 10, "cursor": 10, "status": "retryable-error",
+             "lease_expires_at": None},
+            {"source_chat_id": "300", "scan_boundary": 10, "cursor": 10, "status": "running",
+             "lease_expires_at": now - timedelta(seconds=1)},
+            {"source_chat_id": "400", "scan_boundary": 10, "cursor": 10, "status": "running"},
+            {"source_chat_id": "500", "scan_boundary": 10, "cursor": 10, "status": "running",
+             "lease_expires_at": now + timedelta(seconds=60)},
+        ]).execute()
+
+        scans = manager.get_resumable_msglog_ingestion_scans()
+
+        assert [scan.source_chat_id for scan in scans] == ["100", "200", "300", "400"]
+        assert manager.claim_msglog_ingestion_scan(300, "restart", 60) is not None
+        assert manager.claim_msglog_ingestion_scan(500, "restart", 60) is None
     finally:
         test_db.close()
         database.initialize(original_database)

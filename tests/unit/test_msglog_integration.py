@@ -66,6 +66,27 @@ def test_schedule_msglog_ingestion_starts_one_thread_per_group(monkeypatch):
     thread.start.assert_called_once()
 
 
+def test_msglog_ingestion_uses_the_bound_telegram_runtime_loop():
+    class LoopPinningRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, coroutine):
+            self.calls.append(coroutine)
+            coroutine.close()
+
+    runtime = LoopPinningRuntime()
+    manager = object.__new__(ChatBindingManager)
+    manager.bot = SimpleNamespace(_runtime=runtime)
+    manager.db = Mock()
+    manager.channel = SimpleNamespace(mtproto=SimpleNamespace())
+    manager.logger = Mock()
+
+    ChatBindingManager._run_msglog_ingestion(manager, 100)
+
+    assert len(runtime.calls) == 1
+
+
 def test_ingested_text_and_media_backfill_use_copy_message():
     manager = object.__new__(ChatBindingManager)
     manager.db = Mock()
