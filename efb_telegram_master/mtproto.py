@@ -330,7 +330,7 @@ class MTProtoClient:
             await self._client.connect()
             await self._client.start(bot_token=self._bot_token)
             self._protect_session_file()
-        except BaseException:
+        except BaseException as error:
             if self._client is not None:
                 try:
                     await self._client.disconnect()
@@ -338,7 +338,10 @@ class MTProtoClient:
                     pass
             self._client = None
             self._release_session()
-            raise
+            translated = translate_mtproto_error(error)
+            if translated is error:
+                raise
+            raise translated from error
 
     async def disconnect(self) -> None:
         if self._client is None:

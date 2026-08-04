@@ -39,14 +39,20 @@ class FakeClient:
         self.media_limit = 1024
         self.sent_files: list[tuple[object, ...]] = []
         self.response_messages: list[object] | None = None
+        self.connect_error: BaseException | None = None
+        self.start_error: BaseException | None = None
 
     async def connect(self) -> None:
         self.connect_calls += 1
+        if self.connect_error is not None:
+            raise self.connect_error
         self.connected = True
         self.session_path.with_suffix(".session").touch()
 
     async def start(self, *, bot_token: str) -> None:
         self.start_tokens.append(bot_token)
+        if self.start_error is not None:
+            raise self.start_error
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
@@ -91,15 +97,30 @@ class FakeServerError(Exception):
     pass
 
 
+class FakeRpcCallFailError(Exception):
+    pass
+
+
+class FakeTimedOutError(Exception):
+    pass
+
+
+class FakeInterdcCallError(Exception):
+    pass
+
+
 class LifecycleMTProto:
-    def __init__(self) -> None:
+    def __init__(self, connect_error: BaseException | None = None) -> None:
         self.enabled = True
         self.connected = False
         self.connect_calls = 0
         self.disconnect_calls = 0
+        self.connect_error = connect_error
 
     async def connect(self) -> None:
         self.connect_calls += 1
+        if self.connect_error is not None:
+            raise self.connect_error
         self.connected = True
 
     async def disconnect(self) -> None:
@@ -189,6 +210,42 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
 
 
 @pytest.mark.asyncio
+async def test_bot_lifecycle_keeps_topic_recovery_pending_for_retryable_mtproto_startup_failure():
+    mtproto = LifecycleMTProto(MTProtoFloodWaitError("wait", retry_after=17))
+    runtime = SimpleNamespace(bind_loop=Mock(), clear_loop=Mock())
+    chat_binding = SimpleNamespace(resume_pending_topic_recoveries=Mock())
+    logger = Mock()
+    manager = SimpleNamespace(
+        _runtime=runtime,
+        bot_pool=None,
+        _shutdown_complete_event=threading.Event(),
+        channel=SimpleNamespace(mtproto=mtproto, chat_binding=chat_binding),
+        logger=logger,
+    )
+
+    await TelegramBotManager._post_init(manager, object())
+
+    runtime.bind_loop.assert_called_once()
+    chat_binding.resume_pending_topic_recoveries.assert_not_called()
+    logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_bot_lifecycle_preserves_fatal_mtproto_startup_failures():
+    mtproto = LifecycleMTProto(ValueError("invalid bot token"))
+    manager = SimpleNamespace(
+        _runtime=SimpleNamespace(bind_loop=Mock(), clear_loop=Mock()),
+        bot_pool=None,
+        _shutdown_complete_event=threading.Event(),
+        channel=SimpleNamespace(mtproto=mtproto),
+        logger=Mock(),
+    )
+
+    with pytest.raises(ValueError, match="invalid bot token"):
+        await TelegramBotManager._post_init(manager, object())
+
+
+@pytest.mark.asyncio
 async def test_connect_authenticates_once_and_protects_session_files(tmp_path: Path):
     clients: list[FakeClient] = []
 
@@ -213,6 +270,43 @@ async def test_connect_authenticates_once_and_protects_session_files(tmp_path: P
 
     await client.disconnect()
     assert clients[0].disconnect_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["connect", "start"])
+@pytest.mark.parametrize(
+    ("error_type", "expected_type", "retry_after"),
+    [
+        (FakeServerError, MTProtoRetryableError, None),
+        (FakeRpcCallFailError, MTProtoRetryableError, None),
+        (FakeTimedOutError, MTProtoRetryableError, None),
+        (FakeInterdcCallError, MTProtoRetryableError, None),
+        (FakeFloodWaitError, MTProtoFloodWaitError, 17),
+    ],
+)
+async def test_connect_translates_retryable_telethon_startup_errors_after_cleanup(
+    tmp_path: Path,
+    phase: str,
+    error_type: type[BaseException],
+    expected_type: type[MTProtoRetryableError],
+    retry_after: float | None,
+):
+    clients: list[FakeClient] = []
+
+    def factory(session_path: Path, config: MTProtoConfig) -> FakeClient:
+        client = FakeClient(session_path, config)
+        setattr(client, f"{phase}_error", error_type(17) if error_type is FakeFloodWaitError else error_type())
+        clients.append(client)
+        return client
+
+    client = MTProtoClient(enabled_config(), "bot-token", tmp_path, client_factory=factory)
+
+    with pytest.raises(expected_type) as caught:
+        await client.connect()
+
+    assert caught.value.retry_after == retry_after
+    assert clients[0].disconnect_calls == 1
+    assert client.connected is False
 
 
 @pytest.mark.asyncio

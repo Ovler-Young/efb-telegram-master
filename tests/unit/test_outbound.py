@@ -19,7 +19,7 @@ from telegram import (
     PhotoSize,
 )
 
-from efb_telegram_master.mtproto import MTProtoMediaDescriptor
+from efb_telegram_master.mtproto import MTProtoMediaDescriptor, MTProtoRetryableError
 from efb_telegram_master.outbound import (
     InvalidQueuedPayloadError,
     OutboundQueue,
@@ -1032,6 +1032,15 @@ class DurableAdapter(Adapter):
         return self.reconcile
 
 
+class TransportFailureAdapter(DurableAdapter):
+    def execute_queued_call(self, row, args, kwargs, selection):
+        self.calls.append((row.id, row.telegram_chat_id, row.operation))
+        raise MTProtoRetryableError("temporary transport failure")
+
+    def record_queued_failure(self, row, error, selection):
+        return CompletionDecision("terminal_failure")
+
+
 @pytest.mark.parametrize("operation_name, args, kwargs", [
     ("copy_message", (), {
         "chat_id": 7, "from_chat_id": 8, "message_id": 9, "message_thread_id": 10,
@@ -1073,6 +1082,50 @@ def test_restart_after_remote_success_before_receipt_keeps_row_unknown_without_r
     assert [row.id for row in restarted.unknown()] == [row_id]
     assert restarted.heads() == []
     assert second_adapter.calls == []
+
+
+def test_durable_mtproto_transport_failure_after_submission_becomes_unknown_and_blocks_restart(tmp_path):
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"media")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="", reply_to=None,
+            force_document=True, supports_streaming=False, silent=False,
+            media_name="document", mime_type="application/octet-stream",
+        )
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest(
+        "send_mtproto_media", (7, descriptor),
+        {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+        log_context=b"\x01context",
+    ))
+    enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "later"}, log_context=b"\x01context",
+    ))
+    first_adapter = TransportFailureAdapter(reconcile=False)
+    executor = ThreadPoolExecutor(max_workers=1)
+    scheduler = OutboundQueueScheduler(queue, first_adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    with pytest.raises(MTProtoRetryableError):
+        scheduler.in_flight[row_id].future.result(timeout=1)
+    scheduler.harvest_completed()
+
+    assert first_adapter.calls == [(row_id, 7, "send_mtproto_media")]
+    assert [row.id for row in queue.unknown()] == [row_id]
+    assert queue.heads() == []
+    queue.close()
+    executor.shutdown()
+
+    restarted = OutboundQueue(tmp_path)
+    second_adapter = DurableAdapter(reconcile=True)
+    with ThreadPoolExecutor(max_workers=1) as restarted_executor:
+        OutboundQueueScheduler(restarted, second_adapter, restarted_executor, worker_count=1).dispatch_once()
+
+    assert [row.id for row in restarted.unknown()] == [row_id]
+    assert restarted.heads() == []
+    assert second_adapter.calls == []
+    restarted.close()
 
 
 def test_unknown_row_blocks_its_destination_until_an_operator_requeues_or_resolves_it(tmp_path):
