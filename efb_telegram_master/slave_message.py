@@ -1583,7 +1583,7 @@ class SlaveMessageProcessor(LocaleMixin):
             self.logger.error('Trying to update reactions of message, but message is not found in database. '
                               'Message ID %s from %s, status: %s.', status.msg_id, status.chat, status.reactions)
             return
-        if old_msg_db.provenance == "mtproto_ingested":
+        if getattr(old_msg_db, "provenance", "live") == "mtproto_ingested":
             self.logger.info("Ignoring reaction update for ingested synthetic message %s from %s.",
                              status.msg_id, status.chat)
             return
