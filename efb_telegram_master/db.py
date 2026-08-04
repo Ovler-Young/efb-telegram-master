@@ -148,7 +148,7 @@ class MsgLog(BaseModel):
     """Module ID of the message sent to."""
     sender_bot_id = TextField(null=True)
     """Telegram bot user ID that sent this message. NULL means the main bot."""
-    delivery_queue_id = TextField(null=True)
+    delivery_queue_id = TextField(null=True, unique=True)
     """Durable outbound queue identifier associated with a delivered Telegram receipt."""
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
@@ -387,10 +387,15 @@ class DatabaseManager:
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
-        database.create_tables([
+        models = [
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
             TopicRecoveryScan, TopicRecoveryEntry,
-        ], safe=True)
+        ]
+        existing_tables = set(database.get_tables())
+        database.create_tables(
+            [model for model in models if model._meta.table_name not in existing_tables],
+            safe=True,
+        )
 
     @staticmethod
     def _select_existing_columns(model, table_name: str, requested_fields: List):
@@ -502,6 +507,8 @@ class DatabaseManager:
                 self._migrate(4)
             elif "delivery_queue_id" not in msg_log_columns:
                 self._migrate(5)
+            elif not self._has_unique_column_index("msglog", "delivery_queue_id"):
+                self._migrate(5)
             elif "topicrecoveryscan" not in database.get_tables() or "topicrecoveryentry" not in database.get_tables():
                 self._migrate(6)
             elif "delivery_queue_id" not in {
@@ -510,6 +517,37 @@ class DatabaseManager:
                 self._migrate(7)
             else:
                 return
+
+    @staticmethod
+    def _has_unique_column_index(table_name: str, column_name: str) -> bool:
+        return any(
+            index.unique and tuple(index.columns) == (column_name,)
+            for index in database.get_indexes(table_name)
+        )
+
+    @staticmethod
+    def _create_msglog_delivery_queue_id_index() -> None:
+        if "msglog" not in database.get_tables():
+            raise RuntimeError("Cannot migrate MsgLog delivery_queue_id: msglog table is missing.")
+        if "delivery_queue_id" not in {
+            column.name for column in database.get_columns("msglog")
+        }:
+            raise RuntimeError("Cannot create MsgLog delivery_queue_id index: column is missing.")
+        duplicate = database.execute_sql(
+            "SELECT delivery_queue_id, COUNT(*) FROM msglog "
+            "WHERE delivery_queue_id IS NOT NULL GROUP BY delivery_queue_id "
+            "HAVING COUNT(*) > 1 ORDER BY delivery_queue_id LIMIT 1"
+        ).fetchone()
+        if duplicate is not None:
+            queue_id, count = duplicate
+            raise RuntimeError(
+                "Resolve duplicate MsgLog delivery_queue_id values before restarting: "
+                f"{queue_id!r} occurs {count} times."
+            )
+        database.execute_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS msglog_delivery_queue_id "
+            "ON msglog (delivery_queue_id)"
+        )
 
     def _migrate(self, i: int):
         """
@@ -554,10 +592,13 @@ class DatabaseManager:
                 migrator.add_column("msglog", "sender_bot_id", MsgLog.sender_bot_id)
             )
         if i <= 5:
-            migrate(
-                migrator.add_column("msglog", "delivery_queue_id", MsgLog.delivery_queue_id)
-            )
-        if i <= 6:
+            msg_log_columns = {column.name for column in database.get_columns("msglog")}
+            if "delivery_queue_id" not in msg_log_columns:
+                migrate(
+                    migrator.add_column("msglog", "delivery_queue_id", TextField(null=True))
+                )
+            self._create_msglog_delivery_queue_id_index()
+        if i == 6:
             database.create_tables([TopicRecoveryScan, TopicRecoveryEntry], safe=True)
         if i == 7:
             migrate(
