@@ -106,6 +106,14 @@ class MTProtoReceipt:
     message_id: int
 
 
+class MTProtoKnownNotSubmittedError(ValueError):
+    """An MTProto validation failure raised before a media send request."""
+
+
+class MTProtoMediaDescriptorError(MTProtoKnownNotSubmittedError):
+    """A durable media descriptor cannot be used for an MTProto request."""
+
+
 @dataclass(frozen=True)
 class MTProtoMediaDescriptor:
     """Versioned, reopenable input for one durable MTProto media request."""
@@ -140,7 +148,7 @@ class MTProtoMediaDescriptor:
     ) -> "MTProtoMediaDescriptor":
         name = getattr(stream, "name", None)
         if not isinstance(name, (str, os.PathLike)):
-            raise ValueError("MTProto durable media requires a path-backed file.")
+            raise MTProtoMediaDescriptorError("MTProto durable media requires a path-backed file.")
         path = Path(name).expanduser().resolve(strict=True)
         descriptor = cls(
             cls.VERSION, str(path), file_size, caption, reply_to, force_document,
@@ -152,46 +160,51 @@ class MTProtoMediaDescriptor:
 
     def validate(self) -> None:
         if self.version != self.VERSION:
-            raise ValueError("MTProto media descriptor has an unknown version.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor has an unknown version.")
         if not isinstance(self.path, str) or not self.path:
-            raise ValueError("MTProto media descriptor requires a file path.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor requires a file path.")
         if isinstance(self.file_size, bool) or not isinstance(self.file_size, int) or self.file_size < 0:
-            raise ValueError("MTProto media descriptor has an invalid file size.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid file size.")
         if not isinstance(self.caption, str) or self.media_name not in {"document", "photo", "video", "animation"}:
-            raise ValueError("MTProto media descriptor has invalid metadata.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor has invalid metadata.")
         if self.reply_to is not None and (isinstance(self.reply_to, bool) or not isinstance(self.reply_to, int)):
-            raise ValueError("MTProto media descriptor has an invalid reply target.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid reply target.")
         if not all(isinstance(value, bool) for value in (
             self.force_document, self.supports_streaming, self.silent,
         )):
-            raise ValueError("MTProto media descriptor has invalid flags.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor has invalid flags.")
         if self.mime_type is not None and not isinstance(self.mime_type, str):
-            raise ValueError("MTProto media descriptor has an invalid MIME type.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid MIME type.")
         file_name = getattr(self, "file_name", "")
         if not isinstance(file_name, str):
-            raise ValueError("MTProto media descriptor has an invalid file name.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid file name.")
         if file_name and (
             "/" in file_name
             or "\\" in file_name
             or file_name != _media_filename(file_name, self.media_name, self.mime_type)
         ):
-            raise ValueError("MTProto media descriptor has an invalid file name.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid file name.")
         path = Path(self.path)
         try:
             resolved = path.resolve(strict=True)
         except OSError as error:
-            raise ValueError("MTProto media descriptor cannot reopen the original file.") from error
+            raise MTProtoMediaDescriptorError("MTProto media descriptor cannot reopen the original file.") from error
         if (
             not path.is_absolute()
             or resolved != path
             or not path.is_file()
             or path.stat().st_size != self.file_size
         ):
-            raise ValueError("MTProto media descriptor cannot reopen the original file.")
+            raise MTProtoMediaDescriptorError("MTProto media descriptor cannot reopen the original file.")
 
     def open(self):
         self.validate()
-        return Path(self.path).open("rb")
+        try:
+            return Path(self.path).open("rb")
+        except OSError as error:
+            raise MTProtoMediaDescriptorError(
+                "MTProto media descriptor cannot reopen the original file."
+            ) from error
 
     def media_filename(self) -> str:
         """Return the preserved name, or derive a safe legacy fallback."""
@@ -222,7 +235,7 @@ class MTProtoNotConnectedError(MTProtoRetryableError):
     """A local availability failure raised before an MTProto request is submitted."""
 
 
-class MTProtoMediaLimitError(ValueError):
+class MTProtoMediaLimitError(MTProtoKnownNotSubmittedError):
     """A media transfer exceeds the configured MTProto file limit."""
 
 

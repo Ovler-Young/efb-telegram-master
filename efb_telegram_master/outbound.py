@@ -26,7 +26,12 @@ from telegram import (
 )
 from telegram.error import RetryAfter
 
-from .mtproto import MTProtoFloodWaitError, MTProtoMediaDescriptor, MTProtoNotConnectedError
+from .mtproto import (
+    MTProtoFloodWaitError,
+    MTProtoKnownNotSubmittedError,
+    MTProtoMediaDescriptor,
+    MTProtoNotConnectedError,
+)
 
 
 @dataclass(frozen=True)
@@ -1444,6 +1449,7 @@ class OutboundQueueScheduler:
                     known_not_sent = isinstance(
                         error, (RetryAfter, MTProtoFloodWaitError, MTProtoNotConnectedError)
                     )
+                    known_not_submitted_terminal = isinstance(error, MTProtoKnownNotSubmittedError)
                     if (
                         decision.kind == "retry_eventual"
                         and submitted.row.priority == 0
@@ -1469,7 +1475,7 @@ class OutboundQueueScheduler:
                             )
                         continue
                     if submitted.row.priority == 0:
-                        if submitted.row.log_context is not None:
+                        if submitted.row.log_context is not None and not known_not_submitted_terminal:
                             try:
                                 assert submitted.attempt_id is not None
                                 self.queue.mark_attempt_unknown(row_id, submitted.attempt_id)

@@ -22,6 +22,8 @@ from telegram import (
 
 from efb_telegram_master.mtproto import (
     MTProtoMediaDescriptor,
+    MTProtoMediaDescriptorError,
+    MTProtoMediaLimitError,
     MTProtoNotConnectedError,
     MTProtoRetryableError,
 )
@@ -1055,6 +1057,21 @@ class DisconnectedMTProtoAdapter(DurableAdapter):
         return CompletionDecision("retry_eventual", time.monotonic())
 
 
+class KnownNotSubmittedMediaAdapter(DurableAdapter):
+    def __init__(self, error_type):
+        super().__init__(reconcile=False)
+        self.error_type = error_type
+
+    def execute_queued_call(self, row, args, kwargs, selection):
+        self.calls.append((row.id, row.telegram_chat_id, row.operation))
+        if row.operation == "send_mtproto_media":
+            raise self.error_type("MTProto media validation failed before submission.")
+        return row.id
+
+    def record_queued_failure(self, row, error, selection):
+        return CompletionDecision("terminal_failure")
+
+
 @pytest.mark.parametrize("operation_name, args, kwargs", [
     ("copy_message", (), {
         "chat_id": 7, "from_chat_id": 8, "message_id": 9, "message_thread_id": 10,
@@ -1168,6 +1185,60 @@ def test_disconnected_mtproto_media_is_requeued_without_an_ambiguous_delivery(tm
     assert adapter.calls == [(row_id, 7, "send_mtproto_media")]
     assert [row.id for row in queue.heads()] == [row_id]
     assert queue.unknown() == []
+    queue.close()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [MTProtoMediaLimitError, MTProtoMediaDescriptorError],
+    ids=["media-limit", "descriptor-validation"],
+)
+def test_known_not_submitted_mtproto_media_error_discards_artifact_without_blocking_later_destination_row(
+    tmp_path, error_type,
+):
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"media")
+    with source.open("rb") as stream:
+        descriptor = MTProtoMediaDescriptor.from_stream(
+            stream, file_size=source.stat().st_size, caption="", reply_to=None,
+            force_document=True, supports_streaming=False, silent=False,
+            media_name="document", mime_type="application/octet-stream",
+        )
+    queue = OutboundQueue(tmp_path)
+    first_id, first_waiter = enqueue(queue, QueueRequest(
+        "send_mtproto_media", (7, descriptor),
+        {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
+        log_context=b"\x01context",
+    ))
+    second_id, _second_waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "later"},
+    ))
+    queued_descriptor = queue.decode_payload(queue.heads()[0].payload)[0][1]
+    artifact = Path(queued_descriptor.path)
+    adapter = KnownNotSubmittedMediaAdapter(error_type)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        with pytest.raises(error_type, match="before submission"):
+            scheduler.in_flight[first_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+        with pytest.raises(error_type, match="before submission"):
+            first_waiter.result(timeout=1)
+        assert not artifact.exists()
+        assert queue.unknown() == []
+        assert [row.id for row in queue.heads()] == [second_id]
+
+        scheduler.dispatch_once()
+        scheduler.in_flight[second_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    assert adapter.calls == [
+        (first_id, 7, "send_mtproto_media"),
+        (second_id, 7, "send_message"),
+    ]
+    assert queue.heads() == []
     queue.close()
 
 

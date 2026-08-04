@@ -14,6 +14,7 @@ from efb_telegram_master.mtproto import (
     MTProtoConfig,
     MTProtoFloodWaitError,
     MTProtoMediaDescriptor,
+    MTProtoMediaDescriptorError,
     MTProtoMediaLimitError,
     MTProtoNotConnectedError,
     MTProtoReceipt,
@@ -548,7 +549,7 @@ async def test_media_descriptor_reopens_a_path_without_materializing_file(tmp_pa
 
 
 def test_media_descriptor_rejects_non_reopenable_stream():
-    with pytest.raises(ValueError, match="path-backed"):
+    with pytest.raises(MTProtoMediaDescriptorError, match="path-backed"):
         MTProtoMediaDescriptor.from_stream(
             object(), file_size=1, caption="", reply_to=None, force_document=True,
             supports_streaming=False, silent=False, media_name="document", mime_type=None,
