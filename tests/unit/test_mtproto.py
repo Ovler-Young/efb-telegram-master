@@ -1,12 +1,11 @@
 import sys
-import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from efb_telegram_master.bot_manager import TelegramBotManager
+from efb_telegram_master import TelegramChannel
 from efb_telegram_master.mtproto import (
     MTProtoClient,
     MTProtoConfig,
@@ -100,19 +99,21 @@ def test_telethon_factory_disables_entity_storage_and_updates(monkeypatch: pytes
 @pytest.mark.asyncio
 async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
     mtproto = LifecycleMTProto()
-    runtime = SimpleNamespace(bind_loop=Mock(), clear_loop=Mock())
-    manager = SimpleNamespace(
-        _runtime=runtime,
-        bot_pool=None,
-        _shutdown_complete_event=threading.Event(),
-        channel=SimpleNamespace(mtproto=mtproto),
+    auxiliary = Mock()
+    channel = SimpleNamespace(
+        bot_manager=SimpleNamespace(bot_pool=SimpleNamespace(bots=[auxiliary])),
+        mtproto=mtproto,
+        chat_binding=SimpleNamespace(resume_pending_msglog_ingestions=Mock()),
         logger=Mock(),
     )
+    runtime = SimpleNamespace(async_runtime=Mock())
 
-    await TelegramBotManager._post_init(manager, object())
-    await TelegramBotManager._post_shutdown(manager, object())
+    await TelegramChannel._telegram_runtime_started(channel, runtime)
+    await TelegramChannel._telegram_runtime_stopped(channel, runtime)
 
     assert (mtproto.connect_calls, mtproto.disconnect_calls) == (1, 1)
+    auxiliary.bind_runtime.assert_called_once_with(runtime.async_runtime)
+    channel.chat_binding.resume_pending_msglog_ingestions.assert_called_once_with()
 
 
 @pytest.mark.asyncio

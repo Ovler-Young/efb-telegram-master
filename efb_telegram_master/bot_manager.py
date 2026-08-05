@@ -3,32 +3,27 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import collections.abc
 import html
 import logging
 import numbers
 import os
 import re
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import wraps
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, BinaryIO, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
-from urllib.parse import quote, urlparse, urlunparse
+from typing import TYPE_CHECKING, BinaryIO, Callable, Coroutine, List, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.request import url2pathname
-from unittest.mock import patch
 
 import telegram.constants
 import telegram.error
 from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
-from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
-from telegram.ext import _applicationbuilder as ptb_applicationbuilder
-from telegram.request import HTTPXRequest
+from telegram.ext import CallbackContext, MessageHandler, TypeHandler
 
 from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
+from .etm_metrics import Metrics, parse_metrics_config, start_metrics_server
 from .locale_mixin import LocaleMixin
-from .mtproto import MTProtoRetryableError
 from .outbound import (
     OutboundQueue,
     QUEUED_OPERATIONS,
@@ -39,7 +34,7 @@ from .outbound import (
 from .ptb_compat import Filters
 from .rate_limiter import SlidingWindowRateLimiter
 from .utils import TelegramChatID, TelegramMessageID
-from .telegram_runtime import AsyncTelegramRuntime, SyncBotFacade
+from .telegram_runtime import TelegramPollingRuntime, normalize_request_kwargs
 
 
 if TYPE_CHECKING:
@@ -62,13 +57,6 @@ _INTERNAL_KWARGS = frozenset({
 class SyncBotProtocol(Protocol):
     def __getattr__(self, item: str) -> BotMethod:
         ...
-
-
-class _UnusedJobQueueStub:
-    """Prevent PTB from eagerly instantiating an unused JobQueue during builder setup."""
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        pass
 
 
 def _has_callback_keyboard(reply_markup) -> bool:
@@ -94,11 +82,8 @@ class TelegramBotManager(LocaleMixin):
         dispatcher (telegram.ext.Application): Dispatcher-compatible application instance.
     """
 
-    webhook = False
     logger = logging.getLogger(__name__)
     DEFAULT_SEND_WORKER_COUNT = 8
-    DEFAULT_HTTPX_POOL_MULTIPLIER = 2.0
-    HTTPX_POOL_MULTIPLIER_ENV = "ETM_HTTPX_POOL_MULTIPLIER"
     BLOCKING_SEND_TIMEOUT = 300.0
     BLOCKING_SEND_TARGET_SLAVE_ID = "__blocking__"
     TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS = 60.0
@@ -106,12 +91,9 @@ class TelegramBotManager(LocaleMixin):
     SHUTDOWN_JOIN_GRACE = 1.0
 
     # Type declarations for instance attributes assigned in __init__
-    application: Application
     _bot: SyncBotProtocol
-    _async_bot: telegram.Bot
     me: Optional[User]
     admins: List[int]
-    dispatcher: Application
     bot_pool: Optional['BotPool']
     _stopping: threading.Event
     _cleanup_tls: threading.local
@@ -153,80 +135,23 @@ class TelegramBotManager(LocaleMixin):
 
             return retry_on_chat_migration_wrap
 
-    @classmethod
-    def _default_connection_pool_size(cls, config: Mapping[str, object]) -> int:
-        multiplier = cls.DEFAULT_HTTPX_POOL_MULTIPLIER
-        multiplier_value = os.getenv(cls.HTTPX_POOL_MULTIPLIER_ENV)
-        if multiplier_value:
-            try:
-                parsed_multiplier = float(multiplier_value)
-            except ValueError:
-                parsed_multiplier = multiplier
-            if parsed_multiplier > 0:
-                multiplier = parsed_multiplier
-        return max(1, int(round(cls.DEFAULT_SEND_WORKER_COUNT * multiplier)))
-
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         config = self.channel.config
         self._stopping = threading.Event()
 
-        req_kwargs = {
-            'read_timeout': 15.0,
-            'connection_pool_size': self._default_connection_pool_size(config),
-        }
-        conf_req_kwargs = config.get('request_kwargs')
-        if isinstance(conf_req_kwargs, collections.abc.Mapping):
-            req_kwargs.update(conf_req_kwargs)
-        request_kwargs = self._normalize_request_kwargs(req_kwargs)
-        self._request_kwargs = dict(request_kwargs)
-        self._bot_identity_kwargs: dict[str, str] = {"token": config['token']}
-
-        self.logger.debug("Setting up Telegram application and sync runtime...")
-        if channel.flag('api_base_url'):
-            self._bot_identity_kwargs["base_url"] = channel.flag('api_base_url')
-        if channel.flag('api_base_file_url'):
-            self._bot_identity_kwargs["base_file_url"] = channel.flag('api_base_file_url')
-        self._local_mode = bool(channel.flag('local_tdlib_api'))
-        request = self._build_request()
-        get_updates_request = self._build_request()
-
-        self._runtime = AsyncTelegramRuntime(self.logger)
-        self._async_bot = self._build_bot(request=request, get_updates_request=get_updates_request)
-        self._bot = SyncBotFacade(self._async_bot, self._runtime)
-        with patch.object(ptb_applicationbuilder, "JobQueue", _UnusedJobQueueStub):
-            self.application = (
-                Application.builder()
-                .bot(self._async_bot)
-                # This channel does not use PTB's JobQueue features.
-                .job_queue(None)
-                .post_init(self._post_init)
-                .post_shutdown(self._post_shutdown)
-                .build()
-            )
-
-        if isinstance(config.get('webhook'), dict):
-            self.logger.debug("Setting up webhook...")
-            self.webhook = True
-            self.logger.debug("Webhook is set...")
-
-        self.logger.debug("Checking connection to Telegram bot API...")
-        validation_bot = self._build_bot(
-            request=self._build_request(),
-            get_updates_request=self._build_request(),
+        self.telegram_runtime = TelegramPollingRuntime(
+            config, channel, self.logger, channel._telegram_runtime_started, channel._telegram_runtime_stopped,
         )
-        me = self._runtime.call(validation_bot.get_me())
-        assert me, "Invalid bot credential provided."
-        self.me = me
-        self.logger.debug("Connection to Telegram bot API is OK...")
+        self._runtime = self.telegram_runtime.async_runtime
+        self._async_bot = self.telegram_runtime.async_bot
+        self._bot = self.telegram_runtime.bot
+        self.application = self.telegram_runtime.application
+        self.me = self.telegram_runtime.me
         self.admins = config['admins']
         self.dispatcher = self.application
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
-        self._shutdown_complete_event = threading.Event()
-        self._graceful_stop_lock = threading.Lock()
-        self._graceful_stop_complete = False
-        self._manual_polling_stop_event: Optional[asyncio.Event] = None
         self._aux_recent_use: dict[int, float] = {}  # chat_id -> timestamp of last aux bot use
         self.logger.debug("Rate limiter initialized...")
 
@@ -237,8 +162,7 @@ class TelegramBotManager(LocaleMixin):
             self._init_bot_pool(aux_configs, config, channel)
         self.logger.debug("Bot pool initialization complete...")
 
-        from .etm_metrics import Metrics, start_metrics_server
-        metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
+        metrics_top_n, metrics_endpoint = parse_metrics_config(config.get('metrics'), self.logger)
         self._metrics = Metrics(namespace="etm")
         channel.db.set_metrics(self._metrics)
         if self.bot_pool:
@@ -271,231 +195,6 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Adding base dispatchers...")
         self._add_base_dispatchers()
         self.logger.debug("Base dispatchers added...")
-
-    @staticmethod
-    def _normalize_request_kwargs(request_kwargs: Mapping[str, object]) -> dict[str, object]:
-        """Translate ETM's legacy PTB 13 request settings to PTB 22 HTTPXRequest kwargs."""
-        normalized: dict[str, object] = {}
-        allowed = {
-            "read_timeout",
-            "write_timeout",
-            "connect_timeout",
-            "pool_timeout",
-            "media_write_timeout",
-            "http_version",
-            "socket_options",
-            "httpx_kwargs",
-            "connection_pool_size",
-        }
-        for key in allowed:
-            if key in request_kwargs:
-                normalized[key] = request_kwargs[key]
-
-        proxy = request_kwargs.get("proxy") or request_kwargs.get("proxy_url")
-        username = request_kwargs.get("username")
-        password = request_kwargs.get("password")
-        proxy_auth_raw = request_kwargs.get("urllib3_proxy_kwargs")
-        proxy_auth = proxy_auth_raw if isinstance(proxy_auth_raw, Mapping) else {}
-        if username is None:
-            username = proxy_auth.get("username")
-        if password is None:
-            password = proxy_auth.get("password")
-        if proxy:
-            parsed = urlparse(str(proxy))
-            if username and password and "@" not in parsed.netloc:
-                auth_netloc = f"{quote(str(username))}:{quote(str(password))}@{parsed.hostname or ''}"
-                if parsed.port:
-                    auth_netloc += f":{parsed.port}"
-                proxy = urlunparse(
-                    (
-                        parsed.scheme,
-                        auth_netloc,
-                        parsed.path,
-                        parsed.params,
-                        parsed.query,
-                        parsed.fragment,
-                    )
-                )
-            normalized["proxy"] = proxy
-        return normalized
-
-    def _build_request(self) -> HTTPXRequest:
-        socket_options = self._request_kwargs.get("socket_options")
-        http_version = self._request_kwargs.get("http_version")
-        httpx_kwargs = self._request_kwargs.get("httpx_kwargs")
-        proxy = self._request_kwargs.get("proxy")
-        return HTTPXRequest(
-            connection_pool_size=cast(int, self._request_kwargs.get("connection_pool_size", 1)),
-            read_timeout=cast(Optional[float], self._request_kwargs.get("read_timeout")),
-            write_timeout=cast(Optional[float], self._request_kwargs.get("write_timeout")),
-            connect_timeout=cast(Optional[float], self._request_kwargs.get("connect_timeout")),
-            pool_timeout=cast(Optional[float], self._request_kwargs.get("pool_timeout")),
-            media_write_timeout=cast(Optional[float], self._request_kwargs.get("media_write_timeout")),
-            http_version=cast(Literal["1.1", "2.0", "2"], http_version or "1.1"),
-            socket_options=cast(
-                Optional[
-                    Collection[
-                        tuple[int, int, int]
-                        | tuple[int, int, bytes | bytearray]
-                        | tuple[int, int, None, int]
-                    ]
-                ],
-                socket_options,
-            ),
-            proxy=cast(Optional[str], proxy),
-            httpx_kwargs=cast(Optional[dict[str, object]], httpx_kwargs),
-        )
-
-    def _build_bot(self, *, request: HTTPXRequest, get_updates_request: HTTPXRequest) -> telegram.Bot:
-        base_url = self._bot_identity_kwargs.get("base_url")
-        base_file_url = self._bot_identity_kwargs.get("base_file_url")
-        if base_url is not None and base_file_url is not None:
-            return telegram.Bot(
-                token=self._bot_identity_kwargs["token"],
-                base_url=base_url,
-                base_file_url=base_file_url,
-                local_mode=self._local_mode,
-                request=request,
-                get_updates_request=get_updates_request,
-            )
-        if base_url is not None:
-            return telegram.Bot(
-                token=self._bot_identity_kwargs["token"],
-                base_url=base_url,
-                local_mode=self._local_mode,
-                request=request,
-                get_updates_request=get_updates_request,
-            )
-        if base_file_url is not None:
-            return telegram.Bot(
-                token=self._bot_identity_kwargs["token"],
-                base_file_url=base_file_url,
-                local_mode=self._local_mode,
-                request=request,
-                get_updates_request=get_updates_request,
-            )
-        return telegram.Bot(
-            token=self._bot_identity_kwargs["token"],
-            local_mode=self._local_mode,
-            request=request,
-            get_updates_request=get_updates_request,
-        )
-
-    async def _post_init(self, application: Application):
-        self._runtime.bind_loop(asyncio.get_running_loop())
-        for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
-            aux_bot.bind_runtime(self._runtime)
-        self._shutdown_complete_event.clear()
-        mtproto = self.channel.mtproto
-        if not getattr(mtproto, "enabled", False):
-            return
-        try:
-            await mtproto.connect()
-        except (ConnectionError, TimeoutError, OSError, MTProtoRetryableError) as error:
-            self.logger.warning(
-                "MTProto startup is unavailable; MsgLog ingestion remains pending (%s).",
-                type(error).__name__,
-            )
-            return
-        if not getattr(mtproto, "connected", False):
-            self.logger.warning("MTProto startup did not establish a connection; MsgLog ingestion remains pending.")
-            return
-        chat_binding = getattr(self.channel, "chat_binding", None)
-        if chat_binding is not None:
-            chat_binding.resume_pending_msglog_ingestions()
-
-
-    async def _post_shutdown(self, application: Application):
-        try:
-            await self.channel.mtproto.disconnect()
-        finally:
-            self._runtime.clear_loop()
-            self._shutdown_complete_event.set()
-            self.logger.debug("Telegram runtime loop is cleared; shutdown complete.")
-
-    async def _shutdown_ptb_application(self):
-        self.application.stop_running()
-
-    async def _run_application_lifecycle(
-        self,
-        *,
-        drop_pending_updates: bool,
-        timeout: int | timedelta,
-    ) -> None:
-        """Own the asyncio loop for polling (replaces ``run_polling``).
-
-        Matches PTB 22 ``Application.run_polling`` ordering: initialize → post_init →
-        ``updater.start_polling`` → ``start`` → wait → ``updater.stop`` → ``stop`` →
-        ``post_stop`` → ``shutdown`` → ``post_shutdown``. Teardown runs in ``finally`` so
-        ``await application.shutdown()`` (HTTPX close) completes before this coroutine returns.
-        """
-        # Publish the stop event only after ``post_init`` binds the runtime loop.
-        stop_event = asyncio.Event()
-        try:
-            await self.application.initialize()
-            post_init = self.application.post_init
-            if post_init:
-                await post_init(self.application)
-
-            self._manual_polling_stop_event = stop_event
-
-            updater = self.application.updater
-            if updater is None:
-                raise RuntimeError("Application.run_polling requires an Updater.")
-
-            def error_callback(exc: telegram.error.TelegramError) -> None:
-                self.application.create_task(
-                    self.application.process_error(error=exc, update=None)
-                )
-
-            await updater.start_polling(
-                poll_interval=0.0,
-                timeout=timeout,
-                bootstrap_retries=0,
-                allowed_updates=None,
-                drop_pending_updates=drop_pending_updates,
-                error_callback=error_callback,
-            )
-            await self.application.start()
-            self.logger.debug("Application started; awaiting stop signal")
-            await stop_event.wait()
-            self.logger.debug("Stop signal received; tearing down")
-        finally:
-            self._manual_polling_stop_event = None
-            try:
-                updater = self.application.updater
-                if updater is not None and updater.running:
-                    await updater.stop()
-                for task in asyncio.all_tasks() - {asyncio.current_task()}:
-                    task.cancel()
-                await asyncio.sleep(0)
-            except Exception:
-                self.logger.exception("Error during updater.stop")
-
-            try:
-                if self.application.running:
-                    await self.application.stop()
-            except Exception:
-                self.logger.exception("Error during application.stop")
-
-            try:
-                post_stop = self.application.post_stop
-                if post_stop:
-                    await post_stop(self.application)
-            except Exception:
-                self.logger.exception("Error during post_stop")
-
-            try:
-                await self.application.shutdown()
-            except Exception:
-                self.logger.exception("Error during application.shutdown")
-
-            try:
-                post_shutdown = self.application.post_shutdown
-                if post_shutdown:
-                    await post_shutdown(self.application)
-            except Exception:
-                self.logger.exception("Error during post_shutdown")
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -612,43 +311,6 @@ class TelegramBotManager(LocaleMixin):
     ) -> object:
         return getattr(self._bot, operation)(*args, **self._strip_private_queue_metadata(kwargs))
 
-    @staticmethod
-    def _parse_metrics_config(metrics_cfg: object, logger) -> tuple[int, Optional[tuple[str, int]]]:
-        top_n = 20
-        if metrics_cfg is None:
-            return top_n, None
-        if not isinstance(metrics_cfg, collections.abc.Mapping):
-            logger.warning(
-                "Invalid metrics config type %s; Prometheus endpoint disabled.",
-                type(metrics_cfg).__name__,
-            )
-            return top_n, None
-
-        try:
-            parsed_top_n = int(metrics_cfg.get('top_n', top_n))
-            if parsed_top_n < 0:
-                raise ValueError
-            top_n = parsed_top_n
-        except (TypeError, ValueError):
-            logger.warning("Invalid metrics top_n type %s; using default %d.", type(metrics_cfg.get('top_n')).__name__, top_n)
-
-        host = metrics_cfg.get('host', '127.0.0.1')
-        if not isinstance(host, str) or not host:
-            logger.warning("Invalid metrics host type %s; Prometheus endpoint disabled.", type(host).__name__)
-            return top_n, None
-
-        try:
-            port = int(metrics_cfg.get('port', 9101))
-            if not 0 <= port <= 65535:
-                raise ValueError
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid metrics port type %s; Prometheus endpoint disabled.",
-                type(metrics_cfg.get('port')).__name__,
-            )
-            return top_n, None
-
-        return top_n, (host, port)
 
     def _register_runtime_metric_collectors(self, top_n: int) -> None:
         self._metrics.register_outbound_queue_collectors(self.outbound_queue, top_n)
@@ -673,12 +335,12 @@ class TelegramBotManager(LocaleMixin):
         """Initialize the auxiliary bot pool from config."""
         req_kwargs = {
             'read_timeout': 15.0,
-            'connection_pool_size': self._default_connection_pool_size(config),
+            'connection_pool_size': TelegramPollingRuntime._default_connection_pool_size(config),
         }
         conf_req_kwargs = config.get('request_kwargs')
-        if isinstance(conf_req_kwargs, collections.abc.Mapping):
+        if isinstance(conf_req_kwargs, Mapping):
             req_kwargs.update(conf_req_kwargs)
-        request_kwargs = self._normalize_request_kwargs(req_kwargs)
+        request_kwargs = normalize_request_kwargs(req_kwargs)
 
         main_token = config['token']
         seen_tokens = {main_token}
@@ -699,7 +361,7 @@ class TelegramBotManager(LocaleMixin):
                 request_kwargs=request_kwargs,
                 base_url=channel.flag('api_base_url') or None,
                 base_file_url=channel.flag('api_base_file_url') or None,
-                local_mode=self._local_mode,
+                local_mode=bool(channel.flag('local_tdlib_api')),
             )
             aux_bot.bind_runtime(self._runtime)
             if aux_bot.initialize():
@@ -1031,131 +693,13 @@ class TelegramBotManager(LocaleMixin):
     def set_chat_description(self, *args, **kwargs):
         return self._enqueue_main_chat_mutation("set_chat_description", args, kwargs)
 
-    def polling(self, drop_pending_updates: bool = False, timeout: int | timedelta = 10):
-        """
-        Poll message from Telegram Bot API.
-        This method is blocking and is expected to run inside EFB's master poll thread.
-
-        Args:
-            drop_pending_updates: Whether to clean any pending updates on
-                Telegram servers before actually starting to poll.
-                Default is False.
-            timeout: Long-poll timeout for ``getUpdates``.
-        """
-        if self.webhook:
-            start_webhook = self.channel.config['webhook']['start_webhook']
-            self.application.run_webhook(
-                **start_webhook,
-                drop_pending_updates=drop_pending_updates,
-                close_loop=True,
-                stop_signals=None,
-            )
-        else:
-            try:
-                asyncio.run(
-                    TelegramBotManager._run_application_lifecycle(
-                        self,
-                        drop_pending_updates=drop_pending_updates,
-                        timeout=timeout,
-                    )
-                )
-            except BaseException:
-                self.logger.exception("Polling thread crashed")
-                raise
-            finally:
-                self._manual_polling_stop_event = None
-                shutdown_done = getattr(self, "_shutdown_complete_event", None)
-                if shutdown_done is not None and not shutdown_done.is_set():
-                    shutdown_done.set()
-
-    def graceful_stop(self):
-        """Gracefully stop the bot"""
-        graceful_stop_lock = getattr(self, '_graceful_stop_lock', None)
-        if graceful_stop_lock is None:
-            graceful_stop_lock = self._graceful_stop_lock = threading.Lock()
-
-        with graceful_stop_lock:
-            if getattr(self, '_graceful_stop_complete', False):
-                return
-            TelegramBotManager._graceful_stop(self)
-            self._graceful_stop_complete = True
-
-    def _graceful_stop(self) -> None:
-        if not hasattr(self, '_stopping') or not hasattr(self._stopping, 'set'):
-            self._stopping = threading.Event()
+    def stop_channel_resources(self) -> None:
+        """Stop resources owned by message delivery rather than PTB polling."""
         self._stopping.set()
-        self.logger.info("Starting graceful shutdown...")
-
         self.outbound_queue.stop()
-
-        TelegramBotManager._stop_metrics_server(self)
-
-        # Shut down auxiliary bot pool
+        self._stop_metrics_server()
         if self.bot_pool:
             self.bot_pool.shutdown()
-
-        # Then stop the PTB application loop
-        self.logger.debug("Stopping Telegram application...")
-        if hasattr(self, 'application'):
-            manual_evt = getattr(self, "_manual_polling_stop_event", None)
-            if manual_evt is not None:
-                def _signal_manual_stop() -> None:
-                    manual_evt.set()
-
-                stop_requested = False
-                if hasattr(self, '_runtime'):
-                    stop_requested = self._runtime.call_soon(_signal_manual_stop)
-
-                if not stop_requested:
-                    manual_evt_loop = getattr(manual_evt, "_loop", None)
-                    if manual_evt_loop is not None and manual_evt_loop.is_running():
-                        manual_evt_loop.call_soon_threadsafe(_signal_manual_stop)
-                        stop_requested = True
-
-                if not stop_requested:
-                    self.logger.warning(
-                        "Could not schedule polling stop on runtime loop; "
-                        "falling back to direct stop signalling."
-                    )
-                    try:
-                        self.application.stop_running()
-                    except RuntimeError as exc:
-                        self.logger.debug("Telegram application loop not ready for stop_running() (%s).", type(exc).__name__)
-                    try:
-                        manual_evt.set()
-                    except Exception:
-                        self.logger.debug("Failed to set manual polling stop event directly.", exc_info=True)
-            else:
-                application_stopped = False
-                if hasattr(self, '_runtime') and self._runtime._ready.is_set():
-                    try:
-                        self._runtime.call(self._shutdown_ptb_application(), timeout=30)
-                        application_stopped = True
-                    except Exception as exc:
-                        self.logger.warning("PTB shutdown coroutine did not complete cleanly (%s).", type(exc).__name__)
-
-                if not application_stopped:
-                    stop_requested = False
-                    if hasattr(self, '_runtime'):
-                        stop_requested = self._runtime.call_soon(self.application.stop_running)
-                    if not stop_requested:
-                        try:
-                            self.application.stop_running()
-                        except RuntimeError as exc:
-                            self.logger.debug("Telegram application loop not ready for stop_running() (%s).", type(exc).__name__)
-
-            if hasattr(self, "_shutdown_complete_event"):
-                if not self._shutdown_complete_event.wait(timeout=30):
-                    self.logger.warning(
-                        "Telegram post_shutdown hook did not fire within 30s; "
-                        "the next polling instance may see a Conflict from Telegram."
-                    )
-        if hasattr(self, '_runtime'):
-            if getattr(self._runtime, '_owns_loop_thread', False):
-                self._runtime.shutdown()
-            else:
-                self._runtime.clear_loop()
-        self.logger.info("Graceful shutdown completed")
 
     def _stop_metrics_server(self) -> None:
         """Stop the serving metrics thread without joining an unstarted thread."""
@@ -1171,13 +715,3 @@ class TelegramBotManager(LocaleMixin):
             metrics_httpd.server_close()
         if thread is not None and thread.is_alive() and thread.ident != threading.get_ident():
             thread.join(timeout=self.SHUTDOWN_JOIN_GRACE)
-
-    def __del__(self):
-        """Ensure cleanup on object destruction"""
-        try:
-            outbound_queue = getattr(self, "outbound_queue", None)
-            if outbound_queue is not None:
-                outbound_queue.stop()
-        except Exception:
-            # Don't raise exceptions in __del__
-            pass

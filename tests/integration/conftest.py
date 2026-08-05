@@ -124,7 +124,8 @@ def poll_bot_factory():
 
         still_alive = False
         try:
-            channel.bot_manager.graceful_stop()
+            channel.bot_manager.stop_channel_resources()
+            channel.telegram_runtime.stop()
             polling_thread.join(timeout=30)
             still_alive = polling_thread.is_alive()
         finally:
@@ -153,7 +154,7 @@ def poll_bot_factory():
             def runner():
                 try:
                     # Keep long polling short in tests so teardown can release the slot quickly.
-                    channel.bot_manager.polling(drop_pending_updates=True, timeout=1)
+                    channel.telegram_runtime.poll(drop_pending_updates=True, timeout=1)
                 except BaseException as exc:  # pragma: no cover - test bootstrap path
                     polling_errors.append(exc)
 
@@ -168,8 +169,8 @@ def poll_bot_factory():
             while time.time() < deadline:
                 if polling_errors:
                     raise polling_errors[0]
-                runtime_ready = channel.bot_manager._runtime._ready.wait(timeout=0.1)
-                application = channel.bot_manager.application
+                runtime_ready = channel.telegram_runtime.async_runtime._ready.wait(timeout=0.1)
+                application = channel.telegram_runtime.application
                 updater = application.updater
                 if (
                     runtime_ready

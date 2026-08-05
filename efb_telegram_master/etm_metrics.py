@@ -54,6 +54,35 @@ _DATABASE_METHODS = frozenset({
 _DATABASE_OUTCOMES = frozenset({"success", "failure"})
 
 
+def parse_metrics_config(metrics_cfg: object, logger: Any) -> tuple[int, tuple[str, int] | None]:
+    """Validate the optional Prometheus endpoint configuration."""
+    top_n = 20
+    if metrics_cfg is None:
+        return top_n, None
+    if not isinstance(metrics_cfg, Mapping):
+        logger.warning("Invalid metrics config type %s; Prometheus endpoint disabled.", type(metrics_cfg).__name__)
+        return top_n, None
+    try:
+        parsed_top_n = int(metrics_cfg.get("top_n", top_n))
+        if parsed_top_n < 0:
+            raise ValueError
+        top_n = parsed_top_n
+    except (TypeError, ValueError):
+        logger.warning("Invalid metrics top_n type %s; using default %d.", type(metrics_cfg.get("top_n")).__name__, top_n)
+    host = metrics_cfg.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host:
+        logger.warning("Invalid metrics host type %s; Prometheus endpoint disabled.", type(host).__name__)
+        return top_n, None
+    try:
+        port = int(metrics_cfg.get("port", 9101))
+        if not 0 <= port <= 65535:
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning("Invalid metrics port type %s; Prometheus endpoint disabled.", type(metrics_cfg.get("port")).__name__)
+        return top_n, None
+    return top_n, (host, port)
+
+
 @dataclass(frozen=True)
 class DestinationQueueSnapshot:
     """One destination's current queue state, supplied by a scrape callback."""

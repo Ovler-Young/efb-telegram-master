@@ -5,11 +5,10 @@ import threading
 import time
 from collections.abc import Coroutine
 from inspect import isawaitable
-from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING, TypeVar, cast, overload, Literal
+from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING, TypeVar, cast, overload
 
 import telegram
 import telegram.error
-from telegram.request import HTTPXRequest
 
 if TYPE_CHECKING:
     from .telegram_runtime import AsyncTelegramRuntime, SyncBotFacade
@@ -82,8 +81,10 @@ class AuxiliaryBot:
         self._membership_changed_callback: Optional[Callable[['AuxiliaryBot', int, bool], None]] = None
 
     def _create_bot(self) -> telegram.Bot:
-        request = self._build_request() if self._request_kwargs else None
-        get_updates_request = self._build_request() if self._request_kwargs else None
+        from .telegram_runtime import build_request
+
+        request = build_request(self._request_kwargs) if self._request_kwargs else None
+        get_updates_request = build_request(self._request_kwargs) if self._request_kwargs else None
         base_url = self._base_kwargs.get('base_url')
         base_file_url = self._base_kwargs.get('base_file_url')
         if base_url is not None and base_file_url is not None:
@@ -116,19 +117,6 @@ class AuxiliaryBot:
             local_mode=self._local_mode,
             request=request,
             get_updates_request=get_updates_request,
-        )
-
-    def _build_request(self) -> HTTPXRequest:
-        return HTTPXRequest(
-            read_timeout=cast(Optional[float], self._request_kwargs.get('read_timeout')),
-            write_timeout=cast(Optional[float], self._request_kwargs.get('write_timeout')),
-            connect_timeout=cast(Optional[float], self._request_kwargs.get('connect_timeout')),
-            pool_timeout=cast(Optional[float], self._request_kwargs.get('pool_timeout')),
-            media_write_timeout=cast(Optional[float], self._request_kwargs.get('media_write_timeout')),
-            connection_pool_size=cast(int, self._request_kwargs.get('connection_pool_size', 1)),
-            proxy=cast(Optional[str], self._request_kwargs.get('proxy')),
-            httpx_kwargs=cast(Optional[dict[str, object]], self._request_kwargs.get('httpx_kwargs')),
-            http_version=cast(Literal['1.1', '2.0', '2'], self._request_kwargs.get('http_version') or '1.1'),
         )
 
     def initialize(self) -> bool:

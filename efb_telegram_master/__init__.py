@@ -42,11 +42,12 @@ from .commands import CommandsManager
 from .db import DatabaseManager
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
-from .mtproto import MTProtoClient, MTProtoConfig
+from .mtproto import MTProtoClient, MTProtoConfig, MTProtoRetryableError
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .rpc_utils import RPCUtilities
 from .slave_message import SlaveMessageProcessor
+from .telegram_runtime import TelegramPollingRuntime
 from .utils import ExperimentalFlagsManager, EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 
 
@@ -132,6 +133,7 @@ class TelegramChannel(MasterChannel):
         self.chat_manager: ChatObjectCacheManager = ChatObjectCacheManager(self)
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
         self.bot_manager: TelegramBotManager = TelegramBotManager(self)
+        self.telegram_runtime = self.bot_manager.telegram_runtime
         self.commands: CommandsManager = CommandsManager(self)
         self.chat_binding: ChatBindingManager = ChatBindingManager(self)
         self.slave_messages: SlaveMessageProcessor = SlaveMessageProcessor(self)
@@ -584,11 +586,32 @@ class TelegramChannel(MasterChannel):
                      "    Print this command list.")
         sync_reply_text(self.bot_manager, update.message, txt)
 
+    async def _telegram_runtime_started(self, runtime: TelegramPollingRuntime) -> None:
+        for auxiliary in (self.bot_manager.bot_pool.bots if self.bot_manager.bot_pool else []):
+            auxiliary.bind_runtime(runtime.async_runtime)
+        if not self.mtproto.enabled:
+            return
+        try:
+            await self.mtproto.connect()
+        except (ConnectionError, TimeoutError, OSError, MTProtoRetryableError) as error:
+            self.logger.warning(
+                "MTProto startup is unavailable; MsgLog ingestion remains pending (%s).",
+                type(error).__name__,
+            )
+            return
+        if not self.mtproto.connected:
+            self.logger.warning("MTProto startup did not establish a connection; MsgLog ingestion remains pending.")
+            return
+        self.chat_binding.resume_pending_msglog_ingestions()
+
+    async def _telegram_runtime_stopped(self, runtime: TelegramPollingRuntime) -> None:
+        await self.mtproto.disconnect()
+
     def poll(self):
         """
         Message polling process.
         """
-        self.bot_manager.polling()
+        self.telegram_runtime.poll()
 
     def error(self, update: object, context: CallbackContext):
         """
@@ -741,7 +764,8 @@ class TelegramChannel(MasterChannel):
         self._stop_polling_called = True
         self.logger.debug("Gracefully stopping %s (%s).", self.channel_name, self.channel_id)
         self.rpc_utilities.shutdown()
-        self.bot_manager.graceful_stop()
+        self.bot_manager.stop_channel_resources()
+        self.telegram_runtime.stop()
         self.master_messages.stop_worker()
         self.db.stop_worker()
         self.logger.debug("%s (%s) gracefully stopped.", self.channel_name, self.channel_id)
