@@ -407,10 +407,7 @@ class DatabaseManager:
         sqlite_db.start()
         sqlite_db.connect()
 
-        models = [
-            ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry,
-            MsgLogIngestionScan,
-        ]
+        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry]
         with sqlite_db.bind_ctx(models):
             chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
@@ -448,22 +445,6 @@ class DatabaseManager:
                 ])
             else:
                 history_migration_entries = []
-            if MsgLogIngestionScan.table_exists():
-                msglog_ingestion_scans = self._select_existing_columns(
-                    MsgLogIngestionScan, "msglogingestionscan", [
-                        MsgLogIngestionScan.id, MsgLogIngestionScan.source_chat_id,
-                        MsgLogIngestionScan.scan_boundary, MsgLogIngestionScan.cursor,
-                        MsgLogIngestionScan.existing_streak, MsgLogIngestionScan.scanned_count,
-                        MsgLogIngestionScan.inserted_count, MsgLogIngestionScan.existing_count,
-                        MsgLogIngestionScan.skipped_count, MsgLogIngestionScan.lease_owner,
-                        MsgLogIngestionScan.lease_expires_at, MsgLogIngestionScan.status,
-                        MsgLogIngestionScan.error, MsgLogIngestionScan.created_at,
-                        MsgLogIngestionScan.updated_at,
-                    ],
-                )
-            else:
-                msglog_ingestion_scans = []
-
         sqlite_db.stop()
         sqlite_db.close()
 
@@ -479,22 +460,16 @@ class DatabaseManager:
                 MsgLog.insert_many(msg_log_batch).execute()
             for history_migration_entry_batch in chunked(history_migration_entries, 500):
                 HistoryMigrationEntry.insert_many(history_migration_entry_batch).execute()
-            for msglog_ingestion_scan_batch in chunked(msglog_ingestion_scans, 500):
-                MsgLogIngestionScan.insert_many(msglog_ingestion_scan_batch).execute()
-
         migrated_path = sqlite_path.with_suffix('.db.migrated')
         sqlite_path.rename(migrated_path)
 
         self.logger.info(
             "Migration complete. %d chat assocs, %d topic assocs, "
             "%d chat infos, %d messages migrated. "
-            "%d pending history entries and %d MsgLog ingestion scans migrated. "
-            "Original SQLite file renamed to %s",
+            "%d pending history entries migrated. Original SQLite file renamed to %s",
             len(chat_assocs), len(topic_assocs),
             len(slave_chat_infos), len(msg_logs),
-            len(history_migration_entries),
-            len(msglog_ingestion_scans),
-            migrated_path
+            len(history_migration_entries), migrated_path
         )
 
     def _check_and_run_migrations(self):

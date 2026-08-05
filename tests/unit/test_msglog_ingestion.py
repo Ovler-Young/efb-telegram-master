@@ -92,7 +92,18 @@ def topic_message(message_id, *, topic_id=10, media=None, date=None, topic_root=
 
 def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
     db = FakeDatabase()
-    mtproto = FakeMTProto({205: topic_message(205), 104: topic_message(104), 4: topic_message(4)})
+    ordinary_reply = SimpleNamespace(
+        id=4,
+        message="ordinary reply",
+        reply_to=SimpleNamespace(forum_topic=False, reply_to_top_id=None, reply_to_msg_id=10),
+        action=None,
+        media=None,
+    )
+    mtproto = FakeMTProto({
+        205: topic_message(205),
+        104: topic_message(104, topic_root=True),
+        4: ordinary_reply,
+    })
 
     asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
 
@@ -101,44 +112,11 @@ def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
     ]
     accepted = [entry for entry in db.persisted if entry[1] == "eligible"]
     assert [(entry[0], entry[2]) for entry in accepted] == [
-        (205, "tests.slave"), (104, "tests.slave"), (4, "tests.slave"),
+        (205, "tests.slave"), (104, "tests.slave"),
     ]
+    ordinary_reply_entry = next(entry for entry in db.persisted if entry[0] == 4)
+    assert ordinary_reply_entry[1:] == ("not-topic", None, None)
     assert db.scan.status == "complete"
-
-
-def test_ingestion_maps_topic_root_message_from_reply_to_message_id():
-    db = FakeDatabase(scan_boundary=20)
-    mtproto = FakeMTProto(
-        {20: topic_message(20, topic_id=10, topic_root=True)},
-        scan_ceiling=20,
-    )
-
-    asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
-
-    _, classification, slave_uid, content = db.persisted[0]
-    assert classification == "eligible"
-    assert slave_uid == "tests.slave"
-    assert content.text == "message 20"
-
-
-def test_ingestion_does_not_map_ordinary_reply_to_message_id_as_topic():
-    db = FakeDatabase(scan_boundary=20)
-    message = SimpleNamespace(
-        id=20,
-        message="ordinary reply",
-        reply_to=SimpleNamespace(
-            forum_topic=False,
-            reply_to_top_id=None,
-            reply_to_msg_id=10,
-        ),
-        action=None,
-        media=None,
-    )
-    mtproto = FakeMTProto({20: message}, scan_ceiling=20)
-
-    asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
-
-    assert db.persisted[0][1:] == ("not-topic", None, None)
 
 
 def test_ingestion_skips_are_neutral_and_existing_streak_completes_at_500():

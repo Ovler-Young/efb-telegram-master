@@ -1,6 +1,3 @@
-from types import SimpleNamespace
-from unittest.mock import Mock
-
 from efb_telegram_master import utils
 from efb_telegram_master.chat_binding import ChatBindingManager
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID

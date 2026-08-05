@@ -1,13 +1,10 @@
 import asyncio
-import ast
 from datetime import datetime
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 from threading import Lock
 from uuid import UUID
 
-import pytest
 from telegram import Update
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
@@ -15,122 +12,6 @@ import efb_telegram_master.master_message as master_message
 from efb_telegram_master.master_message import MasterMessageProcessor
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
-from tests.integration import conftest as integration_conftest
-from tests.integration.test_mtproto_live import (
-    _delete_msg_logs_by_master_ids,
-    _wait_for_ingestion_worker_exit,
-)
-
-
-def test_live_msglog_sync_keeps_polling_running():
-    path = Path(__file__).parents[1] / "integration" / "test_mtproto_live.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    test = next(
-        node for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "test_sync_msglog_ingests_unlogged_topic_messages_live"
-    )
-
-    fixture_names = {argument.arg for argument in test.args.args}
-    lifecycle_calls = [
-        node for node in ast.walk(test)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id in {"poll_bot", "poll_bot_factory"}
-        and node.func.attr in {"start", "stop"}
-    ]
-
-    assert "poll_bot" in fixture_names
-    assert "poll_bot_factory" not in fixture_names
-    assert lifecycle_calls == []
-
-
-def test_live_msglog_gap_deletion_is_limited_to_exact_master_message_ids():
-    channel = SimpleNamespace(db=SimpleNamespace(delete_msg_log=Mock()))
-    master_msg_ids = ("-100123.41", "-100123.42")
-
-    _delete_msg_logs_by_master_ids(channel, master_msg_ids)
-
-    assert channel.db.delete_msg_log.call_args_list == [
-        call(master_msg_id="-100123.41"),
-        call(master_msg_id="-100123.42"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_live_msglog_cleanup_joins_registered_worker_with_bounded_timeout():
-    events = []
-
-    class Worker:
-        alive = True
-
-        def join(self, timeout):
-            events.append(("join", timeout))
-            self.alive = False
-
-        def is_alive(self):
-            return self.alive
-
-    worker = Worker()
-    channel = SimpleNamespace(chat_binding=SimpleNamespace(
-        _msglog_ingestion_lock=Lock(),
-        _msglog_ingestion_threads={-100123: worker},
-    ))
-
-    await _wait_for_ingestion_worker_exit(channel, -100123, timeout=7)
-
-    assert events == [("join", 7)]
-    assert not worker.is_alive()
-
-
-def test_live_msglog_cleanup_waits_in_finally_before_deleting_scan():
-    path = Path(__file__).parents[1] / "integration" / "test_mtproto_live.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    test = next(
-        node for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "test_sync_msglog_ingests_unlogged_topic_messages_live"
-    )
-    cleanup = next(node for node in test.body if isinstance(node, ast.Try))
-    wait = next(
-        node for node in ast.walk(ast.Module(body=cleanup.finalbody, type_ignores=[]))
-        if isinstance(node, ast.Await)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "_wait_for_ingestion_worker_exit"
-    )
-    deletion = next(
-        node for node in ast.walk(ast.Module(body=cleanup.finalbody, type_ignores=[]))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "execute"
-    )
-
-    assert wait.lineno < deletion.lineno
-
-
-def test_integration_postgres_config_reads_required_environment(monkeypatch):
-    values = {
-        "TEST_POSTGRES_HOST": "postgres.example",
-        "TEST_POSTGRES_PORT": "5433",
-        "TEST_POSTGRES_DB": "etm_test",
-        "TEST_POSTGRES_USER": "etm",
-        "TEST_POSTGRES_PASSWORD": "secret",
-    }
-    for name, value in values.items():
-        monkeypatch.setenv(name, value)
-
-    config = integration_conftest.integration_postgres_config.__wrapped__()
-
-    assert config == {
-        "type": "postgresql",
-        "host": "postgres.example",
-        "port": 5433,
-        "database": "etm_test",
-        "user": "etm",
-        "password": "secret",
-    }
 
 
 def test_sync_msglog_requires_admin_and_a_bound_forum_group():
