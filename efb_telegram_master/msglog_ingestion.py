@@ -12,10 +12,7 @@ from .mtproto import MTProtoClient, MTProtoRetryableError
 from .utils import EFBChannelChatIDStr
 
 
-_INGESTION_EVENT_IDS = {
-    "start": "msglog_ingestion.start",
-    "complete": "msglog_ingestion.complete",
-}
+_INGESTION_EVENT_IDS = {"start": "msglog_ingestion.start", "complete": "msglog_ingestion.complete"}
 
 
 @dataclass(frozen=True)
