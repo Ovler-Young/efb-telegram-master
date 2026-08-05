@@ -32,7 +32,6 @@ from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
 from .msglog_ingestion import MsgLogIngestionService
-from .outbound import QueueRequest
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TelegramTopicID, TgChatMsgIDStr
 
@@ -1506,8 +1505,12 @@ class ChatBindingManager(LocaleMixin):
             operation, kwargs = prepared_call
             completed_call_count = 0
             try:
-                waiter = self.bot.outbound_queue.enqueue(QueueRequest(operation, (), kwargs, tg_chat_id))
-                waiter.result()
+                if operation == "send_message":
+                    self.bot.send_message(**kwargs)
+                elif operation == "copy_message":
+                    self.bot.copy_message(**kwargs)
+                else:
+                    raise ValueError(f"Unsupported history migration operation: {operation}")
                 completed_call_count += 1
             except BaseException as error:
                 self._log_history_migration_failure(entry.id, completed_call_count, error)
