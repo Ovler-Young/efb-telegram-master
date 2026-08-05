@@ -15,13 +15,6 @@ on:
       - 'setup.py'
       - '.github/workflows/tests.yml'
       - 'pytest.ini'
-  pull_request_target:
-    paths:
-      - 'efb_telegram_master/**.py'
-      - 'tests/**.py'
-      - 'setup.py'
-      - '.github/workflows/tests.yml'
-      - 'pytest.ini'
   workflow_dispatch:
 
 concurrency:
@@ -34,7 +27,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    environment: ${{ github.event_name == 'pull_request_target' && 'telegram-integration' || 'ci' }}
     strategy:
       fail-fast: true
       max-parallel: 1
@@ -42,8 +34,6 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
     - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.pull_request.head.sha || github.sha }}
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
       with:
@@ -61,25 +51,13 @@ jobs:
       run: |
         mypy -p efb_telegram_master --ignore-missing-imports
     - name: Test unit suite
-      env:
-        TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
-        GROUPS: ${{ secrets.TELEGRAM_GROUPS }}
-        CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
-        TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
-        AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
-        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN2 }}
-        USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
-        API_ID: ${{ secrets.TELEGRAM_API_ID }}
-        API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       run: |
         pytest -vv -r a -l --color=yes --mode=unit
 
   integration:
     if: >-
-      github.event_name == 'pull_request_target' ||
-      (github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository)
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     needs: unit
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -102,8 +80,6 @@ jobs:
           --health-retries 5
     steps:
     - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
     - name: Set up Python 3.12
       uses: actions/setup-python@v6
       with:
@@ -124,7 +100,7 @@ jobs:
         CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
         TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
         AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
-        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN2 }}
+        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
         USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
