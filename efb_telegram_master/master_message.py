@@ -394,16 +394,16 @@ class MasterMessageProcessor(LocaleMixin):
                 assert message.photo
                 m.text = msg_md_caption
                 m.mime = "image/jpeg"
-                self._check_file_download(message.photo[-1], m, message)
+                self._check_file_download(message.photo[-1])
             elif mtype in (TGMsgType.Sticker, TGMsgType.AnimatedSticker):
                 assert message.sticker
                 # Convert WebP to the more common PNG
                 m.text = ""
-                self._check_file_download(message.sticker, m, message)
+                self._check_file_download(message.sticker)
             elif mtype is TGMsgType.Animation:
                 assert message.animation
                 m.text = msg_md_caption
-                self._check_file_download(message.animation, m, message)
+                self._check_file_download(message.animation)
                 self.logger.debug("[%s] Telegram message is a \"Telegram GIF\".", message_id)
                 m_filename = getattr(message.animation, "file_name", None) or None
                 if m_filename and not m_filename.lower().endswith(".gif"):
@@ -413,7 +413,7 @@ class MasterMessageProcessor(LocaleMixin):
             elif mtype is TGMsgType.VideoSticker:
                 assert message.sticker and message.sticker.is_video
                 m.text = msg_md_caption
-                self._check_file_download(message.sticker, m, message)
+                self._check_file_download(message.sticker)
                 self.logger.debug("[%s] Telegram message is a WebM sticker.", message_id)
                 m_filename = getattr(message.sticker, "file_name", None) or "sticker"
                 if m_filename and not m_filename.lower().endswith(".gif"):
@@ -426,27 +426,27 @@ class MasterMessageProcessor(LocaleMixin):
                 self.logger.debug("[%s] Telegram message type is document.", message_id)
                 m.filename = getattr(message.document, "file_name", None) or None
                 m.mime = message.document.mime_type
-                self._check_file_download(message.document, m, message)
+                self._check_file_download(message.document)
             elif mtype is TGMsgType.Video:
                 assert message.video
                 m.text = msg_md_caption
                 m.mime = message.video.mime_type
-                self._check_file_download(message.video, m, message)
+                self._check_file_download(message.video)
             elif mtype is TGMsgType.VideoNote:
                 assert message.video_note
                 m.text = msg_md_caption
-                self._check_file_download(message.video_note, m, message)
+                self._check_file_download(message.video_note)
             elif mtype is TGMsgType.Audio:
                 assert message.audio
                 m.text = "%s - %s\n%s" % (
                     message.audio.title, message.audio.performer, msg_md_caption)
                 m.mime = message.audio.mime_type
-                self._check_file_download(message.audio, m, message)
+                self._check_file_download(message.audio)
             elif mtype is TGMsgType.Voice:
                 assert message.voice
                 m.text = msg_md_caption
                 m.mime = message.voice.mime_type
-                self._check_file_download(message.voice, m, message)
+                self._check_file_download(message.voice)
             elif mtype is TGMsgType.Location:
                 # TRANSLATORS: Message body text for location messages.
                 assert message.location
@@ -561,8 +561,7 @@ class MasterMessageProcessor(LocaleMixin):
                 disable_web_page_preview=True,
             )
 
-    def _check_file_download(self, file_obj: Any, etm_message: Optional[ETMMsg] = None,
-                             telegram_message: Optional[Message] = None):
+    def _check_file_download(self, file_obj: Any):
         """
         Check if the file is available for download.
 
@@ -574,10 +573,6 @@ class MasterMessageProcessor(LocaleMixin):
         """
         size = getattr(file_obj, "file_size", None)
         if size and size > FileSizeLimit.FILESIZE_DOWNLOAD:
-            mtproto = getattr(self.channel, "mtproto", None)
-            if getattr(mtproto, "enabled", False) and etm_message is not None and telegram_message is not None:
-                etm_message.set_mtproto_media_ref(telegram_message.chat_id, telegram_message.message_id)
-                return
             if self.channel.flag("local_tdlib_api"):
                 return
             size_str = humanize.naturalsize(size)

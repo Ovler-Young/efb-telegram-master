@@ -1,7 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 import io
-import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -20,13 +18,6 @@ from telegram import (
     PhotoSize,
 )
 
-from efb_telegram_master.mtproto import (
-    MTProtoMediaDescriptor,
-    MTProtoMediaDescriptorError,
-    MTProtoMediaLimitError,
-    MTProtoNotConnectedError,
-    MTProtoRetryableError,
-)
 from efb_telegram_master.outbound import (
     InvalidQueuedPayloadError,
     OutboundQueue,
@@ -47,10 +38,6 @@ def edit_message_text(chat_id, message_id, text):
     return (chat_id, message_id, text)
 
 
-def mtproto_media_operation(chat_id, descriptor):
-    return chat_id, descriptor
-
-
 def copy_message(chat_id, from_chat_id, message_id, message_thread_id):
     return chat_id, from_chat_id, message_id, message_thread_id
 
@@ -60,7 +47,6 @@ def operation(name):
         "send_message": send_message,
         "edit_message_text": edit_message_text,
         "copy_message": copy_message,
-        "send_mtproto_media": mtproto_media_operation,
     }[name]
 
 
@@ -92,86 +78,6 @@ def test_queue_schema_wal_and_restart_retention(tmp_path):
     restarted.delete(row_id)
     restarted.close()
     assert OutboundQueue(tmp_path).heads() == []
-
-
-def test_mtproto_media_descriptor_survives_queue_restart_without_file_buffering(tmp_path):
-    source = tmp_path / "media.bin"
-    source.write_bytes(b"streamed-data")
-    with source.open("rb") as stream:
-        descriptor = MTProtoMediaDescriptor.from_stream(
-            stream, file_size=source.stat().st_size, caption="caption", reply_to=9,
-            force_document=True, supports_streaming=False, silent=False,
-            media_name="document", mime_type="application/octet-stream",
-        )
-    queue = OutboundQueue(tmp_path)
-    row_id, _waiter = enqueue(queue, QueueRequest(
-        "send_mtproto_media", (123, descriptor),
-        {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
-    ))
-    queue.close()
-
-    restarted = OutboundQueue(tmp_path)
-    row = restarted.heads()[0]
-    assert row.id == row_id
-    _chat_id, restored = restarted.decode_payload(row.payload)[0]
-    assert restored.path != descriptor.path
-    assert restored.path.startswith(str(tmp_path / "outbound-media"))
-    assert Path(restored.path).suffix == ".bin"
-    assert restored.media_filename() == "media.bin"
-    with restored.open() as stream:
-        assert stream.read(1) == b"s"
-    restarted.delete(row_id)
-    assert not Path(restored.path).exists()
-    restarted.close()
-
-
-def test_mtproto_queue_artifact_uses_only_a_safe_generated_filename(tmp_path):
-    source = tmp_path / "media.jpg"
-    source.write_bytes(b"streamed-data")
-    with source.open("rb") as stream:
-        descriptor = MTProtoMediaDescriptor.from_stream(
-            stream, file_size=source.stat().st_size, caption="", reply_to=None,
-            force_document=False, supports_streaming=False, silent=False,
-            media_name="photo", mime_type="image/jpeg",
-        )
-    descriptor = replace(descriptor, file_name="../../outside.jpg")
-    queue = OutboundQueue(tmp_path)
-
-    with pytest.raises(QueueEnqueueError, match="file name"):
-        enqueue(queue, QueueRequest(
-            "send_mtproto_media", (123, descriptor),
-            {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
-        ))
-
-    assert not queue.media_directory.exists()
-    queue.close()
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions are unavailable")
-def test_mtproto_media_artifacts_ignore_umask_and_repair_existing_directory_mode(tmp_path):
-    media_directory = tmp_path / OutboundQueue.media_directory_name
-    media_directory.mkdir(mode=0o755)
-    source = tmp_path / "media.bin"
-    source.write_bytes(b"streamed-data")
-    previous_umask = os.umask(0o022)
-    try:
-        queue = OutboundQueue(tmp_path)
-        assert os.stat(media_directory).st_mode & 0o777 == 0o700
-        with source.open("rb") as stream:
-            descriptor = MTProtoMediaDescriptor.from_stream(
-                stream, file_size=source.stat().st_size, caption="", reply_to=None,
-                force_document=True, supports_streaming=False, silent=False,
-                media_name="document", mime_type=None,
-            )
-            enqueue(queue, QueueRequest(
-                "send_mtproto_media", (123, descriptor),
-                {"_send_mode": "eventual", "_slave_id": "slave", "_required_sender_bot_id": "__main__"},
-            ))
-        artifact = Path(queue.decode_payload(queue.heads()[0].payload)[0][1].path)
-        assert os.stat(artifact).st_mode & 0o777 == 0o600
-    finally:
-        os.umask(previous_umask)
-        queue.close()
 
 
 def test_payload_version_round_trip_and_invalid_shapes(tmp_path):

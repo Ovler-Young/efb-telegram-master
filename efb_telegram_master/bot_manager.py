@@ -35,7 +35,7 @@ from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
-from .mtproto import MTProtoMediaDescriptor, MTProtoNotConnectedError, MTProtoRetryableError
+from .mtproto import MTProtoRetryableError
 from .outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
@@ -1075,17 +1075,10 @@ class TelegramBotManager(LocaleMixin):
 
     # Queue rows remain durable only until the scheduler commits their deletion.
     def _queue_operation(self, operation: str) -> Callable[..., object]:
-        if operation == "send_mtproto_media":
-            return self._queued_mtproto_media_operation
         method = getattr(self._bot, operation, None)
         if not callable(method):
             raise QueueEnqueueError(f"Telegram bot has no queued operation {operation!r}.")
         return cast(Callable[..., object], method)
-
-    @staticmethod
-    def _queued_mtproto_media_operation(chat_id: int, descriptor: MTProtoMediaDescriptor) -> None:
-        """Provide the queue with the concrete signature of its MTProto-only operation."""
-        del chat_id, descriptor
 
     def _enqueue_requests(
         self,
@@ -1182,27 +1175,6 @@ class TelegramBotManager(LocaleMixin):
                 f"Blocking send to chat {chat_id} timed out after {self.BLOCKING_SEND_TIMEOUT:g}s"
             ) from error
         return self._make_send_receipt(result, task_id=row_id)
-
-    def enqueue_mtproto_media(
-        self,
-        *,
-        chat_id: int,
-        descriptor: MTProtoMediaDescriptor,
-        slave_id: str,
-        db_log_context: QueuedDbLogContext,
-    ) -> SendReceipt:
-        """Persist an oversized media transfer before the MTProto request is submitted."""
-        if not isinstance(descriptor, MTProtoMediaDescriptor):
-            raise QueueEnqueueError("MTProto media requires a durable media descriptor.")
-        _row_id, waiter = self._enqueue_requests([
-            QueueRequest(
-                "send_mtproto_media", (chat_id, descriptor),
-                {"_send_mode": "eventual", "_slave_id": slave_id, "_required_sender_bot_id": "__main__"},
-            )
-        ], db_log_context=db_log_context)
-        return self._make_send_receipt(
-            self._create_queued_message_placeholder(chat_id, _row_id), queued=True, task_id=_row_id
-        )
 
     def enqueue_history_operation(
         self,
@@ -1358,24 +1330,6 @@ class TelegramBotManager(LocaleMixin):
         return (content, False) if isinstance(content, str) else (None, False)
 
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
-        if row.operation == "send_mtproto_media":
-            if selection.sender_bot_id is not None:
-                raise QueueEnqueueError("MTProto media must use the main bot session.")
-            if len(args) != 2 or not isinstance(args[1], MTProtoMediaDescriptor):
-                raise QueueEnqueueError("Queued MTProto media payload is invalid.")
-            chat_id, descriptor = args
-            if isinstance(chat_id, bool) or not isinstance(chat_id, int):
-                raise QueueEnqueueError("Queued MTProto media chat_id is invalid.")
-            mtproto = self.channel.mtproto
-            if not getattr(mtproto, "connected", False):
-                raise MTProtoNotConnectedError("MTProto client is not connected")
-            receipt = self._runtime.call(mtproto.send_media_descriptor(chat_id, descriptor))
-            media = SimpleNamespace(file_id=None, file_unique_id=None, mime_type=descriptor.mime_type)
-            media_value = [media] if descriptor.media_name == "photo" else media
-            return SimpleNamespace(
-                chat=SimpleNamespace(id=receipt.chat_id), chat_id=receipt.chat_id,
-                message_id=receipt.message_id, **{descriptor.media_name: media_value},
-            )
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
         telegram_kwargs = self._strip_private_queue_metadata(kwargs)
@@ -1500,13 +1454,6 @@ class TelegramBotManager(LocaleMixin):
 
         if row.priority == 0 and isinstance(error, telegram.error.RetryAfter):
             retry_after = self._retry_after_seconds(error)
-            retry_at = time.monotonic() + retry_after
-            with self._get_bot_chat_state_lock():
-                self._bot_chat_disabled_until[key] = retry_at
-            return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
-
-        if row.priority == 0 and isinstance(error, MTProtoRetryableError):
-            retry_after = error.retry_after or self.TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS
             retry_at = time.monotonic() + retry_after
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = retry_at

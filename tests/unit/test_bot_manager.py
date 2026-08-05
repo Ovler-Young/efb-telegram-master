@@ -29,12 +29,6 @@ from efb_telegram_master.bot_manager import (
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.mtproto import (
-    MTProtoFloodWaitError,
-    MTProtoMediaDescriptor,
-    MTProtoNotConnectedError,
-    MTProtoReceipt,
-)
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
@@ -827,25 +821,6 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     assert decision.kind.name == "TERMINAL_FAILURE"
     on_complete.assert_called_once_with()
     assert manager._queued_db_log_contexts == {}
-
-
-def test_mtproto_flood_wait_uses_eventual_durable_retry(monkeypatch: pytest.MonkeyPatch):
-    manager = object.__new__(TelegramBotManager)
-    manager._bot_chat_state_lock = threading.Lock()
-    manager._bot_chat_disabled_until = {}
-    manager._membership_failure_affinities = {}
-    manager.TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS = 60.0
-    manager.bot_pool = None
-    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 10.0)
-    row = SimpleNamespace(id=1, priority=0, telegram_chat_id=123, slave_id=None)
-
-    decision = TelegramBotManager.record_queued_failure(
-        manager, row, MTProtoFloodWaitError("wait", retry_after=17),
-        SimpleNamespace(sender_bot_id=None),
-    )
-
-    assert decision.kind.name == "RETRY_EVENTUAL"
-    assert decision.retry_at == 27.0
 
 
 def test_cooldown_metrics_snapshot_blocks_mutation_until_iteration_is_safe(

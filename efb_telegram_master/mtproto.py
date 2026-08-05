@@ -1,66 +1,11 @@
 """Request-only MTProto operations used alongside the Bot API client."""
 
-import mimetypes
 import os
-import re
 import threading
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, TypeAlias
-
-
-ClientFactory: TypeAlias = Callable[[Path, "MTProtoConfig"], Any]
-GetMessagesRequestFactory: TypeAlias = Callable[[object, list[int]], object]
-
-# Telegram's MTProto configuration normally advertises this as
-# ``document_size_max``.  It is the fallback used before that request is
-# available, and keeps oversized-media routing bounded at 2 GiB.
-PROJECT_MEDIA_LIMIT = 2 * 1024 * 1024 * 1024
-
-_MEDIA_DEFAULT_SUFFIXES = {
-    "photo": ".jpg",
-    "video": ".mp4",
-    "animation": ".gif",
-    "document": ".bin",
-}
-
-
-def _media_filename(name: str, media_name: str, mime_type: Optional[str]) -> str:
-    """Return a portable filename that Telethon can use for media inference."""
-    if not isinstance(name, str) or not name:
-        name = "upload"
-    base_name = name.replace("\\", "/").rsplit("/", 1)[-1]
-    sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", base_name).strip(".")
-    stem, suffix = os.path.splitext(sanitized)
-    if not stem:
-        stem = "upload"
-    if not suffix:
-        normalized_mime = mime_type.split(";", 1)[0].strip().lower() if mime_type else ""
-        suffix = mimetypes.guess_extension(normalized_mime) or _MEDIA_DEFAULT_SUFFIXES[media_name]
-    return f"{stem[:200]}{suffix.lower()}"
-
-
-def _telethon_media_attributes(
-    file_name: str, media_name: str, mime_type: Optional[str], supports_streaming: bool
-) -> list[object]:
-    """Build explicit document attributes so queued media does not depend on artifact paths."""
-    if media_name == "photo":
-        return []
-    from telethon.tl import types
-
-    attributes: list[object] = [types.DocumentAttributeFilename(file_name)]
-    is_video = media_name == "video" or (
-        media_name == "animation" and isinstance(mime_type, str)
-        and mime_type.split(";", 1)[0].strip().lower().startswith("video/")
-    )
-    if is_video:
-        attributes.append(types.DocumentAttributeVideo(
-            duration=0, w=1, h=1, supports_streaming=supports_streaming,
-        ))
-    if media_name == "animation":
-        attributes.append(types.DocumentAttributeAnimated())
-    return attributes
+from typing import Any, Optional
 
 _session_owners: set[Path] = set()
 _session_owners_lock = threading.Lock()
@@ -100,127 +45,12 @@ class MTProtoConfig:
         return cls(enabled=True, api_id=api_id, api_hash=api_hash, scan_ceiling=scan_ceiling)
 
 
-@dataclass(frozen=True)
-class MTProtoReceipt:
-    chat_id: int
-    message_id: int
-
-
-class MTProtoKnownNotSubmittedError(ValueError):
-    """An MTProto validation failure raised before a media send request."""
-
-
-class MTProtoMediaDescriptorError(MTProtoKnownNotSubmittedError):
-    """A durable media descriptor cannot be used for an MTProto request."""
-
-
-@dataclass(frozen=True)
-class MTProtoMediaDescriptor:
-    """Versioned, reopenable input for one durable MTProto media request."""
-
-    version: int
-    path: str
-    file_size: int
-    caption: str
-    reply_to: Optional[int]
-    force_document: bool
-    supports_streaming: bool
-    silent: bool
-    media_name: str
-    mime_type: Optional[str]
-    file_name: str = ""
-
-    VERSION = 1
-
-    @classmethod
-    def from_stream(
-        cls,
-        stream: object,
-        *,
-        file_size: int,
-        caption: str,
-        reply_to: Optional[int],
-        force_document: bool,
-        supports_streaming: bool,
-        silent: bool,
-        media_name: str,
-        mime_type: Optional[str],
-    ) -> "MTProtoMediaDescriptor":
-        name = getattr(stream, "name", None)
-        if not isinstance(name, (str, os.PathLike)):
-            raise MTProtoMediaDescriptorError("MTProto durable media requires a path-backed file.")
-        path = Path(name).expanduser().resolve(strict=True)
-        descriptor = cls(
-            cls.VERSION, str(path), file_size, caption, reply_to, force_document,
-            supports_streaming, silent, media_name, mime_type,
-            _media_filename(path.name, media_name, mime_type),
-        )
-        descriptor.validate()
-        return descriptor
-
-    def validate(self) -> None:
-        if self.version != self.VERSION:
-            raise MTProtoMediaDescriptorError("MTProto media descriptor has an unknown version.")
-        if not isinstance(self.path, str) or not self.path:
-            raise MTProtoMediaDescriptorError("MTProto media descriptor requires a file path.")
-        if isinstance(self.file_size, bool) or not isinstance(self.file_size, int) or self.file_size < 0:
-            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid file size.")
-        if not isinstance(self.caption, str) or self.media_name not in {"document", "photo", "video", "animation"}:
-            raise MTProtoMediaDescriptorError("MTProto media descriptor has invalid metadata.")
-        if self.reply_to is not None and (isinstance(self.reply_to, bool) or not isinstance(self.reply_to, int)):
-            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid reply target.")
-        if not all(isinstance(value, bool) for value in (
-            self.force_document, self.supports_streaming, self.silent,
-        )):
-            raise MTProtoMediaDescriptorError("MTProto media descriptor has invalid flags.")
-        if self.mime_type is not None and not isinstance(self.mime_type, str):
-            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid MIME type.")
-        file_name = getattr(self, "file_name", "")
-        if not isinstance(file_name, str):
-            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid file name.")
-        if file_name and (
-            "/" in file_name
-            or "\\" in file_name
-            or file_name != _media_filename(file_name, self.media_name, self.mime_type)
-        ):
-            raise MTProtoMediaDescriptorError("MTProto media descriptor has an invalid file name.")
-        path = Path(self.path)
-        try:
-            resolved = path.resolve(strict=True)
-        except OSError as error:
-            raise MTProtoMediaDescriptorError("MTProto media descriptor cannot reopen the original file.") from error
-        if (
-            not path.is_absolute()
-            or resolved != path
-            or not path.is_file()
-            or path.stat().st_size != self.file_size
-        ):
-            raise MTProtoMediaDescriptorError("MTProto media descriptor cannot reopen the original file.")
-
-    def open(self):
-        self.validate()
-        try:
-            return Path(self.path).open("rb")
-        except OSError as error:
-            raise MTProtoMediaDescriptorError(
-                "MTProto media descriptor cannot reopen the original file."
-            ) from error
-
-    def media_filename(self) -> str:
-        """Return the preserved name, or derive a safe legacy fallback."""
-        return _media_filename(
-            getattr(self, "file_name", "") or Path(self.path).name,
-            self.media_name,
-            self.mime_type,
-        )
-
-
 class MTProtoSessionOwnershipError(RuntimeError):
     """Raised when a second local client attempts to use the MTProto session."""
 
 
 class MTProtoRetryableError(RuntimeError):
-    """A Telethon request failure that may be retried by durable queue callers."""
+    """A Telethon request failure that can be retried by the MsgLog scan."""
 
     def __init__(self, message: str, retry_after: Optional[float] = None):
         super().__init__(message)
@@ -233,10 +63,6 @@ class MTProtoFloodWaitError(MTProtoRetryableError):
 
 class MTProtoNotConnectedError(MTProtoRetryableError):
     """A local availability failure raised before an MTProto request is submitted."""
-
-
-class MTProtoMediaLimitError(MTProtoKnownNotSubmittedError):
-    """A media transfer exceeds the configured MTProto file limit."""
 
 
 def translate_mtproto_error(error: BaseException) -> BaseException:
@@ -259,30 +85,6 @@ def translate_mtproto_error(error: BaseException) -> BaseException:
     return error
 
 
-def normalize_receipts(result: object) -> tuple[MTProtoReceipt, ...]:
-    """Extract message identifiers from Telethon response objects without Bot API types."""
-    messages = getattr(result, "messages", result)
-    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes, bytearray)):
-        messages = (messages,)
-
-    receipts: list[MTProtoReceipt] = []
-    for message in messages:
-        message_id = getattr(message, "id", None)
-        chat_id = getattr(message, "chat_id", None)
-        peer = getattr(message, "peer_id", None)
-        if chat_id is None and peer is not None:
-            for attribute in ("channel_id", "chat_id", "user_id"):
-                chat_id = getattr(peer, attribute, None)
-                if chat_id is not None:
-                    break
-        if isinstance(message_id, bool) or not isinstance(message_id, int):
-            raise ValueError("MTProto response message has no integer id")
-        if isinstance(chat_id, bool) or not isinstance(chat_id, int):
-            raise ValueError("MTProto response message has no integer chat id")
-        receipts.append(MTProtoReceipt(chat_id=chat_id, message_id=message_id))
-    return tuple(receipts)
-
-
 class MTProtoClient:
     """Own one bot-authenticated Telethon client without subscribing to updates."""
 
@@ -294,21 +96,15 @@ class MTProtoClient:
         config: MTProtoConfig,
         bot_token: str,
         database_base_path: Path,
-        *,
-        client_factory: Optional[ClientFactory] = None,
-        get_messages_request_factory: Optional[GetMessagesRequestFactory] = None,
     ) -> None:
         if config.enabled and not bot_token:
             raise ValueError("MTProto requires a non-empty bot token")
         self.config = config
         self._bot_token = bot_token
         self._database_base_path = Path(database_base_path)
-        self._client_factory = client_factory or self._build_telethon_client
-        self._get_messages_request_factory = get_messages_request_factory or self._build_get_messages_request
         self._client: Any = None
         self._owns_session = False
         self._session_lock_fd: Optional[int] = None
-        self._media_limit: Optional[int] = None
 
     @property
     def enabled(self) -> bool:
@@ -343,7 +139,7 @@ class MTProtoClient:
         self._prepare_session_directory()
         self._claim_session()
         try:
-            self._client = self._client_factory(self.session_path, self.config)
+            self._client = self._build_telethon_client(self.session_path, self.config)
             await self._client.connect()
             await self._client.start(bot_token=self._bot_token)
             self._protect_session_file()
@@ -379,11 +175,13 @@ class MTProtoClient:
             raise RuntimeError("MTProto is disabled")
         if any(isinstance(message_id, bool) or not isinstance(message_id, int) for message_id in message_ids):
             raise ValueError("message ids must be integers")
+        from telethon.tl.functions.channels import GetMessagesRequest
+
         ordered_ids = sorted(set(message_ids))
 
         messages: list[object] = []
         for index in range(0, len(ordered_ids), 100):
-            request = self._get_messages_request_factory(channel, ordered_ids[index:index + 100])
+            request = GetMessagesRequest(channel=channel, id=ordered_ids[index:index + 100])
             try:
                 response = await self.client(request)
             except BaseException as error:
@@ -405,136 +203,6 @@ class MTProtoClient:
                 raise
             raise translated from error
 
-    async def iter_download(self, media: object, *, chunk_size: int = 64 * 1024) -> AsyncIterator[bytes]:
-        """Yield media chunks from Telethon without collecting the complete download."""
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
-        try:
-            async for chunk in self.client.iter_download(media, request_size=chunk_size):
-                yield bytes(chunk)
-        except BaseException as error:
-            translated = translate_mtproto_error(error)
-            if translated is error:
-                raise
-            raise translated from error
-
-    async def upload_stream(
-        self, stream: object, *, file_size: Optional[int] = None, file_name: Optional[str] = None
-    ) -> object:
-        """Pass a caller-owned stream to Telethon without reading it into adapter memory."""
-        try:
-            return await self.client.upload_file(stream, file_size=file_size, file_name=file_name)
-        except BaseException as error:
-            translated = translate_mtproto_error(error)
-            if translated is error:
-                raise
-            raise translated from error
-
-    async def media_limit(self) -> int:
-        """Return Telegram's advertised file limit, with a bounded fallback."""
-        if self._media_limit is not None:
-            return self._media_limit
-        try:
-            from telethon.tl.functions.help import GetConfigRequest
-
-            config = await self.client(GetConfigRequest())
-            value = getattr(config, "document_size_max", None)
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                self._media_limit = min(value, PROJECT_MEDIA_LIMIT)
-                return self._media_limit
-        except ImportError:
-            pass
-        except MTProtoNotConnectedError:
-            raise
-        except BaseException as error:
-            translated = translate_mtproto_error(error)
-            if translated is not error:
-                raise translated from error
-        self._media_limit = PROJECT_MEDIA_LIMIT
-        return self._media_limit
-
-    async def send_media_stream(
-        self,
-        chat_id: int,
-        stream: object,
-        *,
-        file_size: int,
-        caption: str,
-        reply_to: Optional[int],
-        force_document: bool,
-        supports_streaming: bool,
-        silent: bool,
-        media_name: Optional[str] = None,
-        mime_type: Optional[str] = None,
-        file_name: Optional[str] = None,
-    ) -> MTProtoReceipt:
-        """Upload a stream and send it, retaining only Telethon's input-file handle."""
-        limit = await self.media_limit()
-        if file_size > limit:
-            raise MTProtoMediaLimitError(
-                f"Attachment is {file_size} bytes; MTProto allows at most {limit} bytes."
-            )
-        uploaded = await self.upload_stream(stream, file_size=file_size, file_name=file_name)
-        try:
-            send_kwargs: dict[str, object] = {
-                "caption": caption,
-                "parse_mode": "html",
-                "reply_to": reply_to,
-                "force_document": force_document,
-                "supports_streaming": supports_streaming,
-                "silent": silent,
-            }
-            if file_name is not None:
-                if media_name not in {"document", "photo", "video", "animation"}:
-                    raise ValueError("MTProto media has an invalid media name.")
-                send_kwargs["mime_type"] = mime_type
-                send_kwargs["attributes"] = _telethon_media_attributes(
-                    file_name, media_name, mime_type, supports_streaming,
-                )
-            result = await self.client.send_file(
-                chat_id,
-                uploaded,
-                **send_kwargs,
-            )
-        except BaseException as error:
-            translated = translate_mtproto_error(error)
-            if translated is error:
-                raise
-            raise translated from error
-        receipts = normalize_receipts(result)
-        if len(receipts) != 1:
-            raise ValueError("MTProto media send returned an unexpected number of receipts")
-        return receipts[0]
-
-    async def send_media_descriptor(self, chat_id: int, descriptor: MTProtoMediaDescriptor) -> MTProtoReceipt:
-        """Reopen a queued media file only for the duration of its streamed upload."""
-        descriptor.validate()
-        with descriptor.open() as stream:
-            return await self.send_media_stream(
-                chat_id,
-                stream,
-                file_size=descriptor.file_size,
-                caption=descriptor.caption,
-                reply_to=descriptor.reply_to,
-                force_document=descriptor.force_document,
-                supports_streaming=descriptor.supports_streaming,
-                silent=descriptor.silent,
-                media_name=descriptor.media_name,
-                mime_type=descriptor.mime_type,
-                file_name=descriptor.media_filename(),
-            )
-
-    async def download_message_media(self, chat_id: int, message_id: int, destination: object) -> None:
-        """Write a message's media to a caller-owned file one Telethon chunk at a time."""
-        channel = await self.get_input_channel(chat_id)
-        messages = await self.get_channel_messages(channel, [message_id])
-        if len(messages) != 1 or getattr(messages[0], "media", None) is None:
-            raise ValueError("MTProto message has no downloadable media")
-        write = getattr(destination, "write", None)
-        if not callable(write):
-            raise TypeError("MTProto download destination must provide write()")
-        async for chunk in self.iter_download(getattr(messages[0], "media")):
-            write(chunk)
 
     def _prepare_session_directory(self) -> None:
         self.session_directory.mkdir(parents=True, exist_ok=True)
@@ -598,9 +266,3 @@ class MTProtoClient:
             receive_updates=False,
             sequential_updates=False,
         )
-
-    @staticmethod
-    def _build_get_messages_request(channel: object, message_ids: list[int]) -> object:
-        from telethon.tl.functions.channels import GetMessagesRequest
-
-        return GetMessagesRequest(channel=channel, id=message_ids)

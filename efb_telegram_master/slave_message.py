@@ -36,7 +36,6 @@ from ehforwarderbot.status import ChatUpdates, MemberUpdates, MessageRemoval, Me
 from ehforwarderbot.types import MessageID
 from . import utils
 from .bot_manager import QueuedDbLogContext
-from .mtproto import MTProtoMediaDescriptor
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import ETMCommandMsgStorage
@@ -311,15 +310,6 @@ class SlaveMessageProcessor(LocaleMixin):
         if dedupe_key is not None:
             on_db_complete = lambda: self._release_pending_slave_message(dedupe_key)
 
-        if self._uses_mtproto_media(msg):
-            tg_msg = self._send_mtproto_media(
-                msg, tg_dest, thread_id, msg_template, reactions, old_msg_id,
-                target_msg_id, reply_markup, silent, database_old_msg_id or old_msg_id, on_db_complete,
-            )
-            if tg_msg is None:
-                self._release_pending_slave_message(dedupe_key)
-            return
-
         # Type dispatching
         if msg.type == MsgType.Text:
             tg_msg = self.slave_message_text(msg, tg_dest, thread_id, msg_template, reactions, old_msg_id, target_msg_id,
@@ -546,65 +536,6 @@ class SlaveMessageProcessor(LocaleMixin):
         size = file.tell()
         file.seek(0)
         return size
-
-    def _uses_mtproto_media(self, msg: Message) -> bool:
-        size = self._file_size(msg.file)
-        mtproto = getattr(self.channel, "mtproto", None)
-        return bool(
-            size is not None
-            and size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD
-            and getattr(mtproto, "enabled", False)
-        )
-
-    def _send_mtproto_media(self, msg: Message, tg_dest: TelegramChatID,
-                            thread_id: Optional[TelegramTopicID], msg_template: str, reactions: str,
-                            old_msg_id: Optional[OldMsgID], target_msg_id: Optional[TelegramMessageID],
-                            reply_markup: Optional[ReplyMarkup], silent: bool,
-                            database_old_msg_id: Optional[OldMsgID] = None,
-                            on_db_complete: Optional[Callable[[], None]] = None) -> telegram.Message:
-        if old_msg_id is not None or msg.edit_media:
-            raise EFBMessageError("MTProto oversized-media edits are not supported.")
-        if reply_markup is not None or msg.commands:
-            raise EFBMessageError("MTProto oversized media does not support Bot API reply markup or commands.")
-        options = {
-            MsgType.File: (True, False),
-            MsgType.Image: (False, False),
-            MsgType.Video: (False, True),
-            MsgType.Animation: (False, True),
-        }
-        if msg.type not in options:
-            raise EFBMessageError(f"MTProto oversized-media transfer does not support {msg.type.name}.")
-        file = msg.file
-        size = self._file_size(file)
-        if file is None or size is None:
-            raise EFBMessageError("MTProto oversized-media transfer requires a readable file.")
-        force_document, supports_streaming = options[msg.type]
-        caption = self.bot._affix_queued_content(self.html_substitutions(msg), msg_template, reactions, "HTML")
-        reply_to = target_msg_id or thread_id
-        try:
-            media_name = {
-                MsgType.File: "document",
-                MsgType.Image: "photo",
-                MsgType.Video: "video",
-                MsgType.Animation: "animation",
-            }[msg.type]
-            descriptor = MTProtoMediaDescriptor.from_stream(
-                file, file_size=size, caption=caption, reply_to=reply_to,
-                force_document=force_document, supports_streaming=supports_streaming, silent=silent,
-                media_name=media_name, mime_type=getattr(msg, "mime", None),
-            )
-            return cast(telegram.Message, self.bot.enqueue_mtproto_media(
-                chat_id=int(tg_dest), descriptor=descriptor,
-                slave_id=utils.chat_id_to_str(chat=msg.chat),
-                db_log_context=QueuedDbLogContext(
-                    ETMMsg.from_efbmsg(msg, self.chat_manager), database_old_msg_id,
-                    on_db_complete,
-                ),
-            ))
-        except ValueError as error:
-            raise EFBMessageError(str(error)) from error
-        finally:
-            file.close()
 
     @classmethod
     def _remote_image_url(cls, msg: Message) -> Optional[str]:
@@ -1685,8 +1616,7 @@ class SlaveMessageProcessor(LocaleMixin):
         file_size = self._file_size(file)
         if file_size is None:
             return None
-        if not getattr(getattr(self.channel, "mtproto", None), "enabled", False) \
-                and not self.channel.flag("local_tdlib_api") \
+        if not self.channel.flag("local_tdlib_api") \
                 and file_size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD:
             size_str = humanize.naturalsize(file_size)
             max_size_str = humanize.naturalsize(telegram.constants.FileSizeLimit.FILESIZE_UPLOAD)
