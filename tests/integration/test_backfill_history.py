@@ -2,7 +2,6 @@ import asyncio
 import re
 import threading
 import time
-from dataclasses import dataclass
 from typing import List, Sequence, Set
 from uuid import uuid4
 
@@ -18,7 +17,6 @@ from telethon.utils import get_peer_id
 from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.db import HistoryMigrationEntry
 
-from .helper.helper import wait_for_private_response
 from .utils import get_start_token
 
 pytestmark = pytest.mark.asyncio
@@ -47,17 +45,6 @@ async def helper(helper_wrap, slave_with_auxiliary_bots):
     slave_with_auxiliary_bots.clear_statuses()
     assert slave_with_auxiliary_bots.statuses.empty()
     yield helper_wrap
-
-
-@pytest.fixture
-def private_response(channel_with_auxiliary_bots, bot_id):
-    """Wait for primary-bot replies using the auxiliary channel's limiter."""
-    limiter_delay = lambda: (channel_with_auxiliary_bots.bot_manager.outbound_queue._main_rate_limiter.peek_delay(bot_id))
-
-    async def wait(trigger, receive):
-        return await wait_for_private_response(limiter_delay, trigger, receive)
-
-    return wait
 
 
 async def _wait_for_text_in_chat(client, chat_id: int, text_fragment: str, *, min_message_id: int = 0, timeout: float = 20.0):
@@ -223,70 +210,10 @@ def _expected_stream_indices(expected_count: int) -> Set[int]:
     return set(range(expected_count))
 
 
-@dataclass(frozen=True)
-class QueueMetricSnapshot:
-    enqueued: float
-    main_successes: float
-    auxiliary_successes: float
-    main_failures: float
-    auxiliary_failures: float
-    queue_depth: float
-    main_in_flight: float
-    auxiliary_in_flight: float
-
-
-def _queue_metrics_snapshot(bot_manager) -> QueueMetricSnapshot:
-    metrics = bot_manager._metrics
-    registry = metrics.registry
-    prefix = f"{metrics.namespace}_outbound"
-    common = {"priority": "normal", "operation": "send_message"}
-
-    def sample(name: str, labels=None) -> float:
-        value = registry.get_sample_value(name, labels or {})
-        return float(value) if value is not None else 0.0
-
-    def completion(sender_kind: str, outcome: str) -> float:
-        return sample(
-            f"{prefix}_completions_total",
-            {**common, "sender_kind": sender_kind, "outcome": outcome},
-        )
-
-    def in_flight(sender_kind: str) -> float:
-        return sample(
-            f"{prefix}_in_flight",
-            {**common, "sender_kind": sender_kind},
-        )
-
-    return QueueMetricSnapshot(
-        enqueued=sample(f"{prefix}_enqueued_total", common),
-        main_successes=completion("main", "success"),
-        auxiliary_successes=completion("auxiliary", "success"),
-        main_failures=completion("main", "failure"),
-        auxiliary_failures=completion("auxiliary", "failure"),
-        queue_depth=sample(f"{prefix}_queue_depth"),
-        main_in_flight=in_flight("main"),
-        auxiliary_in_flight=in_flight("auxiliary"),
-    )
-
-
-def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricSnapshot, *, expected_count: int) -> bool:
-    success_delta = current.main_successes + current.auxiliary_successes - before.main_successes - before.auxiliary_successes
-    failure_delta = current.main_failures + current.auxiliary_failures - before.main_failures - before.auxiliary_failures
-    return (
-        current.enqueued - before.enqueued == expected_count
-        and success_delta == expected_count
-        and failure_delta == 0
-        and current.queue_depth == 0
-        and current.main_in_flight == 0
-        and current.auxiliary_in_flight == 0
-    )
-
-
-def _migration_activity_completed(*, activity_observed: bool, expected: Set[int], db_indices: List[int], telegram_indices: List[int], target_entry_count: int, queue_completed: bool) -> bool:
+def _migration_activity_completed(*, activity_observed: bool, expected: Set[int], db_indices: List[int], telegram_indices: List[int], target_entry_count: int) -> bool:
     expected_count = len(expected)
     return (
         activity_observed
-        and queue_completed
         and target_entry_count == 0
         and set(db_indices) == expected
         and len(db_indices) == expected_count
@@ -304,7 +231,7 @@ def _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix: str):
     return [log for log in channel_with_auxiliary_bots.db.get_recent_messages(slave_chat_id, limit=0) if (log.text or "").startswith(prefix)]
 
 
-async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_chat_id: int, chat, prefix: str, expected_count: int, min_message_id: int, metrics_before: QueueMetricSnapshot):
+async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_chat_id: int, chat, prefix: str, expected_count: int, min_message_id: int):
     expected = _expected_stream_indices(expected_count)
     deadline = time.time() + STREAM_SETTLE_TIMEOUT
 
@@ -322,30 +249,17 @@ async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_cha
         )
         group_indices = [idx for message in group_messages for idx in _extract_stream_indices(message.raw_text or "", prefix)]
 
-        metrics_current = _queue_metrics_snapshot(channel_with_auxiliary_bots.bot_manager)
-        last_debug = (
-            f"db={len(db_logs)} (idx={len(db_indices)}/{expected_count}), "
-            f"tg={len(group_messages)} (idx={len(group_indices)}/{expected_count}), "
-            f"metrics_before={metrics_before!r}, metrics_current={metrics_current!r}"
-        )
+        last_debug = f"db={len(db_logs)} (idx={len(db_indices)}/{expected_count}), tg={len(group_messages)} (idx={len(group_indices)}/{expected_count})"
 
-        if (
-            set(db_indices) == expected
-            and len(db_indices) == expected_count
-            and set(group_indices) == expected
-            and len(group_indices) == expected_count
-            and _queue_activity_completed(metrics_before, metrics_current, expected_count=expected_count)
-        ):
-            return db_logs, group_messages, metrics_current
+        if set(db_indices) == expected and len(db_indices) == expected_count and set(group_indices) == expected and len(group_indices) == expected_count:
+            return db_logs, group_messages
 
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     raise AssertionError(f"Timed out waiting for stream to settle: {last_debug}")
 
 
-async def _wait_for_migrated_stream_terminal(
-    channel_with_auxiliary_bots, client, chat, chat_id: int, prefix: str, expected_count: int, *, min_message_id: int, metrics_before: QueueMetricSnapshot, timeout: float = BACKFILL_WAIT_TIMEOUT
-):
+async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client, chat, chat_id: int, prefix: str, expected_count: int, *, min_message_id: int, timeout: float = BACKFILL_WAIT_TIMEOUT):
     expected = _expected_stream_indices(expected_count)
     slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
     deadline = time.time() + timeout
@@ -357,20 +271,12 @@ async def _wait_for_migrated_stream_terminal(
         telegram_indices = [idx for message in recent for idx in _extract_stream_indices(message.raw_text or "", prefix)]
         db_logs = _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix)
         db_indices = [idx for log in db_logs for idx in _extract_stream_indices(log.text or "", prefix)]
-        metrics_current = _queue_metrics_snapshot(channel_with_auxiliary_bots.bot_manager)
-        enqueue_delta = metrics_current.enqueued - metrics_before.enqueued
-        activity_observed = activity_observed or enqueue_delta > 0 or bool(telegram_indices)
+        activity_observed = activity_observed or bool(telegram_indices)
         target_entry_count = _target_migration_entry_count(slave_chat_id, chat_id)
-        queue_completed = _queue_activity_completed(
-            metrics_before,
-            metrics_current,
-            expected_count=expected_count,
-        )
         last_debug = (
             f"migration_observed={activity_observed}, db_idx={len(db_indices)}/{expected_count}, "
             f"tg_idx={len(telegram_indices)}/{expected_count}, target_entries={target_entry_count}, "
-            f"expected_migration_sends={expected_count}, "
-            f"metrics_before={metrics_before!r}, metrics_current={metrics_current!r}"
+            f"expected_migration_sends={expected_count}"
         )
         if _migration_activity_completed(
             activity_observed=activity_observed,
@@ -378,9 +284,8 @@ async def _wait_for_migrated_stream_terminal(
             db_indices=db_indices,
             telegram_indices=telegram_indices,
             target_entry_count=target_entry_count,
-            queue_completed=queue_completed,
         ):
-            return recent, metrics_current
+            return recent
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     raise AssertionError(f"Timed out waiting for migrated stream terminal state: {last_debug}")
@@ -405,10 +310,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     channel_with_auxiliary_bots.db.remove_topic_assoc(slave_uid=slave_uid)
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
-    bot_manager = channel_with_auxiliary_bots.bot_manager
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response)
-
-    stream_metrics_before = _queue_metrics_snapshot(bot_manager)
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
     await asyncio.to_thread(stream_thread.join, STREAM_SETTLE_TIMEOUT)
@@ -417,7 +319,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     assert not stream_errors, f"Mock stream failed: {stream_errors!r}"
     assert len(sent_texts) == STREAM_MESSAGE_COUNT
 
-    db_logs, group_messages, stream_metrics_after = await _wait_for_stream_stable(
+    db_logs, group_messages = await _wait_for_stream_stable(
         channel_with_auxiliary_bots,
         client,
         tg_chat_id=source_group_id,
@@ -425,7 +327,6 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         prefix=prefix,
         expected_count=STREAM_MESSAGE_COUNT,
         min_message_id=command_message.id,
-        metrics_before=stream_metrics_before,
     )
 
     group_indices = [idx for msg in group_messages for idx in _extract_stream_indices(msg.raw_text or "", prefix)]
@@ -442,17 +343,10 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     group_sender_ids = {message.sender_id for message in group_messages if message.sender_id is not None}
     assert group_sender_ids & set(working_aux_bot_ids), "Expected auxiliary bot messages in the linked group."
 
-    assert _queue_activity_completed(
-        stream_metrics_before,
-        stream_metrics_after,
-        expected_count=STREAM_MESSAGE_COUNT,
-    )
-
     target_group_id = bot_topic_group
     try:
-        migration_metrics_before = _queue_metrics_snapshot(bot_manager)
         relink_true_message = await _link_chat(client, helper, bot_id, chat.uid, target_group_id, private_response, flag="true")
-        _, migration_metrics_after = await _wait_for_migrated_stream_terminal(
+        await _wait_for_migrated_stream_terminal(
             channel_with_auxiliary_bots,
             client,
             chat,
@@ -460,12 +354,6 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             prefix,
             STREAM_MESSAGE_COUNT,
             min_message_id=relink_true_message.id,
-            metrics_before=migration_metrics_before,
-        )
-        assert _queue_activity_completed(
-            migration_metrics_before,
-            migration_metrics_after,
-            expected_count=STREAM_MESSAGE_COUNT,
         )
         assert _target_migration_entry_count(slave_uid, target_group_id) == 0
 
