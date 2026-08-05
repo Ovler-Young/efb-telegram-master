@@ -97,6 +97,17 @@ def _delete_msg_logs_by_master_ids(channel, master_msg_ids):
         channel.db.delete_msg_log(master_msg_id=master_msg_id)
 
 
+async def _wait_for_ingestion_worker_exit(channel, source_chat_id, timeout=30):
+    manager = channel.chat_binding
+    with manager._msglog_ingestion_lock:
+        worker = manager._msglog_ingestion_threads.get(source_chat_id)
+    if worker is None:
+        return
+    await asyncio.to_thread(worker.join, timeout)
+    if worker.is_alive():
+        raise TimeoutError("MsgLog ingestion worker did not stop")
+
+
 async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         helper, client, bot_topic_group, channel_with_topic_group_and_mtproto,
         slave_with_topic_group_and_mtproto, poll_bot, monkeypatch,
@@ -191,6 +202,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         assert (scan.scanned_count, scan.inserted_count, scan.existing_count) == counters
         assert MsgLog.select().where(MsgLog.master_msg_id.in_(source_log_ids)).count() == 2
     finally:
+        await _wait_for_ingestion_worker_exit(channel, bot_topic_group)
         scan_to_delete = None
         if scan_id is not None:
             scan_to_delete = MsgLogIngestionScan.get_or_none(MsgLogIngestionScan.id == scan_id)
