@@ -3,7 +3,7 @@ import ast
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 from threading import Lock
 from uuid import UUID
 
@@ -15,6 +15,7 @@ from efb_telegram_master.master_message import MasterMessageProcessor
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 from tests.integration import conftest as integration_conftest
+from tests.integration.test_mtproto_live import _delete_msg_logs_by_master_ids
 
 
 def test_live_msglog_sync_keeps_polling_running():
@@ -39,6 +40,18 @@ def test_live_msglog_sync_keeps_polling_running():
     assert "poll_bot" in fixture_names
     assert "poll_bot_factory" not in fixture_names
     assert lifecycle_calls == []
+
+
+def test_live_msglog_gap_deletion_is_limited_to_exact_master_message_ids():
+    channel = SimpleNamespace(db=SimpleNamespace(delete_msg_log=Mock()))
+    master_msg_ids = ("-100123.41", "-100123.42")
+
+    _delete_msg_logs_by_master_ids(channel, master_msg_ids)
+
+    assert channel.db.delete_msg_log.call_args_list == [
+        call(master_msg_id="-100123.41"),
+        call(master_msg_id="-100123.42"),
+    ]
 
 
 def test_integration_postgres_config_reads_required_environment(monkeypatch):

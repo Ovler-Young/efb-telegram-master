@@ -80,11 +80,16 @@ async def _wait_for_msg_log(channel, master_msg_id, timeout=10):
     raise TimeoutError(f"MsgLog row {master_msg_id} was not persisted")
 
 
+def _delete_msg_logs_by_master_ids(channel, master_msg_ids):
+    for master_msg_id in master_msg_ids:
+        channel.db.delete_msg_log(master_msg_id=master_msg_id)
+
+
 async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         helper, client, bot_topic_group, channel_with_topic_group_and_mtproto,
         slave_with_topic_group_and_mtproto, poll_bot, monkeypatch,
 ):
-    """Ingest test-marked topic messages that live routing does not log."""
+    """Rebuild two precisely removed live MsgLog rows from Telegram history."""
     channel = channel_with_topic_group_and_mtproto
     slave = slave_with_topic_group_and_mtproto
     marker = f"mtproto-msglog-{uuid4().hex}"
@@ -125,7 +130,23 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         assert {message.text for message in routed_messages} == {
             f"{marker}-first", f"{marker}-second",
         }
-        assert all(channel.db.get_msg_log(master_msg_id=message_id) is None for message_id in source_log_ids)
+
+        live_rows = [
+            await _wait_for_msg_log(channel, master_msg_id)
+            for master_msg_id in source_log_ids
+        ]
+        expected_slave_uid = channel.db.get_topic_slave(bot_topic_group, topic_id)
+        assert expected_slave_uid is not None
+        assert {row.master_msg_id for row in live_rows} == set(source_log_ids)
+        assert {row.text for row in live_rows} == {f"{marker}-first", f"{marker}-second"}
+        assert {row.slave_origin_uid for row in live_rows} == {expected_slave_uid}
+        assert {row.provenance for row in live_rows} == {"live"}
+
+        _delete_msg_logs_by_master_ids(channel, source_log_ids)
+        assert all(
+            channel.db.get_msg_log(master_msg_id=master_msg_id) is None
+            for master_msg_id in source_log_ids
+        )
 
         scan_boundary = max(source_ids)
         channel.mtproto.config = replace(channel.mtproto.config, scan_ceiling=scan_boundary)
@@ -147,12 +168,15 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         assert {row.master_msg_id for row in rows} == set(source_log_ids)
         assert {row.text for row in rows} == {f"{marker}-first", f"{marker}-second"}
         assert {row.provenance for row in rows} == {"mtproto_ingested"}
-        expected_slave_uid = channel.db.get_topic_slave(bot_topic_group, topic_id)
-        assert expected_slave_uid is not None
         assert {row.slave_origin_uid for row in rows} == {expected_slave_uid}
         assert scan.inserted_count == 2
         assert scan.existing_count >= 1
         assert scan.status == "complete"
+        assert MsgLog.select().where(MsgLog.master_msg_id.in_(source_log_ids)).count() == 2
+        counters = (scan.scanned_count, scan.inserted_count, scan.existing_count)
+        assert channel.chat_binding.schedule_msglog_ingestion(bot_topic_group) == "already complete"
+        scan = MsgLogIngestionScan.get_by_id(scan.id)
+        assert (scan.scanned_count, scan.inserted_count, scan.existing_count) == counters
         assert MsgLog.select().where(MsgLog.master_msg_id.in_(source_log_ids)).count() == 2
     finally:
         if scan_id is not None:
