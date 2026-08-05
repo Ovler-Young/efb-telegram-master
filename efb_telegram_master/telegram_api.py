@@ -142,40 +142,40 @@ class TelegramAPI:
     def _call_direct_operation(self, operation: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> object:
         return getattr(self._bot, operation)(*args, **_strip_private_queue_metadata(kwargs))
 
-    def _enqueue_main_chat_mutation(self, operation: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> object:
+    def _enqueue_main_chat_mutation(self, operation: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> SendReceipt:
         telegram_kwargs = _strip_private_queue_metadata(kwargs)
         target_chat_id = self._normalize_telegram_chat_id(self._queued_chat_id_argument(operation, args, telegram_kwargs))
         return self._outbound_queue.enqueue_and_wait(QueueRequest(operation, args, dict(telegram_kwargs), target_chat_id, required_sender_bot_id="__main__"))
 
     @_retry_on_chat_migration
-    def send_message(self, *args: object, prefix: str = "", suffix: str = "", **kwargs: object):
+    def send_message(self, *args: object, prefix: str = "", suffix: str = "", **kwargs: object) -> SendReceipt:
         return self._route_affixed_operation("send_message", args, kwargs, eventual_capable=True, content_key="text", content_index=1, prefix=prefix, suffix=suffix)
 
     @_retry_on_chat_migration
-    def edit_message_text(self, *args: object, prefix: str = "", suffix: str = "", **kwargs: object):
+    def edit_message_text(self, *args: object, prefix: str = "", suffix: str = "", **kwargs: object) -> SendReceipt:
         return self._route_affixed_operation("edit_message_text", args, kwargs, eventual_capable=False, content_key="text", content_index=0, prefix=prefix, suffix=suffix)
 
     def _send_captioned(self, operation: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> SendReceipt:
         return self._route_affixed_operation(operation, args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @_retry_on_chat_migration
-    def send_voice(self, *args: object, **kwargs: object):
+    def send_voice(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._send_captioned("send_voice", args, kwargs)
 
     @_retry_on_chat_migration
-    def send_video(self, *args: object, **kwargs: object):
+    def send_video(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._send_captioned("send_video", args, kwargs)
 
     @_retry_on_chat_migration
-    def send_document(self, *args: object, **kwargs: object):
+    def send_document(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._send_captioned("send_document", args, kwargs)
 
     @_retry_on_chat_migration
-    def send_animation(self, *args: object, **kwargs: object):
+    def send_animation(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._send_captioned("send_animation", args, kwargs)
 
     @_retry_on_chat_migration
-    def send_photo(self, *args: object, **kwargs: object):
+    def send_photo(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._send_captioned("send_photo", args, kwargs)
 
     @_retry_on_chat_migration
@@ -195,23 +195,23 @@ class TelegramAPI:
         return self._enqueue_main_chat_mutation("edit_message_reply_markup", args, kwargs)
 
     @_retry_on_chat_migration
-    def send_location(self, *args: object, **kwargs: object):
+    def send_location(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._enqueue_main_chat_mutation("send_location", args, kwargs)
 
     @_retry_on_chat_migration
-    def send_sticker(self, *args: object, **kwargs: object):
+    def send_sticker(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._route_queued_operation("send_sticker", args, kwargs, eventual_capable=True)
 
     @_retry_on_chat_migration
-    def copy_message(self, *args: object, **kwargs: object):
+    def copy_message(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._route_queued_operation("copy_message", args, kwargs, eventual_capable=True)
 
     @_retry_on_chat_migration
-    def edit_message_caption(self, *args: object, **kwargs: object):
+    def edit_message_caption(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._route_affixed_operation("edit_message_caption", args, kwargs, eventual_capable=False, content_key="caption", content_index=3)
 
     @_retry_on_chat_migration
-    def edit_message_media(self, *args: object, **kwargs: object):
+    def edit_message_media(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._route_queued_operation("edit_message_media", args, kwargs, eventual_capable=False)
 
     def get_me(self, *args: object, **kwargs: object):
@@ -225,7 +225,7 @@ class TelegramAPI:
     def get_chat_info(self, *args: object, **kwargs: object):
         return self._call_direct_operation("get_chat", args, kwargs)
 
-    def delete_message(self, chat_id: int, message_id: int, _sender_bot_id: object = None):
+    def delete_message(self, chat_id: int, message_id: int, _sender_bot_id: object = None) -> SendReceipt:
         required_sender = str(_sender_bot_id) if _sender_bot_id else "__main__"
         return self._outbound_queue.enqueue_and_wait(QueueRequest("delete_message", (chat_id, message_id), {}, self._normalize_telegram_chat_id(chat_id), required_sender_bot_id=required_sender))
 

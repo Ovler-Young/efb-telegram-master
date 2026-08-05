@@ -20,7 +20,7 @@ EFB Telegram Master Channel (ETM)
 `README in other languages`_.
 
 .. TRANSLATORS: change the URL on previous line as "." (without quotations).
-.. _README in other languages: ./readme_translations
+.. _README in other languages: ./readme_translations/en_US.rst
 
 **Channel ID**: ``blueset.telegram``
 
@@ -322,7 +322,7 @@ Advanced feature: Filtering
 
 If you have just too many chats, and being too tired for keep tapping
 ``Next >``, or maybe you just want to find a way to filter out what
-you’re looking for, now ETM has equipped ``/chat`` and ``/list`` with
+you’re looking for, now ETM has equipped ``/chat`` with
 filtering feature. Attach your keyword behind, and you can get a
 filtered result.
 

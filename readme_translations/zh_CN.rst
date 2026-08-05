@@ -21,7 +21,7 @@ EFB Telegram 主端（ETM）
 .. image:: https://github.com/ehForwarderBot/efb-telegram-master/raw/master/banner.png
    :alt: Banner
 
-`其他语言的 README <./readme_translations>`_。
+`其他语言的 README <../README.rst>`_。
 
 **信道 ID**: ``blueset.telegram``
 
@@ -188,7 +188,7 @@ API，``python-telegram-bot`` 建立。
 ~~~~~~~~~~~~~~
 
 如果你的会话太多，不想在一次次点击 ``下一页
->`` 按钮，亦或是你想要一个更直接的方式筛选你的会话，ETM 为 ``/chat`` 和 ``/list`` 指令搭载了筛选功能。在指令后面追加关联词即可获得筛选后的会话列表。
+>`` 按钮，亦或是你想要一个更直接的方式筛选你的会话，ETM 为 ``/chat`` 指令搭载了筛选功能。在指令后面追加关联词即可获得筛选后的会话列表。
 
 例如：``/chat Eana`` 指令能够筛选出所有包含「Eana」的会话。
 

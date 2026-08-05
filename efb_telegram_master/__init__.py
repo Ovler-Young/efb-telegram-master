@@ -652,7 +652,7 @@ class TelegramChannel(MasterChannel):
                 )
 
             finally:
-                self.logger.error(
+                self.logger.exception(
                     "Unhandled Telegram bot error while handling update (%s).", type(error).__name__, extra={"event": "telegram_channel.unhandled_error", "error_type": type(error).__name__}
                 )
 

@@ -21,7 +21,7 @@ EFB Telegram Master Channel (ETM)
 .. image:: https://github.com/ehForwarderBot/efb-telegram-master/raw/master/banner.png
    :alt: Banner
 
-`README in other languages <./readme_translations>`_.
+`README in other languages <../README.rst>`_.
 
 **Channel ID**: ``blueset.telegram``
 
@@ -212,7 +212,7 @@ Advanced feature: Filtering
 
 If you have just too many chats, and being too tired for keep tapping
 \ ``Next >``, or maybe you just want to find a way to filter out what
-you’re looking for, now ETM has equipped ``/chat`` and ``/list`` with
+you’re looking for, now ETM has equipped ``/chat`` with
 filtering feature. Attach your keyword behind, and you can get a
 filtered result.
 
