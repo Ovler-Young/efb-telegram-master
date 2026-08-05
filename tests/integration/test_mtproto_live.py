@@ -70,6 +70,16 @@ async def _wait_for_scan(source_chat_id, timeout=30):
     raise TimeoutError("MsgLog ingestion did not complete")
 
 
+async def _wait_for_msg_log(channel, master_msg_id, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        row = channel.db.get_msg_log(master_msg_id=master_msg_id)
+        if row is not None:
+            return row
+        await asyncio.sleep(0.1)
+    raise TimeoutError(f"MsgLog row {master_msg_id} was not persisted")
+
+
 async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         helper, client, bot_topic_group, channel_with_topic_group_and_mtproto,
         slave_with_topic_group_and_mtproto, poll_bot_factory, monkeypatch,
@@ -91,17 +101,10 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         )
         topic_id = _topic_id(topic_message)
         assert topic_id is not None
-        logged_message_ids.append(utils.message_id_to_str(bot_topic_group, topic_message.id))
-
-        anchor = await client.send_message(
-            bot_topic_group, f"{marker}-anchor", reply_to=topic_message.id,
-        )
-        created_message_ids.append(anchor.id)
-        slave.messages.get(timeout=10)
-        slave.messages.task_done()
-        anchor_log_id = utils.message_id_to_str(bot_topic_group, anchor.id)
+        anchor_log_id = utils.message_id_to_str(bot_topic_group, topic_message.id)
         logged_message_ids.append(anchor_log_id)
-        assert channel.db.get_msg_log(master_msg_id=anchor_log_id) is not None
+        anchor_log = await _wait_for_msg_log(channel, anchor_log_id)
+        assert anchor_log.provenance == "live"
 
         poll_bot_factory.stop(channel)
         first = await client.send_message(
