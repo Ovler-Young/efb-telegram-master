@@ -241,6 +241,7 @@ class TelegramPollingRuntime:
         self.me = await self.async_bot.get_me()
         assert self.me, "Invalid bot credential provided."
         await self._on_started(self)
+        self.logger.info("Telegram polling runtime started", extra={"event": "telegram_runtime.start"})
 
     async def _post_shutdown(self, _application: Application) -> None:
         try:
@@ -248,6 +249,7 @@ class TelegramPollingRuntime:
         finally:
             self.async_runtime.clear_loop()
             self._shutdown_complete.set()
+            self.logger.info("Telegram polling runtime stopped", extra={"event": "telegram_runtime.stop"})
 
     async def _run_application_lifecycle(self, *, drop_pending_updates: bool, timeout: int) -> None:
         stop_event = asyncio.Event()

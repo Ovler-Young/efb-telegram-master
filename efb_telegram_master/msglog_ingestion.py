@@ -35,6 +35,10 @@ class MsgLogIngestionService:
         self.lease_seconds = lease_seconds
         self.logger = logging.getLogger(__name__)
 
+    def _log_event(self, event: str, source_chat_id: int) -> None:
+        self.logger.info("MsgLog ingestion %s for source chat %d", event, source_chat_id,
+                         extra={"event": f"msglog_ingestion.{event}"})
+
     async def run(self, source_chat_id: int, *, lease_owner: str) -> None:
         """Resume a source-group scan unless another worker owns its lease."""
         scan_ceiling = getattr(getattr(self.mtproto, "config", None), "scan_ceiling", 100_000)
@@ -44,6 +48,7 @@ class MsgLogIngestionService:
         scan = self.db.claim_msglog_ingestion_scan(source_chat_id, lease_owner, self.lease_seconds)
         if scan is None:
             return
+        self._log_event("start", source_chat_id)
 
         try:
             source_channel = await self.mtproto.get_input_channel(source_chat_id)
@@ -77,20 +82,24 @@ class MsgLogIngestionService:
                         self.db.finish_msglog_ingestion_scan(
                             scan, status="complete", lease_owner=lease_owner,
                         )
+                        self._log_event("complete", source_chat_id)
                         return
             self.db.finish_msglog_ingestion_scan(scan, status="complete", lease_owner=lease_owner)
+            self._log_event("complete", source_chat_id)
         except MsgLogIngestionLeaseLostError:
             self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id)
         except MTProtoRetryableError as error:
             self.db.finish_msglog_ingestion_scan(
                 scan, status="retryable-error", error=str(error), lease_owner=lease_owner,
             )
-            self.logger.warning("MsgLog ingestion retained at cursor %d: %s", scan.cursor, error)
+            self.logger.warning("MsgLog ingestion retained at cursor %d (%s)", scan.cursor,
+                                type(error).__name__, extra={"event": "msglog_ingestion.retry"})
         except Exception as error:
             self.db.finish_msglog_ingestion_scan(
                 scan, status="error", error=str(error), lease_owner=lease_owner,
             )
-            self.logger.exception("MsgLog ingestion failed at cursor %d", scan.cursor)
+            self.logger.exception("MsgLog ingestion failed at cursor %d", scan.cursor,
+                                  extra={"event": "msglog_ingestion.error"})
 
     def _classify(
         self, message: object, source_chat_id: int,

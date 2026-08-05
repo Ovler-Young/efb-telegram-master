@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from collections.abc import Callable, Iterable, Mapping
@@ -143,6 +144,7 @@ class Metrics:
         self.registry = CollectorRegistry()
         self.namespace = namespace
         self._collectors: list[_CallbackCollector] = []
+        self._logged_collector_failures: set[str] = set()
         self.membership_probes = Counter(
             f"{namespace}_auxiliary_membership_probes_total",
             "Auxiliary membership probes by bounded outcome.",
@@ -224,6 +226,11 @@ class Metrics:
         self.registry.register(collector)
         self._collectors.append(collector)
 
+    def _record_collector_failure(self, collector: str, error: Exception) -> None:
+        if collector not in self._logged_collector_failures:
+            self._logged_collector_failures.add(collector)
+            logging.getLogger(__name__).warning("Metrics collector %s failed (%s).", collector, type(error).__name__)
+
     def register_process_collector(
         self,
         process_factory: Callable[[], Any] | None = None,
@@ -251,12 +258,13 @@ class Metrics:
 
         try:
             process = process_factory()
-        except Exception:
+        except Exception as error:
+            self._record_collector_failure("process_factory", error)
             return
         try:
             process.cpu_percent(interval=None)
-        except Exception:
-            pass
+        except Exception as error:
+            self._record_collector_failure("process_cpu_baseline", error)
 
         def collect() -> Iterable[Metric]:
             metrics: list[Metric] = []
@@ -269,8 +277,8 @@ class Metrics:
                 )
                 cpu.add_metric([], cpu_percent / 100)
                 metrics.append(cpu)
-            except Exception:
-                pass
+            except Exception as error:
+                self._record_collector_failure("process_cpu", error)
 
             try:
                 memory = process.memory_info()
@@ -281,8 +289,8 @@ class Metrics:
                 )
                 resident.add_metric([], resident_memory)
                 metrics.append(resident)
-            except Exception:
-                pass
+            except Exception as error:
+                self._record_collector_failure("process_memory", error)
 
             try:
                 disk = process.io_counters()
@@ -297,8 +305,8 @@ class Metrics:
                 )
                 disk_write.add_metric([], self._non_negative(disk.write_bytes, "process disk write bytes"))
                 metrics.extend((disk_read, disk_write))
-            except Exception:
-                pass
+            except Exception as error:
+                self._record_collector_failure("process_disk", error)
 
             if network_io_counters is not None:
                 try:
@@ -318,8 +326,8 @@ class Metrics:
                         [], self._non_negative(network_counters.bytes_sent, "host network transmitted bytes")
                     )
                     metrics.extend((network_receive, network_transmit))
-                except Exception:
-                    pass
+                except Exception as error:
+                    self._record_collector_failure("host_network", error)
 
             return tuple(metrics)
 
@@ -463,4 +471,6 @@ def start_metrics_server(host: str, port: int, registry: CollectorRegistry) -> M
     server = make_server(host, port, make_wsgi_app(registry), handler_class=QuietHandler)
     thread = threading.Thread(target=server.serve_forever, name="ETM metrics server", daemon=True)
     thread.start()
-    return MetricsServer(server, thread)
+    metrics_server = MetricsServer(server, thread)
+    logging.getLogger(__name__).info("Metrics endpoint listening on %s", metrics_server.server_address)
+    return metrics_server

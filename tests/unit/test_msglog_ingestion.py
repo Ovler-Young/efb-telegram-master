@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -158,12 +159,14 @@ def test_ingestion_collapses_media_to_generic_copyable_content():
     assert stored.time == source_time
 
 
-def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_cursor():
+def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_cursor(caplog):
     db = FakeDatabase(scan_boundary=5)
     mtproto = FakeMTProto({}, error=MTProtoRetryableError("temporary"), scan_ceiling=5)
 
-    asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+        asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
 
     assert db.scan.status == "retryable-error"
     assert db.scan.error == "temporary"
     assert db.scan.cursor == 5
+    assert [record.event for record in caplog.records] == ["msglog_ingestion.start", "msglog_ingestion.retry"]

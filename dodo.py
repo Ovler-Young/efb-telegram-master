@@ -9,8 +9,18 @@ README_BASE = "./README.rst"
 DEFAULT_BUMP_MODE = "patch"
 # major, minor, patch, alpha, beta, dev, post
 DOIT_CONFIG = {
-    "default_tasks": ["test", "mypy"]
+    "default_tasks": ["quality"]
 }
+
+
+def task_quality():
+    return {
+        "actions": [
+            ["pre-commit", "run", "check-yaml", "--all-files"],
+            ["pre-commit", "run", "rst-linter", "--all-files"],
+        ],
+        "file_dep": [".pre-commit-config.yaml", README_BASE],
+    }
 
 
 def task_gettext():

@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -93,6 +93,17 @@ async def test_polling_lifecycle_keeps_ptb_startup_and_shutdown_order():
     assert order == [
         "initialize", "bind_loop", "identity", "started", "updater.start", "application.start",
         "updater.stop", "application.stop", "post_stop", "shutdown", "post_shutdown",
+    ]
+
+    async def on_stopped(_runtime: TelegramPollingRuntime) -> None:
+        return None
+
+    runtime.async_runtime.clear_loop = Mock()
+    runtime._on_stopped = on_stopped
+    await runtime._post_shutdown(runtime.application)
+    assert runtime.logger.info.call_args_list == [
+        call("Telegram polling runtime started", extra={"event": "telegram_runtime.start"}),
+        call("Telegram polling runtime stopped", extra={"event": "telegram_runtime.stop"}),
     ]
 
 

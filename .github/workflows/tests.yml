@@ -6,6 +6,9 @@ on:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
+      - 'README.rst'
+      - 'dodo.py'
+      - '.pre-commit-config.yaml'
       - '.github/workflows/tests.yml'
       - 'pytest.ini'
   pull_request:
@@ -13,6 +16,9 @@ on:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
+      - 'README.rst'
+      - 'dodo.py'
+      - '.pre-commit-config.yaml'
       - '.github/workflows/tests.yml'
       - 'pytest.ini'
   workflow_dispatch:
@@ -47,9 +53,9 @@ jobs:
       run: |
         sudo apt update
         sudo apt install -y ffmpeg libmagic-dev libwebp-dev
-    - name: Check with mypy
+    - name: Run quality checks
       run: |
-        mypy -p efb_telegram_master --ignore-missing-imports
+        doit quality
     - name: Test unit suite
       run: |
         pytest -vv -r a -l --color=yes --mode=unit
