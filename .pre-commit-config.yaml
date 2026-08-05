@@ -16,6 +16,12 @@ repos:
     hooks:
     -   id: rst-linter
         files: README\.rst
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.8
+    hooks:
+    -   id: ruff
+        args: [--select, E9,F821]
+    -   id: ruff-format
 -   repo: local
     hooks:
     -   id: version_bump

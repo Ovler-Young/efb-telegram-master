@@ -597,15 +597,21 @@ class TelegramChannel(MasterChannel):
             self.logger.warning(
                 "MTProto startup is unavailable; MsgLog ingestion remains pending (%s).",
                 type(error).__name__,
+                extra={"event": "telegram_channel.mtproto_start_failed", "error_type": type(error).__name__},
             )
             return
         if not self.mtproto.connected:
-            self.logger.warning("MTProto startup did not establish a connection; MsgLog ingestion remains pending.")
+            self.logger.warning(
+                "MTProto startup did not establish a connection; MsgLog ingestion remains pending.",
+                extra={"event": "telegram_channel.mtproto_disconnected"},
+            )
             return
+        self.logger.info("Resuming pending MsgLog ingestions", extra={"event": "telegram_channel.msglog_resume"})
         self.chat_binding.resume_pending_msglog_ingestions()
 
     async def _telegram_runtime_stopped(self, runtime: TelegramPollingRuntime) -> None:
         await self.mtproto.disconnect()
+        self.logger.info("MTProto disconnected", extra={"event": "telegram_channel.mtproto_stopped"})
 
     def poll(self):
         """
@@ -628,24 +634,32 @@ class TelegramChannel(MasterChannel):
             if now - self.last_poll_confliction_time < self.CONFLICTION_TIMEOUT:
                 msg = self._('Conflicted polling detected. If this error persists, '
                              'please ensure you are running only one instance of this Telegram bot.')
-                self.logger.critical(msg)
+                self.logger.critical(msg, extra={"event": "telegram_channel.polling_conflict"})
                 self.bot_manager.send_message(self.config['admins'][0], msg)
             self.last_poll_confliction_time = now
             return
         if "Invalid server response" in str(error) and not update:
-            self.logger.error("Boom! Telegram API is no good. (Invalid server response.)")
+            self.logger.error("Telegram API returned an invalid server response", extra={"event": "telegram_channel.api_invalid_response"})
             return
         # noinspection PyBroadException
         try:
             raise error
         except telegram.error.Forbidden:
-            self.logger.error("Telegram authorization failure while handling update (%s).", type(error).__name__)
+            self.logger.error(
+                "Telegram authorization failure while handling update (%s).",
+                type(error).__name__,
+                extra={"event": "telegram_channel.authorization_failed", "error_type": type(error).__name__},
+            )
         except telegram.error.BadRequest as e:
             assert isinstance(update, Update)
             if e.message == "Message is not modified" and update.callback_query:
-                self.logger.error("Chill bro, don't click that fast.")
+                self.logger.error("Telegram callback message was not modified", extra={"event": "telegram_channel.callback_not_modified"})
             else:
-                self.logger.exception("Telegram message request failed (%s).", type(error).__name__)
+                self.logger.exception(
+                    "Telegram message request failed (%s).",
+                    type(error).__name__,
+                    extra={"event": "telegram_channel.request_failed", "error_type": type(error).__name__},
+                )
                 self.bot_manager.send_message(self.config['admins'][0],
                                               self._("Message request is invalid.\n{error}\n"
                                                      "<code>{update}</code>").format(
@@ -657,6 +671,11 @@ class TelegramChannel(MasterChannel):
                 "Telegram network error #%d while handling update (%s).",
                 self.timeout_count,
                 type(error).__name__,
+                extra={
+                    "event": "telegram_channel.network_error",
+                    "error_type": type(error).__name__,
+                    "retry_count": self.timeout_count,
+                },
             )
             if isinstance(update, Update) and isinstance(update.message, Message):
                 sync_reply_html(
@@ -689,7 +708,10 @@ class TelegramChannel(MasterChannel):
             old_id = ChatID(str(update.message.chat_id))
             count = 0
             for i in self.db.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, old_id)):
-                self.logger.debug('Migrating slave chat %s from Telegram chat %s to %s.', i, old_id, new_id)
+                self.logger.info(
+                    "Migrating Telegram chat association",
+                    extra={"event": "telegram_channel.chat_migrated", "old_chat_id": str(old_id), "new_chat_id": new_id},
+                )
                 self.db.remove_chat_assoc(slave_uid=i)
                 self.db.add_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, ChatID(str(new_id))), slave_uid=i)
                 count += 1
@@ -711,10 +733,18 @@ class TelegramChannel(MasterChannel):
                             str(update))),
                     parse_mode="HTML")
             except Exception as ex:
-                self.logger.exception("Failed to send error message through Telegram (%s).", type(ex).__name__)
+                self.logger.exception(
+                    "Failed to send error message through Telegram (%s).",
+                    type(ex).__name__,
+                    extra={"event": "telegram_channel.error_notification_failed", "error_type": type(ex).__name__},
+                )
 
             finally:
-                self.logger.error("Unhandled Telegram bot error while handling update (%s).", type(error).__name__)
+                self.logger.error(
+                    "Unhandled Telegram bot error while handling update (%s).",
+                    type(error).__name__,
+                    extra={"event": "telegram_channel.unhandled_error", "error_type": type(error).__name__},
+                )
 
     def _is_stopping(self) -> bool:
         bot_manager = getattr(self, "bot_manager", None)
@@ -762,13 +792,13 @@ class TelegramChannel(MasterChannel):
         if getattr(self, "_stop_polling_called", False):
             return
         self._stop_polling_called = True
-        self.logger.debug("Gracefully stopping %s (%s).", self.channel_name, self.channel_id)
+        self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
         self.rpc_utilities.shutdown()
         self.bot_manager.stop_channel_resources()
         self.telegram_runtime.stop()
         self.master_messages.stop_worker()
         self.db.stop_worker()
-        self.logger.debug("%s (%s) gracefully stopped.", self.channel_name, self.channel_id)
+        self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
 
     def get_chats(self) -> List[Chat]:
         raise EFBOperationNotSupported()

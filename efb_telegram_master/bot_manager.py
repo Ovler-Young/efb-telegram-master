@@ -35,7 +35,7 @@ from .outbound import (
 from .ptb_compat import Filters
 from .rate_limiter import SlidingWindowRateLimiter
 from .utils import TelegramChatID, TelegramMessageID
-from .telegram_runtime import TelegramPollingRuntime
+from .telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 from .utils import normalize_request_kwargs
 
 
@@ -100,7 +100,10 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def exception_filter(cls, exception: Exception):
-            cls.logger.warning("Telegram request failed (%s).", type(exception).__name__)
+            cls.logger.warning(
+                "Telegram request failed",
+                extra={"event": "telegram_bot.request_failed", "error_type": type(exception).__name__},
+            )
             return isinstance(exception, telegram.error.TimedOut)
 
         @classmethod
@@ -133,7 +136,7 @@ class TelegramBotManager(LocaleMixin):
         config = self.channel.config
         self._stopping = threading.Event()
 
-        self.telegram_runtime = TelegramPollingRuntime(
+        self.telegram_runtime = build_telegram_polling_runtime(
             config, channel, self.logger, channel._telegram_runtime_started, channel._telegram_runtime_stopped,
         )
         self._runtime = self.telegram_runtime.async_runtime
@@ -145,14 +148,14 @@ class TelegramBotManager(LocaleMixin):
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
         self._aux_recent_use: dict[int, float] = {}  # chat_id -> timestamp of last aux bot use
-        self.logger.debug("Rate limiter initialized...")
+        self.logger.debug("Rate limiter initialized", extra={"event": "telegram_bot.rate_limiter_initialized"})
 
         # Initialize auxiliary bot pool
         self.bot_pool: Optional[BotPool] = None
         aux_configs = config.get('auxiliary_bots', [])
         if aux_configs:
             self._init_bot_pool(aux_configs, config, channel)
-        self.logger.debug("Bot pool initialization complete...")
+        self.logger.debug("Bot pool initialization complete", extra={"event": "telegram_bot.pool_initialized"})
 
         metrics_top_n, metrics_endpoint = parse_metrics_config(config.get('metrics'), self.logger)
         self._metrics = Metrics(namespace="etm")
@@ -182,11 +185,10 @@ class TelegramBotManager(LocaleMixin):
             )
 
         self.outbound_queue.start()
-        self.logger.debug("Outbound worker initialized...")
+        self.logger.debug("Outbound worker initialized", extra={"event": "telegram_bot.outbound_worker_initialized"})
 
-        self.logger.debug("Adding base dispatchers...")
         self._add_base_dispatchers()
-        self.logger.debug("Base dispatchers added...")
+        self.logger.debug("Base dispatchers added", extra={"event": "telegram_bot.dispatchers_initialized"})
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -336,11 +338,14 @@ class TelegramBotManager(LocaleMixin):
 
         for entry in aux_configs:
             if not isinstance(entry, dict) or not isinstance(entry.get('token'), str):
-                self.logger.warning("Invalid auxiliary_bots entry type %s; skipping.", type(entry).__name__)
+                self.logger.warning(
+                    "Skipping invalid auxiliary bot configuration",
+                    extra={"event": "telegram_bot.auxiliary_configuration_invalid", "entry_type": type(entry).__name__},
+                )
                 continue
             token = entry['token']
             if token in seen_tokens:
-                self.logger.warning("Duplicate bot token in auxiliary_bots, skipping")
+                self.logger.warning("Skipping duplicate auxiliary bot", extra={"event": "telegram_bot.auxiliary_duplicate"})
                 continue
             seen_tokens.add(token)
 
@@ -355,11 +360,14 @@ class TelegramBotManager(LocaleMixin):
             if aux_bot.initialize():
                 aux_bots.append(aux_bot)
             else:
-                self.logger.error("Skipping auxiliary bot with invalid token")
+                self.logger.error("Skipping unavailable auxiliary bot", extra={"event": "telegram_bot.auxiliary_unavailable"})
 
         if aux_bots:
             self.bot_pool = BotPool(aux_bots)
-            self.logger.info("Initialized bot pool with %d auxiliary bot(s)", len(aux_bots))
+            self.logger.info(
+                "Initialized auxiliary bot pool",
+                extra={"event": "telegram_bot.auxiliary_initialized", "bot_count": len(aux_bots)},
+            )
 
     def _enqueue_blocking_api_operation(
         self,
@@ -684,10 +692,12 @@ class TelegramBotManager(LocaleMixin):
     def stop_channel_resources(self) -> None:
         """Stop resources owned by message delivery rather than PTB polling."""
         self._stopping.set()
+        self.logger.info("Stopping Telegram delivery resources", extra={"event": "telegram_bot.stop_started"})
         self.outbound_queue.stop()
         self._stop_metrics_server()
         if self.bot_pool:
             self.bot_pool.shutdown()
+        self.logger.info("Stopped Telegram delivery resources", extra={"event": "telegram_bot.stop_completed"})
 
     def _stop_metrics_server(self) -> None:
         """Stop the serving metrics thread without joining an unstarted thread."""

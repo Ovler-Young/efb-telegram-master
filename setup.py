@@ -16,7 +16,7 @@ long_description = open('README.rst').read()
 
 tests_require = ["pytest", "telethon>=1.44,<1.45", "cryptg", "pytest-dotenv", "flaky",
                  "pytest-asyncio", "mypy>=0.910", "pytest-html", "doit",
-                 "PySocks", "coverage", "sphinx", "pre-commit"]
+                 "PySocks", "coverage", "sphinx", "pre-commit", "ruff==0.12.8"]
 
 setup(
     name='efb-telegram-master',

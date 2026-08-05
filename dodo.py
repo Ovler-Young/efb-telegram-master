@@ -16,10 +16,13 @@ DOIT_CONFIG = {
 def task_quality():
     return {
         "actions": [
+            ["ruff", "check", "--select", "E9,F821", "."],
+            ["ruff", "format", "--check", f"{PACKAGE}/telegram_runtime.py", "tests/unit/test_telegram_runtime.py"],
             ["pre-commit", "run", "check-yaml", "--all-files"],
             ["pre-commit", "run", "rst-linter", "--all-files"],
         ],
-        "file_dep": [".pre-commit-config.yaml", README_BASE],
+        "file_dep": [".pre-commit-config.yaml", README_BASE, "setup.py"],
+        "task_dep": ["mypy", "test"],
     }
 
 
