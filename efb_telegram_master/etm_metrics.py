@@ -138,6 +138,7 @@ class MetricsServer:
     def server_address(self) -> tuple[str, int]:
         return self._server.server_address
 
+
 class Metrics:
     """Expose bounded queue lifecycle metrics and pull-based runtime snapshots."""
 
@@ -481,12 +482,8 @@ def configure_runtime_metrics(
         for auxiliary in bot_pool.bots:
             auxiliary.bind_metrics(metrics)
     metrics.register_outbound_queue_collectors(outbound_queue, top_n)
-    metrics.register_auxiliary_count_collector(
-        bot_pool.auxiliary_count_snapshot if bot_pool else lambda: {"enabled": 0, "disabled": 0}
-    )
-    metrics.register_membership_cache_collector(
-        bot_pool.membership_cache_snapshot if bot_pool else lambda: {"member": 0, "not_member": 0, "unknown_probe_pending": 0}
-    )
+    metrics.register_auxiliary_count_collector(bot_pool.auxiliary_count_snapshot if bot_pool else lambda: {"enabled": 0, "disabled": 0})
+    metrics.register_membership_cache_collector(bot_pool.membership_cache_snapshot if bot_pool else lambda: {"member": 0, "not_member": 0, "unknown_probe_pending": 0})
     metrics.register_rate_limit_occupancy_collector(outbound_queue.rate_limit_occupancy_snapshot)
     if endpoint is None:
         return metrics, None

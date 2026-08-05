@@ -131,9 +131,7 @@ class TelegramAPI:
             required_sender_bot_id = "__main__"
         cleanup_files = getattr(self._cleanup_tls, "pending_cleanup", [])[:]
         self._cleanup_tls.pending_cleanup = []
-        receipt = self._outbound_queue.enqueue_and_wait(
-            QueueRequest(operation, args, queued_kwargs, normalized_chat_id, str(slave_id) if slave_id else None, required_sender_bot_id)
-        )
+        receipt = self._outbound_queue.enqueue_and_wait(QueueRequest(operation, args, queued_kwargs, normalized_chat_id, str(slave_id) if slave_id else None, required_sender_bot_id))
         for path in cleanup_files:
             try:
                 os.unlink(path)
