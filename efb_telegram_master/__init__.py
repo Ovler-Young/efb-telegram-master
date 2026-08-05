@@ -691,7 +691,7 @@ class TelegramChannel(MasterChannel):
                 self.logger.exception("Failed to send error message through Telegram (%s).", type(ex).__name__)
 
             finally:
-                self.logger.exception("Unhandled Telegram bot error while handling update (%s).", type(error).__name__)
+                self.logger.error("Unhandled Telegram bot error while handling update (%s).", type(error).__name__)
 
     def _is_stopping(self) -> bool:
         bot_manager = getattr(self, "bot_manager", None)
