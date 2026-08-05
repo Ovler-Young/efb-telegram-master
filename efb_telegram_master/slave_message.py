@@ -995,28 +995,22 @@ class SlaveMessageProcessor(LocaleMixin):
 
                 file_too_large = self.check_file_size(msg.file)
                 if file_too_large:
-                    if old_msg_id:
-                        self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1], text=file_too_large)
-                    else:
-                        # Send placeholder text first
-                        message = self.bot.send_message(
-                            chat_id=tg_dest,
-                            reply_to_message_id=target_msg_id,
-                            message_thread_id=thread_id,
-                            text=self.html_substitutions(msg),
-                            parse_mode="HTML",
-                            reply_markup=reply_markup,
-                            disable_notification=silent,
-                            prefix=msg_template,
-                            suffix=reactions,
-                            **self._make_send_kwargs(
-                                msg,
-                                mode="blocking",
-                                on_complete=on_db_complete,
-                            ),
-                        )
-                        sync_reply_text(self.bot, message, file_too_large, quote=True)
-                        return message
+                    oversized_message, _ = self._send_oversized_file_notice(
+                        msg,
+                        file_too_large,
+                        tg_dest,
+                        thread_id,
+                        msg_template,
+                        reactions,
+                        self.html_substitutions(msg),
+                        old_msg_id,
+                        target_msg_id,
+                        reply_markup,
+                        silent,
+                        on_db_complete,
+                    )
+                    if oversized_message is not None:
+                        return oversized_message
 
                 try:
                     assert msg.file is not None

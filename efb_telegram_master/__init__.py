@@ -491,6 +491,7 @@ class TelegramChannel(MasterChannel):
         assert isinstance(update.message, Message)
         txt = self._(
             "EFB Telegram Master Channel\n"
+            "/start <token> [true|false]\n"
             "/link\n"
             "    Link a remote chat to an empty Telegram group.\n"
             "    Followed by a regular expression to filter results.\n"
@@ -508,6 +509,8 @@ class TelegramChannel(MasterChannel):
             "/update_info\n"
             "    Update info of linked Telegram group.\n"
             "    Only works in singly linked group where the bot is an admin.\n"
+            "/init_topics\n"
+            "/sync_msglog\n"
             "/rm\n"
             "    Remove the quoted message from its remote chat.\n"
             "/help\n"
