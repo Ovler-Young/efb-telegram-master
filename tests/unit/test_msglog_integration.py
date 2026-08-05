@@ -1,5 +1,7 @@
 import asyncio
+import ast
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from threading import Lock
@@ -13,6 +15,30 @@ from efb_telegram_master.master_message import MasterMessageProcessor
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 from tests.integration import conftest as integration_conftest
+
+
+def test_live_msglog_sync_keeps_polling_running():
+    path = Path(__file__).parents[1] / "integration" / "test_mtproto_live.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    test = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "test_sync_msglog_ingests_unlogged_topic_messages_live"
+    )
+
+    fixture_names = {argument.arg for argument in test.args.args}
+    lifecycle_calls = [
+        node for node in ast.walk(test)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in {"poll_bot", "poll_bot_factory"}
+        and node.func.attr in {"start", "stop"}
+    ]
+
+    assert "poll_bot" in fixture_names
+    assert "poll_bot_factory" not in fixture_names
+    assert lifecycle_calls == []
 
 
 def test_integration_postgres_config_reads_required_environment(monkeypatch):

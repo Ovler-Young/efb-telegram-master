@@ -82,9 +82,9 @@ async def _wait_for_msg_log(channel, master_msg_id, timeout=10):
 
 async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         helper, client, bot_topic_group, channel_with_topic_group_and_mtproto,
-        slave_with_topic_group_and_mtproto, poll_bot_factory, monkeypatch,
+        slave_with_topic_group_and_mtproto, poll_bot, monkeypatch,
 ):
-    """Ingest only test-marked messages after PTB misses their updates."""
+    """Ingest test-marked topic messages that live routing does not log."""
     channel = channel_with_topic_group_and_mtproto
     slave = slave_with_topic_group_and_mtproto
     marker = f"mtproto-msglog-{uuid4().hex}"
@@ -106,7 +106,6 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         anchor_log = await _wait_for_msg_log(channel, anchor_log_id)
         assert anchor_log.provenance == "live"
 
-        poll_bot_factory.stop(channel)
         first = await client.send_message(
             bot_topic_group, f"{marker}-first", reply_to=topic_message.id,
         )
@@ -117,12 +116,20 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         source_ids = [first.id, second.id]
         source_log_ids = [utils.message_id_to_str(bot_topic_group, message_id) for message_id in source_ids]
         logged_message_ids.extend(source_log_ids)
+
+        routed_messages = []
+        for _ in source_ids:
+            routed_message = await asyncio.to_thread(slave.messages.get, True, 10)
+            slave.messages.task_done()
+            routed_messages.append(routed_message)
+        assert {message.text for message in routed_messages} == {
+            f"{marker}-first", f"{marker}-second",
+        }
         assert all(channel.db.get_msg_log(master_msg_id=message_id) is None for message_id in source_log_ids)
 
         scan_boundary = max(source_ids)
         channel.mtproto.config = replace(channel.mtproto.config, scan_ceiling=scan_boundary)
         monkeypatch.setattr(MsgLogIngestionService, "EXISTING_STREAK_LIMIT", 1)
-        poll_bot_factory.start(channel)
 
         command = await client.send_message(
             bot_topic_group, "/sync_msglog", reply_to=topic_message.id,
