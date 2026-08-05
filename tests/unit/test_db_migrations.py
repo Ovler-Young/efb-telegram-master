@@ -11,18 +11,24 @@ from efb_telegram_master.db import DatabaseManager, MsgLog, MsgLogIngestionScan,
 from efb_telegram_master.msg_type import TGMsgType
 
 
-def test_fresh_database_defines_msglog_provenance_and_ingestion_scan(tmp_path, monkeypatch):
+def test_database_restart_retains_msglog_provenance_and_ingestion_scan(tmp_path, monkeypatch):
     original_database = database.obj
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    manager = DatabaseManager(SimpleNamespace(channel_id="tests.fresh", config={}))
+    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.fresh", config={}))
+    second_manager = None
     try:
+        first_manager.stop_worker()
+        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.fresh", config={}))
         msglog_columns = {column.name for column in database.get_columns("msglog")}
         scan_columns = {column.name for column in database.get_columns("msglogingestionscan")}
+        defaults = {column.name: column.default for column in database.get_columns("msglog")}
     finally:
-        manager.stop_worker()
+        if second_manager is not None:
+            second_manager.stop_worker()
         database.initialize(original_database)
 
     assert "provenance" in msglog_columns
+    assert defaults["provenance"] == "'live'"
     assert {"source_chat_id", "cursor", "lease_owner", "existing_streak"}.issubset(scan_columns)
 
 
