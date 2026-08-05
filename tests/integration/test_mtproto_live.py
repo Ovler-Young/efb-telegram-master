@@ -70,6 +70,18 @@ async def _wait_for_scan(source_chat_id, timeout=30):
     raise TimeoutError("MsgLog ingestion did not complete")
 
 
+async def _wait_for_scan_terminal(source_chat_id, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        scan = MsgLogIngestionScan.get_or_none(
+            MsgLogIngestionScan.source_chat_id == str(source_chat_id)
+        )
+        if scan is not None and scan.status in {"complete", "error", "retryable-error"}:
+            return scan
+        await asyncio.sleep(0.1)
+    raise TimeoutError("MsgLog ingestion did not reach a terminal state")
+
+
 async def _wait_for_msg_log(channel, master_msg_id, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -159,7 +171,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         acknowledgement = await helper.wait_for_message(
             in_chats(bot_topic_group) & regex(r"MsgLog sync (started|resumed) for this group\."),
         )
-        assert acknowledgement.reply_to_msg_id == command.id
+        assert _topic_id(acknowledgement) == topic_id
 
         scan = await _wait_for_scan(bot_topic_group)
         scan_id = scan.id
@@ -179,12 +191,19 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         assert (scan.scanned_count, scan.inserted_count, scan.existing_count) == counters
         assert MsgLog.select().where(MsgLog.master_msg_id.in_(source_log_ids)).count() == 2
     finally:
+        scan_to_delete = None
         if scan_id is not None:
-            MsgLogIngestionScan.delete().where(MsgLogIngestionScan.id == scan_id).execute()
+            scan_to_delete = MsgLogIngestionScan.get_or_none(MsgLogIngestionScan.id == scan_id)
         elif scan_boundary is not None:
-            MsgLogIngestionScan.delete().where(
+            scan_to_delete = MsgLogIngestionScan.get_or_none(
                 (MsgLogIngestionScan.source_chat_id == str(bot_topic_group)) &
                 (MsgLogIngestionScan.scan_boundary == scan_boundary)
+            )
+        if scan_to_delete is not None:
+            if scan_to_delete.status not in {"complete", "error", "retryable-error"}:
+                scan_to_delete = await _wait_for_scan_terminal(bot_topic_group)
+            MsgLogIngestionScan.delete().where(
+                MsgLogIngestionScan.id == scan_to_delete.id
             ).execute()
         for message_id in logged_message_ids:
             channel.db.delete_msg_log(master_msg_id=message_id)

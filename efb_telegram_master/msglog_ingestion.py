@@ -106,6 +106,8 @@ class MsgLogIngestionService:
         if reply_to is None or not getattr(reply_to, "forum_topic", False):
             return "not-topic", None, None
         topic_id = getattr(reply_to, "reply_to_top_id", None)
+        if topic_id is None:
+            topic_id = getattr(reply_to, "reply_to_msg_id", None)
         if isinstance(topic_id, bool) or not isinstance(topic_id, int) or topic_id <= 1:
             return "general-topic", None, None
         slave_uid = self.db.get_topic_assoc_slave_uid(source_chat_id, topic_id)

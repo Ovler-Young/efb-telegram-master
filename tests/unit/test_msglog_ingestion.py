@@ -75,12 +75,16 @@ class FakeMTProto:
         return [self.messages[message_id] for message_id in message_ids if message_id in self.messages]
 
 
-def topic_message(message_id, *, topic_id=10, media=None, date=None):
+def topic_message(message_id, *, topic_id=10, media=None, date=None, topic_root=False):
     return SimpleNamespace(
         id=message_id,
         message=f"message {message_id}",
         date=date,
-        reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=topic_id),
+        reply_to=SimpleNamespace(
+            forum_topic=True,
+            reply_to_top_id=None if topic_root else topic_id,
+            reply_to_msg_id=topic_id if topic_root else None,
+        ),
         action=None,
         media=media,
     )
@@ -100,6 +104,41 @@ def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
         (205, "tests.slave"), (104, "tests.slave"), (4, "tests.slave"),
     ]
     assert db.scan.status == "complete"
+
+
+def test_ingestion_maps_topic_root_message_from_reply_to_message_id():
+    db = FakeDatabase(scan_boundary=20)
+    mtproto = FakeMTProto(
+        {20: topic_message(20, topic_id=10, topic_root=True)},
+        scan_ceiling=20,
+    )
+
+    asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
+
+    _, classification, slave_uid, content = db.persisted[0]
+    assert classification == "eligible"
+    assert slave_uid == "tests.slave"
+    assert content.text == "message 20"
+
+
+def test_ingestion_does_not_map_ordinary_reply_to_message_id_as_topic():
+    db = FakeDatabase(scan_boundary=20)
+    message = SimpleNamespace(
+        id=20,
+        message="ordinary reply",
+        reply_to=SimpleNamespace(
+            forum_topic=False,
+            reply_to_top_id=None,
+            reply_to_msg_id=10,
+        ),
+        action=None,
+        media=None,
+    )
+    mtproto = FakeMTProto({20: message}, scan_ceiling=20)
+
+    asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
+
+    assert db.persisted[0][1:] == ("not-topic", None, None)
 
 
 def test_ingestion_skips_are_neutral_and_existing_streak_completes_at_500():
