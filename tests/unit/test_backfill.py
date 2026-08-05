@@ -346,7 +346,7 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
             events.append(("wait", self.entry_id))
 
     def enqueue_history_operation(**kwargs):
-        entry_id = kwargs["history_entry_ids"][0]
+        entry_id = len(events) // 2 + 1
         events.append(("enqueue", entry_id))
         return Waiter(entry_id)
 
@@ -357,8 +357,6 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
     manager.db.get_recent_messages.assert_not_called()
     manager.bot.enqueue_history_operation.assert_has_calls([
         call(
-            source_key="tests.mocks.slave.chat",
-            target_chat_id=12345,
             operation="send_message",
             args=(),
             kwargs={
@@ -367,11 +365,8 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
                 "parse_mode": "Markdown",
                 "disable_notification": True,
             },
-            history_entry_ids=[1],
         ),
         call(
-            source_key="tests.mocks.slave.chat",
-            target_chat_id=12345,
             operation="send_message",
             args=(),
             kwargs={
@@ -380,11 +375,8 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
                 "parse_mode": "Markdown",
                 "disable_notification": True,
             },
-            history_entry_ids=[2],
         ),
         call(
-            source_key="tests.mocks.slave.chat",
-            target_chat_id=12345,
             operation="copy_message",
             args=(),
             kwargs={
@@ -393,7 +385,6 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
                 "message_id": 22,
                 "disable_notification": True,
             },
-            history_entry_ids=[3],
         ),
     ])
     assert events == [

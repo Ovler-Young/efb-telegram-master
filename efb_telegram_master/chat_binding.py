@@ -1634,12 +1634,9 @@ class ChatBindingManager(LocaleMixin):
             completed_call_count = 0
             try:
                 waiter = self.bot.enqueue_history_operation(
-                    source_key=str(slave_chat_id),
-                    target_chat_id=tg_chat_id,
                     operation=operation,
                     args=(),
                     kwargs=kwargs,
-                    history_entry_ids=[entry.id],
                 )
                 waiter.result()
                 completed_call_count += 1

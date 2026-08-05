@@ -12,7 +12,7 @@ import telegram.error
 from telegram.request import HTTPXRequest
 
 if TYPE_CHECKING:
-    from .bot_manager import AsyncTelegramRuntime, SyncBotFacade
+    from .telegram_runtime import AsyncTelegramRuntime, SyncBotFacade
 
 logger = logging.getLogger(__name__)
 
@@ -276,7 +276,7 @@ class AuxiliaryBot:
 
     def bind_runtime(self, runtime: 'AsyncTelegramRuntime') -> None:
         """Bind the runtime-backed sync facade used by the rest of ETM."""
-        from .bot_manager import SyncBotFacade
+        from .telegram_runtime import SyncBotFacade
 
         self._runtime = runtime
         self.bot = SyncBotFacade(self.async_bot, runtime)

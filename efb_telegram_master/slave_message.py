@@ -34,7 +34,6 @@ from ehforwarderbot.message import LinkAttribute, LocationAttribute, MessageComm
 from ehforwarderbot.status import ChatUpdates, MemberUpdates, MessageRemoval, MessageReactionsUpdate
 from ehforwarderbot.types import MessageID
 from . import utils
-from .bot_manager import QueuedDbLogContext
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import ETMCommandMsgStorage
@@ -367,27 +366,13 @@ class SlaveMessageProcessor(LocaleMixin):
             self._release_pending_slave_message(dedupe_key)
             return
 
-        if hasattr(tg_msg, '_queued_execution_pending') and tg_msg._queued_execution_pending:
-            self.logger.debug("[%s] Message execution is queued (task_id: %s), deferring database logging.",
-                              xid, getattr(tg_msg, 'task_id', 'unknown'))
-
-            if not hasattr(tg_msg, 'task_id'):
-                self.logger.warning("[%s] Queued message missing task_id, cannot track database update", xid)
-                self._release_pending_slave_message(dedupe_key)
-        elif not getattr(tg_msg, 'durable_db_logged', False):
-            # Normal (blocking) execution: send already succeeded, then
-            # write the DB mapping once. DB failures are logged only.
-            self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
-                              xid, tg_msg.chat.id, tg_msg.message_id)
-
-            etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
-
-            sender_bot_id = getattr(tg_msg, 'sender_bot_id', None)
-
-            self.bot.write_db_mapping(
-                etm_msg, tg_msg, database_old_msg_id or old_msg_id,
-                sender_bot_id=sender_bot_id, on_complete=on_db_complete,
-            )
+        self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
+                          xid, tg_msg.chat.id, tg_msg.message_id)
+        etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
+        self.bot.write_db_mapping(
+            etm_msg, tg_msg, database_old_msg_id or old_msg_id,
+            sender_bot_id=getattr(tg_msg, 'sender_bot_id', None), on_complete=on_db_complete,
+        )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
         """Get the Telegram destination of a message with its header.
@@ -450,9 +435,6 @@ class SlaveMessageProcessor(LocaleMixin):
                         tg_dest,
                         thread_id,
                     )
-                    if thread_id is not None and existing_thread_id is None:
-                        msg.vendor_specific = msg.vendor_specific or {}
-                        msg.vendor_specific['_force_send_mode'] = 'blocking'
 
         if not tg_chat:
             singly_linked = False
@@ -496,27 +478,10 @@ class SlaveMessageProcessor(LocaleMixin):
                           *,
                           mode: Optional[str] = None,
                           on_complete: object = _NO_DB_CALLBACK) -> dict:
-        if mode is not None:
-            send_mode = mode
-        else:
-            force_send_mode = (msg.vendor_specific or {}).get('_force_send_mode')
-            if force_send_mode in {'blocking', 'eventual'}:
-                send_mode = force_send_mode
-            elif old_msg_id is not None or msg.commands:
-                send_mode = 'blocking'
-            else:
-                send_mode = 'eventual'
+        del old_msg_id, mode, on_complete
         kwargs: dict[str, object] = {
-            '_send_mode': send_mode,
             '_slave_id': utils.chat_id_to_str(chat=msg.chat),
         }
-        if on_complete is not self._NO_DB_CALLBACK:
-            db_on_complete = cast(Optional[Callable[[], None]], on_complete)
-            kwargs['_queued_db_log_context'] = QueuedDbLogContext(
-                ETMMsg.from_efbmsg(msg, self.chat_manager),
-                old_msg_id,
-                db_on_complete,
-            )
         return kwargs
 
     @classmethod
@@ -569,14 +534,14 @@ class SlaveMessageProcessor(LocaleMixin):
                                               message_thread_id=thread_id,
                                               reply_markup=reply_markup,
                                               disable_notification=silent,
-                                              _send_mode="blocking")
+                                              )
             return self.bot.send_photo(tg_dest, file, prefix=msg_template, suffix=reactions,
                                        caption=text, parse_mode="HTML",
                                        reply_to_message_id=target_msg_id,
                                        message_thread_id=thread_id,
                                        reply_markup=reply_markup,
                                        disable_notification=silent,
-                                       _send_mode="blocking")
+                                       )
         finally:
             placeholder.close()
             self._cleanup_pending_local_api_files()
@@ -1517,7 +1482,6 @@ class SlaveMessageProcessor(LocaleMixin):
         if telegram_origin and not old_msg_db.master_msg_id_alt:
             old_msg.edit = False
             old_msg.vendor_specific = old_msg.vendor_specific or {}
-            old_msg.vendor_specific['_force_send_mode'] = 'blocking'
             self.dispatch_message(
                 old_msg, msg_template, None, tg_dest, thread_id,
                 database_old_msg_id=(chat_id, msg_id), target_msg_id_override=msg_id,
@@ -1538,7 +1502,6 @@ class SlaveMessageProcessor(LocaleMixin):
             )
             old_msg.edit = False
             old_msg.vendor_specific = old_msg.vendor_specific or {}
-            old_msg.vendor_specific['_force_send_mode'] = 'blocking'
             self.dispatch_message(
                 old_msg, msg_template, None, primary_chat_id, thread_id,
                 database_old_msg_id=(chat_id, msg_id), target_msg_id_override=primary_msg_id,
