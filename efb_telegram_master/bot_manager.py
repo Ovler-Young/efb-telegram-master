@@ -100,10 +100,7 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def exception_filter(cls, exception: Exception):
-            cls.logger.warning(
-                "Telegram request failed",
-                extra={"event": "telegram_bot.request_failed", "error_type": type(exception).__name__},
-            )
+            cls.logger.warning("Telegram request failed", extra={"event": "telegram_bot.request_failed", "error_type": type(exception).__name__})
             return isinstance(exception, telegram.error.TimedOut)
 
         @classmethod
@@ -338,10 +335,7 @@ class TelegramBotManager(LocaleMixin):
 
         for entry in aux_configs:
             if not isinstance(entry, dict) or not isinstance(entry.get('token'), str):
-                self.logger.warning(
-                    "Skipping invalid auxiliary bot configuration",
-                    extra={"event": "telegram_bot.auxiliary_configuration_invalid", "entry_type": type(entry).__name__},
-                )
+                self.logger.warning("Skipping invalid auxiliary bot configuration", extra={"event": "telegram_bot.auxiliary_configuration_invalid", "entry_type": type(entry).__name__})
                 continue
             token = entry['token']
             if token in seen_tokens:
@@ -364,10 +358,7 @@ class TelegramBotManager(LocaleMixin):
 
         if aux_bots:
             self.bot_pool = BotPool(aux_bots)
-            self.logger.info(
-                "Initialized auxiliary bot pool",
-                extra={"event": "telegram_bot.auxiliary_initialized", "bot_count": len(aux_bots)},
-            )
+            self.logger.info("Initialized auxiliary bot pool", extra={"event": "telegram_bot.auxiliary_initialized", "bot_count": len(aux_bots)})
 
     def _enqueue_blocking_api_operation(
         self,
