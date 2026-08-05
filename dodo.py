@@ -10,7 +10,7 @@ README_BASE = "./README.rst"
 DEFAULT_BUMP_MODE = "patch"
 # major, minor, patch, alpha, beta, dev, post
 DOIT_CONFIG = {
-    "default_tasks": ["quality"]
+    "default_tasks": ["quality", "test"]
 }
 
 
@@ -19,11 +19,9 @@ def task_quality():
         "actions": [
             ["ruff", "check", *QUALITY_PATHS],
             ["ruff", "format", "--check", *QUALITY_PATHS],
-            ["pre-commit", "run", "check-yaml", "--all-files"],
-            ["pre-commit", "run", "rst-linter", "--all-files"],
         ],
         "file_dep": [".pre-commit-config.yaml", "pyproject.toml", README_BASE, "setup.py"],
-        "task_dep": ["mypy", "test"],
+        "task_dep": ["mypy"],
     }
 
 

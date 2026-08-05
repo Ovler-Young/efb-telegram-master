@@ -83,7 +83,6 @@ class TelegramBotManager(LocaleMixin):
     bot_pool: Optional["BotPool"]
     _stopping: threading.Event
     _cleanup_tls: threading.local
-    _aux_recent_use: dict[int, float]
 
     class Decorators:
         logger = logging.getLogger(__name__)
@@ -93,7 +92,14 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def exception_filter(cls, exception: Exception):
-            cls.logger.warning("Telegram request failed", extra={"event": "telegram_bot.request_failed", "error_type": type(exception).__name__})
+            cls.logger.warning(
+                "Telegram request failed",
+                extra={
+                    "event": "telegram_bot.request_failed",
+                    "error_type": type(exception).__name__,
+                    "error_message": str(exception)[:200],
+                },
+            )
             return isinstance(exception, telegram.error.TimedOut)
 
         @classmethod
@@ -141,7 +147,6 @@ class TelegramBotManager(LocaleMixin):
         self.dispatcher = self.application
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
-        self._aux_recent_use: dict[int, float] = {}  # chat_id -> timestamp of last aux bot use
         self.logger.debug("Rate limiter initialized", extra={"event": "telegram_bot.rate_limiter_initialized"})
 
         # Initialize auxiliary bot pool
@@ -434,25 +439,6 @@ class TelegramBotManager(LocaleMixin):
         )
 
     @Decorators.retry_on_chat_migration
-    def send_audio(self, *args, **kwargs):
-        """
-        Send an audio file.
-
-        Takes exactly same parameters as telegram.bot.send_audio,
-        plus the following.
-
-        Fallback to document when failed to send.
-
-        Args:
-            prefix (str, optional): Prefix of the caption. Default: ""
-            suffix (str, optional): Suffix of the caption. Default: ""
-
-        Returns:
-            telegram.Message
-        """
-        return self._route_affixed_queued_operation("send_audio", args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
-
-    @Decorators.retry_on_chat_migration
     def send_voice(self, *args, **kwargs):
         """
         Send an voice message.
@@ -542,10 +528,6 @@ class TelegramBotManager(LocaleMixin):
         return self._route_affixed_queued_operation("send_photo", args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @Decorators.retry_on_chat_migration
-    def send_media_group(self, *args, **kwargs):
-        return self._route_queued_operation("send_media_group", args, kwargs, eventual_capable=True)
-
-    @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
         queued_kwargs = dict(kwargs)
         message_thread_id = queued_kwargs.pop("message_thread_id", None)
@@ -566,16 +548,8 @@ class TelegramBotManager(LocaleMixin):
         return self._enqueue_main_chat_mutation("send_location", args, kwargs)
 
     @Decorators.retry_on_chat_migration
-    def send_venue(self, *args, **kwargs):
-        return self._enqueue_main_chat_mutation("send_venue", args, kwargs)
-
-    @Decorators.retry_on_chat_migration
     def send_sticker(self, *args, **kwargs):
         return self._route_queued_operation("send_sticker", args, kwargs, eventual_capable=True)
-
-    @Decorators.retry_on_chat_migration
-    def forward_message(self, *args, **kwargs):
-        return self._route_queued_operation("forward_message", args, kwargs, eventual_capable=True)
 
     @Decorators.retry_on_chat_migration
     def copy_message(self, *args, **kwargs):

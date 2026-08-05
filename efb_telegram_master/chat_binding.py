@@ -45,6 +45,10 @@ if TYPE_CHECKING:
 __all__ = ["ChatBindingManager"]
 
 
+def _bounded_error_message(error: BaseException) -> str:
+    return str(error)[:200]
+
+
 class ChatListStorage:
     """
     Storage for list of chats displayed in a message as inline buttons.
@@ -628,8 +632,16 @@ class ChatBindingManager(LocaleMixin):
             else:
                 try:
                     self._update_single_topic_info(TelegramChatID(tg_chat_to_link.id), thread_id, chat_uid)
-                except Exception as e:
-                    self.logger.warning("Auto update group info failed for %s (%s).", chat_uid, type(e).__name__)
+                except Exception as error:
+                    self.logger.warning(
+                        "Auto update group info failed for %s.",
+                        chat_uid,
+                        extra={
+                            "event": "chat_binding.link_topic_info_failed",
+                            "error_type": type(error).__name__,
+                            "error_message": _bounded_error_message(error),
+                        },
+                    )
 
         txt = self._("Chat {0} is now linked.").format(chat_display_name)
         self.bot.edit_message_text(
@@ -656,8 +668,16 @@ class ChatBindingManager(LocaleMixin):
         if do_backfill:
             try:
                 self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
-            except Exception as e:
-                self.logger.warning("History migration failed for %s (%s).", chat_uid, type(e).__name__)
+            except Exception as error:
+                self.logger.warning(
+                    "History migration failed for %s.",
+                    chat_uid,
+                    extra={
+                        "event": "chat_binding.link_history_migration_failed",
+                        "error_type": type(error).__name__,
+                        "error_message": _bounded_error_message(error),
+                    },
+                )
                 try:
                     notice_kwargs = {"chat_id": tg_chat_to_link.id, "text": self._("⚠️ History backfill failed, but the chat is linked."), "disable_notification": True}
                     if thread_id:
@@ -692,8 +712,16 @@ class ChatBindingManager(LocaleMixin):
                 kwargs["message_thread_id"] = thread_id
             self.bot.send_message(**kwargs)
 
-        except Exception as e:
-            self.logger.warning("Failed to send history link for %s (%s).", slave_chat_id, type(e).__name__)
+        except Exception as error:
+            self.logger.warning(
+                "Failed to send history link for %s.",
+                slave_chat_id,
+                extra={
+                    "event": "chat_binding.link_history_link_failed",
+                    "error_type": type(error).__name__,
+                    "error_message": _bounded_error_message(error),
+                },
+            )
 
     def unlink_all(self, update: Update, context: CallbackContext):
         """
@@ -1406,8 +1434,16 @@ class ChatBindingManager(LocaleMixin):
                     self._process_pending_history_migrations_locked()
             finally:
                 self._history_migration_lock.release()
-        except Exception as e:
-            self.logger.error("History migration failed for %s (%s).", slave_chat_id, type(e).__name__)
+        except Exception as error:
+            self.logger.error(
+                "History migration failed for %s.",
+                slave_chat_id,
+                extra={
+                    "event": "chat_binding.history_migration_failed",
+                    "error_type": type(error).__name__,
+                    "error_message": _bounded_error_message(error),
+                },
+            )
 
     def _queue_history_migration_entries(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None) -> int:
         recent_messages = self.db.get_recent_messages(slave_chat_id, limit=0)
@@ -1532,10 +1568,14 @@ class ChatBindingManager(LocaleMixin):
         error: BaseException,
     ) -> None:
         self.logger.warning(
-            "History migration entry %d retained after %d completed calls (%s).",
+            "History migration entry %d retained after %d completed calls.",
             entry_id,
             completed_call_count,
-            type(error).__name__,
+            extra={
+                "event": "chat_binding.history_migration_entry_failed",
+                "error_type": type(error).__name__,
+                "error_message": _bounded_error_message(error),
+            },
         )
 
     @staticmethod

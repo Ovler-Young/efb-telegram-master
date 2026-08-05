@@ -1,5 +1,3 @@
-from unittest.mock import patch
-
 import pytest
 
 pytestmark = pytest.mark.asyncio
@@ -30,11 +28,10 @@ async def test_auxiliary_bot_pool_initializes(channel_with_auxiliary_bots, aux_b
 
 
 @pytest.mark.xfail(strict=False, reason="Depends on live Telegram throttling characteristics")
-async def test_auxiliary_bot_sender_id_can_be_recorded(channel_with_auxiliary_bots, slave_with_auxiliary_bots):
+async def test_auxiliary_bot_sender_id_can_be_recorded(poll_bot, channel_with_auxiliary_bots, slave_with_auxiliary_bots):
     chat = slave_with_auxiliary_bots.chat_with_alias
 
-    with patch.object(channel_with_auxiliary_bots.bot_manager, "_calculate_rate_limit_delay", return_value=(1.0, 0, 0)):
-        slave_with_auxiliary_bots.send_text_message(chat, chat.other)
+    slave_with_auxiliary_bots.send_text_message(chat, chat.other)
 
     recent = channel_with_auxiliary_bots.db.get_last_message(chat.channel_id + "." + chat.uid)
     assert recent is not None

@@ -467,6 +467,40 @@ class SlaveMessageProcessor(LocaleMixin):
         }
         return kwargs
 
+    def _send_oversized_file_notice(
+        self,
+        msg: Message,
+        file_too_large: str,
+        tg_dest: TelegramChatID,
+        thread_id: Optional[TelegramTopicID],
+        msg_template: str,
+        reactions: str,
+        text: str,
+        old_msg_id: Optional[OldMsgID],
+        target_msg_id: Optional[TelegramMessageID],
+        reply_markup: Optional[ReplyMarkup],
+        silent: Optional[bool],
+        on_db_complete: Optional[Callable[[], None]],
+    ) -> tuple[Optional[telegram.Message], bool]:
+        if old_msg_id:
+            self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1], text=file_too_large)
+            return None, False
+
+        message = self.bot.send_message(
+            chat_id=tg_dest,
+            reply_to_message_id=target_msg_id,
+            message_thread_id=thread_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_notification=silent,
+            prefix=msg_template,
+            suffix=reactions,
+            **self._make_send_kwargs(msg, mode="blocking", on_complete=on_db_complete),
+        )
+        sync_reply_text(self.bot, message, file_too_large, quote=True)
+        return message, msg.edit_media
+
     @classmethod
     def _remote_image_url(cls, msg: Message) -> Optional[str]:
         url = (msg.vendor_specific or {}).get(cls.REMOTE_IMAGE_URL_VENDOR_KEY)
@@ -766,29 +800,11 @@ class SlaveMessageProcessor(LocaleMixin):
             file_too_large = self.check_file_size(msg_file)
             edit_media = msg.edit_media
             if file_too_large:
-                if old_msg_id:
-                    if msg.edit_media:
-                        edit_media = False
-                    self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1], text=file_too_large)
-                else:
-                    message = self.bot.send_message(
-                        chat_id=tg_dest,
-                        reply_to_message_id=target_msg_id,
-                        message_thread_id=thread_id,
-                        text=text,
-                        parse_mode="HTML",
-                        reply_markup=reply_markup,
-                        disable_notification=silent,
-                        prefix=msg_template,
-                        suffix=reactions,
-                        **self._make_send_kwargs(
-                            msg,
-                            mode="blocking",
-                            on_complete=on_db_complete,
-                        ),
-                    )
-                    sync_reply_text(self.bot, message, file_too_large, quote=True)
-                    return message
+                oversized_message, edit_media = self._send_oversized_file_notice(
+                    msg, file_too_large, tg_dest, thread_id, msg_template, reactions, text, old_msg_id, target_msg_id, reply_markup, silent, on_db_complete
+                )
+                if oversized_message is not None:
+                    return oversized_message
 
             if old_msg_id:
                 try:
@@ -897,29 +913,11 @@ class SlaveMessageProcessor(LocaleMixin):
             file_too_large = self.check_file_size(msg.file)
             edit_media = msg.edit_media
             if file_too_large:
-                if old_msg_id:
-                    if msg.edit_media:
-                        edit_media = False
-                    self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1], text=file_too_large)
-                else:
-                    message = self.bot.send_message(
-                        chat_id=tg_dest,
-                        reply_to_message_id=target_msg_id,
-                        message_thread_id=thread_id,
-                        text=text,
-                        parse_mode="HTML",
-                        reply_markup=reply_markup,
-                        disable_notification=silent,
-                        prefix=msg_template,
-                        suffix=reactions,
-                        **self._make_send_kwargs(
-                            msg,
-                            mode="blocking",
-                            on_complete=on_db_complete,
-                        ),
-                    )
-                    sync_reply_text(self.bot, message, file_too_large, quote=True)
-                    return message
+                oversized_message, edit_media = self._send_oversized_file_notice(
+                    msg, file_too_large, tg_dest, thread_id, msg_template, reactions, text, old_msg_id, target_msg_id, reply_markup, silent, on_db_complete
+                )
+                if oversized_message is not None:
+                    return oversized_message
 
             if old_msg_id:
                 edit_kwargs = self._get_edit_kwargs(msg)
@@ -1157,29 +1155,11 @@ class SlaveMessageProcessor(LocaleMixin):
             file_too_large = self.check_file_size(msg.file)
             edit_media = msg.edit_media
             if file_too_large:
-                if old_msg_id:
-                    if msg.edit_media:
-                        edit_media = False
-                    self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1], text=file_too_large)
-                else:
-                    message = self.bot.send_message(
-                        chat_id=tg_dest,
-                        reply_to_message_id=target_msg_id,
-                        message_thread_id=thread_id,
-                        text=text,
-                        parse_mode="HTML",
-                        reply_markup=reply_markup,
-                        disable_notification=silent,
-                        prefix=msg_template,
-                        suffix=reactions,
-                        **self._make_send_kwargs(
-                            msg,
-                            mode="blocking",
-                            on_complete=on_db_complete,
-                        ),
-                    )
-                    sync_reply_text(self.bot, message, file_too_large, quote=True)
-                    return message
+                oversized_message, edit_media = self._send_oversized_file_notice(
+                    msg, file_too_large, tg_dest, thread_id, msg_template, reactions, text, old_msg_id, target_msg_id, reply_markup, silent, on_db_complete
+                )
+                if oversized_message is not None:
+                    return oversized_message
 
             if old_msg_id:
                 edit_kwargs = self._get_edit_kwargs(msg)
@@ -1236,29 +1216,11 @@ class SlaveMessageProcessor(LocaleMixin):
             file_too_large = self.check_file_size(msg.file)
             edit_media = msg.edit_media
             if file_too_large:
-                if old_msg_id:
-                    if msg.edit_media:
-                        edit_media = False
-                    self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1], text=file_too_large)
-                else:
-                    message = self.bot.send_message(
-                        chat_id=tg_dest,
-                        reply_to_message_id=target_msg_id,
-                        message_thread_id=thread_id,
-                        text=text,
-                        parse_mode="HTML",
-                        reply_markup=reply_markup,
-                        disable_notification=silent,
-                        prefix=msg_template,
-                        suffix=reactions,
-                        **self._make_send_kwargs(
-                            msg,
-                            mode="blocking",
-                            on_complete=on_db_complete,
-                        ),
-                    )
-                    sync_reply_text(self.bot, message, file_too_large, quote=True)
-                    return message
+                oversized_message, edit_media = self._send_oversized_file_notice(
+                    msg, file_too_large, tg_dest, thread_id, msg_template, reactions, text, old_msg_id, target_msg_id, reply_markup, silent, on_db_complete
+                )
+                if oversized_message is not None:
+                    return oversized_message
 
             if old_msg_id:
                 if edit_media:
@@ -1375,29 +1337,11 @@ class SlaveMessageProcessor(LocaleMixin):
             file_too_large = self.check_file_size(msg.file)
             edit_media = msg.edit_media
             if file_too_large:
-                if old_msg_id:
-                    if msg.edit_media:
-                        edit_media = False
-                    self.bot.send_message(chat_id=old_msg_id[0], reply_to_message_id=old_msg_id[1], text=file_too_large)
-                else:
-                    message = self.bot.send_message(
-                        chat_id=tg_dest,
-                        reply_to_message_id=target_msg_id,
-                        message_thread_id=thread_id,
-                        text=text,
-                        parse_mode="HTML",
-                        reply_markup=reply_markup,
-                        disable_notification=silent,
-                        prefix=msg_template,
-                        suffix=reactions,
-                        **self._make_send_kwargs(
-                            msg,
-                            mode="blocking",
-                            on_complete=on_db_complete,
-                        ),
-                    )
-                    sync_reply_text(self.bot, message, file_too_large, quote=True)
-                    return message
+                oversized_message, edit_media = self._send_oversized_file_notice(
+                    msg, file_too_large, tg_dest, thread_id, msg_template, reactions, text, old_msg_id, target_msg_id, reply_markup, silent, on_db_complete
+                )
+                if oversized_message is not None:
+                    return oversized_message
 
             if old_msg_id:
                 edit_kwargs = self._get_edit_kwargs(msg)

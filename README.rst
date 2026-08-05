@@ -231,15 +231,18 @@ specific sender to an empty group for a more organized conversation.
 In a nutshell, ETM offers the following commands, you can also send it
 to BotFather for a command list::
 
-    help - Show commands list.
-    link - Link a remote chat to a group.
-    unlink_all - Unlink all remote chats from a group.
-    info - Display information of the current Telegram chat.
-    chat - Generate a chat head.
-    extra - Access additional features from Slave Channels.
-    update_info - Update info of linked Telegram group.
-    react - Send a reaction to a message, or show a list of reactors.
-    rm - Remove a message from its remote chat.
+    /help - Show commands list.
+    /link - Link a remote chat to a group.
+    /unlink_all - Unlink all remote chats from a group.
+    /info - Display information of the current Telegram chat.
+    /chat - Generate a chat head.
+    /list - List remote chats.
+    /extra - Access additional features from Slave Channels.
+    /update_info - Update info of linked Telegram group.
+    /init_topics - Create missing topics for existing forum links.
+    /sync_msglog - Ingest mapped MsgLog records from a bound forum group.
+    /react - Send a reaction to a message, or show a list of reactors.
+    /rm - Remove a message from its remote chat.
 
 .. note::
 
