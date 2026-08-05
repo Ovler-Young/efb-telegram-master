@@ -7,12 +7,9 @@ import logging
 import threading
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from .auxiliary_bot import AuxiliaryBot
-
-if TYPE_CHECKING:
-    from .bot_manager import TelegramBotManager
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +17,9 @@ logger = logging.getLogger(__name__)
 class BotPool:
     """Keep auxiliary membership probes and best-effort slave affinity in memory."""
 
-    def __init__(self, aux_bots: list[AuxiliaryBot], bot_manager: 'TelegramBotManager') -> None:
+    def __init__(self, aux_bots: list[AuxiliaryBot]) -> None:
         self._bots = aux_bots
         self._bot_by_id = {bot.bot_id: bot for bot in aux_bots}
-        self._bot_manager = bot_manager
         self._lock = threading.Lock()
         self._preferred_sender_by_slave_id: dict[str, int] = {}
 

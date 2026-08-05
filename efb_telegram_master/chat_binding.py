@@ -32,6 +32,7 @@ from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
 from .msglog_ingestion import MsgLogIngestionService
+from .outbound import QueueRequest
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, TelegramTopicID
 
@@ -1633,10 +1634,8 @@ class ChatBindingManager(LocaleMixin):
             operation, kwargs = prepared_call
             completed_call_count = 0
             try:
-                waiter = self.bot.enqueue_history_operation(
-                    operation=operation,
-                    args=(),
-                    kwargs=kwargs,
+                waiter = self.bot.outbound_queue.enqueue(
+                    QueueRequest(operation, (), kwargs, tg_chat_id)
                 )
                 waiter.result()
                 completed_call_count += 1

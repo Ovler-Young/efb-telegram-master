@@ -1,62 +1,111 @@
-from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+import threading
 
+import pytest
 from telegram.error import RetryAfter
 
-from efb_telegram_master.outbound import (
-    OutboundQueueScheduler,
-    QueueRequest,
-    SenderSelection,
-    SenderSelectionResult,
-)
+from efb_telegram_master.outbound import OutboundQueue, QueueRequest
 
 
-def test_scheduler_serializes_calls_for_one_chat_and_returns_results():
-    executed: list[str] = []
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        scheduler = OutboundQueueScheduler(
-            executor,
-            2,
-            lambda _call, _now: SenderSelectionResult(SenderSelection(object(), None)),
-            lambda _sender, _chat_id: True,
-            lambda call, _sender: executed.append(call.kwargs["text"]) or call.kwargs["text"],
-            lambda *_args: None,
-        )
-        first = scheduler.enqueue(QueueRequest("send_message", (), {"text": "first"}, 1))
-        second = scheduler.enqueue(QueueRequest("send_message", (), {"text": "second"}, 1))
-        while not first.done() or not second.done():
-            scheduler.dispatch_once()
-            scheduler.harvest_completed()
+class _Limiter:
+    def peek_delay(self, _chat_id):
+        return 0.0
 
-    assert first.result() == "first"
-    assert second.result() == "second"
-    assert executed == ["first", "second"]
+    def try_acquire(self, _chat_id):
+        return True
+
+    def occupancy_snapshot(self):
+        return {"global": 0.0, "chat": 0.0}
 
 
-def test_scheduler_retries_retry_after_before_finishing_waiter():
+def _queue(sender, worker_count=2):
+    queue = OutboundQueue(
+        sender, None, _Limiter(), worker_count=worker_count, blocking_timeout=1,
+        shutdown_drain_timeout=1, shutdown_join_grace=0.1,
+    )
+    queue.start()
+    return queue
+
+
+def test_queue_serializes_same_chat_calls():
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            calls.append(text)
+            if text == "first":
+                started.set()
+                assert release.wait(1)
+            return text
+
+    queue = _queue(Sender())
+    try:
+        first = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "first"}, 1))
+        second = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "second"}, 1))
+        assert started.wait(1)
+        assert calls == ["first"]
+        release.set()
+        assert first.result(1).message == "first"
+        assert second.result(1).message == "second"
+        assert calls == ["first", "second"]
+    finally:
+        queue.stop()
+
+
+def test_queue_runs_distinct_chats_concurrently():
+    barrier = threading.Barrier(2)
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            barrier.wait(1)
+            return text
+
+    queue = _queue(Sender())
+    try:
+        first = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "first"}, 1))
+        second = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 2, "text": "second"}, 2))
+        assert first.result(1).message == "first"
+        assert second.result(1).message == "second"
+    finally:
+        queue.stop()
+
+
+@pytest.mark.parametrize("retry_after", [0, timedelta(0)])
+def test_queue_retries_numeric_and_timedelta_retry_after(retry_after):
     attempts = 0
-    retry_events = []
 
-    def execute(_call, _sender):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise RetryAfter(0)
-        return "sent"
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RetryAfter(retry_after)
+            return text
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        scheduler = OutboundQueueScheduler(
-            executor,
-            1,
-            lambda _call, _now: SenderSelectionResult(SenderSelection(object(), None)),
-            lambda _sender, _chat_id: True,
-            execute,
-            lambda *args: retry_events.append(args),
-        )
-        waiter = scheduler.enqueue(QueueRequest("send_message", (), {}, 1))
-        while not waiter.done():
-            scheduler.dispatch_once()
-            scheduler.harvest_completed()
+    queue = _queue(Sender(), worker_count=1)
+    try:
+        waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "sent"}, 1))
+        assert waiter.result(1).message == "sent"
+        assert attempts == 2
+    finally:
+        queue.stop()
 
-    assert waiter.result() == "sent"
-    assert attempts == 2
-    assert len(retry_events) == 1
+
+def test_stop_drains_in_flight_call():
+    started = threading.Event()
+    release = threading.Event()
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            started.set()
+            assert release.wait(1)
+            return text
+
+    queue = _queue(Sender(), worker_count=1)
+    waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "sent"}, 1))
+    assert started.wait(1)
+    release.set()
+    queue.stop()
+    assert waiter.result(1).message == "sent"

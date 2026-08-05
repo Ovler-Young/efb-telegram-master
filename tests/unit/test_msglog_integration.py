@@ -2,10 +2,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from telegram import Update
+from ehforwarderbot.constants import MsgType
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
-from efb_telegram_master.slave_message import SlaveMessageProcessor
+from efb_telegram_master.slave_message import ETMMsg, SlaveMessageProcessor
 
 
 def test_sync_msglog_requires_admin_and_a_bound_forum_group():
@@ -58,3 +59,28 @@ def test_ingested_rows_are_not_remote_get_or_reaction_targets():
     processor.update_reactions(SimpleNamespace(chat=chat, msg_id="mtproto-ingested:100.1", reactions={}))
 
     processor.logger.info.assert_called_once()
+
+
+def test_ordinary_send_writes_msglog_once_and_releases_completion(monkeypatch):
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.logger = Mock()
+    processor.db = SimpleNamespace(add_or_update_message_log=Mock())
+    processor.chat_manager = Mock()
+    processor.channel = SimpleNamespace(commands=SimpleNamespace(register_command=Mock()))
+    processor.build_reactions_footer = Mock(return_value="")
+    processor._release_pending_slave_message = Mock()
+    sent = SimpleNamespace(chat=SimpleNamespace(id=123), message_id=456, sender_bot_id="7")
+    processor.slave_message_text = Mock(return_value=sent)
+    etm_msg = Mock()
+    monkeypatch.setattr(ETMMsg, "from_efbmsg", Mock(return_value=etm_msg))
+    monkeypatch.setattr("efb_telegram_master.slave_message.get_msg_type", Mock(return_value="Text"))
+    message = SimpleNamespace(
+        uid="slave-message", target=None, commands=[], reactions={}, text="hello", type=MsgType.Text,
+    )
+
+    processor.dispatch_message(message, "", None, 123, None, dedupe_key=("slave", "slave-message"))
+
+    processor.db.add_or_update_message_log.assert_called_once_with(
+        etm_msg, sent, None, sender_bot_id="7",
+    )
+    processor._release_pending_slave_message.assert_called_once_with(("slave", "slave-message"))

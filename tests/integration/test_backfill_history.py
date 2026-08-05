@@ -51,7 +51,7 @@ async def helper(helper_wrap, slave_with_auxiliary_bots):
 def private_response(channel_with_auxiliary_bots, bot_id):
     """Wait for primary-bot replies using the auxiliary channel's limiter."""
     limiter_delay = lambda: (
-        channel_with_auxiliary_bots.bot_manager._rate_limiter.peek_delay(bot_id)
+        channel_with_auxiliary_bots.bot_manager.outbound_queue._main_rate_limiter.peek_delay(bot_id)
     )
 
     async def wait(trigger, receive):

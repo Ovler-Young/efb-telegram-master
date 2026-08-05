@@ -369,10 +369,26 @@ class SlaveMessageProcessor(LocaleMixin):
         self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",
                           xid, tg_msg.chat.id, tg_msg.message_id)
         etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
-        self.bot.write_db_mapping(
-            etm_msg, tg_msg, database_old_msg_id or old_msg_id,
-            sender_bot_id=getattr(tg_msg, 'sender_bot_id', None), on_complete=on_db_complete,
-        )
+        try:
+            etm_msg.type_telegram = get_msg_type(tg_msg)
+            etm_msg.put_telegram_file(tg_msg)
+            self.db.add_or_update_message_log(
+                etm_msg,
+                tg_msg,
+                database_old_msg_id or old_msg_id,
+                sender_bot_id=getattr(tg_msg, 'sender_bot_id', None),
+            )
+        except Exception as error:
+            self.logger.warning(
+                "DB write failed for Telegram message %s; dropping mapping (%s).",
+                getattr(tg_msg, 'message_id', '?'), type(error).__name__,
+            )
+        finally:
+            if on_db_complete is not None:
+                try:
+                    on_db_complete()
+                except Exception as error:
+                    self.logger.warning("Database update completion callback failed (%s).", type(error).__name__)
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
         """Get the Telegram destination of a message with its header.

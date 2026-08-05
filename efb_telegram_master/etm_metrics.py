@@ -11,7 +11,7 @@ from typing import Any
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
-from .outbound import QUEUED_OPERATIONS
+from .outbound import OutboundQueue, QUEUED_OPERATIONS
 
 
 _PRIORITIES = frozenset({"blocking", "normal"})
@@ -325,6 +325,22 @@ class Metrics:
             return (depth, oldest)
 
         self._register_collector(collect)
+
+    def register_outbound_queue_collectors(self, queue: OutboundQueue, top_n: int) -> None:
+        """Register the outbound queue's bounded scrape snapshots."""
+        def destination_snapshot() -> Iterable[DestinationQueueSnapshot]:
+            return (
+                DestinationQueueSnapshot(destination, depth, oldest_age)
+                for destination, depth, oldest_age in queue.destination_snapshot()
+            )
+
+        def worker_snapshot() -> WorkerSnapshot:
+            healthy, in_flight = queue.worker_snapshot()
+            return WorkerSnapshot(healthy, in_flight)
+
+        self.register_destination_queue_collector(destination_snapshot, top_n)
+        self.register_worker_collector(worker_snapshot)
+        self.register_cooldown_collector(queue.cooldown_snapshot)
 
     def register_worker_collector(self, snapshot: Callable[[], WorkerSnapshot]) -> None:
         """Register aggregate worker liveness and in-flight state."""
