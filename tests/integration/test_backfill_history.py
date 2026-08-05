@@ -168,7 +168,7 @@ async def _wait_for_logged_stream_messages(channel, chat, prefix: str, expected_
 
 
 async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id: int):
-    pool = channel_with_auxiliary_bots.bot_manager.bot_pool
+    pool = channel_with_auxiliary_bots.bot_manager.api.bot_pool
     assert pool is not None
 
     working_bot_ids = []

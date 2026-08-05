@@ -232,6 +232,7 @@ class TelegramAPI:
     @_retry_on_chat_migration
     def answer_callback_query(self, *args: object, prefix: str = "", suffix: str = "", text: str | None = None, **kwargs: object):
         kwargs.pop("chat_id", None)
+        kwargs.pop("message_id", None)
         if text is None:
             return self._bot.answer_callback_query(*args, **kwargs)
         full_text = f"{prefix + chr(10) if prefix else ''}{text}{chr(10) + suffix if suffix else ''}"
