@@ -129,7 +129,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         )
         created_message_ids.append(command.id)
         acknowledgement = await helper.wait_for_message(
-            in_chats(bot_topic_group) & regex(r"MsgLog sync (started|resumed) for this group\\."),
+            in_chats(bot_topic_group) & regex(r"MsgLog sync (started|resumed) for this group\."),
         )
         assert acknowledgement.reply_to_msg_id == command.id
 
