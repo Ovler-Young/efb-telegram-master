@@ -724,11 +724,6 @@ class OutboundQueue:
         if waiter is not None and not waiter.done():
             waiter.set_exception(error)
 
-    def complete_waiter(self, row_id: int, result: object) -> None:
-        waiter = self.waiters.pop(row_id, None)
-        if waiter is not None and not waiter.done():
-            waiter.set_result(result)
-
     def fail_all_waiters(self, error: BaseException) -> None:
         for row_id in tuple(self.waiters):
             self.fail_waiter(row_id, error)
@@ -1109,7 +1104,9 @@ class OutboundQueueScheduler:
                             self._stop_for_persistence_error(delete_error)
                             return
                         self._record_submitted_removal(submitted.row)
-                    self.queue.complete_waiter(row_id, result)
+                    waiter = self.queue.waiters.pop(row_id, None)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(result)
                     self._record_terminal_completion(submitted.row, submitted.selection, "success")
             if any_harvested:
                 self.wake_event.set()

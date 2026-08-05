@@ -660,9 +660,6 @@ class ChatBindingManager(LocaleMixin):
         msg = self.bot.send_message(tg_chat_to_link.id, text=txt)
 
         chat.link(self.channel.channel_id, ChatID(str(tg_chat_to_link.id)), self.channel.flag("multiple_slave_chats"))
-        previous_thread_id = self.db.get_topic_thread_id(
-            slave_uid=chat_uid, topic_chat_id=TelegramChatID(tg_chat_to_link.id)
-        )
         self.db.remove_topic_assoc(
             slave_uid=chat_uid,
         )

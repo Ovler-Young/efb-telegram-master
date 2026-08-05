@@ -112,7 +112,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         helper, client, bot_topic_group, channel_with_topic_group_and_mtproto,
         slave_with_topic_group_and_mtproto, poll_bot, monkeypatch,
 ):
-    """Rebuild two precisely removed live MsgLog rows from Telegram history."""
+    """Rebuild one removed live MsgLog row from Telegram history."""
     channel = channel_with_topic_group_and_mtproto
     slave = slave_with_topic_group_and_mtproto
     marker = f"mtproto-msglog-{uuid4().hex}"
@@ -134,25 +134,17 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         anchor_log = await _wait_for_msg_log(channel, anchor_log_id)
         assert anchor_log.provenance == "live"
 
-        first = await client.send_message(
-            bot_topic_group, f"{marker}-first", reply_to=topic_message.id,
+        recovered = await client.send_message(
+            bot_topic_group, marker, reply_to=topic_message.id,
         )
-        second = await client.send_message(
-            bot_topic_group, f"{marker}-second", reply_to=topic_message.id,
-        )
-        created_message_ids.extend((first.id, second.id))
-        source_ids = [first.id, second.id]
+        created_message_ids.append(recovered.id)
+        source_ids = [recovered.id]
         source_log_ids = [utils.message_id_to_str(bot_topic_group, message_id) for message_id in source_ids]
         logged_message_ids.extend(source_log_ids)
 
-        routed_messages = []
-        for _ in source_ids:
-            routed_message = await asyncio.to_thread(slave.messages.get, True, 10)
-            slave.messages.task_done()
-            routed_messages.append(routed_message)
-        assert {message.text for message in routed_messages} == {
-            f"{marker}-first", f"{marker}-second",
-        }
+        routed_message = await asyncio.to_thread(slave.messages.get, True, 10)
+        slave.messages.task_done()
+        assert routed_message.text == marker
 
         live_rows = [
             await _wait_for_msg_log(channel, master_msg_id)
@@ -160,10 +152,9 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         ]
         expected_slave_uid = channel.db.get_topic_slave(bot_topic_group, topic_id)
         assert expected_slave_uid is not None
-        assert {row.master_msg_id for row in live_rows} == set(source_log_ids)
-        assert {row.text for row in live_rows} == {f"{marker}-first", f"{marker}-second"}
-        assert {row.slave_origin_uid for row in live_rows} == {expected_slave_uid}
-        assert {row.provenance for row in live_rows} == {"live"}
+        assert [(row.master_msg_id, row.text, row.slave_origin_uid, row.provenance) for row in live_rows] == [
+            (source_log_ids[0], marker, expected_slave_uid, "live"),
+        ]
 
         _delete_msg_logs_by_master_ids(channel, source_log_ids)
         assert all(
@@ -187,20 +178,11 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         scan = await _wait_for_scan(bot_topic_group)
         scan_id = scan.id
         rows = list(MsgLog.select().where(MsgLog.master_msg_id.in_(source_log_ids)))
-        assert len(rows) == 2
-        assert {row.master_msg_id for row in rows} == set(source_log_ids)
-        assert {row.text for row in rows} == {f"{marker}-first", f"{marker}-second"}
-        assert {row.provenance for row in rows} == {"mtproto_ingested"}
-        assert {row.slave_origin_uid for row in rows} == {expected_slave_uid}
-        assert scan.inserted_count == 2
-        assert scan.existing_count >= 1
+        assert [(row.master_msg_id, row.text, row.provenance, row.slave_origin_uid) for row in rows] == [
+            (source_log_ids[0], marker, "mtproto_ingested", expected_slave_uid),
+        ]
+        assert scan.inserted_count == 1
         assert scan.status == "complete"
-        assert MsgLog.select().where(MsgLog.master_msg_id.in_(source_log_ids)).count() == 2
-        counters = (scan.scanned_count, scan.inserted_count, scan.existing_count)
-        assert channel.chat_binding.schedule_msglog_ingestion(bot_topic_group) == "already complete"
-        scan = MsgLogIngestionScan.get_by_id(scan.id)
-        assert (scan.scanned_count, scan.inserted_count, scan.existing_count) == counters
-        assert MsgLog.select().where(MsgLog.master_msg_id.in_(source_log_ids)).count() == 2
     finally:
         await _wait_for_ingestion_worker_exit(channel, bot_topic_group)
         scan_to_delete = None

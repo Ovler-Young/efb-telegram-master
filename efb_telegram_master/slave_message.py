@@ -528,15 +528,6 @@ class SlaveMessageProcessor(LocaleMixin):
             )
         return kwargs
 
-    @staticmethod
-    def _file_size(file: Optional[IO[bytes]]) -> Optional[int]:
-        if file is None or getattr(file, "closed", True):
-            return None
-        file.seek(0, 2)
-        size = file.tell()
-        file.seek(0)
-        return size
-
     @classmethod
     def _remote_image_url(cls, msg: Message) -> Optional[str]:
         url = (msg.vendor_specific or {}).get(cls.REMOTE_IMAGE_URL_VENDOR_KEY)
@@ -1613,9 +1604,9 @@ class SlaveMessageProcessor(LocaleMixin):
         """
         if not file or getattr(file, "closed", True):
             return None
-        file_size = self._file_size(file)
-        if file_size is None:
-            return None
+        file.seek(0, 2)
+        file_size = file.tell()
+        file.seek(0)
         if not self.channel.flag("local_tdlib_api") \
                 and file_size > telegram.constants.FileSizeLimit.FILESIZE_UPLOAD:
             size_str = humanize.naturalsize(file_size)

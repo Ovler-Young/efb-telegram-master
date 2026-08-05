@@ -1,16 +1,10 @@
-import asyncio
-from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
-from threading import Lock
-from uuid import UUID
 
 from telegram import Update
+
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
-import efb_telegram_master.master_message as master_message
-from efb_telegram_master.master_message import MasterMessageProcessor
-from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 
 
@@ -27,13 +21,10 @@ def test_sync_msglog_requires_admin_and_a_bound_forum_group():
     update = Update(update_id=1, message=message)
 
     TelegramChannel.sync_msglog(channel, update, SimpleNamespace())
-
-    channel.chat_binding.schedule_msglog_ingestion.assert_called_once_with(100)
-    channel.bot_manager.send_message.assert_called_once()
-
     message.from_user.id = 11
     TelegramChannel.sync_msglog(channel, update, SimpleNamespace())
-    assert channel.chat_binding.schedule_msglog_ingestion.call_count == 1
+
+    channel.chat_binding.schedule_msglog_ingestion.assert_called_once_with(100)
 
 
 def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
@@ -49,188 +40,7 @@ def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
 
     ChatBindingManager.resume_pending_msglog_ingestions(manager)
 
-    assert manager.schedule_msglog_ingestion.call_args_list[0].args == (100,)
-    assert manager.schedule_msglog_ingestion.call_args_list[1].args == (200,)
-
-
-def test_schedule_msglog_ingestion_starts_one_thread_per_group(monkeypatch):
-    manager = object.__new__(ChatBindingManager)
-    manager.channel = SimpleNamespace(mtproto=SimpleNamespace(
-        enabled=True, connected=True, config=SimpleNamespace(scan_ceiling=100),
-    ))
-    manager.db = SimpleNamespace(get_or_create_msglog_ingestion_scan=Mock(
-        return_value=SimpleNamespace(status="pending", scanned_count=0),
-    ))
-    manager._msglog_ingestion_lock = Lock()
-    manager._msglog_ingestion_threads = {}
-    thread = SimpleNamespace(is_alive=Mock(return_value=True), start=Mock())
-    monkeypatch.setattr("efb_telegram_master.chat_binding.threading.Thread", Mock(return_value=thread))
-
-    assert ChatBindingManager.schedule_msglog_ingestion(manager, 100) == "started"
-    assert ChatBindingManager.schedule_msglog_ingestion(manager, 100) == "already running"
-    thread.start.assert_called_once()
-
-
-def test_msglog_ingestion_uses_the_bound_telegram_runtime_loop():
-    class LoopPinningRuntime:
-        def __init__(self):
-            self.calls = []
-
-        def call(self, coroutine):
-            self.calls.append(coroutine)
-            coroutine.close()
-
-    runtime = LoopPinningRuntime()
-    manager = object.__new__(ChatBindingManager)
-    manager.bot = SimpleNamespace(_runtime=runtime)
-    manager.db = Mock()
-    manager.channel = SimpleNamespace(mtproto=SimpleNamespace())
-    manager.logger = Mock()
-
-    ChatBindingManager._run_msglog_ingestion(manager, 100)
-
-    assert len(runtime.calls) == 1
-
-
-def test_msglog_ingestion_worker_owners_are_unique_when_thread_ids_collide(monkeypatch):
-    owners = []
-
-    class RecordingService:
-        def __init__(self, _db, _mtproto):
-            pass
-
-        async def run(self, _source_chat_id, *, lease_owner):
-            owners.append(lease_owner)
-
-    class Runtime:
-        def call(self, coroutine):
-            asyncio.run(coroutine)
-
-    manager = object.__new__(ChatBindingManager)
-    manager.bot = SimpleNamespace(_runtime=Runtime())
-    manager.db = Mock()
-    manager.channel = SimpleNamespace(mtproto=SimpleNamespace())
-    manager.logger = Mock()
-    monkeypatch.setattr("efb_telegram_master.chat_binding.MsgLogIngestionService", RecordingService)
-    monkeypatch.setattr("efb_telegram_master.chat_binding.threading.get_ident", lambda: 42)
-
-    ChatBindingManager._run_msglog_ingestion(manager, 100)
-    ChatBindingManager._run_msglog_ingestion(manager, 100)
-
-    assert len(owners) == 2
-    assert owners[0] != owners[1]
-    assert all(UUID(owner).version == 4 for owner in owners)
-
-
-def test_ingested_master_edits_do_not_dispatch_or_remove_messages():
-    processor = object.__new__(MasterMessageProcessor)
-    processor.channel = SimpleNamespace(_=lambda text: text)
-    processor.channel_id = "tests.master"
-    processor.db = SimpleNamespace(
-        FAIL_FLAG="__fail__",
-        get_msg_log=Mock(return_value=SimpleNamespace(
-            provenance="mtproto_ingested", slave_message_id="mtproto-ingested:100.10",
-        )),
-    )
-    processor.logger = Mock()
-    processor.process_telegram_message = Mock()
-
-    for text in ("ordinary edit", "rm` remove remotely"):
-        message = Mock()
-        message.chat = SimpleNamespace(id=100, is_forum=False)
-        message.message_id = 10
-        message.text = text
-        message.to_dict.return_value = {}
-        update = Update(update_id=1, edited_message=message)
-
-        MasterMessageProcessor.msg(processor, update, None)
-
-    assert processor.db.get_msg_log.call_count == 2
-    processor.process_telegram_message.assert_not_called()
-
-
-def test_ingested_master_reply_dispatches_without_target(monkeypatch):
-    class CapturedMessage:
-        def __init__(self):
-            self.file = None
-            self.target = None
-
-        def put_telegram_file(self, _message):
-            pass
-
-    target_log = SimpleNamespace(
-        provenance="mtproto_ingested",
-        slave_origin_uid="tests.slave source",
-        build_etm_msg=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(uid="source"), uid="synthetic")),
-    )
-    sent_messages = []
-    slave = SimpleNamespace(
-        supported_message_types={master_message.MsgType.Text},
-        channel_name="Test slave",
-    )
-    monkeypatch.setattr(master_message, "ETMMsg", CapturedMessage)
-    monkeypatch.setattr(master_message, "get_msg_type", lambda _message: TGMsgType.Text)
-    monkeypatch.setattr(master_message, "coordinator", SimpleNamespace(
-        slaves={"tests.slave": slave},
-        send_message=lambda message: sent_messages.append(message),
-    ))
-
-    processor = object.__new__(MasterMessageProcessor)
-    processor.channel = SimpleNamespace(flag=Mock(return_value=False))
-    processor.bot = Mock()
-    processor.db = SimpleNamespace(
-        get_msg_log=Mock(return_value=target_log),
-        add_or_update_message_log=Mock(),
-    )
-    processor.chat_manager = SimpleNamespace(
-        get_chat=Mock(return_value=SimpleNamespace(self=SimpleNamespace())),
-    )
-    processor.logger = Mock()
-
-    reply = SimpleNamespace(chat=SimpleNamespace(id=100), message_id=9)
-    message = SimpleNamespace(
-        chat=SimpleNamespace(id=100),
-        message_id=10,
-        reply_to_message=reply,
-        text="normal body",
-        text_markdown_v2="normal body",
-        caption=None,
-        caption_markdown_v2=None,
-    )
-
-    MasterMessageProcessor.process_telegram_message(
-        processor, Update(update_id=1, message=message), None, "tests.slave source", quote=True,
-    )
-
-    assert len(sent_messages) == 1
-    assert sent_messages[0].text == "normal body"
-    assert sent_messages[0].target is None
-    target_log.build_etm_msg.assert_not_called()
-
-
-def test_ingested_text_and_media_backfill_use_copy_message():
-    manager = object.__new__(ChatBindingManager)
-    manager.db = Mock()
-    manager.chat_manager = Mock()
-    manager.logger = Mock()
-    text_log = SimpleNamespace(
-        master_msg_id="100.10", text="text", media_type="Text", provenance="mtproto_ingested",
-        time=datetime.now(),
-    )
-    media_log = SimpleNamespace(
-        master_msg_id="100.11", text="caption", media_type="Photo", provenance="mtproto_ingested",
-        time=datetime.now(),
-    )
-    manager.db.get_recent_messages.return_value = [text_log, media_log]
-    manager.db.replace_history_migration_entries.return_value = 2
-
-    ChatBindingManager._queue_history_migration_entries(manager, "tests.slave", 300)
-
-    entries = manager.db.replace_history_migration_entries.call_args.args[3]
-    assert [entry["formatted_text"] for entry in entries] == [None, None]
-    entry_namespaces = [SimpleNamespace(**entry) for entry in entries]
-    assert [ChatBindingManager._prepare_history_migration_call(entry, 300, None)[0] for entry in
-            entry_namespaces] == ["copy_message", "copy_message"]
+    assert [call.args for call in manager.schedule_msglog_ingestion.call_args_list] == [(100,), (200,)]
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

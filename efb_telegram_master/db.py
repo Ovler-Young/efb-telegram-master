@@ -6,8 +6,7 @@ import pickle
 import time
 from contextlib import suppress
 from functools import partial, wraps
-from typing import Callable, Collection, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, cast
-from pathlib import Path
+from typing import Callable, Collection, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING
 
 from peewee import (
     AutoField,
@@ -23,7 +22,6 @@ from peewee import (
     TextField,
     fn,
 )
-from playhouse.migrate import migrate
 from telegram import Message
 from typing_extensions import TypedDict
 
@@ -295,7 +293,6 @@ class DatabaseManager:
         db_type = db_config.get('type', 'sqlite')
 
         if db_type == 'postgresql':
-            from playhouse.migrate import PostgresqlMigrator
             from playhouse.postgres_ext import PooledPostgresqlExtDatabase
             actual_db = PooledPostgresqlExtDatabase(
                 db_config.get('database', 'efb_telegram'),
@@ -307,11 +304,8 @@ class DatabaseManager:
                 stale_timeout=db_config.get('stale_timeout', 300),
                 options=db_config.get('options', '-c timezone=UTC'),
             )
-            self._migrator_cls = PostgresqlMigrator
-            self._is_sqlite = False
         else:
             from peewee import SqliteDatabase
-            from playhouse.migrate import SqliteMigrator
             actual_db = SqliteDatabase(
                 str(base_path / 'tgdata.db'),
                 pragmas={
@@ -321,32 +315,13 @@ class DatabaseManager:
                 },
                 check_same_thread=False,
             )
-            self._migrator_cls = SqliteMigrator
-            self._is_sqlite = True
 
         database.initialize(actual_db)
         database.connect()
         self.logger.debug("Database loaded.")
 
         self.logger.debug("Checking database migration...")
-        if not self._is_sqlite:
-            # PostgreSQL backend
-            if not ChatAssoc.table_exists():
-                sqlite_path = Path(base_path / 'tgdata.db')
-                if sqlite_path.exists():
-                    self._migrate_from_sqlite(sqlite_path)
-                else:
-                    self._create()
-            else:
-                self._create_missing_tables()
-                self._check_and_run_migrations()
-        else:
-            # SQLite backend: original logic
-            if not ChatAssoc.table_exists():
-                self._create()
-            else:
-                self._create_missing_tables()
-                self._check_and_run_migrations()
+        self._create()
         self.logger.debug("Database migration finished...")
         self._observe_legacy_outbound_rows()
 
@@ -369,177 +344,6 @@ class DatabaseManager:
         database.create_tables([
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan,
         ])
-
-    @staticmethod
-    def _create_missing_tables():
-        """Create tables introduced after the original schema without touching existing data."""
-        models = [
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan,
-        ]
-        existing_tables = set(database.get_tables())
-        database.create_tables(
-            [model for model in models if model._meta.table_name not in existing_tables],
-            safe=True,
-        )
-
-    @staticmethod
-    def _select_existing_columns(model, table_name: str, requested_fields: List):
-        columns = {i.name for i in model._meta.database.get_columns(table_name)}
-        fields = [
-            field
-            for field in requested_fields
-            if field.column_name in columns
-        ]
-        rows = list(model.select(*fields).dicts())
-        for row in rows:
-            for field in requested_fields:
-                row.setdefault(field.column_name, None)
-        return rows
-
-    def _migrate_from_sqlite(self, sqlite_path: Path):
-        """Migrate data from existing SQLite database to PostgreSQL on first use."""
-        from playhouse.sqliteq import SqliteQueueDatabase
-        from peewee import chunked
-
-        self.logger.info("Detected existing SQLite database. Migrating to PostgreSQL...")
-
-        sqlite_db = SqliteQueueDatabase(str(sqlite_path), autostart=False)
-        sqlite_db.start()
-        sqlite_db.connect()
-
-        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry]
-        with sqlite_db.bind_ctx(models):
-            chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
-                ChatAssoc.master_uid, ChatAssoc.slave_uid
-            ).dicts()))
-            if TopicAssoc.table_exists():
-                topic_assocs = cast(List[Dict[str, object]], list(TopicAssoc.select(
-                    TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id, TopicAssoc.slave_uid
-                ).dicts()))
-            else:
-                topic_assocs = []
-            slave_chat_infos: List[Dict[str, object]] = self._select_existing_columns(SlaveChatInfo, "slavechatinfo", [
-                SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_channel_emoji,
-                SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id,
-                SlaveChatInfo.slave_chat_name, SlaveChatInfo.slave_chat_alias,
-                SlaveChatInfo.slave_chat_type, SlaveChatInfo.pickle
-            ])
-            msg_logs: List[Dict[str, object]] = self._select_existing_columns(MsgLog, "msglog", [
-                MsgLog.master_msg_id, MsgLog.master_msg_id_alt, MsgLog.slave_message_id,
-                MsgLog.text, MsgLog.slave_origin_uid, MsgLog.slave_origin_display_name,
-                MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
-                MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
-                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id,
-                MsgLog.provenance, MsgLog.time,
-            ])
-            for msg_log in msg_logs:
-                if msg_log["provenance"] is None:
-                    msg_log["provenance"] = "live"
-            if HistoryMigrationEntry.table_exists():
-                history_migration_entries = self._select_existing_columns(HistoryMigrationEntry, "historymigrationentry", [
-                    HistoryMigrationEntry.slave_chat_id, HistoryMigrationEntry.target_chat_id,
-                    HistoryMigrationEntry.message_thread_id, HistoryMigrationEntry.source_master_msg_id,
-                    HistoryMigrationEntry.formatted_text, HistoryMigrationEntry.media_type,
-                    HistoryMigrationEntry.source_time, HistoryMigrationEntry.position,
-                    HistoryMigrationEntry.created_at,
-                ])
-            else:
-                history_migration_entries = []
-        sqlite_db.stop()
-        sqlite_db.close()
-
-        with database.atomic():
-            self._create()
-            for chat_assoc_batch in chunked(chat_assocs, 500):
-                ChatAssoc.insert_many(chat_assoc_batch).execute()
-            for topic_assoc_batch in chunked(topic_assocs, 500):
-                TopicAssoc.insert_many(topic_assoc_batch).execute()
-            for slave_chat_info_batch in chunked(slave_chat_infos, 500):
-                SlaveChatInfo.insert_many(slave_chat_info_batch).execute()
-            for msg_log_batch in chunked(msg_logs, 500):
-                MsgLog.insert_many(msg_log_batch).execute()
-            for history_migration_entry_batch in chunked(history_migration_entries, 500):
-                HistoryMigrationEntry.insert_many(history_migration_entry_batch).execute()
-        migrated_path = sqlite_path.with_suffix('.db.migrated')
-        sqlite_path.rename(migrated_path)
-
-        self.logger.info(
-            "Migration complete. %d chat assocs, %d topic assocs, "
-            "%d chat infos, %d messages migrated. "
-            "%d pending history entries migrated. Original SQLite file renamed to %s",
-            len(chat_assocs), len(topic_assocs),
-            len(slave_chat_infos), len(msg_logs),
-            len(history_migration_entries), migrated_path
-        )
-
-    def _check_and_run_migrations(self):
-        """Check schema and run pending migrations."""
-        while True:
-            msg_log_columns = {i.name for i in database.get_columns("msglog")}
-            slave_chat_info_columns = {i.name for i in database.get_columns("slavechatinfo")}
-            if "file_id" not in msg_log_columns:
-                self._migrate(0)
-            elif "pickle" not in msg_log_columns:
-                self._migrate(1)
-            elif "slave_chat_group_id" not in slave_chat_info_columns:
-                self._migrate(2)
-            elif "file_unique_id" not in msg_log_columns:
-                self._migrate(3)
-            elif "sender_bot_id" not in msg_log_columns:
-                self._migrate(4)
-            elif "provenance" not in msg_log_columns or "msglogingestionscan" not in database.get_tables():
-                self._migrate(8)
-            else:
-                return
-
-    def _migrate(self, i: int):
-        """
-        Run migrations.
-
-        Args:
-            i: Migration ID
-        """
-        migrator = self._migrator_cls(database.obj)
-
-        if i <= 0:
-            # Migration 0: Add media file ID and editable message ID
-            # 2019JAN08
-            migrate(
-                migrator.add_column("msglog", "file_id", MsgLog.file_id),
-                migrator.add_column("msglog", "media_type", MsgLog.media_type),
-                migrator.add_column("msglog", "mime", MsgLog.mime),
-                migrator.add_column("msglog", "master_msg_id_alt", MsgLog.master_msg_id_alt)
-            )
-        if i <= 1:
-            # Migration 1: Add pickle objects to MsgLog and SlaveChatInfo
-            # 2019JUL24
-            migrate(
-                migrator.add_column("msglog", "pickle", MsgLog.pickle),
-                migrator.add_column("slavechatinfo", "pickle", SlaveChatInfo.pickle)
-            )
-        if i <= 2:
-            # Migration 2: Add column for group ID to slave chat info table
-            # 2019NOV18
-            migrate(
-                migrator.add_column("slavechatinfo", "slave_chat_group_id", SlaveChatInfo.slave_chat_group_id)
-            )
-        if i <= 3:
-            # Migration 3: Add column for unique file ID to message log table
-            # 2019NOV18
-            migrate(
-                migrator.add_column("msglog", "file_unique_id", MsgLog.file_unique_id)
-            )
-        if i <= 4:
-            # Migration 4: Add column for sender bot ID (multi-bot pool support)
-            migrate(
-                migrator.add_column("msglog", "sender_bot_id", MsgLog.sender_bot_id)
-            )
-        if i == 8:
-            msg_log_columns = {column.name for column in database.get_columns("msglog")}
-            if "provenance" not in msg_log_columns:
-                migrate(migrator.add_column("msglog", "provenance", MsgLog.provenance))
-            database.execute_sql("UPDATE msglog SET provenance = 'live' WHERE provenance IS NULL")
-            database.create_tables([MsgLogIngestionScan], safe=True)
 
     def _observe_legacy_outbound_rows(self) -> None:
         """Report retained workflow rows without loading or changing them."""

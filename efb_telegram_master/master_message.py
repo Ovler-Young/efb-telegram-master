@@ -572,9 +572,8 @@ class MasterMessageProcessor(LocaleMixin):
             EFBMessageError: When file exceeds the maximum download size.
         """
         size = getattr(file_obj, "file_size", None)
-        if size and size > FileSizeLimit.FILESIZE_DOWNLOAD:
-            if self.channel.flag("local_tdlib_api"):
-                return
+        if size and not self.channel.flag("local_tdlib_api")\
+                and size > FileSizeLimit.FILESIZE_DOWNLOAD:
             size_str = humanize.naturalsize(size)
             max_size_str = humanize.naturalsize(FileSizeLimit.FILESIZE_DOWNLOAD)
             raise EFBMessageError(

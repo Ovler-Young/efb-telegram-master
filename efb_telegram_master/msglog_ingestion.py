@@ -18,10 +18,7 @@ class IngestedMsgLog:
     media_type: str
     msg_type: str
     mime: Optional[str]
-    file_id: None = None
-    pickle: None = None
     time: Optional[datetime] = None
-    provenance: str = "mtproto_ingested"
 
 
 class MsgLogIngestionService:
@@ -127,30 +124,9 @@ class MsgLogIngestionService:
     @staticmethod
     def _content(message: object) -> IngestedMsgLog:
         media = getattr(message, "media", None)
-        media_name = type(media).__name__ if media is not None else ""
         text = str(getattr(message, "message", "") or "")
-        if media_name == "MessageMediaPhoto" or getattr(media, "photo", None) is not None:
-            return IngestedMsgLog(text, "Photo", "Image", "image/jpeg")
-        if media_name == "MessageMediaGeo" or getattr(media, "geo", None) is not None:
-            return IngestedMsgLog(text or "Location", "Location", "Location", None)
-        if media_name == "MessageMediaContact" or getattr(media, "phone_number", None) is not None:
-            return IngestedMsgLog(text, "Contact", "Text", None)
-        document = getattr(media, "document", None)
-        if document is not None:
+        if media is not None:
+            document = getattr(media, "document", None)
             mime = getattr(document, "mime_type", None)
-            attributes = getattr(document, "attributes", ()) or ()
-            attribute_names = {type(attribute).__name__ for attribute in attributes}
-            if "DocumentAttributeSticker" in attribute_names:
-                return IngestedMsgLog(text, "Sticker", "Sticker", mime)
-            if "DocumentAttributeAnimated" in attribute_names:
-                return IngestedMsgLog(text, "Animation", "Animation", mime)
-            if "DocumentAttributeAudio" in attribute_names:
-                voice = any(bool(getattr(attribute, "voice", False)) for attribute in attributes)
-                return IngestedMsgLog(text, "Voice" if voice else "Audio", "Voice" if voice else "File", mime)
-            if "DocumentAttributeVideo" in attribute_names:
-                round_message = any(bool(getattr(attribute, "round_message", False)) for attribute in attributes)
-                return IngestedMsgLog(text, "Video_note" if round_message else "Video", "Video", mime)
-            if mime == "video/mp4":
-                return IngestedMsgLog(text, "Video", "Video", mime)
             return IngestedMsgLog(text, "Document", "File", mime)
         return IngestedMsgLog(text, "Text", "Text", None)
