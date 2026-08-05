@@ -12,6 +12,12 @@ from .mtproto import MTProtoClient, MTProtoRetryableError
 from .utils import EFBChannelChatIDStr
 
 
+_INGESTION_EVENT_IDS = {
+    "start": "msglog_ingestion.start",
+    "complete": "msglog_ingestion.complete",
+}
+
+
 @dataclass(frozen=True)
 class IngestedMsgLog:
     text: str
@@ -37,7 +43,7 @@ class MsgLogIngestionService:
 
     def _log_event(self, event: str, source_chat_id: int) -> None:
         self.logger.info("MsgLog ingestion %s for source chat %d", event, source_chat_id,
-                         extra={"event": f"msglog_ingestion.{event}"})
+                         extra={"event": _INGESTION_EVENT_IDS[event]})
 
     async def run(self, source_chat_id: int, *, lease_owner: str) -> None:
         """Resume a source-group scan unless another worker owns its lease."""
