@@ -29,9 +29,9 @@ from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 
 if TYPE_CHECKING:
     from . import TelegramChannel
-    from .bot_manager import TelegramBotManager
     from .chat_object_cache import ChatObjectCacheManager
     from .db import DatabaseManager, MsgLog
+    from .telegram_api import TelegramAPI
 
 
 class MasterMessageProcessor(LocaleMixin):
@@ -62,16 +62,17 @@ class MasterMessageProcessor(LocaleMixin):
 
     def __init__(self, channel: "TelegramChannel"):
         self.channel: "TelegramChannel" = channel
-        self.bot: "TelegramBotManager" = channel.bot_manager
+        self.bot: "TelegramAPI" = channel.bot_manager.api
+        self.runtime = channel.telegram_runtime
         self.db: "DatabaseManager" = channel.db
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: "ChatObjectCacheManager" = channel.chat_manager
 
-        self.bot.dispatcher.add_handler(CommandHandler("rm", self.bot.as_async_callback(self.delete_message)))
+        self.runtime.application.add_handler(CommandHandler("rm", self.runtime.as_async_callback(self.delete_message)))
 
         message_update_filter = Filters.update.message | Filters.update.channel_post | Filters.update.edited_message | Filters.update.edited_channel_post
 
-        self.bot.dispatcher.add_handler(
+        self.runtime.application.add_handler(
             MessageHandler(
                 (
                     Filters.text
@@ -89,12 +90,12 @@ class MasterMessageProcessor(LocaleMixin):
                     | Filters.dice
                 )
                 & message_update_filter,
-                self.bot.as_async_callback(self.enqueue_message),
+                self.runtime.as_async_callback(self.enqueue_message),
             )
         )
-        self.bot.dispatcher.add_handler(
+        self.runtime.application.add_handler(
             MessageHandler(
-                (Filters.passport_data | Filters.invoice | Filters.game | Filters.successful_payment | Filters.poll) & message_update_filter, self.bot.as_async_callback(self.unsupported_message)
+                (Filters.passport_data | Filters.invoice | Filters.game | Filters.successful_payment | Filters.poll) & message_update_filter, self.runtime.as_async_callback(self.unsupported_message)
             )
         )
         self.logger: logging.Logger = logging.getLogger(__name__)

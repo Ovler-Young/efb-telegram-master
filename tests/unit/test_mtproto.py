@@ -101,7 +101,7 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
     mtproto = LifecycleMTProto()
     auxiliary = Mock()
     channel = SimpleNamespace(
-        bot_manager=SimpleNamespace(bot_pool=SimpleNamespace(bots=[auxiliary])),
+            bot_manager=SimpleNamespace(api=SimpleNamespace(bot_pool=SimpleNamespace(bots=[auxiliary]))),
         mtproto=mtproto,
         chat_binding=SimpleNamespace(resume_pending_msglog_ingestions=Mock()),
         logger=Mock(),

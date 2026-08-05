@@ -41,8 +41,8 @@ from .utils import OldMsgID, TelegramChatID, TelegramMessageID, TelegramTopicID
 
 if TYPE_CHECKING:
     from . import TelegramChannel
-    from .bot_manager import TelegramBotManager
     from .db import DatabaseManager
+    from .telegram_api import TelegramAPI
 
 
 class SlaveMessageProcessor(LocaleMixin):
@@ -56,7 +56,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
     def __init__(self, channel: "TelegramChannel"):
         self.channel: "TelegramChannel" = channel
-        self.bot: "TelegramBotManager" = self.channel.bot_manager
+        self.bot: "TelegramAPI" = self.channel.bot_manager.api
         self.logger: logging.Logger = logging.getLogger(__name__)
         self.flag: utils.ExperimentalFlagsManager = self.channel.flag
         self.db: "DatabaseManager" = channel.db

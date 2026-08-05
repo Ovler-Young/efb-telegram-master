@@ -14,7 +14,7 @@ def test_sync_msglog_requires_admin_and_a_bound_forum_group():
     channel.config = {"admins": [10]}
     channel.db = SimpleNamespace(get_topic_slaves=Mock(return_value=[("tests.slave", 7)]))
     channel.chat_binding = SimpleNamespace(schedule_msglog_ingestion=Mock(return_value="started"))
-    channel.bot_manager = SimpleNamespace(send_message=Mock())
+    channel.bot_manager = SimpleNamespace(api=SimpleNamespace(send_message=Mock()))
     channel.translator = SimpleNamespace(gettext=lambda text: text)
     message = Mock()
     message.chat = SimpleNamespace(id=100, is_forum=True)

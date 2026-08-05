@@ -12,6 +12,7 @@ from typing import Any
 from prometheus_client import CollectorRegistry, Counter, Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
+from .bot_pool import BotPool
 from .outbound import QUEUED_OPERATIONS, OutboundQueue
 
 _PRIORITIES = frozenset({"blocking", "normal"})
@@ -125,13 +126,17 @@ class MetricsServer:
     def server_close(self) -> None:
         self._server.server_close()
 
+    def stop(self, join_timeout: float) -> None:
+        """Stop serving and close the socket before joining its thread."""
+        if self.thread.is_alive():
+            self.shutdown()
+        self.server_close()
+        if self.thread.is_alive() and self.thread.ident != threading.get_ident():
+            self.thread.join(timeout=join_timeout)
+
     @property
     def server_address(self) -> tuple[str, int]:
         return self._server.server_address
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._server, name)
-
 
 class Metrics:
     """Expose bounded queue lifecycle metrics and pull-based runtime snapshots."""
@@ -459,3 +464,30 @@ def start_metrics_server(host: str, port: int, registry: CollectorRegistry) -> M
     metrics_server = MetricsServer(server, thread)
     logging.getLogger(__name__).info("Metrics endpoint listening on %s", metrics_server.server_address)
     return metrics_server
+
+
+def configure_runtime_metrics(
+    config: Mapping[str, object],
+    database: Any,
+    bot_pool: BotPool | None,
+    outbound_queue: OutboundQueue,
+    logger: logging.Logger,
+) -> tuple[Metrics, MetricsServer | None]:
+    """Attach scrape callbacks to the live delivery collaborators."""
+    top_n, endpoint = parse_metrics_config(config.get("metrics"), logger)
+    metrics = Metrics(namespace="etm")
+    database.set_metrics(metrics)
+    if bot_pool:
+        for auxiliary in bot_pool.bots:
+            auxiliary.bind_metrics(metrics)
+    metrics.register_outbound_queue_collectors(outbound_queue, top_n)
+    metrics.register_auxiliary_count_collector(
+        bot_pool.auxiliary_count_snapshot if bot_pool else lambda: {"enabled": 0, "disabled": 0}
+    )
+    metrics.register_membership_cache_collector(
+        bot_pool.membership_cache_snapshot if bot_pool else lambda: {"member": 0, "not_member": 0, "unknown_probe_pending": 0}
+    )
+    metrics.register_rate_limit_occupancy_collector(outbound_queue.rate_limit_occupancy_snapshot)
+    if endpoint is None:
+        return metrics, None
+    return metrics, start_metrics_server(*endpoint, registry=metrics.registry)

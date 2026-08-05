@@ -38,24 +38,25 @@ class CommandsManager(LocaleMixin):
 
     def __init__(self, channel: "TelegramChannel"):
         self.channel: "TelegramChannel" = channel
-        self.bot = channel.bot_manager
+        self.bot = channel.bot_manager.api
+        self.runtime = channel.telegram_runtime
         self.msg_storage: Dict[Tuple[int, int], ETMCommandMsgStorage] = dict()
         self.logger = logging.getLogger(__name__)
 
-        self.bot.dispatcher.add_handler(CommandHandler("extra", self.bot.as_async_callback(self.extra_listing)))
-        self.bot.dispatcher.add_handler(MessageHandler(Filters.regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"), self.bot.as_async_callback(self.extra_usage)))
-        self.bot.dispatcher.add_handler(MessageHandler(Filters.regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"), self.bot.as_async_callback(self.extra_call)))
+        self.runtime.application.add_handler(CommandHandler("extra", self.runtime.as_async_callback(self.extra_listing)))
+        self.runtime.application.add_handler(MessageHandler(Filters.regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"), self.runtime.as_async_callback(self.extra_usage)))
+        self.runtime.application.add_handler(MessageHandler(Filters.regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"), self.runtime.as_async_callback(self.extra_call)))
 
         self.command_conv = ConversationHandler(
             entry_points=[],
-            states={Flags.COMMAND_PENDING: [CallbackQueryHandler(self.bot.as_async_callback(self.command_exec))]},
-            fallbacks=[CallbackQueryHandler(self.bot.as_async_callback(self.bot.session_expired))],
+            states={Flags.COMMAND_PENDING: [CallbackQueryHandler(self.runtime.as_async_callback(self.command_exec))]},
+            fallbacks=[CallbackQueryHandler(self.runtime.as_async_callback(self.bot.session_expired))],
             per_message=True,
             per_chat=True,
             per_user=False,
         )
 
-        self.bot.dispatcher.add_handler(self.command_conv)
+        self.runtime.application.add_handler(self.command_conv)
 
         self.modules_list: List[Union[SlaveChannel, Middleware]] = []
         for i in sorted(coordinator.slaves.keys()):

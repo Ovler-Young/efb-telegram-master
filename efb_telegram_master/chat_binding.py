@@ -38,9 +38,9 @@ from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, Teleg
 
 if TYPE_CHECKING:
     from . import TelegramChannel
-    from .bot_manager import TelegramBotManager
     from .chat_object_cache import ChatObjectCacheManager
     from .db import DatabaseManager
+    from .telegram_api import TelegramAPI
 
 __all__ = ["ChatBindingManager"]
 
@@ -108,7 +108,8 @@ class ChatBindingManager(LocaleMixin):
 
     def __init__(self, channel: "TelegramChannel"):
         self.channel: "TelegramChannel" = channel
-        self.bot: "TelegramBotManager" = channel.bot_manager
+        self.bot: "TelegramAPI" = channel.bot_manager.api
+        self.runtime = channel.telegram_runtime
         self.db: "DatabaseManager" = channel.db
         self.chat_manager: "ChatObjectCacheManager" = channel.chat_manager
         self._topic_mutex = threading.Lock()
@@ -119,56 +120,56 @@ class ChatBindingManager(LocaleMixin):
 
         # Link handler
         non_edit_filter = Filters.update.message | Filters.update.channel_post
-        self.bot.dispatcher.add_handler(CommandHandler("link", self.bot.as_async_callback(self.link_chat_show_list), filters=non_edit_filter))
+        self.runtime.application.add_handler(CommandHandler("link", self.runtime.as_async_callback(self.link_chat_show_list), filters=non_edit_filter))
         self.link_handler = ConversationHandler(
             entry_points=[],
             states={
-                Flags.LINK_CONFIRM: [CallbackQueryHandler(self.bot.as_async_callback(self.link_chat_confirm))],
-                Flags.LINK_EXEC: [CallbackQueryHandler(self.bot.as_async_callback(self.link_chat_exec))],
+                Flags.LINK_CONFIRM: [CallbackQueryHandler(self.runtime.as_async_callback(self.link_chat_confirm))],
+                Flags.LINK_EXEC: [CallbackQueryHandler(self.runtime.as_async_callback(self.link_chat_exec))],
             },
-            fallbacks=[CallbackQueryHandler(self.bot.as_async_callback(self.bot.session_expired))],
+            fallbacks=[CallbackQueryHandler(self.runtime.as_async_callback(self.bot.session_expired))],
             per_message=True,
             per_chat=True,
             per_user=False,
         )
-        self.bot.dispatcher.add_handler(self.link_handler)
+        self.runtime.application.add_handler(self.link_handler)
 
         # Chat head handler
-        self.bot.dispatcher.add_handler(CommandHandler("chat", self.bot.as_async_callback(self.start_chat_list), filters=non_edit_filter))
+        self.runtime.application.add_handler(CommandHandler("chat", self.runtime.as_async_callback(self.start_chat_list), filters=non_edit_filter))
         self.chat_head_handler = ConversationHandler(
             entry_points=[],
             states={
-                Flags.CHAT_HEAD_CONFIRM: [CallbackQueryHandler(self.bot.as_async_callback(self.make_chat_head))],
+                Flags.CHAT_HEAD_CONFIRM: [CallbackQueryHandler(self.runtime.as_async_callback(self.make_chat_head))],
             },
-            fallbacks=[CallbackQueryHandler(self.bot.as_async_callback(self.bot.session_expired))],
+            fallbacks=[CallbackQueryHandler(self.runtime.as_async_callback(self.bot.session_expired))],
             per_message=True,
             per_chat=True,
             per_user=False,
         )
-        self.bot.dispatcher.add_handler(self.chat_head_handler)
+        self.runtime.application.add_handler(self.chat_head_handler)
 
         # Unlink all
-        self.bot.dispatcher.add_handler(CommandHandler("unlink_all", self.bot.as_async_callback(self.unlink_all)))
+        self.runtime.application.add_handler(CommandHandler("unlink_all", self.runtime.as_async_callback(self.unlink_all)))
 
         # Recipient suggestion
         self.suggestion_handler: ConversationHandler = ConversationHandler(
             entry_points=[],
-            states={Flags.SUGGEST_RECIPIENTS: [CallbackQueryHandler(self.bot.as_async_callback(self.suggested_recipient))]},
-            fallbacks=[CallbackQueryHandler(self.bot.as_async_callback(self.bot.session_expired))],
+            states={Flags.SUGGEST_RECIPIENTS: [CallbackQueryHandler(self.runtime.as_async_callback(self.suggested_recipient))]},
+            fallbacks=[CallbackQueryHandler(self.runtime.as_async_callback(self.bot.session_expired))],
             per_message=True,
             per_chat=True,
             per_user=False,
         )
 
-        self.bot.dispatcher.add_handler(self.suggestion_handler)
+        self.runtime.application.add_handler(self.suggestion_handler)
 
         # Update group title and profile picture
-        self.bot.dispatcher.add_handler(CommandHandler("update_info", self.bot.as_async_callback(self.update_group_info)))
-        self.bot.dispatcher.add_handler(CommandHandler("init_topics", self.bot.as_async_callback(self.topic_migration)))
+        self.runtime.application.add_handler(CommandHandler("update_info", self.runtime.as_async_callback(self.update_group_info)))
+        self.runtime.application.add_handler(CommandHandler("init_topics", self.runtime.as_async_callback(self.topic_migration)))
 
-        self.bot.dispatcher.add_handler(MessageHandler(Filters.status_update.migrate, self.bot.as_async_callback(self.chat_migration)))
-        self.bot.dispatcher.add_handler(MessageHandler(Filters.status_update.new_chat_members, self.bot.as_async_callback(self.chat_joined)))
-        self.bot.dispatcher.add_handler(MessageHandler(Filters.status_update.left_chat_member, self.bot.as_async_callback(self.chat_left)))
+        self.runtime.application.add_handler(MessageHandler(Filters.status_update.migrate, self.runtime.as_async_callback(self.chat_migration)))
+        self.runtime.application.add_handler(MessageHandler(Filters.status_update.new_chat_members, self.runtime.as_async_callback(self.chat_joined)))
+        self.runtime.application.add_handler(MessageHandler(Filters.status_update.left_chat_member, self.runtime.as_async_callback(self.chat_left)))
         self.resume_pending_history_migrations()
 
     @staticmethod
@@ -188,10 +189,10 @@ class ChatBindingManager(LocaleMixin):
         conversations.pop(key, None)
 
     def _get_bot_user(self) -> telegram.User:
-        bot_user = self.bot.me
+        bot_user = self.runtime.me
         if bot_user is None:
             bot_user = self.bot.get_me()
-            self.bot.me = bot_user
+            self.runtime.me = bot_user
         return bot_user
 
     def pre_link_check(self, message: Message):
@@ -203,7 +204,7 @@ class ChatBindingManager(LocaleMixin):
         """
         err_msg = []
 
-        # self.bot.me is not refreshed after startup, need to refresh it here
+        # Runtime identity is refreshed here after a startup credential change.
         # to check if user has updated the setting with bot father.
         # Assuming user will not revert the settings back.
 
@@ -211,7 +212,7 @@ class ChatBindingManager(LocaleMixin):
         bot_user = self._get_bot_user()
         if not bot_user.can_join_groups or not bot_user.can_read_all_group_messages:
             bot_user = self.bot.get_me()
-            self.bot.me = bot_user
+            self.runtime.me = bot_user
 
         if not bot_user.can_join_groups:
             err_msg.append(self._("This bot cannot join groups. Chat linking might not work properly. Please enable this setting with @BotFather."))
@@ -1377,7 +1378,7 @@ class ChatBindingManager(LocaleMixin):
 
     def _run_msglog_ingestion(self, source_chat_id: int) -> None:
         try:
-            self.bot._runtime.call(
+            self.runtime.async_runtime.call(
                 MsgLogIngestionService(self.db, self.channel.mtproto).run(
                     source_chat_id,
                     lease_owner=str(uuid.uuid4()),

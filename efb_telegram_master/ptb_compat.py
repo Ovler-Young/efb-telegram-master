@@ -76,7 +76,7 @@ def get_forwarded_chat(message: Message) -> Chat | None:
 
 
 def sync_reply_text(
-    bot_manager: SupportsSendMessage,
+    bot_api: SupportsSendMessage,
     message: Message,
     text: str,
     *,
@@ -88,11 +88,11 @@ def sync_reply_text(
         kwargs.setdefault("message_thread_id", thread_id)
     if quote:
         kwargs.setdefault("reply_to_message_id", message.message_id)
-    return bot_manager.send_message(message.chat.id, text=text, **kwargs)
+    return bot_api.send_message(message.chat.id, text=text, **kwargs)
 
 
 def sync_reply_html(
-    bot_manager: SupportsSendMessage,
+    bot_api: SupportsSendMessage,
     message: Message,
     text: str,
     *,
@@ -100,4 +100,4 @@ def sync_reply_html(
     **kwargs: object,
 ) -> MessageIdentifier:
     kwargs.setdefault("parse_mode", "HTML")
-    return sync_reply_text(bot_manager, message, text, quote=quote, **kwargs)
+    return sync_reply_text(bot_api, message, text, quote=quote, **kwargs)

@@ -6,12 +6,66 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Sequence
-from typing import Optional
+from collections.abc import Mapping, Sequence
+from typing import Optional, Protocol, cast
 
 from .auxiliary_bot import AuxiliaryBot
+from .telegram_runtime import AsyncTelegramRuntime, TelegramPollingRuntime
+from .utils import normalize_request_kwargs
 
 logger = logging.getLogger(__name__)
+
+
+class ChannelFlags(Protocol):
+    def flag(self, name: str) -> object: ...
+
+
+def build_bot_pool(
+    auxiliary_configs: object,
+    config: Mapping[str, object],
+    channel: ChannelFlags,
+    runtime: AsyncTelegramRuntime,
+    logger: logging.Logger,
+) -> "BotPool | None":
+    """Construct the valid, available auxiliary bots declared in configuration."""
+    if not isinstance(auxiliary_configs, list):
+        return None
+    request_config: dict[str, object] = {
+        "read_timeout": 15.0,
+        "connection_pool_size": TelegramPollingRuntime._default_connection_pool_size(config),
+    }
+    configured_request_kwargs = config.get("request_kwargs")
+    if isinstance(configured_request_kwargs, Mapping):
+        request_config.update(configured_request_kwargs)
+    request_kwargs = normalize_request_kwargs(request_config)
+    main_token = config["token"]
+    seen_tokens = {main_token}
+    bots: list[AuxiliaryBot] = []
+    for entry in auxiliary_configs:
+        if not isinstance(entry, dict) or not isinstance(entry.get("token"), str):
+            logger.warning("Skipping invalid auxiliary bot configuration", extra={"event": "telegram_bot.auxiliary_configuration_invalid", "entry_type": type(entry).__name__})
+            continue
+        token = entry["token"]
+        if token in seen_tokens:
+            logger.warning("Skipping duplicate auxiliary bot", extra={"event": "telegram_bot.auxiliary_duplicate"})
+            continue
+        seen_tokens.add(token)
+        bot = AuxiliaryBot(
+            token=token,
+            request_kwargs=request_kwargs,
+            base_url=cast(str | None, channel.flag("api_base_url") or None),
+            base_file_url=cast(str | None, channel.flag("api_base_file_url") or None),
+            local_mode=bool(channel.flag("local_tdlib_api")),
+        )
+        bot.bind_runtime(runtime)
+        if bot.initialize():
+            bots.append(bot)
+        else:
+            logger.error("Skipping unavailable auxiliary bot", extra={"event": "telegram_bot.auxiliary_unavailable"})
+    if not bots:
+        return None
+    logger.info("Initialized auxiliary bot pool", extra={"event": "telegram_bot.auxiliary_initialized", "bot_count": len(bots)})
+    return BotPool(bots)
 
 
 class BotPool:

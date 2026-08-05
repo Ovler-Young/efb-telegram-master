@@ -9,7 +9,7 @@ import threading
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from functools import wraps
-from typing import Coroutine, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Coroutine, Literal, NotRequired, Optional, ParamSpec, TypedDict, TypeVar, cast
 
 import telegram
 import telegram.error
@@ -19,6 +19,7 @@ from telegram.request import HTTPXRequest
 from .utils import normalize_request_kwargs
 
 T = TypeVar("T")
+P = ParamSpec("P")
 BotMethod = Callable[..., object]
 LifecycleCallback = Callable[["TelegramPollingRuntime"], Awaitable[None]]
 
@@ -200,6 +201,21 @@ class TelegramPollingRuntime:
     @application.setter
     def application(self, application: Application) -> None:
         self._application = application
+
+    def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            return await asyncio.to_thread(callback, *args, **kwargs)
+
+        return wrapper
+
+    def add_base_dispatchers(self, admins: object, update_locale: Callable[..., object]) -> None:
+        from telegram import Update
+        from telegram.ext import MessageHandler, TypeHandler
+
+        from .ptb_compat import Filters
+
+        self.application.add_handler(MessageHandler(~Filters.user(user_id=cast(int | Collection[int] | None, admins)), self.as_async_callback(lambda update, context: None)))
+        self.application.add_handler(TypeHandler(Update, self.as_async_callback(update_locale)), group=-1)
 
     @staticmethod
     def _default_connection_pool_size(config: Mapping[str, object]) -> int:

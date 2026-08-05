@@ -98,11 +98,11 @@ class ETMMsg(Message):
     def _load_file(self):
         if self.file_id:
             # noinspection PyUnresolvedReferences
-            bot_manager = coordinator.master.bot_manager
+            api = coordinator.master.bot_manager.api
             # Route get_file through the correct bot based on sender_bot_id.
             file_bot = None
             if self.sender_bot_id:
-                bot_pool = getattr(bot_manager, "bot_pool", None)
+                bot_pool = api.bot_pool
                 if bot_pool:
                     aux_bot = bot_pool.get_bot_by_id(self.sender_bot_id)
                     if aux_bot and not aux_bot.disabled:
@@ -112,12 +112,12 @@ class ETMMsg(Message):
                 if file_bot:
                     file_meta = file_bot.get_file(self.file_id)
                 else:
-                    file_meta = bot_manager.get_file(self.file_id)
+                    file_meta = api.get_file(self.file_id)
             except BadRequest as e:
                 if file_bot:
                     logger.warning("Auxiliary bot file lookup failed (%s); trying main bot.", type(e).__name__)
                     try:
-                        file_meta = bot_manager.get_file(self.file_id)
+                        file_meta = api.get_file(self.file_id)
                     except BadRequest as e2:
                         logger.exception("Main bot file lookup failed (%s).", type(e2).__name__)
                         return
@@ -126,7 +126,7 @@ class ETMMsg(Message):
                     return
             ext = os.path.splitext(file_meta.file_path)[1]
             file = tempfile.NamedTemporaryFile(suffix=ext)
-            bot_manager._runtime.call(
+            coordinator.master.telegram_runtime.async_runtime.call(
                 file_meta.download_to_memory(out=file),
                 timeout=FILE_DOWNLOAD_TIMEOUT,
             )
