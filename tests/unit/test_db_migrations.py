@@ -236,6 +236,88 @@ def test_sqlite_to_postgresql_transfer_preserves_msglog_provenance(tmp_path):
         database.initialize(original_database)
 
 
+def test_sqlite_to_postgresql_transfer_preserves_msglog_ingestion_scans(tmp_path):
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    source_path = tmp_path / "ingestion-scans.db"
+    source_db = SqliteDatabase(source_path)
+    source_db.connect()
+    try:
+        source_db.execute_sql(
+            "CREATE TABLE chatassoc (master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "CREATE TABLE slavechatinfo (slave_channel_id TEXT NOT NULL, "
+            "slave_channel_emoji TEXT NOT NULL, slave_chat_uid TEXT NOT NULL, "
+            "slave_chat_name TEXT NOT NULL, slave_chat_type TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, "
+            "text TEXT NOT NULL, slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, "
+            "sent_to TEXT NOT NULL)"
+        )
+        with source_db.bind_ctx([MsgLogIngestionScan]):
+            source_db.create_tables([MsgLogIngestionScan])
+            MsgLogIngestionScan.insert_many([
+                {
+                    "source_chat_id": "-1001", "scan_boundary": 900, "cursor": 700,
+                    "existing_streak": 20, "scanned_count": 200, "inserted_count": 120,
+                    "existing_count": 60, "skipped_count": 20, "status": "pending",
+                    "lease_owner": None, "lease_expires_at": None, "error": "retry later",
+                    "created_at": datetime(2026, 8, 4, 10, 0),
+                    "updated_at": datetime(2026, 8, 4, 11, 0),
+                },
+                {
+                    "source_chat_id": "-1002", "scan_boundary": 800, "cursor": 650,
+                    "existing_streak": 11, "scanned_count": 150, "inserted_count": 75,
+                    "existing_count": 50, "skipped_count": 25, "status": "running",
+                    "lease_owner": "worker-2",
+                    "lease_expires_at": datetime(2026, 8, 4, 12, 30),
+                    "error": None,
+                    "created_at": datetime(2026, 8, 4, 9, 0),
+                    "updated_at": datetime(2026, 8, 4, 12, 0),
+                },
+            ]).execute()
+    finally:
+        source_db.close()
+
+    destination_db = SqliteDatabase(tmp_path / "destination-with-scans.db")
+    database.initialize(destination_db)
+    destination_db.connect()
+    manager = object.__new__(DatabaseManager)
+    try:
+        manager._migrate_from_sqlite(source_path)
+        rows = {
+            row.source_chat_id: row
+            for row in MsgLogIngestionScan.select().order_by(MsgLogIngestionScan.source_chat_id)
+        }
+        pending = rows["-1001"]
+        assert (
+            pending.scan_boundary, pending.cursor, pending.existing_streak,
+            pending.scanned_count, pending.inserted_count, pending.existing_count,
+            pending.skipped_count, pending.status, pending.error,
+        ) == (900, 700, 20, 200, 120, 60, 20, "pending", "retry later")
+        assert (pending.lease_owner, pending.lease_expires_at) == (None, None)
+        assert (pending.created_at, pending.updated_at) == (
+            datetime(2026, 8, 4, 10, 0), datetime(2026, 8, 4, 11, 0),
+        )
+
+        running = rows["-1002"]
+        assert (
+            running.scan_boundary, running.cursor, running.existing_streak,
+            running.scanned_count, running.inserted_count, running.existing_count,
+            running.skipped_count, running.status, running.lease_owner,
+        ) == (800, 650, 11, 150, 75, 50, 25, "running", "worker-2")
+        assert running.lease_expires_at == datetime(2026, 8, 4, 12, 30)
+        assert (running.created_at, running.updated_at) == (
+            datetime(2026, 8, 4, 9, 0), datetime(2026, 8, 4, 12, 0),
+        )
+    finally:
+        destination_db.close()
+        database.initialize(original_database)
+
+
 def test_resumable_msglog_ingestion_scans_include_unleased_and_expired_running_jobs():
     from peewee import SqliteDatabase
 
@@ -541,6 +623,49 @@ def test_msglog_queue_id_reconciliation_reuses_the_existing_row():
 
         assert MsgLog.select().count() == 1
         assert MsgLog.get().delivery_queue_id == "queue-reconcile"
+
+
+def test_live_message_persistence_replaces_ingested_msglog_contents_and_provenance():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    message = SimpleNamespace(
+        uid=MessageID("real-slave-message"),
+        chat=SimpleNamespace(module_id="tests.slave", uid="real-chat"),
+        author=SimpleNamespace(module_id="tests.slave", uid="real-author"),
+        text="live text", type=MsgType.Image, type_telegram=TGMsgType.Photo,
+        deliver_to=SimpleNamespace(channel_id="tests.master"),
+        file_id="real-file-id", file_unique_id="real-file-unique-id", mime="image/jpeg",
+        is_system=True, attributes=None, commands=None, substitutions=None,
+        target=None, sender_bot_id="real-sender-bot", reactions={},
+    )
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        MsgLog.create(
+            master_msg_id="100.1", slave_message_id="mtproto-ingested:100.1",
+            text="ingested text", slave_origin_uid="tests.slave stale-chat",
+            slave_member_uid="tests.slave __self__", msg_type=MsgType.Text.name,
+            sent_to="tests.master", media_type=TGMsgType.Text.value,
+            provenance="mtproto_ingested",
+        )
+
+        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=1))
+
+        row = MsgLog.get_by_id("100.1")
+        assert row.provenance == "live"
+        assert row.slave_message_id == "real-slave-message"
+        assert row.text == "live text"
+        assert row.slave_origin_uid == "tests.slave real-chat"
+        assert row.slave_member_uid == "tests.slave real-author"
+        assert (row.msg_type, row.media_type, row.mime) == (
+            MsgType.Image.name, TGMsgType.Photo.value, "image/jpeg",
+        )
+        assert (row.file_id, row.file_unique_id) == ("real-file-id", "real-file-unique-id")
+        assert (row.sent_to, row.sender_bot_id) == ("tests.master", "real-sender-bot")
+        assert pickle.loads(bytes(row.pickle)) == {"is_system": True}
 
 
 def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
