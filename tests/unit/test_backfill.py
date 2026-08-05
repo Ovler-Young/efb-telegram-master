@@ -25,9 +25,8 @@ def _build_link_update(chat_id, *, is_forum=False):
     return Update(update_id=1, message=message)
 
 
-def _store_link_session(channel, chat, storage_key, backfill_mode=None):
+def _store_link_session(channel, chat, storage_key):
     storage = ChatListStorage([channel.chat_manager.update_chat_obj(chat)])
-    storage.backfill_mode = backfill_mode
     channel.chat_binding.msg_storage[storage_key] = storage
 
 
@@ -50,7 +49,7 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    _store_link_session(channel, chat, storage_key)
     ChatBindingManager._set_conversation_state(channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC)
     update = _build_link_update(bot_group)
 
@@ -74,7 +73,7 @@ def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
     chat = channel.chat_manager.update_chat_obj(slave.chat_with_alias)
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(106))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    _store_link_session(channel, chat, storage_key)
     ChatBindingManager._set_conversation_state(channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC)
     update = _build_link_update(bot_group)
 
@@ -90,7 +89,7 @@ def test_link_chat_edits_status_message_with_sender_bot(channel, slave, bot_grou
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(105))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    _store_link_session(channel, chat, storage_key)
     update = _build_link_update(bot_group)
 
     sent_message = _sent_link_message(bot_group, 505, sender_bot_id="8465204282")
@@ -114,7 +113,7 @@ def test_link_chat_auto_mode_sends_history_link_on_relink(channel, slave, bot_gr
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(102))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    _store_link_session(channel, chat, storage_key)
     master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
     channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
     update = _build_link_update(bot_group)
@@ -134,11 +133,12 @@ def test_link_chat_auto_mode_sends_history_link_on_relink(channel, slave, bot_gr
     _cleanup_link_state(channel, chat, bot_group)
 
 
-def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
+@pytest.mark.parametrize("backfill_flag", ["true", "yes"])
+def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group, backfill_flag):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(103))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    _store_link_session(channel, chat, storage_key)
     master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
     channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
     update = _build_link_update(bot_group)
@@ -151,7 +151,7 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history,
         patch.object(channel.chat_binding, "send_history_link") as send_history_link,
     ):
-        channel.chat_binding.link_chat(update, [token, "true"])
+        channel.chat_binding.link_chat(update, [token, backfill_flag])
 
     migrate_chat_history.assert_called_once()
     send_history_link.assert_not_called()
@@ -162,7 +162,7 @@ def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(104))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    _store_link_session(channel, chat, storage_key)
     master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
     channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
     update = _build_link_update(bot_group)
@@ -238,7 +238,7 @@ def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channe
         waiter.set_result(None)
         waiters.append(waiter)
     with patch.object(channel.db, "get_recent_messages", return_value=msg_logs), patch.object(channel.bot_manager.outbound_queue, "enqueue", side_effect=waiters) as enqueue:
-        channel.chat_binding._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
+        channel.chat_binding._queue_and_process_history_migration("tests.mocks.slave.chat", 12345)
 
     assert enqueue.call_count == 4
     assert [call.args[0].operation for call in enqueue.call_args_list] == [

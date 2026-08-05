@@ -66,9 +66,6 @@ class ChatListStorage:
         self.offset: int = offset
         self.update: Optional[Update] = None
         self.candidates: Optional[List[EFBChannelChatIDStr]] = None
-        # None = auto (backfill on first link, skip on relink)
-        # True = always backfill, False = never backfill
-        self.backfill_mode: Optional[bool] = None
 
     @property
     def length(self) -> int:
@@ -653,9 +650,6 @@ class ChatBindingManager(LocaleMixin):
         )
 
         self.bot.edit_message_text(chat_id=storage_key[0], message_id=storage_key[1], text=txt)
-        backfill_mode = data.backfill_mode  # None=auto, True=always, False=never
-        if backfill_override is not None:
-            backfill_mode = backfill_override
         self.msg_storage.pop(storage_key, None)
         self._clear_conversation_state(self.link_handler, storage_key)
 
@@ -663,8 +657,8 @@ class ChatBindingManager(LocaleMixin):
         # auto:   backfill on first link, send history link on relink
         # True:   always backfill (even on relink)
         # False:  skip both (user opted out)
-        do_backfill = (backfill_mode is True) or (backfill_mode is None and not is_relink)
-        do_history_link = backfill_mode is None and is_relink
+        do_backfill = backfill_override is True or (backfill_override is None and not is_relink)
+        do_history_link = backfill_override is None and is_relink
 
         if do_backfill:
             try:
@@ -1397,16 +1391,6 @@ class ChatBindingManager(LocaleMixin):
             source_chat_id = int(scan.source_chat_id)
             if self.db.get_topic_slaves(TelegramChatID(source_chat_id)):
                 self.schedule_msglog_ingestion(source_chat_id)
-
-    def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
-        """Background method that performs the actual migration work.
-
-        Args:
-            slave_chat_id: The slave chat identifier
-            tg_chat_id: The Telegram chat ID to migrate messages to
-            thread_id: Optional thread ID for forum groups
-        """
-        self._queue_and_process_history_migration(slave_chat_id, tg_chat_id, thread_id)
 
     def resume_pending_history_migrations(self):
         try:
