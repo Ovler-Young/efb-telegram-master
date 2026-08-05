@@ -196,6 +196,37 @@ async def test_runtime_logs_lifecycle_callback_failure_with_error_type() -> None
     )
 
 
+@pytest.mark.asyncio
+async def test_shutdown_failures_log_events_and_error_types() -> None:
+    runtime = object.__new__(TelegramPollingRuntime)
+    runtime.logger = Mock()
+
+    async def fail(*_args: object) -> None:
+        raise RuntimeError("failed")
+
+    runtime.application = SimpleNamespace(
+        updater=SimpleNamespace(running=True, stop=fail),
+        running=True,
+        stop=fail,
+        post_stop=fail,
+        shutdown=fail,
+        post_shutdown=fail,
+    )
+
+    await runtime._shutdown_application()
+
+    assert [entry.kwargs["extra"] for entry in runtime.logger.exception.call_args_list] == [
+        {"event": event, "error_type": "RuntimeError"}
+        for event in (
+            "telegram_runtime.updater_stop_failed",
+            "telegram_runtime.application_stop_failed",
+            "telegram_runtime.post_stop_failed",
+            "telegram_runtime.shutdown_failed",
+            "telegram_runtime.post_shutdown_failed",
+        )
+    ]
+
+
 def test_webhook_poll_logs_start_and_stop_events() -> None:
     runtime = object.__new__(TelegramPollingRuntime)
     runtime.logger = Mock()

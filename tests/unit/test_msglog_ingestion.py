@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from efb_telegram_master.db import MsgLogIngestionLeaseLostError
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.mtproto import MTProtoRetryableError
 
@@ -171,4 +172,42 @@ def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_c
     assert db.scan.status == "retryable-error"
     assert db.scan.error == "temporary"
     assert db.scan.cursor == 5
-    assert [record.event for record in caplog.records] == ["msglog_ingestion.start", "msglog_ingestion.retry"]
+    assert [(record.event, getattr(record, "error_type", None)) for record in caplog.records] == [
+        ("msglog_ingestion.start", None),
+        ("msglog_ingestion.retry", "MTProtoRetryableError"),
+    ]
+
+
+def test_ingestion_logs_lease_loss_with_a_stable_event(caplog):
+    db = FakeDatabase(scan_boundary=5)
+    mtproto = FakeMTProto({}, scan_ceiling=5)
+
+    async def lose_lease(_source_chat_id):
+        raise MsgLogIngestionLeaseLostError()
+
+    mtproto.get_input_channel = lose_lease
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+        asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
+
+    assert [(record.event, getattr(record, "error_type", None)) for record in caplog.records] == [
+        ("msglog_ingestion.start", None),
+        ("msglog_ingestion.lease_lost", None),
+    ]
+
+
+def test_ingestion_logs_unexpected_failure_with_error_type(caplog):
+    db = FakeDatabase(scan_boundary=5)
+    mtproto = FakeMTProto({}, scan_ceiling=5)
+
+    async def fail(_source_chat_id):
+        raise ValueError("failed")
+
+    mtproto.get_input_channel = fail
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+        asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
+
+    assert db.scan.status == "error"
+    assert [(record.event, getattr(record, "error_type", None)) for record in caplog.records] == [
+        ("msglog_ingestion.start", None),
+        ("msglog_ingestion.error", "ValueError"),
+    ]

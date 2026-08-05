@@ -272,27 +272,27 @@ class TelegramPollingRuntime:
             updater = self.application.updater
             if updater is not None and updater.running:
                 await updater.stop()
-        except Exception:
-            self.logger.exception("Telegram updater stop failed", extra={"event": "telegram_runtime.updater_stop_failed"})
+        except Exception as error:
+            self.logger.exception("Telegram updater stop failed", extra={"event": "telegram_runtime.updater_stop_failed", "error_type": type(error).__name__})
         try:
             if self.application.running:
                 await self.application.stop()
-        except Exception:
-            self.logger.exception("Telegram application stop failed", extra={"event": "telegram_runtime.application_stop_failed"})
+        except Exception as error:
+            self.logger.exception("Telegram application stop failed", extra={"event": "telegram_runtime.application_stop_failed", "error_type": type(error).__name__})
         try:
             if self.application.post_stop:
                 await self.application.post_stop(self.application)
-        except Exception:
-            self.logger.exception("Telegram post-stop hook failed", extra={"event": "telegram_runtime.post_stop_failed"})
+        except Exception as error:
+            self.logger.exception("Telegram post-stop hook failed", extra={"event": "telegram_runtime.post_stop_failed", "error_type": type(error).__name__})
         try:
             await self.application.shutdown()
-        except Exception:
-            self.logger.exception("Telegram application shutdown failed", extra={"event": "telegram_runtime.shutdown_failed"})
+        except Exception as error:
+            self.logger.exception("Telegram application shutdown failed", extra={"event": "telegram_runtime.shutdown_failed", "error_type": type(error).__name__})
         try:
             if self.application.post_shutdown:
                 await self.application.post_shutdown(self.application)
-        except Exception:
-            self.logger.exception("Telegram post-shutdown hook failed", extra={"event": "telegram_runtime.post_shutdown_failed"})
+        except Exception as error:
+            self.logger.exception("Telegram post-shutdown hook failed", extra={"event": "telegram_runtime.post_shutdown_failed", "error_type": type(error).__name__})
 
     def poll(self, drop_pending_updates: bool = False, timeout: int = 10) -> None:
         if self._webhook is not None:

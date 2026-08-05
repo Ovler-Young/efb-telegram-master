@@ -90,7 +90,7 @@ class MsgLogIngestionService:
             self.db.finish_msglog_ingestion_scan(scan, status="complete", lease_owner=lease_owner)
             self._log_event("complete", source_chat_id)
         except MsgLogIngestionLeaseLostError:
-            self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id)
+            self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id, extra={"event": "msglog_ingestion.lease_lost"})
         except MTProtoRetryableError as error:
             self.db.finish_msglog_ingestion_scan(
                 scan,
@@ -98,7 +98,7 @@ class MsgLogIngestionService:
                 error=str(error),
                 lease_owner=lease_owner,
             )
-            self.logger.warning("MsgLog ingestion retained at cursor %d (%s)", scan.cursor, type(error).__name__, extra={"event": "msglog_ingestion.retry"})
+            self.logger.warning("MsgLog ingestion retained at cursor %d (%s)", scan.cursor, type(error).__name__, extra={"event": "msglog_ingestion.retry", "error_type": type(error).__name__})
         except Exception as error:
             self.db.finish_msglog_ingestion_scan(
                 scan,
@@ -106,7 +106,7 @@ class MsgLogIngestionService:
                 error=str(error),
                 lease_owner=lease_owner,
             )
-            self.logger.exception("MsgLog ingestion failed at cursor %d", scan.cursor, extra={"event": "msglog_ingestion.error"})
+            self.logger.exception("MsgLog ingestion failed at cursor %d", scan.cursor, extra={"event": "msglog_ingestion.error", "error_type": type(error).__name__})
 
     def _classify(
         self,
