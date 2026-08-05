@@ -10,12 +10,10 @@ from collections.abc import Awaitable, Callable, Collection, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from functools import wraps
 from typing import Coroutine, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
-from unittest.mock import patch
 
 import telegram
 import telegram.error
 from telegram.ext import Application
-from telegram.ext import _applicationbuilder as ptb_applicationbuilder
 from telegram.request import HTTPXRequest
 
 from .utils import normalize_request_kwargs
@@ -168,18 +166,13 @@ def build_request(request_kwargs: Mapping[str, object]) -> HTTPXRequest:
     )
 
 
-class _UnusedJobQueueStub:
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        pass
-
-
 class TelegramPollingRuntime:
     """Own one PTB application and its explicit polling lifecycle."""
 
     def __init__(
         self,
         logger: logging.Logger,
-        application: Application,
+        application: Application | None,
         async_bot: telegram.Bot,
         async_runtime: AsyncTelegramRuntime,
         on_started: LifecycleCallback,
@@ -194,9 +187,19 @@ class TelegramPollingRuntime:
         self.async_runtime = async_runtime
         self.async_bot = async_bot
         self.bot = SyncBotFacade(self.async_bot, self.async_runtime)
-        self.application = application
+        self._application = application
         self.me: telegram.User | None = None
         self._webhook = webhook
+
+    @property
+    def application(self) -> Application:
+        if self._application is None:
+            raise RuntimeError("Telegram application has not been built.")
+        return self._application
+
+    @application.setter
+    def application(self, application: Application) -> None:
+        self._application = application
 
     @staticmethod
     def _default_connection_pool_size(config: Mapping[str, object]) -> int:
@@ -213,12 +216,25 @@ class TelegramPollingRuntime:
         self._shutdown_complete.clear()
         self.me = await self.async_bot.get_me()
         assert self.me, "Invalid bot credential provided."
-        await self._on_started(self)
+        try:
+            await self._on_started(self)
+        except Exception as error:
+            self.logger.exception(
+                "Telegram runtime start callback failed",
+                extra={"event": "telegram_runtime.start_callback_failed", "error_type": type(error).__name__},
+            )
+            raise
         self.logger.info("Telegram polling runtime started", extra={"event": "telegram_runtime.start"})
 
     async def _post_shutdown(self, _application: Application) -> None:
         try:
             await self._on_stopped(self)
+        except Exception as error:
+            self.logger.exception(
+                "Telegram runtime stop callback failed",
+                extra={"event": "telegram_runtime.stop_callback_failed", "error_type": type(error).__name__},
+            )
+            raise
         finally:
             self.async_runtime.clear_loop()
             self._shutdown_complete.set()
@@ -283,17 +299,31 @@ class TelegramPollingRuntime:
             start_webhook = self._webhook.get("start_webhook")
             if not isinstance(start_webhook, Mapping):
                 raise ValueError("webhook.start_webhook must be a mapping")
-            self.application.run_webhook(
-                **dict(start_webhook),
-                drop_pending_updates=drop_pending_updates,
-                close_loop=True,
-                stop_signals=None,
-            )
+            self.logger.info("Telegram webhook runtime starting", extra={"event": "telegram_runtime.webhook_start"})
+            try:
+                self.application.run_webhook(
+                    **dict(start_webhook),
+                    drop_pending_updates=drop_pending_updates,
+                    close_loop=True,
+                    stop_signals=None,
+                )
+            except BaseException as error:
+                self.logger.exception(
+                    "Telegram webhook lifecycle failed",
+                    extra={"event": "telegram_runtime.webhook_failed", "error_type": type(error).__name__},
+                )
+                raise
+            finally:
+                self._shutdown_complete.set()
+                self.logger.info("Telegram webhook runtime stopped", extra={"event": "telegram_runtime.webhook_stop"})
             return
         try:
             asyncio.run(self._run_application_lifecycle(drop_pending_updates=drop_pending_updates, timeout=timeout))
-        except BaseException:
-            self.logger.exception("Telegram polling lifecycle failed", extra={"event": "telegram_runtime.polling_failed"})
+        except BaseException as error:
+            self.logger.exception(
+                "Telegram polling lifecycle failed",
+                extra={"event": "telegram_runtime.polling_failed", "error_type": type(error).__name__},
+            )
             raise
         finally:
             self._stop_event = None
@@ -342,28 +372,25 @@ def build_telegram_polling_runtime(
     bot_kwargs: _BotArguments = {**identity, "request": build_request(request_kwargs), "get_updates_request": build_request(request_kwargs)}
     async_bot = telegram.Bot(**bot_kwargs)
     async_runtime = AsyncTelegramRuntime(logger)
-    runtime: TelegramPollingRuntime | None = None
-
-    async def post_init(application: Application) -> None:
-        assert runtime is not None
-        await runtime._post_init(application)
-
-    async def post_shutdown(application: Application) -> None:
-        assert runtime is not None
-        await runtime._post_shutdown(application)
-
-    with patch.object(ptb_applicationbuilder, "JobQueue", _UnusedJobQueueStub):
-        application = Application.builder().bot(async_bot).job_queue(None).post_init(post_init).post_shutdown(post_shutdown).build()
     webhook = config.get("webhook")
     runtime = TelegramPollingRuntime(
         logger,
-        application,
+        None,
         async_bot,
         async_runtime,
         on_started,
         on_stopped,
         cast(Mapping[str, object], webhook) if isinstance(webhook, Mapping) else None,
     )
+
+    async def post_init(application: Application) -> None:
+        await runtime._post_init(application)
+
+    async def post_shutdown(application: Application) -> None:
+        await runtime._post_shutdown(application)
+
+    application = Application.builder().bot(async_bot).job_queue(None).post_init(post_init).post_shutdown(post_shutdown).build()
+    runtime.application = application
     return runtime
 
 

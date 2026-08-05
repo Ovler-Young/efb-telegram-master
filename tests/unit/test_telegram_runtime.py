@@ -3,8 +3,9 @@ from unittest.mock import Mock, call
 
 import pytest
 
+from efb_telegram_master import telegram_runtime
 from efb_telegram_master.etm_metrics import parse_metrics_config
-from efb_telegram_master.telegram_runtime import TelegramPollingRuntime
+from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 
 
 def test_constructor_does_not_validate_bot_identity() -> None:
@@ -21,6 +22,47 @@ def test_constructor_does_not_validate_bot_identity() -> None:
 
     bot.get_me.assert_not_called()
     assert runtime.async_bot is bot
+
+
+def test_builder_assembles_injected_ptb_dependencies_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    built: dict[str, object] = {}
+
+    class Builder:
+        def bot(self, bot: object) -> "Builder":
+            built["bot"] = bot
+            return self
+
+        def job_queue(self, queue: object) -> "Builder":
+            built["job_queue"] = queue
+            return self
+
+        def post_init(self, callback: object) -> "Builder":
+            built["post_init"] = callback
+            return self
+
+        def post_shutdown(self, callback: object) -> "Builder":
+            built["post_shutdown"] = callback
+            return self
+
+        def build(self) -> object:
+            return SimpleNamespace()
+
+    async_bot = Mock()
+    async_runtime = Mock()
+    monkeypatch.setattr(telegram_runtime.telegram, "Bot", Mock(return_value=async_bot))
+    monkeypatch.setattr(telegram_runtime, "AsyncTelegramRuntime", Mock(return_value=async_runtime))
+    monkeypatch.setattr(telegram_runtime.Application, "builder", staticmethod(Builder))
+    channel = SimpleNamespace(flag=lambda name: {"local_tdlib_api": False, "api_base_url": None, "api_base_file_url": None}[name])
+
+    runtime = build_telegram_polling_runtime({"token": "token"}, channel, Mock(), Mock(), Mock())
+
+    assert runtime.async_bot is async_bot
+    assert runtime.async_runtime is async_runtime
+    assert runtime.application is not None
+    assert built["bot"] is async_bot
+    assert built["job_queue"] is None
+    assert callable(built["post_init"])
+    assert callable(built["post_shutdown"])
 
 
 @pytest.mark.asyncio
@@ -115,6 +157,79 @@ async def test_polling_lifecycle_keeps_ptb_startup_and_shutdown_order():
         ),
         call("Telegram polling runtime stopped", extra={"event": "telegram_runtime.stop"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_logs_lifecycle_callback_failure_with_error_type() -> None:
+    runtime = object.__new__(TelegramPollingRuntime)
+    runtime.logger = Mock()
+    runtime.async_runtime = SimpleNamespace(bind_loop=Mock(), clear_loop=Mock())
+    runtime._shutdown_complete = Mock()
+
+    async def get_me() -> SimpleNamespace:
+        return SimpleNamespace(id=123)
+
+    runtime.async_bot = SimpleNamespace(get_me=get_me)
+
+    async def started(_runtime: TelegramPollingRuntime) -> None:
+        raise RuntimeError("unavailable")
+
+    runtime._on_started = started
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await runtime._post_init(Mock())
+
+    runtime.logger.exception.assert_called_once_with(
+        "Telegram runtime start callback failed",
+        extra={"event": "telegram_runtime.start_callback_failed", "error_type": "RuntimeError"},
+    )
+
+    async def stopped(_runtime: TelegramPollingRuntime) -> None:
+        raise ValueError("stopped")
+
+    runtime._on_stopped = stopped
+    with pytest.raises(ValueError, match="stopped"):
+        await runtime._post_shutdown(Mock())
+
+    assert runtime.logger.exception.call_args_list[-1] == call(
+        "Telegram runtime stop callback failed",
+        extra={"event": "telegram_runtime.stop_callback_failed", "error_type": "ValueError"},
+    )
+
+
+def test_webhook_poll_logs_start_and_stop_events() -> None:
+    runtime = object.__new__(TelegramPollingRuntime)
+    runtime.logger = Mock()
+    runtime._webhook = {"start_webhook": {"listen": "127.0.0.1", "port": 8080}}
+    runtime._shutdown_complete = Mock()
+    runtime.application = SimpleNamespace(run_webhook=Mock())
+
+    runtime.poll()
+
+    assert runtime.logger.info.call_args_list == [
+        call("Telegram webhook runtime starting", extra={"event": "telegram_runtime.webhook_start"}),
+        call("Telegram webhook runtime stopped", extra={"event": "telegram_runtime.webhook_stop"}),
+    ]
+
+
+def test_polling_failure_logs_error_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = object.__new__(TelegramPollingRuntime)
+    runtime.logger = Mock()
+    runtime._webhook = None
+    runtime._shutdown_complete = Mock()
+
+    def fail_run(coroutine: object) -> None:
+        coroutine.close()
+        raise RuntimeError("failed")
+
+    monkeypatch.setattr(telegram_runtime.asyncio, "run", fail_run)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        runtime.poll()
+
+    runtime.logger.exception.assert_called_once_with(
+        "Telegram polling lifecycle failed",
+        extra={"event": "telegram_runtime.polling_failed", "error_type": "RuntimeError"},
+    )
 
 
 def test_metrics_config_parser_returns_validated_endpoint() -> None:

@@ -1,5 +1,4 @@
 from efb_telegram_master import utils
-from efb_telegram_master.chat_binding import ChatBindingManager
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
 
@@ -23,26 +22,18 @@ def test_source_chat_pagination(channel, slave):
 
 
 def test_chat_pagination_filters_groups_users_and_invalid_regex(channel, slave):
-    _, buttons = channel.chat_binding.slave_chats_pagination(
-        (TelegramChatID(0), TelegramMessageID(4)), pattern="wonderland"
-    )
+    _, buttons = channel.chat_binding.slave_chats_pagination((TelegramChatID(0), TelegramMessageID(4)), pattern="wonderland")
     names = [button.text for row in buttons[:-1] for button in row]
     assert names and all("Wonderland" in name for name in names)
 
-    for message_id, (pattern, chat_type) in enumerate(
-            (("type: group", "GroupChat"), ("type: private", "PrivateChat")), start=5):
-        _, buttons = channel.chat_binding.slave_chats_pagination(
-            (TelegramChatID(0), TelegramMessageID(message_id)), pattern=pattern
-        )
+    for message_id, (pattern, chat_type) in enumerate((("type: group", "GroupChat"), ("type: private", "PrivateChat")), start=5):
+        _, buttons = channel.chat_binding.slave_chats_pagination((TelegramChatID(0), TelegramMessageID(message_id)), pattern=pattern)
         names = [button.text for row in buttons[:-1] for button in row]
         expected = slave.get_chats_by_criteria(chat_type=chat_type)
         assert names and all(any(chat.display_name in name for chat in expected) for name in names)
 
-    _, buttons = channel.chat_binding.slave_chats_pagination(
-        (TelegramChatID(0), TelegramMessageID(7)), pattern="("
-    )
+    _, buttons = channel.chat_binding.slave_chats_pagination((TelegramChatID(0), TelegramMessageID(7)), pattern="(")
     assert len(buttons) == 1
-
 
 
 def test_truncate_ellipsis(channel):
@@ -53,5 +44,6 @@ def test_truncate_ellipsis(channel):
     truncated = truncate_ellipsis(long_text, 256)
     assert len(truncated) <= 256
     assert truncated.endswith("…")
+
 
 # All other methods are to be tested with integration testing.

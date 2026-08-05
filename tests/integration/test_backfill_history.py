@@ -11,11 +11,13 @@ import telegram.error
 from telethon.errors import UserAlreadyParticipantError
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
-from telethon.tl.types import Channel, Chat as TelethonChat
+from telethon.tl.types import Channel
+from telethon.tl.types import Chat as TelethonChat
 from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.db import HistoryMigrationEntry
+
 from .helper.helper import wait_for_private_response
 from .utils import get_start_token
 
@@ -50,9 +52,7 @@ async def helper(helper_wrap, slave_with_auxiliary_bots):
 @pytest.fixture
 def private_response(channel_with_auxiliary_bots, bot_id):
     """Wait for primary-bot replies using the auxiliary channel's limiter."""
-    limiter_delay = lambda: (
-        channel_with_auxiliary_bots.bot_manager.outbound_queue._main_rate_limiter.peek_delay(bot_id)
-    )
+    limiter_delay = lambda: (channel_with_auxiliary_bots.bot_manager.outbound_queue._main_rate_limiter.peek_delay(bot_id))
 
     async def wait(trigger, receive):
         return await wait_for_private_response(limiter_delay, trigger, receive)
@@ -60,8 +60,7 @@ def private_response(channel_with_auxiliary_bots, bot_id):
     return wait
 
 
-async def _wait_for_text_in_chat(client, chat_id: int, text_fragment: str, *,
-                                 min_message_id: int = 0, timeout: float = 20.0):
+async def _wait_for_text_in_chat(client, chat_id: int, text_fragment: str, *, min_message_id: int = 0, timeout: float = 20.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         async for message in client.iter_messages(chat_id, limit=50):
@@ -73,8 +72,7 @@ async def _wait_for_text_in_chat(client, chat_id: int, text_fragment: str, *,
     raise AssertionError(f"Timed out waiting for {text_fragment!r} in chat {chat_id}")
 
 
-async def _messages_since_id(client, chat_id: int, min_message_id: int, *,
-                             limit: int = 200):
+async def _messages_since_id(client, chat_id: int, min_message_id: int, *, limit: int = 200):
     messages = []
     async for message in client.iter_messages(chat_id, limit=limit):
         if message.id <= min_message_id:
@@ -83,8 +81,7 @@ async def _messages_since_id(client, chat_id: int, min_message_id: int, *,
     return messages
 
 
-async def _messages_with_prefix(client, chat_id: int, prefix: str, *,
-                                min_message_id: int = 0, limit: int = 300):
+async def _messages_with_prefix(client, chat_id: int, prefix: str, *, min_message_id: int = 0, limit: int = 300):
     messages = []
     async for message in client.iter_messages(chat_id, limit=limit):
         if message.id <= min_message_id:
@@ -94,16 +91,11 @@ async def _messages_with_prefix(client, chat_id: int, prefix: str, *,
     return messages
 
 
-async def _wait_for_messages_with_prefix(client, chat_id: int, prefix: str, *,
-                                         min_message_id: int = 0,
-                                         minimum: int = 1,
-                                         timeout: float = BACKFILL_WAIT_TIMEOUT):
+async def _wait_for_messages_with_prefix(client, chat_id: int, prefix: str, *, min_message_id: int = 0, minimum: int = 1, timeout: float = BACKFILL_WAIT_TIMEOUT):
     deadline = time.time() + timeout
     messages = []
     while time.time() < deadline:
-        messages = await _messages_with_prefix(
-            client, chat_id, prefix, min_message_id=min_message_id
-        )
+        messages = await _messages_with_prefix(client, chat_id, prefix, min_message_id=min_message_id)
         if len(messages) >= minimum:
             return messages
         await asyncio.sleep(1)
@@ -168,16 +160,11 @@ async def _wait_for_logged_stream_messages(channel, chat, prefix: str, expected_
     deadline = time.time() + STREAM_SETTLE_TIMEOUT
     matches = []
     while time.time() < deadline:
-        matches = [
-            log for log in channel.db.get_recent_messages(slave_chat_id, limit=0)
-            if (log.text or "").startswith(prefix)
-        ]
+        matches = [log for log in channel.db.get_recent_messages(slave_chat_id, limit=0) if (log.text or "").startswith(prefix)]
         if len(matches) >= expected_count:
             return matches
         await asyncio.sleep(1)
-    raise AssertionError(
-        f"Timed out waiting for {expected_count} logged messages for {prefix!r}; got {len(matches)}"
-    )
+    raise AssertionError(f"Timed out waiting for {expected_count} logged messages for {prefix!r}; got {len(matches)}")
 
 
 async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id: int):
@@ -201,8 +188,7 @@ async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id:
     return working_bot_ids, statuses
 
 
-async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, private_response, *,
-                     flag: str | None = None):
+async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, private_response, *, flag: str | None = None):
     token = await get_start_token(client, helper, bot_id, chat_uid, private_response)
     command = f"/start {token}"
     if flag is not None:
@@ -283,16 +269,9 @@ def _queue_metrics_snapshot(bot_manager) -> QueueMetricSnapshot:
     )
 
 
-def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricSnapshot, *,
-                              expected_count: int) -> bool:
-    success_delta = (
-        current.main_successes + current.auxiliary_successes
-        - before.main_successes - before.auxiliary_successes
-    )
-    failure_delta = (
-        current.main_failures + current.auxiliary_failures
-        - before.main_failures - before.auxiliary_failures
-    )
+def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricSnapshot, *, expected_count: int) -> bool:
+    success_delta = current.main_successes + current.auxiliary_successes - before.main_successes - before.auxiliary_successes
+    failure_delta = current.main_failures + current.auxiliary_failures - before.main_failures - before.auxiliary_failures
     return (
         current.enqueued - before.enqueued == expected_count
         and success_delta == expected_count
@@ -303,9 +282,7 @@ def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricS
     )
 
 
-def _migration_activity_completed(*, activity_observed: bool, expected: Set[int],
-                                  db_indices: List[int], telegram_indices: List[int],
-                                  target_entry_count: int, queue_completed: bool) -> bool:
+def _migration_activity_completed(*, activity_observed: bool, expected: Set[int], db_indices: List[int], telegram_indices: List[int], target_entry_count: int, queue_completed: bool) -> bool:
     expected_count = len(expected)
     return (
         activity_observed
@@ -319,38 +296,22 @@ def _migration_activity_completed(*, activity_observed: bool, expected: Set[int]
 
 
 def _target_migration_entry_count(slave_chat_id: str, target_chat_id: int) -> int:
-    return int(
-        HistoryMigrationEntry.select()
-        .where(
-            (HistoryMigrationEntry.slave_chat_id == slave_chat_id)
-            & (HistoryMigrationEntry.target_chat_id == str(target_chat_id))
-        )
-        .count()
-    )
+    return int(HistoryMigrationEntry.select().where((HistoryMigrationEntry.slave_chat_id == slave_chat_id) & (HistoryMigrationEntry.target_chat_id == str(target_chat_id))).count())
 
 
 def _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix: str):
     slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
-    return [
-        log for log in channel_with_auxiliary_bots.db.get_recent_messages(slave_chat_id, limit=0)
-        if (log.text or "").startswith(prefix)
-    ]
+    return [log for log in channel_with_auxiliary_bots.db.get_recent_messages(slave_chat_id, limit=0) if (log.text or "").startswith(prefix)]
 
 
-async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_chat_id: int, chat, prefix: str,
-                                  expected_count: int, min_message_id: int,
-                                  metrics_before: QueueMetricSnapshot):
+async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_chat_id: int, chat, prefix: str, expected_count: int, min_message_id: int, metrics_before: QueueMetricSnapshot):
     expected = _expected_stream_indices(expected_count)
     deadline = time.time() + STREAM_SETTLE_TIMEOUT
 
     last_debug = ""
     while time.time() < deadline:
         db_logs = _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix)
-        db_indices = [
-            idx
-            for log in db_logs
-            for idx in _extract_stream_indices(log.text or "", prefix)
-        ]
+        db_indices = [idx for log in db_logs for idx in _extract_stream_indices(log.text or "", prefix)]
 
         group_messages = await _messages_with_prefix(
             client,
@@ -359,11 +320,7 @@ async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_cha
             min_message_id=min_message_id,
             limit=max(2000, expected_count + 400),
         )
-        group_indices = [
-            idx
-            for message in group_messages
-            for idx in _extract_stream_indices(message.raw_text or "", prefix)
-        ]
+        group_indices = [idx for message in group_messages for idx in _extract_stream_indices(message.raw_text or "", prefix)]
 
         metrics_current = _queue_metrics_snapshot(channel_with_auxiliary_bots.bot_manager)
         last_debug = (
@@ -386,10 +343,9 @@ async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_cha
     raise AssertionError(f"Timed out waiting for stream to settle: {last_debug}")
 
 
-async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client, chat, chat_id: int,
-                                             prefix: str, expected_count: int, *, min_message_id: int,
-                                             metrics_before: QueueMetricSnapshot,
-                                             timeout: float = BACKFILL_WAIT_TIMEOUT):
+async def _wait_for_migrated_stream_terminal(
+    channel_with_auxiliary_bots, client, chat, chat_id: int, prefix: str, expected_count: int, *, min_message_id: int, metrics_before: QueueMetricSnapshot, timeout: float = BACKFILL_WAIT_TIMEOUT
+):
     expected = _expected_stream_indices(expected_count)
     slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
     deadline = time.time() + timeout
@@ -398,17 +354,9 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
     last_debug = ""
     while time.time() < deadline:
         recent = await _messages_since_id(client, chat_id, min_message_id)
-        telegram_indices = [
-            idx
-            for message in recent
-            for idx in _extract_stream_indices(message.raw_text or "", prefix)
-        ]
+        telegram_indices = [idx for message in recent for idx in _extract_stream_indices(message.raw_text or "", prefix)]
         db_logs = _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix)
-        db_indices = [
-            idx
-            for log in db_logs
-            for idx in _extract_stream_indices(log.text or "", prefix)
-        ]
+        db_indices = [idx for log in db_logs for idx in _extract_stream_indices(log.text or "", prefix)]
         metrics_current = _queue_metrics_snapshot(channel_with_auxiliary_bots.bot_manager)
         enqueue_delta = metrics_current.enqueued - metrics_before.enqueued
         activity_observed = activity_observed or enqueue_delta > 0 or bool(telegram_indices)
@@ -438,22 +386,15 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
     raise AssertionError(f"Timed out waiting for migrated stream terminal state: {last_debug}")
 
 
-async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_bots, helper, client, bot_id,
-                                                         bot_group, bot_topic_group, aux_bot_ids,
-                                                         slave_with_auxiliary_bots, private_response):
+async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_bots, helper, client, bot_id, bot_group, bot_topic_group, aux_bot_ids, slave_with_auxiliary_bots, private_response):
     if bot_topic_group is None:
         pytest.skip("TOPIC_GROUP is required for backfill history relink coverage.")
 
     source_group_id = bot_group
     await _ensure_users_in_group(client, source_group_id, aux_bot_ids)
-    working_aux_bot_ids, membership_statuses = await _require_aux_membership(
-        channel_with_auxiliary_bots, source_group_id
-    )
+    working_aux_bot_ids, membership_statuses = await _require_aux_membership(channel_with_auxiliary_bots, source_group_id)
     if not working_aux_bot_ids:
-        pytest.skip(
-            f"No auxiliary bots are members of configured test group {source_group_id}; "
-            f"probes={membership_statuses}"
-        )
+        pytest.skip(f"No auxiliary bots are members of configured test group {source_group_id}; probes={membership_statuses}")
 
     chat = slave_with_auxiliary_bots.chat_with_alias
     slave_uid = etm_utils.chat_id_to_str(chat=chat)
@@ -465,9 +406,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
     bot_manager = channel_with_auxiliary_bots.bot_manager
-    command_message = await _link_chat(
-        client, helper, bot_id, chat.uid, source_group_id, private_response
-    )
+    command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response)
 
     stream_metrics_before = _queue_metrics_snapshot(bot_manager)
 
@@ -497,11 +436,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     assert set(db_indices) == _expected_stream_indices(STREAM_MESSAGE_COUNT)
     assert len(db_indices) == STREAM_MESSAGE_COUNT, "Expected exactly 120 logged stream messages in DB."
 
-    db_sender_ids = {
-        int(log.sender_bot_id)
-        for log in db_logs
-        if log.sender_bot_id is not None
-    }
+    db_sender_ids = {int(log.sender_bot_id) for log in db_logs if log.sender_bot_id is not None}
     assert db_sender_ids & set(working_aux_bot_ids), "Expected at least one stream message to be sent by an auxiliary bot."
 
     group_sender_ids = {message.sender_id for message in group_messages if message.sender_id is not None}
@@ -513,13 +448,10 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         expected_count=STREAM_MESSAGE_COUNT,
     )
 
-
     target_group_id = bot_topic_group
     try:
         migration_metrics_before = _queue_metrics_snapshot(bot_manager)
-        relink_true_message = await _link_chat(
-            client, helper, bot_id, chat.uid, target_group_id, private_response, flag="true"
-        )
+        relink_true_message = await _link_chat(client, helper, bot_id, chat.uid, target_group_id, private_response, flag="true")
         _, migration_metrics_after = await _wait_for_migrated_stream_terminal(
             channel_with_auxiliary_bots,
             client,
@@ -538,22 +470,16 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         assert _target_migration_entry_count(slave_uid, target_group_id) == 0
 
         recent_messages = await _messages_since_id(client, target_group_id, relink_true_message.id)
-        assert not any(
-            "History messages are not migrated" in (message.raw_text or "")
-            for message in recent_messages
-        ), "Relink with true should migrate history instead of sending the history-link notice."
-
-        relink_false_message = await _link_chat(
-            client, helper, bot_id, chat.uid, source_group_id, private_response, flag="false"
+        assert not any("History messages are not migrated" in (message.raw_text or "") for message in recent_messages), (
+            "Relink with true should migrate history instead of sending the history-link notice."
         )
+
+        relink_false_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response, flag="false")
         await asyncio.sleep(10)
         recent_source_messages = await _messages_since_id(client, source_group_id, relink_false_message.id)
-        assert not any(prefix in (message.raw_text or "") for message in recent_source_messages), (
-            "Relink with false should skip migrating historical messages."
+        assert not any(prefix in (message.raw_text or "") for message in recent_source_messages), "Relink with false should skip migrating historical messages."
+        assert not any("History messages are not migrated" in (message.raw_text or "") for message in recent_source_messages), (
+            "Relink with false should skip both history migration and the history-link notice."
         )
-        assert not any(
-            "History messages are not migrated" in (message.raw_text or "")
-            for message in recent_source_messages
-        ), "Relink with false should skip both history migration and the history-link notice."
     finally:
         etm_chat.unlink()

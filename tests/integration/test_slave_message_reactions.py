@@ -1,6 +1,6 @@
 from pytest import mark
 
-from tests.integration.helper.filters import in_chats, regex, edited
+from tests.integration.helper.filters import edited, in_chats, regex
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio

@@ -20,8 +20,9 @@ repos:
     rev: v0.12.8
     hooks:
     -   id: ruff
-        args: [--select, E9,F821]
+        files: ^(efb_telegram_master|tests)/.+\.py$
     -   id: ruff-format
+        files: ^(efb_telegram_master|tests)/.+\.py$
 -   repo: local
     hooks:
     -   id: version_bump

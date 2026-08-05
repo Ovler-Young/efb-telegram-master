@@ -4,10 +4,10 @@ import logging
 import os
 import time
 from asyncio import QueueEmpty
-from typing import Awaitable, Callable, Tuple, Optional, Dict, Iterable, List, Sequence, TypeVar, Union
+from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
 
 from telethon import TelegramClient
-from telethon.events import NewMessage, UserUpdate, MessageDeleted, MessageEdited, ChatAction
+from telethon.events import ChatAction, MessageDeleted, MessageEdited, NewMessage, UserUpdate
 from telethon.events.common import EventCommon
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
@@ -17,15 +17,13 @@ from . import filters
 from .filters import BaseFilter
 from .utils import parse_socks5_link
 
-
 CLIENT_START_TIMEOUT = 60
 CLIENT_STOP_TIMEOUT = 10
 PRIVATE_RESPONSE_WAIT_CAP = 65.0
 Response = TypeVar("Response")
 
 
-async def wait_for_limiter_slot(peek_delay: Callable[[], float], *,
-                                cap: float = PRIVATE_RESPONSE_WAIT_CAP) -> None:
+async def wait_for_limiter_slot(peek_delay: Callable[[], float], *, cap: float = PRIVATE_RESPONSE_WAIT_CAP) -> None:
     """Wait for one outbound limiter slot, never beyond its 60-second window plus margin."""
     deadline = time.monotonic() + cap
     while True:
@@ -39,11 +37,14 @@ async def wait_for_limiter_slot(peek_delay: Callable[[], float], *,
 
 
 async def wait_for_private_response(
-        peek_delay: Callable[[], float], trigger: Callable[[], Awaitable[object]],
-        receive: Callable[[float], Awaitable[Response]], *,
-        cap: float = PRIVATE_RESPONSE_WAIT_CAP,
+    peek_delay: Callable[[], float],
+    trigger: Callable[[], Awaitable[object]],
+    receive: Callable[[float], Awaitable[Response]],
+    *,
+    cap: float = PRIVATE_RESPONSE_WAIT_CAP,
 ) -> Response:
     """Use one deadline for the limiter wait, command, and its response."""
+
     async def wait() -> Response:
         deadline = time.monotonic() + cap
         await wait_for_limiter_slot(peek_delay, cap=deadline - time.monotonic())
@@ -57,11 +58,7 @@ async def wait_for_private_response(
 
 
 class TelegramIntegrationTestHelper:
-    def __init__(self,
-                 session: str, api_id: int, api_hash: str,
-                 loop: asyncio.AbstractEventLoop,
-                 bot_id: Union[int, Sequence[int]],
-                 chats: Iterable[int] = tuple()):
+    def __init__(self, session: str, api_id: int, api_hash: str, loop: asyncio.AbstractEventLoop, bot_id: Union[int, Sequence[int]], chats: Iterable[int] = tuple()):
         """
         Need to create a client with API key, hash, and a session file
         Need a list of whitelisted chat IDs
@@ -77,19 +74,17 @@ class TelegramIntegrationTestHelper:
 
         # Build proxy parameters
         # Currently only support SOCKS5 proxy in ALL_PROXY environment variable
-        proxy_env = os.environ.get('all_proxy') or os.environ.get('ALL_PROXY')
-        if proxy_env and proxy_env.startswith('socks5://'):
+        proxy_env = os.environ.get("all_proxy") or os.environ.get("ALL_PROXY")
+        if proxy_env and proxy_env.startswith("socks5://"):
             from socks import SOCKS5
+
             hostname, port, username, password = parse_socks5_link(proxy_env)
             proxy: Optional[Tuple] = (SOCKS5, hostname, port, True, username, password)
         else:
             proxy = None
 
         # Telethon client to use
-        self.client: TelegramClient = TelegramClient(
-            StringSession(session), api_id, api_hash, proxy=proxy, loop=loop,
-            sequential_updates=True
-        )
+        self.client: TelegramClient = TelegramClient(StringSession(session), api_id, api_hash, proxy=proxy, loop=loop, sequential_updates=True)
 
         # Queue for incoming messages
         self.queue: "asyncio.queues.Queue[EventCommon]" = asyncio.queues.Queue()
@@ -103,8 +98,7 @@ class TelegramIntegrationTestHelper:
         self.chats = list(map(abs, chats))
         self.client.parse_mode = "html"
         bot_ids = [bot_id] if isinstance(bot_id, int) else list(bot_id)
-        self.client.add_event_handler(self.new_message_handler,
-                                      NewMessage(chats=self.chats, incoming=True, from_users=bot_ids))
+        self.client.add_event_handler(self.new_message_handler, NewMessage(chats=self.chats, incoming=True, from_users=bot_ids))
         # self.client.add_event_handler(self.new_message_handler,
         #                               NewMessage(incoming=True))
         self.client.add_event_handler(self.deleted_message_handler, MessageDeleted())
@@ -143,8 +137,7 @@ class TelegramIntegrationTestHelper:
         self.logger.debug("Got deleted message event, %s, %s", time.time(), event.to_dict())
         await self.queue.put(event)
 
-    async def wait_for_event(self, event_filter: BaseFilter = filters.everything,
-                             timeout: float = 20.0) -> EventCommon:
+    async def wait_for_event(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0) -> EventCommon:
         """
         Args:
             event_filter: Filter updates to collect
@@ -172,15 +165,13 @@ class TelegramIntegrationTestHelper:
                 return value
             self.pending_events.append(value)
 
-    async def wait_for_message(self, event_filter: BaseFilter = filters.everything,
-                               timeout: float = 20.0) -> Message:
+    async def wait_for_message(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0) -> Message:
         """Short cut for “Wait for a message and return its entity”."""
         event = await self.wait_for_event(filters.message & event_filter, timeout=timeout)
         # noinspection PyUnresolvedReferences
         return event.message  # type: ignore
 
-    async def wait_for_message_text(self, event_filter: BaseFilter = filters.everything,
-                                    timeout: float = 20.0) -> str:
+    async def wait_for_message_text(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0) -> str:
         """Short cut for “Wait for a text message and return its text”."""
         event = await self.wait_for_event(filters.text & event_filter, timeout=timeout)
         # noinspection PyUnresolvedReferences
@@ -193,10 +184,7 @@ class TelegramIntegrationTestHelper:
         try:
             return await asyncio.wait_for(operation, timeout=CLIENT_START_TIMEOUT)
         except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"Telegram integration helper timed out during {phase} after "
-                f"{CLIENT_START_TIMEOUT} seconds"
-            ) from exc
+            raise TimeoutError(f"Telegram integration helper timed out during {phase} after {CLIENT_START_TIMEOUT} seconds") from exc
 
     async def _disconnect_client(self) -> None:
         await asyncio.wait_for(self.client.disconnect(), timeout=CLIENT_STOP_TIMEOUT)
@@ -204,7 +192,7 @@ class TelegramIntegrationTestHelper:
         if inspect.isawaitable(disconnected):
             await asyncio.wait_for(disconnected, timeout=CLIENT_STOP_TIMEOUT)
 
-    async def __aenter__(self) -> 'TelegramIntegrationTestHelper':
+    async def __aenter__(self) -> "TelegramIntegrationTestHelper":
         try:
             await self._startup_step("client connect", self.client.connect())
 
@@ -221,7 +209,7 @@ class TelegramIntegrationTestHelper:
 
         return self
 
-    def __enter__(self) -> 'TelegramIntegrationTestHelper':
+    def __enter__(self) -> "TelegramIntegrationTestHelper":
         """
         Start the client and return the helper
 

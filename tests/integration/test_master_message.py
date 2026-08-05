@@ -24,16 +24,15 @@ from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 from uuid import uuid4
 
-from pytest import mark, approx, param, xfail
-from telethon import TelegramClient
-from telethon.tl.custom import Message
-from telethon.tl.types import InputMediaGeoPoint, InputGeoPoint, InputMediaGeoLive, \
-    InputMediaVenue, MessageMediaVenue, InputMediaContact, InputMediaDice, MessageMediaDice
-
 from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot import MsgType
 from ehforwarderbot.chat import SelfChatMember
 from ehforwarderbot.message import LocationAttribute
+from pytest import approx, mark, param, xfail
+from telethon import TelegramClient
+from telethon.tl.custom import Message
+from telethon.tl.types import InputGeoPoint, InputMediaContact, InputMediaDice, InputMediaGeoLive, InputMediaGeoPoint, InputMediaVenue, MessageMediaDice, MessageMediaVenue
+
 from .utils import link_chats
 
 pytestmark = mark.asyncio
@@ -42,9 +41,7 @@ TELEGRAM_OPERATION_TIMEOUT = 90
 LIVE_LOCATION_DELIVERY_TIMEOUT = 5
 LIVE_LOCATION_RESPONSE_FAILURE = "'SendMediaRequest' object has no attribute 'id'"
 LIVE_LOCATION_XFAIL_REASON = (
-    "Telethon _get_response_message: Telegram returns UpdateEditChannelMessage for "
-    "live-location sendMedia in supergroups; Telethon expects EditMessageRequest.id "
-    "(AttributeError on SendMediaRequest)."
+    "Telethon _get_response_message: Telegram returns UpdateEditChannelMessage for live-location sendMedia in supergroups; Telethon expects EditMessageRequest.id (AttributeError on SendMediaRequest)."
 )
 
 # region Message factory classes
@@ -91,19 +88,12 @@ async def run_telegram_operation(factory: MessageFactory, phase: str, operation)
     try:
         return await asyncio.wait_for(operation, timeout=TELEGRAM_OPERATION_TIMEOUT)
     except asyncio.TimeoutError as exc:
-        raise TimeoutError(
-            f"{factory} timed out during {phase} after {TELEGRAM_OPERATION_TIMEOUT} seconds"
-        ) from exc
+        raise TimeoutError(f"{factory} timed out during {phase} after {TELEGRAM_OPERATION_TIMEOUT} seconds") from exc
 
 
 class TextMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            f"守ったものは、明るい未来幻想を見せながら消えてゆくヒカリ。\n"
-            f"new message {uuid4()}, target: {target and target.id}",
-            reply_to=target
-        )
+        return await client.send_message(chat_id, f"守ったものは、明るい未来幻想を見せながら消えてゆくヒカリ。\nnew message {uuid4()}, target: {target and target.id}", reply_to=target)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Text
@@ -111,18 +101,13 @@ class TextMessageFactory(MessageFactory):
 
     async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
         return await message.edit(
-            text=f"信じたものは、都合のいい妄想を繰り返し映し出す鏡。\n"
-                 f"edited message {uuid4()}",
+            text=f"信じたものは、都合のいい妄想を繰り返し映し出す鏡。\nedited message {uuid4()}",
         )
 
 
 class LocationMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            file=InputMediaGeoPoint(InputGeoPoint(0.0, 0.0)),
-            reply_to=target
-        )
+        return await client.send_message(chat_id, file=InputMediaGeoPoint(InputGeoPoint(0.0, 0.0)), reply_to=target)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Location
@@ -132,7 +117,6 @@ class LocationMessageFactory(MessageFactory):
 
 
 class LiveLocationMessageFactory(MessageFactory):
-
     test_quote = False
 
     def __init__(self):
@@ -140,12 +124,7 @@ class LiveLocationMessageFactory(MessageFactory):
 
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
         self.location = random.uniform(0.0, 90.0), random.uniform(0.0, 90.0)
-        return await client.send_message(
-            chat_id,
-            file=InputMediaGeoLive(
-                InputGeoPoint(*self.location), stopped=False, period=3600),
-            reply_to=target
-        )
+        return await client.send_message(chat_id, file=InputMediaGeoLive(InputGeoPoint(*self.location), stopped=False, period=3600), reply_to=target)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Location
@@ -154,11 +133,7 @@ class LiveLocationMessageFactory(MessageFactory):
         assert tg_msg.geo.long == approx(efb_msg.attributes.longitude, abs=1e-3)
 
     async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        return await message.edit(
-            file=InputMediaGeoLive(
-                InputGeoPoint(-random.uniform(0.0, 90.0), -random.uniform(0.0, 90.0)),
-                stopped=True)
-        )
+        return await message.edit(file=InputMediaGeoLive(InputGeoPoint(-random.uniform(0.0, 90.0), -random.uniform(0.0, 90.0)), stopped=True))
 
     async def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         """Only stop live location from the second message is to be closed."""
@@ -168,12 +143,7 @@ class LiveLocationMessageFactory(MessageFactory):
 
 class VenueMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            file=InputMediaVenue(InputGeoPoint(0.0, 0.0),
-                                 "Location name", f"Address {uuid4()}", "", "", ""),
-            reply_to=target
-        )
+        return await client.send_message(chat_id, file=InputMediaVenue(InputGeoPoint(0.0, 0.0), "Location name", f"Address {uuid4()}", "", "", ""), reply_to=target)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Location
@@ -187,11 +157,7 @@ class VenueMessageFactory(MessageFactory):
 
 class ContactMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            file=InputMediaContact("+424 3 14159", "Bot", "Support", ""),
-            reply_to=target
-        )
+        return await client.send_message(chat_id, file=InputMediaContact("+424 3 14159", "Bot", "Support", ""), reply_to=target)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Text
@@ -203,11 +169,7 @@ class ContactMessageFactory(MessageFactory):
 
 class StickerMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            file="tests/mocks/sticker.webp",
-            reply_to=target
-        )
+        return await client.send_message(chat_id, file="tests/mocks/sticker.webp", reply_to=target)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Sticker
@@ -222,21 +184,13 @@ class StickerMessageFactory(MessageFactory):
 
 class DocumentMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            f"Document caption {uuid4()}",
-            file="tests/mocks/document_0.txt.gz",
-            reply_to=target
-        )
+        return await client.send_message(chat_id, f"Document caption {uuid4()}", file="tests/mocks/document_0.txt.gz", reply_to=target)
 
     async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
         return await message.edit(text=f"Edited document caption {uuid4()}")
 
     async def edit_message_media(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        return await message.edit(
-            text=f"Edited document file & caption {uuid4()}",
-            file="tests/mocks/document_1.txt.gz"
-        )
+        return await message.edit(text=f"Edited document file & caption {uuid4()}", file="tests/mocks/document_1.txt.gz")
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.File
@@ -254,21 +208,13 @@ class DocumentMessageFactory(MessageFactory):
 
 class PhotoMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            f"Photo caption {uuid4()}",
-            file="tests/mocks/image.png",
-            reply_to=target
-        )
+        return await client.send_message(chat_id, f"Photo caption {uuid4()}", file="tests/mocks/image.png", reply_to=target)
 
     async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
         return await message.edit(text=f"Edited image caption {uuid4()}")
 
     async def edit_message_media(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        return await message.edit(
-            text=f"Edited image file & caption {uuid4()}",
-            file="tests/mocks/image_1.png"
-        )
+        return await message.edit(text=f"Edited image file & caption {uuid4()}", file="tests/mocks/image_1.png")
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Image
@@ -284,13 +230,7 @@ class PhotoMessageFactory(MessageFactory):
 
 class VoiceMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_file(
-            chat_id,
-            caption=f"Voice caption {uuid4()}",
-            file="tests/mocks/voice_0.ogg",
-            voice_note=True,
-            reply_to=target
-        )
+        return await client.send_file(chat_id, caption=f"Voice caption {uuid4()}", file="tests/mocks/voice_0.ogg", voice_note=True, reply_to=target)
 
     async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
         return await message.edit(text=f"Edited voice caption {uuid4()}")
@@ -309,21 +249,13 @@ class VoiceMessageFactory(MessageFactory):
 
 class AudioMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            f"Audio caption {uuid4()}",
-            file="tests/mocks/audio_0.mp3",
-            reply_to=target
-        )
+        return await client.send_message(chat_id, f"Audio caption {uuid4()}", file="tests/mocks/audio_0.mp3", reply_to=target)
 
     async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
         return await message.edit(text=f"Edited audio caption {uuid4()}")
 
     async def edit_message_media(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        return await message.edit(
-            text=f"Edited audio file & caption {uuid4()}",
-            file="tests/mocks/audio_1.mp3"
-        )
+        return await message.edit(text=f"Edited audio file & caption {uuid4()}", file="tests/mocks/audio_1.mp3")
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.File
@@ -346,21 +278,13 @@ class AudioMessageFactory(MessageFactory):
 
 class VideoMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            f"Video caption {uuid4()}",
-            file="tests/mocks/video_0.mp4",
-            reply_to=target
-        )
+        return await client.send_message(chat_id, f"Video caption {uuid4()}", file="tests/mocks/video_0.mp4", reply_to=target)
 
     async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
         return await message.edit(text=f"Edited video caption {uuid4()}")
 
     async def edit_message_media(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        return await message.edit(
-            text=f"Edited video file & caption {uuid4()}",
-            file="tests/mocks/video_1.mp4"
-        )
+        return await message.edit(text=f"Edited video file & caption {uuid4()}", file="tests/mocks/video_1.mp4")
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Video
@@ -378,12 +302,7 @@ class VideoMessageFactory(MessageFactory):
 
 class VideoNoteMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_file(
-            chat_id,
-            file="tests/mocks/video_note_0.mp4",
-            video_note=True,
-            reply_to=target
-        )
+        return await client.send_file(chat_id, file="tests/mocks/video_note_0.mp4", video_note=True, reply_to=target)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Video
@@ -398,21 +317,13 @@ class VideoNoteMessageFactory(MessageFactory):
 
 class AnimationMessageFactory(MessageFactory):
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            f"Animation caption {uuid4()}",
-            file="tests/mocks/animation_0.gif",
-            reply_to=target
-        )
+        return await client.send_message(chat_id, f"Animation caption {uuid4()}", file="tests/mocks/animation_0.gif", reply_to=target)
 
     async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
         return await message.edit(text=f"Edited animation caption {uuid4()}")
 
     async def edit_message_media(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        return await message.edit(
-            text=f"Edited animation file & caption {uuid4()}",
-            file="tests/mocks/animation_1.gif"
-        )
+        return await message.edit(text=f"Edited animation file & caption {uuid4()}", file="tests/mocks/animation_1.gif")
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Animation
@@ -433,12 +344,7 @@ class DiceMessageFactory(MessageFactory):
         self.emoji = emoji
 
     async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(
-            chat_id,
-            f"Dice caption {uuid4()}",
-            file=InputMediaDice(self.emoji),
-            reply_to=target
-        )
+        return await client.send_message(chat_id, f"Dice caption {uuid4()}", file=InputMediaDice(self.emoji), reply_to=target)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.type == MsgType.Text
@@ -457,9 +363,7 @@ class DiceMessageFactory(MessageFactory):
 async def consume_live_location_delivery(slave, chat, factory: LiveLocationMessageFactory) -> None:
     """Consume the accepted delivery that Telethon fails to return to the sender."""
     assert factory.location is not None
-    efb_msg = await asyncio.to_thread(
-        slave.messages.get, timeout=LIVE_LOCATION_DELIVERY_TIMEOUT
-    )
+    efb_msg = await asyncio.to_thread(slave.messages.get, timeout=LIVE_LOCATION_DELIVERY_TIMEOUT)
     try:
         assert efb_msg.chat == chat
         assert isinstance(efb_msg.author, SelfChatMember)
@@ -475,36 +379,38 @@ async def consume_live_location_delivery(slave, chat, factory: LiveLocationMessa
         slave.messages.task_done()
 
 
-@mark.parametrize("factory", [
-    TextMessageFactory(), LocationMessageFactory(),
-    param(
-        LiveLocationMessageFactory(),
-    ),
-    ContactMessageFactory(),
-    StickerMessageFactory(),
-    DocumentMessageFactory(),
-    PhotoMessageFactory(),
-    VoiceMessageFactory(),
-    AudioMessageFactory(),
-    VideoMessageFactory(),
-    VideoNoteMessageFactory(),
-    AnimationMessageFactory(),
-    DiceMessageFactory("🎲"),
-    DiceMessageFactory("🎯"),
-    DiceMessageFactory("🏀"),
-], ids=str)
+@mark.parametrize(
+    "factory",
+    [
+        TextMessageFactory(),
+        LocationMessageFactory(),
+        param(
+            LiveLocationMessageFactory(),
+        ),
+        ContactMessageFactory(),
+        StickerMessageFactory(),
+        DocumentMessageFactory(),
+        PhotoMessageFactory(),
+        VoiceMessageFactory(),
+        AudioMessageFactory(),
+        VideoMessageFactory(),
+        VideoNoteMessageFactory(),
+        AnimationMessageFactory(),
+        DiceMessageFactory("🎲"),
+        DiceMessageFactory("🎯"),
+        DiceMessageFactory("🏀"),
+    ],
+    ids=str,
+)
 async def test_master_message(helper, client, bot_group, slave, channel, factory: MessageFactory):
     chat = slave.chat_without_alias
 
-    with link_chats(channel, (chat, ), bot_group):
+    with link_chats(channel, (chat,), bot_group):
         # Send message
         try:
-            tg_msg = await run_telegram_operation(
-                factory, "initial send", factory.send_message(client, bot_group)
-            )
+            tg_msg = await run_telegram_operation(factory, "initial send", factory.send_message(client, bot_group))
         except AttributeError as exc:
-            if (not isinstance(factory, LiveLocationMessageFactory)
-                    or str(exc) != LIVE_LOCATION_RESPONSE_FAILURE):
+            if not isinstance(factory, LiveLocationMessageFactory) or str(exc) != LIVE_LOCATION_RESPONSE_FAILURE:
                 raise
             await consume_live_location_delivery(slave, chat, factory)
             xfail(LIVE_LOCATION_XFAIL_REASON)
@@ -518,9 +424,7 @@ async def test_master_message(helper, client, bot_group, slave, channel, factory
         await factory.finalize_message(tg_msg, efb_msg)
 
         # Edit message
-        edited_msg = await run_telegram_operation(
-            factory, "text edit", factory.edit_message(client, tg_msg)
-        )
+        edited_msg = await run_telegram_operation(factory, "text edit", factory.edit_message(client, tg_msg))
         if edited_msg is not None:
             efb_msg = slave.messages.get(timeout=5)
             assert efb_msg.chat == chat
@@ -532,9 +436,7 @@ async def test_master_message(helper, client, bot_group, slave, channel, factory
             await factory.finalize_message(edited_msg, efb_msg)
 
         # Edit media
-        media_edited = await run_telegram_operation(
-            factory, "media edit", factory.edit_message_media(client, tg_msg)
-        )
+        media_edited = await run_telegram_operation(factory, "media edit", factory.edit_message_media(client, tg_msg))
         if media_edited is not None:
             efb_msg = slave.messages.get(timeout=5)
             assert efb_msg.chat == chat
@@ -547,9 +449,7 @@ async def test_master_message(helper, client, bot_group, slave, channel, factory
 
         # Quote reply
         if factory.test_quote:
-            quoted_message = await run_telegram_operation(
-                factory, "quote reply send", factory.send_message(client, bot_group, target=tg_msg)
-            )
+            quoted_message = await run_telegram_operation(factory, "quote reply send", factory.send_message(client, bot_group, target=tg_msg))
             quoted_efb_msg = slave.messages.get(timeout=5)
             assert quoted_efb_msg.chat == chat
             assert isinstance(quoted_efb_msg.author, SelfChatMember)

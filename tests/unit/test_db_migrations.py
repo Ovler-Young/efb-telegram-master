@@ -39,16 +39,34 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
         assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
         assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is None
         content = SimpleNamespace(
-            text="ingested", media_type="Text", mime=None, msg_type="Text", time=datetime(2026, 8, 4),
+            text="ingested",
+            media_type="Text",
+            mime=None,
+            msg_type="Text",
+            time=datetime(2026, 8, 4),
         )
-        assert manager.persist_msglog_ingestion_item(
-            scan, source_message_id=500, classification="eligible", slave_uid="tests.slave target",
-            message=content, lease_owner="worker-a",
-        ) == "inserted"
-        assert manager.persist_msglog_ingestion_item(
-            scan, source_message_id=500, classification="eligible", slave_uid="tests.slave target",
-            message=content, lease_owner="worker-a",
-        ) == "existing"
+        assert (
+            manager.persist_msglog_ingestion_item(
+                scan,
+                source_message_id=500,
+                classification="eligible",
+                slave_uid="tests.slave target",
+                message=content,
+                lease_owner="worker-a",
+            )
+            == "inserted"
+        )
+        assert (
+            manager.persist_msglog_ingestion_item(
+                scan,
+                source_message_id=500,
+                classification="eligible",
+                slave_uid="tests.slave target",
+                message=content,
+                lease_owner="worker-a",
+            )
+            == "existing"
+        )
         row = MsgLog.get_by_id("100.500")
     finally:
         test_db.close()
@@ -68,9 +86,7 @@ def test_expired_scan_is_resumable_after_restart():
         test_db.create_tables([MsgLogIngestionScan])
         scan = manager.get_or_create_msglog_ingestion_scan(100, 500)
         assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
-        MsgLogIngestionScan.update(lease_expires_at=datetime.now() - timedelta(seconds=1)).where(
-            MsgLogIngestionScan.id == scan.id
-        ).execute()
+        MsgLogIngestionScan.update(lease_expires_at=datetime.now() - timedelta(seconds=1)).where(MsgLogIngestionScan.id == scan.id).execute()
         resumed = manager.get_resumable_msglog_ingestion_scans()
         assert [item.source_chat_id for item in resumed] == ["100"]
         assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is not None
@@ -87,17 +103,32 @@ def test_live_message_overwrites_synthetic_provenance():
         uid=MessageID("live-message"),
         chat=SimpleNamespace(module_id="tests.slave", uid="chat"),
         author=SimpleNamespace(module_id="tests.slave", uid="author"),
-        text="live text", type=MsgType.Text, type_telegram=TGMsgType.Text,
-        deliver_to=SimpleNamespace(channel_id="tests.master"), file_id=None, file_unique_id=None,
-        mime=None, is_system=False, attributes=None, commands=None, substitutions=None,
-        target=None, sender_bot_id=None, reactions={},
+        text="live text",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=SimpleNamespace(channel_id="tests.master"),
+        file_id=None,
+        file_unique_id=None,
+        mime=None,
+        is_system=False,
+        attributes=None,
+        commands=None,
+        substitutions=None,
+        target=None,
+        sender_bot_id=None,
+        reactions={},
     )
     with test_db.bind_ctx([MsgLog]):
         test_db.create_tables([MsgLog])
         MsgLog.create(
-            master_msg_id="100.1", slave_message_id="mtproto-ingested:100.1", text="ingested",
-            slave_origin_uid="tests.slave stale", slave_member_uid="tests.slave __self__",
-            msg_type="Text", sent_to="tests.master", provenance="mtproto_ingested",
+            master_msg_id="100.1",
+            slave_message_id="mtproto-ingested:100.1",
+            text="ingested",
+            slave_origin_uid="tests.slave stale",
+            slave_member_uid="tests.slave __self__",
+            msg_type="Text",
+            sent_to="tests.master",
+            provenance="mtproto_ingested",
         )
         manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=1))
         row = MsgLog.get_by_id("100.1")

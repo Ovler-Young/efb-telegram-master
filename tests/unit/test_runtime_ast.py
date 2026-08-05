@@ -1,17 +1,18 @@
 import ast
 from pathlib import Path
 
-
-RETIRED_OUTBOUND_IDENTIFIERS = frozenset({
-    "OutboundWorkflow",
-    "OutboundTask",
-    "OutboundRepository",
-    "OutboundScheduler",
-    "RunCondition",
-    "TaskState",
-    "SlotReservation",
-    "ReservationOutcome",
-})
+RETIRED_OUTBOUND_IDENTIFIERS = frozenset(
+    {
+        "OutboundWorkflow",
+        "OutboundTask",
+        "OutboundRepository",
+        "OutboundScheduler",
+        "RunCondition",
+        "TaskState",
+        "SlotReservation",
+        "ReservationOutcome",
+    }
+)
 
 
 def _ast_identifiers(path: Path) -> set[str]:

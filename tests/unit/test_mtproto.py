@@ -125,7 +125,9 @@ async def test_get_messages_builds_ascending_batches_of_at_most_100(monkeypatch:
     responses = await client.get_channel_messages("channel", list(range(205, 0, -1)))
 
     assert [request.id for request in client.client.requests] == [
-        list(range(1, 101)), list(range(101, 201)), list(range(201, 206)),
+        list(range(1, 101)),
+        list(range(101, 201)),
+        list(range(201, 206)),
     ]
     assert len(responses) == 205
     await client.disconnect()

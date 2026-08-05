@@ -1,27 +1,27 @@
-import pytest
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
-
-from collections.abc import Iterator
-from ruamel.yaml import YAML
 from typing import List
+
+import pytest
+from ruamel.yaml import YAML
 
 os.environ.setdefault("PTB_TIMEDELTA", "1")
 
+import ehforwarderbot.coordinator
 from telegram.error import NetworkError, TimedOut
 
-import ehforwarderbot.coordinator
-
-from .mocks.slave import MockSlaveChannel
-from .bot import get_bot
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.paths import get_config_path
+
+from .bot import get_bot
+from .mocks.slave import MockSlaveChannel
 
 pytestmark = [pytest.mark.xfail(raises=TimedOut), pytest.mark.xfail(raises=NetworkError)]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_info():
     try:
         return get_bot()
@@ -29,29 +29,29 @@ def bot_info():
         pytest.skip(str(error))
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_token(bot_info) -> str:
-    return bot_info['token']
+    return bot_info["token"]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_id(bot_token) -> int:
     return int(bot_token.split(":")[0])
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_admins(bot_info) -> List[int]:
-    return bot_info['admins']
+    return bot_info["admins"]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_admin(bot_admins) -> int:
     return bot_admins[0]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_groups(bot_info) -> List[int]:
-    return bot_info['groups']
+    return bot_info["groups"]
 
 
 @pytest.fixture
@@ -59,29 +59,29 @@ def bot_group(bot_groups) -> int:
     return bot_groups[0]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_channels(bot_info) -> List[int]:
-    return bot_info['channels']
+    return bot_info["channels"]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_channel(bot_channels) -> int:
     return bot_channels[0]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def bot_topic_group(bot_info):
-    return bot_info['topic_group']
+    return bot_info["topic_group"]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def aux_bot_tokens(bot_info) -> List[str]:
-    return bot_info['aux_bot_tokens']
+    return bot_info["aux_bot_tokens"]
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def aux_bot_ids(bot_info) -> List[int]:
-    return bot_info['aux_bot_ids']
+    return bot_info["aux_bot_ids"]
 
 
 def dump_config(file_path: Path, data):
@@ -89,24 +89,23 @@ def dump_config(file_path: Path, data):
     yaml = YAML()
     if not file_path.parent.exists():
         file_path.parent.mkdir(parents=True, exist_ok=True)
-    with file_path.open('w') as file:
+    with file_path.open("w") as file:
         yaml.dump(data, file)
 
 
-def build_channel_config(bot_token, bot_admins, *, topic_group=None, aux_bot_tokens=None,
-                         mtproto=None, database=None):
+def build_channel_config(bot_token, bot_admins, *, topic_group=None, aux_bot_tokens=None, mtproto=None, database=None):
     config = {
-        'token': bot_token,
-        'admins': bot_admins,
+        "token": bot_token,
+        "admins": bot_admins,
     }
     if topic_group is not None:
-        config['topic_group'] = topic_group
+        config["topic_group"] = topic_group
     if aux_bot_tokens:
-        config['auxiliary_bots'] = [{'token': token} for token in aux_bot_tokens]
+        config["auxiliary_bots"] = [{"token": token} for token in aux_bot_tokens]
     if mtproto is not None:
-        config['mtproto'] = mtproto
+        config["mtproto"] = mtproto
     if database is not None:
-        config['database'] = database
+        config["database"] = database
     return config
 
 
@@ -115,11 +114,7 @@ def load_test_coordinator(tmp_path_factory, monkey_class, channel_config) -> Mod
     monkey_class.setenv("EFB_DATA_PATH", str(tmp_path))
 
     config_path = get_config_path()
-    dump_config(config_path, {
-        "master_channel": TelegramChannel.channel_id,
-        "slave_channels": ["tests.mocks.slave"],
-        "middlewares": []
-    })
+    dump_config(config_path, {"master_channel": TelegramChannel.channel_id, "slave_channels": ["tests.mocks.slave"], "middlewares": []})
 
     ehforwarderbot.coordinator.add_channel(MockSlaveChannel())
 
@@ -134,6 +129,7 @@ def load_test_coordinator(tmp_path_factory, monkey_class, channel_config) -> Mod
 @pytest.fixture(scope="module")
 def monkey_class():
     from _pytest.monkeypatch import MonkeyPatch
+
     mpatch = MonkeyPatch()
     yield mpatch
     mpatch.undo()
@@ -156,8 +152,7 @@ def coordinator(tmp_path_factory, monkey_class, bot_token, bot_admins) -> Iterat
 
 
 @pytest.fixture(scope="module")
-def coordinator_with_topic_group(tmp_path_factory, monkey_class, bot_token, bot_admins,
-                                 bot_topic_group) -> Iterator[ModuleType]:
+def coordinator_with_topic_group(tmp_path_factory, monkey_class, bot_token, bot_admins, bot_topic_group) -> Iterator[ModuleType]:
     if bot_topic_group is None:
         pytest.skip("TOPIC_GROUP is not configured")
 
@@ -176,8 +171,14 @@ def coordinator_with_topic_group(tmp_path_factory, monkey_class, bot_token, bot_
 
 @pytest.fixture(scope="module")
 def coordinator_with_topic_group_and_mtproto(
-        tmp_path_factory, monkey_class, bot_token, bot_admins, bot_topic_group,
-        api_id, api_hash, integration_postgres_config,
+    tmp_path_factory,
+    monkey_class,
+    bot_token,
+    bot_admins,
+    bot_topic_group,
+    api_id,
+    api_hash,
+    integration_postgres_config,
 ) -> Iterator[ModuleType]:
     if bot_topic_group is None:
         pytest.skip("TOPIC_GROUP is not configured")
@@ -202,8 +203,7 @@ def coordinator_with_topic_group_and_mtproto(
 
 
 @pytest.fixture(scope="module")
-def coordinator_with_auxiliary_bots(tmp_path_factory, monkey_class, bot_token, bot_admins,
-                                    aux_bot_tokens) -> Iterator[ModuleType]:
+def coordinator_with_auxiliary_bots(tmp_path_factory, monkey_class, bot_token, bot_admins, aux_bot_tokens) -> Iterator[ModuleType]:
     if not aux_bot_tokens:
         pytest.skip("AUX_BOT_TOKEN is not configured")
 
@@ -262,13 +262,14 @@ def slave_with_auxiliary_bots(coordinator_with_auxiliary_bots) -> MockSlaveChann
 
 # Isolation of unit tests and integration tests
 
+
 def pytest_addoption(parser):
     parser.addoption(
         "--mode",
         action="store",
         metavar="MODE",
-        default='unit',
-        choices=['unit', 'integration', 'both'],
+        default="unit",
+        choices=["unit", "integration", "both"],
         help="run test of mode 'unit', 'integration', or 'both' (default: 'unit').",
     )
 
@@ -280,13 +281,13 @@ def pytest_configure(config):
 
 
 def pytest_runtest_setup(item):
-    is_unit = item.module.__name__.startswith('tests.unit')
-    is_integration = item.module.__name__.startswith('tests.integration')
+    is_unit = item.module.__name__.startswith("tests.unit")
+    is_integration = item.module.__name__.startswith("tests.integration")
     mode = item.config.getoption("--mode")
-    if mode == 'unit' and not is_unit:
+    if mode == "unit" and not is_unit:
         pytest.skip("test is a unit test", allow_module_level=True)
-    elif mode == 'integration' and not is_integration:
+    elif mode == "integration" and not is_integration:
         pytest.skip("test is an integration test", allow_module_level=True)
 
     if is_integration:
-        item.fixturenames.append('poll_bot')
+        item.fixturenames.append("poll_bot")

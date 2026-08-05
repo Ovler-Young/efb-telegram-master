@@ -1,13 +1,13 @@
-from datetime import timedelta
 import threading
+from datetime import timedelta
 
 import pytest
 from telegram.error import BadRequest, RetryAfter
 
 from efb_telegram_master.outbound import (
     OutboundQueue,
-    QueueRequest,
     QueuedCall,
+    QueueRequest,
     SenderPolicy,
     SenderSelection,
     TelegramCallAdapter,
@@ -27,8 +27,13 @@ class _Limiter:
 
 def _queue(sender, worker_count=2):
     queue = OutboundQueue(
-        sender, None, _Limiter(), worker_count=worker_count, blocking_timeout=1,
-        shutdown_drain_timeout=1, shutdown_join_grace=0.1,
+        sender,
+        None,
+        _Limiter(),
+        worker_count=worker_count,
+        blocking_timeout=1,
+        shutdown_drain_timeout=1,
+        shutdown_join_grace=0.1,
     )
     queue.start()
     return queue

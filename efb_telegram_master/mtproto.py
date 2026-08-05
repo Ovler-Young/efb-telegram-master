@@ -9,23 +9,18 @@ from typing import Optional, Protocol
 class TelethonClient(Protocol):
     """Operations used by the request-only MTProto adapter."""
 
-    async def connect(self) -> None:
-        ...
+    async def connect(self) -> None: ...
 
-    async def start(self, *, bot_token: str) -> None:
-        ...
+    async def start(self, *, bot_token: str) -> None: ...
 
-    async def disconnect(self) -> None:
-        ...
+    async def disconnect(self) -> None: ...
 
-    def is_connected(self) -> bool:
-        ...
+    def is_connected(self) -> bool: ...
 
-    async def __call__(self, request: object) -> object:
-        ...
+    async def __call__(self, request: object) -> object: ...
 
-    async def get_input_entity(self, entity: int) -> object:
-        ...
+    async def get_input_entity(self, entity: int) -> object: ...
+
 
 @dataclass(frozen=True)
 class MTProtoConfig:
@@ -167,7 +162,7 @@ class MTProtoClient:
 
         messages: list[object] = []
         for index in range(0, len(ordered_ids), 100):
-            request = GetMessagesRequest(channel=channel, id=ordered_ids[index:index + 100])
+            request = GetMessagesRequest(channel=channel, id=ordered_ids[index : index + 100])
             try:
                 response = await self.client(request)
             except BaseException as error:

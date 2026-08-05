@@ -9,11 +9,10 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+from prometheus_client import CollectorRegistry, Counter, Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
-from .outbound import OutboundQueue, QUEUED_OPERATIONS
-
+from .outbound import QUEUED_OPERATIONS, OutboundQueue
 
 _PRIORITIES = frozenset({"blocking", "normal"})
 _SENDER_KINDS = frozenset({"main", "auxiliary"})
@@ -26,32 +25,34 @@ _AUXILIARY_STATES = frozenset({"enabled", "disabled"})
 _MEMBERSHIP_CACHE_STATES = frozenset({"member", "not_member", "unknown_probe_pending"})
 _MEMBERSHIP_PROBE_OUTCOMES = frozenset({"ok_member", "ok_not_member", "forbidden", "bad_request", "error"})
 _RATE_LIMIT_SCOPES = frozenset({"global", "chat"})
-_DATABASE_METHODS = frozenset({
-    "stop_worker",
-    "add_chat_assoc",
-    "remove_chat_assoc",
-    "get_master_msg_id",
-    "get_chat_assoc",
-    "add_topic_assoc",
-    "get_topic_thread_id",
-    "get_topic_slave",
-    "get_topic_slaves",
-    "remove_topic_assoc",
-    "add_or_update_message_log",
-    "get_msg_log",
-    "delete_msg_log",
-    "get_slave_chat_info",
-    "set_slave_chat_info",
-    "delete_slave_chat_info",
-    "get_recent_slave_chats",
-    "get_last_message",
-    "get_recent_messages",
-    "replace_history_migration_entries",
-    "has_pending_history_migrations",
-    "get_next_history_migration_target",
-    "get_history_migration_entries",
-    "delete_history_migration_entry",
-})
+_DATABASE_METHODS = frozenset(
+    {
+        "stop_worker",
+        "add_chat_assoc",
+        "remove_chat_assoc",
+        "get_master_msg_id",
+        "get_chat_assoc",
+        "add_topic_assoc",
+        "get_topic_thread_id",
+        "get_topic_slave",
+        "get_topic_slaves",
+        "remove_topic_assoc",
+        "add_or_update_message_log",
+        "get_msg_log",
+        "delete_msg_log",
+        "get_slave_chat_info",
+        "set_slave_chat_info",
+        "delete_slave_chat_info",
+        "get_recent_slave_chats",
+        "get_last_message",
+        "get_recent_messages",
+        "replace_history_migration_entries",
+        "has_pending_history_migrations",
+        "get_next_history_migration_target",
+        "get_history_migration_entries",
+        "delete_history_migration_entry",
+    }
+)
 _DATABASE_OUTCOMES = frozenset({"success", "failure"})
 
 
@@ -204,16 +205,12 @@ class Metrics:
         return value
 
     def record_membership_probe(self, outcome: str) -> None:
-        self.membership_probes.labels(
-            self._bounded(outcome, _MEMBERSHIP_PROBE_OUTCOMES, "membership probe outcome")
-        ).inc()
+        self.membership_probes.labels(self._bounded(outcome, _MEMBERSHIP_PROBE_OUTCOMES, "membership probe outcome")).inc()
 
     def record_database_method_call(self, method: str, seconds: float, outcome: str) -> None:
         """Record one DatabaseManager call using only statically bounded method names."""
         labels = (self._bounded(method, _DATABASE_METHODS, "database method"),)
-        self.database_method_duration.labels(*labels).observe(
-            self._non_negative(seconds, "database method duration")
-        )
+        self.database_method_duration.labels(*labels).observe(self._non_negative(seconds, "database method duration"))
         if self._bounded(outcome, _DATABASE_OUTCOMES, "database method outcome") == "failure":
             self.database_method_failures.labels(*labels).inc()
 
@@ -315,16 +312,12 @@ class Metrics:
                         f"{self.namespace}_host_network_receive_bytes_total",
                         "Cumulative network bytes received by the host.",
                     )
-                    network_receive.add_metric(
-                        [], self._non_negative(network_counters.bytes_recv, "host network received bytes")
-                    )
+                    network_receive.add_metric([], self._non_negative(network_counters.bytes_recv, "host network received bytes"))
                     network_transmit = CounterMetricFamily(
                         f"{self.namespace}_host_network_transmit_bytes_total",
                         "Cumulative network bytes transmitted by the host.",
                     )
-                    network_transmit.add_metric(
-                        [], self._non_negative(network_counters.bytes_sent, "host network transmitted bytes")
-                    )
+                    network_transmit.add_metric([], self._non_negative(network_counters.bytes_sent, "host network transmitted bytes"))
                     metrics.extend((network_receive, network_transmit))
                 except Exception as error:
                     self._record_collector_failure("host_network", error)
@@ -333,9 +326,7 @@ class Metrics:
 
         self._register_collector(collect)
 
-    def register_destination_queue_collector(
-        self, snapshot: Callable[[], Iterable[DestinationQueueSnapshot]], top_n: int
-    ) -> None:
+    def register_destination_queue_collector(self, snapshot: Callable[[], Iterable[DestinationQueueSnapshot]], top_n: int) -> None:
         """Register a scrape-time top-N destination snapshot with no retained destination state."""
         cap = self._count(top_n, "destination top_n")
 
@@ -356,20 +347,16 @@ class Metrics:
                     raise ValueError("destination must be a non-empty string")
                 depth.add_metric([item.destination], self._count(item.depth, "destination depth"))
                 if item.oldest_age_seconds is not None:
-                    oldest.add_metric(
-                        [item.destination], self._non_negative(item.oldest_age_seconds, "destination oldest age")
-                    )
+                    oldest.add_metric([item.destination], self._non_negative(item.oldest_age_seconds, "destination oldest age"))
             return (depth, oldest)
 
         self._register_collector(collect)
 
     def register_outbound_queue_collectors(self, queue: OutboundQueue, top_n: int) -> None:
         """Register the outbound queue's bounded scrape snapshots."""
+
         def destination_snapshot() -> Iterable[DestinationQueueSnapshot]:
-            return (
-                DestinationQueueSnapshot(destination, depth, oldest_age)
-                for destination, depth, oldest_age in queue.destination_snapshot()
-            )
+            return (DestinationQueueSnapshot(destination, depth, oldest_age) for destination, depth, oldest_age in queue.destination_snapshot())
 
         def worker_snapshot() -> WorkerSnapshot:
             healthy, in_flight = queue.worker_snapshot()
@@ -381,13 +368,10 @@ class Metrics:
 
     def register_worker_collector(self, snapshot: Callable[[], WorkerSnapshot]) -> None:
         """Register aggregate worker liveness and in-flight state."""
+
         def collect() -> Iterable[GaugeMetricFamily]:
-            health = GaugeMetricFamily(
-                f"{self.namespace}_outbound_worker_healthy", "Whether the outbound worker is alive."
-            )
-            in_flight = GaugeMetricFamily(
-                f"{self.namespace}_outbound_worker_in_flight", "Calls currently owned by the outbound worker."
-            )
+            health = GaugeMetricFamily(f"{self.namespace}_outbound_worker_healthy", "Whether the outbound worker is alive.")
+            in_flight = GaugeMetricFamily(f"{self.namespace}_outbound_worker_in_flight", "Calls currently owned by the outbound worker.")
             value = snapshot()
             health.add_metric([], int(value.healthy))
             in_flight.add_metric([], self._count(value.in_flight, "worker in-flight"))
@@ -461,8 +445,9 @@ class Metrics:
 
 def start_metrics_server(host: str, port: int, registry: CollectorRegistry) -> MetricsServer:
     """Start a daemon WSGI serving thread and return its bounded-shutdown handle."""
-    from prometheus_client import make_wsgi_app
     from wsgiref.simple_server import WSGIRequestHandler, make_server
+
+    from prometheus_client import make_wsgi_app
 
     class QuietHandler(WSGIRequestHandler):
         def log_message(self, *_args: object) -> None:

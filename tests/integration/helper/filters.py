@@ -6,19 +6,33 @@ under GPL v3.
 
 .. _python-telegram-bot: https://github.com/python-telegram-bot/python-telegram-bot
 """
-import re
-from typing import Optional, cast, Set
 
-from telethon.events import NewMessage, ChatAction, MessageEdited, MessageDeleted, UserUpdate
+import re
+from typing import Optional, Set, cast
+
+from telethon.events import ChatAction, MessageDeleted, MessageEdited, NewMessage, UserUpdate
 from telethon.events.common import EventCommon
 from telethon.tl.custom import Message
 from telethon.tl.types import MessageMediaWebPage
 
-__all__ = ["BaseFilter", "MergedFilter", "InvertedFilter",
-           "everything", "in_chats",
-           "message", "text", "has_button", "edited", "regex",
-           "chat_action", "new_photo", "new_title",
-           "deleted", "reply_to", "typing"]
+__all__ = [
+    "BaseFilter",
+    "MergedFilter",
+    "InvertedFilter",
+    "everything",
+    "in_chats",
+    "message",
+    "text",
+    "has_button",
+    "edited",
+    "regex",
+    "chat_action",
+    "new_photo",
+    "new_title",
+    "deleted",
+    "reply_to",
+    "typing",
+]
 
 
 class BaseFilter:
@@ -58,9 +72,7 @@ class BaseFilter:
 
 
 class MergedFilter(BaseFilter):
-    def __init__(self, base: BaseFilter,
-                 and_filter: Optional[BaseFilter] = None,
-                 or_filter: Optional[BaseFilter] = None):
+    def __init__(self, base: BaseFilter, and_filter: Optional[BaseFilter] = None, or_filter: Optional[BaseFilter] = None):
         self.base = base
         self.and_filter = and_filter
         self.or_filter = or_filter
@@ -206,10 +218,7 @@ class _TextMessage(_Message):
         if not super().filter(event):
             return False
         message: Message = cast(NewMessage.Event, event).message
-        return (bool(message.raw_text) and
-                message.action is None and
-                (message.media is None or isinstance(message.media, MessageMediaWebPage))
-                )
+        return bool(message.raw_text) and message.action is None and (message.media is None or isinstance(message.media, MessageMediaWebPage))
 
     def __repr__(self):
         return "Text"

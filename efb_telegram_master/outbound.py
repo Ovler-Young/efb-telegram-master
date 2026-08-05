@@ -6,7 +6,8 @@ import collections
 import io
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Mapping, Optional, TypeAlias
 
@@ -20,16 +21,35 @@ if TYPE_CHECKING:
     from .bot_pool import BotPool
 
 
-QUEUED_OPERATIONS = frozenset({
-    "send_message", "send_document", "send_photo", "send_audio",
-    "send_video", "send_animation", "send_voice", "send_sticker",
-    "send_media_group", "copy_message", "forward_message",
-    "edit_message_text", "edit_message_caption", "edit_message_media",
-    "delete_message", "edit_message_reply_markup", "send_location",
-    "send_venue", "create_forum_topic", "edit_forum_topic",
-    "reopen_forum_topic", "set_chat_title", "set_chat_photo",
-    "pin_chat_message", "set_chat_description",
-})
+QUEUED_OPERATIONS = frozenset(
+    {
+        "send_message",
+        "send_document",
+        "send_photo",
+        "send_audio",
+        "send_video",
+        "send_animation",
+        "send_voice",
+        "send_sticker",
+        "send_media_group",
+        "copy_message",
+        "forward_message",
+        "edit_message_text",
+        "edit_message_caption",
+        "edit_message_media",
+        "delete_message",
+        "edit_message_reply_markup",
+        "send_location",
+        "send_venue",
+        "create_forum_topic",
+        "edit_forum_topic",
+        "reopen_forum_topic",
+        "set_chat_title",
+        "set_chat_photo",
+        "pin_chat_message",
+        "set_chat_description",
+    }
+)
 
 _INTERNAL_KWARGS = frozenset({"prefix", "suffix", "_sender_bot_id", "_slave_id", "_force_main_bot"})
 _CONTENT_SPECS = {
@@ -137,9 +157,7 @@ class SenderPolicy:
 
     MEMBERSHIP_RECHECK_SECONDS = 0.25
 
-    def __init__(
-        self, main_bot: object, bot_pool: Optional[BotPool], main_rate_limiter: SlidingWindowRateLimiter
-    ) -> None:
+    def __init__(self, main_bot: object, bot_pool: Optional[BotPool], main_rate_limiter: SlidingWindowRateLimiter) -> None:
         self._main_bot = main_bot
         self._bot_pool = bot_pool
         self._main_rate_limiter = main_rate_limiter
@@ -241,7 +259,7 @@ class TelegramCallAdapter:
                 attachment = io.BytesIO(attachment_content.encode("utf-8"))
                 truncated = full_content[:100] + "\n...\n" + full_content[-100:]
                 if positional:
-                    telegram_args = (*telegram_args[:content_index], truncated, *telegram_args[content_index + 1:])
+                    telegram_args = (*telegram_args[:content_index], truncated, *telegram_args[content_index + 1 :])
                 else:
                     telegram_kwargs[content_key] = truncated
         try:
@@ -255,9 +273,13 @@ class TelegramCallAdapter:
         if attachment is not None and content_key is not None and getattr(result, "message_id", None) is not None:
             extension = ".md" if original_parse_mode == "markdown" else ".html" if original_parse_mode == "html" else ".txt"
             label = "Message" if content_key == "text" else "Caption"
-            getattr(sender, "send_document")(call.telegram_chat_id, attachment,
-                filename=f"{call.telegram_chat_id}_{result.message_id}{extension}", reply_to_message_id=result.message_id,
-                caption=f"{label} is truncated due to its length. Full message is sent as attachment.")
+            getattr(sender, "send_document")(
+                call.telegram_chat_id,
+                attachment,
+                filename=f"{call.telegram_chat_id}_{result.message_id}{extension}",
+                reply_to_message_id=result.message_id,
+                caption=f"{label} is truncated due to its length. Full message is sent as attachment.",
+            )
         if selection.sender_bot_id is not None and self._bot_pool and call.slave_id:
             self._bot_pool.record_successful_auxiliary_send(call.slave_id, selection.sender_bot_id)
         return SendReceipt(result, selection.sender_bot_id)
@@ -328,8 +350,12 @@ class OutboundQueue:
         waiter: QueueFuture = Future()
         pending = _PendingCall(
             QueuedCall(
-                request.operation, request.args, dict(request.kwargs), request.telegram_chat_id,
-                request.slave_id, request.required_sender_bot_id,
+                request.operation,
+                request.args,
+                dict(request.kwargs),
+                request.telegram_chat_id,
+                request.slave_id,
+                request.required_sender_bot_id,
             ),
             waiter,
         )
@@ -345,9 +371,7 @@ class OutboundQueue:
         try:
             return waiter.result(timeout=self._blocking_timeout)
         except FutureTimeoutError as error:
-            raise RuntimeError(
-                f"Telegram call to chat {request.telegram_chat_id} timed out after {self._blocking_timeout:g}s"
-            ) from error
+            raise RuntimeError(f"Telegram call to chat {request.telegram_chat_id} timed out after {self._blocking_timeout:g}s") from error
 
     def stop(self) -> None:
         with self._lock:

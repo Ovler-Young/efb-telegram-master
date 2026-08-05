@@ -3,19 +3,19 @@ import mimetypes
 import os
 import tempfile
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING, Dict, Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO, Dict, Optional
 
 import magic
 import telegram
+from ehforwarderbot import Channel, Chat, Message, MsgType, coordinator
+from ehforwarderbot.chat import ChatMember
+from ehforwarderbot.message import MessageAttribute, MessageCommands, Substitutions
+from ehforwarderbot.types import MessageID, Reactions
 from PIL import Image
 from telegram.error import BadRequest
 
-from ehforwarderbot import Message, coordinator, MsgType, Chat, Channel
-from ehforwarderbot.chat import ChatMember
-from ehforwarderbot.message import MessageAttribute, MessageCommands, Substitutions
-from ehforwarderbot.types import Reactions, MessageID
 from . import utils
-from .chat import ETMChatType, ETMChatMember
+from .chat import ETMChatMember, ETMChatType
 from .chat_object_cache import ChatObjectCacheManager
 from .msg_type import TGMsgType
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 FILE_DOWNLOAD_TIMEOUT = 120
 
-__all__ = ['ETMMsg']
+__all__ = ["ETMMsg"]
 
 
 class ETMMsg(Message):
@@ -45,17 +45,52 @@ class ETMMsg(Message):
     __path = None
     __filename = None
 
-    def __init__(self, attributes: Optional[MessageAttribute] = None, author: Optional[ChatMember] = None,
-                 chat: Optional[Chat] = None,
-                 commands: Optional[MessageCommands] = None, deliver_to: Optional[Channel] = None, edit: bool = False,
-                 edit_media: bool = False, file: Optional[BinaryIO] = None, filename: Optional[str] = None,
-                 is_system: bool = False, mime: Optional[str] = None, path: Optional[Path] = None,
-                 reactions: Optional[Reactions] = None, substitutions: Optional[Substitutions] = None,
-                 target: 'Optional[Message]' = None, text: str = "", type: MsgType = MsgType.Unsupported,
-                 uid: Optional[MessageID] = None, vendor_specific: Optional[Dict[str, Any]] = None,
-                 type_telegram: TGMsgType = TGMsgType.System, file_id: Optional[str] = None):
+    def __init__(
+        self,
+        attributes: Optional[MessageAttribute] = None,
+        author: Optional[ChatMember] = None,
+        chat: Optional[Chat] = None,
+        commands: Optional[MessageCommands] = None,
+        deliver_to: Optional[Channel] = None,
+        edit: bool = False,
+        edit_media: bool = False,
+        file: Optional[BinaryIO] = None,
+        filename: Optional[str] = None,
+        is_system: bool = False,
+        mime: Optional[str] = None,
+        path: Optional[Path] = None,
+        reactions: Optional[Reactions] = None,
+        substitutions: Optional[Substitutions] = None,
+        target: "Optional[Message]" = None,
+        text: str = "",
+        type: MsgType = MsgType.Unsupported,
+        uid: Optional[MessageID] = None,
+        vendor_specific: Optional[Dict[str, Any]] = None,
+        type_telegram: TGMsgType = TGMsgType.System,
+        file_id: Optional[str] = None,
+    ):
         # ehforwarderbot.Message doesn't annotate these as Optional, but handles None at runtime
-        super().__init__(attributes=attributes, chat=chat, author=author, commands=commands, deliver_to=deliver_to, edit=edit, edit_media=edit_media, file=file, filename=filename, is_system=is_system, mime=mime, path=path, reactions=reactions, substitutions=substitutions, target=target, text=text, type=type, uid=uid, vendor_specific=vendor_specific)  # type: ignore[arg-type]
+        super().__init__(
+            attributes=attributes,
+            chat=chat,  # type: ignore[arg-type]
+            author=author,  # type: ignore[arg-type]
+            commands=commands,
+            deliver_to=deliver_to,  # type: ignore[arg-type]
+            edit=edit,
+            edit_media=edit_media,
+            file=file,
+            filename=filename,
+            is_system=is_system,
+            mime=mime,
+            path=path,
+            reactions=reactions,  # type: ignore[arg-type]
+            substitutions=substitutions,
+            target=target,
+            text=text,
+            type=type,
+            uid=uid,
+            vendor_specific=vendor_specific,  # type: ignore[arg-type]
+        )
         self.__initialized = False
         self.type_telegram = type_telegram
         self.file_id = file_id
@@ -67,7 +102,7 @@ class ETMMsg(Message):
             # Route get_file through the correct bot based on sender_bot_id.
             file_bot = None
             if self.sender_bot_id:
-                bot_pool = getattr(bot_manager, 'bot_pool', None)
+                bot_pool = getattr(bot_manager, "bot_pool", None)
                 if bot_pool:
                     aux_bot = bot_pool.get_bot_by_id(self.sender_bot_id)
                     if aux_bot and not aux_bot.disabled:
@@ -123,7 +158,7 @@ class ETMMsg(Message):
                 self.mime = "image/gif"
             elif self.type_telegram == TGMsgType.Sticker:
                 out_file = tempfile.NamedTemporaryFile(suffix=".png")
-                Image.open(file).convert("RGBA").save(out_file, 'png')
+                Image.open(file).convert("RGBA").save(out_file, "png")
                 file.close()
                 out_file.seek(0)
                 self.mime = "image/png"
@@ -185,7 +220,7 @@ class ETMMsg(Message):
     filename: Optional[str] = property(get_filename, set_filename)  # type: ignore
 
     @staticmethod
-    def from_efbmsg(source: Message, chat_manager: ChatObjectCacheManager) -> 'ETMMsg':
+    def from_efbmsg(source: Message, chat_manager: ChatObjectCacheManager) -> "ETMMsg":
         target = ETMMsg()
         target.__dict__.update(source.__dict__)
         if not isinstance(target.chat, ETMChatType):
@@ -203,7 +238,7 @@ class ETMMsg(Message):
         is_common_file = False
 
         # Store media related information to local database
-        for tg_media_type in ('animation', 'document', 'video', 'voice'):
+        for tg_media_type in ("animation", "document", "video", "voice"):
             attachment = getattr(message, tg_media_type, None)
             if attachment:
                 is_common_file = True
@@ -223,26 +258,26 @@ class ETMMsg(Message):
                 assert message.sticker
                 self.file_id = message.sticker.file_id
                 self.file_unique_id = message.sticker.file_unique_id
-                self.mime = 'image/webp'
+                self.mime = "image/webp"
             elif self.type_telegram is TGMsgType.AnimatedSticker:
                 assert message.sticker
                 self.file_id = message.sticker.file_id
                 self.file_unique_id = message.sticker.file_unique_id
-                self.mime = 'application/json+tgs'
+                self.mime = "application/json+tgs"
                 self.type = MsgType.Animation
             elif self.type_telegram is TGMsgType.VideoSticker:
                 assert message.sticker
                 self.file_id = message.sticker.file_id
                 self.file_unique_id = message.sticker.file_unique_id
-                self.mime = 'video/webm'
+                self.mime = "video/webm"
                 self.type = MsgType.Animation
-            elif getattr(message, 'photo', None):
+            elif getattr(message, "photo", None):
                 attachment = message.photo[-1]
                 self.file_id = attachment.file_id
                 self.file_unique_id = attachment.file_unique_id
-                self.mime = 'image/jpeg'
+                self.mime = "image/jpeg"
             elif self.type_telegram is TGMsgType.VideoNote:
                 assert message.video_note
                 self.file_id = message.video_note.file_id
                 self.file_unique_id = message.video_note.file_unique_id
-                self.mime = 'video/mpeg'
+                self.mime = "video/mpeg"

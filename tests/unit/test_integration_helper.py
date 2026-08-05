@@ -54,7 +54,7 @@ def build_event_helper() -> helper_module.TelegramIntegrationTestHelper:
 
 @pytest.mark.asyncio
 async def test_helper_disconnects_partially_started_client_after_connect_timeout(
-        monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = StalledTelegramClient()
     test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
@@ -70,8 +70,8 @@ async def test_helper_disconnects_partially_started_client_after_connect_timeout
 
 @pytest.mark.asyncio
 async def test_helper_preserves_startup_failure_when_cleanup_fails(
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = FailingCleanupTelegramClient()
     test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
@@ -100,7 +100,7 @@ async def test_helper_waits_for_telethon_disconnect_completion() -> None:
 
 @pytest.mark.asyncio
 async def test_helper_disconnect_completion_has_a_timeout(
-        monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = HangingDisconnectTelegramClient()
     test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
@@ -185,21 +185,21 @@ async def test_private_response_deadline_includes_trigger() -> None:
         response_received = True
 
     with pytest.raises(asyncio.TimeoutError):
-        await helper_module.wait_for_private_response(
-            lambda: 0.0, trigger, receive, cap=0.01
-        )
+        await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive, cap=0.01)
 
     assert not response_received
 
 
 @pytest.mark.asyncio
 async def test_wait_for_limiter_slot_caps_wait_at_65_seconds(
-        monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monotonic_values = iter((0.0, 0.0, 65.0))
     sleeps = []
+
     async def sleep(delay: float) -> None:
         sleeps.append(delay)
+
     monkeypatch.setattr(helper_module, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
     monkeypatch.setattr(helper_module.asyncio, "sleep", sleep)
     with pytest.raises(TimeoutError, match="65 seconds"):

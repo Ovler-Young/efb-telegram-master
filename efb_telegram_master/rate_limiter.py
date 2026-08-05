@@ -10,7 +10,6 @@ from collections.abc import Callable
 from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate, SingleBucketFactory
 from pyrate_limiter.clocks import AbstractClock
 
-
 GLOBAL_LIMIT = 28
 GLOBAL_WINDOW_SECONDS = 1.0
 CHAT_LIMIT = 18

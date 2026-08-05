@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from telegram import Update
 from ehforwarderbot.constants import MsgType
+from telegram import Update
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
@@ -31,10 +31,13 @@ def test_sync_msglog_requires_admin_and_a_bound_forum_group():
 def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
     manager = object.__new__(ChatBindingManager)
     manager.db = SimpleNamespace(
-        get_resumable_msglog_ingestion_scans=Mock(return_value=[
-            SimpleNamespace(source_chat_id="100"), SimpleNamespace(source_chat_id="200"),
-        ]),
-        get_topic_slaves=Mock(side_effect=[[('a', 1)], [('b', 2)]]),
+        get_resumable_msglog_ingestion_scans=Mock(
+            return_value=[
+                SimpleNamespace(source_chat_id="100"),
+                SimpleNamespace(source_chat_id="200"),
+            ]
+        ),
+        get_topic_slaves=Mock(side_effect=[[("a", 1)], [("b", 2)]]),
     )
     manager.schedule_msglog_ingestion = Mock()
     manager.logger = Mock()
@@ -75,12 +78,20 @@ def test_ordinary_send_writes_msglog_once_and_releases_completion(monkeypatch):
     monkeypatch.setattr(ETMMsg, "from_efbmsg", Mock(return_value=etm_msg))
     monkeypatch.setattr("efb_telegram_master.slave_message.get_msg_type", Mock(return_value="Text"))
     message = SimpleNamespace(
-        uid="slave-message", target=None, commands=[], reactions={}, text="hello", type=MsgType.Text,
+        uid="slave-message",
+        target=None,
+        commands=[],
+        reactions={},
+        text="hello",
+        type=MsgType.Text,
     )
 
     processor.dispatch_message(message, "", None, 123, None, dedupe_key=("slave", "slave-message"))
 
     processor.db.add_or_update_message_log.assert_called_once_with(
-        etm_msg, sent, None, sender_bot_id="7",
+        etm_msg,
+        sent,
+        None,
+        sender_bot_id="7",
     )
     processor._release_pending_slave_message.assert_called_once_with(("slave", "slave-message"))

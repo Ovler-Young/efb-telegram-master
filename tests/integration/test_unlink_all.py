@@ -2,7 +2,7 @@ from pytest import mark
 from telethon.tl.custom import Message
 
 from .helper.filters import in_chats
-from .utils import link_chats, assert_is_linked
+from .utils import assert_is_linked, link_chats
 
 pytestmark = mark.asyncio
 
@@ -33,8 +33,7 @@ async def test_unlink_all_group_linked(helper, client, bot_group, slave, channel
         assert_is_linked(channel, tuple(), bot_group)
 
 
-async def test_unlink_all_channel_linked(helper, client, bot_channel, bot_id, slave, channel,
-                                         private_response):
+async def test_unlink_all_channel_linked(helper, client, bot_channel, bot_id, slave, channel, private_response):
     with link_chats(channel, slave.get_chats_by_criteria(alias=True, avatar=True), bot_channel):
         message: Message = await client.send_message(bot_channel, "/unlink_all")
         await private_response(

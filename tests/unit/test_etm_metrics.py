@@ -30,9 +30,7 @@ def test_process_collector_logs_a_repeated_failure_once_and_keeps_other_metrics(
         generate_latest(metrics.registry)
 
     assert "etm_process_resident_memory_bytes" in first_scrape
-    assert [record.message for record in caplog.records].count(
-        "Metrics collector process_cpu failed (RuntimeError)."
-    ) == 1
+    assert [record.message for record in caplog.records].count("Metrics collector process_cpu failed (RuntimeError).") == 1
 
 
 def test_metrics_server_logs_the_port_chosen_by_the_os(caplog):

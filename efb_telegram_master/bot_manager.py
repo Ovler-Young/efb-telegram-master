@@ -2,22 +2,17 @@
 from __future__ import annotations
 
 import asyncio
-import collections
 import html
 import logging
 import numbers
 import os
-import re
 import threading
-from datetime import datetime
 from functools import wraps
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, BinaryIO, Callable, Coroutine, List, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
-from urllib.request import url2pathname
+from typing import TYPE_CHECKING, Callable, Coroutine, List, Mapping, Optional, ParamSpec, Protocol, TypeAlias, TypeVar, cast
 
 import telegram.constants
 import telegram.error
-from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
+from telegram import File, ForumTopic, InlineKeyboardMarkup, Update, User
 from telegram.ext import CallbackContext, MessageHandler, TypeHandler
 
 from .auxiliary_bot import AuxiliaryBot
@@ -25,8 +20,8 @@ from .bot_pool import BotPool
 from .etm_metrics import Metrics, parse_metrics_config, start_metrics_server
 from .locale_mixin import LocaleMixin
 from .outbound import (
-    OutboundQueue,
     QUEUED_OPERATIONS,
+    OutboundQueue,
     QueueEnqueueError,
     QueueRequest,
     SendReceipt,
@@ -34,22 +29,20 @@ from .outbound import (
 )
 from .ptb_compat import Filters
 from .rate_limiter import SlidingWindowRateLimiter
-from .utils import TelegramChatID, TelegramMessageID
 from .telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 from .utils import normalize_request_kwargs
 
-
 if TYPE_CHECKING:
     from . import TelegramChannel
-    from .message import ETMMsg
 
 MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
 P = ParamSpec("P")
 T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
+
+
 class SyncBotProtocol(Protocol):
-    def __getattr__(self, item: str) -> BotMethod:
-        ...
+    def __getattr__(self, item: str) -> BotMethod: ...
 
 
 def _has_callback_keyboard(reply_markup) -> bool:
@@ -87,7 +80,7 @@ class TelegramBotManager(LocaleMixin):
     _bot: SyncBotProtocol
     me: Optional[User]
     admins: List[int]
-    bot_pool: Optional['BotPool']
+    bot_pool: Optional["BotPool"]
     _stopping: threading.Event
     _cleanup_tls: threading.local
     _aux_recent_use: dict[int, float]
@@ -95,7 +88,7 @@ class TelegramBotManager(LocaleMixin):
     class Decorators:
         logger = logging.getLogger(__name__)
         _POSITIONAL_CHAT_ID_INDICES = {
-            'edit_message_text': 1,
+            "edit_message_text": 1,
         }
 
         @classmethod
@@ -106,14 +99,14 @@ class TelegramBotManager(LocaleMixin):
         @classmethod
         def retry_on_chat_migration(cls, fn: Callable):
             @wraps(fn)
-            def retry_on_chat_migration_wrap(self: 'TelegramBotManager', *args, **kwargs):
+            def retry_on_chat_migration_wrap(self: "TelegramBotManager", *args, **kwargs):
                 try:
                     return fn(self, *args, **kwargs)
                 except telegram.error.ChatMigrated as e:
-                    if 'chat_id' in kwargs:
-                        chat_id = kwargs['chat_id']
+                    if "chat_id" in kwargs:
+                        chat_id = kwargs["chat_id"]
                         self.channel.chat_binding.chat_migration_by_id(chat_id, e.new_chat_id)
-                        kwargs['chat_id'] = e.new_chat_id
+                        kwargs["chat_id"] = e.new_chat_id
                         return fn(self, *args, **kwargs)
                     else:
                         chat_id_index = cls._POSITIONAL_CHAT_ID_INDICES.get(fn.__name__, 0)
@@ -122,25 +115,29 @@ class TelegramBotManager(LocaleMixin):
                         args = (
                             *args[:chat_id_index],
                             e.new_chat_id,
-                            *args[chat_id_index + 1:],
+                            *args[chat_id_index + 1 :],
                         )
                         return fn(self, *args, **kwargs)
 
             return retry_on_chat_migration_wrap
 
-    def __init__(self, channel: 'TelegramChannel'):
-        self.channel: 'TelegramChannel' = channel
+    def __init__(self, channel: "TelegramChannel"):
+        self.channel: "TelegramChannel" = channel
         config = self.channel.config
         self._stopping = threading.Event()
 
         self.telegram_runtime = build_telegram_polling_runtime(
-            config, channel, self.logger, channel._telegram_runtime_started, channel._telegram_runtime_stopped,
+            config,
+            channel,
+            self.logger,
+            channel._telegram_runtime_started,
+            channel._telegram_runtime_stopped,
         )
         self._runtime = self.telegram_runtime.async_runtime
         self._async_bot = self.telegram_runtime.async_bot
         self._bot = self.telegram_runtime.bot
         self.application = self.telegram_runtime.application
-        self.admins = config['admins']
+        self.admins = config["admins"]
         self.dispatcher = self.application
 
         self._cleanup_tls = threading.local()  # Thread-local for pending cleanup files
@@ -149,12 +146,12 @@ class TelegramBotManager(LocaleMixin):
 
         # Initialize auxiliary bot pool
         self.bot_pool: Optional[BotPool] = None
-        aux_configs = config.get('auxiliary_bots', [])
+        aux_configs = config.get("auxiliary_bots", [])
         if aux_configs:
             self._init_bot_pool(aux_configs, config, channel)
         self.logger.debug("Bot pool initialization complete", extra={"event": "telegram_bot.pool_initialized"})
 
-        metrics_top_n, metrics_endpoint = parse_metrics_config(config.get('metrics'), self.logger)
+        metrics_top_n, metrics_endpoint = parse_metrics_config(config.get("metrics"), self.logger)
         self._metrics = Metrics(namespace="etm")
         channel.db.set_metrics(self._metrics)
         if self.bot_pool:
@@ -195,9 +192,7 @@ class TelegramBotManager(LocaleMixin):
 
     def _add_base_dispatchers(self):
         whitelist_filter = ~Filters.user(user_id=self.admins)
-        self.dispatcher.add_handler(
-            MessageHandler(whitelist_filter, self.as_async_callback(lambda update, context: None))
-        )
+        self.dispatcher.add_handler(MessageHandler(whitelist_filter, self.as_async_callback(lambda update, context: None)))
         # Register update_locale in a negative group so it runs BEFORE group 0
         # handlers and does NOT block them. PTB 22 runs one matching handler
         # per group; group 0 is the default and is where commands live.
@@ -213,9 +208,7 @@ class TelegramBotManager(LocaleMixin):
         return int(value)
 
     @staticmethod
-    def _queued_chat_id_argument(
-        operation: str, args: tuple, kwargs: Mapping[str, object]
-    ) -> object:
+    def _queued_chat_id_argument(operation: str, args: tuple, kwargs: Mapping[str, object]) -> object:
         chat_id_index = 1 if operation == "edit_message_text" else 0
         return args[chat_id_index] if len(args) > chat_id_index else kwargs.get("chat_id")
 
@@ -247,14 +240,10 @@ class TelegramBotManager(LocaleMixin):
         queued_args = list(args)
         if len(queued_args) > content_index:
             content = queued_args[content_index]
-            queued_args[content_index] = self._affix_queued_content(
-                content, prefix, suffix, queued_kwargs.get("parse_mode", "")
-            )
+            queued_args[content_index] = self._affix_queued_content(content, prefix, suffix, queued_kwargs.get("parse_mode", ""))
         else:
             content = queued_kwargs.get(content_key, "")
-            queued_kwargs[content_key] = self._affix_queued_content(
-                content, prefix, suffix, queued_kwargs.get("parse_mode", "")
-            )
+            queued_kwargs[content_key] = self._affix_queued_content(content, prefix, suffix, queued_kwargs.get("parse_mode", ""))
         return self._route_queued_operation(operation, tuple(queued_args), queued_kwargs, eventual_capable=eventual_capable)
 
     def _route_queued_operation(
@@ -282,10 +271,16 @@ class TelegramBotManager(LocaleMixin):
         required_sender_bot_id = str(sender_bot_id) if sender_bot_id and not eventual_capable else None
         if force_main_bot or (eventual_capable and has_callback) or not eventual_capable and required_sender_bot_id is None:
             required_sender_bot_id = "__main__"
-        receipt = self.outbound_queue.enqueue_and_wait(QueueRequest(
-            operation, args, queued_kwargs, normalized_chat_id,
-            str(slave_id) if slave_id else None, required_sender_bot_id,
-        ))
+        receipt = self.outbound_queue.enqueue_and_wait(
+            QueueRequest(
+                operation,
+                args,
+                queued_kwargs,
+                normalized_chat_id,
+                str(slave_id) if slave_id else None,
+                required_sender_bot_id,
+            )
+        )
         for path in cleanup_files:
             try:
                 os.unlink(path)
@@ -293,11 +288,8 @@ class TelegramBotManager(LocaleMixin):
                 pass
         return receipt
 
-    def _call_direct_operation(
-        self, operation: str, args: tuple, kwargs: Mapping[str, object]
-    ) -> object:
+    def _call_direct_operation(self, operation: str, args: tuple, kwargs: Mapping[str, object]) -> object:
         return getattr(self._bot, operation)(*args, **_strip_private_queue_metadata(kwargs))
-
 
     def _register_runtime_metric_collectors(self, top_n: int) -> None:
         self._metrics.register_outbound_queue_collectors(self.outbound_queue, top_n)
@@ -318,26 +310,26 @@ class TelegramBotManager(LocaleMixin):
     def _rate_limit_occupancy_snapshot(self) -> dict[str, float]:
         return self.outbound_queue.rate_limit_occupancy_snapshot()
 
-    def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
+    def _init_bot_pool(self, aux_configs: list, config: dict, channel: "TelegramChannel"):
         """Initialize the auxiliary bot pool from config."""
         req_kwargs = {
-            'read_timeout': 15.0,
-            'connection_pool_size': TelegramPollingRuntime._default_connection_pool_size(config),
+            "read_timeout": 15.0,
+            "connection_pool_size": TelegramPollingRuntime._default_connection_pool_size(config),
         }
-        conf_req_kwargs = config.get('request_kwargs')
+        conf_req_kwargs = config.get("request_kwargs")
         if isinstance(conf_req_kwargs, Mapping):
             req_kwargs.update(conf_req_kwargs)
         request_kwargs = normalize_request_kwargs(req_kwargs)
 
-        main_token = config['token']
+        main_token = config["token"]
         seen_tokens = {main_token}
         aux_bots: list = []
 
         for entry in aux_configs:
-            if not isinstance(entry, dict) or not isinstance(entry.get('token'), str):
+            if not isinstance(entry, dict) or not isinstance(entry.get("token"), str):
                 self.logger.warning("Skipping invalid auxiliary bot configuration", extra={"event": "telegram_bot.auxiliary_configuration_invalid", "entry_type": type(entry).__name__})
                 continue
-            token = entry['token']
+            token = entry["token"]
             if token in seen_tokens:
                 self.logger.warning("Skipping duplicate auxiliary bot", extra={"event": "telegram_bot.auxiliary_duplicate"})
                 continue
@@ -346,9 +338,9 @@ class TelegramBotManager(LocaleMixin):
             aux_bot = AuxiliaryBot(
                 token=token,
                 request_kwargs=request_kwargs,
-                base_url=channel.flag('api_base_url') or None,
-                base_file_url=channel.flag('api_base_file_url') or None,
-                local_mode=bool(channel.flag('local_tdlib_api')),
+                base_url=channel.flag("api_base_url") or None,
+                base_file_url=channel.flag("api_base_file_url") or None,
+                local_mode=bool(channel.flag("local_tdlib_api")),
             )
             aux_bot.bind_runtime(self._runtime)
             if aux_bot.initialize():
@@ -369,18 +361,19 @@ class TelegramBotManager(LocaleMixin):
         kwargs: Mapping[str, object],
         required_sender_bot_id: Optional[str],
     ) -> object:
-        return self.outbound_queue.enqueue_and_wait(QueueRequest(
-            operation, args, dict(kwargs), target_chat_id,
-            required_sender_bot_id=required_sender_bot_id,
-        ))
-
-    def _enqueue_main_chat_mutation(
-        self, operation: str, args: tuple, kwargs: Mapping[str, object]
-    ) -> object:
-        telegram_kwargs = _strip_private_queue_metadata(kwargs)
-        target_chat_id = self._normalize_telegram_chat_id(
-            self._queued_chat_id_argument(operation, args, telegram_kwargs)
+        return self.outbound_queue.enqueue_and_wait(
+            QueueRequest(
+                operation,
+                args,
+                dict(kwargs),
+                target_chat_id,
+                required_sender_bot_id=required_sender_bot_id,
+            )
         )
+
+    def _enqueue_main_chat_mutation(self, operation: str, args: tuple, kwargs: Mapping[str, object]) -> object:
+        telegram_kwargs = _strip_private_queue_metadata(kwargs)
+        target_chat_id = self._normalize_telegram_chat_id(self._queued_chat_id_argument(operation, args, telegram_kwargs))
         return self._enqueue_blocking_api_operation(
             target_chat_id=target_chat_id,
             operation=operation,
@@ -390,7 +383,7 @@ class TelegramBotManager(LocaleMixin):
         )
 
     @Decorators.retry_on_chat_migration
-    def send_message(self, *args, prefix: str = '', suffix: str = '', **kwargs):
+    def send_message(self, *args, prefix: str = "", suffix: str = "", **kwargs):
         """
         Send text message.
 
@@ -405,12 +398,18 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message
         """
         return self._route_affixed_queued_operation(
-            "send_message", args, kwargs, eventual_capable=True,
-            content_key="text", content_index=1, prefix=prefix, suffix=suffix,
+            "send_message",
+            args,
+            kwargs,
+            eventual_capable=True,
+            content_key="text",
+            content_index=1,
+            prefix=prefix,
+            suffix=suffix,
         )
 
     @Decorators.retry_on_chat_migration
-    def edit_message_text(self, *args, prefix='', suffix='', **kwargs):
+    def edit_message_text(self, *args, prefix="", suffix="", **kwargs):
         """
         Edit text message.
         Takes exactly same parameters as telegram.bot.edit_message_text,
@@ -424,8 +423,14 @@ class TelegramBotManager(LocaleMixin):
             telegram.Message
         """
         return self._route_affixed_queued_operation(
-            "edit_message_text", args, kwargs, eventual_capable=False,
-            content_key="text", content_index=0, prefix=prefix, suffix=suffix,
+            "edit_message_text",
+            args,
+            kwargs,
+            eventual_capable=False,
+            content_key="text",
+            content_index=0,
+            prefix=prefix,
+            suffix=suffix,
         )
 
     @Decorators.retry_on_chat_migration
@@ -445,9 +450,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_affixed_queued_operation(
-            "send_audio", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
-        )
+        return self._route_affixed_queued_operation("send_audio", args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @Decorators.retry_on_chat_migration
     def send_voice(self, *args, **kwargs):
@@ -466,9 +469,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_affixed_queued_operation(
-            "send_voice", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
-        )
+        return self._route_affixed_queued_operation("send_voice", args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @Decorators.retry_on_chat_migration
     def send_video(self, *args, **kwargs):
@@ -487,9 +488,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_affixed_queued_operation(
-            "send_video", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
-        )
+        return self._route_affixed_queued_operation("send_video", args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @Decorators.retry_on_chat_migration
     def send_document(self, *args, **kwargs):
@@ -506,9 +505,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_affixed_queued_operation(
-            "send_document", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
-        )
+        return self._route_affixed_queued_operation("send_document", args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @Decorators.retry_on_chat_migration
     def send_animation(self, *args, **kwargs):
@@ -525,9 +522,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_affixed_queued_operation(
-            "send_animation", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
-        )
+        return self._route_affixed_queued_operation("send_animation", args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @Decorators.retry_on_chat_migration
     def send_photo(self, *args, **kwargs):
@@ -544,9 +539,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message
         """
-        return self._route_affixed_queued_operation(
-            "send_photo", args, kwargs, eventual_capable=True, content_key="caption", content_index=2
-        )
+        return self._route_affixed_queued_operation("send_photo", args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @Decorators.retry_on_chat_migration
     def send_media_group(self, *args, **kwargs):
@@ -555,11 +548,11 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_chat_migration
     def send_chat_action(self, *args, **kwargs):
         queued_kwargs = dict(kwargs)
-        message_thread_id = queued_kwargs.pop('message_thread_id', None)
+        message_thread_id = queued_kwargs.pop("message_thread_id", None)
         if message_thread_id is not None:
-            api_kwargs = dict(cast(Mapping[str, object], queued_kwargs.get('api_kwargs', {})))
-            api_kwargs['message_thread_id'] = message_thread_id
-            queued_kwargs['api_kwargs'] = api_kwargs
+            api_kwargs = dict(cast(Mapping[str, object], queued_kwargs.get("api_kwargs", {})))
+            api_kwargs["message_thread_id"] = message_thread_id
+            queued_kwargs["api_kwargs"] = api_kwargs
         return self._call_direct_operation("send_chat_action", args, queued_kwargs)
 
     @Decorators.retry_on_chat_migration
@@ -597,15 +590,11 @@ class TelegramBotManager(LocaleMixin):
         assert update.effective_chat
         if update.callback_query:
             self.answer_callback_query(update.callback_query.id)
-        self.edit_message_text(text=self._("Session expired. Please try again. (SE01)"),
-                               chat_id=update.effective_chat.id,
-                               message_id=update.effective_message.message_id)
+        self.edit_message_text(text=self._("Session expired. Please try again. (SE01)"), chat_id=update.effective_chat.id, message_id=update.effective_message.message_id)
 
     @Decorators.retry_on_chat_migration
     def edit_message_caption(self, *args, **kwargs):
-        return self._route_affixed_queued_operation(
-            "edit_message_caption", args, kwargs, eventual_capable=False, content_key="caption", content_index=3
-        )
+        return self._route_affixed_queued_operation("edit_message_caption", args, kwargs, eventual_capable=False, content_key="caption", content_index=3)
 
     @Decorators.retry_on_chat_migration
     def edit_message_media(self, *args, **kwargs):
@@ -618,8 +607,7 @@ class TelegramBotManager(LocaleMixin):
         Returns:
             telegram.Message: Message sent
         """
-        return self.send_message(update.effective_chat.id, errmsg,
-                                 reply_to_message_id=update.effective_message.message_id)
+        return self.send_message(update.effective_chat.id, errmsg, reply_to_message_id=update.effective_message.message_id)
 
     @Decorators.retry_on_chat_migration
     def get_file(self, file_id: str) -> File:
@@ -636,13 +624,10 @@ class TelegramBotManager(LocaleMixin):
         )
 
     @Decorators.retry_on_chat_migration
-    def answer_callback_query(self, *args, prefix="", suffix="", text=None,
-                              message_id=None, **kwargs):
-        chat_id = kwargs.pop('chat_id', None)
+    def answer_callback_query(self, *args, prefix="", suffix="", text=None, message_id=None, **kwargs):
+        kwargs.pop("chat_id", None)
         if text is None:
-            return self._bot.answer_callback_query(
-                *args, **kwargs
-            )
+            return self._bot.answer_callback_query(*args, **kwargs)
         prefix = (prefix and (prefix + "\n")) or prefix
         suffix = (suffix and ("\n" + suffix)) or suffix
 
@@ -651,9 +636,7 @@ class TelegramBotManager(LocaleMixin):
             keep_size = MAX_CALLBACK_QUERY_ANSWER_LENGTH // 3
             truncated = full_message[:keep_size] + "..." + full_message[-keep_size:]
             return self._bot.answer_callback_query(*args, text=truncated, **kwargs)
-        return self._bot.answer_callback_query(
-            *args, text=prefix + text + suffix, **kwargs
-        )
+        return self._bot.answer_callback_query(*args, text=prefix + text + suffix, **kwargs)
 
     @Decorators.retry_on_chat_migration
     def get_chat_info(self, *args, **kwargs):
@@ -692,11 +675,11 @@ class TelegramBotManager(LocaleMixin):
 
     def _stop_metrics_server(self) -> None:
         """Stop the serving metrics thread without joining an unstarted thread."""
-        metrics_httpd = getattr(self, '_metrics_httpd', None)
+        metrics_httpd = getattr(self, "_metrics_httpd", None)
         if metrics_httpd is None:
             return
         self._metrics_httpd = None
-        thread = getattr(metrics_httpd, 'thread', None)
+        thread = getattr(metrics_httpd, "thread", None)
         try:
             if thread is not None and thread.is_alive():
                 metrics_httpd.shutdown()

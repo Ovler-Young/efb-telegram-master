@@ -69,11 +69,7 @@ class BotPool:
         except (TypeError, ValueError):
             return
         with self._lock:
-            stale_slaves = [
-                slave_id
-                for slave_id, preferred_bot_id in self._preferred_sender_by_slave_id.items()
-                if preferred_bot_id == normalized_bot_id
-            ]
+            stale_slaves = [slave_id for slave_id, preferred_bot_id in self._preferred_sender_by_slave_id.items() if preferred_bot_id == normalized_bot_id]
             for slave_id in stale_slaves:
                 del self._preferred_sender_by_slave_id[slave_id]
 

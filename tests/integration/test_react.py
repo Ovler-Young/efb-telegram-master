@@ -3,7 +3,7 @@ from unittest.mock import patch
 from pytest import mark
 from telethon.tl.custom import Message
 
-from tests.integration.helper.filters import in_chats, regex, reply_to, edited
+from tests.integration.helper.filters import edited, in_chats, regex, reply_to
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio
@@ -28,7 +28,7 @@ async def test_react_send_and_retract_reaction(helper, client, bot_group, slave,
         assert reaction in edited_tg_msg.text
 
         # Retract reaction
-        await tg_msg.reply(f"/react -")
+        await tg_msg.reply("/react -")
         edited_tg_msg = await helper.wait_for_message(in_chats(bot_group) & edited(edited_tg_msg.id))
         assert reaction not in edited_tg_msg.text
 

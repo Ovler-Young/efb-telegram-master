@@ -1,9 +1,9 @@
 import re
 
+from ehforwarderbot.__version__ import __version__ as efb_version
 from pytest import mark
 from telethon.tl.custom import Message
 
-from ehforwarderbot.__version__ import __version__ as efb_version
 from .helper.filters import in_chats, regex
 from .utils import link_chats
 
@@ -21,13 +21,11 @@ async def test_start(helper, client, bot_id, private_response):
 async def test_help(helper, client, bot_group):
     await client.send_message(bot_group, "/help")
     text = await helper.wait_for_message_text(in_chats(bot_group))
-    for i in ("/link", "/chat", "/extra", "/unlink_all", "/info", "/react",
-              "/update_info", "/rm", "/help"):
+    for i in ("/link", "/chat", "/extra", "/unlink_all", "/info", "/react", "/update_info", "/rm", "/help"):
         assert i in text
 
 
-async def test_info_bot(helper, client, bot_id, coordinator, channel, slave,
-                        private_response):
+async def test_info_bot(helper, client, bot_id, coordinator, channel, slave, private_response):
     text = await private_response(
         lambda: client.send_message(bot_id, "/info"),
         lambda timeout: helper.wait_for_message_text(in_chats(bot_id), timeout),
@@ -54,11 +52,7 @@ async def test_info_chat(helper, client, bot_group, channel, slave):
     assert str(bot_group) in text
     assert "/link" in text
 
-    with link_chats(channel, (
-        slave.unknown_chat,
-        slave.unknown_channel,
-        slave.chat_with_alias
-    ), bot_group):
+    with link_chats(channel, (slave.unknown_chat, slave.unknown_channel, slave.chat_with_alias), bot_group):
         await client.send_message(bot_group, "/info")
         text = await helper.wait_for_message_text(in_chats(bot_group))
 
@@ -79,8 +73,7 @@ async def test_info_chat(helper, client, bot_group, channel, slave):
         assert slave.chat_with_alias.alias in text
 
 
-async def test_info_channel(helper, client, bot_id, bot_channel, channel, slave,
-                            private_response):
+async def test_info_channel(helper, client, bot_id, bot_channel, channel, slave, private_response):
     # Not linked
     group_name = (await client.get_entity(bot_channel)).title
     message: Message = await client.send_message(bot_channel, "/info")
@@ -93,11 +86,7 @@ async def test_info_channel(helper, client, bot_id, bot_channel, channel, slave,
     assert "/link" in text
 
     # Linked group
-    with link_chats(channel, (
-        slave.unknown_chat,
-        slave.unknown_channel,
-        slave.chat_with_alias
-    ), bot_channel):
+    with link_chats(channel, (slave.unknown_chat, slave.unknown_channel, slave.chat_with_alias), bot_channel):
         message: Message = await client.send_message(bot_channel, "/info")
         text = await private_response(
             lambda: message.forward_to(bot_id),
@@ -131,7 +120,7 @@ async def test_extra_echo(helper, client, bot_group, channel, slave):
     text = await helper.wait_for_message_text(in_chats(bot_group) & regex("echo"))
     assert slave.echo.name in text
 
-    cmd_match = re.search(r'/[a-zA-Z0-9_-]+echo', text)
+    cmd_match = re.search(r"/[a-zA-Z0-9_-]+echo", text)
     assert cmd_match is not None, "Help text of echo command should be found."
     command = cmd_match.group()
 
@@ -139,7 +128,7 @@ async def test_extra_echo(helper, client, bot_group, channel, slave):
     await client.send_message(bot_group, command)
     text = await helper.wait_for_message_text(in_chats(bot_group))
 
-    cmd_match = re.search(r'/[a-zA-Z0-9_-]+echo', text)
+    cmd_match = re.search(r"/[a-zA-Z0-9_-]+echo", text)
     assert cmd_match is not None, "Echo command should be found."
     command = cmd_match.group()
     assert slave.echo.name in text

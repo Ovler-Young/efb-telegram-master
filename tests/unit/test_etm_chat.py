@@ -1,11 +1,12 @@
 import re
 from datetime import datetime
-from pytest import fixture
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-from efb_telegram_master.chat import convert_chat, ETMPrivateChat, ETMChatMember, ETMSelfChatMember, ETMSystemChat, \
-    ETMSystemChatMember, ETMGroupChat, unpickle
-from ehforwarderbot.chat import PrivateChat, SystemChat, GroupChat
+
+from ehforwarderbot.chat import GroupChat, PrivateChat, SystemChat
+from pytest import fixture
+
+from efb_telegram_master.chat import ETMChatMember, ETMGroupChat, ETMPrivateChat, ETMSelfChatMember, ETMSystemChat, ETMSystemChatMember, convert_chat, unpickle
 
 
 @fixture(scope="module")
@@ -30,7 +31,7 @@ def test_etm_chat_name(db, slave):
 
 
 def test_etm_chat_conversion_private(db, slave):
-    private_chat = slave.get_chat_by_criteria(chat_type='PrivateChat')
+    private_chat = slave.get_chat_by_criteria(chat_type="PrivateChat")
     assert isinstance(private_chat, PrivateChat)
     etm_private_chat = convert_chat(db, private_chat)
     assert isinstance(etm_private_chat, ETMPrivateChat)
@@ -44,7 +45,7 @@ def test_etm_chat_conversion_private(db, slave):
 
 
 def test_etm_chat_conversion_system(db, slave):
-    system_chat = slave.get_chat_by_criteria(chat_type='SystemChat')
+    system_chat = slave.get_chat_by_criteria(chat_type="SystemChat")
     assert isinstance(system_chat, SystemChat)
     etm_system_chat = convert_chat(db, system_chat)
     assert isinstance(etm_system_chat, ETMSystemChat)
@@ -57,7 +58,7 @@ def test_etm_chat_conversion_system(db, slave):
 
 
 def test_etm_chat_conversion_group(db, slave):
-    group_chat = slave.get_chat_by_criteria(chat_type='GroupChat')
+    group_chat = slave.get_chat_by_criteria(chat_type="GroupChat")
     assert isinstance(group_chat, GroupChat)
     etm_group_chat = convert_chat(db, group_chat)
     assert isinstance(etm_group_chat, ETMGroupChat)
@@ -137,11 +138,9 @@ def test_etm_chat_match(db, slave):
     assert chat.match(re.compile("Channel ID: .+mock")), "re compile object search"
     assert chat.match("Mode: \n")
 
-    assert chat.match(re.compile(f"Channel: {slave.channel_name}.*Type: Private",
-                                 re.DOTALL | re.IGNORECASE)), "docs example #0"
+    assert chat.match(re.compile(f"Channel: {slave.channel_name}.*Type: Private", re.DOTALL | re.IGNORECASE)), "docs example #0"
     assert not chat.match("Alias: None"), "docs example #1"
-    assert chat.match(re.compile(r"(?=.*Chat)(?=.*Channel)",
-                                 re.DOTALL | re.IGNORECASE)), "docs example #2"
+    assert chat.match(re.compile(r"(?=.*Chat)(?=.*Channel)", re.DOTALL | re.IGNORECASE)), "docs example #2"
 
     no_alias = convert_chat(db, slave.chat_without_alias)
     assert no_alias.match("Alias: None")
@@ -150,8 +149,7 @@ def test_etm_chat_match(db, slave):
 def test_etm_chat_pickle(db, slave):
     chat = convert_chat(db, chat=slave.chat_with_alias)
     recovered = unpickle(chat.pickle, db)
-    attributes = ('module_id', 'module_name', 'channel_emoji', 'uid', 'name', 'alias', 'notification',
-                  'vendor_specific', 'full_name', 'long_name', 'chat_title')
+    attributes = ("module_id", "module_name", "channel_emoji", "uid", "name", "alias", "notification", "vendor_specific", "full_name", "long_name", "chat_title")
     for i in attributes:
         assert getattr(chat, i) == getattr(recovered, i)
     assert chat.db is recovered.db
@@ -160,8 +158,7 @@ def test_etm_chat_pickle(db, slave):
 def test_etm_chat_copy(db, slave):
     chat = convert_chat(db, chat=slave.chat_with_alias)
     copied = chat.copy()
-    attributes = ('module_id', 'module_name', 'channel_emoji', 'uid', 'name', 'alias', 'notification',
-                  'vendor_specific', 'full_name', 'long_name', 'chat_title')
+    attributes = ("module_id", "module_name", "channel_emoji", "uid", "name", "alias", "notification", "vendor_specific", "full_name", "long_name", "chat_title")
     for i in attributes:
         assert getattr(chat, i) == getattr(copied, i)
     assert chat.db is copied.db

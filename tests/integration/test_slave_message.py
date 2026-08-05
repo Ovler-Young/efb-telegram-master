@@ -15,20 +15,21 @@ Send another message of same kind, quoting the previous one
     Assert message is sent
     Assert message target is correct.
 """
-from abc import abstractmethod, ABC
+
+from abc import ABC, abstractmethod
 from itertools import chain
 from pathlib import Path
-from typing import Optional, List, Tuple
-
-from pytest import mark, approx
-from telethon.tl.custom import Message
-from telethon.tl.types import MessageEntityMentionName, MessageEntityCode
+from typing import List, Optional, Tuple
 
 from ehforwarderbot import Chat
 from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot.chat import SelfChatMember
 from ehforwarderbot.message import LinkAttribute, LocationAttribute, MsgType
-from tests.integration.helper.filters import in_chats, edited, reply_to
+from pytest import approx, mark
+from telethon.tl.custom import Message
+from telethon.tl.types import MessageEntityCode, MessageEntityMentionName
+
+from tests.integration.helper.filters import edited, in_chats, reply_to
 from tests.integration.utils import link_chats
 from tests.mocks.slave import MockSlaveChannel
 
@@ -45,8 +46,7 @@ class MessageFactory(ABC):
     """If the message media is editable in Telegram."""
 
     @abstractmethod
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
         """Build an initial message to send with."""
 
     @abstractmethod
@@ -83,26 +83,18 @@ class MessageFactory(ABC):
         for coord, chat in efb_msg.substitutions.items():
             size = coord[1] - coord[0]
             if isinstance(chat, SelfChatMember):
-                assert any(ent.length == size for ent, _ in self_subs), (
-                    f"string of size {size} is not found in self_subs: "
-                    f"{[(x.to_dict(), y) for x, y in self_subs]}"
-                )
+                assert any(ent.length == size for ent, _ in self_subs), f"string of size {size} is not found in self_subs: {[(x.to_dict(), y) for x, y in self_subs]}"
             else:
-                assert any(ent.length == size for ent, _ in other_subs), (
-                    f"string of size {size} is not found in other_subs: "
-                    f"{[(x.to_dict(), y) for x, y in self_subs]}"
-                )
+                assert any(ent.length == size for ent, _ in other_subs), f"string of size {size} is not found in other_subs: {[(x.to_dict(), y) for x, y in self_subs]}"
 
     @staticmethod
     def assert_metadata_in_buttons(tg_msg: Message, efb_msg: EFBMessage):
         """Compare metadata (text, reactions and commands) in the case
         when sent in buttons.
         """
-        assert any(efb_msg.text in btn.text
-                   for btn in chain.from_iterable(tg_msg.buttons))
+        assert any(efb_msg.text in btn.text for btn in chain.from_iterable(tg_msg.buttons))
         for r_name in efb_msg.reactions:
-            assert any(r_name in btn.text
-                       for btn in chain.from_iterable(tg_msg.buttons))
+            assert any(r_name in btn.text for btn in chain.from_iterable(tg_msg.buttons))
         if efb_msg.commands:
             assert tg_msg.button_count >= len(efb_msg.commands)
 
@@ -114,11 +106,8 @@ class TextMessageFactory(MessageFactory):
     def __init__(self, unsupported=False):
         self.unsupported = unsupported
 
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
-        return slave.send_text_message(
-            chat, target=target, reactions=True, commands=True,
-            substitution=True, unsupported=self.unsupported)
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
+        return slave.send_text_message(chat, target=target, reactions=True, commands=True, substitution=True, unsupported=self.unsupported)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert efb_msg.text in tg_msg.raw_text
@@ -140,9 +129,7 @@ class TextMessageFactory(MessageFactory):
 
 
 class LinkMessageFactory(MessageFactory):
-
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
         return slave.send_link_message(chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
@@ -167,11 +154,9 @@ class LinkMessageFactory(MessageFactory):
 
 
 class LocationMessageFactory(MessageFactory):
-
     content_editable = False
 
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
         return slave.send_location_message(chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
@@ -193,15 +178,12 @@ class ImageMessageFactory(MessageFactory):
         """
         self.large = large
 
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
         if self.large:
             path = Path("tests/mocks/large_image_0.png")
         else:
             path = Path("tests/mocks/image.png")
-        return slave.send_file_like_message(
-            MsgType.Image, path, "image/png",
-            chat, target=target, reactions=True, commands=True, substitution=True)
+        return slave.send_file_like_message(MsgType.Image, path, "image/png", chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         if self.large:
@@ -221,17 +203,14 @@ class ImageMessageFactory(MessageFactory):
             assert tg_msg.button_count == len(efb_msg.commands)
 
     def edit_message(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message_text(
-            message, reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message_text(message, reactions=True, commands=True, substitution=True)
 
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
         if self.large:
             path = Path("tests/mocks/large_image_1.png")
         else:
             path = Path("tests/mocks/image_1.png")
-        return slave.edit_file_like_message(
-            message, path, mime="image/png",
-            reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message(message, path, mime="image/png", reactions=True, commands=True, substitution=True)
 
     def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
@@ -242,14 +221,10 @@ class ImageMessageFactory(MessageFactory):
 
 
 class StickerMessageFactory(MessageFactory):
-
     media_editable = False
 
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
-        return slave.send_file_like_message(
-            MsgType.Sticker, Path("tests/mocks/sticker_0.png"), "image/png",
-            chat, target=target, reactions=True, commands=True, substitution=True)
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
+        return slave.send_file_like_message(MsgType.Sticker, Path("tests/mocks/sticker_0.png"), "image/png", chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert tg_msg.sticker is not None
@@ -258,13 +233,10 @@ class StickerMessageFactory(MessageFactory):
         self.assert_metadata_in_buttons(tg_msg, efb_msg)
 
     def edit_message(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message_text(
-            message, reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message_text(message, reactions=True, commands=True, substitution=True)
 
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message(
-            message, Path("tests/mocks/sticker_1.png"), mime="image/png",
-            reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message(message, Path("tests/mocks/sticker_1.png"), mime="image/png", reactions=True, commands=True, substitution=True)
 
     def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
@@ -272,11 +244,8 @@ class StickerMessageFactory(MessageFactory):
 
 
 class FileMessageFactory(MessageFactory):
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
-        return slave.send_file_like_message(
-            MsgType.File, Path("tests/mocks/document_0.txt.gz"), "application/gzip",
-            chat, target=target, reactions=True, commands=True, substitution=True)
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
+        return slave.send_file_like_message(MsgType.File, Path("tests/mocks/document_0.txt.gz"), "application/gzip", chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert tg_msg.file
@@ -291,13 +260,10 @@ class FileMessageFactory(MessageFactory):
             assert tg_msg.button_count == len(efb_msg.commands)
 
     def edit_message(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message_text(
-            message, reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message_text(message, reactions=True, commands=True, substitution=True)
 
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message(
-            message, Path("tests/mocks/document_1.txt.gz"), mime="application/gzip",
-            reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message(message, Path("tests/mocks/document_1.txt.gz"), mime="application/gzip", reactions=True, commands=True, substitution=True)
 
     def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
@@ -305,12 +271,8 @@ class FileMessageFactory(MessageFactory):
 
 
 class AnimationMessageFactory(MessageFactory):
-
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
-        return slave.send_file_like_message(
-            MsgType.Animation, Path("tests/mocks/animation_0.gif"), "image/gif",
-            chat, target=target, reactions=True, commands=True, substitution=True)
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
+        return slave.send_file_like_message(MsgType.Animation, Path("tests/mocks/animation_0.gif"), "image/gif", chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert tg_msg.gif
@@ -323,13 +285,10 @@ class AnimationMessageFactory(MessageFactory):
             assert tg_msg.button_count == len(efb_msg.commands)
 
     def edit_message(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message_text(
-            message, reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message_text(message, reactions=True, commands=True, substitution=True)
 
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message(
-            message, Path("tests/mocks/animation_1.gif"), "image/gif",
-            reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message(message, Path("tests/mocks/animation_1.gif"), "image/gif", reactions=True, commands=True, substitution=True)
 
     def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
@@ -337,12 +296,8 @@ class AnimationMessageFactory(MessageFactory):
 
 
 class VideoMessageFactory(MessageFactory):
-
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
-        return slave.send_file_like_message(
-            MsgType.Video, Path("tests/mocks/video_0.mp4"), "video/mp4",
-            chat, target=target, reactions=True, commands=True, substitution=True)
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
+        return slave.send_file_like_message(MsgType.Video, Path("tests/mocks/video_0.mp4"), "video/mp4", chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert tg_msg.video or tg_msg.file
@@ -355,13 +310,10 @@ class VideoMessageFactory(MessageFactory):
             assert tg_msg.button_count == len(efb_msg.commands)
 
     def edit_message(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message_text(
-            message, reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message_text(message, reactions=True, commands=True, substitution=True)
 
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message(
-            message, Path("tests/mocks/video_1.mp4"), "video/mp4",
-            reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message(message, Path("tests/mocks/video_1.mp4"), "video/mp4", reactions=True, commands=True, substitution=True)
 
     def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
@@ -369,14 +321,10 @@ class VideoMessageFactory(MessageFactory):
 
 
 class VoiceMessageFactory(MessageFactory):
-
     media_editable = False
 
-    def send_message(self, slave: MockSlaveChannel, chat: Chat,
-                     target: Optional[Message] = None) -> Message:
-        return slave.send_file_like_message(
-            MsgType.Voice, Path("tests/mocks/audio_0.mp3"), "audio/mpeg",
-            chat, target=target, reactions=True, commands=True, substitution=True)
+    def send_message(self, slave: MockSlaveChannel, chat: Chat, target: Optional[Message] = None) -> Message:
+        return slave.send_file_like_message(MsgType.Voice, Path("tests/mocks/audio_0.mp3"), "audio/mpeg", chat, target=target, reactions=True, commands=True, substitution=True)
 
     def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
         assert tg_msg.voice
@@ -389,26 +337,33 @@ class VoiceMessageFactory(MessageFactory):
             assert tg_msg.button_count == len(efb_msg.commands)
 
     def edit_message(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message_text(
-            message, reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message_text(message, reactions=True, commands=True, substitution=True)
 
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
-        return slave.edit_file_like_message(
-            message, Path("tests/mocks/audio_0.mp3"), "audio/mpeg",
-            reactions=True, commands=True, substitution=True)
+        return slave.edit_file_like_message(message, Path("tests/mocks/audio_0.mp3"), "audio/mpeg", reactions=True, commands=True, substitution=True)
 
     def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
             efb_msg.file.close()
 
 
-@mark.parametrize("factory", [
-    TextMessageFactory(), LinkMessageFactory(), LocationMessageFactory(),
-    ImageMessageFactory(large=False), ImageMessageFactory(large=True),
-    StickerMessageFactory(), FileMessageFactory(), AnimationMessageFactory(),
-    VideoMessageFactory(), VoiceMessageFactory(),
-    TextMessageFactory(unsupported=True)
-], ids=str)
+@mark.parametrize(
+    "factory",
+    [
+        TextMessageFactory(),
+        LinkMessageFactory(),
+        LocationMessageFactory(),
+        ImageMessageFactory(large=False),
+        ImageMessageFactory(large=True),
+        StickerMessageFactory(),
+        FileMessageFactory(),
+        AnimationMessageFactory(),
+        VideoMessageFactory(),
+        VoiceMessageFactory(),
+        TextMessageFactory(unsupported=True),
+    ],
+    ids=str,
+)
 async def test_slave_message(helper, client, bot_group, slave, channel, factory: MessageFactory):
     chat = slave.group
 

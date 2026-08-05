@@ -6,9 +6,8 @@ Adapted from messud4312 ( https://my.oschina.net/u/914655/blog/1799159 ).
 
 import time
 from collections import deque
-from weakref import WeakValueDictionary
-
 from typing import Deque, Optional
+from weakref import WeakValueDictionary
 
 from .utils import EFBChannelChatIDStr
 
@@ -37,10 +36,10 @@ class ChatDestination:
 
 class ChatDestinationCache:
     def __init__(self, mode: str, size: int = CHAT_DEST_CACHE_SIZE):
-        self.enabled = mode in ('enabled', 'warn')
+        self.enabled = mode in ("enabled", "warn")
         if self.enabled:
             # noinspection PyUnresolvedReferences
-            self.weak: 'WeakValueDictionary[str, ChatDestination]' = WeakValueDictionary()
+            self.weak: "WeakValueDictionary[str, ChatDestination]" = WeakValueDictionary()
             self.strong: Deque[ChatDestination] = deque(maxlen=size)
 
     def get(self, key: str) -> Optional[EFBChannelChatIDStr]:

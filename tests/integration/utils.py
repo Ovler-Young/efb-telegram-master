@@ -3,29 +3,25 @@ from contextlib import contextmanager
 from itertools import chain
 from typing import Iterable
 
+from ehforwarderbot import Chat
+from ehforwarderbot.types import ChatID
 from telethon import TelegramClient
 from telethon.tl.types import ChannelParticipantsAdmins
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.utils import chat_id_to_str
-from ehforwarderbot import Chat
-from ehforwarderbot.types import ChatID
 
 from .helper.filters import has_button, in_chats
 
 
 @contextmanager
-def link_chats(channel: TelegramChannel,
-               slave_chats: Iterable[Chat],
-               telegram_chat_id: int):
+def link_chats(channel: TelegramChannel, slave_chats: Iterable[Chat], telegram_chat_id: int):
     """Link a list of remote chats to a Telegram chat and revert the changes
     upon finishing.
     """
     # Link the chats
     db = channel.db
-    slave_ids = [
-        chat_id_to_str(chat=i) for i in slave_chats
-    ]
+    slave_ids = [chat_id_to_str(chat=i) for i in slave_chats]
     master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     backup = db.get_chat_assoc(master_uid=master_str)
 
@@ -63,14 +59,10 @@ async def get_start_token(client, helper, bot_id, chat_uid, private_response):
     return re.search(r"\?startgroup=(.+)", url).groups()[0]
 
 
-def assert_is_linked(channel: TelegramChannel,
-                     slave_chats: Iterable[Chat],
-                     telegram_chat_id: int):
+def assert_is_linked(channel: TelegramChannel, slave_chats: Iterable[Chat], telegram_chat_id: int):
     master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     chats_str = set(channel.db.get_chat_assoc(master_uid=master_str))
-    slave_ids = {
-        chat_id_to_str(chat=i) for i in slave_chats
-    }
+    slave_ids = {chat_id_to_str(chat=i) for i in slave_chats}
     # print("ASSERT_IS_LINKED", chats_str, slave_ids)
     assert chats_str == slave_ids, f"expecting {slave_ids} linked, found {chats_str}"
 

@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import pytest
 import telegram.error
 
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
@@ -90,8 +89,7 @@ def test_check_membership_tri_returns_unknown_while_refreshing_stale_entry():
     with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0):
         aux_bot.update_membership(2000, True)
 
-    with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), \
-         patch.object(aux_bot, "_start_membership_probe") as start_probe:
+    with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), patch.object(aux_bot, "_start_membership_probe") as start_probe:
         assert aux_bot.check_membership_tri(2000) is None
 
     start_probe.assert_called_once_with(2000)

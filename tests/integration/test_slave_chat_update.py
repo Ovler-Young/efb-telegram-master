@@ -1,7 +1,6 @@
-from pytest import raises
-
 from ehforwarderbot import Chat
 from ehforwarderbot.chat import BaseChat, ChatMember
+from pytest import raises
 
 
 def compare_base_chat(self: BaseChat, other: BaseChat):

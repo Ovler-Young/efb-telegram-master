@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-import pytest
-
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.mtproto import MTProtoRetryableError
 
@@ -41,8 +39,7 @@ class FakeDatabase:
         assert source_chat_id == 100
         return self.associations.get(topic_id)
 
-    def persist_msglog_ingestion_item(self, scan, *, source_message_id, classification,
-                                      slave_uid=None, message=None, lease_owner):
+    def persist_msglog_ingestion_item(self, scan, *, source_message_id, classification, slave_uid=None, message=None, lease_owner):
         self.persisted.append((source_message_id, classification, slave_uid, message))
         scan.cursor = source_message_id - 1
         if classification == "eligible":
@@ -99,20 +96,25 @@ def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
         action=None,
         media=None,
     )
-    mtproto = FakeMTProto({
-        205: topic_message(205),
-        104: topic_message(104, topic_root=True),
-        4: ordinary_reply,
-    })
+    mtproto = FakeMTProto(
+        {
+            205: topic_message(205),
+            104: topic_message(104, topic_root=True),
+            4: ordinary_reply,
+        }
+    )
 
     asyncio.run(MsgLogIngestionService(db, mtproto).run(100, lease_owner="worker-a"))
 
     assert [ids for _, ids in mtproto.calls] == [
-        list(range(205, 105, -1)), list(range(105, 5, -1)), list(range(5, 0, -1)),
+        list(range(205, 105, -1)),
+        list(range(105, 5, -1)),
+        list(range(5, 0, -1)),
     ]
     accepted = [entry for entry in db.persisted if entry[1] == "eligible"]
     assert [(entry[0], entry[2]) for entry in accepted] == [
-        (205, "tests.slave"), (104, "tests.slave"),
+        (205, "tests.slave"),
+        (104, "tests.slave"),
     ]
     ordinary_reply_entry = next(entry for entry in db.persisted if entry[0] == 4)
     assert ordinary_reply_entry[1:] == ("not-topic", None, None)

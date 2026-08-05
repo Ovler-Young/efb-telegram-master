@@ -14,8 +14,8 @@ from telethon import TelegramClient
 
 from efb_telegram_master import TelegramChannel
 
-from .helper.helper import TelegramIntegrationTestHelper, wait_for_private_response
 from ..bot import get_user_session
+from .helper.helper import TelegramIntegrationTestHelper, wait_for_private_response
 
 pytest.register_assert_rewrite("tests.integration.utils")
 
@@ -27,6 +27,7 @@ def pytest_collection_modifyitems(items):
         if integration_directory in item.path.parents and inspect.iscoroutinefunction(item.obj):
             item.add_marker(pytest.mark.asyncio(loop_scope="session"), append=False)
 
+
 @pytest.fixture(scope="session")
 def user_session_info():
     return get_user_session()
@@ -34,24 +35,27 @@ def user_session_info():
 
 @pytest.fixture(scope="session")
 def user_session(user_session_info) -> str:
-    return user_session_info['user_session']
+    return user_session_info["user_session"]
 
 
 @pytest.fixture(scope="session")
 def api_id(user_session_info) -> int:
-    return user_session_info['api_id']
+    return user_session_info["api_id"]
 
 
 @pytest.fixture(scope="session")
 def api_hash(user_session_info) -> str:
-    return user_session_info['api_hash']
+    return user_session_info["api_hash"]
 
 
 @pytest.fixture(scope="session")
 def integration_postgres_config() -> Dict[str, object]:
     required = (
-        "TEST_POSTGRES_HOST", "TEST_POSTGRES_PORT", "TEST_POSTGRES_DB",
-        "TEST_POSTGRES_USER", "TEST_POSTGRES_PASSWORD",
+        "TEST_POSTGRES_HOST",
+        "TEST_POSTGRES_PORT",
+        "TEST_POSTGRES_DB",
+        "TEST_POSTGRES_USER",
+        "TEST_POSTGRES_PASSWORD",
     )
     if any(not os.environ.get(name) for name in required):
         pytest.skip("PostgreSQL integration environment is not configured")
@@ -78,13 +82,9 @@ def filter_chats(bot_id, bot_groups, bot_channels, bot_topic_group) -> Set[int]:
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
-async def helper_wrap(user_session, api_id, api_hash, bot_id,
-                      filter_chats, aux_bot_ids) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
+async def helper_wrap(user_session, api_id, api_hash, bot_id, filter_chats, aux_bot_ids) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
     loop = asyncio.get_running_loop()
-    async with TelegramIntegrationTestHelper(
-            user_session, api_id, api_hash, loop, [bot_id, *aux_bot_ids],
-            chats=filter_chats
-    ) as helper:
+    async with TelegramIntegrationTestHelper(user_session, api_id, api_hash, loop, [bot_id, *aux_bot_ids], chats=filter_chats) as helper:
         yield helper
 
 
@@ -172,12 +172,7 @@ def poll_bot_factory():
                 runtime_ready = channel.telegram_runtime.async_runtime._ready.wait(timeout=0.1)
                 application = channel.telegram_runtime.application
                 updater = application.updater
-                if (
-                    runtime_ready
-                    and updater is not None
-                    and updater.running
-                    and application.running
-                ):
+                if runtime_ready and updater is not None and updater.running and application.running:
                     if polling_errors:
                         raise polling_errors[0]
                     state["channel"] = channel
@@ -219,8 +214,8 @@ def _primary_bot_limiter_delay(channel: TelegramChannel, target_chat_id: int) ->
 @pytest.fixture
 def private_response(channel: TelegramChannel, bot_id: int):
     """Wait for a private response within one deadline."""
-    async def wait(trigger, receive, *, source_channel: TelegramChannel = channel,
-                   target_chat_id: int = bot_id):
+
+    async def wait(trigger, receive, *, source_channel: TelegramChannel = channel, target_chat_id: int = bot_id):
         limiter_delay = lambda: _primary_bot_limiter_delay(source_channel, target_chat_id)
         return await wait_for_private_response(limiter_delay, trigger, receive)
 

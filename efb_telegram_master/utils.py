@@ -5,21 +5,21 @@ import json
 import logging
 import os
 import subprocess
-from io import BytesIO
 from collections.abc import Mapping
+from io import BytesIO
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
+from typing import IO, TYPE_CHECKING, Any, BinaryIO, Dict, Optional, Tuple, cast
 from urllib.parse import quote, urlparse, urlunparse
 
 import ffmpeg
 import telegram
-from PIL import Image
-from ffmpeg._utils import convert_kwargs_to_cmd_line_args
-from typing_extensions import NewType
-
 from ehforwarderbot import Channel
 from ehforwarderbot.chat import BaseChat, ChatMember
 from ehforwarderbot.types import ChatID, ModuleID
+from ffmpeg._utils import convert_kwargs_to_cmd_line_args
+from PIL import Image
+from typing_extensions import NewType
+
 from .locale_mixin import LocaleMixin
 
 if TYPE_CHECKING:
@@ -28,11 +28,11 @@ if TYPE_CHECKING:
 FFMPEG_TIMEOUT = 60
 
 
-TelegramChatID = NewType('TelegramChatID', int)
-TelegramTopicID = NewType('TelegramTopicID', int)
-TelegramMessageID = NewType('TelegramMessageID', int)
-TgChatMsgIDStr = NewType('TgChatMsgIDStr', str)
-EFBChannelChatIDStr = NewType('EFBChannelChatIDStr', str)
+TelegramChatID = NewType("TelegramChatID", int)
+TelegramTopicID = NewType("TelegramTopicID", int)
+TelegramMessageID = NewType("TelegramMessageID", int)
+TgChatMsgIDStr = NewType("TgChatMsgIDStr", str)
+EFBChannelChatIDStr = NewType("EFBChannelChatIDStr", str)
 OldMsgID = Tuple[TelegramChatID, TelegramMessageID]
 # TelegramChatID = Union[str, int]
 # TelegramMessageID = Union[str, int]
@@ -51,8 +51,14 @@ def normalize_request_kwargs(request_kwargs: Mapping[str, object] | None) -> dic
     if not isinstance(request_kwargs, Mapping):
         return {}
     allowed = {
-        "read_timeout", "write_timeout", "connect_timeout", "pool_timeout",
-        "media_write_timeout", "http_version", "socket_options", "httpx_kwargs",
+        "read_timeout",
+        "write_timeout",
+        "connect_timeout",
+        "pool_timeout",
+        "media_write_timeout",
+        "http_version",
+        "socket_options",
+        "httpx_kwargs",
         "connection_pool_size",
     }
     normalized = {key: request_kwargs[key] for key in allowed if key in request_kwargs}
@@ -76,7 +82,6 @@ def normalize_request_kwargs(request_kwargs: Mapping[str, object] | None) -> dic
 
 
 class ExperimentalFlagsManager(LocaleMixin):
-
     DEFAULT_VALUES = {
         "chats_per_page": 10,
         "multiple_slave_chats": True,
@@ -97,7 +102,7 @@ class ExperimentalFlagsManager(LocaleMixin):
     }
 
     @staticmethod
-    def get_temp_dir(channel: 'TelegramChannel') -> Optional[str]:
+    def get_temp_dir(channel: "TelegramChannel") -> Optional[str]:
         """Get the temp directory for creating temporary files.
 
         When using local TDLIB API with Docker, temp files need to be created
@@ -112,15 +117,16 @@ class ExperimentalFlagsManager(LocaleMixin):
         """
         if channel.flag("local_tdlib_api") and channel.flag("api_base_file_url"):
             from urllib.parse import urlparse
+
             parsed = urlparse(channel.flag("api_base_file_url"))
             if parsed.scheme == "file" and parsed.path:
                 return parsed.path
         return None
 
-    def __init__(self, channel: 'TelegramChannel'):
+    def __init__(self, channel: "TelegramChannel"):
         self.channel = channel
         self.config: Dict[str, Any] = ExperimentalFlagsManager.DEFAULT_VALUES.copy()
-        self.config.update(channel.config.get('flags', dict()) or dict())
+        self.config.update(channel.config.get("flags", dict()) or dict())
         if self.config.get("topic_group") is None and channel.config.get("topic_group") is not None:
             self.config["topic_group"] = channel.config["topic_group"]
 
@@ -137,13 +143,11 @@ def b64en(s: str) -> str:
 def b64de(s: str) -> str:
     missing_padding = len(s) % 4
     if missing_padding:
-        s += '=' * (4 - missing_padding)
+        s += "=" * (4 - missing_padding)
     return base64.urlsafe_b64decode(s).decode()
 
 
-def message_id_to_str(chat_id: Optional[TelegramChatID] = None,
-                      message_id: Optional[TelegramMessageID] = None,
-                      update: Optional[telegram.Update] = None) -> TgChatMsgIDStr:
+def message_id_to_str(chat_id: Optional[TelegramChatID] = None, message_id: Optional[TelegramMessageID] = None, update: Optional[telegram.Update] = None) -> TgChatMsgIDStr:
     """
     Convert an unique identifier of Telegram message to a string.
 
@@ -175,9 +179,9 @@ def message_id_str_to_id(s: TgChatMsgIDStr) -> Tuple[TelegramChatID, TelegramMes
     return TelegramChatID(int(msg_ids[0])), TelegramMessageID(int(msg_ids[1]))
 
 
-def chat_id_to_str(channel_id: Optional[ModuleID] = None, chat_uid: Optional[ChatID] = None,
-                   group_id: Optional[ChatID] = None,
-                   chat: Optional[BaseChat] = None, channel: Optional[Channel] = None) -> EFBChannelChatIDStr:
+def chat_id_to_str(
+    channel_id: Optional[ModuleID] = None, chat_uid: Optional[ChatID] = None, group_id: Optional[ChatID] = None, chat: Optional[BaseChat] = None, channel: Optional[Channel] = None
+) -> EFBChannelChatIDStr:
     """
     Convert an unique identifier to EFB chat to a string.
 
@@ -294,7 +298,7 @@ def _run_ffmpeg_stream_command(args, input_stream: IO[bytes]) -> bytes:
 
 
 def export_gif(animation, fp, dpi=96, skip_frames=5):
-    """ Fork of lottie.exporters.gif.export_gif
+    """Fork of lottie.exporters.gif.export_gif
     Adapted from jqqqqqqqqqq/UnifiedMessageRelay
     https://github.com/jqqqqqqqqqq/UnifiedMessageRelay/blob/c920d005714a33fbd50594ef8013ce7ec2f3b240/src/Core/UMRFile.py#L141
     License:
@@ -309,7 +313,7 @@ def export_gif(animation, fp, dpi=96, skip_frames=5):
     start = int(animation.in_point)
     end = int(animation.out_point)
     frames = []
-    for i in range(start, end+1, skip_frames):
+    for i in range(start, end + 1, skip_frames):
         file = BytesIO()
         export_png(animation, file, i, dpi)
         file.seek(0)
@@ -318,7 +322,7 @@ def export_gif(animation, fp, dpi=96, skip_frames=5):
     duration = 1000 / animation.frame_rate * (1 + skip_frames) / 2
     frames[0].save(
         fp,
-        format='GIF',
+        format="GIF",
         append_images=frames[1:],
         save_all=True,
         duration=duration,
@@ -354,7 +358,7 @@ if os.name == "nt":
     #
     # See: https://etm.1a23.studio/issues/90
 
-    def ffprobe(stream: IO[bytes], cmd='ffprobe', **kwargs):
+    def ffprobe(stream: IO[bytes], cmd="ffprobe", **kwargs):
         """Run ffprobe on an input stream and return a JSON representation of the output.
 
         Code adopted from ffmpeg-python by Karl Kroening (Apache License 2.0).
@@ -366,17 +370,16 @@ if os.name == "nt":
                 The stderr output can be retrieved by accessing the
                 ``stderr`` property of the exception.
         """
-        args = [cmd, '-show_format', '-show_streams', '-of', 'json']
+        args = [cmd, "-show_format", "-show_streams", "-of", "json"]
         args += convert_kwargs_to_cmd_line_args(kwargs)
         args += ["-"]
 
         out = _run_ffmpeg_stream_command(args, stream)
-        return json.loads(out.decode('utf-8'))
-
+        return json.loads(out.decode("utf-8"))
 
     def gif_conversion(file: IO[bytes], channel_id: str) -> IO[bytes]:
         """Convert Telegram GIF to real GIF, the NT way."""
-        gif_file = NamedTemporaryFile(suffix='.gif')
+        gif_file = NamedTemporaryFile(suffix=".gif")
         file.seek(0)
 
         # Use custom ffprobe command to read from stream
@@ -384,7 +387,7 @@ if os.name == "nt":
 
         # Set input/output of ffmpeg to stream
         stream = ffmpeg.input("pipe:")
-        if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
+        if channel_id.startswith("blueset.wechat") and metadata.get("width", 0) > 600:
             # Workaround: Compress GIF for slave channel `blueset.wechat`
             # TODO: Move this logic to `blueset.wechat` in the future
             stream = stream.filter("scale", 600, -2)
@@ -402,13 +405,14 @@ if os.name == "nt":
         return gif_file
 
 else:
+
     def gif_conversion(file: IO[bytes], channel_id: str) -> IO[bytes]:
         """Convert Telegram GIF to real GIF, the non-NT way."""
-        gif_file = NamedTemporaryFile(suffix='.gif')
+        gif_file = NamedTemporaryFile(suffix=".gif")
         file.seek(0)
         metadata = ffmpeg.probe(file.name, timeout=FFMPEG_TIMEOUT)
         stream = ffmpeg.input(file.name)
-        if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
+        if channel_id.startswith("blueset.wechat") and metadata.get("width", 0) > 600:
             # Workaround: Compress GIF for slave channel `blueset.wechat`
             # TODO: Move this logic to `blueset.wechat` in the future
             stream = stream.filter("scale", 600, -2)

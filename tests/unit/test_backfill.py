@@ -2,21 +2,20 @@ import threading
 from concurrent.futures import Future
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import pytest
-import telegram
+from ehforwarderbot.types import ChatID
 from telegram import Update
 
-from efb_telegram_master import TelegramChannel
-from ehforwarderbot.types import ChatID
-
-from efb_telegram_master import utils
+from efb_telegram_master import TelegramChannel, utils
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
 from efb_telegram_master.outbound import QueueRequest
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+
+
 def _build_link_update(chat_id, *, is_forum=False):
     effective_chat = SimpleNamespace(id=chat_id, is_forum=is_forum, type="group")
     message = Mock()
@@ -52,17 +51,17 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key, backfill_mode=None)
-    ChatBindingManager._set_conversation_state(
-        channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC
-    )
+    ChatBindingManager._set_conversation_state(channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC)
     update = _build_link_update(bot_group)
 
     sent_message = _sent_link_message(bot_group, 500)
 
-    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
-         patch.object(channel.bot_manager, "edit_message_text"), \
-         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
-         patch.object(channel.chat_binding, "send_history_link") as send_history_link:
+    with (
+        patch.object(channel.bot_manager, "send_message", return_value=sent_message),
+        patch.object(channel.bot_manager, "edit_message_text"),
+        patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history,
+        patch.object(channel.chat_binding, "send_history_link") as send_history_link,
+    ):
         channel.chat_binding.link_chat(update, [token])
 
     migrate_chat_history.assert_called_once()
@@ -76,13 +75,10 @@ def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(106))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key, backfill_mode=None)
-    ChatBindingManager._set_conversation_state(
-        channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC
-    )
+    ChatBindingManager._set_conversation_state(channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC)
     update = _build_link_update(bot_group)
 
-    with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 506)), \
-         patch.object(chat, "link", side_effect=RuntimeError("link failed")):
+    with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 506)), patch.object(chat, "link", side_effect=RuntimeError("link failed")):
         with pytest.raises(RuntimeError, match="link failed"):
             channel.chat_binding.link_chat(update, [token])
 
@@ -99,10 +95,12 @@ def test_link_chat_edits_status_message_with_sender_bot(channel, slave, bot_grou
 
     sent_message = _sent_link_message(bot_group, 505, sender_bot_id="8465204282")
 
-    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
-         patch.object(channel.bot_manager, "edit_message_text") as edit_message_text, \
-         patch.object(channel.chat_binding, "migrate_chat_history"), \
-         patch.object(channel.chat_binding, "send_history_link"):
+    with (
+        patch.object(channel.bot_manager, "send_message", return_value=sent_message),
+        patch.object(channel.bot_manager, "edit_message_text") as edit_message_text,
+        patch.object(channel.chat_binding, "migrate_chat_history"),
+        patch.object(channel.chat_binding, "send_history_link"),
+    ):
         channel.chat_binding.link_chat(update, [token])
 
     target_status_edit = edit_message_text.call_args_list[0].kwargs
@@ -123,10 +121,12 @@ def test_link_chat_auto_mode_sends_history_link_on_relink(channel, slave, bot_gr
 
     sent_message = _sent_link_message(bot_group, 501)
 
-    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
-         patch.object(channel.bot_manager, "edit_message_text"), \
-         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
-         patch.object(channel.chat_binding, "send_history_link") as send_history_link:
+    with (
+        patch.object(channel.bot_manager, "send_message", return_value=sent_message),
+        patch.object(channel.bot_manager, "edit_message_text"),
+        patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history,
+        patch.object(channel.chat_binding, "send_history_link") as send_history_link,
+    ):
         channel.chat_binding.link_chat(update, [token])
 
     migrate_chat_history.assert_not_called()
@@ -145,16 +145,17 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
 
     sent_message = _sent_link_message(bot_group, 502)
 
-    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
-         patch.object(channel.bot_manager, "edit_message_text"), \
-         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
-         patch.object(channel.chat_binding, "send_history_link") as send_history_link:
+    with (
+        patch.object(channel.bot_manager, "send_message", return_value=sent_message),
+        patch.object(channel.bot_manager, "edit_message_text"),
+        patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history,
+        patch.object(channel.chat_binding, "send_history_link") as send_history_link,
+    ):
         channel.chat_binding.link_chat(update, [token, "true"])
 
     migrate_chat_history.assert_called_once()
     send_history_link.assert_not_called()
     _cleanup_link_state(channel, chat, bot_group)
-
 
 
 def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(channel, slave, bot_group):
@@ -169,10 +170,12 @@ def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(
 
     sent_message = _sent_link_message(bot_group, 503)
 
-    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
-         patch.object(channel.bot_manager, "edit_message_text"), \
-         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
-         patch.object(channel.chat_binding, "send_history_link") as send_history_link:
+    with (
+        patch.object(channel.bot_manager, "send_message", return_value=sent_message),
+        patch.object(channel.bot_manager, "edit_message_text"),
+        patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history,
+        patch.object(channel.chat_binding, "send_history_link") as send_history_link,
+    ):
         channel.chat_binding.link_chat(update, [token])
 
     migrate_chat_history.assert_called_once()
@@ -234,8 +237,7 @@ def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channe
         waiter = Future()
         waiter.set_result(None)
         waiters.append(waiter)
-    with patch.object(channel.db, "get_recent_messages", return_value=msg_logs), \
-         patch.object(channel.bot_manager.outbound_queue, "enqueue", side_effect=waiters) as enqueue:
+    with patch.object(channel.db, "get_recent_messages", return_value=msg_logs), patch.object(channel.bot_manager.outbound_queue, "enqueue", side_effect=waiters) as enqueue:
         channel.chat_binding._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
 
     assert enqueue.call_count == 4
@@ -333,9 +335,7 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
         get_next_history_migration_target=Mock(side_effect=get_next_history_migration_target),
         get_history_migration_entries=Mock(side_effect=get_history_migration_entries),
         get_recent_messages=Mock(),
-        delete_history_migration_entry=Mock(side_effect=lambda entry_id: pending_entries.remove(
-            next(entry for entry in pending_entries if entry.id == entry_id)
-        )),
+        delete_history_migration_entry=Mock(side_effect=lambda entry_id: pending_entries.remove(next(entry for entry in pending_entries if entry.id == entry_id))),
     )
     events = []
 
@@ -357,17 +357,17 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
 
     manager.db.get_recent_messages.assert_not_called()
     assert [call.args[0] for call in manager.bot.outbound_queue.enqueue.call_args_list] == [
-        QueueRequest("send_message", (), {"chat_id": 12345, "text": "first\n", "parse_mode": "Markdown",
-                                            "disable_notification": True}, 12345),
-        QueueRequest("send_message", (), {"chat_id": 12345, "text": "second\n", "parse_mode": "Markdown",
-                                            "disable_notification": True}, 12345),
-        QueueRequest("copy_message", (), {"chat_id": 12345, "from_chat_id": 10, "message_id": 22,
-                                            "disable_notification": True}, 12345),
+        QueueRequest("send_message", (), {"chat_id": 12345, "text": "first\n", "parse_mode": "Markdown", "disable_notification": True}, 12345),
+        QueueRequest("send_message", (), {"chat_id": 12345, "text": "second\n", "parse_mode": "Markdown", "disable_notification": True}, 12345),
+        QueueRequest("copy_message", (), {"chat_id": 12345, "from_chat_id": 10, "message_id": 22, "disable_notification": True}, 12345),
     ]
     assert events == [
-        ("enqueue", 1), ("wait", 1),
-        ("enqueue", 2), ("wait", 2),
-        ("enqueue", 3), ("wait", 3),
+        ("enqueue", 1),
+        ("wait", 1),
+        ("enqueue", 2),
+        ("wait", 2),
+        ("enqueue", 3),
+        ("wait", 3),
     ]
     assert pending_entries == []
 

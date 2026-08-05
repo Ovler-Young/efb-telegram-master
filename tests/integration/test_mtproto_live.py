@@ -13,9 +13,8 @@ from efb_telegram_master import utils
 from efb_telegram_master.db import MsgLog, MsgLogIngestionScan
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 
-from .helper.filters import in_chats, regex
 from ..bot import get_user_session
-
+from .helper.filters import in_chats, regex
 
 pytestmark = pytest.mark.asyncio
 
@@ -51,19 +50,13 @@ def _topic_id(message):
     if thread_id is not None:
         return thread_id
     reply_to = getattr(message, "reply_to", None)
-    return (
-        getattr(reply_to, "reply_to_top_id", None)
-        or getattr(reply_to, "reply_to_msg_id", None)
-        or getattr(message, "reply_to_msg_id", None)
-    )
+    return getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None) or getattr(message, "reply_to_msg_id", None)
 
 
 async def _wait_for_scan(source_chat_id, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        scan = MsgLogIngestionScan.get_or_none(
-            MsgLogIngestionScan.source_chat_id == str(source_chat_id)
-        )
+        scan = MsgLogIngestionScan.get_or_none(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
         if scan is not None and scan.status == "complete":
             return scan
         await asyncio.sleep(0.1)
@@ -73,9 +66,7 @@ async def _wait_for_scan(source_chat_id, timeout=30):
 async def _wait_for_scan_terminal(source_chat_id, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        scan = MsgLogIngestionScan.get_or_none(
-            MsgLogIngestionScan.source_chat_id == str(source_chat_id)
-        )
+        scan = MsgLogIngestionScan.get_or_none(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
         if scan is not None and scan.status in {"complete", "error", "retryable-error"}:
             return scan
         await asyncio.sleep(0.1)
@@ -109,8 +100,13 @@ async def _wait_for_ingestion_worker_exit(channel, source_chat_id, timeout=30):
 
 
 async def test_sync_msglog_ingests_unlogged_topic_messages_live(
-        helper, client, bot_topic_group, channel_with_topic_group_and_mtproto,
-        slave_with_topic_group_and_mtproto, poll_bot, monkeypatch,
+    helper,
+    client,
+    bot_topic_group,
+    channel_with_topic_group_and_mtproto,
+    slave_with_topic_group_and_mtproto,
+    poll_bot,
+    monkeypatch,
 ):
     """Rebuild one removed live MsgLog row from Telegram history."""
     channel = channel_with_topic_group_and_mtproto
@@ -124,9 +120,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
 
     try:
         delivered = slave.send_text_message(slave.chat_with_alias, slave.chat_with_alias.other)
-        topic_message = await helper.wait_for_message(
-            in_chats(bot_topic_group) & regex(re.escape(delivered.text))
-        )
+        topic_message = await helper.wait_for_message(in_chats(bot_topic_group) & regex(re.escape(delivered.text)))
         topic_id = _topic_id(topic_message)
         assert topic_id is not None
         anchor_log_id = utils.message_id_to_str(bot_topic_group, topic_message.id)
@@ -135,7 +129,9 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         assert anchor_log.provenance == "live"
 
         recovered = await client.send_message(
-            bot_topic_group, marker, reply_to=topic_message.id,
+            bot_topic_group,
+            marker,
+            reply_to=topic_message.id,
         )
         created_message_ids.append(recovered.id)
         source_ids = [recovered.id]
@@ -146,10 +142,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         slave.messages.task_done()
         assert routed_message.text == marker
 
-        live_rows = [
-            await _wait_for_msg_log(channel, master_msg_id)
-            for master_msg_id in source_log_ids
-        ]
+        live_rows = [await _wait_for_msg_log(channel, master_msg_id) for master_msg_id in source_log_ids]
         expected_slave_uid = channel.db.get_topic_slave(bot_topic_group, topic_id)
         assert expected_slave_uid is not None
         assert [(row.master_msg_id, row.text, row.slave_origin_uid, row.provenance) for row in live_rows] == [
@@ -157,17 +150,16 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         ]
 
         _delete_msg_logs_by_master_ids(channel, source_log_ids)
-        assert all(
-            channel.db.get_msg_log(master_msg_id=master_msg_id) is None
-            for master_msg_id in source_log_ids
-        )
+        assert all(channel.db.get_msg_log(master_msg_id=master_msg_id) is None for master_msg_id in source_log_ids)
 
         scan_boundary = max(source_ids)
         channel.mtproto.config = replace(channel.mtproto.config, scan_ceiling=scan_boundary)
         monkeypatch.setattr(MsgLogIngestionService, "EXISTING_STREAK_LIMIT", 1)
 
         command = await client.send_message(
-            bot_topic_group, "/sync_msglog", reply_to=topic_message.id,
+            bot_topic_group,
+            "/sync_msglog",
+            reply_to=topic_message.id,
         )
         created_message_ids.append(command.id)
         acknowledgement = await helper.wait_for_message(
@@ -189,23 +181,19 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         if scan_id is not None:
             scan_to_delete = MsgLogIngestionScan.get_or_none(MsgLogIngestionScan.id == scan_id)
         elif scan_boundary is not None:
-            scan_to_delete = MsgLogIngestionScan.get_or_none(
-                (MsgLogIngestionScan.source_chat_id == str(bot_topic_group)) &
-                (MsgLogIngestionScan.scan_boundary == scan_boundary)
-            )
+            scan_to_delete = MsgLogIngestionScan.get_or_none((MsgLogIngestionScan.source_chat_id == str(bot_topic_group)) & (MsgLogIngestionScan.scan_boundary == scan_boundary))
         if scan_to_delete is not None:
             if scan_to_delete.status not in {"complete", "error", "retryable-error"}:
                 scan_to_delete = await _wait_for_scan_terminal(bot_topic_group)
-            MsgLogIngestionScan.delete().where(
-                MsgLogIngestionScan.id == scan_to_delete.id
-            ).execute()
+            MsgLogIngestionScan.delete().where(MsgLogIngestionScan.id == scan_to_delete.id).execute()
         for message_id in logged_message_ids:
             channel.db.delete_msg_log(master_msg_id=message_id)
         if topic_id is not None:
             channel.db.remove_topic_assoc(bot_topic_group, topic_id)
             with suppress(Exception):
                 channel.bot_manager._bot.delete_forum_topic(
-                    chat_id=bot_topic_group, message_thread_id=topic_id,
+                    chat_id=bot_topic_group,
+                    message_thread_id=topic_id,
                 )
         if created_message_ids:
             with suppress(Exception):
