@@ -45,6 +45,7 @@ from .outbound import (
     SchedulerStoppedError,
     SenderSelection,
     SenderSelectionResult,
+    _retry_after_seconds,
 )
 from .ptb_compat import Filters
 from .rate_limiter import SlidingWindowRateLimiter
@@ -1453,7 +1454,7 @@ class TelegramBotManager(LocaleMixin):
                 affinities.setdefault(key, set()).add(row.slave_id)
 
         if row.priority == 0 and isinstance(error, telegram.error.RetryAfter):
-            retry_after = self._retry_after_seconds(error)
+            retry_after = _retry_after_seconds(error)
             retry_at = time.monotonic() + retry_after
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = retry_at
@@ -1470,7 +1471,7 @@ class TelegramBotManager(LocaleMixin):
         self, row, error: telegram.error.RetryAfter, selection: SenderSelection
     ) -> None:
         """Record a sender/chat cooldown without completing the queued database update."""
-        retry_at = time.monotonic() + self._retry_after_seconds(error)
+        retry_at = time.monotonic() + _retry_after_seconds(error)
         with self._get_bot_chat_state_lock():
             self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = retry_at
 
@@ -1499,17 +1500,10 @@ class TelegramBotManager(LocaleMixin):
             self._finalize_outbound_resources()
             self.logger.debug("Outbound queue worker stopped")
 
-    @staticmethod
-    def _retry_after_seconds(error: telegram.error.RetryAfter) -> float:
-        retry_after_value = error.retry_after
-        if isinstance(retry_after_value, timedelta):
-            return retry_after_value.total_seconds()
-        return float(retry_after_value)
-
     @classmethod
     def _rate_limit_retry_after_seconds(cls, error: Exception) -> Optional[float]:
         if isinstance(error, telegram.error.RetryAfter):
-            return cls._retry_after_seconds(error)
+            return _retry_after_seconds(error)
         response = getattr(getattr(error, "__cause__", None), "response", None)
         if getattr(response, "status_code", None) == 429:
             return cls.TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS

@@ -38,11 +38,11 @@ ngettext = translator.ngettext
 
 class DataModel:
     data: dict
-    request: Optional[HTTPXRequest] = None
-    building_default = False
 
     def __init__(self, profile: str, instance_id: str):
         print("==== etm_wizard, data mod, init", profile)
+        self.request: Optional[HTTPXRequest] = None
+        self.building_default = False
         coordinator.profile = profile
         self.profile = profile
         self.instance_id = instance_id

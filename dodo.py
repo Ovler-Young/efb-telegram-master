@@ -9,7 +9,7 @@ README_BASE = "./README.rst"
 DEFAULT_BUMP_MODE = "patch"
 # major, minor, patch, alpha, beta, dev, post
 DOIT_CONFIG = {
-    "default_tasks": ["msgfmt"]
+    "default_tasks": ["test", "mypy"]
 }
 
 

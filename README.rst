@@ -30,7 +30,7 @@ Bot API, ``python-telegram-bot``.
 Requirements
 ------------
 
--  Python >= 3.6
+-  Python >= 3.10
 -  EH Forwarder Bot >= 2.0.0
 -  ffmpeg
 -  libmagic
@@ -777,7 +777,7 @@ RPC interface
 -------------
 
 A standard `Python XML RPC server`__ is implemented in ETM 2. It can be
-enabled by adding a ``rpc`` section in ETM’s ``config.yml`` file.
+enabled by adding a ``rpc`` section in ETM’s ``config.yaml`` file.
 
 __ https://docs.python.org/3/library/xmlrpc.html
 
@@ -811,7 +811,7 @@ documentation on xmlrpc`__.
 __ https://docs.python.org/3/library/xmlrpc.html
 
 .. _the db (database manager) class: https://etm.1a23.studio/blob/master/efb_telegram_master/db.py
-.. _the RPCUtilities class: https://etm.1a23.studio/blob/master/efb_telegram_master/rpc_utilities.py
+.. _the RPCUtilities class: https://etm.1a23.studio/blob/master/efb_telegram_master/rpc_utils.py
 
 Setup Webhook
 -------------

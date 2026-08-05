@@ -1,10 +1,17 @@
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
-from efb_telegram_master.outbound import QUEUED_OPERATIONS, QueueEnqueueError
+from efb_telegram_master.outbound import QUEUED_OPERATIONS, QueueEnqueueError, _retry_after_seconds
+from telegram.error import RetryAfter
+
+
+@pytest.mark.parametrize(("value", "seconds"), [(3, 3.0), (timedelta(seconds=4), 4.0)])
+def test_retry_after_seconds_accepts_numeric_and_timedelta_values(value, seconds):
+    assert _retry_after_seconds(RetryAfter(value)) == seconds
 
 
 def _manager_with_adapter_stubs():

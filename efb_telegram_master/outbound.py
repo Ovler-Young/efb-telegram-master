@@ -281,6 +281,11 @@ class QueueMetrics(Protocol):
         ...
 
 
+def _retry_after_seconds(error: RetryAfter) -> float:
+    retry_after = error.retry_after
+    return retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else float(retry_after)
+
+
 class OutboundQueue:
     """Own the queue connection, codec, and transactional row mutations."""
 
@@ -811,11 +816,6 @@ class OutboundQueueScheduler:
         self.wake_event.set()
 
     @staticmethod
-    def _retry_after_seconds(error: RetryAfter) -> float:
-        retry_after = error.retry_after
-        return retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else float(retry_after)
-
-    @staticmethod
     def _is_blocking_media_retry(row: QueuedCall, error: BaseException) -> bool:
         return (
             row.priority == 1
@@ -1051,7 +1051,7 @@ class OutboundQueueScheduler:
                         )
                     if self._is_blocking_media_retry(submitted.row, error):
                         assert isinstance(error, RetryAfter)
-                        retry_after = self._retry_after_seconds(error)
+                        retry_after = _retry_after_seconds(error)
                         deadline = submitted.row.created_at + 300.0
                         if not self.stopping and time.time() + retry_after <= deadline:
                             self.adapter.record_queued_retry_after(
