@@ -150,8 +150,6 @@ class MsgLog(BaseModel):
     """Module ID of the message sent to."""
     sender_bot_id = TextField(null=True)
     """Telegram bot user ID that sent this message. NULL means the main bot."""
-    delivery_queue_id = TextField(null=True, unique=True)
-    """Durable outbound queue identifier associated with a delivered Telegram receipt."""
     provenance = TextField(default="live", constraints=[SQL("DEFAULT 'live'")])
     """Origin of this record: ``live`` or ``mtproto_ingested``."""
     time = DateTimeField(default=datetime.datetime.now, null=True)
@@ -434,7 +432,7 @@ class DatabaseManager:
                 MsgLog.text, MsgLog.slave_origin_uid, MsgLog.slave_origin_display_name,
                 MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
                 MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
-                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id, MsgLog.delivery_queue_id,
+                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id,
                 MsgLog.provenance, MsgLog.time,
             ])
             for msg_log in msg_logs:
@@ -514,45 +512,10 @@ class DatabaseManager:
                 self._migrate(3)
             elif "sender_bot_id" not in msg_log_columns:
                 self._migrate(4)
-            elif "delivery_queue_id" not in msg_log_columns:
-                self._migrate(5)
-            elif not self._has_unique_column_index("msglog", "delivery_queue_id"):
-                self._migrate(5)
             elif "provenance" not in msg_log_columns or "msglogingestionscan" not in database.get_tables():
                 self._migrate(8)
             else:
                 return
-
-    @staticmethod
-    def _has_unique_column_index(table_name: str, column_name: str) -> bool:
-        return any(
-            index.unique and tuple(index.columns) == (column_name,)
-            for index in database.get_indexes(table_name)
-        )
-
-    @staticmethod
-    def _create_msglog_delivery_queue_id_index() -> None:
-        if "msglog" not in database.get_tables():
-            raise RuntimeError("Cannot migrate MsgLog delivery_queue_id: msglog table is missing.")
-        if "delivery_queue_id" not in {
-            column.name for column in database.get_columns("msglog")
-        }:
-            raise RuntimeError("Cannot create MsgLog delivery_queue_id index: column is missing.")
-        duplicate = database.execute_sql(
-            "SELECT delivery_queue_id, COUNT(*) FROM msglog "
-            "WHERE delivery_queue_id IS NOT NULL GROUP BY delivery_queue_id "
-            "HAVING COUNT(*) > 1 ORDER BY delivery_queue_id LIMIT 1"
-        ).fetchone()
-        if duplicate is not None:
-            queue_id, count = duplicate
-            raise RuntimeError(
-                "Resolve duplicate MsgLog delivery_queue_id values before restarting: "
-                f"{queue_id!r} occurs {count} times."
-            )
-        database.execute_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS msglog_delivery_queue_id "
-            "ON msglog (delivery_queue_id)"
-        )
 
     def _migrate(self, i: int):
         """
@@ -596,13 +559,6 @@ class DatabaseManager:
             migrate(
                 migrator.add_column("msglog", "sender_bot_id", MsgLog.sender_bot_id)
             )
-        if i <= 5:
-            msg_log_columns = {column.name for column in database.get_columns("msglog")}
-            if "delivery_queue_id" not in msg_log_columns:
-                migrate(
-                    migrator.add_column("msglog", "delivery_queue_id", TextField(null=True))
-                )
-            self._create_msglog_delivery_queue_id_index()
         if i == 8:
             msg_log_columns = {column.name for column in database.get_columns("msglog")}
             if "provenance" not in msg_log_columns:
@@ -1046,8 +1002,7 @@ class DatabaseManager:
                                   msg: ETMMsg,
                                   master_message: Message,
                                   old_message_id: Optional[OldMsgID] = None,
-                                  sender_bot_id: Optional[str] = None,
-                                  delivery_queue_id: Optional[str] = None):
+                                  sender_bot_id: Optional[str] = None):
         """Add or update a message into the database."""
         sent_message_id = message_id_to_str(
             TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)
@@ -1057,9 +1012,7 @@ class DatabaseManager:
         self.logger.debug("[%s] Received message logging request of %s", master_msg_id, msg.uid)
 
         row: Optional[MsgLog] = None
-        if delivery_queue_id is not None:
-            row = MsgLog.get_or_none(MsgLog.delivery_queue_id == delivery_queue_id)
-        if row is None and old_message_id is not None:
+        if old_message_id is not None:
             old_message_id_str = message_id_to_str(*old_message_id)
             row = MsgLog.get_or_none(
                 (MsgLog.master_msg_id == old_message_id_str) |
@@ -1097,8 +1050,6 @@ class DatabaseManager:
         row.file_unique_id = msg.file_unique_id
         row.mime = msg.mime
         row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
-        if delivery_queue_id is not None:
-            row.delivery_queue_id = delivery_queue_id
         row.provenance = "live"
         pickle_data = self.pickle_misc_msg(msg)
         row.pickle = pickle_data

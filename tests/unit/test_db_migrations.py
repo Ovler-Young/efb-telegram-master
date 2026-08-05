@@ -30,12 +30,12 @@ from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 
 
-def test_msglog_schema_has_durable_delivery_queue_id(channel):
+def test_msglog_schema_has_sender_bot_id(channel):
     columns = {column.name for column in channel.db.database.get_columns("msglog")} if hasattr(channel.db, "database") else None
     if columns is None:
         from efb_telegram_master.db import database
         columns = {column.name for column in database.get_columns("msglog")}
-    assert {"sender_bot_id", "delivery_queue_id"}.issubset(columns)
+    assert "sender_bot_id" in columns
 
 
 def test_msglog_ingestion_schema_has_live_provenance_and_durable_scan_state():
@@ -351,83 +351,6 @@ def test_resumable_msglog_ingestion_scans_include_unleased_and_expired_running_j
         database.initialize(original_database)
 
 
-def test_fresh_sqlite_msglog_rejects_duplicate_delivery_queue_id():
-    from peewee import IntegrityError, SqliteDatabase
-
-    test_db = SqliteDatabase(":memory:")
-    with test_db.bind_ctx([MsgLog]):
-        test_db.create_tables([MsgLog])
-        MsgLog.create(
-            master_msg_id="100.1", slave_message_id="slave-1", text="first",
-            slave_origin_uid="tests.slave", msg_type="Text", sent_to="tests",
-            delivery_queue_id="queue-duplicate",
-        )
-        with pytest.raises(IntegrityError):
-            MsgLog.create(
-                master_msg_id="100.2", slave_message_id="slave-2", text="second",
-                slave_origin_uid="tests.slave", msg_type="Text", sent_to="tests",
-                delivery_queue_id="queue-duplicate",
-            )
-
-
-def test_sqlite_upgrade_rejects_duplicate_msglog_delivery_queue_ids(tmp_path, monkeypatch):
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    channel = SimpleNamespace(channel_id="tests.msglog-queue-id-migration", config={})
-    first = DatabaseManager(channel)
-    try:
-        database.execute_sql("DROP INDEX IF EXISTS msglog_delivery_queue_id")
-        database.execute_sql(
-            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, "
-            "msg_type, sent_to, delivery_queue_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("100.1", "slave-1", "first", "tests.slave", "Text", "tests", "queue-duplicate"),
-        )
-        database.execute_sql(
-            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, "
-            "msg_type, sent_to, delivery_queue_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("100.2", "slave-2", "second", "tests.slave", "Text", "tests", "queue-duplicate"),
-        )
-    finally:
-        first.stop_worker()
-
-    try:
-        with pytest.raises(RuntimeError, match="Resolve duplicate MsgLog delivery_queue_id values"):
-            DatabaseManager(channel)
-    finally:
-        database.close()
-        database.initialize(original_database)
-
-
-def test_sqlite_upgrade_creates_msglog_queue_id_index(tmp_path, monkeypatch):
-    from peewee import IntegrityError
-
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    channel = SimpleNamespace(channel_id="tests.msglog-queue-id-index", config={})
-    first = DatabaseManager(channel)
-    try:
-        database.execute_sql("DROP INDEX IF EXISTS msglog_delivery_queue_id")
-        database.execute_sql(
-            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, "
-            "msg_type, sent_to, delivery_queue_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("100.1", "slave-1", "first", "tests.slave", "Text", "tests", "queue-one"),
-        )
-    finally:
-        first.stop_worker()
-
-    upgraded = DatabaseManager(channel)
-    try:
-        with pytest.raises(IntegrityError):
-            database.execute_sql(
-                "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, "
-                "msg_type, sent_to, delivery_queue_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("100.2", "slave-2", "second", "tests.slave", "Text", "tests", "queue-one"),
-            )
-    finally:
-        upgraded.stop_worker()
-        database.initialize(original_database)
-
-
 def test_sqlite_startup_adds_msglog_provenance_and_ingestion_scan(tmp_path, monkeypatch):
     original_database = database.obj
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
@@ -442,7 +365,7 @@ def test_sqlite_startup_adds_msglog_provenance_and_ingestion_scan(tmp_path, monk
             "slave_origin_display_name TEXT NULL, slave_member_uid TEXT NULL, "
             "slave_member_display_name TEXT NULL, media_type TEXT NULL, mime TEXT NULL, "
             "file_id TEXT NULL, file_unique_id TEXT NULL, msg_type TEXT NOT NULL, pickle BLOB NULL, "
-            "sent_to TEXT NOT NULL, sender_bot_id TEXT NULL, delivery_queue_id TEXT NULL UNIQUE, "
+            "sent_to TEXT NOT NULL, sender_bot_id TEXT NULL, "
             "time DATETIME NULL)"
         )
         database.execute_sql(
@@ -507,57 +430,6 @@ def test_postgresql_msglog_ingestion_migration_adds_provenance_before_scan_table
     assert operations[3] == ("create_tables", ("MsgLogIngestionScan",), True)
 
 
-def test_postgresql_msglog_queue_id_migration_adds_column_before_unique_index(monkeypatch):
-    operations = []
-
-    class Cursor:
-        @staticmethod
-        def fetchone():
-            return None
-
-    class FakeDatabase:
-        obj = object()
-        column_reads = 0
-
-        @staticmethod
-        def get_tables():
-            return ["msglog"]
-
-        @classmethod
-        def get_columns(cls, _table_name):
-            cls.column_reads += 1
-            if cls.column_reads == 1:
-                return []
-            return [SimpleNamespace(name="delivery_queue_id")]
-
-        @staticmethod
-        def execute_sql(sql, _parameters=None):
-            operations.append(sql)
-            return Cursor()
-
-    class FakeMigrator:
-        def __init__(self, _database):
-            pass
-
-        @staticmethod
-        def add_column(table_name, column_name, _field):
-            operations.append(("add_column", table_name, column_name))
-            return "add-column"
-
-    manager = object.__new__(DatabaseManager)
-    manager._migrator_cls = FakeMigrator
-    manager._is_sqlite = False
-    monkeypatch.setattr(db_module, "database", FakeDatabase())
-    monkeypatch.setattr(db_module, "migrate", lambda *steps: operations.append(("migrate", steps)))
-
-    manager._migrate(5)
-
-    assert operations[0] == ("add_column", "msglog", "delivery_queue_id")
-    assert operations[1][0] == "migrate"
-    assert "SELECT delivery_queue_id" in operations[2]
-    assert "CREATE UNIQUE INDEX IF NOT EXISTS msglog_delivery_queue_id" in operations[3]
-
-
 def test_database_method_metrics_record_success_failure_and_bounded_labels(channel):
     metrics = Metrics()
     channel.db.set_metrics(metrics)
@@ -596,33 +468,6 @@ def test_history_migration_entry_table_exists():
         "position",
     }.issubset(history_columns)
     assert "source_master_msg_id" not in msglog_columns
-
-
-def test_msglog_queue_id_reconciliation_reuses_the_existing_row():
-    from peewee import SqliteDatabase
-
-    test_db = SqliteDatabase(":memory:")
-    manager = object.__new__(DatabaseManager)
-    manager.logger = Mock()
-    message = SimpleNamespace(
-        uid=MessageID("slave-1"), chat=SimpleNamespace(module_id="tests", uid="chat"),
-        author=SimpleNamespace(module_id="tests", uid="author"), text="message",
-        type=MsgType.Text, type_telegram=TGMsgType.Text,
-        deliver_to=SimpleNamespace(channel_id="tests"), file_id=None, file_unique_id=None,
-        mime=None, is_system=False, attributes=None, commands=None, substitutions=None,
-        target=None, sender_bot_id=None, reactions={},
-    )
-
-    with test_db.bind_ctx([MsgLog]):
-        test_db.create_tables([MsgLog])
-        for _ in range(2):
-            manager.add_or_update_message_log(
-                message, SimpleNamespace(chat_id=100, message_id=1),
-                delivery_queue_id="queue-reconcile",
-            )
-
-        assert MsgLog.select().count() == 1
-        assert MsgLog.get().delivery_queue_id == "queue-reconcile"
 
 
 def test_live_message_persistence_replaces_ingested_msglog_contents_and_provenance():

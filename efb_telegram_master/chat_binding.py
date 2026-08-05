@@ -1632,7 +1632,6 @@ class ChatBindingManager(LocaleMixin):
                     args=(),
                     kwargs=kwargs,
                     history_entry_ids=[entry.id],
-                    queue_id=f"history-migration:{entry.id}",
                 )
                 waiter.result()
                 completed_call_count += 1

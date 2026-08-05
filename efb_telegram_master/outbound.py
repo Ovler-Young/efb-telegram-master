@@ -27,10 +27,7 @@ from telegram import (
 from telegram.error import RetryAfter
 
 from .mtproto import (
-    MTProtoFloodWaitError,
-    MTProtoKnownNotSubmittedError,
     MTProtoMediaDescriptor,
-    MTProtoNotConnectedError,
 )
 
 
@@ -126,14 +123,11 @@ class QueueRequest:
     operation: str
     args: tuple
     kwargs: dict
-    log_context: Optional[bytes] = None
-    queue_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class QueuedCall:
     id: int
-    queue_id: str
     priority: int
     telegram_chat_id: int
     operation: str
@@ -141,10 +135,6 @@ class QueuedCall:
     slave_id: Optional[str]
     required_sender_bot_id: Optional[str]
     created_at: float
-    log_context: Optional[bytes]
-    delivery_state: str
-    completion_receipt: Optional[bytes]
-    attempt_id: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -176,7 +166,6 @@ class SubmittedCall:
     selection: SenderSelection
     future: Future
     dispatched_at: float
-    attempt_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -328,20 +317,11 @@ class OutboundQueue:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS outbound_queue ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "queue_id TEXT UNIQUE, "
                 "priority INTEGER NOT NULL CHECK (priority IN (0, 1)), "
                 "telegram_chat_id INTEGER NOT NULL, "
                 f"operation TEXT NOT NULL CHECK (operation IN ({operations})), "
                 "payload BLOB NOT NULL, slave_id TEXT NULL, "
-                "required_sender_bot_id TEXT NULL, created_at REAL NOT NULL, "
-                "log_context BLOB NULL, "
-                "delivery_state TEXT NOT NULL DEFAULT 'queued' "
-                "CHECK (delivery_state IN ('queued', 'in_flight', 'sent_pending', 'unknown')), "
-                "completion_receipt BLOB NULL, attempt_id TEXT NULL)"
-            )
-            self._migrate_schema(connection)
-            connection.execute(
-                "UPDATE outbound_queue SET delivery_state = 'unknown' WHERE delivery_state = 'in_flight'"
+                "required_sender_bot_id TEXT NULL, created_at REAL NOT NULL)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS outbound_queue_destination_priority_id "
@@ -357,57 +337,6 @@ class OutboundQueue:
                 finally:
                     connection.close()
             raise
-
-    @staticmethod
-    def _migrate_schema(connection: sqlite3.Connection) -> None:
-        """Upgrade queue files before creating indexes that depend on new columns."""
-        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(outbound_queue)")}
-        if "queue_id" not in columns:
-            connection.execute("ALTER TABLE outbound_queue ADD COLUMN queue_id TEXT")
-            connection.execute("UPDATE outbound_queue SET queue_id = 'legacy-' || id WHERE queue_id IS NULL")
-        if "log_context" not in columns:
-            connection.execute("ALTER TABLE outbound_queue ADD COLUMN log_context BLOB NULL")
-        if "delivery_state" not in columns:
-            connection.execute(
-                "ALTER TABLE outbound_queue ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'queued'"
-            )
-        if "completion_receipt" not in columns:
-            connection.execute("ALTER TABLE outbound_queue ADD COLUMN completion_receipt BLOB NULL")
-        if "attempt_id" not in columns:
-            connection.execute("ALTER TABLE outbound_queue ADD COLUMN attempt_id TEXT NULL")
-        schema_row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbound_queue'"
-        ).fetchone()
-        schema = "" if schema_row is None or schema_row[0] is None else str(schema_row[0])
-        if "send_mtproto_media" not in schema or "'in_flight'" not in schema or "'unknown'" not in schema:
-            operations = ", ".join(repr(name) for name in sorted(QUEUED_OPERATIONS))
-            connection.execute("ALTER TABLE outbound_queue RENAME TO outbound_queue_legacy")
-            connection.execute(
-                "CREATE TABLE outbound_queue ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "queue_id TEXT UNIQUE, "
-                "priority INTEGER NOT NULL CHECK (priority IN (0, 1)), "
-                "telegram_chat_id INTEGER NOT NULL, "
-                f"operation TEXT NOT NULL CHECK (operation IN ({operations})), "
-                "payload BLOB NOT NULL, slave_id TEXT NULL, "
-                "required_sender_bot_id TEXT NULL, created_at REAL NOT NULL, "
-                "log_context BLOB NULL, "
-                "delivery_state TEXT NOT NULL DEFAULT 'queued' "
-                "CHECK (delivery_state IN ('queued', 'in_flight', 'sent_pending', 'unknown')), "
-                "completion_receipt BLOB NULL, attempt_id TEXT NULL)"
-            )
-            connection.execute(
-                "INSERT INTO outbound_queue "
-                "(id, queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
-                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, attempt_id) "
-                "SELECT id, queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
-                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, attempt_id "
-                "FROM outbound_queue_legacy"
-            )
-            connection.execute("DROP TABLE outbound_queue_legacy")
-        connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS outbound_queue_queue_id ON outbound_queue (queue_id)"
-        )
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -748,7 +677,7 @@ class OutboundQueue:
             raise QueueEnqueueError("chat_id must be a non-Boolean integral value.")
         return int(chat_id)
 
-    def _prepare(self, request: QueueRequest, operation: Callable[..., object]) -> tuple[str, tuple, dict, int, int, Optional[str], Optional[str], bytes, Optional[bytes]]:
+    def _prepare(self, request: QueueRequest, operation: Callable[..., object]) -> tuple[str, tuple, dict, int, int, Optional[str], Optional[str], bytes]:
         if not isinstance(request.operation, str) or not isinstance(request.args, tuple) or not isinstance(request.kwargs, dict):
             raise QueueEnqueueError("Queue request must be (operation: str, args: tuple, kwargs: dict).")
         telegram_kwargs, priority, slave_id, required_sender = self._validate_metadata(
@@ -784,16 +713,12 @@ class OutboundQueue:
         try:
             chat_id = self._destination(operation, telegram_args, telegram_kwargs)
             payload = self.encode_payload(telegram_args, telegram_kwargs)
-            if request.log_context is not None and not isinstance(request.log_context, bytes):
-                raise QueueEnqueueError("Queued log context must be bytes when supplied.")
-            if request.log_context is not None and priority != 0:
-                raise QueueEnqueueError("Queued log context requires an eventual send.")
         except Exception:
             self._unlink_artifact(artifact)
             raise
         return (
             request.operation, telegram_args, telegram_kwargs, chat_id, priority,
-            slave_id, required_sender, payload, request.log_context,
+            slave_id, required_sender, payload,
         )
 
     def enqueue_many(
@@ -802,101 +727,60 @@ class OutboundQueue:
         request_list = list(requests)
         if not request_list:
             raise QueueEnqueueError("Queued request sequence cannot be empty.")
-        prepared = []
-        try:
-            for request in request_list:
-                prepared.append(self._prepare(request, operation_resolver(request.operation)))
-        except Exception:
-            for item in prepared:
-                self._unlink_artifact(self._artifact_path_from_payload(item[7]))
-            raise
+        prepared = [self._prepare(request, operation_resolver(request.operation)) for request in request_list]
         destinations = {(item[3], item[4]) for item in prepared}
         if len(destinations) != 1:
-            for item in prepared:
-                self._unlink_artifact(self._artifact_path_from_payload(item[7]))
             raise QueueEnqueueError("Queued request sequence must share chat_id and priority.")
         with self._lock:
             try:
                 self.connection.execute("BEGIN")
                 identifiers: list[int] = []
-                inserted: list[bool] = []
                 now = time.time()
-                for index, prepared_request in enumerate(prepared):
-                    operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context = prepared_request
-                    queue_id = request_list[index].queue_id or str(uuid.uuid4())
+                for operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload in prepared:
                     cursor = self.connection.execute(
                         "INSERT INTO outbound_queue "
-                        "(queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
-                        "required_sender_bot_id, created_at, log_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                        "ON CONFLICT(queue_id) DO NOTHING",
+                        "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (
-                            queue_id, priority, chat_id, operation, payload, slave_id,
-                            required_sender, now, log_context,
+                            priority, chat_id, operation, payload, slave_id, required_sender, now,
                         ),
                     )
-                    if cursor.rowcount == 1:
-                        identifier = cursor.lastrowid
-                        if identifier is None:
-                            raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
-                        identifiers.append(identifier)
-                        inserted.append(True)
-                        continue
-                    existing = self.connection.execute(
-                        "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
-                        "required_sender_bot_id, log_context FROM outbound_queue WHERE queue_id = ?",
-                        (queue_id,),
-                    ).fetchone()
-                    expected = (priority, chat_id, operation, payload, slave_id, required_sender, log_context)
-                    if existing is None or tuple(existing[1:]) != expected:
-                        raise QueueEnqueueError(f"Queue ID {queue_id!r} is already used by another request.")
-                    identifiers.append(int(existing[0]))
-                    inserted.append(False)
+                    identifier = cursor.lastrowid
+                    if identifier is None:
+                        raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
+                    identifiers.append(identifier)
                 self.connection.commit()
             except Exception as error:
                 try:
                     self.connection.rollback()
                 except sqlite3.Error:
                     pass
-                for item in prepared:
-                    self._unlink_artifact(self._artifact_path_from_payload(item[7]))
                 raise QueueEnqueueError("Unable to commit queued Telegram call.") from error
             if self.metrics is not None:
-                for did_insert, prepared_request in zip(inserted, prepared):
+                for prepared_request in prepared:
                     (
                         operation, _args, _kwargs, _chat_id, priority, _slave_id,
-                        _required_sender, _payload, _log_context,
+                        _required_sender, _payload,
                     ) = prepared_request
-                    if not did_insert:
-                        continue
                     self.metrics.record_enqueued(priority, operation)
             self.refresh_depth()
-            waiter = self.waiters.get(identifiers[0])
-            if waiter is None:
-                waiter = Future()
-                self.waiters[identifiers[0]] = waiter
+            waiter: Future = Future()
+            self.waiters[identifiers[0]] = waiter
             return identifiers[0], waiter
 
     def heads(self) -> list[QueuedCall]:
         with self._lock:
-            # An unresolved durable delivery prevents later calls to the same
-            # destination from changing their observed order.
             rows = self.connection.execute(
-                "SELECT id, queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
-                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, attempt_id "
-                "FROM outbound_queue AS queued WHERE queued.delivery_state = 'queued' "
-                "AND NOT EXISTS ("
-                "SELECT 1 FROM outbound_queue AS earlier "
-                "WHERE earlier.telegram_chat_id = queued.telegram_chat_id "
-                "AND earlier.id < queued.id "
-                "AND earlier.delivery_state IN ('in_flight', 'sent_pending', 'unknown')"
-                ") ORDER BY queued.telegram_chat_id ASC, queued.priority DESC, queued.id ASC"
+                "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
+                "required_sender_bot_id, created_at FROM outbound_queue "
+                "ORDER BY telegram_chat_id ASC, priority DESC, id ASC"
             ).fetchall()
         heads: list[QueuedCall] = []
         destinations: set[int] = set()
         for row in rows:
-            if int(row[3]) in destinations:
+            if int(row[2]) in destinations:
                 continue
-            destinations.add(int(row[3]))
+            destinations.add(int(row[2]))
             heads.append(QueuedCall(*row))
         return heads
 
@@ -912,128 +796,6 @@ class OutboundQueue:
             (f"rank_{rank}", int(depth), max(0.0, now - float(oldest_created_at)))
             for rank, (_chat_id, depth, oldest_created_at) in enumerate(rows, start=1)
         ]
-
-    def sent_pending(self) -> list[QueuedCall]:
-        with self._lock:
-            rows = self.connection.execute(
-                "SELECT id, queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
-                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, attempt_id "
-                "FROM outbound_queue WHERE delivery_state = 'sent_pending' ORDER BY id ASC"
-            ).fetchall()
-        return [QueuedCall(*row) for row in rows]
-
-    def begin_attempt(self, row_id: int) -> str:
-        attempt_id = str(uuid.uuid4())
-        with self._lock:
-            try:
-                self.connection.execute("BEGIN")
-                cursor = self.connection.execute(
-                    "UPDATE outbound_queue SET delivery_state = 'in_flight', attempt_id = ? "
-                    "WHERE id = ? AND delivery_state = 'queued'", (attempt_id, row_id),
-                )
-                if cursor.rowcount != 1:
-                    raise QueuePersistenceError(f"Queued row {row_id} cannot begin a delivery attempt.")
-                self.connection.commit()
-            except Exception:
-                try:
-                    self.connection.rollback()
-                except sqlite3.Error:
-                    pass
-                raise
-        return attempt_id
-
-    def _transition_attempt(self, row_id: int, attempt_id: str, state: str) -> None:
-        with self._lock:
-            try:
-                self.connection.execute("BEGIN")
-                cursor = self.connection.execute(
-                    "UPDATE outbound_queue SET delivery_state = ? WHERE id = ? "
-                    "AND delivery_state = 'in_flight' AND attempt_id = ?",
-                    (state, row_id, attempt_id),
-                )
-                if cursor.rowcount != 1:
-                    raise QueuePersistenceError(f"Queued row {row_id} lost its delivery attempt state.")
-                self.connection.commit()
-            except Exception:
-                try:
-                    self.connection.rollback()
-                except sqlite3.Error:
-                    pass
-                raise
-
-    def return_attempt_to_queue(self, row_id: int, attempt_id: str) -> None:
-        self._transition_attempt(row_id, attempt_id, "queued")
-
-    def mark_attempt_unknown(self, row_id: int, attempt_id: str) -> None:
-        self._transition_attempt(row_id, attempt_id, "unknown")
-
-    def unknown(self) -> list[QueuedCall]:
-        with self._lock:
-            rows = self.connection.execute(
-                "SELECT id, queue_id, priority, telegram_chat_id, operation, payload, slave_id, "
-                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, attempt_id "
-                "FROM outbound_queue WHERE delivery_state = 'unknown' ORDER BY id ASC"
-            ).fetchall()
-        return [QueuedCall(*row) for row in rows]
-
-    def requeue_unknown(self, row_id: int) -> None:
-        with self._lock:
-            try:
-                self.connection.execute("BEGIN")
-                cursor = self.connection.execute(
-                    "UPDATE outbound_queue SET delivery_state = 'queued', attempt_id = NULL "
-                    "WHERE id = ? AND delivery_state = 'unknown'", (row_id,)
-                )
-                if cursor.rowcount != 1:
-                    raise QueuePersistenceError(f"Queued row {row_id} is not an unknown delivery.")
-                self.connection.commit()
-            except Exception:
-                try:
-                    self.connection.rollback()
-                except sqlite3.Error:
-                    pass
-                raise
-
-    def resolve_unknown(self, row_id: int, receipt: bytes) -> None:
-        if not isinstance(receipt, bytes):
-            raise QueuePersistenceError("Queued Telegram completion receipt must be bytes.")
-        with self._lock:
-            try:
-                self.connection.execute("BEGIN")
-                cursor = self.connection.execute(
-                    "UPDATE outbound_queue SET delivery_state = 'sent_pending', completion_receipt = ? "
-                    "WHERE id = ? AND delivery_state = 'unknown'", (receipt, row_id),
-                )
-                if cursor.rowcount != 1:
-                    raise QueuePersistenceError(f"Queued row {row_id} is not an unknown delivery.")
-                self.connection.commit()
-            except Exception:
-                try:
-                    self.connection.rollback()
-                except sqlite3.Error:
-                    pass
-                raise
-
-    def record_telegram_completion(self, row_id: int, attempt_id: str, receipt: bytes) -> None:
-        if not isinstance(receipt, bytes):
-            raise QueuePersistenceError("Queued Telegram completion receipt must be bytes.")
-        with self._lock:
-            try:
-                self.connection.execute("BEGIN")
-                cursor = self.connection.execute(
-                    "UPDATE outbound_queue SET delivery_state = 'sent_pending', completion_receipt = ? "
-                    "WHERE id = ? AND delivery_state = 'in_flight' AND attempt_id = ?",
-                    (receipt, row_id, attempt_id),
-                )
-                if cursor.rowcount != 1:
-                    raise QueuePersistenceError(f"Queued row {row_id} cannot record Telegram completion.")
-                self.connection.commit()
-            except Exception:
-                try:
-                    self.connection.rollback()
-                except sqlite3.Error:
-                    pass
-                raise
 
     def delete(self, row_id: int) -> None:
         with self._lock:
@@ -1089,7 +851,6 @@ class OutboundQueueScheduler:
         self.in_flight_destinations: set[int] = set()
         self.blocking_media_retries: dict[int, BlockingMediaRetry] = {}
         self.next_deadline: Optional[float] = None
-        self._startup_reconciled = False
 
     @staticmethod
     def _sender_kind(selection: SenderSelection) -> str:
@@ -1273,30 +1034,10 @@ class OutboundQueueScheduler:
         self.queue.fail_all_waiters(persistence_error)
         self.wake_event.set()
 
-    def reconcile_sent_pending(self) -> set[int]:
-        """Apply persisted Telegram receipts before any row can be dispatched again."""
-        reconciler = getattr(self.adapter, "reconcile_queued_delivery", None)
-        if not callable(reconciler):
-            return set()
-        reconciled: set[int] = set()
-        for row in self.queue.sent_pending():
-            try:
-                if not reconciler(row):
-                    continue
-                self.queue.delete(row.id)
-            except Exception:
-                continue
-            self._record_submitted_removal(row)
-            reconciled.add(row.id)
-        return reconciled
-
     def dispatch_once(self) -> None:
         with self._lock:
             if self.stopping:
                 return
-            if not self._startup_reconciled:
-                self.reconcile_sent_pending()
-                self._startup_reconciled = True
             self.next_deadline = None
             self._dispatch_blocking_media_retries()
             retry_destinations = {
@@ -1357,7 +1098,6 @@ class OutboundQueueScheduler:
                     self._schedule_retry(retry_at)
                     continue
                 retained = row.priority == 0
-                durable = retained and row.log_context is not None
                 if not retained:
                     try:
                         self.queue.delete(row.id)
@@ -1366,14 +1106,6 @@ class OutboundQueueScheduler:
                         self._stop_for_persistence_error(delete_error)
                         return
                     self._record_submitted_removal(row)
-                attempt_id: Optional[str] = None
-                if durable:
-                    try:
-                        attempt_id = self.queue.begin_attempt(row.id)
-                    except Exception as persistence_error:
-                        self._permits.release()
-                        self._stop_for_persistence_error(persistence_error)
-                        return
                 try:
                     dispatched_at = self._record_dispatch_attempt(row)
                     future = self.executor.submit(
@@ -1386,13 +1118,6 @@ class OutboundQueueScheduler:
                         self.queue.metrics.record_dispatch_failure(row.priority, row.operation)
                         self.queue.metrics.record_failure(row.priority, row.operation, "dispatch")
                     if retained:
-                        if durable:
-                            assert attempt_id is not None
-                            try:
-                                self.queue.return_attempt_to_queue(row.id, attempt_id)
-                            except Exception as persistence_error:
-                                self._stop_for_persistence_error(persistence_error)
-                                return
                         self._schedule_retry(now + 0.25)
                     else:
                         error = ExecutorSubmitError("Unable to submit queued Telegram call.")
@@ -1401,9 +1126,7 @@ class OutboundQueueScheduler:
                     continue
                 self._record_dispatch("submitted")
                 future.add_done_callback(self._wake_on_future_completion)
-                self.in_flight[row.id] = SubmittedCall(
-                    row, decision.selection, future, dispatched_at, attempt_id
-                )
+                self.in_flight[row.id] = SubmittedCall(row, decision.selection, future, dispatched_at)
                 self.in_flight_destinations.add(row.telegram_chat_id)
                 if self.queue.metrics is not None:
                     self.queue.metrics.increment_in_flight(
@@ -1451,27 +1174,12 @@ class OutboundQueueScheduler:
                                 )
                             continue
                     decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
-                    known_not_sent = isinstance(
-                        error, (RetryAfter, MTProtoFloodWaitError, MTProtoNotConnectedError)
-                    )
-                    known_not_submitted_terminal = isinstance(error, MTProtoKnownNotSubmittedError)
-                    if (
-                        decision.kind == "retry_eventual"
-                        and submitted.row.priority == 0
-                        and known_not_sent
-                    ):
+                    if decision.kind == "retry_eventual" and submitted.row.priority == 0:
                         if self.stopping:
                             self.queue.fail_waiter(row_id, SchedulerStoppedError("Outbound scheduler stopped."))
                             continue
                         if decision.retry_at is None:
                             raise RuntimeError("Retry decision requires a retry deadline.")
-                        if submitted.row.log_context is not None:
-                            assert submitted.attempt_id is not None
-                            try:
-                                self.queue.return_attempt_to_queue(row_id, submitted.attempt_id)
-                            except Exception as persistence_error:
-                                self._stop_for_persistence_error(persistence_error)
-                                return
                         self._schedule_retry(decision.retry_at)
                         if self.queue.metrics is not None:
                             self.queue.metrics.record_retry(
@@ -1480,20 +1188,12 @@ class OutboundQueueScheduler:
                             )
                         continue
                     if submitted.row.priority == 0:
-                        if submitted.row.log_context is not None and not known_not_submitted_terminal:
-                            try:
-                                assert submitted.attempt_id is not None
-                                self.queue.mark_attempt_unknown(row_id, submitted.attempt_id)
-                            except Exception as persistence_error:
-                                self._stop_for_persistence_error(persistence_error)
-                                return
-                        else:
-                            try:
-                                self.queue.delete(row_id)
-                            except Exception as delete_error:
-                                self._stop_for_persistence_error(delete_error)
-                                return
-                            self._record_terminal_discard(submitted.row)
+                        try:
+                            self.queue.delete(row_id)
+                        except Exception as delete_error:
+                            self._stop_for_persistence_error(delete_error)
+                            return
+                        self._record_terminal_discard(submitted.row)
                     self.queue.fail_waiter(row_id, error)
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_failure(
@@ -1502,32 +1202,6 @@ class OutboundQueueScheduler:
                     self._record_terminal_completion(submitted.row, submitted.selection, "failure")
                 else:
                     self._record_executor_attempt_duration(submitted, "success")
-                    if submitted.row.log_context is not None:
-                        receipt_encoder = getattr(self.adapter, "encode_queued_completion_receipt", None)
-                        if not callable(receipt_encoder):
-                            self._stop_for_persistence_error(
-                                QueuePersistenceError("Queue adapter cannot persist a Telegram completion receipt.")
-                            )
-                            return
-                        try:
-                            assert submitted.attempt_id is not None
-                            self.queue.record_telegram_completion(
-                                row_id, submitted.attempt_id, receipt_encoder(result, submitted.selection)
-                            )
-                        except Exception as persistence_error:
-                            self._stop_for_persistence_error(persistence_error)
-                            return
-                        reconciled = self.reconcile_sent_pending()
-                        if row_id not in reconciled:
-                            continue
-                        self.adapter.record_queued_success(
-                            submitted.row, result, submitted.selection
-                        )
-                        self.queue.complete_waiter(row_id, result)
-                        self._record_terminal_completion(
-                            submitted.row, submitted.selection, "success"
-                        )
-                        continue
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
                     if submitted.row.priority == 0:
                         try:
