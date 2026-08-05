@@ -2,9 +2,16 @@ from datetime import timedelta
 import threading
 
 import pytest
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, RetryAfter
 
-from efb_telegram_master.outbound import OutboundQueue, QueueRequest
+from efb_telegram_master.outbound import (
+    OutboundQueue,
+    QueueRequest,
+    QueuedCall,
+    SenderPolicy,
+    SenderSelection,
+    TelegramCallAdapter,
+)
 
 
 class _Limiter:
@@ -109,3 +116,60 @@ def test_stop_drains_in_flight_call():
     release.set()
     queue.stop()
     assert waiter.result(1).message == "sent"
+
+
+def test_sender_policy_prefers_affinity_and_honors_required_sender():
+    class Auxiliary:
+        disabled = False
+
+        def __init__(self, bot_id):
+            self.bot_id = bot_id
+            self.bot = object()
+
+        def check_membership_tri(self, _chat_id):
+            return True
+
+        def peek_delay(self, _chat_id):
+            return 0.0
+
+        def try_acquire_limits(self, _chat_id):
+            return True
+
+    class Pool:
+        def __init__(self):
+            self.first, self.second = Auxiliary(1), Auxiliary(2)
+
+        def get_bot_by_id(self, bot_id):
+            return {"1": self.first, "2": self.second}.get(str(bot_id))
+
+        def candidate_bots(self, _chat_id):
+            return [(self.first, True), (self.second, True)]
+
+        def preferred_sender(self, _slave_id):
+            return self.second
+
+        def rate_limit_occupancy_snapshot(self):
+            return {"global": 0.0, "chat": 0.0}
+
+    pool = Pool()
+    policy = SenderPolicy(object(), pool, _Limiter())
+    call = QueuedCall("send_message", (), {"chat_id": 1, "text": "sent"}, 1, "slave", None)
+    assert policy.select(call, 0).selection == SenderSelection(pool.second.bot, "2")
+    required = QueuedCall("send_message", (), {"chat_id": 1, "text": "sent"}, 1, None, "1")
+    assert policy.select(required, 0).selection == SenderSelection(pool.first.bot, "1")
+
+
+def test_adapter_removes_metadata_and_retries_parse_fallback():
+    calls = []
+
+    class Sender:
+        def send_message(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise BadRequest("Can't parse entities")
+            return "sent"
+
+    call = QueuedCall("send_message", (), {"chat_id": 1, "text": "sent", "parse_mode": "HTML", "_slave_id": "x"}, 1, None, None)
+    receipt = TelegramCallAdapter(None).execute(call, SenderSelection(Sender(), None))
+    assert receipt.message == "sent"
+    assert calls == [{"chat_id": 1, "text": "sent", "parse_mode": "HTML"}, {"chat_id": 1, "text": "sent"}]

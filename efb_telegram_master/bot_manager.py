@@ -30,6 +30,7 @@ from .outbound import (
     QueueEnqueueError,
     QueueRequest,
     SendReceipt,
+    _strip_private_queue_metadata,
 )
 from .ptb_compat import Filters
 from .rate_limiter import SlidingWindowRateLimiter
@@ -45,15 +46,6 @@ MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
 P = ParamSpec("P")
 T = TypeVar("T")
 BotMethod: TypeAlias = Callable[..., object]
-_INTERNAL_KWARGS = frozenset({
-    'prefix',
-    'suffix',
-    '_sender_bot_id',
-    '_slave_id',
-    '_force_main_bot',
-})
-
-
 class SyncBotProtocol(Protocol):
     def __getattr__(self, item: str) -> BotMethod:
         ...
@@ -222,10 +214,6 @@ class TelegramBotManager(LocaleMixin):
         return int(value)
 
     @staticmethod
-    def _strip_private_queue_metadata(kwargs: Mapping[str, object]) -> dict[str, object]:
-        return {key: value for key, value in kwargs.items() if key not in _INTERNAL_KWARGS}
-
-    @staticmethod
     def _queued_chat_id_argument(
         operation: str, args: tuple, kwargs: Mapping[str, object]
     ) -> object:
@@ -309,7 +297,7 @@ class TelegramBotManager(LocaleMixin):
     def _call_direct_operation(
         self, operation: str, args: tuple, kwargs: Mapping[str, object]
     ) -> object:
-        return getattr(self._bot, operation)(*args, **self._strip_private_queue_metadata(kwargs))
+        return getattr(self._bot, operation)(*args, **_strip_private_queue_metadata(kwargs))
 
 
     def _register_runtime_metric_collectors(self, top_n: int) -> None:
@@ -390,7 +378,7 @@ class TelegramBotManager(LocaleMixin):
     def _enqueue_main_chat_mutation(
         self, operation: str, args: tuple, kwargs: Mapping[str, object]
     ) -> object:
-        telegram_kwargs = self._strip_private_queue_metadata(kwargs)
+        telegram_kwargs = _strip_private_queue_metadata(kwargs)
         target_chat_id = self._normalize_telegram_chat_id(
             self._queued_chat_id_argument(operation, args, telegram_kwargs)
         )
