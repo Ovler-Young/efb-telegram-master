@@ -4,7 +4,6 @@ import threading
 from getpass import getpass
 from gettext import translation
 from typing import Optional
-from urllib.parse import quote, urlparse, urlunparse
 
 from PIL import Image, WebPImagePlugin
 from bullet import YesNo, Numbers, Bullet
@@ -20,6 +19,8 @@ from ehforwarderbot.types import ModuleID
 
 from . import TelegramChannel
 from .paths import LOCALE_DIR, get_config_path
+from .telegram_runtime import build_request
+from .utils import normalize_request_kwargs
 
 
 def print_wrapped(text):
@@ -57,7 +58,7 @@ class DataModel:
         else:
             self.data = self.yaml.load(self.config_path.open())
             if self.data.get('request_kwargs'):
-                self.request = HTTPXRequest(**normalize_request_kwargs(self.data['request_kwargs']))
+                self.request = build_request(normalize_request_kwargs(self.data['request_kwargs']))
 
     def build_default_config(self):
         self.data = {
@@ -171,42 +172,6 @@ class DataModel:
                 self.yaml.dump(self.data, f)
 
 
-def normalize_request_kwargs(request_kwargs: Optional[dict]) -> dict:
-    if not isinstance(request_kwargs, dict):
-        return {}
-
-    normalized = dict(request_kwargs)
-    proxy = normalized.pop("proxy", None) or normalized.pop("proxy_url", None)
-    username = normalized.pop("username", None)
-    password = normalized.pop("password", None)
-    urllib3_proxy_kwargs = normalized.pop("urllib3_proxy_kwargs", None) or {}
-
-    if proxy:
-        parsed = urlparse(proxy)
-        auth_user = username or urllib3_proxy_kwargs.get("username")
-        auth_password = password or urllib3_proxy_kwargs.get("password")
-        if auth_user is not None:
-            auth = quote(str(auth_user), safe="")
-            if auth_password is not None:
-                auth += ":" + quote(str(auth_password), safe="")
-            host = parsed.hostname or parsed.netloc
-            auth_netloc = f"{auth}@{host}"
-            if parsed.port:
-                auth_netloc += f":{parsed.port}"
-            proxy = urlunparse(
-                (
-                    parsed.scheme,
-                    auth_netloc,
-                    parsed.path,
-                    parsed.params,
-                    parsed.query,
-                    parsed.fragment,
-                )
-            )
-        normalized["proxy"] = proxy
-    return normalized
-
-
 def build_bot(data: DataModel, token: Optional[str] = None) -> Bot:
     bot_kwargs: dict = {"token": token or data.data["token"]}
     if data.request is not None:
@@ -299,7 +264,7 @@ def setup_proxy(data):
                     "username": username,
                     "password": password
                 }
-        data.request = HTTPXRequest(**normalize_request_kwargs(data.data['request_kwargs']))
+        data.request = build_request(normalize_request_kwargs(data.data['request_kwargs']))
 
 
 def setup_telegram_bot(data):

@@ -10,7 +10,6 @@ from collections.abc import Awaitable, Callable, Collection, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from functools import wraps
 from typing import Coroutine, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
-from urllib.parse import quote, urlparse, urlunparse
 from unittest.mock import patch
 
 import telegram
@@ -18,6 +17,8 @@ import telegram.error
 from telegram.ext import Application
 from telegram.ext import _applicationbuilder as ptb_applicationbuilder
 from telegram.request import HTTPXRequest
+
+from .utils import normalize_request_kwargs
 
 T = TypeVar("T")
 BotMethod = Callable[..., object]
@@ -142,30 +143,6 @@ class AsyncTelegramRuntime:
             raise
 
 
-def normalize_request_kwargs(request_kwargs: Mapping[str, object]) -> dict[str, object]:
-    """Translate ETM's legacy PTB 13 request settings to PTB 22 kwargs."""
-    allowed = {
-        "read_timeout", "write_timeout", "connect_timeout", "pool_timeout",
-        "media_write_timeout", "http_version", "socket_options", "httpx_kwargs",
-        "connection_pool_size",
-    }
-    normalized = {key: request_kwargs[key] for key in allowed if key in request_kwargs}
-    proxy = request_kwargs.get("proxy") or request_kwargs.get("proxy_url")
-    auth = request_kwargs.get("urllib3_proxy_kwargs")
-    auth = auth if isinstance(auth, Mapping) else {}
-    username = request_kwargs.get("username", auth.get("username"))
-    password = request_kwargs.get("password", auth.get("password"))
-    if proxy:
-        parsed = urlparse(str(proxy))
-        if username and password and "@" not in parsed.netloc:
-            netloc = f"{quote(str(username))}:{quote(str(password))}@{parsed.hostname or ''}"
-            if parsed.port:
-                netloc += f":{parsed.port}"
-            proxy = urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
-        normalized["proxy"] = proxy
-    return normalized
-
-
 def build_request(request_kwargs: Mapping[str, object]) -> HTTPXRequest:
     socket_options = request_kwargs.get("socket_options")
     return HTTPXRequest(
@@ -234,9 +211,7 @@ class TelegramPollingRuntime:
                 Application.builder().bot(self.async_bot).job_queue(None)
                 .post_init(self._post_init).post_shutdown(self._post_shutdown).build()
             )
-        validation_bot = self._build_bot(identity)
-        self.me = self.async_runtime.call(validation_bot.get_me())
-        assert self.me, "Invalid bot credential provided."
+        self.me: telegram.User | None = None
         webhook = config.get("webhook")
         self._webhook: Mapping[str, object] | None = (
             cast(Mapping[str, object], webhook) if isinstance(webhook, Mapping) else None
@@ -263,6 +238,8 @@ class TelegramPollingRuntime:
     async def _post_init(self, _application: Application) -> None:
         self.async_runtime.bind_loop(asyncio.get_running_loop())
         self._shutdown_complete.clear()
+        self.me = await self.async_bot.get_me()
+        assert self.me, "Invalid bot credential provided."
         await self._on_started(self)
 
     async def _post_shutdown(self, _application: Application) -> None:

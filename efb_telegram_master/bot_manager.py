@@ -35,7 +35,8 @@ from .outbound import (
 from .ptb_compat import Filters
 from .rate_limiter import SlidingWindowRateLimiter
 from .utils import TelegramChatID, TelegramMessageID
-from .telegram_runtime import TelegramPollingRuntime, normalize_request_kwargs
+from .telegram_runtime import TelegramPollingRuntime
+from .utils import normalize_request_kwargs
 
 
 if TYPE_CHECKING:
@@ -139,7 +140,6 @@ class TelegramBotManager(LocaleMixin):
         self._async_bot = self.telegram_runtime.async_bot
         self._bot = self.telegram_runtime.bot
         self.application = self.telegram_runtime.application
-        self.me = self.telegram_runtime.me
         self.admins = config['admins']
         self.dispatcher = self.application
 

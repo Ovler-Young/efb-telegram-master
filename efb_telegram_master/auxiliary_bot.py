@@ -4,8 +4,7 @@ import logging
 import threading
 import time
 from collections.abc import Coroutine
-from inspect import isawaitable
-from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING, TypeVar, cast, overload
+from typing import Callable, Optional, Protocol, TYPE_CHECKING, TypeVar, overload
 
 import telegram
 import telegram.error
@@ -18,8 +17,15 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+class MembershipProbeMetrics(Protocol):
+    def membership_probe(self, bot_id: int, username: str, outcome: str) -> None:
+        ...
+
+
 @overload
-def _resolve_bot_result(result: Coroutine[Any, Any, T], runtime: 'AsyncTelegramRuntime') -> T:
+def _resolve_bot_result(
+    result: Coroutine[object, object, T], runtime: Optional['AsyncTelegramRuntime'],
+) -> T:
     ...
 
 
@@ -29,10 +35,10 @@ def _resolve_bot_result(result: T, runtime: Optional['AsyncTelegramRuntime']) ->
 
 
 def _resolve_bot_result(result: object, runtime: Optional['AsyncTelegramRuntime']) -> object:
-    if isawaitable(result):
+    if isinstance(result, Coroutine):
         if runtime is None:
             raise RuntimeError("Auxiliary bot runtime is not bound.")
-        return runtime.call(cast(Coroutine[Any, Any, object], result))
+        return runtime.call(result)
     return result
 
 
@@ -47,13 +53,13 @@ class AuxiliaryBot:
     MEMBERSHIP_TTL_NOT_MEMBER = 300.0   # 5 min for non-member (re-check sooner)
 
     def __init__(self, token: str, *,
-                 request_kwargs: Optional[dict] = None,
+                 request_kwargs: Optional[dict[str, object]] = None,
                  base_url: Optional[str] = None,
                  base_file_url: Optional[str] = None,
                  local_mode: bool = False):
         self._token = token
         self._request_kwargs = dict(request_kwargs or {})
-        self._base_kwargs: Dict[str, str] = {}
+        self._base_kwargs: dict[str, str] = {}
         if base_url:
             self._base_kwargs['base_url'] = base_url
         if base_file_url:
@@ -74,10 +80,10 @@ class AuxiliaryBot:
         self._rate_limiter = SlidingWindowRateLimiter()
 
         # Membership cache: chat_id -> (is_member, wall-clock timestamp)
-        self._membership_cache: Dict[int, Tuple[bool, float]] = {}
+        self._membership_cache: dict[int, tuple[bool, float]] = {}
         self._membership_lock = threading.Lock()
         self._pending_probes: set[int] = set()
-        self._metrics = None
+        self._metrics: MembershipProbeMetrics | None = None
         self._membership_changed_callback: Optional[Callable[['AuxiliaryBot', int, bool], None]] = None
 
     def _create_bot(self) -> telegram.Bot:
@@ -125,7 +131,7 @@ class AuxiliaryBot:
         """
         try:
             validation_bot = self._create_bot()
-            me: telegram.User = cast(telegram.User, _resolve_bot_result(validation_bot.get_me(), self._runtime))
+            me = _resolve_bot_result(validation_bot.get_me(), self._runtime)
             self.bot_id = me.id
             self.username = me.username or ""
             logger.info("Auxiliary bot initialized: @%s (id=%d)", self.username, self.bot_id)
@@ -152,7 +158,7 @@ class AuxiliaryBot:
         chat_count, _global_count = self._rate_limiter.get_counts(chat_id)
         return chat_count
 
-    def rate_limit_occupancy_snapshot(self) -> Dict[str, float]:
+    def rate_limit_occupancy_snapshot(self) -> dict[str, float]:
         """Return aggregate rate-limit occupancy without exposing chat identities."""
         return self._rate_limiter.occupancy_snapshot()
 
@@ -165,7 +171,7 @@ class AuxiliaryBot:
                 if is_member
             }
 
-    def get_membership_cache_snapshot(self) -> Dict[str, int]:
+    def get_membership_cache_snapshot(self) -> dict[str, int]:
         """Return membership cache counts without exposing chat IDs."""
         with self._membership_lock:
             member_count = sum(1 for is_member, _timestamp in self._membership_cache.values() if is_member)
@@ -177,7 +183,7 @@ class AuxiliaryBot:
             "unknown_probe_pending": pending_count,
         }
 
-    def bind_metrics(self, metrics) -> None:
+    def bind_metrics(self, metrics: MembershipProbeMetrics) -> None:
         self._metrics = metrics
 
     def _record_membership_probe(self, outcome: str) -> None:
@@ -232,10 +238,7 @@ class AuxiliaryBot:
     def _probe_membership(self, chat_id: int) -> None:
         """Background probe: call get_chat_member and update cache."""
         try:
-            member: telegram.ChatMember = cast(
-                telegram.ChatMember,
-                _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id), self._runtime),
-            )
+            member = _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id), self._runtime)
             is_member = member.status in ('member', 'administrator', 'creator', 'restricted')
             self.update_membership(chat_id, is_member)
             self._record_membership_probe("ok_member" if is_member else "ok_not_member")

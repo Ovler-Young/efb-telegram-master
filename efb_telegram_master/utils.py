@@ -6,8 +6,10 @@ import logging
 import os
 import subprocess
 from io import BytesIO
+from collections.abc import Mapping
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
+from urllib.parse import quote, urlparse, urlunparse
 
 import ffmpeg
 import telegram
@@ -36,6 +38,41 @@ OldMsgID = Tuple[TelegramChatID, TelegramMessageID]
 # TelegramMessageID = Union[str, int]
 # TgChatMsgIDStr = str
 # EFBChannelChatIDStr = str
+
+
+def normalize_request_kwargs(request_kwargs: Mapping[str, object] | None) -> dict[str, object]:
+    """Translate supported legacy request settings to ``HTTPXRequest`` kwargs.
+
+    Only PTB 22 request options are retained. ``proxy`` takes precedence over
+    ``proxy_url``; credentials from top-level settings or
+    ``urllib3_proxy_kwargs`` are percent-encoded into a proxy without embedded
+    credentials.
+    """
+    if not isinstance(request_kwargs, Mapping):
+        return {}
+    allowed = {
+        "read_timeout", "write_timeout", "connect_timeout", "pool_timeout",
+        "media_write_timeout", "http_version", "socket_options", "httpx_kwargs",
+        "connection_pool_size",
+    }
+    normalized = {key: request_kwargs[key] for key in allowed if key in request_kwargs}
+    proxy = request_kwargs.get("proxy") or request_kwargs.get("proxy_url")
+    proxy_auth = request_kwargs.get("urllib3_proxy_kwargs")
+    auth = proxy_auth if isinstance(proxy_auth, Mapping) else {}
+    username = request_kwargs.get("username", auth.get("username"))
+    password = request_kwargs.get("password", auth.get("password"))
+    if proxy:
+        parsed = urlparse(str(proxy))
+        if username is not None and "@" not in parsed.netloc:
+            netloc = quote(str(username), safe="")
+            if password is not None:
+                netloc += ":" + quote(str(password), safe="")
+            netloc += f"@{parsed.hostname or ''}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            proxy = urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+        normalized["proxy"] = proxy
+    return normalized
 
 
 class ExperimentalFlagsManager(LocaleMixin):

@@ -3,7 +3,29 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional, Protocol
+
+
+class TelethonClient(Protocol):
+    """Operations used by the request-only MTProto adapter."""
+
+    async def connect(self) -> None:
+        ...
+
+    async def start(self, *, bot_token: str) -> None:
+        ...
+
+    async def disconnect(self) -> None:
+        ...
+
+    def is_connected(self) -> bool:
+        ...
+
+    async def __call__(self, request: object) -> object:
+        ...
+
+    async def get_input_entity(self, entity: int) -> object:
+        ...
 
 @dataclass(frozen=True)
 class MTProtoConfig:
@@ -79,7 +101,7 @@ class MTProtoClient:
         self.config = config
         self._bot_token = bot_token
         self._database_base_path = Path(database_base_path)
-        self._client: Any = None
+        self._client: TelethonClient | None = None
 
     @property
     def enabled(self) -> bool:
@@ -87,14 +109,14 @@ class MTProtoClient:
 
     @property
     def connected(self) -> bool:
-        is_connected = getattr(self._client, "is_connected", None)
-        return self._client is not None and (not callable(is_connected) or bool(is_connected()))
+        return self._client is not None and self._client.is_connected()
 
     @property
-    def client(self) -> Any:
-        if not self.connected:
+    def client(self) -> TelethonClient:
+        client = self._client
+        if client is None or not client.is_connected():
             raise MTProtoRetryableError("MTProto client is not connected")
-        return self._client
+        return client
 
     @property
     def session_directory(self) -> Path:
@@ -128,8 +150,7 @@ class MTProtoClient:
         if self._client is None:
             return
         try:
-            is_connected = getattr(self._client, "is_connected", None)
-            if not callable(is_connected) or is_connected():
+            if self._client.is_connected():
                 await self._client.disconnect()
         finally:
             self._client = None
@@ -169,7 +190,7 @@ class MTProtoClient:
             raise translated from error
 
     @staticmethod
-    def _build_telethon_client(session_path: Path, config: MTProtoConfig) -> Any:
+    def _build_telethon_client(session_path: Path, config: MTProtoConfig) -> TelethonClient:
         from telethon import TelegramClient
         from telethon.sessions import SQLiteSession
 
