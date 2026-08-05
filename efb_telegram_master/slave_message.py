@@ -7,7 +7,6 @@ import os
 import threading
 import tempfile
 import time
-import traceback
 import urllib.parse
 from types import SimpleNamespace
 from collections import defaultdict
@@ -183,13 +182,11 @@ class SlaveMessageProcessor(LocaleMixin):
         xid = msg.uid
         old_msg = None
         try:
-            self.logger.debug("[%s] Slave message delivered to ETM.\n%s", xid, msg)
-
             slave_origin_uid = utils.chat_id_to_str(chat=msg.chat)
             if msg.edit:
                 old_msg = self.db.get_msg_log(slave_msg_id=msg.uid, slave_origin_uid=slave_origin_uid)
                 if old_msg and old_msg.provenance == "mtproto_ingested":
-                    self.logger.info("Ignoring edit for ingested synthetic message %s from %s.", msg.uid, msg.chat)
+                    self.logger.info("Ignoring edit for ingested synthetic message %s.", msg.uid)
                     return msg
             dedupe_key = self._dedupe_key(msg, slave_origin_uid)
             if dedupe_key is not None:
@@ -206,12 +203,10 @@ class SlaveMessageProcessor(LocaleMixin):
 
             silent = self.is_silent(msg)
             if silent is None:
-                self.logger.debug("[%s] Message is not delivered per silent settings.", xid)
                 self._release_pending_slave_message(dedupe_key)
                 return msg
 
             if tg_dest is None:
-                self.logger.debug("[%s] Sender of the message is muted.", xid)
                 self._release_pending_slave_message(dedupe_key)
                 return msg
 
@@ -249,14 +244,17 @@ class SlaveMessageProcessor(LocaleMixin):
                             message_thread_id=thread_id
                         )
                     except telegram.error.BadRequest as reopen_err:
-                        self.logger.error('Failed to reopen topic, Reason: %s', reopen_err)
+                        self.logger.error('Failed to reopen topic (%s).', type(reopen_err).__name__)
                         self.db.remove_topic_assoc(
                             topic_chat_id=tg_dest,
                             message_thread_id=thread_id,
                         )
             else:
-                self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
-                              repr(msg), repr(e), traceback.format_exc())
+                self.logger.exception(
+                    "Failed to process slave message %s (%s).",
+                    xid,
+                    type(e).__name__,
+                )
         return msg
 
     def dispatch_message(self, msg: Message, msg_template: str,
@@ -274,15 +272,15 @@ class SlaveMessageProcessor(LocaleMixin):
         # When targeting a message (reply to)
         target_msg_id = target_msg_id_override
         if target_msg_id is None and isinstance(msg.target, Message):
-            self.logger.debug("[%s] Message is replying to %s.", msg.uid, msg.target)
+            self.logger.debug("[%s] Message is replying to slave message %s.", msg.uid, msg.target.uid)
             log = self.db.get_msg_log(
                 slave_msg_id=msg.target.uid,
                 slave_origin_uid=utils.chat_id_to_str(chat=msg.target.chat)
             )
             if not log:
-                self.logger.debug("[%s] Target message %s is not found in database.", msg.uid, msg.target)
+                self.logger.debug("[%s] Target message %s is not found in database.", msg.uid, msg.target.uid)
             else:
-                self.logger.debug("[%s] Target message has database entry: %s.", msg.uid, log)
+                self.logger.debug("[%s] Target message maps to Telegram message %s.", msg.uid, log.master_msg_id)
                 target_msg = utils.message_id_str_to_id(utils.TgChatMsgIDStr(log.master_msg_id))
                 if not target_msg or target_msg[0] != int(tg_dest):
                     self.logger.error('[%s] Trying to reply to a message not from this chat. '
@@ -412,16 +410,12 @@ class SlaveMessageProcessor(LocaleMixin):
 
         if tg_chats:
             tg_chat = tg_chats[0]
-        self.logger.debug("[%s] The message should deliver to %s", xid, tg_chat)
-
         singly_linked = True
         if tg_chat:
             slaves = self.db.get_chat_assoc(master_uid=tg_chat)
             if slaves and len(slaves) > 1:
                 singly_linked = False
                 self.logger.debug("[%s] Sender is linked with other chats in a Telegram group.", xid)
-        self.logger.debug("[%s] Message is in chat %s", xid, msg.chat)
-
         # Generate chat text template & Decide type target
         tg_dest = TelegramChatID(self.channel.config['admins'][0])
 
@@ -466,9 +460,6 @@ class SlaveMessageProcessor(LocaleMixin):
             singly_linked = True
 
         msg_template = self.generate_message_template(msg, singly_linked)
-        self.logger.debug("[%s] Message is sent to Telegram chat %s, with header \"%s\".",
-                          xid, tg_dest, msg_template)
-
         if self.chat_dest_cache.get(str(tg_dest)) != chat_uid:
             self.chat_dest_cache.remove(str(tg_dest))
 
@@ -613,7 +604,6 @@ class SlaveMessageProcessor(LocaleMixin):
         Returns:
             The telegram bot message object sent
         """
-        self.logger.debug("[%s] Sending as a text message.", msg.uid)
         self.bot.send_chat_action(tg_dest, ChatAction.TYPING, message_thread_id=thread_id)
 
         text = self.html_substitutions(msg)
@@ -640,7 +630,6 @@ class SlaveMessageProcessor(LocaleMixin):
                 edit_kwargs['_sender_bot_id'] = _sender_bot_id
             tg_msg = self.bot.edit_message_text(**edit_kwargs)
 
-        self.logger.debug("[%s] Processed and sent as text message", msg.uid)
         return tg_msg
 
     def slave_message_link(self, msg: Message, tg_dest: TelegramChatID,
@@ -705,9 +694,8 @@ class SlaveMessageProcessor(LocaleMixin):
         if not remote_image_url:
             assert msg.file
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO, message_thread_id=thread_id)
-        self.logger.debug("[%s] Message is of %s type; Path: %s; MIME: %s", msg.uid, msg.type, msg.path, msg.mime)
         if msg.path:
-            self.logger.debug("[%s] Size of %s is %s.", msg.uid, msg.path, os.stat(msg.path).st_size)
+            self.logger.debug("[%s] Image file size is %s bytes.", msg.uid, os.stat(msg.path).st_size)
 
         if msg.text:
             text = self.html_substitutions(msg)
@@ -741,8 +729,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                          prefix=msg_template, suffix=reactions, caption=text,
                                                          parse_mode="HTML", **edit_kwargs)
                 except telegram.error.BadRequest as e:
-                    self.logger.warning("[%s] Failed to edit remote image/caption (BadRequest: %s). "
-                                        "Sending new message instead.", msg.uid, e)
+                    self.logger.warning("[%s] Failed to edit remote image/caption (%s); sending new message instead.",
+                                        msg.uid, type(e).__name__)
                     if old_msg_id[0] == tg_dest:
                         target_msg_id = target_msg_id or old_msg_id[1]
 
@@ -758,8 +746,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                msg, mode='blocking', on_complete=on_db_complete,
                                            ))
             except telegram.error.BadRequest as e:
-                self.logger.warning('[%s] Failed to send remote image URL, sending editable placeholder. Reason: %s',
-                                    msg.uid, e)
+                self.logger.warning('[%s] Failed to send remote image URL (%s); sending editable placeholder.',
+                                    msg.uid, type(e).__name__)
                 return self._send_remote_image_placeholder(tg_dest, thread_id, msg_template, reactions, text,
                                                            target_msg_id, reply_markup, silent)
 
@@ -838,7 +826,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                          prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML",
                                                          **edit_kwargs)
                 except telegram.error.BadRequest as e:
-                    self.logger.warning("[%s] Failed to edit media/caption (BadRequest: %s). Sending new message instead.", msg.uid, e)
+                    self.logger.warning("[%s] Failed to edit media/caption (%s); sending new message instead.",
+                                        msg.uid, type(e).__name__)
                     if old_msg_id[0] == tg_dest:
                         target_msg_id = target_msg_id or old_msg_id[1]
                     msg_file.seek(0)
@@ -865,8 +854,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                disable_notification=silent,
                                                **self._make_send_kwargs(msg, old_msg_id, on_complete=on_db_complete))
                 except telegram.error.BadRequest as e:
-                    self.logger.error('[%s] Failed to send it as image, sending as document. Reason: %s',
-                                      msg.uid, e)
+                    self.logger.error('[%s] Failed to send as image (%s); sending as document.',
+                                      msg.uid, type(e).__name__)
                     assert msg.path
                     msg_file.seek(0)
                     file = self.process_file_obj(msg_file, msg.path, msg.filename)
@@ -890,9 +879,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                 on_db_complete: Optional[Callable[[], None]] = None) -> telegram.Message:
         self.bot.send_chat_action(tg_dest, ChatAction.UPLOAD_PHOTO, message_thread_id=thread_id)
 
-        self.logger.debug("[%s] Message is an Animation; Path: %s; MIME: %s", msg.uid, msg.path, msg.mime)
         if msg.path:
-            self.logger.debug("[%s] Size of %s is %s.", msg.uid, msg.path, os.stat(msg.path).st_size)
+            self.logger.debug("[%s] Animation file size is %s bytes.", msg.uid, os.stat(msg.path).st_size)
 
         if msg.text:
             text = self.html_substitutions(msg)
@@ -961,9 +949,8 @@ class SlaveMessageProcessor(LocaleMixin):
 
         sticker_reply_markup = self.build_chat_info_inline_keyboard(msg, msg_template, reactions, reply_markup)
 
-        self.logger.debug("[%s] Message is of %s type; Path: %s; MIME: %s", msg.uid, msg.type, msg.path, msg.mime)
         if msg.path:
-            self.logger.debug("[%s] Size of %s is %s.", msg.uid, msg.path, os.stat(msg.path).st_size)
+            self.logger.debug("[%s] Sticker file size is %s bytes.", msg.uid, os.stat(msg.path).st_size)
 
         try:
             if msg.edit_media and old_msg_id is not None:
@@ -1123,8 +1110,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                       msg, mode='blocking', on_complete=on_db_complete,
                                                   ))
                 except telegram.error.BadRequest as e:
-                    self.logger.warning('[%s] Failed to send remote image URL as document, sending editable placeholder. '
-                                        'Reason: %s', msg.uid, e)
+                    self.logger.warning('[%s] Failed to send remote image URL as document (%s); '
+                                        'sending editable placeholder.', msg.uid, type(e).__name__)
                     return self._send_remote_image_placeholder(tg_dest, thread_id, msg_template, reactions, text,
                                                                target_msg_id, reply_markup, silent, as_document=True)
 
@@ -1160,8 +1147,6 @@ class SlaveMessageProcessor(LocaleMixin):
                                                      prefix=msg_template, suffix=reactions, caption=text, parse_mode="HTML",
                                                      **edit_kwargs)
             assert msg.file is not None and msg.path is not None
-            self.logger.debug("[%s] Uploading file %s (%s) as %s", msg.uid,
-                              msg.file.name, msg.mime, file_name)
             file = self.process_file_obj(msg.file, msg.path, file_name)
             return self.bot.send_document(tg_dest, file,
                                           prefix=msg_template, suffix=reactions,
@@ -1238,7 +1223,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                                      **self._make_send_kwargs(msg, old_msg_id, on_complete=on_db_complete))
                         return tg_msg
                     except pydub.exceptions.CouldntDecodeError as e:
-                        self.logger.error("[%s] Failed to decode audio file for conversion: %s. Sending as file.", msg.uid, e)
+                        self.logger.error("[%s] Failed to decode audio file for conversion (%s); sending as file.",
+                                          msg.uid, type(e).__name__)
                         msg.file.seek(0)
                         return self.slave_message_file(msg, tg_dest, thread_id, msg_template, reactions,
                                                        old_msg_id=None,
@@ -1262,11 +1248,6 @@ class SlaveMessageProcessor(LocaleMixin):
         self.bot.send_chat_action(tg_dest, ChatAction.FIND_LOCATION, message_thread_id=thread_id)
         assert (isinstance(msg.attributes, LocationAttribute))
         attributes: LocationAttribute = msg.attributes
-        self.logger.info("[%s] Sending as a Telegram venue.\nlat: %s, long: %s\ntitle: %s\naddress: %s",
-                         msg.uid,
-                         attributes.latitude, attributes.longitude,
-                         msg.text, msg_template)
-
         self.logger.debug("[%s] Location message received with old_msg_id %s, compare it with tg_dest %s", msg.uid, old_msg_id, tg_dest)
         if old_msg_id and old_msg_id[0] == str(tg_dest):
             # TRANSLATORS: Flag for messages edited on slave channels, but cannot be edited on Telegram.
@@ -1445,19 +1426,19 @@ class SlaveMessageProcessor(LocaleMixin):
                                                 _sender_bot_id=old_msg.sender_bot_id)
                         return
                 except TelegramError as e:
-                    self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
+                    self.logger.warning("Failed to delete message %s.%s (%s); sending notification instead.",
+                                        *old_msg_id, type(e).__name__)
                     pass
                 self.bot.send_message(chat_id=old_msg_id[0],
                                       text=self._("Message is removed in remote chat."),
                                       reply_to_message_id=old_msg_id[1],
                                       disable_notification=True)
             else:
-                self.logger.info('Was supposed to delete a message, '
-                                 'but it does not exist in database: %s', status)
+                self.logger.info('Message removal has no database record.')
         elif isinstance(status, MessageReactionsUpdate):
             self.update_reactions(status)
         else:
-            self.logger.error('Received an unsupported type of status: %s', status)
+            self.logger.error('Received unsupported status type %s.', type(status).__name__)
 
     @staticmethod
     def build_reactions_footer(reactions: Reactions) -> str:
@@ -1566,7 +1547,7 @@ class SlaveMessageProcessor(LocaleMixin):
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name
         if isinstance(msg.chat, GroupChat):
-            self.logger.debug("[%s] Message is from a group. Sender: %s", msg.uid, msg.author)
+            self.logger.debug("[%s] Message is from a group.", msg.uid)
             msg_prefix = msg.author.long_name
 
         if singly_linked:
@@ -1688,8 +1669,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     os.chmod(dest_path, 0o644)
 
                     abs_path = Path(dest_path)
-                    self.logger.debug("Copied file from %s to shared temp dir: %s (original filename: %s)",
-                                      path, dest_path, filename or "N/A")
+                    self.logger.debug("Copied file to shared temporary directory.")
 
                     tls = self.bot._cleanup_tls
                     if not hasattr(tls, 'pending_cleanup'):
@@ -1707,7 +1687,7 @@ class SlaveMessageProcessor(LocaleMixin):
         for path in pending:
             try:
                 os.unlink(path)
-                self.logger.debug("Cleaned up local API temp file: %s", path)
+                self.logger.debug("Cleaned up local API temporary file.")
             except OSError as e:
-                self.logger.warning("Failed to clean up local API temp file %s: %s", path, e)
+                self.logger.warning("Failed to clean up local API temporary file (%s).", type(e).__name__)
         tls.pending_cleanup = []

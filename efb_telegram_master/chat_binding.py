@@ -332,8 +332,12 @@ class ChatBindingManager(LocaleMixin):
                 `legend` is the legend of all Emoji headings in the entire list.
                 `chat_btn_list` is a list which can be fit into `telegram.InlineKeyboardMarkup`.
         """
-        self.logger.debug("Generating pagination of chats.\nStorage ID: %s; Offset: %s; Filter: %s; Source chats: %s;",
-                          storage_id, offset, pattern, source_chats)
+        self.logger.debug(
+            "Generating chat pagination (storage=%s, offset=%s, source_chat_count=%d).",
+            storage_id,
+            offset,
+            len(source_chats) if source_chats else 0,
+        )
         legend: List[str] = [
             self._("{0}: Linked").format(Emoji.LINK),
             self._("{0}: User").format(Emoji.USER),
@@ -346,7 +350,6 @@ class ChatBindingManager(LocaleMixin):
             # Generate the full chat list first
             re_filter: Union[str, Pattern, None] = None
             if pattern:
-                self.logger.debug("Filter pattern: %s", pattern)
                 escaped_pattern = re.escape(pattern)
                 # Use simple string match if no regex significance is found.
                 if pattern == escaped_pattern:
@@ -521,7 +524,7 @@ class ChatBindingManager(LocaleMixin):
         assert bot_username is not None
         link_url = f"https://telegram.me/{bot_username}?" \
                    f"startgroup={urllib.parse.quote(utils.b64en(utils.message_id_to_str(tg_chat_id, tg_msg_id)))}"
-        self.logger.debug("Telegram start trigger for linking chat: %s", link_url)
+        self.logger.debug("Generated Telegram start link for chat %s message %s.", tg_chat_id, tg_msg_id)
         if chat.linked:
             btn_list = [InlineKeyboardButton(self._("Relink"), url=link_url),
                         InlineKeyboardButton(self._("Restore"), callback_data="unlink 0")]
@@ -681,7 +684,7 @@ class ChatBindingManager(LocaleMixin):
                 try:
                     self._update_single_topic_info(TelegramChatID(tg_chat_to_link.id), thread_id, chat_uid)
                 except Exception as e:
-                    self.logger.warning("Auto update group info failed for %s: %s", chat_display_name, e)
+                    self.logger.warning("Auto update group info failed for %s (%s).", chat_uid, type(e).__name__)
 
         txt = self._("Chat {0} is now linked.").format(chat_display_name)
         self.bot.edit_message_text(
@@ -711,7 +714,7 @@ class ChatBindingManager(LocaleMixin):
             try:
                 self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
             except Exception as e:
-                self.logger.warning("History migration failed for %s: %s", chat_display_name, e)
+                self.logger.warning("History migration failed for %s (%s).", chat_uid, type(e).__name__)
                 try:
                     notice_kwargs = {
                         'chat_id': tg_chat_to_link.id,
@@ -757,7 +760,7 @@ class ChatBindingManager(LocaleMixin):
             self.bot.send_message(**kwargs)
 
         except Exception as e:
-            self.logger.warning("Failed to send history link for %s: %s", slave_chat_id, e)
+            self.logger.warning("Failed to send history link for %s (%s).", slave_chat_id, type(e).__name__)
 
     def unlink_all(self, update: Update, context: CallbackContext):
         """
@@ -1087,7 +1090,7 @@ class ChatBindingManager(LocaleMixin):
 
         channel_id, chat_uid, _ = utils.chat_id_str_to_id(chats[0])
         if channel_id not in coordinator.slaves:
-            self.logger.exception(f"Channel linked ({channel_id}) is not found.")
+            self.logger.warning("Linked channel %s is not found.", channel_id)
             return self.bot.reply_error(update, self._('Channel linked ({channel}) is not found.')
                                         .format(channel=channel_id))
         channel = coordinator.slaves[channel_id]
@@ -1106,9 +1109,9 @@ class ChatBindingManager(LocaleMixin):
                     if "Chat description is not modified" in e.message:
                         pass
                     else:
-                        self.logger.exception("Exception occurred while trying to update chat description: %s", e)
+                        self.logger.exception("Failed to update chat description (%s).", type(e).__name__)
                 except TelegramError as e:  # description is not updated
-                    self.logger.exception("Exception occurred while trying to update chat description: %s", e)
+                    self.logger.exception("Failed to update chat description (%s).", type(e).__name__)
 
             if picture:
                 self.bot.set_chat_photo(tg_chat.id, pic_resized or picture)
@@ -1117,8 +1120,7 @@ class ChatBindingManager(LocaleMixin):
 
             sync_reply_text(self.bot, update.effective_message, self._('Chat details updated.'))
         except EFBChatNotFound:
-            self.logger.exception("Chat linked (%s) is not found in the slave channel "
-                                  "(%s).", channel_id, chat_uid)
+            self.logger.error("Linked chat %s is not found in channel %s.", chat_uid, channel_id)
             return self.bot.reply_error(update, self._("Chat linked ({chat_uid}) is not found in the slave channel "
                                                        "({channel_name}, {channel_id}).")
                                         .format(channel_name=channel.channel_name, channel_id=channel_id,
@@ -1183,7 +1185,7 @@ class ChatBindingManager(LocaleMixin):
         except EFBOperationNotSupported:
             pass
         except Exception as e:
-            self.logger.warning(f"Failed to get chat picture: {e}")
+            self.logger.warning("Failed to get chat picture (%s).", type(e).__name__)
 
         return desc, picture, pic_resized
 
@@ -1217,7 +1219,7 @@ class ChatBindingManager(LocaleMixin):
                 if success:
                     updated_count += 1
             except Exception as e:
-                self.logger.warning(f"Failed to update topic {thread_id}: {e}")
+                self.logger.warning("Failed to update topic %s (%s).", thread_id, type(e).__name__)
 
             time.sleep(30) # seems pinning message has a special rate limit but I didn't find the official documentation
 
@@ -1237,7 +1239,7 @@ class ChatBindingManager(LocaleMixin):
         try:
             channel_id, chat_uid, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(slave_uid))
             if channel_id not in coordinator.slaves:
-                self.logger.warning(f"Channel linked ({channel_id}) is not found.")
+                self.logger.warning("Linked channel %s is not found.", channel_id)
                 return False
 
             channel = coordinator.slaves[channel_id]
@@ -1252,7 +1254,12 @@ class ChatBindingManager(LocaleMixin):
                 )
             except TelegramError as e:
                 if e.message != "Topic_not_modified":
-                    self.logger.warning(f"Failed to update topic {thread_id} for chat {slave_uid}: {e}")
+                    self.logger.warning(
+                        "Failed to update topic %s for chat %s (%s).",
+                        thread_id,
+                        slave_uid,
+                        type(e).__name__,
+                    )
                     return False
 
             desc, picture, pic_resized = self._get_chat_info_and_picture(chat, channel)
@@ -1284,7 +1291,12 @@ class ChatBindingManager(LocaleMixin):
             return True
 
         except Exception as e:
-            self.logger.warning(f"Failed to update topic {thread_id} for chat {slave_uid}: {e}")
+            self.logger.warning(
+                "Failed to update topic %s for chat %s (%s).",
+                thread_id,
+                slave_uid,
+                type(e).__name__,
+            )
             return False
         finally:
             if picture and getattr(picture, 'close', None):
@@ -1343,7 +1355,7 @@ class ChatBindingManager(LocaleMixin):
             return self.bot.reply_error(update, self._("This topic is not managed by this bot. Update failed"))
         channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_origin_uid)
         if channel_id not in coordinator.slaves:
-            self.logger.exception(f"Channel linked ({channel_id}) is not found.")
+            self.logger.warning("Linked channel %s is not found.", channel_id)
             return self.bot.reply_error(update, self._('Channel linked ({channel}) is not found.')
                                         .format(channel=channel_id))
         channel = coordinator.slaves[channel_id]
@@ -1357,8 +1369,7 @@ class ChatBindingManager(LocaleMixin):
             )
             sync_reply_text(self.bot, update.effective_message, self._('Chat details updated.'))
         except EFBChatNotFound:
-            self.logger.exception("Chat linked (%s) is not found in the slave channel "
-                                  "(%s).", channel_id, chat_uid)
+            self.logger.error("Linked chat %s is not found in channel %s.", chat_uid, channel_id)
             return self.bot.reply_error(update, self._("Chat linked ({chat_uid}) is not found in the slave channel "
                                                        "({channel_name}, {channel_id}).")
                                         .format(channel_name=channel.channel_name, channel_id=channel_id,
@@ -1406,7 +1417,7 @@ class ChatBindingManager(LocaleMixin):
                             slave_uid=slave_uid,
                         )
                     except Exception as e:
-                        self.logger.info('Failed to create topic, Reason: %s', e)
+                        self.logger.info('Failed to create topic (%s).', type(e).__name__)
         return thread_id
 
     def chat_migration(self, update: Update, context: CallbackContext):
@@ -1496,7 +1507,7 @@ class ChatBindingManager(LocaleMixin):
         try:
             scans = self.db.get_resumable_msglog_ingestion_scans()
         except Exception as error:
-            self.logger.warning("Failed to load resumable MsgLog ingestions: %s", error)
+            self.logger.warning("Failed to load resumable MsgLog ingestions (%s).", type(error).__name__)
             return
         for scan in scans:
             source_chat_id = int(scan.source_chat_id)
@@ -1519,7 +1530,7 @@ class ChatBindingManager(LocaleMixin):
             if self.db.has_pending_history_migrations():
                 self._start_history_migration_worker()
         except Exception as e:
-            self.logger.warning("Failed to check pending history migrations: %s", e)
+            self.logger.warning("Failed to check pending history migrations (%s).", type(e).__name__)
 
     def _start_history_migration_worker(self):
         existing_thread = self._history_migration_thread
@@ -1544,7 +1555,7 @@ class ChatBindingManager(LocaleMixin):
             finally:
                 self._history_migration_lock.release()
         except Exception as e:
-            self.logger.error("Error during history migration for %s: %s", slave_chat_id, e)
+            self.logger.error("History migration failed for %s (%s).", slave_chat_id, type(e).__name__)
 
     def _queue_history_migration_entries(self, slave_chat_id: EFBChannelChatIDStr,
                                          tg_chat_id: int,
@@ -1678,10 +1689,10 @@ class ChatBindingManager(LocaleMixin):
         error: BaseException,
     ) -> None:
         self.logger.warning(
-            "History migration entry %d retained after %d completed calls: %s",
+            "History migration entry %d retained after %d completed calls (%s).",
             entry_id,
             completed_call_count,
-            error,
+            type(error).__name__,
         )
 
     @staticmethod

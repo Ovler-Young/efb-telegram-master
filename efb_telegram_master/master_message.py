@@ -112,7 +112,7 @@ class MasterMessageProcessor(LocaleMixin):
                 self.msg(update, context)
             except Exception as e:
                 self.logger.exception(
-                    "Error [%r] occurred while processing update %s.", e, update)
+                    "Failed to process Telegram update (%s).", type(e).__name__)
                 if update.effective_message:
                     sync_reply_text(
                         self.bot,
@@ -177,8 +177,6 @@ class MasterMessageProcessor(LocaleMixin):
                 linked_slave_chats = self.db.get_chat_assoc(master_uid=master_chat_uid)
             return linked_slave_chats
 
-        self.logger.debug("[%s] Received message from Telegram: %s", mid, message.to_dict())
-
         destination: Optional[EFBChannelChatIDStr] = None
         edited: Optional["MsgLog"] = None
         quote = False
@@ -204,11 +202,9 @@ class MasterMessageProcessor(LocaleMixin):
                 destination = chats[0]
             if destination:
                 quote = message.reply_to_message is not None
-                self.logger.debug("[%s] Chat %s is singly-linked to %s", mid, message.chat, destination)
                 if message.chat.is_forum:
                     ideal_thread_id = self.db.get_topic_thread_id(slave_uid=destination, topic_chat_id=TelegramChatID(update.effective_chat.id))
                     if ideal_thread_id and ideal_thread_id != message.message_thread_id:
-                        self.logger.debug("[%s] Chat %s is singly-linked to %s, but the thread ID is not matching.", mid, message.chat, destination)
                         destination = None
                         quote = False
                         return
@@ -220,7 +216,6 @@ class MasterMessageProcessor(LocaleMixin):
                 if thread_id and topic_destinations:
                     for (dest, topic_id) in topic_destinations:
                          if topic_id == thread_id:
-                             self.logger.debug("[%s] Chat %s is singly-linked to %s in topic %s", mid, message.chat, dest, topic_id)
                              destination = dest
                              reply_to_message = message.reply_to_message
                              quote = (
@@ -232,19 +227,15 @@ class MasterMessageProcessor(LocaleMixin):
                         self.logger.debug("[%s] Ignored message as it's a topic which wasn't created by this bot", mid)
                         return
                 else:
-                    self.logger.debug("[%s] Chat %s is a forum, but no thread ID is found.", mid, message.chat)
                     destinations = get_linked_slave_chats()
                     if topic_destinations is not None and len(destinations) == len(topic_destinations):
-                        self.logger.debug("[%s] Chat %s is a forum, and all destinations are in topics. The new message is not in any topic, so ignore it.", mid, message.chat)
                         return
 
         if destination is None:  # not singly linked
             quote = False
-            self.logger.debug("[%s] Chat %s is not singly-linked", mid, update.effective_chat)
             reply_to = message.reply_to_message
             cached_dest = self.chat_dest_cache.get(str(message.chat.id))
             if reply_to:
-                self.logger.debug("[%s] Message is quote-replying to %s", mid, reply_to)
                 dest_msg = self.db.get_msg_log(
                     master_msg_id=utils.message_id_to_str(
                         TelegramChatID(reply_to.chat.id),
@@ -269,7 +260,7 @@ class MasterMessageProcessor(LocaleMixin):
                  get_linked_slave_chats()[:5]
             )
             if candidates:
-                self.logger.debug("[%s] Candidate suggestions are found for this message: %s", mid, candidates)
+                self.logger.debug("[%s] Found %d candidate suggestions for this message.", mid, len(candidates))
                 tg_err_msg = sync_reply_text(self.bot, message,
                                              self._("Error: No recipient specified.\n"
                                                     "Please reply to a previous message. (MS01)"),
@@ -488,10 +479,10 @@ class MasterMessageProcessor(LocaleMixin):
                                  self._("Message editing is not supported.\n\n{exception!s}".format(exception=e)))
         except EFBException as e:
             self.bot.reply_error(update, self._("Message is not sent.\n\n{exception!s}".format(exception=e)))
-            self.logger.exception("Message is not sent. (update: %s, exception: %s)", update, e)
+            self.logger.exception("Message %s is not sent (%s).", utils.message_id_to_str(update=update), type(e).__name__)
         except Exception as e:
             self.bot.reply_error(update, self._("Message is not sent.\n\n{exception!r}".format(exception=e)))
-            self.logger.exception("Message is not sent. (update: %s, exception: %s)", update, e)
+            self.logger.exception("Message %s is not sent (%s).", utils.message_id_to_str(update=update), type(e).__name__)
         finally:
             if log_message:
                 self.db.add_or_update_message_log(m, update.effective_message)
@@ -623,12 +614,22 @@ class MasterMessageProcessor(LocaleMixin):
                 source_channel=self.channel, destination_channel=dest_channel, message=etm_msg
             ))
         except EFBException as e:
-            self.logger.exception("Failed to remove message from remote chat. Message: %s; Error: %s", etm_msg, e)
+            self.logger.exception(
+                "Failed to remove Telegram message %s.%s from remote chat (%s).",
+                reply.chat_id,
+                reply.message_id,
+                type(e).__name__,
+            )
             return sync_reply_text(self.bot, reply, self._(
                 "Failed to remove this message from remote chat.\n\n{error!s}"
             ).format(error=e))
         except Exception as e:
-            self.logger.exception("Failed to remove message from remote chat. Message: %s; Error: %s", etm_msg, e)
+            self.logger.exception(
+                "Failed to remove Telegram message %s.%s from remote chat (%s).",
+                reply.chat_id,
+                reply.message_id,
+                type(e).__name__,
+            )
             return sync_reply_text(self.bot, reply, self._(
                 "Failed to remove this message from remote chat.\n\n{error!r}"
             ).format(error=e))

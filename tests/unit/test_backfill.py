@@ -2,7 +2,7 @@ import threading
 from concurrent.futures import Future
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import ANY, Mock, call, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import telegram
@@ -428,10 +428,10 @@ def test_history_migration_retains_entry_and_logs_completed_count_on_waiter_fail
     assert processed is False
     manager.db.delete_history_migration_entry.assert_not_called()
     manager.logger.warning.assert_called_once_with(
-        "History migration entry %d retained after %d completed calls: %s",
+        "History migration entry %d retained after %d completed calls (%s).",
         7,
         0,
-        ANY,
+        "RuntimeError",
     )
 
 

@@ -616,13 +616,13 @@ class TelegramChannel(MasterChannel):
         try:
             raise error
         except telegram.error.Forbidden:
-            self.logger.error("The bot is not authorised to send update:\n%s\n%s", str(update), str(error))
+            self.logger.error("Telegram authorization failure while handling update (%s).", type(error).__name__)
         except telegram.error.BadRequest as e:
             assert isinstance(update, Update)
             if e.message == "Message is not modified" and update.callback_query:
                 self.logger.error("Chill bro, don't click that fast.")
             else:
-                self.logger.exception("Message request is invalid.\n%s\n%s", str(update), str(error))
+                self.logger.exception("Telegram message request failed (%s).", type(error).__name__)
                 self.bot_manager.send_message(self.config['admins'][0],
                                               self._("Message request is invalid.\n{error}\n"
                                                      "<code>{update}</code>").format(
@@ -630,9 +630,11 @@ class TelegramChannel(MasterChannel):
                                               parse_mode="HTML")
         except (telegram.error.TimedOut, telegram.error.NetworkError):
             self.timeout_count += 1
-            self.logger.error("Poor internet connection detected.\n"
-                              "Number of network error occurred since last startup: %s\n%s\nUpdate: %s",
-                              self.timeout_count, str(error), str(update))
+            self.logger.error(
+                "Telegram network error #%d while handling update (%s).",
+                self.timeout_count,
+                type(error).__name__,
+            )
             if isinstance(update, Update) and isinstance(update.message, Message):
                 sync_reply_html(
                     self.bot_manager,
@@ -686,11 +688,10 @@ class TelegramChannel(MasterChannel):
                             str(update))),
                     parse_mode="HTML")
             except Exception as ex:
-                self.logger.exception("Failed to send error message through Telegram: %s", ex)
+                self.logger.exception("Failed to send error message through Telegram (%s).", type(ex).__name__)
 
             finally:
-                self.logger.exception('Unhandled telegram bot error!\n'
-                                      'Update %s caused error %s. Exception', update, error)
+                self.logger.exception("Unhandled Telegram bot error while handling update (%s).", type(error).__name__)
 
     def _is_stopping(self) -> bool:
         bot_manager = getattr(self, "bot_manager", None)
@@ -704,13 +705,11 @@ class TelegramChannel(MasterChannel):
 
     def send_message(self, msg: EFBMessage) -> EFBMessage:
         if self._is_stopping():
-            self.logger.debug("Dropping slave message during Telegram Master shutdown: %s", msg)
             return msg
         return self.slave_messages.send_message(msg)
 
     def send_status(self, status: Status):
         if self._is_stopping():
-            self.logger.debug("Dropping slave status during Telegram Master shutdown: %s", status)
             return None
         return self.slave_messages.send_status(status)
 

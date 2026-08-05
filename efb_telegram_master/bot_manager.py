@@ -366,7 +366,7 @@ class TelegramBotManager(LocaleMixin):
 
         @classmethod
         def exception_filter(cls, exception: Exception):
-            cls.logger.exception("Exception: %s while sending request to Telegram server.", exception)
+            cls.logger.warning("Telegram request failed (%s).", type(exception).__name__)
             return isinstance(exception, telegram.error.TimedOut)
 
         @classmethod
@@ -656,7 +656,10 @@ class TelegramBotManager(LocaleMixin):
         try:
             await mtproto.connect()
         except (ConnectionError, TimeoutError, OSError, MTProtoRetryableError) as error:
-            self.logger.warning("MTProto startup is unavailable; MsgLog ingestion remains pending: %s", error)
+            self.logger.warning(
+                "MTProto startup is unavailable; MsgLog ingestion remains pending (%s).",
+                type(error).__name__,
+            )
             return
         if not getattr(mtproto, "connected", False):
             self.logger.warning("MTProto startup did not establish a connection; MsgLog ingestion remains pending.")
@@ -932,7 +935,10 @@ class TelegramBotManager(LocaleMixin):
         if metrics_cfg is None:
             return top_n, None
         if not isinstance(metrics_cfg, collections.abc.Mapping):
-            logger.warning("Invalid metrics config, Prometheus endpoint disabled: %s", metrics_cfg)
+            logger.warning(
+                "Invalid metrics config type %s; Prometheus endpoint disabled.",
+                type(metrics_cfg).__name__,
+            )
             return top_n, None
 
         try:
@@ -941,11 +947,11 @@ class TelegramBotManager(LocaleMixin):
                 raise ValueError
             top_n = parsed_top_n
         except (TypeError, ValueError):
-            logger.warning("Invalid metrics top_n, using default %d: %s", top_n, metrics_cfg.get('top_n'))
+            logger.warning("Invalid metrics top_n type %s; using default %d.", type(metrics_cfg.get('top_n')).__name__, top_n)
 
         host = metrics_cfg.get('host', '127.0.0.1')
         if not isinstance(host, str) or not host:
-            logger.warning("Invalid metrics host, Prometheus endpoint disabled: %s", host)
+            logger.warning("Invalid metrics host type %s; Prometheus endpoint disabled.", type(host).__name__)
             return top_n, None
 
         try:
@@ -953,7 +959,10 @@ class TelegramBotManager(LocaleMixin):
             if not 0 <= port <= 65535:
                 raise ValueError
         except (TypeError, ValueError):
-            logger.warning("Invalid metrics port, Prometheus endpoint disabled: %s", metrics_cfg.get('port'))
+            logger.warning(
+                "Invalid metrics port type %s; Prometheus endpoint disabled.",
+                type(metrics_cfg.get('port')).__name__,
+            )
             return top_n, None
 
         return top_n, (host, port)
@@ -1037,7 +1046,7 @@ class TelegramBotManager(LocaleMixin):
 
         for entry in aux_configs:
             if not isinstance(entry, dict) or not isinstance(entry.get('token'), str):
-                self.logger.warning("Invalid auxiliary_bots entry (missing token string), skipping: %s", entry)
+                self.logger.warning("Invalid auxiliary_bots entry type %s; skipping.", type(entry).__name__)
                 continue
             token = entry['token']
             if token in seen_tokens:
@@ -1527,7 +1536,7 @@ class TelegramBotManager(LocaleMixin):
         try:
             on_complete()
         except Exception as e:
-            self.logger.warning("Database update completion callback failed: %s", e)
+            self.logger.warning("Database update completion callback failed (%s).", type(e).__name__)
 
     def _write_database_update(
         self,
@@ -1550,9 +1559,9 @@ class TelegramBotManager(LocaleMixin):
             )
         except Exception as e:
             self.logger.warning(
-                "DB write failed for tg_msg %s, dropping mapping: %s",
+                "DB write failed for Telegram message %s; dropping mapping (%s).",
                 getattr(real_tg_msg, 'message_id', '?'),
-                e,
+                type(e).__name__,
             )
         finally:
             self._run_database_update_callback(on_complete)
@@ -1871,7 +1880,6 @@ class TelegramBotManager(LocaleMixin):
             keep_size = MAX_CALLBACK_QUERY_ANSWER_LENGTH // 3
             truncated = full_message[:keep_size] + "..." + full_message[-keep_size:]
             return self._bot.answer_callback_query(*args, text=truncated, **kwargs)
-        self.logger.debug(f"answer_callback_query({args}, {kwargs})")
         return self._bot.answer_callback_query(
             *args, text=prefix + text + suffix, **kwargs
         )
@@ -2001,7 +2009,7 @@ class TelegramBotManager(LocaleMixin):
                     try:
                         self.application.stop_running()
                     except RuntimeError as exc:
-                        self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
+                        self.logger.debug("Telegram application loop not ready for stop_running() (%s).", type(exc).__name__)
                     try:
                         manual_evt.set()
                     except Exception:
@@ -2013,7 +2021,7 @@ class TelegramBotManager(LocaleMixin):
                         self._runtime.call(self._shutdown_ptb_application(), timeout=30)
                         application_stopped = True
                     except Exception as exc:
-                        self.logger.warning("PTB shutdown coroutine did not complete cleanly: %s", exc)
+                        self.logger.warning("PTB shutdown coroutine did not complete cleanly (%s).", type(exc).__name__)
 
                 if not application_stopped:
                     stop_requested = False
@@ -2023,7 +2031,7 @@ class TelegramBotManager(LocaleMixin):
                         try:
                             self.application.stop_running()
                         except RuntimeError as exc:
-                            self.logger.debug("Telegram application loop not ready for stop_running(): %s", exc)
+                            self.logger.debug("Telegram application loop not ready for stop_running() (%s).", type(exc).__name__)
 
             if hasattr(self, "_shutdown_complete_event"):
                 if not self._shutdown_complete_event.wait(timeout=30):

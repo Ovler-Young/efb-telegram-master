@@ -22,7 +22,7 @@ from .msg_type import TGMsgType
 if TYPE_CHECKING:
     pass
 
-logger = logging.Logger(__name__)
+logger = logging.getLogger(__name__)
 
 FILE_DOWNLOAD_TIMEOUT = 120
 
@@ -80,14 +80,14 @@ class ETMMsg(Message):
                     file_meta = bot_manager.get_file(self.file_id)
             except BadRequest as e:
                 if file_bot:
-                    logger.warning("Failed to get file from aux bot, trying main bot: %s", e)
+                    logger.warning("Auxiliary bot file lookup failed (%s); trying main bot.", type(e).__name__)
                     try:
                         file_meta = bot_manager.get_file(self.file_id)
                     except BadRequest as e2:
-                        logger.exception("Bad request from main bot too: %s", e2)
+                        logger.exception("Main bot file lookup failed (%s).", type(e2).__name__)
                         return
                 else:
-                    logger.exception("Bad request while trying to get file metadata: %s", e)
+                    logger.exception("File metadata lookup failed (%s).", type(e).__name__)
                     return
             ext = os.path.splitext(file_meta.file_path)[1]
             file = tempfile.NamedTemporaryFile(suffix=ext)
