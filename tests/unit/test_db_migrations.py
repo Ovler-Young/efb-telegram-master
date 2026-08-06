@@ -10,10 +10,12 @@ import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
 from peewee import SqliteDatabase
+from prometheus_client import generate_latest
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
 from efb_telegram_master.db import DatabaseManager, MsgLog, MsgLogIngestionScan, TopicAssoc, database
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
@@ -21,6 +23,21 @@ from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, Telegra
 
 def test_msglog_schema_has_sender_bot_id(channel):
     assert "sender_bot_id" in {column.name for column in database.get_columns("msglog")}
+
+
+def test_database_method_metrics_record_bounded_public_operation_labels(channel):
+    metrics = Metrics()
+    channel.db.set_metrics(metrics)
+
+    assert channel.db.get_chat_assoc(master_uid="metrics-master") == []
+    with pytest.raises(ValueError, match="Only one parameter"):
+        channel.db.get_msg_log()
+
+    rendered = generate_latest(metrics.registry).decode()
+
+    assert 'etm_database_method_duration_seconds_count{method="get_chat_assoc"} 1.0' in rendered
+    assert 'etm_database_method_failures_total{method="get_msg_log"} 1.0' in rendered
+    assert "metrics-master" not in rendered
 
 
 def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
