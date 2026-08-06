@@ -229,6 +229,13 @@ def test_ingested_message_edit_has_no_telegram_side_effect() -> None:
     processor.dispatch_message.assert_not_called()
 
 
+def test_send_kwargs_preserve_slave_routing_identity() -> None:
+    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
+    message = SimpleNamespace(chat=SimpleNamespace(module_id="tests.slave", uid="chat"))
+
+    assert processor._make_send_kwargs(message) == {"_slave_id": "tests.slave chat"}
+
+
 def _remote_image(url="https://example.com/images/photo.jpg"):
     return SimpleNamespace(
         uid=MessageID("remote"),
