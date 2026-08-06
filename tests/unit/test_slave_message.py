@@ -248,6 +248,11 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"))
 
     processor.db.add_or_update_message_log.assert_called_once()
+    processor.logger.warning.assert_called_once_with(
+        "DB write failed for Telegram message %s; dropping mapping (%s).",
+        7,
+        "RuntimeError",
+    )
     processor._release_pending_slave_message.assert_called_once_with(("tests.slave chat", "message"))
 
 

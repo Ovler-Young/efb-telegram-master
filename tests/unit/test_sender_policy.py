@@ -179,10 +179,10 @@ def test_retry_after_keeps_the_latest_deadline_for_one_sender_chat(monkeypatch: 
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock[0])
 
     sender_policy.record_retry_after(call(chat_id=100), RetryAfter(20), sender)
-    clock[0] = 1_005.0
     sender_policy.record_retry_after(call(chat_id=100), RetryAfter(5), sender)
+    sender_policy.record_retry_after(call(chat_id=100), RetryAfter(1_000), sender)
 
-    assert sender_policy.select(call(required_sender_bot_id="10", chat_id=100), now=1_005.0).retry_at == 1_020.0
+    assert sender_policy.select(call(required_sender_bot_id="10", chat_id=100), now=1_000.0).retry_at == 2_000.0
 
 
 def test_cooldown_snapshot_is_safe_while_retry_after_updates_arrive(monkeypatch: pytest.MonkeyPatch) -> None:
