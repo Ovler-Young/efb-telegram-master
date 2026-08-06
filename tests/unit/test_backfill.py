@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -257,6 +258,65 @@ def test_history_migration_dispatches_persisted_entries_through_telegram_api():
         database.initialize(original_database)
 
 
+def test_pending_history_migrations_send_entries_in_position_order_and_delete_each_success():
+    original_database = database.obj
+    test_database = SqliteDatabase(":memory:")
+    database.initialize(test_database)
+    test_database.connect()
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.db = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    manager._history_migration_lock = threading.Lock()
+    manager.bot = SimpleNamespace(send_message=Mock(), copy_message=Mock())
+    try:
+        test_database.create_tables([HistoryMigrationEntry])
+        HistoryMigrationEntry.insert_many(
+            [
+                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.20", "formatted_text": "first\n", "position": 0},
+                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.21", "formatted_text": "second\n", "position": 1},
+                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.22", "formatted_text": None, "position": 2},
+            ]
+        ).execute()
+
+        manager._process_pending_history_migrations()
+
+        assert [call.kwargs["text"] for call in manager.bot.send_message.call_args_list] == ["first\n", "second\n"]
+        manager.bot.copy_message.assert_called_once_with(chat_id=12345, from_chat_id=10, message_id=22, disable_notification=True)
+        assert HistoryMigrationEntry.select().count() == 0
+    finally:
+        test_database.close()
+        database.initialize(original_database)
+
+
+def test_pending_history_migrations_keep_the_failed_entry_and_remaining_boundary():
+    original_database = database.obj
+    test_database = SqliteDatabase(":memory:")
+    database.initialize(test_database)
+    test_database.connect()
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.db = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    manager._history_migration_lock = threading.Lock()
+    manager.bot = SimpleNamespace(send_message=Mock(side_effect=[None, RuntimeError("Telegram failed")]), copy_message=Mock())
+    try:
+        test_database.create_tables([HistoryMigrationEntry])
+        HistoryMigrationEntry.insert_many(
+            [
+                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.20", "formatted_text": "first\n", "position": 0},
+                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.21", "formatted_text": "second\n", "position": 1},
+                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.22", "formatted_text": None, "position": 2},
+            ]
+        ).execute()
+
+        manager._process_pending_history_migrations()
+
+        assert [entry.source_master_msg_id for entry in HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.position)] == ["10.21", "10.22"]
+        manager.bot.copy_message.assert_not_called()
+    finally:
+        test_database.close()
+        database.initialize(original_database)
+
+
 def test_queue_history_migration_entries_persists_pending_rows():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager.db = Mock()
@@ -307,12 +367,13 @@ def test_history_migration_deletes_zero_call_entry_without_queueing():
         get_history_migration_entries=Mock(return_value=[entry]),
         delete_history_migration_entry=Mock(),
     )
-    manager.bot = SimpleNamespace(outbound_queue=SimpleNamespace(enqueue=Mock()))
+    manager.bot = SimpleNamespace(send_message=Mock(), copy_message=Mock())
 
     processed = ChatBindingManager._process_history_migration_target(manager, entry)
 
     assert processed is True
-    manager.bot.outbound_queue.enqueue.assert_not_called()
+    manager.bot.send_message.assert_not_called()
+    manager.bot.copy_message.assert_not_called()
     manager.db.delete_history_migration_entry.assert_called_once_with(8)
     manager.logger.info.assert_any_call("History migration entry %d completed 0 calls", 8)
 
