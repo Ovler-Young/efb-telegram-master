@@ -211,6 +211,15 @@ class AuxiliaryBot:
         if self._membership_changed_callback is not None:
             self._membership_changed_callback(self, chat_id, is_member)
 
+    def recheck_membership(self, chat_id: int) -> None:
+        """Discard cached membership and asynchronously probe its current value."""
+        with self._membership_lock:
+            cached_membership = self._membership_cache.get(chat_id)
+            if cached_membership is not None and not cached_membership[0]:
+                return
+            self._membership_cache.pop(chat_id, None)
+        self._start_membership_probe(chat_id)
+
     def _start_membership_probe(self, chat_id: int) -> None:
         """Start a background thread to check membership via get_chat_member API."""
         with self._membership_lock:

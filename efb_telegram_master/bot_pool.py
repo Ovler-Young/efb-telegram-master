@@ -141,15 +141,17 @@ class BotPool:
                 del self._preferred_sender_by_slave_id[slave_id]
 
     def record_possible_membership_failure(self, slave_id: Optional[str], bot_id: str | int, chat_id: int) -> None:
-        """Remember the affinity affected by a send failure until membership is confirmed."""
-        if slave_id is None:
-            return
+        """Remember a failed affinity and refresh the auxiliary's membership state."""
         try:
             normalized_bot_id = int(bot_id)
         except (TypeError, ValueError):
             return
-        with self._lock:
-            self._membership_failure_slaves.setdefault((normalized_bot_id, chat_id), set()).add(slave_id)
+        if slave_id is not None:
+            with self._lock:
+                self._membership_failure_slaves.setdefault((normalized_bot_id, chat_id), set()).add(slave_id)
+        bot = self.get_bot_by_id(normalized_bot_id)
+        if bot is not None and not bot.disabled:
+            bot.recheck_membership(chat_id)
 
     def disable_bot(self, bot_id: str | int) -> None:
         """Disable an auxiliary and remove every affinity that points to it."""

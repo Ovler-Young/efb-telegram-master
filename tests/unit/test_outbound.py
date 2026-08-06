@@ -1,13 +1,15 @@
 import io
 import threading
+import time
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from telegram.constants import MessageLimit
 from telegram.error import BadRequest, RetryAfter
 
+from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.outbound import (
     OutboundQueue,
@@ -216,17 +218,29 @@ def test_queue_propagates_terminal_sender_failure() -> None:
         queue.stop()
 
 
-def test_queue_failure_records_only_the_triggering_affinity_until_membership_is_confirmed() -> None:
-    auxiliary = Mock()
+def test_queue_failure_rechecks_cached_member_and_clears_only_the_triggering_affinity() -> None:
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+
+    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
+        probe_started.set()
+        assert release_probe.wait(1)
+        return SimpleNamespace(status="left")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        auxiliary = AuxiliaryBot("123:token")
     auxiliary.bot_id = 10
-    auxiliary.disabled = False
-    auxiliary.check_membership_tri.return_value = True
-    auxiliary.peek_delay.return_value = 0.0
-    auxiliary.try_acquire_limits.return_value = True
+    auxiliary.async_bot.get_chat_member.side_effect = get_chat_member
     auxiliary.bot.send_message.side_effect = ValueError("publication failed")
-    pool = BotPool([auxiliary])
+    auxiliary.update_membership(1, True)
+
+    replacement = Mock()
+    replacement.bot_id = 20
+    replacement.disabled = False
+    pool = BotPool([auxiliary, replacement])
     pool.record_successful_auxiliary_send("slave-a", 10)
     pool.record_successful_auxiliary_send("slave-b", 10)
+    pool.record_successful_auxiliary_send("slave-new", 20)
     queue = OutboundQueue(
         Mock(),
         pool,
@@ -238,13 +252,19 @@ def test_queue_failure_records_only_the_triggering_affinity_until_membership_is_
     )
     queue.start()
     try:
-        waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "body"}, 1, slave_id="slave-a"))
+        waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "body"}, 1, slave_id="slave-a", required_sender_bot_id="10"))
         with pytest.raises(ValueError, match="publication failed"):
             waiter.result(1)
-    finally:
-        queue.stop()
+        assert probe_started.wait(0.2)
+        release_probe.set()
 
-    auxiliary._membership_changed_callback(auxiliary, 1, False)
+        deadline = time.monotonic() + 1
+        while pool.preferred_sender("slave-a") is auxiliary and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        release_probe.set()
+        queue.stop()
 
     assert pool.preferred_sender("slave-a") is None
     assert pool.preferred_sender("slave-b") is auxiliary
+    assert pool.preferred_sender("slave-new") is replacement
