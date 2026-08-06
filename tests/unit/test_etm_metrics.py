@@ -51,9 +51,12 @@ def test_process_collector_logs_a_repeated_failure_once_and_keeps_other_metrics(
 
     with caplog.at_level(logging.WARNING, logger="efb_telegram_master.etm_metrics"):
         first_scrape = generate_latest(metrics.registry).decode()
-        generate_latest(metrics.registry)
+        second_scrape = generate_latest(metrics.registry).decode()
 
     assert "etm_process_resident_memory_bytes" in first_scrape
+    assert "etm_host_network_receive_bytes_total 1.0" in first_scrape
+    assert "etm_host_network_transmit_bytes_total 1.0" in first_scrape
+    assert "etm_host_network_receive_bytes_total 1.0" in second_scrape
     assert [record.message for record in caplog.records].count("Metrics collector process_cpu failed (RuntimeError).") == 1
 
 
@@ -70,14 +73,20 @@ def test_process_collector_renders_supported_process_observations():
     assert "etm_host_network_transmit_bytes_total 4096.0" in rendered
 
 
-def test_process_collector_omits_unsupported_io_observations():
+def test_process_collector_omits_unsupported_io_observations_without_suppressing_network(caplog):
     metrics = Metrics(process_factory=NoIoProcess, network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=2))
 
-    rendered = generate_latest(metrics.registry).decode()
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.etm_metrics"):
+        rendered = generate_latest(metrics.registry).decode()
+        second_scrape = generate_latest(metrics.registry).decode()
 
     assert "etm_process_resident_memory_bytes 2048.0" in rendered
     assert "etm_process_disk_read_bytes_total" not in rendered
     assert "etm_process_disk_write_bytes_total" not in rendered
+    assert "etm_host_network_receive_bytes_total 1.0" in rendered
+    assert "etm_host_network_transmit_bytes_total 2.0" in rendered
+    assert "etm_host_network_receive_bytes_total 1.0" in second_scrape
+    assert [record.message for record in caplog.records].count("Metrics collector process_disk failed (OSError).") == 1
 
 
 def test_snapshot_collectors_render_bounded_aggregate_metrics():
@@ -92,9 +101,15 @@ def test_snapshot_collectors_render_bounded_aggregate_metrics():
     rendered = generate_latest(metrics.registry).decode()
 
     assert 'etm_outbound_destination_queue_depth{destination="deepest"} 3.0' in rendered
+    assert 'etm_outbound_destination_oldest_age_seconds{destination="deepest"} 2.0' in rendered
     assert 'etm_outbound_destination_queue_depth{destination="middle"} 2.0' in rendered
     assert 'etm_outbound_destination_queue_depth{destination="least"}' not in rendered
+    assert "etm_outbound_worker_healthy 1.0" in rendered
     assert "etm_outbound_worker_in_flight 4.0" in rendered
+    assert 'etm_outbound_cooldown_seconds{sender_kind="main"} 1.5' in rendered
+    assert 'etm_outbound_cooldown_seconds{sender_kind="auxiliary"} 0.0' in rendered
+    assert 'etm_auxiliary_bots{state="enabled"} 2.0' in rendered
+    assert 'etm_auxiliary_bots{state="disabled"} 1.0' in rendered
     assert 'etm_auxiliary_membership_cache_entries{state="unknown_probe_pending"} 1.0' in rendered
     assert 'etm_rate_limit_occupancy{scope="chat"} 0.25' in rendered
 
@@ -132,3 +147,4 @@ def test_metrics_server_logs_the_port_chosen_by_the_os(caplog):
         metrics_server.shutdown()
         metrics_server.server_close()
         metrics_server.thread.join(timeout=1)
+        assert not metrics_server.thread.is_alive()

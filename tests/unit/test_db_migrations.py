@@ -14,7 +14,7 @@ from prometheus_client import generate_latest
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
-from efb_telegram_master.db import DatabaseManager, MsgLog, MsgLogIngestionScan, TopicAssoc, database
+from efb_telegram_master.db import DatabaseManager, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
@@ -23,6 +23,29 @@ from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, Telegra
 
 def test_msglog_schema_has_sender_bot_id(channel):
     assert "sender_bot_id" in {column.name for column in database.get_columns("msglog")}
+
+
+def test_history_migration_entry_schema_retains_replay_columns_without_msglog_legacy_field():
+    test_db = SqliteDatabase(":memory:")
+
+    with test_db.bind_ctx([HistoryMigrationEntry, MsgLog]):
+        test_db.create_tables([HistoryMigrationEntry, MsgLog])
+        history_columns = {column.name for column in test_db.get_columns("historymigrationentry")}
+        msglog_columns = {column.name for column in test_db.get_columns("msglog")}
+
+    assert {
+        "id",
+        "slave_chat_id",
+        "target_chat_id",
+        "message_thread_id",
+        "source_master_msg_id",
+        "formatted_text",
+        "media_type",
+        "source_time",
+        "position",
+        "created_at",
+    }.issubset(history_columns)
+    assert "source_master_msg_id" not in msglog_columns
 
 
 def test_database_method_metrics_record_bounded_public_operation_labels(channel):
