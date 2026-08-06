@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
+import threading
+import time
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 from efb_telegram_master.bot_pool import BotPool
 
 
@@ -103,3 +107,49 @@ def test_confirmed_membership_failure_preserves_a_newer_affinity() -> None:
     first._membership_changed_callback(first, 100, False)
 
     assert pool.preferred_sender("slave-a") is second
+
+
+def test_successful_membership_recheck_discards_stale_affinities_and_deduplicates_later_probes() -> None:
+    first_probe_finished = threading.Event()
+    second_probe_started = threading.Event()
+    release_second_probe = threading.Event()
+    probe_count = 0
+
+    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
+        nonlocal probe_count
+        probe_count += 1
+        if probe_count == 1:
+            first_probe_finished.set()
+            return SimpleNamespace(status="member")
+        second_probe_started.set()
+        assert release_second_probe.wait(1)
+        return SimpleNamespace(status="left")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        auxiliary = AuxiliaryBot("123:token")
+    auxiliary.bot_id = 10
+    auxiliary.async_bot.get_chat_member.side_effect = get_chat_member
+    auxiliary.update_membership(100, True)
+    pool = BotPool([auxiliary])
+    pool.record_successful_auxiliary_send("slave-a", 10)
+    pool.record_possible_membership_failure("slave-a", 10, 100)
+    assert first_probe_finished.wait(1)
+
+    deadline = time.monotonic() + 1
+    while auxiliary.check_membership_tri(100) is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert auxiliary.check_membership_tri(100) is True
+
+    pool.record_successful_auxiliary_send("slave-b", 10)
+    pool.record_possible_membership_failure("slave-b", 10, 100)
+    assert second_probe_started.wait(1)
+    pool.record_possible_membership_failure("slave-b", 10, 100)
+    assert probe_count == 2
+    release_second_probe.set()
+
+    deadline = time.monotonic() + 1
+    while pool.preferred_sender("slave-b") is auxiliary and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert pool.preferred_sender("slave-a") is auxiliary
+    assert pool.preferred_sender("slave-b") is None

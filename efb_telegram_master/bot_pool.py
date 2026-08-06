@@ -81,11 +81,11 @@ class BotPool:
             bot._membership_changed_callback = self._membership_changed
 
     def _membership_changed(self, bot: AuxiliaryBot, chat_id: int, is_member: bool) -> None:
-        if is_member:
-            return
         key = (bot.bot_id, chat_id)
         with self._lock:
             slave_ids = self._membership_failure_slaves.pop(key, set())
+            if is_member:
+                return
             for slave_id in slave_ids:
                 if self._preferred_sender_by_slave_id.get(slave_id) == bot.bot_id:
                     del self._preferred_sender_by_slave_id[slave_id]
