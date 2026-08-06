@@ -1,9 +1,11 @@
 import threading
 import time
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from ehforwarderbot import Message
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.types import MessageID
 from telegram import InputMediaPhoto
@@ -11,6 +13,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.slave_message import SlaveMessageProcessor
+from tests.mocks.slave import MockSlaveChannel
 
 
 def _processor() -> SlaveMessageProcessor:
@@ -48,6 +51,18 @@ def _dedupe_processor() -> SlaveMessageProcessor:
 def test_reaction_footer_omits_empty_reactions() -> None:
     assert SlaveMessageProcessor.build_reactions_footer({}) == ""
     assert SlaveMessageProcessor.build_reactions_footer({"ok": [object(), object()], "empty": []}) == "[ok\u00d72]"
+
+
+def test_mock_slave_message_snapshot_survives_producer_file_close() -> None:
+    message = Message(file=BytesIO(b"image-bytes"), filename="image.png", mime="image/png")
+
+    snapshot = MockSlaveChannel._snapshot_message(message)
+    message.file.close()
+
+    assert snapshot is not message
+    assert snapshot.filename == "image.png"
+    assert snapshot.mime == "image/png"
+    assert snapshot.file.read() == b"image-bytes"
 
 
 def test_channel_stopping_gate_drops_messages_and_statuses() -> None:
