@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.etm_metrics import parse_metrics_config
+from efb_telegram_master.etm_metrics import MetricsServer, parse_metrics_config
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import (
     AsyncTelegramRuntime,
@@ -275,6 +275,18 @@ def test_api_resource_shutdown_stops_metrics_server_under_its_current_owner() ->
     metrics_server.stop.assert_called_once_with(2.5)
     api.bot_pool.shutdown.assert_called_once_with()
     assert api._metrics_server is None
+
+
+def test_metrics_server_stop_closes_an_unstarted_server_without_shutdown_or_join() -> None:
+    thread = Mock()
+    thread.is_alive.return_value = False
+    server = Mock()
+
+    MetricsServer(server, thread).stop(1.0)
+
+    server.shutdown.assert_not_called()
+    server.server_close.assert_called_once_with()
+    thread.join.assert_not_called()
 
 
 def test_metrics_configuration_defaults_and_disables_invalid_endpoint_options() -> None:
