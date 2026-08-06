@@ -11,6 +11,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+uv.lock
 env/
 build/
 develop-eggs/
