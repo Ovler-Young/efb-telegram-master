@@ -74,3 +74,32 @@ def test_remove_affinity_for_bot_keeps_other_bot_affinities() -> None:
 
     assert pool.preferred_sender("slave-a") is None
     assert pool.preferred_sender("slave-b") is second
+
+
+def test_confirmed_membership_failure_removes_only_the_failed_sender_affinity() -> None:
+    first = bot(10)
+    second = bot(20)
+    pool = BotPool([first, second])
+    pool.record_successful_auxiliary_send("slave-a", 10)
+    pool.record_successful_auxiliary_send("slave-b", 10)
+    pool.record_successful_auxiliary_send("slave-c", 20)
+    pool.record_possible_membership_failure("slave-a", 10, 100)
+
+    first._membership_changed_callback(first, 100, False)
+
+    assert pool.preferred_sender("slave-a") is None
+    assert pool.preferred_sender("slave-b") is first
+    assert pool.preferred_sender("slave-c") is second
+
+
+def test_confirmed_membership_failure_preserves_a_newer_affinity() -> None:
+    first = bot(10)
+    second = bot(20)
+    pool = BotPool([first, second])
+    pool.record_successful_auxiliary_send("slave-a", 10)
+    pool.record_possible_membership_failure("slave-a", 10, 100)
+    pool.record_successful_auxiliary_send("slave-a", 20)
+
+    first._membership_changed_callback(first, 100, False)
+
+    assert pool.preferred_sender("slave-a") is second

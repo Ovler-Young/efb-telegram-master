@@ -218,6 +218,39 @@ def test_pending_duplicate_and_muted_message_do_not_dispatch() -> None:
     processor.dispatch_message.assert_not_called()
 
 
+def test_destination_mapping_failure_releases_the_pending_dedupe_claim() -> None:
+    processor = _dedupe_processor()
+    processor.get_slave_msg_dest.side_effect = RuntimeError("database unavailable")
+
+    assert processor.send_message(_message()) is not None
+    assert processor._pending_slave_messages == set()
+    processor.dispatch_message.assert_not_called()
+
+
+def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.logger = Mock()
+    processor.channel = SimpleNamespace(commands=SimpleNamespace(register_command=Mock()))
+    processor.chat_manager = Mock()
+    processor.db = SimpleNamespace(add_or_update_message_log=Mock(side_effect=RuntimeError("database unavailable")))
+    processor._release_pending_slave_message = Mock()
+    processor.slave_message_text = Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=7))
+    message = SimpleNamespace(
+        uid="message",
+        target=None,
+        commands=None,
+        reactions={},
+        text="body",
+        type=MsgType.Text,
+        author=SimpleNamespace(module_id="tests.slave"),
+    )
+    with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()), patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"):
+        processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"))
+
+    processor.db.add_or_update_message_log.assert_called_once()
+    processor._release_pending_slave_message.assert_called_once_with(("tests.slave chat", "message"))
+
+
 def test_ingested_message_edit_has_no_telegram_side_effect() -> None:
     processor = _dedupe_processor()
     processor.db.get_msg_log.return_value = SimpleNamespace(provenance="mtproto_ingested")
@@ -299,6 +332,39 @@ def test_oversized_file_sends_current_bot_api_notice_for_new_message() -> None:
     assert (sent, edit_media) == ("sent", True)
     assert processor.bot.send_message.call_args.kwargs["text"] == "caption"
     reply.assert_called_once_with(processor.bot, "sent", "Attachment exceeds the limit.", quote=True)
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "slave_message_image",
+        "slave_message_animation",
+        "slave_message_sticker",
+        "slave_message_file",
+        "slave_message_voice",
+        "slave_message_video",
+    ],
+)
+def test_each_oversized_media_branch_uses_the_quoted_notice_helper(method_name: str) -> None:
+    processor = _processor()
+    processor.check_file_size = Mock(return_value="Attachment exceeds the limit.")
+    processor._send_oversized_file_notice = Mock(return_value=("notice", False))
+    message = SimpleNamespace(
+        uid="oversized",
+        text="caption",
+        file=BytesIO(b"file"),
+        path=None,
+        filename="file.bin",
+        mime="application/octet-stream",
+        edit_media=False,
+        vendor_specific=None,
+        commands=None,
+        substitutions=None,
+        type=MsgType.File,
+    )
+
+    assert getattr(processor, method_name)(message, 100, None, "header", "footer") == "notice"
+    processor._send_oversized_file_notice.assert_called_once()
 
 
 def test_oversized_file_edit_replies_with_notice_only() -> None:

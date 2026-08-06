@@ -8,6 +8,7 @@ import pytest
 from telegram.constants import MessageLimit
 from telegram.error import BadRequest, RetryAfter
 
+from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.outbound import (
     OutboundQueue,
     QueuedCall,
@@ -213,3 +214,37 @@ def test_queue_propagates_terminal_sender_failure() -> None:
             waiter.result(1)
     finally:
         queue.stop()
+
+
+def test_queue_failure_records_only_the_triggering_affinity_until_membership_is_confirmed() -> None:
+    auxiliary = Mock()
+    auxiliary.bot_id = 10
+    auxiliary.disabled = False
+    auxiliary.check_membership_tri.return_value = True
+    auxiliary.peek_delay.return_value = 0.0
+    auxiliary.try_acquire_limits.return_value = True
+    auxiliary.bot.send_message.side_effect = ValueError("publication failed")
+    pool = BotPool([auxiliary])
+    pool.record_successful_auxiliary_send("slave-a", 10)
+    pool.record_successful_auxiliary_send("slave-b", 10)
+    queue = OutboundQueue(
+        Mock(),
+        pool,
+        _Limiter(),
+        worker_count=1,
+        blocking_timeout=1,
+        shutdown_drain_timeout=1,
+        shutdown_join_grace=0.1,
+    )
+    queue.start()
+    try:
+        waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "body"}, 1, slave_id="slave-a"))
+        with pytest.raises(ValueError, match="publication failed"):
+            waiter.result(1)
+    finally:
+        queue.stop()
+
+    auxiliary._membership_changed_callback(auxiliary, 1, False)
+
+    assert pool.preferred_sender("slave-a") is None
+    assert pool.preferred_sender("slave-b") is auxiliary

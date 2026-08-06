@@ -76,6 +76,19 @@ class BotPool:
         self._bot_by_id = {bot.bot_id: bot for bot in aux_bots}
         self._lock = threading.Lock()
         self._preferred_sender_by_slave_id: dict[str, int] = {}
+        self._membership_failure_slaves: dict[tuple[int, int], set[str]] = {}
+        for bot in aux_bots:
+            bot._membership_changed_callback = self._membership_changed
+
+    def _membership_changed(self, bot: AuxiliaryBot, chat_id: int, is_member: bool) -> None:
+        if is_member:
+            return
+        key = (bot.bot_id, chat_id)
+        with self._lock:
+            slave_ids = self._membership_failure_slaves.pop(key, set())
+            for slave_id in slave_ids:
+                if self._preferred_sender_by_slave_id.get(slave_id) == bot.bot_id:
+                    del self._preferred_sender_by_slave_id[slave_id]
 
     @property
     def bots(self) -> list[AuxiliaryBot]:
@@ -126,6 +139,17 @@ class BotPool:
             stale_slaves = [slave_id for slave_id, preferred_bot_id in self._preferred_sender_by_slave_id.items() if preferred_bot_id == normalized_bot_id]
             for slave_id in stale_slaves:
                 del self._preferred_sender_by_slave_id[slave_id]
+
+    def record_possible_membership_failure(self, slave_id: Optional[str], bot_id: str | int, chat_id: int) -> None:
+        """Remember the affinity affected by a send failure until membership is confirmed."""
+        if slave_id is None:
+            return
+        try:
+            normalized_bot_id = int(bot_id)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            self._membership_failure_slaves.setdefault((normalized_bot_id, chat_id), set()).add(slave_id)
 
     def disable_bot(self, bot_id: str | int) -> None:
         """Disable an auxiliary and remove every affinity that points to it."""

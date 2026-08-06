@@ -157,6 +157,7 @@ class SenderPolicy:
         self._main_bot = main_bot
         self._bot_pool = bot_pool
         self._main_rate_limiter = main_rate_limiter
+        self._cooldowns_lock = threading.Lock()
         self._cooldowns: dict[tuple[Optional[str], int], float] = {}
 
     def select(self, call: QueuedCall, now: float) -> SenderDecision:
@@ -197,7 +198,8 @@ class SenderPolicy:
         return SenderDecision(None, min(retries) if retries else now + self.MEMBERSHIP_RECHECK_SECONDS)
 
     def _available(self, selection: SenderSelection, chat_id: int, now: float) -> SenderDecision:
-        cooldown = self._cooldowns.get((selection.sender_bot_id, chat_id), 0.0)
+        with self._cooldowns_lock:
+            cooldown = self._cooldowns.get((selection.sender_bot_id, chat_id), 0.0)
         retry_at = max(cooldown, now + self._limiter_delay(selection, chat_id))
         return SenderDecision(selection) if retry_at <= now else SenderDecision(None, retry_at)
 
@@ -214,12 +216,21 @@ class SenderPolicy:
         return auxiliary is not None and auxiliary.try_acquire_limits(chat_id)
 
     def record_retry_after(self, call: QueuedCall, error: RetryAfter, selection: SenderSelection) -> None:
-        self._cooldowns[(selection.sender_bot_id, call.telegram_chat_id)] = time.monotonic() + retry_after_seconds(error)
+        key = (selection.sender_bot_id, call.telegram_chat_id)
+        deadline = time.monotonic() + retry_after_seconds(error)
+        with self._cooldowns_lock:
+            self._cooldowns[key] = max(self._cooldowns.get(key, 0.0), deadline)
+
+    def record_send_failure(self, call: QueuedCall, selection: SenderSelection) -> None:
+        if selection.sender_bot_id is not None and self._bot_pool is not None:
+            self._bot_pool.record_possible_membership_failure(call.slave_id, selection.sender_bot_id, call.telegram_chat_id)
 
     def cooldown_snapshot(self) -> dict[str, float]:
         now = time.monotonic()
         cooldowns = {"main": 0.0, "auxiliary": 0.0}
-        for (sender_bot_id, _chat_id), deadline in self._cooldowns.items():
+        with self._cooldowns_lock:
+            cooldown_entries = tuple(self._cooldowns.items())
+        for (sender_bot_id, _chat_id), deadline in cooldown_entries:
             kind = "main" if sender_bot_id is None else "auxiliary"
             cooldowns[kind] = max(cooldowns[kind], max(0.0, deadline - now))
         return cooldowns
@@ -471,6 +482,7 @@ class OutboundQueue:
                     else:
                         pending.waiter.set_exception(SchedulerStoppedError("Outbound queue stopped."))
                 except BaseException as error:
+                    self._sender_policy.record_send_failure(pending.call, submitted.selection)
                     pending.waiter.set_exception(error)
             if completed:
                 self._wake_event.set()
