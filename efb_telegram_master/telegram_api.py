@@ -199,6 +199,10 @@ class TelegramAPI:
         return self._enqueue_main_chat_mutation("send_location", args, kwargs)
 
     @_retry_on_chat_migration
+    def send_venue(self, *args: object, **kwargs: object) -> SendReceipt:
+        return self._enqueue_main_chat_mutation("send_venue", args, kwargs)
+
+    @_retry_on_chat_migration
     def send_sticker(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._route_queued_operation("send_sticker", args, kwargs, eventual_capable=True)
 

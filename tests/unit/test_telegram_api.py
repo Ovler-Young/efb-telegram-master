@@ -96,6 +96,7 @@ def test_remaining_public_queued_operations_route_to_the_outbound_queue(operatio
     [
         ("edit_message_reply_markup", (), {"chat_id": 1, "message_id": 2}),
         ("send_location", (1, 1.0, 2.0), {}),
+        ("send_venue", (1, 1.0, 2.0, "title", "address"), {}),
         ("create_forum_topic", (1, "topic"), {}),
         ("edit_forum_topic", (1, 2), {}),
         ("reopen_forum_topic", (1, 2), {}),
@@ -125,6 +126,46 @@ def test_edit_requires_explicit_sender_and_delete_routes_to_requested_sender() -
     api.delete_message(1, 2, _sender_bot_id="aux-8")
 
     assert [request.required_sender_bot_id for request in queue.requests] == ["__main__", "aux-7", "aux-8"]
+
+
+@pytest.mark.parametrize(
+    ("operation", "args", "kwargs", "content_key", "content_index"),
+    [
+        ("edit_message_text", ("body", 1, 2), {}, "text", 0),
+        ("edit_message_text", (), {"chat_id": 1, "message_id": 2, "text": "body"}, "text", 0),
+        ("edit_message_caption", (1, 2, "inline-id", "body"), {}, "caption", 3),
+        ("edit_message_caption", (), {"chat_id": 1, "message_id": 2, "caption": "body"}, "caption", 3),
+    ],
+)
+def test_edit_operations_affix_positional_and_keyword_content(operation, args, kwargs, content_key, content_index) -> None:
+    api, _bot, queue, _chat_binding = _api()
+
+    getattr(api, operation)(*args, **kwargs, prefix="Prefix", suffix="Suffix")
+
+    request = queue.requests[0]
+    content = request.args[content_index] if len(request.args) > content_index else request.kwargs[content_key]
+    assert content == "Prefix\nbody\nSuffix"
+    assert request.required_sender_bot_id == "__main__"
+    assert "prefix" not in request.kwargs
+    assert "suffix" not in request.kwargs
+
+
+def test_keyword_only_set_chat_title_strips_queue_metadata() -> None:
+    api, _bot, queue, _chat_binding = _api()
+
+    api.set_chat_title(
+        chat_id=1,
+        title="title",
+        _sender_bot_id="aux-7",
+        _slave_id="slave.chat",
+        _force_main_bot=True,
+    )
+
+    request = queue.requests[0]
+    assert request.args == ()
+    assert request.kwargs == {"chat_id": 1, "title": "title"}
+    assert request.required_sender_bot_id == "__main__"
+    assert request.slave_id is None
 
 
 def test_direct_calls_strip_queue_metadata_and_preserve_chat_action_thread_arguments() -> None:

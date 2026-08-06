@@ -136,6 +136,51 @@ def test_adapter_retries_entity_parse_failure_without_parse_mode(operation, args
     assert calls[1].kwargs == kwargs
 
 
+@pytest.mark.parametrize(
+    ("operation", "args", "kwargs", "content_key", "content_index", "limit"),
+    [
+        ("edit_message_text", ("body", 1, 2), {}, "text", 0, MessageLimit.MAX_TEXT_LENGTH),
+        ("edit_message_text", (), {"chat_id": 1, "message_id": 2, "text": "body"}, "text", 0, MessageLimit.MAX_TEXT_LENGTH),
+        ("edit_message_caption", (1, 2, "inline-id", "body"), {}, "caption", 3, MessageLimit.CAPTION_LENGTH),
+        ("edit_message_caption", (), {"chat_id": 1, "message_id": 2, "caption": "body"}, "caption", 3, MessageLimit.CAPTION_LENGTH),
+    ],
+)
+def test_adapter_edit_overflow_attaches_the_prepared_content(operation, args, kwargs, content_key, content_index, limit):
+    full_content = "Prefix\n" + "x" * int(limit) + "\nSuffix"
+    prepared_args = (*args[:content_index], full_content, *args[content_index + 1 :]) if args else ()
+    prepared_kwargs = {**kwargs, content_key: full_content} if not args else kwargs
+    sender = Mock()
+    getattr(sender, operation).return_value = SimpleNamespace(message_id=7)
+
+    TelegramCallAdapter(None).execute(QueuedCall(operation, prepared_args, prepared_kwargs, 1, None, None), SenderSelection(sender, None))
+
+    call = getattr(sender, operation).call_args
+    delivered = call.args[content_index] if prepared_args else call.kwargs[content_key]
+    assert delivered == full_content[:100] + "\n...\n" + full_content[-100:]
+    assert sender.send_document.call_args.args[1].getvalue() == full_content.encode()
+
+
+@pytest.mark.parametrize(
+    ("operation", "args", "kwargs", "content_key", "content_index"),
+    [
+        ("edit_message_text", ("<broken>", 1, 2), {}, "text", 0),
+        ("edit_message_caption", (1, 2, "inline-id", "<broken>"), {}, "caption", 3),
+    ],
+)
+def test_adapter_edit_retries_entity_parse_failure_without_parse_mode(operation, args, kwargs, content_key, content_index):
+    sender = Mock()
+    getattr(sender, operation).side_effect = [BadRequest("Can't parse entities"), SimpleNamespace(message_id=7)]
+
+    TelegramCallAdapter(None).execute(QueuedCall(operation, args, {**kwargs, "parse_mode": "HTML"}, 1, None, None), SenderSelection(sender, None))
+
+    calls = getattr(sender, operation).call_args_list
+    assert len(calls) == 2
+    assert calls[0].args[content_index] == args[content_index]
+    assert calls[0].kwargs["parse_mode"] == "HTML"
+    assert calls[1].args[content_index] == args[content_index]
+    assert "parse_mode" not in calls[1].kwargs
+
+
 def test_adapter_rewinds_files_before_retrying_entity_parse_failure() -> None:
     photo = io.BytesIO(b"photo")
     positions = []

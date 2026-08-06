@@ -306,3 +306,15 @@ def test_channel_dispatch_stops_when_the_runtime_stop_signal_is_set() -> None:
 
     assert channel.send_message(message) is message
     channel.slave_messages.send_message.assert_not_called()
+
+
+def test_channel_dispatches_messages_while_the_runtime_is_running() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._stop_polling_called = False
+    channel.bot_manager = SimpleNamespace(_stopping=Mock(is_set=Mock(return_value=False)))
+    channel.slave_messages = Mock()
+    message = Mock()
+    channel.slave_messages.send_message.return_value = message
+
+    assert channel.send_message(message) is message
+    channel.slave_messages.send_message.assert_called_once_with(message)

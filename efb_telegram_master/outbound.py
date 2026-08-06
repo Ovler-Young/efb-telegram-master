@@ -37,6 +37,7 @@ QUEUED_OPERATIONS = frozenset(
         "delete_message",
         "edit_message_reply_markup",
         "send_location",
+        "send_venue",
         "create_forum_topic",
         "edit_forum_topic",
         "reopen_forum_topic",
