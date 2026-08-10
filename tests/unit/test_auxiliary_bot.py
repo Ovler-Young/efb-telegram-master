@@ -4,8 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import telegram.error
+from prometheus_client import generate_latest
 
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
+from efb_telegram_master.etm_metrics import Metrics
 
 
 def test_initialize_sets_identity():
@@ -187,6 +189,35 @@ def test_membership_probes_are_bounded_for_many_unknown_chats() -> None:
     release.set()
     aux_bot.begin_membership_shutdown()
     aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
+
+
+def test_membership_probe_queue_saturation_records_a_bounded_metric() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
+        started.set()
+        assert release.wait(1)
+        return SimpleNamespace(status="member")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls, patch.object(AuxiliaryBot, "MEMBERSHIP_PROBE_WORKERS", 1), patch.object(AuxiliaryBot, "MAX_PENDING_MEMBERSHIP_PROBES", 1):
+        aux_bot = AuxiliaryBot("123:token")
+    aux_bot.bot_id = 123
+    aux_bot.username = "botA"
+    bot_cls.return_value.get_chat_member.side_effect = get_chat_member
+    metrics = Metrics()
+    aux_bot.bind_metrics(metrics)
+
+    try:
+        assert aux_bot.check_membership_tri(1) is None
+        assert started.wait(1)
+        assert aux_bot.check_membership_tri(2) is None
+        rendered = generate_latest(metrics.registry).decode()
+        assert 'etm_auxiliary_membership_probes_total{outcome="queue_full"} 1.0' in rendered
+    finally:
+        release.set()
+        aux_bot.begin_membership_shutdown()
+        aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
 
 
 def test_shutdown_rejects_new_membership_probes() -> None:

@@ -24,7 +24,7 @@ _RETRY_REASONS = frozenset({"rate_limit", "membership", "worker_capacity"})
 _FAILURE_STAGES = frozenset({"dispatch", "execution", "terminal"})
 _AUXILIARY_STATES = frozenset({"enabled", "disabled"})
 _MEMBERSHIP_CACHE_STATES = frozenset({"member", "not_member", "unknown_probe_pending"})
-_MEMBERSHIP_PROBE_OUTCOMES = frozenset({"ok_member", "ok_not_member", "forbidden", "bad_request", "error"})
+_MEMBERSHIP_PROBE_OUTCOMES = frozenset({"ok_member", "ok_not_member", "forbidden", "bad_request", "error", "queue_full"})
 _RATE_LIMIT_SCOPES = frozenset({"global", "chat"})
 _DATABASE_METHODS = frozenset(
     {
