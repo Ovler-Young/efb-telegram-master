@@ -1,5 +1,152 @@
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
+from telegram import Update
+from telegram.ext import ConversationHandler
+
 from efb_telegram_master import utils
+from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
+from efb_telegram_master.constants import Flags
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+
+
+def _callback_update(chat_id, message_id, data):
+    return Update.de_json(
+        {
+            "update_id": 1,
+            "callback_query": {
+                "id": "callback-id",
+                "from": {"id": 1, "is_bot": False, "first_name": "Tester"},
+                "chat_instance": "instance",
+                "data": data,
+                "message": {
+                    "message_id": message_id,
+                    "date": 1,
+                    "chat": {"id": chat_id, "type": "private", "first_name": "Tester"},
+                },
+            },
+        },
+        None,
+    )
+
+
+@pytest.fixture
+def callback_manager():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.bot = Mock()
+    manager.channel = SimpleNamespace(_=lambda text: text, flag=lambda _name: 10, master_messages=Mock())
+    manager.msg_storage = {}
+    manager.link_handler = SimpleNamespace(_conversations={})
+    manager.suggestion_handler = SimpleNamespace(_conversations={})
+    manager.chat_head_handler = SimpleNamespace(_conversations={})
+    return manager
+
+
+@pytest.fixture
+def callback_chat():
+    return SimpleNamespace(module_id="tests.mocks.slave", full_name="Test chat", linked=False)
+
+
+def _store_callback_session(manager, handler, state, storage_id, chats):
+    manager.msg_storage[storage_id] = ChatListStorage(chats)
+    manager._set_conversation_state(handler, storage_id, state)
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "state", "callback"),
+    [
+        ("link_handler", Flags.LINK_EXEC, "manual_link 0"),
+        ("suggestion_handler", Flags.SUGGEST_RECIPIENTS, "chat 0"),
+        ("chat_head_handler", Flags.CHAT_HEAD_CONFIRM, "offset 0"),
+    ],
+)
+def test_callback_handlers_expire_missing_sessions(callback_manager, handler_name, state, callback):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(201))
+    handler = getattr(manager, handler_name)
+    manager._set_conversation_state(handler, storage_id, state)
+    update = _callback_update(*storage_id, callback)
+    method = {
+        "link_handler": manager.link_chat_exec,
+        "suggestion_handler": manager.suggested_recipient,
+        "chat_head_handler": manager.make_chat_head,
+    }[handler_name]
+
+    with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query") as answer_callback_query:
+        assert method(update, None) == ConversationHandler.END
+
+    assert storage_id not in handler._conversations
+    answer_callback_query.assert_called_once_with("callback-id")
+
+
+@pytest.mark.parametrize("callback", ["manual_link", "manual_link 0 extra", "manual_link nope"])
+def test_link_exec_rejects_malformed_callback_tokens(callback_manager, callback_chat, callback):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(202))
+    _store_callback_session(manager, manager.link_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
+
+    with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"):
+        assert manager.link_chat_exec(_callback_update(*storage_id, callback), None) == ConversationHandler.END
+
+    assert storage_id not in manager.msg_storage
+    assert storage_id not in manager.link_handler._conversations
+
+
+@pytest.mark.parametrize("callback", ["offset", "offset nope", "offset 999", "chat nope", "chat 4"])
+def test_link_confirmation_rejects_invalid_callback_indexes(callback_manager, callback_chat, callback):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(206))
+    _store_callback_session(manager, manager.link_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
+
+    with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"), patch.object(manager, "link_chat_gen_list") as generate:
+        assert manager.link_chat_confirm(_callback_update(*storage_id, callback), None) == ConversationHandler.END
+
+    generate.assert_not_called()
+    assert storage_id not in manager.msg_storage
+    assert storage_id not in manager.link_handler._conversations
+
+
+@pytest.mark.parametrize("callback", ["chat", "chat 0 extra", "chat nope", "chat 4"])
+def test_suggested_recipient_rejects_invalid_or_stale_selection(callback_manager, callback_chat, callback):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(203))
+    _store_callback_session(manager, manager.suggestion_handler, Flags.SUGGEST_RECIPIENTS, storage_id, [callback_chat])
+
+    with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"), patch.object(manager.channel.master_messages, "process_telegram_message") as process:
+        assert manager.suggested_recipient(_callback_update(*storage_id, callback), None) == ConversationHandler.END
+
+    process.assert_not_called()
+    assert storage_id not in manager.msg_storage
+    assert storage_id not in manager.suggestion_handler._conversations
+
+
+@pytest.mark.parametrize("callback", ["offset", "offset 0 extra", "offset nope", "offset -1", "offset 999", "chat 4"])
+def test_chat_head_rejects_invalid_or_out_of_range_callback_indexes(callback_manager, callback_chat, callback):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(204))
+    _store_callback_session(manager, manager.chat_head_handler, Flags.CHAT_HEAD_CONFIRM, storage_id, [callback_chat])
+
+    with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"), patch.object(manager, "chat_head_req_generate") as generate:
+        assert manager.make_chat_head(_callback_update(*storage_id, callback), None) == ConversationHandler.END
+
+    generate.assert_not_called()
+    assert storage_id not in manager.msg_storage
+    assert storage_id not in manager.chat_head_handler._conversations
+
+
+def test_link_exec_keeps_valid_manual_link_callback_active(callback_manager, callback_chat):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(205))
+    _store_callback_session(manager, manager.link_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
+
+    with patch.object(manager, "build_link_action_message") as build_link_action_message, patch.object(manager.bot, "answer_callback_query") as answer_callback_query:
+        assert manager.link_chat_exec(_callback_update(*storage_id, "manual_link 0"), None) == Flags.LINK_EXEC
+
+    build_link_action_message.assert_not_called()
+    answer_callback_query.assert_not_called()
+    assert storage_id in manager.msg_storage
+    assert storage_id in manager.link_handler._conversations
 
 
 def test_full_chat_pagination(channel, slave):

@@ -184,6 +184,37 @@ class ChatBindingManager(LocaleMixin):
         conversations = cast(ConversationDict, conversations)
         conversations.pop(key, None)
 
+    @staticmethod
+    def _parse_callback_index(callback_data: str, command: str) -> Optional[int]:
+        parts = callback_data.split()
+        if len(parts) != 2 or parts[0] != command:
+            return None
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+
+    def _end_callback_session(self, handler: ConversationHandler, storage_id: Tuple[TelegramChatID, TelegramMessageID], callback_query_id: str, text: str) -> int:
+        self.msg_storage.pop(storage_id, None)
+        self._clear_conversation_state(handler, storage_id)
+        self.bot.edit_message_text(text=text, chat_id=storage_id[0], message_id=storage_id[1])
+        self.bot.answer_callback_query(callback_query_id)
+        return ConversationHandler.END
+
+    def _get_callback_storage(self, handler: ConversationHandler, storage_id: Tuple[TelegramChatID, TelegramMessageID], callback_query_id: str, text: str) -> Optional[ChatListStorage]:
+        storage = self.msg_storage.get(storage_id)
+        if storage is None:
+            self._end_callback_session(handler, storage_id, callback_query_id, text)
+        return storage
+
+    def _is_current_selection(self, storage: ChatListStorage, index: int) -> bool:
+        chats_per_page = self.channel.flag("chats_per_page")
+        return storage.offset <= index < min(storage.offset + chats_per_page, storage.length)
+
+    def _is_valid_page_offset(self, storage: ChatListStorage, offset: int) -> bool:
+        chats_per_page = self.channel.flag("chats_per_page")
+        return 0 <= offset < storage.length and offset % chats_per_page == 0
+
     def _get_bot_user(self) -> telegram.User:
         bot_user = self.runtime.me
         if bot_user is None:
@@ -353,6 +384,8 @@ class ChatBindingManager(LocaleMixin):
             chats.sort(key=lambda a: a.last_message_time, reverse=True)
             chat_list = self.msg_storage[storage_id] = ChatListStorage(chats, offset)
 
+        chat_list.offset = offset
+
         # self._db_update_slave_chats_cache(chat_list.chats)
 
         for ch in chat_list.channels.values():
@@ -447,29 +480,36 @@ class ChatBindingManager(LocaleMixin):
         tg_chat_id = TelegramChatID(update.effective_chat.id)
         tg_msg_id = TelegramMessageID(update.effective_message.message_id)
         callback_uid: str = update.callback_query.data
-        if callback_uid.split()[0] == "offset":
+        storage_id = (tg_chat_id, tg_msg_id)
+        expired_text = self._("Session expired. Please try again. (SE01)")
+        invalid_text = self._("Invalid parameter ({0}). (IP01)").format(callback_uid)
+        if callback_uid.split(maxsplit=1)[0] == "offset":
+            offset = self._parse_callback_index(callback_uid, "offset")
+            storage = self._get_callback_storage(self.link_handler, storage_id, update.callback_query.id, expired_text)
+            if storage is None:
+                return ConversationHandler.END
+            if offset is None or not self._is_valid_page_offset(storage, offset):
+                return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, invalid_text)
             # Offer a new page of chats
             self.bot.answer_callback_query(update.callback_query.id)
-            return self.link_chat_gen_list(tg_chat_id, message_id=tg_msg_id, offset=int(callback_uid.split()[1]))
+            return self.link_chat_gen_list(tg_chat_id, message_id=tg_msg_id, offset=offset)
 
         if callback_uid == Flags.CANCEL_PROCESS:
             # Terminate the process
             txt = self._("Cancelled.")
-            self.bot.edit_message_text(text=txt, chat_id=tg_chat_id, message_id=tg_msg_id)
-            self.msg_storage.pop((tg_chat_id, tg_msg_id), None)
-            self.bot.answer_callback_query(update.callback_query.id)
-            return ConversationHandler.END
+            return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, txt)
 
         if callback_uid[:4] != "chat":
             # The only possible command now is "chat".
-            txt = self._("Invalid parameter ({0}). (IP01)").format(callback_uid)
-            self.bot.edit_message_text(text=txt, chat_id=tg_chat_id, message_id=tg_msg_id)
-            self.msg_storage.pop((tg_chat_id, tg_msg_id), None)
-            self.bot.answer_callback_query(update.callback_query.id)
-            return ConversationHandler.END
+            return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, invalid_text)
 
-        callback_idx: int = int(callback_uid.split()[1])
-        chat: ETMChatType = self.msg_storage[(tg_chat_id, tg_msg_id)].chats[callback_idx]
+        callback_idx = self._parse_callback_index(callback_uid, "chat")
+        storage = self._get_callback_storage(self.link_handler, storage_id, update.callback_query.id, expired_text)
+        if storage is None:
+            return ConversationHandler.END
+        if callback_idx is None or not self._is_current_selection(storage, callback_idx):
+            return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, invalid_text)
+        chat: ETMChatType = storage.chats[callback_idx]
 
         self.build_link_action_message(chat, tg_chat_id, tg_msg_id)
 
@@ -512,13 +552,24 @@ class ChatBindingManager(LocaleMixin):
 
         if callback_uid == Flags.CANCEL_PROCESS:
             txt = self._("Cancelled.")
-            self.bot.edit_message_text(text=txt, chat_id=tg_chat_id, message_id=tg_msg_id)
-            self.msg_storage.pop((tg_chat_id, tg_msg_id), None)
-            self.bot.answer_callback_query(update.callback_query.id)
-            return ConversationHandler.END
+            storage_id = (tg_chat_id, tg_msg_id)
+            return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, txt)
 
-        cmd, chat_lid = callback_uid.split()
-        chat: ETMChatType = self.msg_storage[(tg_chat_id, tg_msg_id)].chats[int(chat_lid)]
+        storage_id = (tg_chat_id, tg_msg_id)
+        expired_text = self._("Session expired. Please try again. (SE01)")
+        callback_parts = callback_uid.split()
+        if len(callback_parts) != 2:
+            txt = self._("Command ‘{command}’ ({query}) is not recognised, please try again.").format(command=callback_parts[0] if callback_parts else "", query=callback_uid)
+            return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, txt)
+        cmd, _ = callback_parts
+        callback_idx = self._parse_callback_index(callback_uid, cmd)
+        storage = self._get_callback_storage(self.link_handler, storage_id, update.callback_query.id, expired_text)
+        if storage is None:
+            return ConversationHandler.END
+        if callback_idx is None or not self._is_current_selection(storage, callback_idx):
+            txt = self._("Invalid parameter ({0}). (IP01)").format(callback_uid)
+            return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, txt)
+        chat: ETMChatType = storage.chats[callback_idx]
         chat_display_name = chat.full_name
         if cmd == "unlink":
             chat.unlink()
@@ -549,7 +600,8 @@ class ChatBindingManager(LocaleMixin):
             txt = self._("Command ‘{command}’ ({query}) is not recognised, please try again.").format(command=cmd, query=callback_uid)
             self.bot.edit_message_text(text=txt, chat_id=tg_chat_id, message_id=tg_msg_id)
         self.bot.answer_callback_query(update.callback_query.id)
-        self.msg_storage.pop((tg_chat_id, tg_msg_id), None)
+        self.msg_storage.pop(storage_id, None)
+        self._clear_conversation_state(self.link_handler, storage_id)
         return ConversationHandler.END
 
     def link_chat(self, update: Update, args: Optional[List[str]]):
@@ -852,28 +904,36 @@ class ChatBindingManager(LocaleMixin):
         callback_uid: str = update.callback_query.data
 
         # Refresh with a new set of pages
-        if callback_uid.split()[0] == "offset":
+        storage_id = (tg_chat_id, tg_msg_id)
+        expired_text = self._("Session expired. Please try again. (SE01)")
+        invalid_text = self._("Invalid command. ({0})").format(callback_uid)
+        if callback_uid.split(maxsplit=1)[0] == "offset":
+            offset = self._parse_callback_index(callback_uid, "offset")
+            storage = self._get_callback_storage(self.chat_head_handler, storage_id, update.callback_query.id, expired_text)
+            if storage is None:
+                return ConversationHandler.END
+            if offset is None or not self._is_valid_page_offset(storage, offset):
+                return self._end_callback_session(self.chat_head_handler, storage_id, update.callback_query.id, invalid_text)
             self.bot.answer_callback_query(update.callback_query.id)
-            return self.chat_head_req_generate(tg_chat_id, message_id=tg_msg_id, offset=int(callback_uid.split()[1]))
+            return self.chat_head_req_generate(tg_chat_id, message_id=tg_msg_id, offset=offset)
         if callback_uid == Flags.CANCEL_PROCESS:
             txt = self._("Cancelled.")
-            self.msg_storage.pop((tg_chat_id, tg_msg_id), None)
-            self.bot.edit_message_text(text=txt, chat_id=tg_chat_id, message_id=tg_msg_id)
-            self.bot.answer_callback_query(update.callback_query.id)
-            return ConversationHandler.END
+            return self._end_callback_session(self.chat_head_handler, storage_id, update.callback_query.id, txt)
 
         if not callback_uid.startswith("chat "):
             # Invalid command
-            txt = self._("Invalid command. ({0})").format(callback_uid)
-            self.msg_storage.pop((tg_chat_id, tg_msg_id), None)
-            self.bot.edit_message_text(text=txt, chat_id=tg_chat_id, message_id=tg_msg_id)
-            self.bot.answer_callback_query(update.callback_query.id)
-            return ConversationHandler.END
+            return self._end_callback_session(self.chat_head_handler, storage_id, update.callback_query.id, invalid_text)
 
-        callback_idx = int(callback_uid.split()[1])
-        chat: ETMChatType = self.msg_storage[(tg_chat_id, tg_msg_id)].chats[callback_idx]
+        callback_idx = self._parse_callback_index(callback_uid, "chat")
+        storage = self._get_callback_storage(self.chat_head_handler, storage_id, update.callback_query.id, expired_text)
+        if storage is None:
+            return ConversationHandler.END
+        if callback_idx is None or not self._is_current_selection(storage, callback_idx):
+            return self._end_callback_session(self.chat_head_handler, storage_id, update.callback_query.id, invalid_text)
+        chat: ETMChatType = storage.chats[callback_idx]
         chat_display_name = chat.full_name
-        self.msg_storage.pop((tg_chat_id, tg_msg_id), None)
+        self.msg_storage.pop(storage_id, None)
+        self._clear_conversation_state(self.chat_head_handler, storage_id)
         txt = self._("Reply to this message to chat with {0}.").format(chat_display_name)
         chat_head_etm = ETMMsg()
         chat_head_etm.chat = chat
@@ -921,31 +981,31 @@ class ChatBindingManager(LocaleMixin):
         chat_id = TelegramChatID(update.effective_chat.id)
         msg_id = TelegramMessageID(update.effective_message.message_id)
         param = update.callback_query.data
+        callback_query_id = update.callback_query.id
 
         storage_id = (chat_id, msg_id)
-        if param.startswith("chat "):
-            if storage_id not in self.msg_storage:
-                self.bot.edit_message_text(text=self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nSession expired, please try again."), chat_id=chat_id, message_id=msg_id)
-            update_ = self.msg_storage[storage_id].update
-            assert update_
-            update = update_
-            chats = self.msg_storage[storage_id].chats
-            if not chats:
-                self.bot.edit_message_text(text=self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nSession expired, please try again."), chat_id=chat_id, message_id=msg_id)
-                if update.callback_query:
-                    self.bot.answer_callback_query(update.callback_query.id)
+        session_expired_text = self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nSession expired, please try again.")
+        invalid_text = self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nInvalid parameter ({0}).").format(param)
+        if param.split(maxsplit=1)[0] == "chat":
+            callback_idx = self._parse_callback_index(param, "chat")
+            storage = self._get_callback_storage(self.suggestion_handler, storage_id, callback_query_id, session_expired_text)
+            if storage is None:
                 return ConversationHandler.END
-            slave_chat = chats[int(param.split(" ", 1)[1])]
+            if callback_idx is None or storage.update is None or not self._is_current_selection(storage, callback_idx):
+                return self._end_callback_session(self.suggestion_handler, storage_id, callback_query_id, invalid_text)
+            update_ = storage.update
+            update = update_
+            slave_chat = storage.chats[callback_idx]
             slave_chat_id = utils.chat_id_to_str(chat=slave_chat)
             self.channel.master_messages.process_telegram_message(update, context, slave_chat_id)
             self.bot.edit_message_text(text=self._("Delivering the message to {0}.").format(slave_chat.full_name), chat_id=chat_id, message_id=msg_id)
         elif param == Flags.CANCEL_PROCESS:
             self.bot.edit_message_text(text=self._("Error: No recipient specified.\nPlease reply to a previous message."), chat_id=chat_id, message_id=msg_id)
         else:
-            self.bot.edit_message_text(text=self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nInvalid parameter ({0}).").format(param), chat_id=chat_id, message_id=msg_id)
-        del self.msg_storage[storage_id]
-        if update.callback_query:
-            self.bot.answer_callback_query(update.callback_query.id)
+            self.bot.edit_message_text(text=invalid_text, chat_id=chat_id, message_id=msg_id)
+        self.msg_storage.pop(storage_id, None)
+        self._clear_conversation_state(self.suggestion_handler, storage_id)
+        self.bot.answer_callback_query(callback_query_id)
         return ConversationHandler.END
 
     def update_group_info(self, update: Update, context: CallbackContext):
