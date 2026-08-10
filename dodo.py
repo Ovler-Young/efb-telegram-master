@@ -13,6 +13,7 @@ QUALITY_FILES = (
     + glob.glob("./**/*.yaml", recursive=True)
     + glob.glob("./**/*.yml", recursive=True)
     + glob.glob("./.github/workflows/*.yml")
+    + glob.glob("./readme_translations/*.rst")
     + [README_BASE, ".pre-commit-config.yaml", "dodo.py", "pyproject.toml", "setup.py"]
 )
 DEFAULT_BUMP_MODE = "patch"

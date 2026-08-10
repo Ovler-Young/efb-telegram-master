@@ -15,7 +15,7 @@ repos:
     rev: v1.0.0
     hooks:
     -   id: rst-linter
-        files: README\.rst
+        files: ^(README\.rst|readme_translations/.+\.rst)$
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.12.8
     hooks:

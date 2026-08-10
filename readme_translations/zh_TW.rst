@@ -393,7 +393,7 @@ ETM 不能：
 
 由於 Telegram Bot API 和 EH Forwarder Bot 的技術局限，ETM 存在一些限制：
 
-* **不支援**部分 Telegram 消息類型：
+* **不支援**\ 部分 Telegram 消息類型：
      * 遊戲消息
 
      * 發票（invoice，又譯「帳單」、「訂單」）消息

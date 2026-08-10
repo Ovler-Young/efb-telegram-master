@@ -176,8 +176,8 @@ Nota: In case of multiple admins are assigned, they may all send
 2. Send ``/link`` directly to the bot, then select your preferred
     slave chat.
 
-3. Tap “Link” and select your new group. *You can also choose to
-    unlink or relink a linked chat from this menu.*
+3. Tap “Link” and select your new group.
+   *You can also choose to unlink or relink a linked chat from this menu.*
 
 4. Tap “Start” at the bottom of your screen, and you should see a
     success message: “Chat linked.”
