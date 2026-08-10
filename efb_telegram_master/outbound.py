@@ -10,7 +10,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence, TypeAlias
 
@@ -55,6 +55,7 @@ QUEUED_OPERATIONS = frozenset(
 )
 
 _INTERNAL_KWARGS = frozenset({"prefix", "suffix", "_sender_bot_id", "_slave_id", "_force_main_bot"})
+_CHAT_ID_ARGUMENT_INDICES = {"edit_message_text": 1}
 _CONTENT_SPECS = {
     "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
     "edit_message_text": ("text", 0, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
@@ -163,6 +164,7 @@ class _PendingCall:
     phase: "_CallPhase" = field(default_factory=lambda: _CallPhase.PRIMARY)
     primary_result: Optional[SendReceipt] = None
     attachment: Optional[QueuedCall] = None
+    attachment_migrated: bool = False
 
     def active_call(self) -> QueuedCall:
         if self.phase is _CallPhase.PRIMARY:
@@ -202,6 +204,17 @@ def retry_after_seconds(error: RetryAfter) -> float:
 
 def _strip_private_queue_metadata(kwargs: Mapping[str, object]) -> TelegramKwargs:
     return {key: value for key, value in kwargs.items() if key not in _INTERNAL_KWARGS}
+
+
+def _call_with_chat_id(call: QueuedCall, chat_id: int) -> QueuedCall:
+    args = list(call.args)
+    kwargs = dict(call.kwargs)
+    argument_index = _CHAT_ID_ARGUMENT_INDICES.get(call.operation, 0)
+    if "chat_id" in kwargs:
+        kwargs["chat_id"] = chat_id
+    else:
+        args[argument_index] = chat_id
+    return replace(call, args=tuple(args), kwargs=kwargs, telegram_chat_id=chat_id)
 
 
 def rewind_uploads(args: Sequence[object], kwargs: Mapping[str, object]) -> None:
@@ -462,6 +475,7 @@ class OutboundQueue:
         self._pending: collections.deque[_PendingCall] = collections.deque()
         self._in_flight: dict[Future[object], _SubmittedCall] = {}
         self._in_flight_chats: set[int] = set()
+        self._chat_redirects: dict[int, int] = {}
         self._capacity = threading.BoundedSemaphore(worker_count)
         self._lock = threading.RLock()
         self._wake_event = threading.Event()
@@ -486,22 +500,20 @@ class OutboundQueue:
             cleanup_upload_paths(request.cleanup)
             raise QueueEnqueueError(f"Unsupported queued operation: {request.operation}")
         waiter: QueueFuture = Future()
-        pending = _PendingCall(
-            QueuedCall(
-                request.operation,
-                request.args,
-                dict(request.kwargs),
-                request.telegram_chat_id,
-                request.slave_id,
-                request.required_sender_bot_id,
-                request.cleanup,
-            ),
-            waiter,
+        call = QueuedCall(
+            request.operation,
+            request.args,
+            dict(request.kwargs),
+            request.telegram_chat_id,
+            request.slave_id,
+            request.required_sender_bot_id,
+            request.cleanup,
         )
         with self._lock:
             if self._lifecycle is not OutboundLifecycle.RUNNING:
                 cleanup_upload_paths(request.cleanup)
                 raise SchedulerStoppedError("Outbound queue stopped.")
+            pending = _PendingCall(_call_with_chat_id(call, self._resolve_chat_id_locked(call.telegram_chat_id)), waiter)
             self._pending.append(pending)
             self._wake_event.set()
         return waiter
@@ -623,6 +635,32 @@ class OutboundQueue:
                 self._in_flight[future] = _SubmittedCall(pending, decision.selection)
                 self._in_flight_chats.add(chat_id)
 
+    def _resolve_chat_id_locked(self, chat_id: int) -> int:
+        seen: set[int] = set()
+        while chat_id in self._chat_redirects and chat_id not in seen:
+            seen.add(chat_id)
+            chat_id = self._chat_redirects[chat_id]
+        return chat_id
+
+    def _migrate_attachment_locked(self, pending: _PendingCall, new_chat_id: int) -> None:
+        old_chat_id = pending.call.telegram_chat_id
+        new_chat_id = self._resolve_chat_id_locked(new_chat_id)
+        if old_chat_id == new_chat_id:
+            raise QueueError("Attachment chat migration did not change the destination.")
+        rewind_uploads(pending.active_call().args, pending.active_call().kwargs)
+        self._chat_redirects[old_chat_id] = new_chat_id
+        for queued in self._pending:
+            resolved_chat_id = self._resolve_chat_id_locked(queued.call.telegram_chat_id)
+            if resolved_chat_id != queued.call.telegram_chat_id:
+                queued.call = _call_with_chat_id(queued.call, resolved_chat_id)
+                if queued.attachment is not None:
+                    queued.attachment = _call_with_chat_id(queued.attachment, resolved_chat_id)
+        pending.call = _call_with_chat_id(pending.call, new_chat_id)
+        assert pending.attachment is not None
+        pending.attachment = _call_with_chat_id(pending.attachment, new_chat_id)
+        pending.attachment_migrated = True
+        pending.retry_at = 0.0
+
     def _harvest_completed(self) -> None:
         with self._lock:
             completed = [future for future in self._in_flight if future.done()]
@@ -644,7 +682,20 @@ class OutboundQueue:
                     else:
                         self._complete_pending_locked(pending, error=SchedulerStoppedError("Outbound queue stopped."))
                 except telegram.error.ChatMigrated as error:
-                    pending.waiter.set_exception(error)
+                    if pending.phase is _CallPhase.PRIMARY:
+                        pending.waiter.set_exception(error)
+                    elif pending.attachment_migrated:
+                        self._complete_pending_locked(pending, error=QueueError("Attachment chat migrated repeatedly."))
+                    else:
+                        try:
+                            self._migrate_attachment_locked(pending, error.new_chat_id)
+                        except BaseException as migration_error:
+                            self._complete_pending_locked(pending, error=migration_error)
+                        else:
+                            if self._lifecycle is OutboundLifecycle.RUNNING:
+                                self._pending.appendleft(pending)
+                            else:
+                                self._complete_pending_locked(pending, error=SchedulerStoppedError("Outbound queue stopped."))
                 except BaseException as error:
                     self._sender_policy.record_send_failure(pending.call, submitted.selection)
                     self._complete_pending_locked(pending, error=error)
