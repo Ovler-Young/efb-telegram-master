@@ -185,7 +185,8 @@ def test_membership_probes_are_bounded_for_many_unknown_chats() -> None:
     with aux_bot._membership_lock:
         assert len(aux_bot._pending_probes) == 2
     release.set()
-    aux_bot.shutdown(time.monotonic() + 1)
+    aux_bot.begin_membership_shutdown()
+    aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
 
 
 def test_shutdown_rejects_new_membership_probes() -> None:

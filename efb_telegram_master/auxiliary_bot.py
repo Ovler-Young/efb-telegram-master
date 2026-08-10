@@ -304,11 +304,6 @@ class AuxiliaryBot:
                 return
             time.sleep(min(0.01, remaining))
 
-    def shutdown(self, deadline: float) -> None:
-        """Stop accepting membership probes and wait until an absolute deadline."""
-        self.begin_membership_shutdown()
-        self.wait_for_membership_shutdown(deadline)
-
     def has_pending_probes(self) -> bool:
         """Check if there are any pending membership probes."""
         with self._membership_lock:
