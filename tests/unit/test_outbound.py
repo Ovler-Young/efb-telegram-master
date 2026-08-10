@@ -467,6 +467,7 @@ def test_stop_timeout_keeps_blocked_send_and_upload_owned_until_later_stop(tmp_p
     assert waiter.result(1).message == upload.as_uri()
     queue.stop()
     assert queue.lifecycle is OutboundLifecycle.FINALIZED
+    assert not any(thread.name.startswith("ETM-send") and thread.is_alive() for thread in threading.enumerate())
     assert not upload.exists()
 
 
