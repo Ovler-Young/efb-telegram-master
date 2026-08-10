@@ -71,11 +71,14 @@ def test_callback_keyboard_forces_main_sender() -> None:
 @pytest.mark.parametrize(
     ("operation", "args", "required_sender_bot_id"),
     [
+        ("send_audio", (1, "audio"), None),
         ("send_document", (1, "document"), None),
         ("send_video", (1, "video"), None),
         ("send_animation", (1, "animation"), None),
         ("send_voice", (1, "voice"), None),
         ("send_sticker", (1, "sticker"), None),
+        ("send_media_group", (1, ["media"]), None),
+        ("forward_message", (1, 2, 3), None),
         ("copy_message", (1, 2, 3), None),
         ("edit_message_caption", (1, 2, "inline-id", "caption"), "__main__"),
         ("edit_message_media", (1, 2, "media"), "__main__"),
@@ -197,3 +200,58 @@ def test_positional_edit_retries_with_migrated_chat_id() -> None:
     assert receipt.message_id == 3
     assert [request.args for request in queue.requests] == [("body", 1, 3, "inline-id"), ("body", 2, 3, "inline-id")]
     chat_binding.chat_migration_by_id.assert_called_once_with(1, 2)
+
+
+def test_send_audio_affixes_caption_and_strips_queue_metadata() -> None:
+    api, _bot, queue, _chat_binding = _api()
+
+    api.send_audio(
+        chat_id=1,
+        audio="audio",
+        caption="body",
+        prefix="before",
+        suffix="after",
+        _sender_bot_id="aux-7",
+        _slave_id="slave.chat",
+    )
+
+    request = queue.requests[0]
+    assert request.kwargs == {"chat_id": 1, "audio": "audio", "caption": "before\nbody\nafter"}
+    assert request.required_sender_bot_id is None
+    assert request.slave_id == "slave.chat"
+
+
+@pytest.mark.parametrize(
+    ("operation", "kwargs"),
+    [
+        ("send_media_group", {"chat_id": 1, "media": ["media"], "message_thread_id": 7}),
+        ("forward_message", {"chat_id": 1, "from_chat_id": 2, "message_id": 3, "message_thread_id": 7}),
+    ],
+)
+def test_ordinary_operations_keep_destination_thread_and_strip_queue_metadata(operation, kwargs) -> None:
+    api, _bot, queue, _chat_binding = _api()
+
+    getattr(api, operation)(**kwargs, _sender_bot_id="aux-7", _slave_id="slave.chat", _force_main_bot=True)
+
+    request = queue.requests[0]
+    assert request.operation == operation
+    assert request.kwargs == kwargs
+    assert request.required_sender_bot_id == "__main__"
+    assert request.slave_id == "slave.chat"
+
+
+def test_forward_message_retries_after_chat_migration_and_waits_for_receipt() -> None:
+    api, _bot, queue, chat_binding = _api()
+
+    def migrate_then_succeed(request):
+        if len(queue.requests) == 1:
+            raise ChatMigrated(4)
+        return SendReceipt(SimpleNamespace(message_id=5))
+
+    queue.side_effect = migrate_then_succeed
+
+    receipt = api.forward_message(chat_id=1, from_chat_id=2, message_id=3)
+
+    assert receipt.message_id == 5
+    assert [request.kwargs["chat_id"] for request in queue.requests] == [1, 4]
+    chat_binding.chat_migration_by_id.assert_called_once_with(1, 4)

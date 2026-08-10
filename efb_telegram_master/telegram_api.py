@@ -159,6 +159,10 @@ class TelegramAPI:
         return self._route_affixed_operation(operation, args, kwargs, eventual_capable=True, content_key="caption", content_index=2)
 
     @_retry_on_chat_migration
+    def send_audio(self, *args: object, **kwargs: object) -> SendReceipt:
+        return self._send_captioned("send_audio", args, kwargs)
+
+    @_retry_on_chat_migration
     def send_voice(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._send_captioned("send_voice", args, kwargs)
 
@@ -205,6 +209,14 @@ class TelegramAPI:
     @_retry_on_chat_migration
     def send_sticker(self, *args: object, **kwargs: object) -> SendReceipt:
         return self._route_queued_operation("send_sticker", args, kwargs, eventual_capable=True)
+
+    @_retry_on_chat_migration
+    def send_media_group(self, *args: object, **kwargs: object) -> SendReceipt:
+        return self._route_queued_operation("send_media_group", args, kwargs, eventual_capable=True)
+
+    @_retry_on_chat_migration
+    def forward_message(self, *args: object, **kwargs: object) -> SendReceipt:
+        return self._route_queued_operation("forward_message", args, kwargs, eventual_capable=True)
 
     @_retry_on_chat_migration
     def copy_message(self, *args: object, **kwargs: object) -> SendReceipt:
