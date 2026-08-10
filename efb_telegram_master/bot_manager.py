@@ -45,6 +45,7 @@ class TelegramBotManager:
             blocking_timeout=self.BLOCKING_SEND_TIMEOUT,
             shutdown_drain_timeout=self.SHUTDOWN_DRAIN_TIMEOUT,
             shutdown_join_grace=self.SHUTDOWN_JOIN_GRACE,
+            cancel_active_calls=self.telegram_runtime.async_runtime.begin_delivery_shutdown,
         )
         self.api = TelegramAPI(channel, self.telegram_runtime.bot, outbound_queue, bot_pool)
         _metrics, metrics_server = configure_runtime_metrics(config, channel.db, bot_pool, outbound_queue, self.logger)

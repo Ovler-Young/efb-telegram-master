@@ -12,7 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Mapping, Optional, Sequence, TypeAlias
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence, TypeAlias
 
 import telegram.constants
 import telegram.error
@@ -88,6 +88,17 @@ class SchedulerStoppedError(QueueError):
 
 class ExecutorSubmitError(QueueError):
     pass
+
+
+class OutboundShutdownTimeout(QueueError):
+    """The outbound worker did not quiesce before its shutdown deadline."""
+
+
+class OutboundLifecycle(Enum):
+    RUNNING = "running"
+    STOPPING = "stopping"
+    QUIESCENT = "quiescent"
+    FINALIZED = "finalized"
 
 
 @dataclass
@@ -439,12 +450,14 @@ class OutboundQueue:
         blocking_timeout: float,
         shutdown_drain_timeout: float,
         shutdown_join_grace: float,
+        cancel_active_calls: Callable[[], None] | None = None,
     ) -> None:
         self._sender_policy = SenderPolicy(main_bot, bot_pool, main_rate_limiter)
         self._call_adapter = TelegramCallAdapter(bot_pool)
         self._blocking_timeout = blocking_timeout
         self._shutdown_drain_timeout = shutdown_drain_timeout
         self._shutdown_join_grace = shutdown_join_grace
+        self._cancel_active_calls = cancel_active_calls
         self._executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ETM-send")
         self._pending: collections.deque[_PendingCall] = collections.deque()
         self._in_flight: dict[Future[object], _SubmittedCall] = {}
@@ -454,15 +467,16 @@ class OutboundQueue:
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
         self._started = False
-        self._stopping = False
-        self._resources_finalized = False
+        self._lifecycle = OutboundLifecycle.RUNNING
+        self._finalizing = False
+        self._finalized = threading.Event()
         self._worker = threading.Thread(target=self._run, name="ETM queued send worker", daemon=True)
 
     def start(self) -> None:
         with self._lock:
             if self._started:
                 return
-            if self._stopping:
+            if self._lifecycle is not OutboundLifecycle.RUNNING:
                 raise SchedulerStoppedError("Outbound queue stopped.")
             self._started = True
         self._worker.start()
@@ -485,7 +499,7 @@ class OutboundQueue:
             waiter,
         )
         with self._lock:
-            if self._stopping:
+            if self._lifecycle is not OutboundLifecycle.RUNNING:
                 cleanup_upload_paths(request.cleanup)
                 raise SchedulerStoppedError("Outbound queue stopped.")
             self._pending.append(pending)
@@ -500,16 +514,27 @@ class OutboundQueue:
             raise RuntimeError(f"Telegram call to chat {request.telegram_chat_id} timed out after {self._blocking_timeout:g}s") from error
 
     def stop(self) -> None:
+        deadline = time.monotonic() + self._shutdown_drain_timeout + self._shutdown_join_grace
         with self._lock:
-            if self._stopping:
+            if self._lifecycle is OutboundLifecycle.FINALIZED:
                 return
-            self._stopping = True
-            self._fail_pending_locked()
-            self._stop_event.set()
-            self._wake_event.set()
-        if self._started and self._worker.is_alive():
-            self._worker.join(timeout=self._shutdown_drain_timeout + self._shutdown_join_grace)
-        self._finalize_resources()
+            if self._lifecycle is OutboundLifecycle.RUNNING:
+                self._lifecycle = OutboundLifecycle.STOPPING
+                self._fail_pending_locked()
+                self._stop_event.set()
+                self._wake_event.set()
+            submitted = tuple(self._in_flight)
+            started = self._started
+        if self._cancel_active_calls is not None:
+            self._cancel_active_calls()
+        for future in submitted:
+            future.cancel()
+        if not started:
+            self._mark_quiescent()
+            self._finalize_resources()
+        remaining = max(0.0, deadline - time.monotonic())
+        if not self._finalized.wait(remaining):
+            raise OutboundShutdownTimeout(f"Outbound queue did not stop within {self._shutdown_drain_timeout + self._shutdown_join_grace:g}s.")
 
     def destination_snapshot(self) -> list[tuple[str, int, Optional[float]]]:
         with self._lock:
@@ -517,6 +542,11 @@ class OutboundQueue:
             for pending in self._pending:
                 destinations.setdefault(pending.call.telegram_chat_id, []).append(pending.retry_at)
         return [(str(chat_id), len(retries), None) for chat_id, retries in destinations.items()]
+
+    @property
+    def lifecycle(self) -> OutboundLifecycle:
+        with self._lock:
+            return self._lifecycle
 
     def worker_snapshot(self) -> tuple[bool, int]:
         with self._lock:
@@ -537,6 +567,7 @@ class OutboundQueue:
                 self._wake_event.clear()
         finally:
             self._drain_in_flight()
+            self._mark_quiescent()
             self._finalize_resources()
 
     def _sleep_timeout(self) -> float:
@@ -549,6 +580,8 @@ class OutboundQueue:
     def _dispatch_once(self) -> None:
         now = time.monotonic()
         with self._lock:
+            if self._lifecycle is not OutboundLifecycle.RUNNING:
+                return
             blocked_chats: set[int] = set()
             for _ in range(len(self._pending)):
                 if not self._capacity.acquire(blocking=False):
@@ -606,7 +639,7 @@ class OutboundQueue:
                 except RetryAfter as error:
                     self._sender_policy.record_retry_after(pending.active_call(), error, submitted.selection)
                     pending.retry_at = time.monotonic() + retry_after_seconds(error)
-                    if not self._stopping:
+                    if self._lifecycle is OutboundLifecycle.RUNNING:
                         self._pending.appendleft(pending)
                     else:
                         self._complete_pending_locked(pending, error=SchedulerStoppedError("Outbound queue stopped."))
@@ -635,17 +668,12 @@ class OutboundQueue:
                 self._wake_event.set()
 
     def _drain_in_flight(self) -> None:
-        deadline = time.monotonic() + self._shutdown_drain_timeout
-        while time.monotonic() < deadline:
+        while True:
             self._harvest_completed()
             with self._lock:
                 if not self._in_flight:
                     return
             time.sleep(0.01)
-        with self._lock:
-            error = SchedulerStoppedError("Outbound queue stopped.")
-            for submitted in self._in_flight.values():
-                self._complete_pending_locked(submitted.pending, error=error)
 
     def _fail_pending_locked(self) -> None:
         error = SchedulerStoppedError("Outbound queue stopped.")
@@ -666,7 +694,23 @@ class OutboundQueue:
 
     def _finalize_resources(self) -> None:
         with self._lock:
-            if self._resources_finalized:
+            if self._lifecycle is OutboundLifecycle.FINALIZED:
                 return
-            self._resources_finalized = True
-        self._executor.shutdown(wait=False)
+            if self._lifecycle is not OutboundLifecycle.QUIESCENT:
+                return
+            if self._finalizing:
+                finalizer = False
+            else:
+                self._finalizing = True
+                finalizer = True
+        if not finalizer:
+            return
+        self._executor.shutdown(wait=True)
+        with self._lock:
+            self._lifecycle = OutboundLifecycle.FINALIZED
+            self._finalized.set()
+
+    def _mark_quiescent(self) -> None:
+        with self._lock:
+            if self._lifecycle is OutboundLifecycle.STOPPING:
+                self._lifecycle = OutboundLifecycle.QUIESCENT

@@ -41,6 +41,7 @@ from .db import DatabaseManager
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
 from .mtproto import MTProtoClient, MTProtoConfig, MTProtoRetryableError
+from .outbound import OutboundShutdownTimeout
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .rpc_utils import RPCUtilities
@@ -697,7 +698,12 @@ class TelegramChannel(MasterChannel):
         self._stop_polling_called = True
         self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
         self.rpc_utilities.shutdown()
-        self.bot_manager.stop_channel_resources()
+        try:
+            self.bot_manager.stop_channel_resources()
+        except OutboundShutdownTimeout:
+            self._stop_polling_called = False
+            self.logger.warning("Telegram delivery did not stop before the deadline", extra={"event": "telegram_channel.delivery_shutdown_timeout"})
+            raise
         self.telegram_runtime.stop()
         self.master_messages.stop_worker()
         self.db.stop_worker()

@@ -49,24 +49,36 @@ class TelegramAPI:
 
     _POSITIONAL_CHAT_ID_INDICES = {"edit_message_text": 1}
 
-    def __init__(self, channel: "TelegramChannel", bot: SyncBotProtocol, outbound_queue: OutboundQueue, bot_pool: BotPool | None) -> None:
+    def __init__(
+        self,
+        channel: "TelegramChannel",
+        bot: SyncBotProtocol,
+        outbound_queue: OutboundQueue,
+        bot_pool: BotPool | None,
+    ) -> None:
         self._channel = channel
         self._bot = bot
         self._outbound_queue = outbound_queue
         self.bot_pool = bot_pool
         self._cleanup_tls = threading.local()
         self._metrics_server: MetricsServer | None = None
+        self._delivery_stop_lock = threading.Lock()
+        self._delivery_resources_stopped = False
 
     def bind_metrics_server(self, metrics_server: "MetricsServer | None") -> None:
         self._metrics_server = metrics_server
 
     def stop_delivery_resources(self, join_timeout: float) -> None:
-        self._outbound_queue.stop()
-        if self._metrics_server is not None:
-            self._metrics_server.stop(join_timeout)
-            self._metrics_server = None
-        if self.bot_pool:
-            self.bot_pool.shutdown()
+        with self._delivery_stop_lock:
+            if self._delivery_resources_stopped:
+                return
+            self._outbound_queue.stop()
+            if self._metrics_server is not None:
+                self._metrics_server.stop(join_timeout)
+                self._metrics_server = None
+            if self.bot_pool:
+                self.bot_pool.shutdown()
+            self._delivery_resources_stopped = True
 
     @staticmethod
     def _normalize_telegram_chat_id(value: object) -> int:

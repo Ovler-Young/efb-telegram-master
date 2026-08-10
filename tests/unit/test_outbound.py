@@ -13,9 +13,12 @@ from telegram.error import BadRequest, RetryAfter
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.outbound import (
+    OutboundLifecycle,
     OutboundQueue,
+    OutboundShutdownTimeout,
     QueuedCall,
     QueueRequest,
+    SchedulerStoppedError,
     SenderSelection,
     TelegramCallAdapter,
     UploadCleanup,
@@ -423,6 +426,48 @@ def test_queue_preserves_owned_upload_after_caller_timeout(tmp_path) -> None:
     finally:
         release.set()
         queue.stop()
+
+
+def test_stop_timeout_keeps_blocked_send_and_upload_owned_until_later_stop(tmp_path) -> None:
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"upload")
+    started = threading.Event()
+    release = threading.Event()
+
+    class Sender:
+        def send_document(self, *, chat_id, document):
+            started.set()
+            assert release.wait(1)
+            return document
+
+    cancellation_states = []
+    queue = OutboundQueue(
+        Sender(),
+        None,
+        _Limiter(),
+        worker_count=1,
+        blocking_timeout=1,
+        shutdown_drain_timeout=0.02,
+        shutdown_join_grace=0.02,
+        cancel_active_calls=lambda: cancellation_states.append(queue.lifecycle),
+    )
+    queue.start()
+    waiter = queue.enqueue(QueueRequest("send_document", (), {"chat_id": 1, "document": upload.as_uri()}, 1, cleanup=UploadCleanup((str(upload),))))
+    assert started.wait(1)
+
+    with pytest.raises(OutboundShutdownTimeout):
+        queue.stop()
+
+    assert cancellation_states == [OutboundLifecycle.STOPPING]
+    assert queue.lifecycle is OutboundLifecycle.STOPPING
+    assert upload.exists()
+    with pytest.raises(SchedulerStoppedError):
+        queue.enqueue(QueueRequest("send_message", (), {"chat_id": 2, "text": "later"}, 2))
+    release.set()
+    assert waiter.result(1).message == upload.as_uri()
+    queue.stop()
+    assert queue.lifecycle is OutboundLifecycle.FINALIZED
+    assert not upload.exists()
 
 
 def test_queue_cleans_owned_upload_when_shutdown_cancels_pending_call(tmp_path) -> None:

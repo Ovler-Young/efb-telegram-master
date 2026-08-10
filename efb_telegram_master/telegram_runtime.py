@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 from collections.abc import Awaitable, Callable, Collection, Mapping
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from functools import wraps
 from typing import Coroutine, Literal, Optional, ParamSpec, TypedDict, TypeVar, cast
@@ -48,6 +49,8 @@ class AsyncTelegramRuntime:
         self._loop_thread: Optional[threading.Thread] = None
         self._owns_loop_thread = False
         self._lock = threading.Lock()
+        self._accepting_calls = True
+        self._active_calls: set[Future[object]] = set()
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop, *, owns_thread: bool = False) -> None:
         old_loop = old_thread = None
@@ -120,6 +123,15 @@ class AsyncTelegramRuntime:
         if loop is None:
             self.clear_loop()
 
+    def begin_delivery_shutdown(self) -> None:
+        """Reject and cancel synchronous Bot API calls before PTB teardown."""
+
+        with self._lock:
+            self._accepting_calls = False
+            active_calls = tuple(self._active_calls)
+        for future in active_calls:
+            future.cancel()
+
     def call_soon(self, callback: Callable[..., object], *args: object) -> bool:
         with self._lock:
             loop = self._loop
@@ -129,6 +141,11 @@ class AsyncTelegramRuntime:
         return True
 
     def call(self, coroutine: Coroutine[object, object, T], timeout: Optional[float] = None) -> T:
+        with self._lock:
+            accepting_calls = self._accepting_calls
+        if not accepting_calls:
+            coroutine.close()
+            raise RuntimeError("Telegram runtime is stopping.")
         if not self._ready.wait(timeout=2.0):
             self._ensure_background_loop()
         with self._lock:
@@ -142,11 +159,19 @@ class AsyncTelegramRuntime:
         if threading.get_ident() == loop_thread_id:
             raise RuntimeError("Synchronous bot wrapper invoked from the PTB event loop thread.")
         future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        with self._lock:
+            if not self._accepting_calls:
+                future.cancel()
+                raise RuntimeError("Telegram runtime is stopping.")
+            self._active_calls.add(cast(Future[object], future))
         try:
             return future.result(timeout)
         except FutureTimeoutError:
             future.cancel()
             raise
+        finally:
+            with self._lock:
+                self._active_calls.discard(cast(Future[object], future))
 
 
 def build_request(request_kwargs: Mapping[str, object]) -> HTTPXRequest:

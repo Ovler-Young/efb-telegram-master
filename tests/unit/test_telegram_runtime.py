@@ -7,6 +7,7 @@ import pytest
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.etm_metrics import MetricsServer, parse_metrics_config
+from efb_telegram_master.outbound import OutboundShutdownTimeout
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import (
     AsyncTelegramRuntime,
@@ -94,6 +95,23 @@ def test_async_runtime_call_starts_background_loop_when_no_loop_is_ready() -> No
     runtime._ensure_background_loop.assert_called_once_with()
     runner.assert_called_once_with(coroutine, background_loop)
     future.result.assert_called_once_with(None)
+
+
+def test_async_runtime_delivery_shutdown_cancels_active_calls_and_rejects_new_calls() -> None:
+    runtime = AsyncTelegramRuntime(Mock())
+    future = Mock()
+    runtime._active_calls.add(future)
+
+    runtime.begin_delivery_shutdown()
+
+    future.cancel.assert_called_once_with()
+
+    async def coroutine_function() -> None:
+        return None
+
+    coroutine = coroutine_function()
+    with pytest.raises(RuntimeError, match="runtime is stopping"):
+        runtime.call(coroutine)
 
 
 def test_async_runtime_stale_loop_clear_does_not_remove_rebound_loop() -> None:
@@ -275,6 +293,40 @@ def test_api_resource_shutdown_stops_metrics_server_under_its_current_owner() ->
     metrics_server.stop.assert_called_once_with(2.5)
     api.bot_pool.shutdown.assert_called_once_with()
     assert api._metrics_server is None
+
+
+def test_api_timeout_keeps_runtime_dependents_alive_for_a_later_stop() -> None:
+    queue = Mock()
+    queue.stop.side_effect = OutboundShutdownTimeout("blocked send")
+    api = TelegramAPI(SimpleNamespace(), Mock(), queue, Mock())
+    metrics_server = Mock()
+    api.bind_metrics_server(metrics_server)
+
+    with pytest.raises(OutboundShutdownTimeout, match="blocked send"):
+        api.stop_delivery_resources(2.5)
+
+    metrics_server.stop.assert_not_called()
+    api.bot_pool.shutdown.assert_not_called()
+
+
+def test_channel_shutdown_timeout_does_not_close_the_polling_runtime() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    channel.bot_manager = Mock()
+    channel.bot_manager.stop_channel_resources.side_effect = OutboundShutdownTimeout("blocked send")
+    channel.telegram_runtime = Mock()
+    channel.master_messages = Mock()
+    channel.db = Mock()
+
+    with pytest.raises(OutboundShutdownTimeout, match="blocked send"):
+        channel.stop_polling()
+
+    assert not channel._stop_polling_called
+    channel.telegram_runtime.stop.assert_not_called()
+    channel.master_messages.stop_worker.assert_not_called()
+    channel.db.stop_worker.assert_not_called()
 
 
 def test_metrics_server_stop_closes_an_unstarted_server_without_shutdown_or_join() -> None:
