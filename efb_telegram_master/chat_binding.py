@@ -77,6 +77,7 @@ class ChatListStorage:
     @chats.setter
     def chats(self, value: List[ETMChatType]):
         self.__chats = value
+        self.offset = 0
         self.channels = dict()
         for i in value:
             if i.module_id not in self.channels and i.module_id in coordinator.slaves:

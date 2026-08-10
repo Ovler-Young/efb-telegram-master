@@ -149,6 +149,51 @@ def test_link_exec_keeps_valid_manual_link_callback_active(callback_manager, cal
     assert storage_id in manager.link_handler._conversations
 
 
+@pytest.mark.parametrize(
+    ("linked", "callback", "expected_state"),
+    [
+        (False, "manual_link 0", Flags.LINK_EXEC),
+        (True, "unlink 0", ConversationHandler.END),
+    ],
+)
+def test_link_actions_accept_zero_index_after_second_page_selection(callback_manager, linked, callback, expected_state):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(207))
+    chats = [SimpleNamespace(module_id="tests.mocks.slave", full_name=f"Test chat {index}", linked=False) for index in range(10)]
+    selected_chat = SimpleNamespace(module_id="tests.mocks.slave", full_name="Selected chat", linked=linked, unlink=Mock())
+    chats.append(selected_chat)
+    _store_callback_session(manager, manager.link_handler, Flags.LINK_CONFIRM, storage_id, chats)
+    manager.msg_storage[storage_id].offset = manager.channel.flag("chats_per_page")
+    manager.logger = Mock()
+
+    with patch.object(manager, "_get_bot_user", return_value=SimpleNamespace(username="test_bot")):
+        assert manager.link_chat_confirm(_callback_update(*storage_id, "chat 10"), None) == Flags.LINK_EXEC
+
+    assert manager.msg_storage[storage_id].chats == [selected_chat]
+    with patch.object(manager.bot, "answer_callback_query"):
+        assert manager.link_chat_exec(_callback_update(*storage_id, callback), None) == expected_state
+
+    if linked:
+        selected_chat.unlink.assert_called_once_with()
+    else:
+        assert storage_id in manager.msg_storage
+
+
+@pytest.mark.parametrize("callback", ["manual_link 10", "unlink 10"])
+def test_link_actions_reject_stale_second_page_index_after_selection(callback_manager, callback):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(208))
+    selected_chat = SimpleNamespace(module_id="tests.mocks.slave", full_name="Selected chat", linked=False, unlink=Mock())
+    _store_callback_session(manager, manager.link_handler, Flags.LINK_EXEC, storage_id, [selected_chat])
+    manager.msg_storage[storage_id].offset = manager.channel.flag("chats_per_page")
+
+    with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"):
+        assert manager.link_chat_exec(_callback_update(*storage_id, callback), None) == ConversationHandler.END
+
+    selected_chat.unlink.assert_not_called()
+    assert storage_id not in manager.msg_storage
+
+
 def test_full_chat_pagination(channel, slave):
     storage_id = (TelegramChatID(0), TelegramMessageID(1))
     legends, buttons = channel.chat_binding.slave_chats_pagination(storage_id)
