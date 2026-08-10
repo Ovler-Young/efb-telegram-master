@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import collections
 import io
+import logging
+import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Mapping, Optional, TypeAlias
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence, TypeAlias
 
 import telegram.constants
 import telegram.error
@@ -68,6 +70,8 @@ TelegramArgs: TypeAlias = tuple[object, ...]
 TelegramKwargs: TypeAlias = dict[str, object]
 QueueFuture: TypeAlias = Future["SendReceipt"]
 
+logger = logging.getLogger(__name__)
+
 
 class QueueError(RuntimeError):
     pass
@@ -85,6 +89,20 @@ class ExecutorSubmitError(QueueError):
     pass
 
 
+@dataclass
+class UploadCleanup:
+    paths: tuple[str, ...] = ()
+    _cleaned: bool = field(default=False, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def claim_paths(self) -> tuple[str, ...]:
+        with self._lock:
+            if self._cleaned:
+                return ()
+            self._cleaned = True
+            return self.paths
+
+
 @dataclass(frozen=True)
 class QueueRequest:
     operation: str
@@ -93,6 +111,7 @@ class QueueRequest:
     telegram_chat_id: int
     slave_id: Optional[str] = None
     required_sender_bot_id: Optional[str] = None
+    cleanup: UploadCleanup = field(default_factory=UploadCleanup)
 
 
 @dataclass(frozen=True)
@@ -103,6 +122,7 @@ class QueuedCall:
     telegram_chat_id: int
     slave_id: Optional[str]
     required_sender_bot_id: Optional[str]
+    cleanup: UploadCleanup = field(default_factory=UploadCleanup)
 
 
 @dataclass(frozen=True)
@@ -150,6 +170,51 @@ def retry_after_seconds(error: RetryAfter) -> float:
 
 def _strip_private_queue_metadata(kwargs: Mapping[str, object]) -> TelegramKwargs:
     return {key: value for key, value in kwargs.items() if key not in _INTERNAL_KWARGS}
+
+
+def rewind_uploads(args: Sequence[object], kwargs: Mapping[str, object]) -> None:
+    """Return every file-like upload in a Telegram call to its initial position."""
+
+    seen: set[int] = set()
+
+    def visit(value: object) -> None:
+        value_id = id(value)
+        if value_id in seen:
+            return
+        seen.add(value_id)
+        seek = getattr(value, "seek", None)
+        if callable(seek):
+            seek(0)
+            return
+        if isinstance(value, telegram.InputFile):
+            visit(value.input_file_content)
+            return
+        if isinstance(value, telegram.InputMedia):
+            visit(value.media)
+            thumbnail = getattr(value, "thumbnail", None)
+            if thumbnail is not None:
+                visit(thumbnail)
+            return
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                visit(nested)
+            return
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for nested in value:
+                visit(nested)
+
+    for value in args:
+        visit(value)
+    for value in kwargs.values():
+        visit(value)
+
+
+def cleanup_upload_paths(cleanup: UploadCleanup) -> None:
+    for path in set(cleanup.claim_paths()):
+        try:
+            os.unlink(path)
+        except OSError as error:
+            logger.warning("Failed to remove queued upload %s (%s).", path, type(error).__name__)
 
 
 class SenderPolicy:
@@ -279,7 +344,7 @@ class TelegramCallAdapter:
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
             telegram_kwargs.pop("parse_mode")
-            self._rewind_files(telegram_args, telegram_kwargs)
+            rewind_uploads(telegram_args, telegram_kwargs)
             result = method(*telegram_args, **telegram_kwargs)
         if attachment is not None and content_key is not None and getattr(result, "message_id", None) is not None:
             extension = ".md" if original_parse_mode == "markdown" else ".html" if original_parse_mode == "html" else ".txt"
@@ -305,13 +370,6 @@ class TelegramCallAdapter:
         if parse_mode == "html":
             return "<html><head><meta charset='utf-8'></head><body><pre style='white-space:pre-wrap'>" + content + "</pre></body></html>"
         return content
-
-    @staticmethod
-    def _rewind_files(args: TelegramArgs, kwargs: Mapping[str, object]) -> None:
-        for value in (*args, *kwargs.values()):
-            seek = getattr(value, "seek", None)
-            if callable(seek):
-                seek(0)
 
 
 class OutboundQueue:
@@ -357,6 +415,7 @@ class OutboundQueue:
 
     def enqueue(self, request: QueueRequest) -> QueueFuture:
         if request.operation not in QUEUED_OPERATIONS:
+            cleanup_upload_paths(request.cleanup)
             raise QueueEnqueueError(f"Unsupported queued operation: {request.operation}")
         waiter: QueueFuture = Future()
         pending = _PendingCall(
@@ -367,11 +426,13 @@ class OutboundQueue:
                 request.telegram_chat_id,
                 request.slave_id,
                 request.required_sender_bot_id,
+                request.cleanup,
             ),
             waiter,
         )
         with self._lock:
             if self._stopping:
+                cleanup_upload_paths(request.cleanup)
                 raise SchedulerStoppedError("Outbound queue stopped.")
             self._pending.append(pending)
             self._wake_event.set()
@@ -444,7 +505,7 @@ class OutboundQueue:
                     continue
                 decision = self._sender_policy.select(pending.call, now)
                 if decision.error is not None:
-                    pending.waiter.set_exception(QueueError(decision.error.replace("_", " ")))
+                    self._complete_pending_locked(pending, error=QueueError(decision.error.replace("_", " ")))
                     self._capacity.release()
                     continue
                 if decision.selection is None:
@@ -460,7 +521,7 @@ class OutboundQueue:
                 try:
                     future = self._executor.submit(self._call_adapter.execute, pending.call, decision.selection)
                 except BaseException as error:
-                    pending.waiter.set_exception(ExecutorSubmitError(str(error)))
+                    self._complete_pending_locked(pending, error=ExecutorSubmitError(str(error)))
                     self._capacity.release()
                     continue
                 self._in_flight[future] = _SubmittedCall(pending, decision.selection)
@@ -475,19 +536,22 @@ class OutboundQueue:
                 self._in_flight_chats.discard(pending.call.telegram_chat_id)
                 self._capacity.release()
                 if pending.waiter.done():
+                    cleanup_upload_paths(pending.call.cleanup)
                     continue
                 try:
-                    pending.waiter.set_result(future.result())
+                    self._complete_pending_locked(pending, result=future.result())
                 except RetryAfter as error:
                     self._sender_policy.record_retry_after(pending.call, error, submitted.selection)
                     pending.retry_at = time.monotonic() + retry_after_seconds(error)
                     if not self._stopping:
                         self._pending.append(pending)
                     else:
-                        pending.waiter.set_exception(SchedulerStoppedError("Outbound queue stopped."))
+                        self._complete_pending_locked(pending, error=SchedulerStoppedError("Outbound queue stopped."))
+                except telegram.error.ChatMigrated as error:
+                    pending.waiter.set_exception(error)
                 except BaseException as error:
                     self._sender_policy.record_send_failure(pending.call, submitted.selection)
-                    pending.waiter.set_exception(error)
+                    self._complete_pending_locked(pending, error=error)
             if completed:
                 self._wake_event.set()
 
@@ -502,15 +566,24 @@ class OutboundQueue:
         with self._lock:
             error = SchedulerStoppedError("Outbound queue stopped.")
             for submitted in self._in_flight.values():
-                if not submitted.pending.waiter.done():
-                    submitted.pending.waiter.set_exception(error)
+                self._complete_pending_locked(submitted.pending, error=error)
 
     def _fail_pending_locked(self) -> None:
         error = SchedulerStoppedError("Outbound queue stopped.")
         while self._pending:
             pending = self._pending.popleft()
-            if not pending.waiter.done():
-                pending.waiter.set_exception(error)
+            self._complete_pending_locked(pending, error=error)
+
+    @staticmethod
+    def _complete_pending_locked(pending: _PendingCall, *, result: Optional[SendReceipt] = None, error: Optional[BaseException] = None) -> None:
+        cleanup_upload_paths(pending.call.cleanup)
+        if pending.waiter.done():
+            return
+        if error is not None:
+            pending.waiter.set_exception(error)
+        else:
+            assert result is not None
+            pending.waiter.set_result(result)
 
     def _finalize_resources(self) -> None:
         with self._lock:

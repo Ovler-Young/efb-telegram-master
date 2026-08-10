@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from telegram import InputFile, InputMediaVideo
 from telegram.constants import MessageLimit
 from telegram.error import BadRequest, RetryAfter
 
@@ -17,7 +18,9 @@ from efb_telegram_master.outbound import (
     QueueRequest,
     SenderSelection,
     TelegramCallAdapter,
+    UploadCleanup,
     retry_after_seconds,
+    rewind_uploads,
 )
 
 
@@ -202,6 +205,125 @@ def test_adapter_rewinds_files_before_retrying_entity_parse_failure() -> None:
     )
 
     assert positions == [0, 0]
+
+
+def test_rewind_uploads_recursively_rewinds_input_media_and_nested_containers() -> None:
+    media_source = io.BytesIO(b"media")
+    thumbnail_source = io.BytesIO(b"thumbnail")
+    nested_source = io.BytesIO(b"nested")
+    media = InputMediaVideo(
+        InputFile(media_source, read_file_handle=False),
+        thumbnail=InputFile(thumbnail_source, read_file_handle=False),
+    )
+    for source in (media_source, thumbnail_source, nested_source):
+        source.seek(1)
+
+    rewind_uploads(({"media": [media, {"nested": nested_source}]},), {})
+
+    assert [source.tell() for source in (media_source, thumbnail_source, nested_source)] == [0, 0, 0]
+
+
+def test_adapter_aborts_parse_retry_when_upload_cannot_rewind() -> None:
+    class UnrewindableUpload:
+        def seek(self, _offset):
+            raise OSError("rewind failed")
+
+    sender = Mock()
+    sender.send_photo.side_effect = BadRequest("Can't parse entities")
+
+    with pytest.raises(OSError, match="rewind failed"):
+        TelegramCallAdapter(None).execute(
+            QueuedCall("send_photo", (1, UnrewindableUpload()), {"caption": "caption", "parse_mode": "HTML"}, 1, None, None),
+            SenderSelection(sender, None),
+        )
+
+    assert sender.send_photo.call_count == 1
+
+
+def test_queue_cleans_owned_upload_after_terminal_failure(tmp_path) -> None:
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"upload")
+
+    class Sender:
+        def send_document(self, *, chat_id, document):
+            raise ValueError(f"cannot send {document} to {chat_id}")
+
+    queue = _queue(Sender(), worker_count=1)
+    try:
+        waiter = queue.enqueue(QueueRequest("send_document", (), {"chat_id": 1, "document": upload.as_uri()}, 1, cleanup=UploadCleanup((str(upload),))))
+        with pytest.raises(ValueError, match="cannot send"):
+            waiter.result(1)
+        assert not upload.exists()
+    finally:
+        queue.stop()
+
+
+def test_queue_preserves_owned_upload_through_retry_after(tmp_path) -> None:
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"upload")
+    first_attempt = threading.Event()
+    attempts = 0
+
+    class Sender:
+        def send_document(self, *, chat_id, document):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_attempt.set()
+                raise RetryAfter(0.1)
+            return document
+
+    queue = _queue(Sender(), worker_count=1)
+    try:
+        waiter = queue.enqueue(QueueRequest("send_document", (), {"chat_id": 1, "document": upload.as_uri()}, 1, cleanup=UploadCleanup((str(upload),))))
+        assert first_attempt.wait(1)
+        assert upload.exists()
+        assert waiter.result(1).message == upload.as_uri()
+        assert not upload.exists()
+    finally:
+        queue.stop()
+
+
+def test_queue_preserves_owned_upload_after_caller_timeout(tmp_path) -> None:
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"upload")
+    started = threading.Event()
+    release = threading.Event()
+
+    class Sender:
+        def send_document(self, *, chat_id, document):
+            started.set()
+            assert release.wait(1)
+            return document
+
+    queue = OutboundQueue(Sender(), None, _Limiter(), worker_count=1, blocking_timeout=0.01, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
+    queue.start()
+    try:
+        with pytest.raises(RuntimeError, match="timed out"):
+            queue.enqueue_and_wait(QueueRequest("send_document", (), {"chat_id": 1, "document": upload.as_uri()}, 1, cleanup=UploadCleanup((str(upload),))))
+        assert started.wait(1)
+        assert upload.exists()
+        release.set()
+        deadline = time.monotonic() + 1
+        while upload.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not upload.exists()
+    finally:
+        release.set()
+        queue.stop()
+
+
+def test_queue_cleans_owned_upload_when_shutdown_cancels_pending_call(tmp_path) -> None:
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"upload")
+    queue = OutboundQueue(Mock(), None, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
+
+    waiter = queue.enqueue(QueueRequest("send_document", (), {"chat_id": 1, "document": upload.as_uri()}, 1, cleanup=UploadCleanup((str(upload),))))
+    queue.stop()
+
+    with pytest.raises(Exception, match="Outbound queue stopped"):
+        waiter.result()
+    assert not upload.exists()
 
 
 def test_queue_propagates_terminal_sender_failure() -> None:

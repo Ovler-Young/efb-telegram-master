@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import html
 import numbers
-import os
 import threading
 from collections.abc import Callable, Mapping
 from functools import wraps
@@ -15,7 +14,18 @@ from telegram import File, ForumTopic, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext
 
 from .bot_pool import BotPool
-from .outbound import QUEUED_OPERATIONS, OutboundQueue, QueueEnqueueError, QueueRequest, SendReceipt, _strip_private_queue_metadata
+from .outbound import (
+    QUEUED_OPERATIONS,
+    OutboundQueue,
+    QueueEnqueueError,
+    QueueRequest,
+    SchedulerStoppedError,
+    SendReceipt,
+    UploadCleanup,
+    _strip_private_queue_metadata,
+    cleanup_upload_paths,
+    rewind_uploads,
+)
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -84,6 +94,11 @@ class TelegramAPI:
             try:
                 return function(self, *args, **kwargs)
             except telegram.error.ChatMigrated as error:
+                try:
+                    rewind_uploads(args, kwargs)
+                except BaseException:
+                    cleanup_upload_paths(self._claim_pending_upload_cleanup())
+                    raise
                 if "chat_id" in kwargs:
                     chat_id = kwargs["chat_id"]
                     self._channel.chat_binding.chat_migration_by_id(chat_id, error.new_chat_id)
@@ -129,15 +144,24 @@ class TelegramAPI:
         required_sender_bot_id = str(sender_bot_id) if sender_bot_id and not eventual_capable else None
         if force_main_bot or (eventual_capable and _has_callback_keyboard(queued_kwargs.get("reply_markup"))) or (not eventual_capable and required_sender_bot_id is None):
             required_sender_bot_id = "__main__"
-        cleanup_files = getattr(self._cleanup_tls, "pending_cleanup", [])[:]
+        return self._enqueue_request(
+            QueueRequest(operation, args, queued_kwargs, normalized_chat_id, str(slave_id) if slave_id else None, required_sender_bot_id, self._claim_pending_upload_cleanup())
+        )
+
+    def _claim_pending_upload_cleanup(self) -> UploadCleanup:
+        cleanup = UploadCleanup(tuple(getattr(self._cleanup_tls, "pending_cleanup", [])))
         self._cleanup_tls.pending_cleanup = []
-        receipt = self._outbound_queue.enqueue_and_wait(QueueRequest(operation, args, queued_kwargs, normalized_chat_id, str(slave_id) if slave_id else None, required_sender_bot_id))
-        for path in cleanup_files:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-        return receipt
+        return cleanup
+
+    def _enqueue_request(self, request: QueueRequest) -> SendReceipt:
+        try:
+            return self._outbound_queue.enqueue_and_wait(request)
+        except telegram.error.ChatMigrated:
+            self._cleanup_tls.pending_cleanup = [*getattr(self._cleanup_tls, "pending_cleanup", []), *request.cleanup.paths]
+            raise
+        except (QueueEnqueueError, SchedulerStoppedError):
+            cleanup_upload_paths(request.cleanup)
+            raise
 
     def _call_direct_operation(self, operation: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> object:
         return getattr(self._bot, operation)(*args, **_strip_private_queue_metadata(kwargs))
@@ -145,7 +169,7 @@ class TelegramAPI:
     def _enqueue_main_chat_mutation(self, operation: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> SendReceipt:
         telegram_kwargs = _strip_private_queue_metadata(kwargs)
         target_chat_id = self._normalize_telegram_chat_id(self._queued_chat_id_argument(operation, args, telegram_kwargs))
-        return self._outbound_queue.enqueue_and_wait(QueueRequest(operation, args, dict(telegram_kwargs), target_chat_id, required_sender_bot_id="__main__"))
+        return self._enqueue_request(QueueRequest(operation, args, dict(telegram_kwargs), target_chat_id, required_sender_bot_id="__main__", cleanup=self._claim_pending_upload_cleanup()))
 
     @_retry_on_chat_migration
     def send_message(self, *args: object, prefix: str = "", suffix: str = "", **kwargs: object) -> SendReceipt:
@@ -243,7 +267,9 @@ class TelegramAPI:
 
     def delete_message(self, chat_id: int, message_id: int, _sender_bot_id: object = None) -> SendReceipt:
         required_sender = str(_sender_bot_id) if _sender_bot_id else "__main__"
-        return self._outbound_queue.enqueue_and_wait(QueueRequest("delete_message", (chat_id, message_id), {}, self._normalize_telegram_chat_id(chat_id), required_sender_bot_id=required_sender))
+        return self._enqueue_request(
+            QueueRequest("delete_message", (chat_id, message_id), {}, self._normalize_telegram_chat_id(chat_id), required_sender_bot_id=required_sender, cleanup=self._claim_pending_upload_cleanup())
+        )
 
     @_retry_on_chat_migration
     def answer_callback_query(self, *args: object, prefix: str = "", suffix: str = "", text: str | None = None, **kwargs: object):

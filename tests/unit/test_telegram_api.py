@@ -1,3 +1,4 @@
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -5,7 +6,7 @@ import pytest
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import ChatMigrated
 
-from efb_telegram_master.outbound import SendReceipt
+from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, SendReceipt
 from efb_telegram_master.telegram_api import TelegramAPI
 
 
@@ -255,3 +256,76 @@ def test_forward_message_retries_after_chat_migration_and_waits_for_receipt() ->
     assert receipt.message_id == 5
     assert [request.kwargs["chat_id"] for request in queue.requests] == [1, 4]
     chat_binding.chat_migration_by_id.assert_called_once_with(1, 4)
+
+
+def test_chat_migration_retry_rewinds_an_exhausted_upload() -> None:
+    api, _bot, queue, chat_binding = _api()
+    photo = BytesIO(b"photo")
+    uploaded = []
+
+    def migrate_then_succeed(request):
+        source = request.args[1]
+        uploaded.append(source.read())
+        if len(uploaded) == 1:
+            raise ChatMigrated(4)
+        return SendReceipt(SimpleNamespace(message_id=5))
+
+    queue.side_effect = migrate_then_succeed
+
+    receipt = api.send_photo(1, photo)
+
+    assert receipt.message_id == 5
+    assert uploaded == [b"photo", b"photo"]
+    chat_binding.chat_migration_by_id.assert_called_once_with(1, 4)
+
+
+def test_api_cleans_claimed_upload_when_enqueue_fails(tmp_path) -> None:
+    api, _bot, queue, _chat_binding = _api()
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"upload")
+    api._cleanup_tls.pending_cleanup = [str(upload)]
+    queue.side_effect = lambda _request: (_ for _ in ()).throw(QueueEnqueueError("queue rejected request"))
+
+    with pytest.raises(QueueEnqueueError, match="queue rejected request"):
+        api.send_document(1, upload.as_uri())
+
+    assert not upload.exists()
+
+
+def test_chat_migration_preserves_owned_upload_until_the_retried_request_finishes(tmp_path) -> None:
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"upload")
+    attempts = 0
+
+    class Limiter:
+        def peek_delay(self, _chat_id):
+            return 0.0
+
+        def try_acquire(self, _chat_id):
+            return True
+
+        def occupancy_snapshot(self):
+            return {"global": 0.0, "chat": 0.0}
+
+    class Sender:
+        def send_document(self, chat_id, document, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ChatMigrated(2)
+            assert upload.exists()
+            return SimpleNamespace(message_id=5)
+
+    queue = OutboundQueue(Sender(), None, Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
+    queue.start()
+    try:
+        api = TelegramAPI(SimpleNamespace(chat_binding=Mock()), Sender(), queue, None)
+        api._cleanup_tls.pending_cleanup = [str(upload)]
+
+        receipt = api.send_document(1, upload.as_uri())
+
+        assert receipt.message_id == 5
+        assert attempts == 2
+        assert not upload.exists()
+    finally:
+        queue.stop()
