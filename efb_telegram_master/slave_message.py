@@ -263,6 +263,8 @@ class SlaveMessageProcessor(LocaleMixin):
             log = self.db.get_msg_log(slave_msg_id=msg.target.uid, slave_origin_uid=utils.chat_id_to_str(chat=msg.target.chat))
             if not log:
                 self.logger.debug("[%s] Target message %s is not found in database.", msg.uid, msg.target.uid)
+            elif log.provenance == "mtproto_ingested":
+                self.logger.info("[%s] Ignoring reply to ingested synthetic message %s.", msg.uid, msg.target.uid)
             else:
                 self.logger.debug("[%s] Target message maps to Telegram message %s.", msg.uid, log.master_msg_id)
                 target_msg = utils.message_id_str_to_id(utils.TgChatMsgIDStr(log.master_msg_id))

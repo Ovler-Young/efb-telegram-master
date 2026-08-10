@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+from ehforwarderbot import Message
 from ehforwarderbot.constants import MsgType
+from ehforwarderbot.types import MessageID
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
@@ -62,6 +65,26 @@ def test_ingested_rows_are_not_remote_get_or_reaction_targets():
     processor.update_reactions(SimpleNamespace(chat=chat, msg_id="mtproto-ingested:100.1", reactions={}))
 
     processor.logger.info.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("provenance", "expected_target_msg_id"),
+    [("mtproto_ingested", None), ("live", 456)],
+)
+def test_dispatch_reply_target_respects_provenance(provenance, expected_target_msg_id):
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.logger = Mock()
+    processor.db = SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(master_msg_id="123.456", provenance=provenance)))
+    processor.chat_manager = Mock()
+    processor.channel = SimpleNamespace(commands=SimpleNamespace(register_command=Mock()))
+    processor.slave_message_text = Mock(return_value=None)
+    processor._release_pending_slave_message = Mock()
+    target = Message(uid=MessageID("recovered"), chat=SimpleNamespace(module_id="tests.slave", uid="chat"))
+    message = Message(uid=MessageID("reply"), chat=SimpleNamespace(module_id="tests.slave", uid="chat"), target=target, text="reply", type=MsgType.Text)
+
+    processor.dispatch_message(message, "", None, 123, None)
+
+    assert processor.slave_message_text.call_args.args[6] == expected_target_msg_id
 
 
 def test_ordinary_send_writes_msglog_once_and_releases_completion(monkeypatch):
