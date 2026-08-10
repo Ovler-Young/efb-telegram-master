@@ -830,7 +830,7 @@ For details on how to setup a webhook, please visit this `wiki article`_.
 Development notes (CI and tooling)
 ----------------------------------
 
-- Run ``doit quality`` for the read-only YAML and README lint checks. CI runs
+- Run ``doit quality`` for Ruff, mypy, YAML, and README RST checks. CI runs
   the same command after installing the ``tests`` extra.
 - **CI Python versions**: GitHub Actions workflows in this branch run tests on
   Python 3.10+ (and use Python 3.10 for Crowdin tasks).

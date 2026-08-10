@@ -7,6 +7,14 @@ from doit.action import CmdAction
 PACKAGE = "efb_telegram_master"
 QUALITY_PATHS = [PACKAGE, "tests"]
 README_BASE = "./README.rst"
+QUALITY_FILES = (
+    glob.glob(f"./{PACKAGE}/**/*.py", recursive=True)
+    + glob.glob("./tests/**/*.py", recursive=True)
+    + glob.glob("./**/*.yaml", recursive=True)
+    + glob.glob("./**/*.yml", recursive=True)
+    + glob.glob("./.github/workflows/*.yml")
+    + [README_BASE, ".pre-commit-config.yaml", "dodo.py", "pyproject.toml", "setup.py"]
+)
 DEFAULT_BUMP_MODE = "patch"
 # major, minor, patch, alpha, beta, dev, post
 DOIT_CONFIG = {
@@ -19,8 +27,10 @@ def task_quality():
         "actions": [
             ["ruff", "check", *QUALITY_PATHS],
             ["ruff", "format", "--check", *QUALITY_PATHS],
+            ["pre-commit", "run", "check-yaml", "--all-files"],
+            ["pre-commit", "run", "rst-linter", "--all-files"],
         ],
-        "file_dep": [".pre-commit-config.yaml", "pyproject.toml", README_BASE, "setup.py"],
+        "file_dep": QUALITY_FILES,
         "task_dep": ["mypy"],
     }
 
