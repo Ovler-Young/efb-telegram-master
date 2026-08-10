@@ -1,3 +1,5 @@
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -86,10 +88,10 @@ def test_check_membership_tri_returns_unknown_while_refreshing_stale_entry():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token")
 
-    with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0):
+    with patch("efb_telegram_master.auxiliary_bot.time.monotonic", return_value=1000.0):
         aux_bot.update_membership(2000, True)
 
-    with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), patch.object(aux_bot, "_start_membership_probe") as start_probe:
+    with patch("efb_telegram_master.auxiliary_bot.time.monotonic", return_value=1000.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), patch.object(aux_bot, "_start_membership_probe") as start_probe:
         assert aux_bot.check_membership_tri(2000) is None
 
     start_probe.assert_called_once_with(2000)
@@ -148,3 +150,99 @@ def test_probe_membership_forbidden_marks_non_member_without_disabling():
 
     assert aux_bot.check_membership_tri(4000) is False
     assert aux_bot.disabled is False
+
+
+def test_membership_cache_expiry_uses_monotonic_time() -> None:
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+
+    with patch("efb_telegram_master.auxiliary_bot.time.monotonic", return_value=100.0):
+        aux_bot.update_membership(100, True)
+
+    with patch("efb_telegram_master.auxiliary_bot.time.monotonic", return_value=100.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), patch.object(aux_bot, "_start_membership_probe") as start_probe:
+        assert aux_bot.check_membership_tri(100) is None
+
+    start_probe.assert_called_once_with(100)
+
+
+def test_membership_probes_are_bounded_for_many_unknown_chats() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
+        started.set()
+        assert release.wait(1)
+        return SimpleNamespace(status="member")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"), patch.object(AuxiliaryBot, "MAX_PENDING_MEMBERSHIP_PROBES", 2):
+        aux_bot = AuxiliaryBot("123:token")
+    aux_bot.bot_id = 123
+    aux_bot.async_bot.get_chat_member.side_effect = get_chat_member
+    for chat_id in range(10):
+        assert aux_bot.check_membership_tri(chat_id) is None
+
+    assert started.wait(1)
+    with aux_bot._membership_lock:
+        assert len(aux_bot._pending_probes) == 2
+    release.set()
+    aux_bot.shutdown(time.monotonic() + 1)
+
+
+def test_shutdown_rejects_new_membership_probes() -> None:
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+
+    aux_bot.begin_membership_shutdown()
+    assert aux_bot.check_membership_tri(100) is None
+    assert aux_bot.has_pending_probes() is False
+
+
+def test_network_exception_is_not_cached_as_non_membership() -> None:
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
+        bot_cls.return_value.get_chat_member.side_effect = OSError("network unavailable")
+        aux_bot = AuxiliaryBot("123:token")
+        aux_bot.bot_id = 123
+
+    aux_bot._probe_membership(4000)
+
+    with aux_bot._membership_lock:
+        assert 4000 not in aux_bot._membership_cache
+
+
+def test_membership_cache_evicts_the_least_recently_used_entry() -> None:
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"), patch.object(AuxiliaryBot, "MAX_MEMBERSHIP_CACHE_ENTRIES", 2):
+        aux_bot = AuxiliaryBot("123:token")
+
+    aux_bot.update_membership(1, True)
+    aux_bot.update_membership(2, True)
+    assert aux_bot.check_membership_tri(1) is True
+    aux_bot.update_membership(3, True)
+
+    with aux_bot._membership_lock:
+        assert list(aux_bot._membership_cache) == [1, 3]
+
+
+def test_shutdown_cancels_queued_membership_probes() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
+        started.set()
+        assert release.wait(1)
+        return SimpleNamespace(status="member")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"), patch.object(AuxiliaryBot, "MEMBERSHIP_PROBE_WORKERS", 1), patch.object(AuxiliaryBot, "MAX_PENDING_MEMBERSHIP_PROBES", 2):
+        aux_bot = AuxiliaryBot("123:token")
+    aux_bot.bot_id = 123
+    aux_bot.async_bot.get_chat_member.side_effect = get_chat_member
+
+    aux_bot.check_membership_tri(1)
+    assert started.wait(1)
+    aux_bot.check_membership_tri(2)
+    aux_bot.begin_membership_shutdown()
+
+    with aux_bot._membership_lock:
+        assert aux_bot._pending_probes == {1}
+    release.set()
+    aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
+    assert aux_bot.has_pending_probes() is False

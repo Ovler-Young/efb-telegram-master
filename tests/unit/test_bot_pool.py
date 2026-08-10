@@ -153,3 +153,33 @@ def test_successful_membership_recheck_discards_stale_affinities_and_deduplicate
 
     assert pool.preferred_sender("slave-a") is auxiliary
     assert pool.preferred_sender("slave-b") is None
+
+
+def test_shutdown_uses_one_deadline_for_all_bots_and_disables_affinity_callbacks(monkeypatch) -> None:
+    first = bot(10)
+    second = bot(20)
+    pool = BotPool([first, second])
+    observed_deadlines: list[float] = []
+    now = [10.0]
+
+    def begin_shutdown() -> None:
+        return None
+
+    def wait_for_membership_shutdown(deadline: float) -> None:
+        observed_deadlines.append(deadline)
+        now[0] += 3.0
+
+    first.begin_membership_shutdown.side_effect = begin_shutdown
+    second.begin_membership_shutdown.side_effect = begin_shutdown
+    first.wait_for_membership_shutdown.side_effect = wait_for_membership_shutdown
+    second.wait_for_membership_shutdown.side_effect = wait_for_membership_shutdown
+    monkeypatch.setattr("efb_telegram_master.bot_pool.time.monotonic", lambda: now[0])
+
+    pool.record_successful_auxiliary_send("slave-a", 10)
+    pool._membership_failure_slaves[(10, 100)] = {"slave-a"}
+    pool.shutdown()
+    first._membership_changed_callback(first, 100, False)
+
+    assert observed_deadlines == [15.0, 15.0]
+    assert pool.preferred_sender("slave-a") is first
+    assert pool._membership_failure_slaves == {(10, 100): {"slave-a"}}

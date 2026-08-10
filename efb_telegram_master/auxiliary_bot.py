@@ -3,7 +3,9 @@
 import logging
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, TypeVar, overload
 
 import telegram
@@ -49,6 +51,9 @@ class AuxiliaryBot:
 
     MEMBERSHIP_TTL_MEMBER = 1800.0  # 30 min for confirmed member
     MEMBERSHIP_TTL_NOT_MEMBER = 300.0  # 5 min for non-member (re-check sooner)
+    MEMBERSHIP_PROBE_WORKERS = 2
+    MAX_PENDING_MEMBERSHIP_PROBES = 32
+    MAX_MEMBERSHIP_CACHE_ENTRIES = 512
 
     def __init__(self, token: str, *, request_kwargs: Optional[dict[str, object]] = None, base_url: Optional[str] = None, base_file_url: Optional[str] = None, local_mode: bool = False):
         self._token = token
@@ -74,10 +79,14 @@ class AuxiliaryBot:
 
         self._rate_limiter = SlidingWindowRateLimiter()
 
-        # Membership cache: chat_id -> (is_member, wall-clock timestamp)
-        self._membership_cache: dict[int, tuple[bool, float]] = {}
+        # Membership cache: chat_id -> (is_member, monotonic timestamp).
+        self._membership_cache: OrderedDict[int, tuple[bool, float]] = OrderedDict()
         self._membership_lock = threading.Lock()
         self._pending_probes: set[int] = set()
+        self._max_membership_cache_entries = self.MAX_MEMBERSHIP_CACHE_ENTRIES
+        self._membership_probe_slots = threading.BoundedSemaphore(self.MAX_PENDING_MEMBERSHIP_PROBES)
+        self._membership_probe_executor = ThreadPoolExecutor(max_workers=self.MEMBERSHIP_PROBE_WORKERS, thread_name_prefix="ETM-membership")
+        self._membership_stopping = False
         self._metrics: MembershipProbeMetrics | None = None
         self._membership_changed_callback: Optional[Callable[["AuxiliaryBot", int, bool], None]] = None
 
@@ -160,11 +169,13 @@ class AuxiliaryBot:
     def get_known_member_chat_ids(self) -> set[int]:
         """Return chat IDs where this bot is currently cached as a member."""
         with self._membership_lock:
+            self._purge_expired_membership_cache_locked(time.monotonic())
             return {chat_id for chat_id, (is_member, _timestamp) in self._membership_cache.items() if is_member}
 
     def get_membership_cache_snapshot(self) -> dict[str, int]:
         """Return membership cache counts without exposing chat IDs."""
         with self._membership_lock:
+            self._purge_expired_membership_cache_locked(time.monotonic())
             member_count = sum(1 for is_member, _timestamp in self._membership_cache.values() if is_member)
             not_member_count = sum(1 for is_member, _timestamp in self._membership_cache.values() if not is_member)
             pending_count = len(self._pending_probes)
@@ -192,9 +203,11 @@ class AuxiliaryBot:
             if entry is not None:
                 is_member, timestamp = entry
                 ttl = self.MEMBERSHIP_TTL_MEMBER if is_member else self.MEMBERSHIP_TTL_NOT_MEMBER
-                age = time.time() - timestamp
+                age = time.monotonic() - timestamp
                 if age < ttl:
+                    self._membership_cache.move_to_end(chat_id)
                     return is_member
+                del self._membership_cache[chat_id]
                 need_probe = True
 
         if need_probe:
@@ -207,9 +220,13 @@ class AuxiliaryBot:
     def update_membership(self, chat_id: int, is_member: bool) -> None:
         """Update the membership cache directly (e.g. from chat_left handler)."""
         with self._membership_lock:
-            self._membership_cache[chat_id] = (is_member, time.time())
-        if self._membership_changed_callback is not None:
-            self._membership_changed_callback(self, chat_id, is_member)
+            self._membership_cache[chat_id] = (is_member, time.monotonic())
+            self._membership_cache.move_to_end(chat_id)
+            while len(self._membership_cache) > self._max_membership_cache_entries:
+                self._membership_cache.popitem(last=False)
+            callback = self._membership_changed_callback
+        if callback is not None:
+            callback(self, chat_id, is_member)
 
     def recheck_membership(self, chat_id: int) -> None:
         """Discard cached membership and asynchronously probe its current value."""
@@ -221,14 +238,20 @@ class AuxiliaryBot:
         self._start_membership_probe(chat_id)
 
     def _start_membership_probe(self, chat_id: int) -> None:
-        """Start a background thread to check membership via get_chat_member API."""
+        """Queue a bounded background membership probe when the bot is running."""
         with self._membership_lock:
-            if chat_id in self._pending_probes:
+            if self._membership_stopping or chat_id in self._pending_probes:
+                return
+            if not self._membership_probe_slots.acquire(blocking=False):
+                self._record_membership_probe("queue_full")
                 return
             self._pending_probes.add(chat_id)
-
-        thread = threading.Thread(target=self._probe_membership, args=(chat_id,), daemon=True, name=f"AuxBotMemberProbe-{self.bot_id}-{chat_id}")
-        thread.start()
+        try:
+            future = self._membership_probe_executor.submit(self._probe_membership, chat_id)
+        except RuntimeError:
+            self._finish_membership_probe(chat_id)
+            return
+        future.add_done_callback(lambda _future: self._finish_membership_probe(chat_id))
 
     def _probe_membership(self, chat_id: int) -> None:
         """Background probe: call get_chat_member and update cache."""
@@ -247,12 +270,44 @@ class AuxiliaryBot:
             self._record_membership_probe("bad_request")
             logger.debug("Membership probe for bot %d in chat %d failed: %s", self.bot_id, chat_id, e)
         except Exception as e:
-            self.update_membership(chat_id, False)
             self._record_membership_probe("error")
             logger.warning("Membership probe failed for bot %d in chat %d: %s", self.bot_id, chat_id, e)
-        finally:
-            with self._membership_lock:
-                self._pending_probes.discard(chat_id)
+
+    def _finish_membership_probe(self, chat_id: int) -> None:
+        with self._membership_lock:
+            if chat_id not in self._pending_probes:
+                return
+            self._pending_probes.remove(chat_id)
+            self._membership_probe_slots.release()
+
+    def _purge_expired_membership_cache_locked(self, now: float) -> None:
+        expired_chat_ids = [
+            chat_id for chat_id, (is_member, timestamp) in self._membership_cache.items() if now - timestamp >= (self.MEMBERSHIP_TTL_MEMBER if is_member else self.MEMBERSHIP_TTL_NOT_MEMBER)
+        ]
+        for chat_id in expired_chat_ids:
+            del self._membership_cache[chat_id]
+
+    def begin_membership_shutdown(self) -> None:
+        """Reject new probes and cancel queued work without waiting under a lock."""
+        with self._membership_lock:
+            if self._membership_stopping:
+                return
+            self._membership_stopping = True
+            self._membership_changed_callback = None
+        self._membership_probe_executor.shutdown(wait=False, cancel_futures=True)
+
+    def wait_for_membership_shutdown(self, deadline: float) -> None:
+        """Wait only until the caller-owned absolute shutdown deadline."""
+        while self.has_pending_probes():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.01, remaining))
+
+    def shutdown(self, deadline: float) -> None:
+        """Stop accepting membership probes and wait until an absolute deadline."""
+        self.begin_membership_shutdown()
+        self.wait_for_membership_shutdown(deadline)
 
     def has_pending_probes(self) -> bool:
         """Check if there are any pending membership probes."""

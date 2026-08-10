@@ -75,6 +75,7 @@ class BotPool:
         self._bots = aux_bots
         self._bot_by_id = {bot.bot_id: bot for bot in aux_bots}
         self._lock = threading.Lock()
+        self._membership_stopping = False
         self._preferred_sender_by_slave_id: dict[str, int] = {}
         self._membership_failure_slaves: dict[tuple[int, int], set[str]] = {}
         for bot in aux_bots:
@@ -83,6 +84,8 @@ class BotPool:
     def _membership_changed(self, bot: AuxiliaryBot, chat_id: int, is_member: bool) -> None:
         key = (bot.bot_id, chat_id)
         with self._lock:
+            if self._membership_stopping:
+                return
             slave_ids = self._membership_failure_slaves.pop(key, set())
             if is_member:
                 return
@@ -127,6 +130,8 @@ class BotPool:
         if bot is None or bot.disabled:
             return
         with self._lock:
+            if self._membership_stopping:
+                return
             self._preferred_sender_by_slave_id[slave_id] = bot.bot_id
 
     def remove_affinity_for_bot(self, bot_id: str | int) -> None:
@@ -146,8 +151,10 @@ class BotPool:
             normalized_bot_id = int(bot_id)
         except (TypeError, ValueError):
             return
-        if slave_id is not None:
-            with self._lock:
+        with self._lock:
+            if self._membership_stopping:
+                return
+            if slave_id is not None:
                 self._membership_failure_slaves.setdefault((normalized_bot_id, chat_id), set()).add(slave_id)
         bot = self.get_bot_by_id(normalized_bot_id)
         if bot is not None and not bot.disabled:
@@ -175,9 +182,14 @@ class BotPool:
     def shutdown(self) -> None:
         """Wait up to five seconds for asynchronous membership probes."""
         deadline = time.monotonic() + 5.0
+        with self._lock:
+            if self._membership_stopping:
+                return
+            self._membership_stopping = True
         for bot in self._bots:
-            while bot.has_pending_probes() and time.monotonic() < deadline:
-                time.sleep(0.1)
+            bot.begin_membership_shutdown()
+        for bot in self._bots:
+            bot.wait_for_membership_shutdown(deadline)
 
     def auxiliary_count_snapshot(self) -> dict[str, int]:
         """Return configured auxiliary counts grouped by enabled state."""
