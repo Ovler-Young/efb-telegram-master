@@ -23,6 +23,8 @@ from peewee import (
     IntegerField,
     IntegrityError,
     Model,
+    PostgresqlDatabase,
+    SqliteDatabase,
     TextField,
     fn,
 )
@@ -356,6 +358,26 @@ class DatabaseManager:
                 MsgLogIngestionScan,
             ]
         )
+        DatabaseManager._ensure_msglog_provenance()
+
+    @staticmethod
+    def _ensure_msglog_provenance() -> None:
+        """Add the required MsgLog provenance column to databases created before it existed."""
+        current_database = database.obj
+        transaction_arguments: Tuple[str, ...] = ()
+        if isinstance(current_database, SqliteDatabase):
+            transaction_arguments = ("IMMEDIATE",)
+        elif isinstance(current_database, PostgresqlDatabase):
+            pass
+        else:
+            raise TypeError(f"Unsupported database backend: {type(current_database).__name__}")
+
+        with current_database.atomic(*transaction_arguments):
+            if isinstance(current_database, PostgresqlDatabase):
+                current_database.execute_sql('LOCK TABLE "msglog" IN ACCESS EXCLUSIVE MODE')
+            column_names = {column.name for column in current_database.get_columns(MsgLog._meta.table_name)}
+            if "provenance" not in column_names:
+                current_database.execute_sql('ALTER TABLE "msglog" ADD COLUMN "provenance" TEXT NOT NULL DEFAULT \'live\'')
 
     def _observe_legacy_outbound_rows(self) -> None:
         """Report retained workflow rows without loading or changing them."""
