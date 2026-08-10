@@ -12,23 +12,66 @@ from efb_telegram_master.chat_binding import ChatBindingManager
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageProcessor
 
 
-def test_sync_msglog_requires_admin_and_a_bound_forum_group():
+@pytest.fixture
+def sync_msglog_channel():
     channel = object.__new__(TelegramChannel)
     channel.config = {"admins": [10]}
     channel.db = SimpleNamespace(get_topic_slaves=Mock(return_value=[("tests.slave", 7)]))
     channel.chat_binding = SimpleNamespace(schedule_msglog_ingestion=Mock(return_value="started"))
     channel.bot_manager = SimpleNamespace(api=SimpleNamespace(send_message=Mock()))
     channel.translator = SimpleNamespace(gettext=lambda text: text)
+    return channel
+
+
+def sync_msglog_update(*, user_id=10, is_forum=True):
     message = Mock()
-    message.chat = SimpleNamespace(id=100, is_forum=True)
-    message.from_user = SimpleNamespace(id=10)
-    update = Update(update_id=1, message=message)
+    message.chat = SimpleNamespace(id=100, is_forum=is_forum)
+    message.from_user = SimpleNamespace(id=user_id)
+    message.message_thread_id = None
+    return Update(update_id=1, message=message)
 
-    TelegramChannel.sync_msglog(channel, update, SimpleNamespace())
-    message.from_user.id = 11
-    TelegramChannel.sync_msglog(channel, update, SimpleNamespace())
 
+def test_sync_msglog_schedules_for_admin_in_bound_forum_group(sync_msglog_channel):
+    channel = sync_msglog_channel
+
+    TelegramChannel.sync_msglog(channel, sync_msglog_update(), SimpleNamespace())
+
+    channel.db.get_topic_slaves.assert_called_once_with(100)
     channel.chat_binding.schedule_msglog_ingestion.assert_called_once_with(100)
+    channel.bot_manager.api.send_message.assert_called_once_with(100, text="MsgLog sync started for this group.")
+
+
+@pytest.mark.parametrize(
+    ("user_id", "is_forum", "bound_topics", "expected_reply", "topic_lookup_expected"),
+    [
+        (11, True, [("tests.slave", 7)], "This command is for ETM admins only.", False),
+        (10, False, [("tests.slave", 7)], "This command must be used in a bound forum group.", False),
+        (10, True, [], "This forum group has no bound topics.", True),
+    ],
+    ids=["non-admin", "non-forum", "no-bound-topics"],
+)
+def test_sync_msglog_rejects_unqualified_requests(sync_msglog_channel, user_id, is_forum, bound_topics, expected_reply, topic_lookup_expected):
+    channel = sync_msglog_channel
+    channel.db.get_topic_slaves.return_value = bound_topics
+
+    TelegramChannel.sync_msglog(channel, sync_msglog_update(user_id=user_id, is_forum=is_forum), SimpleNamespace())
+
+    if topic_lookup_expected:
+        channel.db.get_topic_slaves.assert_called_once_with(100)
+    else:
+        channel.db.get_topic_slaves.assert_not_called()
+    channel.chat_binding.schedule_msglog_ingestion.assert_not_called()
+    channel.bot_manager.api.send_message.assert_called_once_with(100, text=expected_reply)
+
+
+def test_sync_msglog_ignores_updates_without_an_effective_message(sync_msglog_channel):
+    channel = sync_msglog_channel
+
+    TelegramChannel.sync_msglog(channel, Update(update_id=1), SimpleNamespace())
+
+    channel.db.get_topic_slaves.assert_not_called()
+    channel.chat_binding.schedule_msglog_ingestion.assert_not_called()
+    channel.bot_manager.api.send_message.assert_not_called()
 
 
 def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
