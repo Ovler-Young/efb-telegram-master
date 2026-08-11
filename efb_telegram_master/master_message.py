@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from queue import Queue
 from threading import Thread
 from typing import Callable, Optional
@@ -24,6 +25,8 @@ class MasterMessageWorker:
         self.localize = localize
         self.logger = logger
         self.message_queue: Queue[Optional[tuple[Update, CallbackContext]]] = Queue()
+        self._stopping = threading.Event()
+        self._queue_lock = threading.Lock()
         self._register_handlers()
         self.message_worker_thread = Thread(target=self.message_worker, name="ETM master messages worker thread")
         self.message_worker_thread.start()
@@ -61,7 +64,7 @@ class MasterMessageWorker:
                 self.inbound.msg(update, context)
             except Exception as error:
                 self.logger.exception("Failed to process Telegram update (%s).", type(error).__name__)
-                if update.effective_message:
+                if update.effective_message and not self._stopping.is_set():
                     sync_reply_text(
                         self.bot, update.effective_message, self.localize("Unknown error has occurred while trying to process this message. See log for details.\n\n{error!r}").format(error=error)
                     )
@@ -69,25 +72,30 @@ class MasterMessageWorker:
                 self.message_queue.task_done()
 
     def stop_worker(self) -> None:
-        if not self.message_worker_thread.is_alive():
-            return
-        drained_count = 0
-        while not self.message_queue.empty():
-            try:
-                self.message_queue.get_nowait()
-                self.message_queue.task_done()
-                drained_count += 1
-            except Exception:
-                break
+        with self._queue_lock:
+            self._stopping.set()
+            if not self.message_worker_thread.is_alive():
+                return
+            drained_count = 0
+            while not self.message_queue.empty():
+                try:
+                    self.message_queue.get_nowait()
+                    self.message_queue.task_done()
+                    drained_count += 1
+                except Exception:
+                    break
+            self.message_queue.put(None)
         if drained_count:
             self.logger.info("Drained %d pending messages from queue during shutdown", drained_count)
-        self.message_queue.put(None)
         self.message_worker_thread.join(timeout=5.0)
         if self.message_worker_thread.is_alive():
             self.logger.warning("Message worker thread did not stop within timeout, continuing anyway")
 
     def enqueue_message(self, update: Update, context: CallbackContext) -> None:
         assert isinstance(update, Update)
-        self.message_queue.put((update, context))
-        if not self.message_worker_thread.is_alive() and update.effective_message:
+        with self._queue_lock:
+            if self._stopping.is_set():
+                return
+            self.message_queue.put((update, context))
+        if not self.message_worker_thread.is_alive() and update.effective_message and not self._stopping.is_set():
             sync_reply_text(self.bot, update.effective_message, self.localize("ETM message worker is not running due to unforeseen reason. This might be a bug. Please see log for details."))

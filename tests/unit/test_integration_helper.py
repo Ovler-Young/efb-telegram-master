@@ -5,7 +5,9 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from telethon.events import MessageEdited
 
+from tests.integration.helper import filters
 from tests.integration.helper import helper as helper_module
 
 
@@ -47,6 +49,32 @@ class FailingCleanupTelegramClient(StalledTelegramClient):
         raise RuntimeError("disconnect failed")
 
 
+class RecordingTelegramClient:
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.parse_mode = None
+        self.added_handlers = []
+        self.removed_handlers = []
+        self.disconnect_calls = 0
+
+    def add_event_handler(self, handler, event_builder) -> None:
+        self.added_handlers.append((handler, event_builder))
+
+    def remove_event_handler(self, handler, event_builder) -> None:
+        self.removed_handlers.append((handler, event_builder))
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+
+class DummyEditedMessageEvent(MessageEdited.Event):
+    @property
+    def chat_id(self) -> int:
+        return 100
+
+    def to_dict(self) -> dict[str, object]:
+        return {}
+
+
 def build_event_helper() -> helper_module.TelegramIntegrationTestHelper:
     test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
     test_helper.queue = asyncio.Queue()
@@ -59,6 +87,34 @@ def build_event_helper() -> helper_module.TelegramIntegrationTestHelper:
     test_helper._temporary_chat_lock = threading.Lock()
     test_helper.logger = logging.getLogger(__name__)
     return test_helper
+
+
+def test_helper_registers_and_removes_a_broad_edited_message_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(helper_module, "TelegramClient", RecordingTelegramClient)
+    monkeypatch.setattr(helper_module, "StringSession", lambda _session: object())
+    test_helper = helper_module.TelegramIntegrationTestHelper("session", 1, "hash", None, 2, chats={100})
+    client = test_helper.client
+
+    edited_builders = [event_builder for _handler, event_builder in client.added_handlers if isinstance(event_builder, MessageEdited)]
+    assert len(edited_builders) == 1
+    assert edited_builders[0].chats is None
+
+    asyncio.run(test_helper._disconnect_client())
+
+    assert client.removed_handlers == client.added_handlers
+    assert client.disconnect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_helper_queues_watched_edited_message_events_for_strict_id_correlation() -> None:
+    test_helper = build_event_helper()
+    event = object.__new__(DummyEditedMessageEvent)
+    event.__dict__["_init"] = False
+    event.message = SimpleNamespace(id=42)
+
+    await test_helper.edited_message_handler(event)
+
+    assert await test_helper.wait_for_event(filters.edited(42)) is event
 
 
 @pytest.mark.asyncio

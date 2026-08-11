@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from telegram import Update
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
@@ -357,6 +358,45 @@ def test_channel_owner_stops_the_real_master_message_worker() -> None:
         channel.rpc_utilities.shutdown.assert_called_once_with()
         channel.db.stop_worker.assert_called_once_with()
     finally:
+        worker.stop_worker()
+
+
+def test_master_message_worker_shutdown_suppresses_an_in_flight_delivery_failure() -> None:
+    runtime = SimpleNamespace(application=SimpleNamespace(add_handler=Mock()), as_async_callback=lambda callback: callback)
+    bot = Mock()
+    update = SimpleNamespace(effective_message=SimpleNamespace(chat=SimpleNamespace(id=1)))
+    inbound = Mock()
+    started = threading.Event()
+    release = threading.Event()
+
+    def fail_after_shutdown(*_args) -> None:
+        started.set()
+        assert release.wait(1)
+        raise RuntimeError("cancelled delivery")
+
+    inbound.msg.side_effect = fail_after_shutdown
+    worker = MasterMessageWorker(runtime, bot, inbound, Mock(), lambda text: text, Mock())
+    worker.message_queue.put((update, Mock()))
+    assert started.wait(1)
+    stopped = threading.Thread(target=worker.stop_worker)
+
+    try:
+        stopped.start()
+        deadline = time.monotonic() + 1
+        while not worker._stopping.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert worker._stopping.is_set()
+        release.set()
+        stopped.join(1)
+        assert not stopped.is_alive()
+        assert not worker.message_worker_thread.is_alive()
+        bot.send_message.assert_not_called()
+        worker.enqueue_message(Update(1), Mock())
+        assert worker.message_queue.empty()
+        bot.send_message.assert_not_called()
+    finally:
+        release.set()
+        stopped.join(1)
         worker.stop_worker()
 
 

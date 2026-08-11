@@ -120,11 +120,15 @@ class TelegramIntegrationTestHelper:
         self._temporary_chat_lock = threading.Lock()
         self.client.parse_mode = "html"
         bot_ids = [bot_id] if isinstance(bot_id, int) else list(bot_id)
-        self.client.add_event_handler(self.new_message_handler, NewMessage(incoming=True, from_users=bot_ids))
-        self.client.add_event_handler(self.deleted_message_handler, MessageDeleted())
-        self.client.add_event_handler(self.update_handler, UserUpdate(chats=self.chats))
-        self.client.add_event_handler(self.update_handler, MessageEdited(chats=self.chats))
-        self.client.add_event_handler(self.update_handler, ChatAction(chats=self.chats))
+        self._event_handlers = (
+            (self.new_message_handler, NewMessage(incoming=True, from_users=bot_ids)),
+            (self.deleted_message_handler, MessageDeleted()),
+            (self.update_handler, UserUpdate(chats=self.chats)),
+            (self.edited_message_handler, MessageEdited()),
+            (self.update_handler, ChatAction(chats=self.chats)),
+        )
+        for handler, event_builder in self._event_handlers:
+            self.client.add_event_handler(handler, event_builder)
 
         self.logger = logging.getLogger(__name__)
 
@@ -231,6 +235,12 @@ class TelegramIntegrationTestHelper:
         self.logger.debug("Got new message event, %s, %s", time.time(), event.to_dict())
         await self._queue_event(event)
 
+    async def edited_message_handler(self, event: MessageEdited.Event) -> None:
+        if not self._watches_chat(event.chat_id):
+            return
+        self.logger.debug("Got edited message event, %s, %s", time.time(), event.to_dict())
+        await self._queue_event(event)
+
     async def deleted_message_handler(self, event: MessageDeleted.Event):
         # Try to recover chat of the message from the mapping
         message_id = event.deleted_id
@@ -297,6 +307,8 @@ class TelegramIntegrationTestHelper:
             raise TimeoutError(f"Telegram integration helper timed out during {phase} after {CLIENT_START_TIMEOUT} seconds") from exc
 
     async def _disconnect_client(self) -> None:
+        for handler, event_builder in getattr(self, "_event_handlers", ()):
+            self.client.remove_event_handler(handler, event_builder)
         await asyncio.wait_for(self.client.disconnect(), timeout=CLIENT_STOP_TIMEOUT)
         disconnected = getattr(self.client, "disconnected", None)
         if inspect.isawaitable(disconnected):

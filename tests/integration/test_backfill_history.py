@@ -178,6 +178,42 @@ async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id:
     return working_bot_ids, statuses
 
 
+async def _wait_for_available_auxiliary(channel_with_auxiliary_bots, source_group_id: int, configured_auxiliary_ids: Sequence[int]):
+    pool = channel_with_auxiliary_bots.bot_manager.api.bot_pool
+    assert pool is not None
+    configured_ids = set(configured_auxiliary_ids)
+    deadline = time.monotonic() + STREAM_SETTLE_TIMEOUT
+    while True:
+        candidates = [
+            (auxiliary.bot_id, auxiliary.check_membership_tri(source_group_id), auxiliary.peek_delay(source_group_id))
+            for auxiliary in pool.bots
+            if auxiliary.bot_id in configured_ids and not auxiliary.disabled
+        ]
+        eligible = {bot_id for bot_id, membership, delay in candidates if membership is True and delay == 0.0}
+        if eligible:
+            return eligible
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise AssertionError(f"No configured auxiliary sender became eligible for {source_group_id}; candidates={candidates}")
+        delays = [delay for _bot_id, membership, delay in candidates if membership is True and delay > 0.0]
+        if not delays:
+            raise AssertionError(f"No configured auxiliary has confirmed membership for {source_group_id}; candidates={candidates}")
+        await asyncio.sleep(min(min(delays), remaining))
+
+
+async def _wait_for_provenance_log(channel_with_auxiliary_bots, chat, message, *, timeout: float = STREAM_SETTLE_TIMEOUT):
+    slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
+    deadline = time.monotonic() + timeout
+    while True:
+        row = channel_with_auxiliary_bots.msglogs.get_msg_log(slave_msg_id=message.uid, slave_origin_uid=slave_chat_id)
+        if row is not None and row.text == message.text:
+            return row
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise AssertionError(f"Timed out waiting for MsgLog provenance for uid={message.uid!s}, text={message.text!r}")
+        await asyncio.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+
+
 async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, private_response, *, flag: str | None = None):
     start_link = await get_start_link(client, helper, bot_id, chat_uid, private_response)
     command = f"/start {start_link.token}"
@@ -313,7 +349,13 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response)
     working_aux_bot_ids, membership_statuses = await _require_aux_membership(channel_with_auxiliary_bots, source_group_id)
     if not working_aux_bot_ids:
-        pytest.skip(f"No auxiliary bots are members of configured test group {source_group_id}; probes={membership_statuses}")
+        raise AssertionError(f"No auxiliary bots are members of configured test group {source_group_id}; probes={membership_statuses}")
+
+    eligible_auxiliary_ids = await _wait_for_available_auxiliary(channel_with_auxiliary_bots, source_group_id, aux_bot_ids)
+    provenance_message = slave_with_auxiliary_bots.send_text_message(chat, chat.other, text=f"AUXPROVENANCE{uuid4().hex}")
+    provenance_log = await _wait_for_provenance_log(channel_with_auxiliary_bots, chat, provenance_message)
+    assert provenance_log.sender_bot_id is not None
+    assert int(provenance_log.sender_bot_id) in eligible_auxiliary_ids
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
     await asyncio.to_thread(stream_thread.join, STREAM_SETTLE_TIMEOUT)
@@ -339,12 +381,6 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     db_indices = [idx for log in db_logs for idx in _extract_stream_indices(log.text or "", prefix)]
     assert set(db_indices) == _expected_stream_indices(STREAM_MESSAGE_COUNT)
     assert len(db_indices) == STREAM_MESSAGE_COUNT, "Expected exactly 120 logged stream messages in DB."
-
-    persisted_auxiliary_sender_ids = {int(log.sender_bot_id) for log in db_logs if log.sender_bot_id is not None}
-    assert persisted_auxiliary_sender_ids & set(working_aux_bot_ids), "Expected at least one persisted MsgLog sender_bot_id from an auxiliary bot."
-
-    group_sender_ids = {message.sender_id for message in group_messages if message.sender_id is not None}
-    assert group_sender_ids & set(working_aux_bot_ids), "Expected auxiliary bot messages in the linked group."
 
     target_group_id = bot_topic_group
     try:
