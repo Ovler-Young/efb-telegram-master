@@ -104,6 +104,19 @@ def test_link_confirmation_rejects_invalid_callback_indexes(callback_manager, ca
     assert storage_id not in manager.link_handler._conversations
 
 
+def test_link_confirmation_answers_before_building_the_action_menu(callback_manager, callback_chat):
+    manager = callback_manager
+    storage_id = (TelegramChatID(1), TelegramMessageID(208))
+    _store_callback_session(manager, manager.link_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
+    calls = []
+    manager.bot.answer_callback_query.side_effect = lambda *_args: calls.append("answer")
+
+    with patch.object(manager, "build_action", side_effect=lambda *_args: calls.append("build")):
+        assert manager.confirm(_callback_update(*storage_id, "chat 0"), None) == Flags.LINK_EXEC
+
+    assert calls == ["answer", "build"]
+
+
 def test_link_exec_keeps_valid_manual_link_callback_active(callback_manager, callback_chat):
     manager = callback_manager
     storage_id = (TelegramChatID(1), TelegramMessageID(205))

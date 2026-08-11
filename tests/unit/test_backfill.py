@@ -51,7 +51,7 @@ def _sent_link_message(chat_id, message_id, sender_bot_id=None):
     return sent_message
 
 
-def _link_completion_service(storage_key, chat):
+def _link_completion_service(storage_key, chat, multiple_slave_chats=lambda: False):
     bot = SimpleNamespace(
         send_message=Mock(return_value=_sent_link_message(-100500, 600)),
         edit_message_text=Mock(),
@@ -63,7 +63,7 @@ def _link_completion_service(storage_key, chat):
     service = LinkCompletionService(
         bot,
         ModuleID("blueset.telegram"),
-        False,
+        multiple_slave_chats,
         SimpleNamespace(remove_topic_assoc=Mock()),
         callback_sessions,
         Mock(),
@@ -74,6 +74,26 @@ def _link_completion_service(storage_key, chat):
     )
     service.set_handler(Mock())
     return service
+
+
+def test_link_completion_reads_multiple_slave_setting_at_completion_time():
+    storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(458))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(
+        module_id=ModuleID("tests.slave"),
+        uid=ChatID("chat"),
+        linked=False,
+        full_name="Test chat",
+        link=Mock(),
+    )
+    multiple_slave_chats = Mock(return_value=False)
+    service = _link_completion_service(storage_key, chat, multiple_slave_chats)
+
+    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
+        service.complete(_build_link_update(-100500), [token])
+
+    multiple_slave_chats.assert_called_once_with()
+    assert chat.link.call_args.args[-1] is False
 
 
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):

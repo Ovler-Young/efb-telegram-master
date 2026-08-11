@@ -244,9 +244,8 @@ class LinkService:
             return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
         chat: ETMChatMixin = storage.chats[callback_idx]
 
-        self.build_action(chat, tg_chat_id, tg_msg_id)
-
         self.bot.answer_callback_query(update.callback_query.id)
+        self.build_action(chat, tg_chat_id, tg_msg_id)
         return Flags.LINK_EXEC
 
     def build_action(self, chat: ETMChatMixin, tg_chat_id: TelegramChatID, tg_msg_id: TelegramMessageID):

@@ -168,7 +168,7 @@ class TelegramChannel(MasterChannel):
         self.link_completion = LinkCompletionService(
             self.bot_manager.api,
             self.channel_id,
-            self.flag("multiple_slave_chats"),
+            lambda: self.flag("multiple_slave_chats"),
             self.chat_associations,
             self.callback_sessions,
             self.topic_sync,

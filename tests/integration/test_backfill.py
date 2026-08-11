@@ -20,7 +20,7 @@ async def test_link_chat_start_false_skips_backfill(helper, client, bot_id, bot_
         migrate_chat_history.assert_not_called()
         send_history_link.assert_not_called()
     finally:
-        unlink_all_chats(channel, bot_group)
+        await unlink_all_chats(channel, client, helper, bot_group)
 
 
 @pytest.mark.parametrize("backfill_flag", ["true", "yes", "on", "1"])
@@ -49,4 +49,4 @@ async def test_link_chat_start_true_forces_backfill_on_relink(helper, client, bo
         migrate_chat_history.assert_called()
         send_history_link.assert_not_called()
     finally:
-        unlink_all_chats(channel, bot_group)
+        await unlink_all_chats(channel, client, helper, bot_group)

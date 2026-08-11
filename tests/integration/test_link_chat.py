@@ -80,10 +80,12 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
     assert match is not None
     assert token == match.group(1), "URL token matches manual token"
 
-    await client.send_message(bot_group, command)
-    await helper.wait_for_message(in_chats(bot_id) & edited(manual_session_message_id) & ~has_button)
-    assert_is_linked(channel, (chat_0,), bot_group)
-    unlink_all_chats(channel, bot_group)
+    try:
+        await client.send_message(bot_group, command)
+        await helper.wait_for_message(in_chats(bot_id) & edited(manual_session_message_id) & ~has_button)
+        assert_is_linked(channel, (chat_0,), bot_group)
+    finally:
+        await unlink_all_chats(channel, client, helper, bot_group)
 
     message = await private_response(
         lambda: client.send_message(bot_id, "/link"),
@@ -116,13 +118,13 @@ async def test_link_chat_multi_link_flag_off(helper, client, bot_id, bot_group, 
 
     backup = channel.flag.config["multiple_slave_chats"]
     channel.flag.config["multiple_slave_chats"] = False
-
-    with link_chats(channel, (chat_0,), bot_group):
-        assert_is_linked(channel, (chat_0,), bot_group)
-        await simulate_link_chat(client, helper, chat_1, bot_id, bot_group, private_response=private_response)
-        assert_is_linked(channel, (chat_1,), bot_group)
-
-    channel.flag.config["multiple_slave_chats"] = backup
+    try:
+        with link_chats(channel, (chat_0,), bot_group):
+            assert_is_linked(channel, (chat_0,), bot_group)
+            await simulate_link_chat(client, helper, chat_1, bot_id, bot_group, private_response=private_response)
+            assert_is_linked(channel, (chat_1,), bot_group)
+    finally:
+        channel.flag.config["multiple_slave_chats"] = backup
 
 
 async def test_link_chat_group_unlinked(helper, client, bot_id, bot_group, channel, private_response):
@@ -241,30 +243,31 @@ async def test_group_chat_migration(client, helper, channel, slave, bot_id):
         chat: TelethonChat = response.updates.chats[0]
     else:
         chat = await client.get_entity(title)
-    with link_chats(channel, slave_chats, get_peer_id(chat)):
-        mega_chat_response = await client(MigrateChatRequest(chat_id=chat.id))
-        if getattr(mega_chat_response, "chats", None):
-            mega_chat: TelethonChat = next(c for c in mega_chat_response.chats if getattr(c, "id", None) != chat.id)
-        elif getattr(mega_chat_response, "updates", None) and getattr(mega_chat_response.updates, "chats", None):
-            mega_chat = next(c for c in mega_chat_response.updates.chats if getattr(c, "id", None) != chat.id)
-        else:
-            mega_chat = await client.get_entity(get_peer_id(chat))
-
-        deadline = asyncio.get_running_loop().time() + 20
-        while True:
-            migrated = get_peer_id(mega_chat)
-            original = get_peer_id(chat)
-            try:
-                assert_is_linked(channel, slave_chats, migrated)
-                assert_is_linked(channel, tuple(), original)
-            except AssertionError:
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise
-                await asyncio.sleep(0.1)
+    mega_chat = None
+    try:
+        with link_chats(channel, slave_chats, get_peer_id(chat)):
+            mega_chat_response = await client(MigrateChatRequest(chat_id=chat.id))
+            if getattr(mega_chat_response, "chats", None):
+                mega_chat = next(c for c in mega_chat_response.chats if getattr(c, "id", None) != chat.id)
+            elif getattr(mega_chat_response, "updates", None) and getattr(mega_chat_response.updates, "chats", None):
+                mega_chat = next(c for c in mega_chat_response.updates.chats if getattr(c, "id", None) != chat.id)
             else:
-                break
+                mega_chat = await client.get_entity(get_peer_id(chat))
 
-    # Clean up
-    unlink_all_chats(channel, get_peer_id(mega_chat))
-    unlink_all_chats(channel, get_peer_id(chat))
-    await client(DeleteChannelRequest(mega_chat.id))
+            deadline = asyncio.get_running_loop().time() + 20
+            while True:
+                migrated = get_peer_id(mega_chat)
+                original = get_peer_id(chat)
+                try:
+                    assert_is_linked(channel, slave_chats, migrated)
+                    assert_is_linked(channel, tuple(), original)
+                except AssertionError:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise
+                    await asyncio.sleep(0.1)
+                else:
+                    break
+    finally:
+        if mega_chat is not None:
+            await unlink_all_chats(channel, client, helper, get_peer_id(mega_chat))
+            await client(DeleteChannelRequest(mega_chat.id))

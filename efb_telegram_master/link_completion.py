@@ -2,6 +2,7 @@
 
 import logging
 import shlex
+from collections.abc import Callable
 from typing import List, Optional, Tuple
 
 from ehforwarderbot import coordinator
@@ -24,11 +25,21 @@ def _bounded_error_message(error: BaseException) -> str:
 
 class LinkCompletionService:
     def __init__(
-        self, bot, channel_id: ModuleID, multiple_slave_chats: bool, chat_associations, callback_sessions: CallbackSessionStore, topic_sync, history_replay, translate, ngettext, logger: logging.Logger
+        self,
+        bot,
+        channel_id: ModuleID,
+        multiple_slave_chats: Callable[[], bool],
+        chat_associations,
+        callback_sessions: CallbackSessionStore,
+        topic_sync,
+        history_replay,
+        translate,
+        ngettext,
+        logger: logging.Logger,
     ):
         self.bot = bot
         self.channel_id = channel_id
-        self.multiple_slave_chats = multiple_slave_chats
+        self._multiple_slave_chats = multiple_slave_chats
         self.chat_associations = chat_associations
         self.callback_sessions = callback_sessions
         self.topic_sync = topic_sync
@@ -106,7 +117,7 @@ class LinkCompletionService:
         txt = self._("Trying to link chat {0}...").format(chat_display_name)
         msg = self.bot.send_message(tg_chat_to_link.id, text=txt)
 
-        chat.link(self.channel_id, ChatID(str(tg_chat_to_link.id)), self.multiple_slave_chats)
+        chat.link(self.channel_id, ChatID(str(tg_chat_to_link.id)), self._multiple_slave_chats())
         self.chat_associations.remove_topic_assoc(
             slave_uid=chat_uid,
         )
