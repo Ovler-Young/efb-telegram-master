@@ -6,7 +6,8 @@ import pytest
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import ChatMigrated
 
-from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, SendReceipt
+from efb_telegram_master.outbound import OutboundQueue
+from efb_telegram_master.outbound_types import QueueEnqueueError, SendReceipt
 from efb_telegram_master.telegram_api import TelegramAPI
 
 

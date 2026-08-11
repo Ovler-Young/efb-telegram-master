@@ -14,18 +14,9 @@ from telegram import File, ForumTopic, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext
 
 from .bot_pool import BotPool
-from .outbound import (
-    QUEUED_OPERATIONS,
-    OutboundQueue,
-    QueueEnqueueError,
-    QueueRequest,
-    SchedulerStoppedError,
-    SendReceipt,
-    UploadCleanup,
-    _strip_private_queue_metadata,
-    cleanup_upload_paths,
-    rewind_uploads,
-)
+from .outbound import OutboundQueue
+from .outbound_types import QueueEnqueueError, QueueRequest, SchedulerStoppedError, SendReceipt, UploadCleanup, cleanup_upload_paths, rewind_uploads
+from .telegram_calls import QUEUED_OPERATIONS, stripped_telegram_kwargs
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -176,10 +167,10 @@ class TelegramAPI:
             raise
 
     def _call_direct_operation(self, operation: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> object:
-        return getattr(self._bot, operation)(*args, **_strip_private_queue_metadata(kwargs))
+        return getattr(self._bot, operation)(*args, **stripped_telegram_kwargs(kwargs))
 
     def _enqueue_main_chat_mutation(self, operation: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> SendReceipt:
-        telegram_kwargs = _strip_private_queue_metadata(kwargs)
+        telegram_kwargs = stripped_telegram_kwargs(kwargs)
         target_chat_id = self._normalize_telegram_chat_id(self._queued_chat_id_argument(operation, args, telegram_kwargs))
         return self._enqueue_request(QueueRequest(operation, args, dict(telegram_kwargs), target_chat_id, required_sender_bot_id="__main__", cleanup=self._claim_pending_upload_cleanup()))
 

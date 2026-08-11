@@ -11,7 +11,8 @@ from typing import Any
 from prometheus_client import CollectorRegistry, Counter, Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
-from .outbound import QUEUED_OPERATIONS, OutboundQueue
+from .outbound import OutboundQueue
+from .telegram_calls import QUEUED_OPERATIONS
 
 _PRIORITIES = frozenset({"blocking", "normal"})
 _SENDER_KINDS = frozenset({"main", "auxiliary"})

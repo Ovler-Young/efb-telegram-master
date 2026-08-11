@@ -41,7 +41,7 @@ from .db import DatabaseManager
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
 from .mtproto import MTProtoClient, MTProtoConfig, MTProtoRetryableError
-from .outbound import OutboundShutdownTimeout
+from .outbound_types import OutboundShutdownTimeout
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .rpc_utils import RPCUtilities

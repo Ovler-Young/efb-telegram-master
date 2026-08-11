@@ -12,20 +12,10 @@ from telegram.error import BadRequest, ChatMigrated, RetryAfter
 
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 from efb_telegram_master.bot_pool import BotPool
-from efb_telegram_master.outbound import (
-    OutboundLifecycle,
-    OutboundQueue,
-    OutboundShutdownTimeout,
-    QueuedCall,
-    QueueError,
-    QueueRequest,
-    SchedulerStoppedError,
-    SenderSelection,
-    TelegramCallAdapter,
-    UploadCleanup,
-    retry_after_seconds,
-    rewind_uploads,
-)
+from efb_telegram_master.outbound import OutboundQueue
+from efb_telegram_master.outbound_types import OutboundLifecycle, OutboundShutdownTimeout, QueuedCall, QueueError, QueueRequest, SchedulerStoppedError, SenderSelection, UploadCleanup, rewind_uploads
+from efb_telegram_master.sender_policy import retry_after_seconds
+from efb_telegram_master.telegram_calls import TelegramCallAdapter
 
 
 class _Limiter:
@@ -51,6 +41,14 @@ def _queue(sender, worker_count=2):
     )
     queue.start()
     return queue
+
+
+def _execute_adapter_call(adapter, call, selection):
+    primary = adapter.execute_primary(call, selection)
+    if primary.attachment is not None:
+        adapter.execute_attachment(primary.attachment, selection)
+    adapter.record_successful_send(call, selection)
+    return primary.receipt
 
 
 def test_queue_serializes_same_chat_calls():
@@ -119,7 +117,7 @@ def test_adapter_sends_oversize_text_and_caption_as_attachment(operation, args, 
     getattr(sender, operation).return_value = SimpleNamespace(message_id=7)
     call = QueuedCall(operation, args, {**kwargs, content_key: full_content}, 1, None, None)
 
-    receipt = TelegramCallAdapter(None).execute(call, SenderSelection(sender, None))
+    receipt = _execute_adapter_call(TelegramCallAdapter(None), call, SenderSelection(sender, None))
 
     assert receipt.message.message_id == 7
     delivered = getattr(sender, operation).call_args.kwargs[content_key]
@@ -350,7 +348,7 @@ def test_adapter_retries_entity_parse_failure_without_parse_mode(operation, args
     sender = Mock()
     getattr(sender, operation).side_effect = [BadRequest("Can't parse entities"), SimpleNamespace(message_id=7)]
 
-    TelegramCallAdapter(None).execute(QueuedCall(operation, args, {**kwargs, "parse_mode": "HTML"}, 1, None, None), SenderSelection(sender, None))
+    _execute_adapter_call(TelegramCallAdapter(None), QueuedCall(operation, args, {**kwargs, "parse_mode": "HTML"}, 1, None, None), SenderSelection(sender, None))
 
     calls = getattr(sender, operation).call_args_list
     assert calls[0].kwargs["parse_mode"] == "HTML"
@@ -373,7 +371,7 @@ def test_adapter_edit_overflow_attaches_the_prepared_content(operation, args, kw
     sender = Mock()
     getattr(sender, operation).return_value = SimpleNamespace(message_id=7)
 
-    TelegramCallAdapter(None).execute(QueuedCall(operation, prepared_args, prepared_kwargs, 1, None, None), SenderSelection(sender, None))
+    _execute_adapter_call(TelegramCallAdapter(None), QueuedCall(operation, prepared_args, prepared_kwargs, 1, None, None), SenderSelection(sender, None))
 
     call = getattr(sender, operation).call_args
     delivered = call.args[content_index] if prepared_args else call.kwargs[content_key]
@@ -392,7 +390,7 @@ def test_adapter_edit_retries_entity_parse_failure_without_parse_mode(operation,
     sender = Mock()
     getattr(sender, operation).side_effect = [BadRequest("Can't parse entities"), SimpleNamespace(message_id=7)]
 
-    TelegramCallAdapter(None).execute(QueuedCall(operation, args, {**kwargs, "parse_mode": "HTML"}, 1, None, None), SenderSelection(sender, None))
+    _execute_adapter_call(TelegramCallAdapter(None), QueuedCall(operation, args, {**kwargs, "parse_mode": "HTML"}, 1, None, None), SenderSelection(sender, None))
 
     calls = getattr(sender, operation).call_args_list
     assert len(calls) == 2
@@ -414,7 +412,8 @@ def test_adapter_rewinds_files_before_retrying_entity_parse_failure() -> None:
                 raise BadRequest("Can't parse entities")
             return SimpleNamespace(message_id=7)
 
-    TelegramCallAdapter(None).execute(
+    _execute_adapter_call(
+        TelegramCallAdapter(None),
         QueuedCall("send_photo", (1, photo), {"caption": "caption", "parse_mode": "HTML"}, 1, None, None),
         SenderSelection(Sender(), None),
     )
@@ -447,7 +446,8 @@ def test_adapter_aborts_parse_retry_when_upload_cannot_rewind() -> None:
     sender.send_photo.side_effect = BadRequest("Can't parse entities")
 
     with pytest.raises(OSError, match="rewind failed"):
-        TelegramCallAdapter(None).execute(
+        _execute_adapter_call(
+            TelegramCallAdapter(None),
             QueuedCall("send_photo", (1, UnrewindableUpload()), {"caption": "caption", "parse_mode": "HTML"}, 1, None, None),
             SenderSelection(sender, None),
         )

@@ -7,7 +7,7 @@ import pytest
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.metrics_runtime import MetricsServer, parse_metrics_config
-from efb_telegram_master.outbound import OutboundShutdownTimeout
+from efb_telegram_master.outbound_types import OutboundShutdownTimeout
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade

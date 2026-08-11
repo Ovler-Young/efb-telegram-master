@@ -7,9 +7,11 @@ from unittest.mock import Mock
 import pytest
 from telegram.error import RetryAfter
 
-import efb_telegram_master.outbound as outbound
+import efb_telegram_master.sender_policy as sender_policy_module
 from efb_telegram_master.bot_pool import BotPool
-from efb_telegram_master.outbound import QueuedCall, SenderPolicy, SenderSelection, TelegramCallAdapter
+from efb_telegram_master.outbound_types import QueuedCall, SenderSelection
+from efb_telegram_master.sender_policy import SenderPolicy
+from efb_telegram_master.telegram_calls import TelegramCallAdapter
 
 
 class Limiter:
@@ -133,10 +135,12 @@ def test_affinity_is_recorded_only_after_successful_auxiliary_execution() -> Non
     queued_call = call(slave_id="slave-a")
 
     main_adapter = TelegramCallAdapter(pool)
-    main_adapter.execute(queued_call, SenderSelection(main_bot, None))
+    main_adapter.execute_primary(queued_call, SenderSelection(main_bot, None))
+    main_adapter.record_successful_send(queued_call, SenderSelection(main_bot, None))
     assert pool.preferred_sender("slave-a") is None
 
-    main_adapter.execute(queued_call, SenderSelection(sender, "10"))
+    main_adapter.execute_primary(queued_call, SenderSelection(sender, "10"))
+    main_adapter.record_successful_send(queued_call, SenderSelection(sender, "10"))
 
     assert pool.preferred_sender("slave-a") is auxiliary_bot
 
@@ -159,7 +163,7 @@ def test_retry_after_cooldown_is_scoped_to_exact_sender_and_chat(monkeypatch: py
     auxiliary_bot = auxiliary(10)
     sender_policy, _pool, _main_bot, _limiter = policy(auxiliary_bot)
     sender = SenderSelection(auxiliary_bot.bot, "10")
-    monkeypatch.setattr(outbound.time, "monotonic", lambda: 1_000.0)
+    monkeypatch.setattr(sender_policy_module.time, "monotonic", lambda: 1_000.0)
 
     sender_policy.record_retry_after(call(chat_id=100), RetryAfter(20), sender)
 
@@ -176,7 +180,7 @@ def test_retry_after_keeps_the_latest_deadline_for_one_sender_chat(monkeypatch: 
     sender_policy, _pool, _main_bot, _limiter = policy(auxiliary_bot)
     sender = SenderSelection(auxiliary_bot.bot, "10")
     clock = [1_000.0]
-    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(sender_policy_module.time, "monotonic", lambda: clock[0])
 
     sender_policy.record_retry_after(call(chat_id=100), RetryAfter(20), sender)
     sender_policy.record_retry_after(call(chat_id=100), RetryAfter(5), sender)
@@ -189,7 +193,7 @@ def test_cooldown_snapshot_is_safe_while_retry_after_updates_arrive(monkeypatch:
     auxiliary_bot = auxiliary(10)
     sender_policy, _pool, _main_bot, _limiter = policy(auxiliary_bot)
     sender = SenderSelection(auxiliary_bot.bot, "10")
-    monkeypatch.setattr(outbound.time, "monotonic", lambda: 1_000.0)
+    monkeypatch.setattr(sender_policy_module.time, "monotonic", lambda: 1_000.0)
     start = threading.Event()
     errors: list[BaseException] = []
 
@@ -233,7 +237,7 @@ def test_retry_after_cooldown_leaves_another_sender_for_the_same_chat_selectable
     first = auxiliary(10)
     second = auxiliary(20)
     sender_policy, _pool, _main_bot, _limiter = policy(first, second, main_delay=30.0)
-    monkeypatch.setattr(outbound.time, "monotonic", lambda: 1_000.0)
+    monkeypatch.setattr(sender_policy_module.time, "monotonic", lambda: 1_000.0)
     queued_call = call()
 
     sender_policy.record_retry_after(queued_call, RetryAfter(20), SenderSelection(first.bot, "10"))
