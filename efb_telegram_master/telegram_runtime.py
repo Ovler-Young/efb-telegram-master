@@ -1,4 +1,4 @@
-"""PTB construction, polling, and synchronous Bot API access."""
+"""PTB application construction and polling lifecycle."""
 
 from __future__ import annotations
 
@@ -7,9 +7,6 @@ import logging
 import os
 import threading
 from collections.abc import Awaitable, Callable, Collection, Mapping
-from concurrent.futures import Future
-from concurrent.futures import TimeoutError as FutureTimeoutError
-from functools import wraps
 from typing import Coroutine, Literal, Optional, ParamSpec, TypedDict, TypeVar, cast
 
 import telegram
@@ -18,164 +15,24 @@ from telegram.ext import Application
 from telegram.request import HTTPXRequest
 from typing_extensions import NotRequired
 
+from .telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
 from .utils import normalize_request_kwargs
 
-T = TypeVar("T")
 P = ParamSpec("P")
-BotMethod = Callable[..., object]
+T = TypeVar("T")
 LifecycleCallback = Callable[["TelegramPollingRuntime"], Awaitable[None]]
 
 
-class _BotIdentity(TypedDict):
+class _BotArguments(TypedDict):
     token: str
     local_mode: bool
+    request: HTTPXRequest
+    get_updates_request: HTTPXRequest
     base_url: NotRequired[str]
     base_file_url: NotRequired[str]
 
 
-class _BotArguments(_BotIdentity):
-    request: HTTPXRequest
-    get_updates_request: HTTPXRequest
-
-
-class AsyncTelegramRuntime:
-    """Thread-safe bridge into the PTB event loop."""
-
-    def __init__(self, logger: logging.Logger):
-        self.logger = logger
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._ready = threading.Event()
-        self._loop_thread_id: Optional[int] = None
-        self._loop_thread: Optional[threading.Thread] = None
-        self._owns_loop_thread = False
-        self._lock = threading.Lock()
-        self._accepting_calls = True
-        self._active_calls: set[Future[object]] = set()
-
-    def bind_loop(self, loop: asyncio.AbstractEventLoop, *, owns_thread: bool = False) -> None:
-        old_loop = old_thread = None
-        with self._lock:
-            if self._loop is loop:
-                self._loop_thread_id, self._loop_thread = (
-                    threading.get_ident(),
-                    threading.current_thread(),
-                )
-                self._owns_loop_thread = owns_thread
-                self._ready.set()
-                return
-            if self._owns_loop_thread and self._loop is not None:
-                old_loop, old_thread = self._loop, self._loop_thread
-            self._loop, self._loop_thread_id = loop, threading.get_ident()
-            self._loop_thread, self._owns_loop_thread = (
-                threading.current_thread(),
-                owns_thread,
-            )
-            self._ready.set()
-        if old_loop is not None and old_thread is not None and old_thread.ident != threading.get_ident():
-            old_loop.call_soon_threadsafe(old_loop.stop)
-            old_thread.join(timeout=5)
-
-    def clear_loop(self, expected_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
-        with self._lock:
-            if expected_loop is not None and self._loop is not expected_loop:
-                return
-            self._loop = self._loop_thread_id = self._loop_thread = None
-            self._owns_loop_thread = False
-            self._ready.clear()
-
-    def _ensure_background_loop(self) -> None:
-        with self._lock:
-            if self._ready.is_set() and self._loop is not None:
-                return
-            if self._loop_thread is not None and self._loop_thread.is_alive():
-                return
-            started = threading.Event()
-
-            def runner() -> None:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                self.bind_loop(loop, owns_thread=True)
-                started.set()
-                try:
-                    loop.run_forever()
-                finally:
-                    pending = asyncio.all_tasks(loop)
-                    for task in pending:
-                        task.cancel()
-                    if pending:
-                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                    loop.close()
-                    self.clear_loop(loop)
-
-            self._loop_thread = threading.Thread(target=runner, daemon=True, name="ETMAsyncTelegramRuntime")
-            self._loop_thread.start()
-        if not started.wait(timeout=30):
-            raise RuntimeError("Failed to start Telegram runtime loop thread.")
-
-    def shutdown(self) -> None:
-        with self._lock:
-            loop = self._loop if self._owns_loop_thread else None
-            thread = self._loop_thread if self._owns_loop_thread else None
-        if loop is not None:
-            loop.call_soon_threadsafe(loop.stop)
-        if thread is not None and thread.ident != threading.get_ident():
-            thread.join(timeout=5)
-        if loop is None:
-            self.clear_loop()
-
-    def begin_delivery_shutdown(self) -> None:
-        """Reject and cancel synchronous Bot API calls before PTB teardown."""
-
-        with self._lock:
-            self._accepting_calls = False
-            active_calls = tuple(self._active_calls)
-        for future in active_calls:
-            future.cancel()
-
-    def call_soon(self, callback: Callable[..., object], *args: object) -> bool:
-        with self._lock:
-            loop = self._loop
-        if loop is None:
-            return False
-        loop.call_soon_threadsafe(callback, *args)
-        return True
-
-    def call(self, coroutine: Coroutine[object, object, T], timeout: Optional[float] = None) -> T:
-        with self._lock:
-            accepting_calls = self._accepting_calls
-        if not accepting_calls:
-            coroutine.close()
-            raise RuntimeError("Telegram runtime is stopping.")
-        if not self._ready.wait(timeout=2.0):
-            self._ensure_background_loop()
-        with self._lock:
-            loop, loop_thread_id = self._loop, self._loop_thread_id
-        if loop is None:
-            self._ensure_background_loop()
-            with self._lock:
-                loop, loop_thread_id = self._loop, self._loop_thread_id
-        if loop is None:
-            raise RuntimeError("Telegram runtime loop is unavailable.")
-        if threading.get_ident() == loop_thread_id:
-            raise RuntimeError("Synchronous bot wrapper invoked from the PTB event loop thread.")
-        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
-        with self._lock:
-            if not self._accepting_calls:
-                future.cancel()
-                raise RuntimeError("Telegram runtime is stopping.")
-            self._active_calls.add(cast(Future[object], future))
-        try:
-            return future.result(timeout)
-        except FutureTimeoutError:
-            future.cancel()
-            raise
-        finally:
-            with self._lock:
-                self._active_calls.discard(cast(Future[object], future))
-
-
 def build_request(request_kwargs: Mapping[str, object]) -> HTTPXRequest:
-    socket_options = request_kwargs.get("socket_options")
     return HTTPXRequest(
         connection_pool_size=cast(int, request_kwargs.get("connection_pool_size", 1)),
         read_timeout=cast(Optional[float], request_kwargs.get("read_timeout")),
@@ -186,7 +43,7 @@ def build_request(request_kwargs: Mapping[str, object]) -> HTTPXRequest:
         http_version=cast(Literal["1.1", "2.0", "2"], request_kwargs.get("http_version") or "1.1"),
         socket_options=cast(
             Optional[Collection[tuple[int, int, int] | tuple[int, int, bytes | bytearray] | tuple[int, int, None, int]]],
-            socket_options,
+            request_kwargs.get("socket_options"),
         ),
         proxy=cast(Optional[str], request_kwargs.get("proxy")),
         httpx_kwargs=cast(Optional[dict[str, object]], request_kwargs.get("httpx_kwargs")),
@@ -223,10 +80,6 @@ class TelegramPollingRuntime:
         if self._application is None:
             raise RuntimeError("Telegram application has not been built.")
         return self._application
-
-    @application.setter
-    def application(self, application: Application) -> None:
-        self._application = application
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -401,9 +254,11 @@ def build_telegram_polling_runtime(
     if isinstance(configured, Mapping):
         request_config.update(configured)
     request_kwargs = normalize_request_kwargs(request_config)
-    identity: _BotIdentity = {
+    identity: _BotArguments = {
         "token": cast(str, config["token"]),
         "local_mode": bool(getattr(channel, "flag")("local_tdlib_api")),
+        "request": build_request(request_kwargs),
+        "get_updates_request": build_request(request_kwargs),
     }
     base_url = getattr(channel, "flag")("api_base_url")
     if base_url:
@@ -411,8 +266,7 @@ def build_telegram_polling_runtime(
     base_file_url = getattr(channel, "flag")("api_base_file_url")
     if base_file_url:
         identity["base_file_url"] = base_file_url
-    bot_kwargs: _BotArguments = {**identity, "request": build_request(request_kwargs), "get_updates_request": build_request(request_kwargs)}
-    async_bot = telegram.Bot(**bot_kwargs)
+    async_bot = telegram.Bot(**identity)
     async_runtime = AsyncTelegramRuntime(logger)
     webhook = config.get("webhook")
     runtime = TelegramPollingRuntime(
@@ -432,23 +286,5 @@ def build_telegram_polling_runtime(
         await runtime._post_shutdown(application)
 
     application = Application.builder().bot(async_bot).job_queue(None).post_init(post_init).post_shutdown(post_shutdown).build()
-    runtime.application = application
+    runtime._application = application
     return runtime
-
-
-class SyncBotFacade:
-    """Expose PTB async Bot methods through synchronous wrappers."""
-
-    def __init__(self, bot: telegram.Bot, runtime: AsyncTelegramRuntime):
-        self._bot, self._runtime = bot, runtime
-
-    def __getattr__(self, item: str) -> BotMethod:
-        attr = getattr(self._bot, item)
-        if not callable(attr):
-            raise AttributeError(f"{type(self._bot).__name__}.{item} is not callable")
-
-        @wraps(attr)
-        def wrapper(*args: object, **kwargs: object) -> object:
-            return self._runtime.call(cast(Coroutine[object, object, object], attr(*args, **kwargs)))
-
-        return wrapper

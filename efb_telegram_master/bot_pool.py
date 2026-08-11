@@ -10,7 +10,8 @@ from collections.abc import Mapping, Sequence
 from typing import Optional, Protocol, cast
 
 from .auxiliary_bot import AuxiliaryBot
-from .telegram_runtime import AsyncTelegramRuntime, TelegramPollingRuntime
+from .telegram_runtime import TelegramPollingRuntime
+from .telegram_sync_bridge import AsyncTelegramRuntime
 from .utils import normalize_request_kwargs
 
 logger = logging.getLogger(__name__)

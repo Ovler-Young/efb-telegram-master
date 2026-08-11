@@ -9,12 +9,8 @@ from efb_telegram_master import TelegramChannel
 from efb_telegram_master.etm_metrics import MetricsServer, parse_metrics_config
 from efb_telegram_master.outbound import OutboundShutdownTimeout
 from efb_telegram_master.telegram_api import TelegramAPI
-from efb_telegram_master.telegram_runtime import (
-    AsyncTelegramRuntime,
-    SyncBotFacade,
-    TelegramPollingRuntime,
-    build_telegram_polling_runtime,
-)
+from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
+from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
 
 
 def _runtime(*, application: object | None = None, async_runtime: AsyncTelegramRuntime | None = None) -> TelegramPollingRuntime:
@@ -53,7 +49,7 @@ def test_async_runtime_call_uses_bound_loop_without_starting_background_loop() -
     coroutine = coroutine_function()
 
     try:
-        with patch("efb_telegram_master.telegram_runtime.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
+        with patch("efb_telegram_master.telegram_sync_bridge.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
             assert runtime.call(coroutine, timeout=7) == "ok"
     finally:
         coroutine.close()
@@ -86,7 +82,7 @@ def test_async_runtime_call_starts_background_loop_when_no_loop_is_ready() -> No
     coroutine = coroutine_function()
 
     try:
-        with patch("efb_telegram_master.telegram_runtime.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
+        with patch("efb_telegram_master.telegram_sync_bridge.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
             assert runtime.call(coroutine) == "ok"
     finally:
         coroutine.close()
