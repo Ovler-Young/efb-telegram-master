@@ -17,7 +17,7 @@ from telethon.utils import get_peer_id
 from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.models import HistoryMigrationEntry
 
-from .utils import get_start_token
+from .utils import get_start_link
 
 pytestmark = pytest.mark.asyncio
 
@@ -176,8 +176,8 @@ async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id:
 
 
 async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, private_response, *, flag: str | None = None):
-    token = await get_start_token(client, helper, bot_id, chat_uid, private_response)
-    command = f"/start {token}"
+    start_link = await get_start_link(client, helper, bot_id, chat_uid, private_response)
+    command = f"/start {start_link.token}"
     if flag is not None:
         command += f" {flag}"
     command_message = None

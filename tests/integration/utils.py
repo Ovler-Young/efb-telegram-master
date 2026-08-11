@@ -1,5 +1,6 @@
 import re
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import chain
 from typing import Iterable
 
@@ -11,7 +12,13 @@ from telethon.tl.types import ChannelParticipantsAdmins
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.utils import chat_id_to_str
 
-from .helper.filters import has_button, in_chats
+from .helper.filters import edited, has_button, in_chats
+
+
+@dataclass(frozen=True)
+class StartLink:
+    token: str
+    session_message_id: int
 
 
 @contextmanager
@@ -43,20 +50,22 @@ async def is_bot_admin(client: TelegramClient, bot_id: int, group):
     return False
 
 
-async def get_start_token(client, helper, bot_id, chat_uid, private_response):
+async def get_start_link(client, helper, bot_id, chat_uid, private_response) -> StartLink:
     message = await private_response(
         lambda: client.send_message(bot_id, f"/link {chat_uid}"),
         lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
     )
     await message.buttons[0][0].click()
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+    message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
     url = None
     for button in chain.from_iterable(message.buttons):
         if button.url:
             url = button.url
             break
     assert url
-    return re.search(r"\?startgroup=(.+)", url).groups()[0]
+    match = re.search(r"\?startgroup=(.+)", url)
+    assert match is not None
+    return StartLink(match.groups()[0], message.id)
 
 
 def assert_is_linked(channel: TelegramChannel, slave_chats: Iterable[Chat], telegram_chat_id: int):
