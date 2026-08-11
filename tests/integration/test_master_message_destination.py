@@ -9,7 +9,7 @@ Only testing with text messages, as everything else shall follow suit.
 import asyncio
 import re
 import time
-from contextlib import suppress
+from contextlib import contextmanager
 from typing import List
 from unittest.mock import patch
 
@@ -25,6 +25,24 @@ retry_on_integration_timeout = mark.flaky(
 )
 
 pytestmark = mark.asyncio
+
+
+@contextmanager
+def preserve_destination_cache(cache):
+    weak_items = tuple(cache.weak.items())
+    strong_entries = tuple(cache.strong)
+    entries = tuple(dict.fromkeys((*strong_entries, *(entry for _, entry in weak_items))))
+    entry_state = tuple((entry, entry.expiry, entry.warned) for entry in entries)
+    try:
+        yield
+    finally:
+        cache.weak.clear()
+        cache.strong.clear()
+        cache.strong.extend(strong_entries)
+        cache.weak.update(weak_items)
+        for entry, expiry, warned in entry_state:
+            entry.expiry = expiry
+            entry.warned = warned
 
 
 async def test_master_master_quick_reply_no_cache(helper, client, bot_id, slave, channel, private_response):
@@ -105,7 +123,7 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
         lambda timeout: helper.wait_for_message(in_chats(bot_id), timeout),
     )  # Error message
     assert slave.messages.empty()
-    await cancel_destination_suggestion(helper, message)
+    await cancel_destination_suggestion(helper, private_response, message)
 
 
 async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, slave, channel, private_response):
@@ -128,14 +146,16 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
     # module object Telethon also uses for its transport deadlines.
     human_chat_cache_key = str((await client.get_me()).id)
     assert human_chat_cache_key in channel.chat_dest_cache.weak
-    channel.chat_dest_cache.weak[human_chat_cache_key].expiry = time.time() - 1
-    content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
-    message = await private_response(
-        lambda: client.send_message(bot_id, content),
-        lambda timeout: helper.wait_for_message(in_chats(bot_id) & text & regex("Error: No recipient specified"), timeout),
-    )
-    assert slave.messages.empty()
-    await cancel_destination_suggestion(helper, message)
+    cache_entry = channel.chat_dest_cache.weak[human_chat_cache_key]
+    with preserve_destination_cache(channel.chat_dest_cache):
+        cache_entry.expiry = time.time() - 1
+        content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
+        message = await private_response(
+            lambda: client.send_message(bot_id, content),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & text & regex("Error: No recipient specified"), timeout),
+        )
+        assert slave.messages.empty()
+        await cancel_destination_suggestion(helper, private_response, message)
 
 
 @retry_on_integration_timeout
@@ -181,10 +201,12 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         assert slave_message.edit
 
 
-async def cancel_destination_suggestion(helper, message: Message):
+async def cancel_destination_suggestion(helper, private_response, message: Message):
     """Cancel chat destination suggestions if available."""
-    with suppress(asyncio.TimeoutError):
-        while not message.button_count:
-            message = await helper.wait_for_message(in_chats(message.chat_id))
-    if message.button_count:
-        await message.buttons[-1][-1].click()
+    if not message.button_count:
+        return
+    await private_response(
+        lambda: message.buttons[-1][-1].click(),
+        lambda timeout: helper.wait_for_message(in_chats(message.chat_id) & edited(message.id) & ~has_button, timeout),
+        target_chat_id=message.chat_id,
+    )

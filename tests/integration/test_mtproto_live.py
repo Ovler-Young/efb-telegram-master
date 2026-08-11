@@ -153,7 +153,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         assert all(channel.msglogs.get_msg_log(master_msg_id=master_msg_id) is None for master_msg_id in source_log_ids)
 
         scan_boundary = max(source_ids)
-        channel.mtproto.config = replace(channel.mtproto.config, scan_ceiling=scan_boundary)
+        monkeypatch.setattr(channel.mtproto, "config", replace(channel.mtproto.config, scan_ceiling=scan_boundary))
         monkeypatch.setattr(MsgLogIngestionService, "EXISTING_STREAK_LIMIT", 1)
 
         command = await client.send_message(

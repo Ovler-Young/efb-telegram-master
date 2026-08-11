@@ -35,20 +35,23 @@ def link_chats(channel: TelegramChannel, slave_chats: Iterable[Chat], telegram_c
     master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     backup = tuple(db.get_chat_assoc(master_uid=master_str))
 
-    db.remove_chat_assoc(master_uid=master_str)
-    for i in slave_ids:
-        db.add_chat_assoc(master_str, i, multiple_slave=True)
+    body_started = False
     body_failed = False
     try:
+        db.remove_chat_assoc(master_uid=master_str)
+        for i in slave_ids:
+            db.add_chat_assoc(master_str, i, multiple_slave=True)
+        body_started = True
         yield
     except BaseException:
         body_failed = True
         raise
     finally:
         try:
-            db.remove_chat_assoc(master_uid=master_str)
-            for i in backup:
-                db.add_chat_assoc(master_str, i, multiple_slave=True)
+            if body_started or db.get_chat_assoc(master_uid=master_str) != list(backup):
+                db.remove_chat_assoc(master_uid=master_str)
+                for i in backup:
+                    db.add_chat_assoc(master_str, i, multiple_slave=True)
         except BaseException:
             if not body_failed:
                 raise

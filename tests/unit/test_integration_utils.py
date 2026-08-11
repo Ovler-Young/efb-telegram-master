@@ -4,6 +4,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from efb_telegram_master.chat_destination_cache import ChatDestinationCache
+from tests.integration import test_master_message_destination as destination_tests
 from tests.integration import utils as integration_utils
 from tests.integration.helper.filters import BaseFilter
 
@@ -125,6 +127,74 @@ def test_link_chats_does_not_restore_when_setup_fails() -> None:
     assert associations.added == []
 
 
+def test_link_chats_restores_associations_after_partial_setup_failure() -> None:
+    associations = _Associations({"blueset.telegram 500": ["slave old"]}, fail_slave_uid="slave new-b")
+    channel = cast(integration_utils.TelegramChannel, SimpleNamespace(channel_id="blueset.telegram", chat_associations=associations))
+    slave_chats = (SimpleNamespace(module_id="slave", uid="new-a"), SimpleNamespace(module_id="slave", uid="new-b"))
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        with integration_utils.link_chats(channel, slave_chats, 500):
+            pytest.fail("The context body must not run after setup failure")
+
+    assert associations.state == {"blueset.telegram 500": ["slave old"]}
+
+
+def test_expired_destination_lookup_restores_the_cache_snapshot() -> None:
+    cache = ChatDestinationCache("enabled", size=3)
+    cache.set("unrelated-first", "slave first")
+    cache.set("expired", "slave expired")
+    cache.set("unrelated-last", "slave last")
+    original_weak_items = tuple(cache.weak.items())
+    original_strong_entries = tuple(cache.strong)
+    expired = cache.weak["expired"]
+    original_expiry = expired.expiry
+
+    with destination_tests.preserve_destination_cache(cache):
+        expired.expiry = 0
+        assert cache.get("expired") is None
+        cache.set("created-during-test", "slave created")
+
+    assert tuple(cache.weak.items()) == original_weak_items
+    assert tuple(cache.strong) == original_strong_entries
+    assert cache.weak["expired"] is expired
+    assert expired.expiry == original_expiry
+    assert "created-during-test" not in cache.weak
+
+
+@pytest.mark.asyncio
+async def test_cancel_destination_suggestion_waits_for_its_own_edit(monkeypatch: pytest.MonkeyPatch) -> None:
+    clicked = False
+    calls = []
+    expected = SimpleNamespace(chat_id=34, is_edited=True, has_button=False, message=SimpleNamespace(id=12))
+    unrelated_chat = SimpleNamespace(chat_id=35, is_edited=True, has_button=False, message=SimpleNamespace(id=12))
+    wrong_message = SimpleNamespace(chat_id=34, is_edited=True, has_button=False, message=SimpleNamespace(id=13))
+    new_message = SimpleNamespace(chat_id=34, is_edited=False, has_button=False, message=SimpleNamespace(id=12))
+    helper = _QueuedHelper([unrelated_chat, wrong_message, new_message, expected])
+
+    async def click() -> None:
+        nonlocal clicked
+        clicked = True
+
+    async def private_response(trigger, receive, **kwargs):
+        calls.append((trigger, receive, kwargs))
+        await trigger()
+        return await receive(1.0)
+
+    message = SimpleNamespace(id=12, chat_id=34, button_count=1, buttons=[[SimpleNamespace(click=click)]])
+
+    monkeypatch.setattr(destination_tests, "in_chats", lambda chat_id: EventFieldFilter(lambda event: event.chat_id == chat_id))
+    monkeypatch.setattr(destination_tests, "edited", lambda message_id: EventFieldFilter(lambda event: event.is_edited and event.message.id == message_id))
+    monkeypatch.setattr(destination_tests, "has_button", EventFieldFilter(lambda event: event.has_button))
+
+    await destination_tests.cancel_destination_suggestion(helper, private_response, message)
+
+    assert clicked
+    assert len(calls) == 1
+    assert calls[0][2] == {"target_chat_id": 34}
+    assert helper.received is expected
+    assert helper.queue == [unrelated_chat, wrong_message, new_message]
+
+
 async def _async_noop(*_args: object, **_kwargs: object) -> None:
     return None
 
@@ -167,12 +237,26 @@ class _FailingUnlinkHelper(_UnlinkHelper):
         raise RuntimeError("reply wait failed")
 
 
+class _QueuedHelper:
+    def __init__(self, queue) -> None:
+        self.queue = queue
+        self.received = None
+
+    async def wait_for_message(self, event_filter, timeout):
+        for index, event in enumerate(self.queue):
+            if event_filter(event):
+                self.received = self.queue.pop(index)
+                return self.received
+        raise AssertionError("No matching event was queued")
+
+
 class _Associations:
-    def __init__(self, state: dict[str, list[str]], *, fail_first_removal: bool = False) -> None:
+    def __init__(self, state: dict[str, list[str]], *, fail_first_removal: bool = False, fail_slave_uid: str | None = None) -> None:
         self.state = {master: list(slaves) for master, slaves in state.items()}
         self.removed_masters: list[str] = []
         self.added: list[tuple[str, str]] = []
         self.fail_first_removal = fail_first_removal
+        self.fail_slave_uid = fail_slave_uid
 
     def get_chat_assoc(self, *, master_uid: str) -> list[str]:
         return list(self.state.get(master_uid, []))
@@ -188,3 +272,5 @@ class _Associations:
         assert multiple_slave
         self.added.append((master_uid, slave_uid))
         self.state.setdefault(master_uid, []).append(slave_uid)
+        if slave_uid == self.fail_slave_uid:
+            raise RuntimeError("setup failed")

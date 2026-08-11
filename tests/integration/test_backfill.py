@@ -14,8 +14,10 @@ async def test_link_chat_start_false_skips_backfill(helper, client, bot_id, bot_
     try:
         start_link = await get_start_link(client, helper, bot_id, slave.chat_with_alias.uid, private_response)
         with patch.object(channel.history_replay, "start") as migrate_chat_history, patch.object(channel.link_completion, "send_history_link") as send_history_link:
-            await client.send_message(bot_group, f"/start {start_link.token} {backfill_flag}")
-            await helper.wait_for_message(in_chats(bot_id) & edited(start_link.session_message_id) & text)
+            await private_response(
+                lambda: client.send_message(bot_group, f"/start {start_link.token} {backfill_flag}"),
+                lambda timeout: helper.wait_for_message(in_chats(bot_id) & edited(start_link.session_message_id) & text, timeout),
+            )
 
         migrate_chat_history.assert_not_called()
         send_history_link.assert_not_called()

@@ -81,8 +81,10 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
     assert token == match.group(1), "URL token matches manual token"
 
     try:
-        await client.send_message(bot_group, command)
-        await helper.wait_for_message(in_chats(bot_id) & edited(manual_session_message_id) & ~has_button)
+        await private_response(
+            lambda: client.send_message(bot_group, command),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & edited(manual_session_message_id) & ~has_button, timeout),
+        )
         assert_is_linked(channel, (chat_0,), bot_group)
     finally:
         await unlink_all_chats(channel, client, helper, bot_group)
@@ -225,12 +227,19 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
     assert match is not None
     token = match.group(1)
     command = f"/start {token}"
-    if dest_channel:
-        message = await client.send_message(dest_channel, command)
-        await message.forward_to(dest_chat)
-    else:
-        await client.send_message(dest_chat, command)
-    await helper.wait_for_message(in_chats(command_chat) & edited(session_message_id) & ~has_button)
+
+    async def complete_link():
+        if dest_channel:
+            message = await client.send_message(dest_channel, command)
+            await message.forward_to(dest_chat)
+        else:
+            await client.send_message(dest_chat, command)
+
+    await private_response(
+        complete_link,
+        lambda timeout: helper.wait_for_message(in_chats(command_chat) & edited(session_message_id) & ~has_button, timeout),
+        target_chat_id=command_chat,
+    )
 
 
 async def test_group_chat_migration(client, helper, channel, slave, bot_id):
@@ -271,3 +280,5 @@ async def test_group_chat_migration(client, helper, channel, slave, bot_id):
         if mega_chat is not None:
             await unlink_all_chats(channel, client, helper, get_peer_id(mega_chat))
             await client(DeleteChannelRequest(mega_chat.id))
+        else:
+            await client.delete_dialog(chat)
