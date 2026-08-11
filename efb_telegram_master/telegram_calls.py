@@ -71,6 +71,13 @@ class TelegramCallAdapter:
     def __init__(self, bot_pool: Optional[BotPool]) -> None:
         self._bot_pool = bot_pool
 
+    def execute(self, call: QueuedCall, selection: SenderSelection) -> SendReceipt:
+        primary = self.execute_primary(call, selection)
+        if primary.attachment is not None:
+            self.execute_attachment(primary.attachment, selection)
+        self.record_successful_send(call, selection)
+        return primary.receipt
+
     def execute_primary(self, call: QueuedCall, selection: SenderSelection) -> PrimaryExecution:
         method = getattr(selection.sender, call.operation)
         telegram_kwargs = stripped_telegram_kwargs(call.kwargs)

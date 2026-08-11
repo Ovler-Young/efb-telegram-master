@@ -117,7 +117,7 @@ def test_adapter_sends_oversize_text_and_caption_as_attachment(operation, args, 
     getattr(sender, operation).return_value = SimpleNamespace(message_id=7)
     call = QueuedCall(operation, args, {**kwargs, content_key: full_content}, 1, None, None)
 
-    receipt = _execute_adapter_call(TelegramCallAdapter(None), call, SenderSelection(sender, None))
+    receipt = TelegramCallAdapter(None).execute(call, SenderSelection(sender, None))
 
     assert receipt.message.message_id == 7
     delivered = getattr(sender, operation).call_args.kwargs[content_key]
