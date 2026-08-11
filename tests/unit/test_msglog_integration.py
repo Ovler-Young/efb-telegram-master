@@ -8,7 +8,7 @@ from ehforwarderbot.types import MessageID
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.chat_binding import ChatBindingManager
+from efb_telegram_master.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
 
@@ -18,7 +18,7 @@ def sync_msglog_channel():
     channel = object.__new__(TelegramChannel)
     channel.config = {"admins": [10]}
     channel.chat_associations = SimpleNamespace(get_topic_slaves=Mock(return_value=[("tests.slave", 7)]))
-    channel.chat_binding = SimpleNamespace(schedule_msglog_ingestion=Mock(return_value="started"))
+    channel.msglog_scan = SimpleNamespace(schedule=Mock(return_value="started"))
     channel.bot_manager = SimpleNamespace(api=SimpleNamespace(send_message=Mock()))
     channel.translator = SimpleNamespace(gettext=lambda text: text)
     return channel
@@ -38,7 +38,7 @@ def test_sync_msglog_schedules_for_admin_in_bound_forum_group(sync_msglog_channe
     TelegramChannel.sync_msglog(channel, sync_msglog_update(), SimpleNamespace())
 
     channel.chat_associations.get_topic_slaves.assert_called_once_with(100)
-    channel.chat_binding.schedule_msglog_ingestion.assert_called_once_with(100)
+    channel.msglog_scan.schedule.assert_called_once_with(100)
     channel.bot_manager.api.send_message.assert_called_once_with(100, text="MsgLog sync started for this group.")
 
 
@@ -61,7 +61,7 @@ def test_sync_msglog_rejects_unqualified_requests(sync_msglog_channel, user_id, 
         channel.chat_associations.get_topic_slaves.assert_called_once_with(100)
     else:
         channel.chat_associations.get_topic_slaves.assert_not_called()
-    channel.chat_binding.schedule_msglog_ingestion.assert_not_called()
+    channel.msglog_scan.schedule.assert_not_called()
     channel.bot_manager.api.send_message.assert_called_once_with(100, text=expected_reply)
 
 
@@ -71,13 +71,13 @@ def test_sync_msglog_ignores_updates_without_an_effective_message(sync_msglog_ch
     TelegramChannel.sync_msglog(channel, Update(update_id=1), SimpleNamespace())
 
     channel.chat_associations.get_topic_slaves.assert_not_called()
-    channel.chat_binding.schedule_msglog_ingestion.assert_not_called()
+    channel.msglog_scan.schedule.assert_not_called()
     channel.bot_manager.api.send_message.assert_not_called()
 
 
 def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
-    manager = object.__new__(ChatBindingManager)
-    manager.msglog_ingestion = SimpleNamespace(
+    manager = object.__new__(MsgLogScanScheduler)
+    manager.ingestion = SimpleNamespace(
         get_resumable_scans=Mock(
             return_value=[
                 SimpleNamespace(source_chat_id="100"),
@@ -86,12 +86,12 @@ def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
         )
     )
     manager.chat_associations = SimpleNamespace(get_topic_slaves=Mock(side_effect=[[("a", 1)], [("b", 2)]]))
-    manager.schedule_msglog_ingestion = Mock()
+    manager.schedule = Mock()
     manager.logger = Mock()
 
-    ChatBindingManager.resume_pending_msglog_ingestions(manager)
+    MsgLogScanScheduler.resume(manager)
 
-    assert [call.args for call in manager.schedule_msglog_ingestion.call_args_list] == [(100,), (200,)]
+    assert [call.args for call in manager.schedule.call_args_list] == [(100,), (200,)]
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

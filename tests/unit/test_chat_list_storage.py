@@ -1,4 +1,4 @@
-from efb_telegram_master.chat_binding import ChatListStorage
+from efb_telegram_master.callback_sessions import ChatListStorage
 
 
 def test_chat_list_storage(slave):

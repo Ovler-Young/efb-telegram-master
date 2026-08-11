@@ -55,7 +55,7 @@ def test_get_slave_msg_dest_uses_topic_group(channel, slave):
 
     with (
         patch.object(channel.bot_manager, "get_chat_info", return_value=SimpleNamespace(is_forum=True)),
-        patch.object(channel.chat_binding, "create_topic", return_value=TelegramTopicID(40004)) as create_topic,
+        patch.object(channel.topic_sync, "create_topic", return_value=TelegramTopicID(40004)) as create_topic,
         patch.object(channel, "topic_group", topic_group),
     ):
         plan = channel.message_router.route(msg)
@@ -85,8 +85,8 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
 
     forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(60006))
     with patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
-        first = channel.chat_binding.create_topic(slave_uid, topic_chat_id)
-        second = channel.chat_binding.create_topic(slave_uid, topic_chat_id)
+        first = channel.topic_sync.create_topic(slave_uid, topic_chat_id)
+        second = channel.topic_sync.create_topic(slave_uid, topic_chat_id)
 
     assert first == TelegramTopicID(60006)
     assert second == TelegramTopicID(60006)
@@ -111,12 +111,12 @@ def test_master_message_routes_forum_thread_to_slave(channel, slave):
 
     update = Update(update_id=1, message=message)
 
-    with patch.object(channel.master_message_inbound, "process_telegram_message") as process_telegram_message:
+    with patch.object(channel.master_message_delivery, "deliver") as deliver:
         channel.master_message_inbound.msg(update, None)
 
-    process_telegram_message.assert_called_once()
-    args = process_telegram_message.call_args.args
-    kwargs = process_telegram_message.call_args.kwargs
+    deliver.assert_called_once()
+    args = deliver.call_args.args
+    kwargs = deliver.call_args.kwargs
     assert args[2] == slave_uid
     assert kwargs["quote"] is True
 
@@ -136,11 +136,11 @@ def test_master_message_ignores_forum_topic_auto_reply_without_mutating_message(
 
     update = Update(update_id=3, message=message)
 
-    with patch.object(channel.master_message_inbound, "process_telegram_message") as process_telegram_message:
+    with patch.object(channel.master_message_delivery, "deliver") as deliver:
         channel.master_message_inbound.msg(update, None)
 
-    process_telegram_message.assert_called_once()
-    kwargs = process_telegram_message.call_args.kwargs
+    deliver.assert_called_once()
+    kwargs = deliver.call_args.kwargs
     assert kwargs["quote"] is False
 
     channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
@@ -174,8 +174,8 @@ def test_master_message_ignores_unknown_forum_thread(channel, slave):
 
     update = Update(update_id=2, message=message)
 
-    with patch.object(channel.master_message_inbound, "process_telegram_message") as process_telegram_message:
+    with patch.object(channel.master_message_delivery, "deliver") as deliver:
         channel.master_message_inbound.msg(update, None)
 
-    process_telegram_message.assert_not_called()
+    deliver.assert_not_called()
     channel.chat_associations.remove_topic_assoc(slave_uid=other_slave_uid)

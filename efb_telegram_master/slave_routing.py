@@ -25,7 +25,7 @@ class SlaveMessageRouter:
 
     FORUM_CHAT_CACHE_TTL = 3600
 
-    def __init__(self, bot, msglogs, chat_associations, chat_dest_cache: ChatDestinationCache, chat_manager: ChatObjectCacheManager, admins: list[int], topic_group: Optional[TelegramChatID], chat_binding, logger: logging.Logger) -> None:
+    def __init__(self, bot, msglogs, chat_associations, chat_dest_cache: ChatDestinationCache, chat_manager: ChatObjectCacheManager, admins: list[int], topic_group: Optional[TelegramChatID], topic_sync, logger: logging.Logger) -> None:
         self.bot = bot
         self.msglogs = msglogs
         self.chat_associations = chat_associations
@@ -33,7 +33,7 @@ class SlaveMessageRouter:
         self.chat_manager = chat_manager
         self.admins = admins
         self.topic_group = topic_group
-        self.chat_binding = chat_binding
+        self.topic_sync = topic_sync
         self.logger = logger
         self._known_forum_chat_ids: dict[int, float] = {}
         self._known_forum_chat_ids_lock = threading.Lock()
@@ -92,7 +92,7 @@ class SlaveMessageRouter:
                     existing_thread_id = self.chat_associations.get_topic_thread_id(slave_uid=chat_uid, topic_chat_id=destination)
                 self.logger.debug("[%s] Topic thread lookup for Telegram chat %s returned existing_thread_id=%s.", xid, destination, existing_thread_id)
                 with self._timed_phase(xid, f"Topic creation/resolution for Telegram chat {destination}"):
-                    thread_id = self.chat_binding.create_topic(slave_uid=chat_uid, telegram_chat_id=destination)
+                    thread_id = self.topic_sync.create_topic(slave_uid=chat_uid, telegram_chat_id=destination)
                 self.logger.debug("[%s] Topic creation/resolution for Telegram chat %s returned thread_id=%s.", xid, destination, thread_id)
         if not linked_chat:
             singly_linked = False

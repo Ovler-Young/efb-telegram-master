@@ -28,25 +28,34 @@ from PIL import Image, WebPImagePlugin
 from ruamel.yaml import YAML
 from telegram import Message, Update
 from telegram.constants import ChatType
-from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler
+from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, ConversationHandler
 
 from . import utils as etm_utils
 from .__version__ import __version__
 from .bot_manager import TelegramBotManager
-from .chat_binding import ChatBindingManager
+from .callback_sessions import CallbackSessionStore
 from .chat_destination_cache import ChatDestinationCache
+from .chat_head import ChatHeadService
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import CommandsManager
+from .constants import Flags
 from .db import DatabaseManager
+from .history_replay import HistoryReplayWorker
+from .link_completion import LinkCompletionService
+from .link_service import LinkService
+from .master_delivery import MasterMessageDelivery
 from .master_inbound import MasterMessageInbound
 from .master_message import MasterMessageWorker
 from .master_mutations import MasterMessageMutations
 from .message import ETMMsg
+from .msg_type import TGMsgType
+from .msglog_scan import MsgLogScanScheduler
 from .mtproto import MTProtoClient, MTProtoConfig, MTProtoRetryableError
 from .outbound_types import OutboundShutdownTimeout
 from .oversized_notice import OversizedNoticeSender
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
+from .recipient_suggestions import RecipientSuggestionService
 from .rpc_utils import RPCUtilities
 from .slave_file_delivery import SlaveFileDelivery
 from .slave_file_transfer import SlaveFileTransfer
@@ -57,6 +66,7 @@ from .slave_routing import SlaveMessageRouter
 from .slave_status import SlaveStatusService
 from .slave_text_delivery import TextDelivery
 from .telegram_runtime import TelegramPollingRuntime
+from .topic_sync import TopicGroupService
 from .utils import EFBChannelChatIDStr, ExperimentalFlagsManager, TelegramChatID, TelegramMessageID
 
 
@@ -141,13 +151,90 @@ class TelegramChannel(MasterChannel):
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
         self.bot_manager: TelegramBotManager = TelegramBotManager(self)
         self.telegram_runtime = self.bot_manager.telegram_runtime
+        self.history_replay = HistoryReplayWorker(
+            self.bot_manager.api, self.msglogs, self.history_migrations,
+            self.chat_manager, self.logger,
+        )
+        self.msglog_scan = MsgLogScanScheduler(
+            self.telegram_runtime, self.mtproto, self.msglog_ingestion,
+            self.chat_associations, self.logger,
+        )
+        self.topic_sync = TopicGroupService(
+            self.telegram_runtime, self.bot_manager.api, self.chat_associations,
+            self.chat_manager, self.channel_id, self._, self.ngettext, self.logger,
+        )
         self.commands: CommandsManager = CommandsManager(self)
-        self.chat_binding: ChatBindingManager = ChatBindingManager(self)
+        self.master_message_delivery = MasterMessageDelivery(
+            self.bot_manager.api, self.msglogs, self.chat_manager, self._,
+            self.flag, self._send_master_message_removal, self.logger,
+        )
+        self.callback_sessions = CallbackSessionStore(self.bot_manager.api, lambda: self.flag("chats_per_page"))
+        self.recipient_suggestions = RecipientSuggestionService(
+            self.bot_manager.api, self.callback_sessions, self.chat_manager, self.master_message_delivery,
+            lambda: self.flag("chats_per_page"), self._, self.logger,
+        )
+        self.link_service = LinkService(
+            self.bot_manager.api, self.telegram_runtime, self.channel_id,
+            self.flag("multiple_slave_chats"), self.msglogs, self.chat_associations,
+            self.chat_manager, self.callback_sessions, self.recipient_suggestions.render_chat_list,
+            self._, self.ngettext, self.logger,
+        )
+        self.link_completion = LinkCompletionService(
+            self.bot_manager.api, self.channel_id, self.flag("multiple_slave_chats"),
+            self.chat_associations, self.callback_sessions, self.topic_sync,
+            self.history_replay, self._, self.ngettext, self.logger,
+        )
+        self.chat_head = ChatHeadService(
+            self.bot_manager.api, self.callback_sessions, self.chat_associations,
+            self.chat_manager, self.channel_id, self.recipient_suggestions.render_chat_list,
+            self._record_chat_head, self._,
+        )
+
+        non_edit_filter = Filters.update.message | Filters.update.channel_post
+        self.telegram_runtime.application.add_handler(CommandHandler("link", self.telegram_runtime.as_async_callback(self.link_service.show_list), filters=non_edit_filter))
+        self.link_handler = ConversationHandler(
+            entry_points=[],
+            states={
+                Flags.LINK_CONFIRM: [CallbackQueryHandler(self.telegram_runtime.as_async_callback(self.link_service.confirm))],
+                Flags.LINK_EXEC: [CallbackQueryHandler(self.telegram_runtime.as_async_callback(self.link_service.execute))],
+            },
+            fallbacks=[CallbackQueryHandler(self.telegram_runtime.as_async_callback(self.bot_manager.api.session_expired))],
+            per_message=True,
+            per_chat=True,
+            per_user=False,
+        )
+        self.link_service.set_handler(self.link_handler)
+        self.link_completion.set_handler(self.link_handler)
+        self.telegram_runtime.application.add_handler(self.link_handler)
+        self.telegram_runtime.application.add_handler(CommandHandler("chat", self.telegram_runtime.as_async_callback(self.chat_head.start_chat_list), filters=non_edit_filter))
+        self.chat_head_handler = ConversationHandler(
+            entry_points=[],
+            states={Flags.CHAT_HEAD_CONFIRM: [CallbackQueryHandler(self.telegram_runtime.as_async_callback(self.chat_head.make_chat_head))]},
+            fallbacks=[CallbackQueryHandler(self.telegram_runtime.as_async_callback(self.bot_manager.api.session_expired))],
+            per_message=True,
+            per_chat=True,
+            per_user=False,
+        )
+        self.chat_head.set_handler(self.chat_head_handler)
+        self.telegram_runtime.application.add_handler(self.chat_head_handler)
+        self.telegram_runtime.application.add_handler(CommandHandler("unlink_all", self.telegram_runtime.as_async_callback(self.link_completion.unlink_all)))
+        self.suggestion_handler = ConversationHandler(
+            entry_points=[],
+            states={Flags.SUGGEST_RECIPIENTS: [CallbackQueryHandler(self.telegram_runtime.as_async_callback(self.recipient_suggestions.suggested_recipient))]},
+            fallbacks=[CallbackQueryHandler(self.telegram_runtime.as_async_callback(self.bot_manager.api.session_expired))],
+            per_message=True,
+            per_chat=True,
+            per_user=False,
+        )
+        self.recipient_suggestions.set_handler(self.suggestion_handler)
+        self.telegram_runtime.application.add_handler(self.suggestion_handler)
+        self.topic_sync.register_handlers()
+        self.history_replay.resume()
         self.topic_group: Optional[TelegramChatID] = TelegramChatID(self.flag("topic_group"))
         self.message_router = SlaveMessageRouter(
             self.bot_manager.api, self.msglogs, self.chat_associations,
             self.chat_dest_cache, self.chat_manager, self.config["admins"],
-            self.topic_group, self.chat_binding, self.logger,
+            self.topic_group, self.topic_sync, self.logger,
         )
         self.text_delivery = TextDelivery(self.config["admins"][0], self.bot_manager.api, self._, self.logger)
         self.file_transfer = SlaveFileTransfer(
@@ -183,7 +270,6 @@ class TelegramChannel(MasterChannel):
             self.translator = translation("efb_telegram_master", os.fspath(LOCALE_DIR), fallback=True)
 
         # Basic message handlers
-        non_edit_filter = Filters.update.message | Filters.update.channel_post
         self.telegram_runtime.application.add_handler(CommandHandler("start", self.telegram_runtime.as_async_callback(self.start), filters=non_edit_filter))
         self.telegram_runtime.application.add_handler(CommandHandler("help", self.telegram_runtime.as_async_callback(self.help), filters=non_edit_filter))
         self.telegram_runtime.application.add_handler(CommandHandler("info", self.telegram_runtime.as_async_callback(self.info), filters=non_edit_filter))
@@ -196,8 +282,8 @@ class TelegramChannel(MasterChannel):
         # commands to be delivered as messages
         self.master_message_inbound = MasterMessageInbound(
             self.bot_manager.api, self.msglogs, self.chat_associations,
-            self.chat_dest_cache, self.chat_manager, self.chat_binding,
-            self.channel_id, self._, self.flag, self._send_master_message_removal, self.logger,
+            self.chat_dest_cache, self.chat_manager, self.recipient_suggestions,
+            self.master_message_delivery, self.channel_id, self._, self.flag, self.logger,
         )
         self.master_message_mutations = MasterMessageMutations(
             self.bot_manager.api, self.msglogs, self.chat_manager,
@@ -222,6 +308,17 @@ class TelegramChannel(MasterChannel):
 
     def _send_master_message_removal(self, destination, message: ETMMsg) -> None:
         coordinator.send_status(MessageRemoval(source_channel=self, destination_channel=destination, message=message))
+
+    def _record_chat_head(self, chat, message: Message, text: str) -> None:
+        chat_head = ETMMsg()
+        chat_head.chat = chat
+        chat_head.author = chat.self or chat.add_self()
+        chat_head.uid = MessageID("__chathead__")
+        chat_head.type = MsgType.Text
+        chat_head.text = text
+        chat_head.type_telegram = TGMsgType.Text
+        chat_head.deliver_to = self
+        self.msglogs.add_or_update_message_log(chat_head, message)
 
     def load_config(self):
         """
@@ -429,7 +526,7 @@ class TelegramChannel(MasterChannel):
             if (update.effective_message.chat.type != ChatType.PRIVATE and update.effective_chat.id != self.topic_group) or (
                 forwarded_chat and forwarded_chat.type == ChatType.CHANNEL and forwarded_chat.id != self.topic_group
             ):
-                self.chat_binding.link_chat(update, command_args)
+                self.link_completion.complete(update, command_args)
             else:
                 self.bot_manager.api.send_message(update.effective_chat.id, self._("You cannot link remote chats to here. Please try again."))
         else:
@@ -547,7 +644,7 @@ class TelegramChannel(MasterChannel):
         if not self.chat_associations.get_topic_slaves(group_id):
             sync_reply_text(self.bot_manager.api, update.effective_message, self._("This forum group has no bound topics."))
             return
-        state = self.chat_binding.schedule_msglog_ingestion(int(group_id))
+        state = self.msglog_scan.schedule(int(group_id))
         sync_reply_text(self.bot_manager.api, update.effective_message, self._("MsgLog sync {state} for this group.").format(state=state))
 
     def help(self, update: Update, context: CallbackContext):
@@ -600,7 +697,7 @@ class TelegramChannel(MasterChannel):
             self.logger.warning("MTProto startup did not establish a connection; MsgLog ingestion remains pending.", extra={"event": "telegram_channel.mtproto_disconnected"})
             return
         self.logger.info("Resuming pending MsgLog ingestions", extra={"event": "telegram_channel.msglog_resume"})
-        self.chat_binding.resume_pending_msglog_ingestions()
+        self.msglog_scan.resume()
 
     async def _telegram_runtime_stopped(self, runtime: TelegramPollingRuntime) -> None:
         await self.mtproto.disconnect()

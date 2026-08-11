@@ -6,7 +6,7 @@ from ehforwarderbot.constants import MsgType
 from telegram import Update
 from telegram.constants import FileSizeLimit
 
-from efb_telegram_master.master_inbound import MasterMessageInbound
+from efb_telegram_master.master_delivery import MasterMessageDelivery
 from efb_telegram_master.utils import EFBChannelChatIDStr
 
 
@@ -45,22 +45,18 @@ def test_edited_oversized_attachment_removal_skips_download_eligibility(monkeypa
     removals = []
     bot = Mock()
     msglogs = Mock()
-    inbound = MasterMessageInbound(
+    delivery = MasterMessageDelivery(
         bot,
         msglogs,
-        Mock(),
-        Mock(),
         SimpleNamespace(get_chat=Mock(return_value=chat)),
-        Mock(),
-        "master",
         lambda text: text,
         lambda _: False,
         lambda destination, etm_message: removals.append((destination, etm_message)),
         Mock(),
     )
-    monkeypatch.setattr("efb_telegram_master.master_inbound.coordinator.slaves", {"slave": slave})
+    monkeypatch.setattr("efb_telegram_master.master_delivery.coordinator.slaves", {"slave": slave})
 
-    inbound.process_telegram_message(update, None, EFBChannelChatIDStr("slave chat"), edited=SimpleNamespace(slave_message_id="old-message", file_unique_id="old-file"))
+    delivery.deliver(update, None, EFBChannelChatIDStr("slave chat"), edited=SimpleNamespace(slave_message_id="old-message", file_unique_id="old-file"))
 
     assert len(removals) == 1
     assert removals[0][0] is slave

@@ -104,12 +104,12 @@ class TelegramAPI:
                     raise
                 if "chat_id" in kwargs:
                     chat_id = kwargs["chat_id"]
-                    self._channel.chat_binding.chat_migration_by_id(chat_id, error.new_chat_id)
+                    self._channel.topic_sync.migrate_chat_associations(cast(int, chat_id), error.new_chat_id)
                     kwargs["chat_id"] = error.new_chat_id
                     return function(self, *args, **kwargs)
                 index = TelegramAPI._POSITIONAL_CHAT_ID_INDICES.get(function.__name__, 0)
                 chat_id = args[index]
-                self._channel.chat_binding.chat_migration_by_id(chat_id, error.new_chat_id)
+                self._channel.topic_sync.migrate_chat_associations(cast(int, chat_id), error.new_chat_id)
                 migrated_args = (*args[:index], error.new_chat_id, *args[index + 1 :])
                 return function(self, *migrated_args, **kwargs)
 

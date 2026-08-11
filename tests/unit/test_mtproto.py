@@ -103,7 +103,7 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
     channel = SimpleNamespace(
         bot_manager=SimpleNamespace(api=SimpleNamespace(bot_pool=SimpleNamespace(bots=[auxiliary]))),
         mtproto=mtproto,
-        chat_binding=SimpleNamespace(resume_pending_msglog_ingestions=Mock()),
+            msglog_scan=SimpleNamespace(resume=Mock()),
         logger=Mock(),
     )
     runtime = SimpleNamespace(async_runtime=Mock())
@@ -113,7 +113,7 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
 
     assert (mtproto.connect_calls, mtproto.disconnect_calls) == (1, 1)
     auxiliary.bind_runtime.assert_called_once_with(runtime.async_runtime)
-    channel.chat_binding.resume_pending_msglog_ingestions.assert_called_once_with()
+    channel.msglog_scan.resume.assert_called_once_with()
 
 
 @pytest.mark.asyncio

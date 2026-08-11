@@ -89,9 +89,9 @@ def _delete_msg_logs_by_master_ids(channel, master_msg_ids):
 
 
 async def _wait_for_ingestion_worker_exit(channel, source_chat_id, timeout=30):
-    manager = channel.chat_binding
-    with manager._msglog_ingestion_lock:
-        worker = manager._msglog_ingestion_threads.get(source_chat_id)
+    scheduler = channel.msglog_scan
+    with scheduler._lock:
+        worker = scheduler._threads.get(source_chat_id)
     if worker is None:
         return
     await asyncio.to_thread(worker.join, timeout)

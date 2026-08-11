@@ -26,9 +26,9 @@ class _RecordingQueue:
 def _api() -> tuple[TelegramAPI, Mock, _RecordingQueue, Mock]:
     bot = Mock()
     queue = _RecordingQueue()
-    chat_binding = Mock()
-    api = TelegramAPI(SimpleNamespace(chat_binding=chat_binding), bot, queue, None)
-    return api, bot, queue, chat_binding
+    topic_sync = Mock()
+    api = TelegramAPI(SimpleNamespace(topic_sync=topic_sync), bot, queue, None)
+    return api, bot, queue, topic_sync
 
 
 def test_answer_callback_query_does_not_forward_internal_routing_arguments() -> None:
@@ -189,7 +189,7 @@ def test_direct_calls_strip_queue_metadata_and_preserve_chat_action_thread_argum
 
 
 def test_positional_edit_retries_with_migrated_chat_id() -> None:
-    api, _bot, queue, chat_binding = _api()
+    api, _bot, queue, topic_sync = _api()
 
     def migrate_then_succeed(request):
         if len(queue.requests) == 1:
@@ -201,7 +201,7 @@ def test_positional_edit_retries_with_migrated_chat_id() -> None:
 
     assert receipt.message_id == 3
     assert [request.args for request in queue.requests] == [("body", 1, 3, "inline-id"), ("body", 2, 3, "inline-id")]
-    chat_binding.chat_migration_by_id.assert_called_once_with(1, 2)
+    topic_sync.migrate_chat_associations.assert_called_once_with(1, 2)
 
 
 def test_send_audio_affixes_caption_and_strips_queue_metadata() -> None:
@@ -243,7 +243,7 @@ def test_ordinary_operations_keep_destination_thread_and_strip_queue_metadata(op
 
 
 def test_forward_message_retries_after_chat_migration_and_waits_for_receipt() -> None:
-    api, _bot, queue, chat_binding = _api()
+    api, _bot, queue, topic_sync = _api()
 
     def migrate_then_succeed(request):
         if len(queue.requests) == 1:
@@ -256,11 +256,11 @@ def test_forward_message_retries_after_chat_migration_and_waits_for_receipt() ->
 
     assert receipt.message_id == 5
     assert [request.kwargs["chat_id"] for request in queue.requests] == [1, 4]
-    chat_binding.chat_migration_by_id.assert_called_once_with(1, 4)
+    topic_sync.migrate_chat_associations.assert_called_once_with(1, 4)
 
 
 def test_chat_migration_retry_rewinds_an_exhausted_upload() -> None:
-    api, _bot, queue, chat_binding = _api()
+    api, _bot, queue, topic_sync = _api()
     photo = BytesIO(b"photo")
     uploaded = []
 
@@ -277,7 +277,7 @@ def test_chat_migration_retry_rewinds_an_exhausted_upload() -> None:
 
     assert receipt.message_id == 5
     assert uploaded == [b"photo", b"photo"]
-    chat_binding.chat_migration_by_id.assert_called_once_with(1, 4)
+    topic_sync.migrate_chat_associations.assert_called_once_with(1, 4)
 
 
 def test_api_cleans_claimed_upload_when_enqueue_fails(tmp_path) -> None:
@@ -320,7 +320,7 @@ def test_chat_migration_preserves_owned_upload_until_the_retried_request_finishe
     queue = OutboundQueue(Sender(), None, Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
     queue.start()
     try:
-        api = TelegramAPI(SimpleNamespace(chat_binding=Mock()), Sender(), queue, None)
+        api = TelegramAPI(SimpleNamespace(topic_sync=Mock()), Sender(), queue, None)
         api.register_upload_cleanup(str(upload))
 
         receipt = api.send_document(1, upload.as_uri())
