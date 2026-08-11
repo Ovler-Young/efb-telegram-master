@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -10,6 +11,7 @@ from efb_telegram_master.mtproto import (
     MTProtoClient,
     MTProtoConfig,
     MTProtoRetryableError,
+    MTProtoSessionOwnershipError,
     translate_mtproto_error,
 )
 
@@ -17,16 +19,21 @@ from efb_telegram_master.mtproto import (
 class FakeClient:
     def __init__(self, session_path: Path, _config: MTProtoConfig):
         self.connected = False
+        self.connect_calls = 0
+        self.disconnect_calls = 0
         self.requests: list[object] = []
         self.session_path = session_path
 
     async def connect(self) -> None:
+        self.connect_calls += 1
         self.connected = True
+        self.session_path.with_suffix(".session").touch()
 
     async def start(self, *, bot_token: str) -> None:
         assert bot_token == "bot-token"
 
     async def disconnect(self) -> None:
+        self.disconnect_calls += 1
         self.connected = False
 
     def is_connected(self) -> bool:
@@ -41,12 +48,15 @@ class LifecycleMTProto:
     enabled = True
     connected = False
 
-    def __init__(self) -> None:
+    def __init__(self, connect_error: BaseException | None = None) -> None:
         self.connect_calls = 0
         self.disconnect_calls = 0
+        self.connect_error = connect_error
 
     async def connect(self) -> None:
         self.connect_calls += 1
+        if self.connect_error is not None:
+            raise self.connect_error
         self.connected = True
 
     async def disconnect(self) -> None:
@@ -138,6 +148,32 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
 
 
 @pytest.mark.asyncio
+async def test_bot_lifecycle_keeps_polling_running_when_another_process_owns_mtproto_session():
+    mtproto = LifecycleMTProto(MTProtoSessionOwnershipError("session owned"))
+    auxiliary = Mock()
+    scan_scheduler = LifecycleScanScheduler()
+    service = object.__new__(TelegramBotManager)
+    service.mtproto = mtproto
+    service.msglog_scan = scan_scheduler
+    service.api = LifecycleAPI(auxiliary)
+    service.logger = Mock()
+    runtime = LifecycleRuntime()
+
+    await service.runtime_started(runtime)
+
+    auxiliary.bind_runtime.assert_called_once_with(runtime.async_runtime)
+    assert scan_scheduler.resume_calls == 0
+    service.logger.warning.assert_called_once()
+    assert service.logger.warning.call_args.args[0] == "MTProto startup is unavailable; MsgLog ingestion remains pending (%s)."
+
+    mtproto.connect_error = None
+    await service.runtime_started(runtime)
+
+    assert mtproto.connect_calls == 2
+    assert scan_scheduler.resume_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_get_messages_builds_ascending_batches_of_at_most_100(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(MTProtoClient, "_build_telethon_client", staticmethod(FakeClient))
     client = MTProtoClient(enabled_config(), "bot-token", tmp_path)
@@ -152,6 +188,63 @@ async def test_get_messages_builds_ascending_batches_of_at_most_100(monkeypatch:
     ]
     assert len(responses) == 205
     await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX session permissions and file locking")
+async def test_mtproto_session_has_one_owner_and_protects_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    clients: list[FakeClient] = []
+
+    def factory(session_path: Path, config: MTProtoConfig) -> FakeClient:
+        client = FakeClient(session_path, config)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(MTProtoClient, "_build_telethon_client", staticmethod(factory))
+    first = MTProtoClient(enabled_config(), "bot-token", tmp_path)
+    second = MTProtoClient(enabled_config(), "bot-token", tmp_path)
+
+    await first.connect()
+    await first.connect()
+    with pytest.raises(MTProtoSessionOwnershipError):
+        await second.connect()
+    await second.disconnect()
+    with pytest.raises(MTProtoSessionOwnershipError):
+        await MTProtoClient(enabled_config(), "bot-token", tmp_path).connect()
+
+    session_directory = tmp_path / "mtproto"
+    assert clients[0].connect_calls == 1
+    assert os.stat(session_directory).st_mode & 0o777 == 0o700
+    assert os.stat(session_directory / "bot.session").st_mode & 0o777 == 0o600
+    assert os.stat(session_directory / "owner.lock").st_mode & 0o777 == 0o600
+
+    await first.disconnect()
+    await first.disconnect()
+    await second.connect()
+    assert clients[0].disconnect_calls == 1
+    await second.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_mtproto_connect_failure_releases_session_ownership(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    class FailingClient(FakeClient):
+        async def connect(self) -> None:
+            await super().connect()
+            raise ConnectionError("unavailable")
+
+    monkeypatch.setattr(MTProtoClient, "_build_telethon_client", staticmethod(FailingClient))
+    failing = MTProtoClient(enabled_config(), "bot-token", tmp_path)
+
+    with pytest.raises(MTProtoRetryableError, match="unavailable"):
+        await failing.connect()
+
+    if os.name == "posix":
+        assert os.stat(tmp_path / "mtproto" / "bot.session").st_mode & 0o777 == 0o600
+
+    monkeypatch.setattr(MTProtoClient, "_build_telethon_client", staticmethod(FakeClient))
+    recovered = MTProtoClient(enabled_config(), "bot-token", tmp_path)
+    await recovered.connect()
+    await recovered.disconnect()
 
 
 def test_telethon_retryable_errors_use_the_base_exception():
