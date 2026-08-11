@@ -436,11 +436,11 @@ async def test_private_response_deadline_includes_trigger() -> None:
 
 
 @pytest.mark.asyncio
-async def test_private_response_captures_cursor_before_fast_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_private_response_excludes_a_pre_trigger_stale_panel(monkeypatch: pytest.MonkeyPatch) -> None:
     test_helper = build_event_helper()
-    prior = SimpleNamespace(kind="prior")
-    response = SimpleNamespace(kind="response")
-    await test_helper._queue_event(prior)
+    stale_panel = SimpleNamespace(kind="panel")
+    response_panel = SimpleNamespace(kind="panel")
+    await test_helper._queue_event(stale_panel)
     phases = []
 
     async def wait_for_slot(_, *, cap):
@@ -448,16 +448,16 @@ async def test_private_response_captures_cursor_before_fast_trigger(monkeypatch:
 
     async def trigger():
         phases.append(("trigger", None))
-        await test_helper._queue_event(response)
+        await test_helper._queue_event(response_panel)
 
     async def receive(_):
         phases.append(("receive", None))
-        return await test_helper.wait_for_event(lambda event: event.kind in {"prior", "response"})
+        return await test_helper.wait_for_event(lambda event: event.kind == "panel")
 
     monkeypatch.setattr(helper_module, "wait_for_limiter_slot", wait_for_slot)
-    assert await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive, response_cursor=test_helper.event_cursor) is response
+    assert await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive, response_cursor=test_helper.event_cursor) is response_panel
     assert [phase for phase, _ in phases] == ["limiter", "trigger", "receive"]
-    assert await test_helper.wait_for_event(lambda event: event.kind == "prior") is prior
+    assert await test_helper.wait_for_event(lambda event: event.kind == "panel") is stale_panel
 
 
 @pytest.mark.asyncio

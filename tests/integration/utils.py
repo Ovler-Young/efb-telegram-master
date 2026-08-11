@@ -67,15 +67,12 @@ async def is_bot_admin(client: TelegramClient, bot_id: int, group):
 
 
 async def get_start_link(client, helper, bot_id, chat_uid, private_response) -> StartLink:
-    command_message = None
-
     async def request_link():
-        nonlocal command_message
-        command_message = await client.send_message(bot_id, f"/link {chat_uid}")
+        await client.send_message(bot_id, f"/link {chat_uid}")
 
     message = await private_response(
         request_link,
-        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & reply_to(command_message.id if command_message else None), timeout),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
     )
     session_message_id = message.id
     message = await private_response(

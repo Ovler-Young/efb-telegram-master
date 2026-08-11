@@ -10,14 +10,6 @@ from tests.integration import utils as integration_utils
 from tests.integration.helper.filters import BaseFilter
 
 
-class EditedSessionFilter(BaseFilter):
-    def __init__(self, message_id: int) -> None:
-        self.message_id = message_id
-
-    def filter(self, _event) -> bool:
-        return True
-
-
 class EventFieldFilter(BaseFilter):
     def __init__(self, predicate) -> None:
         self.predicate = predicate
@@ -27,21 +19,28 @@ class EventFieldFilter(BaseFilter):
 
 
 @pytest.mark.asyncio
-async def test_start_link_waits_for_the_selected_session_menu(monkeypatch: pytest.MonkeyPatch) -> None:
-    selected = SimpleNamespace(id=41, buttons=[[SimpleNamespace(click=None)]])
+async def test_start_link_accepts_a_post_trigger_button_panel_without_reply_to(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected = SimpleNamespace(id=41, chat_id=9001, buttons=[[SimpleNamespace(click=None)]], edited=False)
     selected.buttons[0][0].click = _async_noop
-    completed = SimpleNamespace(id=41, buttons=[[SimpleNamespace(url="https://telegram.me/test?startgroup=token")]])
-    helper = _StartLinkHelper(selected, completed)
+    completed = SimpleNamespace(id=41, chat_id=9001, buttons=[[SimpleNamespace(url="https://telegram.me/test?startgroup=token")]], edited=True)
+    unrelated_chat = SimpleNamespace(
+        id=40,
+        chat_id=9002,
+        buttons=[
+            [SimpleNamespace(click=_async_noop)],
+        ],
+        edited=False,
+    )
+    no_button = SimpleNamespace(id=40, chat_id=9001, buttons=None, edited=False)
+    helper = _QueuedHelper([unrelated_chat, no_button, selected, completed])
     edited_calls: list[int] = []
-    replied_to: list[int | None] = []
 
-    def edited(message_id: int) -> EditedSessionFilter:
+    def edited(message_id: int) -> BaseFilter:
         edited_calls.append(message_id)
-        return EditedSessionFilter(message_id)
+        return EventFieldFilter(lambda event: event.edited and event.id == message_id)
 
-    def reply_to(message_id: int | None) -> EditedSessionFilter:
-        replied_to.append(message_id)
-        return EditedSessionFilter(message_id or 0)
+    def reply_to(_message_id: int | None) -> BaseFilter:
+        pytest.fail("start-link panels must not require reply_to")
 
     calls = []
 
@@ -50,15 +49,17 @@ async def test_start_link_waits_for_the_selected_session_menu(monkeypatch: pytes
         await trigger()
         return await receive(1)
 
+    monkeypatch.setattr(integration_utils, "in_chats", lambda chat_id: EventFieldFilter(lambda event: event.chat_id == chat_id))
+    monkeypatch.setattr(integration_utils, "has_button", EventFieldFilter(lambda event: bool(event.buttons)))
     monkeypatch.setattr(integration_utils, "edited", edited)
     monkeypatch.setattr(integration_utils, "reply_to", reply_to)
 
     start_link = await integration_utils.get_start_link(SimpleNamespace(send_message=_send_link_command), helper, 9001, "chat", private_response)
 
     assert start_link == integration_utils.StartLink("token", 41)
-    assert replied_to == [99]
     assert edited_calls == [41]
     assert len(calls) == 2
+    assert helper.queue == [unrelated_chat, no_button]
 
 
 @pytest.mark.asyncio
