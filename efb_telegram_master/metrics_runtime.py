@@ -1,4 +1,5 @@
 """Prometheus endpoint configuration and runtime lifecycle wiring."""
+
 from __future__ import annotations
 
 import logging
@@ -41,15 +42,20 @@ def parse_metrics_config(metrics_cfg: object, logger: Any) -> tuple[int, tuple[s
         return top_n, None
     return top_n, (host, port)
 
+
 class MetricsServer:
     """Serving-thread handle with the WSGI server's shutdown compatibility methods."""
+
     def __init__(self, server: Any, thread: threading.Thread) -> None:
         self._server = server
         self.thread = thread
+
     def shutdown(self) -> None:
         self._server.shutdown()
+
     def server_close(self) -> None:
         self._server.server_close()
+
     def stop(self, join_timeout: float) -> None:
         """Stop serving and close the socket before joining its thread."""
         if self.thread.is_alive():
@@ -61,6 +67,7 @@ class MetricsServer:
     @property
     def server_address(self) -> tuple[str, int]:
         return self._server.server_address
+
 
 def start_metrics_server(host: str, port: int, registry: CollectorRegistry) -> MetricsServer:
     """Start a daemon WSGI serving thread and return its bounded-shutdown handle."""
@@ -78,6 +85,7 @@ def start_metrics_server(host: str, port: int, registry: CollectorRegistry) -> M
     metrics_server = MetricsServer(server, thread)
     logging.getLogger(__name__).info("Metrics endpoint listening on %s", metrics_server.server_address)
     return metrics_server
+
 
 def configure_runtime_metrics(
     config: Mapping[str, object],
