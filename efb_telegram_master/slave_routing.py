@@ -25,7 +25,18 @@ class SlaveMessageRouter:
 
     FORUM_CHAT_CACHE_TTL = 3600
 
-    def __init__(self, bot, msglogs, chat_associations, chat_dest_cache: ChatDestinationCache, chat_manager: ChatObjectCacheManager, admins: list[int], topic_group: Optional[TelegramChatID], topic_sync, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        bot,
+        msglogs,
+        chat_associations,
+        chat_dest_cache: ChatDestinationCache,
+        chat_manager: ChatObjectCacheManager,
+        admins: list[int],
+        topic_group: Optional[TelegramChatID],
+        topic_sync,
+        logger: logging.Logger,
+    ) -> None:
         self.bot = bot
         self.msglogs = msglogs
         self.chat_associations = chat_associations

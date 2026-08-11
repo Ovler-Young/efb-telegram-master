@@ -47,18 +47,35 @@ def remote_image_placeholder(temp_directory: Callable[[], Optional[str]]):
 
 
 def send_remote_image_placeholder(
-    bot, file_transfer, temp_directory: Callable[[], Optional[str]], destination, thread_id,
-    template: str, reactions: str, text: str, reply_to, reply_markup, silent: bool, *, as_document: bool,
+    bot,
+    file_transfer,
+    temp_directory: Callable[[], Optional[str]],
+    destination,
+    thread_id,
+    template: str,
+    reactions: str,
+    text: str,
+    reply_to,
+    reply_markup,
+    silent: bool,
+    *,
+    as_document: bool,
 ):
     placeholder = remote_image_placeholder(temp_directory)
     try:
         method = bot.send_document if as_document else bot.send_photo
         return method(
-            destination, file_transfer.prepare(placeholder, placeholder.name, "remote-image-placeholder.png"),
-            prefix=template, suffix=reactions, caption=text, parse_mode="HTML",
+            destination,
+            file_transfer.prepare(placeholder, placeholder.name, "remote-image-placeholder.png"),
+            prefix=template,
+            suffix=reactions,
+            caption=text,
+            parse_mode="HTML",
             filename="remote-image-placeholder.png" if as_document else None,
-            reply_to_message_id=reply_to, message_thread_id=thread_id,
-            reply_markup=reply_markup, disable_notification=silent,
+            reply_to_message_id=reply_to,
+            message_thread_id=thread_id,
+            reply_markup=reply_markup,
+            disable_notification=silent,
         )
     finally:
         placeholder.close()

@@ -133,7 +133,9 @@ class SlaveStatusService:
         if telegram_origin and not row.master_msg_id_alt:
             message.edit = False
             message.vendor_specific = message.vendor_specific or {}
-            self.reaction_dispatcher.dispatch_message(message, plan.message_template, None, plan.destination, plan.thread_id, database_old_msg_id=(chat_id, message_id), target_msg_id_override=message_id)
+            self.reaction_dispatcher.dispatch_message(
+                message, plan.message_template, None, plan.destination, plan.thread_id, database_old_msg_id=(chat_id, message_id), target_msg_id_override=message_id
+            )
             return
         try:
             self.reaction_dispatcher.dispatch_message(message, plan.message_template, (chat_id, message_id), plan.destination, plan.thread_id)
@@ -143,4 +145,6 @@ class SlaveStatusService:
             primary_chat_id, primary_message_id = utils.message_id_str_to_id(utils.TgChatMsgIDStr(row.master_msg_id))
             message.edit = False
             message.vendor_specific = message.vendor_specific or {}
-            self.reaction_dispatcher.dispatch_message(message, plan.message_template, None, primary_chat_id, plan.thread_id, database_old_msg_id=(chat_id, message_id), target_msg_id_override=primary_message_id)
+            self.reaction_dispatcher.dispatch_message(
+                message, plan.message_template, None, primary_chat_id, plan.thread_id, database_old_msg_id=(chat_id, message_id), target_msg_id_override=primary_message_id
+            )

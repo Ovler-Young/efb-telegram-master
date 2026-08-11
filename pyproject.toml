@@ -1,3 +1,91 @@
+[build-system]
+requires = ["setuptools==81.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "efb-telegram-master"
+dynamic = ["version"]
+description = "Telegram Master Channel for EH Forwarder Bot, based on Telegram Bot API."
+readme = { file = "README.rst", content-type = "text/x-rst" }
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "Eana Hufwe", email = "ilove@1a23.com" }]
+keywords = ["ehforwarderbot", "EH Forwarder Bot", "EH Forwarder Bot Master Channel", "Telegram", "chatbot"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Communications :: Chat",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "ehforwarderbot>=2.0.0",
+    "setuptools==81.0.0; python_version >= '3.9'",
+    "python-telegram-bot~=22.7",
+    "python-magic",
+    "ffmpeg-python",
+    "peewee",
+    "requests",
+    "pydub",
+    "audioop-lts; python_version >= '3.13'",
+    "ruamel.yaml",
+    "pillow",
+    "language-tags",
+    "retrying",
+    "bullet>=2.2.0",
+    "cjkwrap",
+    "humanize",
+    "typing-extensions>=3.7.4.1",
+    "prometheus_client",
+    "psutil>=5.9,<8",
+    "pyrate-limiter>=3.9.0",
+    "telethon>=1.44,<1.45",
+]
+
+[project.optional-dependencies]
+tests = [
+    "pytest",
+    "cryptg",
+    "pytest-dotenv",
+    "flaky",
+    "pytest-asyncio",
+    "mypy>=0.910",
+    "pytest-html",
+    "doit",
+    "PySocks",
+    "coverage",
+    "sphinx",
+    "pre-commit",
+    "ruff==0.12.8",
+]
+tgs = ["lottie", "cairosvg"]
+postgresql = ["psycopg2-binary"]
+
+[project.entry-points."ehforwarderbot.master"]
+"blueset.telegram" = "efb_telegram_master:TelegramChannel"
+
+[project.entry-points."ehforwarderbot.wizard"]
+"blueset.telegram" = "efb_telegram_master.wizard:wizard"
+
+[project.urls]
+Homepage = "https://etm.1a23.studio"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["efb_telegram_master*"]
+exclude = ["*.tests", "*.tests.*", "tests.*", "tests"]
+
+[tool.setuptools.dynamic]
+version = { attr = "efb_telegram_master.__version__.__version__" }
+
 [tool.ruff]
 line-length = 200
 

@@ -83,7 +83,14 @@ class TopicGroupService:
         if telegram_chat.is_forum and len(chats) > 1:
             return self._update_forum_reply(update, TelegramChatID(telegram_chat.id))
         if len(chats) != 1:
-            return self.bot.reply_error(update, self.ngettext("This only works in a group linked with one chat. Currently {0} chat linked to this group.", "This only works in a group linked with one chat. Currently {0} chats linked to this group.", len(chats)).format(len(chats)))
+            return self.bot.reply_error(
+                update,
+                self.ngettext(
+                    "This only works in a group linked with one chat. Currently {0} chat linked to this group.",
+                    "This only works in a group linked with one chat. Currently {0} chats linked to this group.",
+                    len(chats),
+                ).format(len(chats)),
+            )
         return self._update_single_group(update, telegram_chat, chats[0])
 
     def _update_forum_reply(self, update: Update, chat_id: TelegramChatID):
@@ -119,7 +126,12 @@ class TopicGroupService:
             assert update.effective_message
             return sync_reply_text(self.bot, update.effective_message, self._("Chat details updated."))
         except EFBChatNotFound:
-            return self.bot.reply_error(update, self._("Chat linked ({chat_uid}) is not found in the slave channel ({channel_name}, {channel_id}).").format(chat_uid=chat_uid, channel_name=channel.channel_name, channel_id=channel_id))
+            return self.bot.reply_error(
+                update,
+                self._("Chat linked ({chat_uid}) is not found in the slave channel ({channel_name}, {channel_id}).").format(
+                    chat_uid=chat_uid, channel_name=channel.channel_name, channel_id=channel_id
+                ),
+            )
         except EFBOperationNotSupported:
             return self.bot.reply_error(update, self._("No profile picture provided from this chat."))
         except TelegramError as error:
@@ -136,7 +148,9 @@ class TopicGroupService:
         try:
             if isinstance(chat, ETMGroupChat):
                 members = self._(", ").join(member.long_name for member in chat.members if not isinstance(member, SystemChatMember))
-                description += ("\n" if description else "") + self.ngettext("{count} group member: {list}", "{count} group members: {list}", len(chat.members)).format(count=len(chat.members), list=members)
+                description += ("\n" if description else "") + self.ngettext("{count} group member: {list}", "{count} group members: {list}", len(chat.members)).format(
+                    count=len(chat.members), list=members
+                )
             picture = channel.get_chat_picture(chat)
             if not picture:
                 raise EFBOperationNotSupported()

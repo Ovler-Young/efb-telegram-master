@@ -62,7 +62,9 @@ class MasterMessageWorker:
             except Exception as error:
                 self.logger.exception("Failed to process Telegram update (%s).", type(error).__name__)
                 if update.effective_message:
-                    sync_reply_text(self.bot, update.effective_message, self.localize("Unknown error has occurred while trying to process this message. See log for details.\n\n{error!r}").format(error=error))
+                    sync_reply_text(
+                        self.bot, update.effective_message, self.localize("Unknown error has occurred while trying to process this message. See log for details.\n\n{error!r}").format(error=error)
+                    )
             finally:
                 self.message_queue.task_done()
 

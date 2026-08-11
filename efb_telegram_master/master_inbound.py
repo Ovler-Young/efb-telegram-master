@@ -131,4 +131,12 @@ class MasterMessageInbound:
         self.chat_dest_cache.set_warned(str(cache_key))
         module_id, chat_id, _ = utils.chat_id_str_to_id(cached_destination)
         destination_chat = self.chat_manager.get_chat(module_id, chat_id)
-        sync_reply_text(self.bot, update.effective_message, self.localize("This message is sent to “{dest}” with quick reply feature.\n\nLearn more about how this works, how to turn this feature off, and how to stop this warning at {docs}.").format(dest=destination_chat.full_name if destination_chat else cached_destination, docs="https://etm.1a23.studio/"), quote=True, disable_web_page_preview=True)
+        sync_reply_text(
+            self.bot,
+            update.effective_message,
+            self.localize(
+                "This message is sent to “{dest}” with quick reply feature.\n\nLearn more about how this works, how to turn this feature off, and how to stop this warning at {docs}."
+            ).format(dest=destination_chat.full_name if destination_chat else cached_destination, docs="https://etm.1a23.studio/"),
+            quote=True,
+            disable_web_page_preview=True,
+        )

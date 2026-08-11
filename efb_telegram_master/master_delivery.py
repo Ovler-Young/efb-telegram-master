@@ -81,7 +81,11 @@ class MasterMessageDelivery:
             if quote:
                 self.attach_target_message(message, etm_message, channel)
             if etm_message.type not in coordinator.slaves[channel].supported_message_types:
-                raise EFBMessageTypeNotSupported(self.localize("{type_name} messages are not supported by slave channel {channel_name}.").format(type_name=etm_message.type.name, channel_name=coordinator.slaves[channel].channel_name))
+                raise EFBMessageTypeNotSupported(
+                    self.localize("{type_name} messages are not supported by slave channel {channel_name}.").format(
+                        type_name=etm_message.type.name, channel_name=coordinator.slaves[channel].channel_name
+                    )
+                )
             if edited:
                 self._apply_edit(etm_message, edited)
                 if (self._markdown(message.text, message.text_markdown_v2) or self._markdown(message.caption, message.caption_markdown_v2)).startswith(self.DELETE_FLAG):
@@ -163,7 +167,9 @@ class MasterMessageDelivery:
         elif message_type is TGMsgType.Contact:
             assert message.contact
             contact: Contact = message.contact
-            etm_message.text = self.localize("Shared a contact: {first_name} {last_name}\n{phone_number}").format(first_name=contact.first_name, last_name=contact.last_name, phone_number=contact.phone_number)
+            etm_message.text = self.localize("Shared a contact: {first_name} {last_name}\n{phone_number}").format(
+                first_name=contact.first_name, last_name=contact.last_name, phone_number=contact.phone_number
+            )
         elif message_type is TGMsgType.Dice:
             assert message.dice
             etm_message.text = f"{message.dice.emoji} = {message.dice.value}"
@@ -202,7 +208,11 @@ class MasterMessageDelivery:
     def _check_file_download(self, file_obj: Any) -> None:
         size = getattr(file_obj, "file_size", None)
         if size and not self.flags("local_tdlib_api") and size > FileSizeLimit.FILESIZE_DOWNLOAD:
-            raise EFBMessageError(self.localize("Attachment is too large ({size}). Maximum allowed by Telegram Bot API is {max_size}. (AT01)").format(size=humanize.naturalsize(size), max_size=humanize.naturalsize(FileSizeLimit.FILESIZE_DOWNLOAD)))
+            raise EFBMessageError(
+                self.localize("Attachment is too large ({size}). Maximum allowed by Telegram Bot API is {max_size}. (AT01)").format(
+                    size=humanize.naturalsize(size), max_size=humanize.naturalsize(FileSizeLimit.FILESIZE_DOWNLOAD)
+                )
+            )
 
     @staticmethod
     def _markdown(plain: Optional[str], markdown: Optional[str]) -> str:

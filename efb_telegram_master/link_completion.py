@@ -13,6 +13,7 @@ from telegram.ext import CallbackContext, ConversationHandler
 from . import utils
 from .callback_sessions import CallbackSessionStore
 from .chat import ETMChatMixin
+from .history_replay import history_location_text
 from .ptb_compat import get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TelegramTopicID, TgChatMsgIDStr
 
@@ -22,7 +23,9 @@ def _bounded_error_message(error: BaseException) -> str:
 
 
 class LinkCompletionService:
-    def __init__(self, bot, channel_id: ModuleID, multiple_slave_chats: bool, chat_associations, callback_sessions: CallbackSessionStore, topic_sync, history_replay, translate, ngettext, logger: logging.Logger):
+    def __init__(
+        self, bot, channel_id: ModuleID, multiple_slave_chats: bool, chat_associations, callback_sessions: CallbackSessionStore, topic_sync, history_replay, translate, ngettext, logger: logging.Logger
+    ):
         self.bot = bot
         self.channel_id = channel_id
         self.multiple_slave_chats = multiple_slave_chats
@@ -152,7 +155,7 @@ class LinkCompletionService:
 
         if do_backfill:
             try:
-                self.history_replay.start(chat_uid, tg_chat_to_link.id, thread_id)
+                self.history_replay.start(chat_uid, tg_chat_to_link.id, thread_id, storage_key)
             except Exception as error:
                 self.logger.warning(
                     "History migration failed for %s.",
@@ -176,21 +179,7 @@ class LinkCompletionService:
     def send_history_link(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, storage_key: Tuple[int, int], thread_id: Optional[TelegramTopicID] = None):
         """Send a message with a link to the chat history."""
         try:
-            original_chat_id_int = int(storage_key[0])
-            original_msg_id = int(storage_key[1])
-
-            if str(original_chat_id_int).startswith("-100"):
-                # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
-                short_id = str(original_chat_id_int)[4:]
-                link = f"https://t.me/c/{short_id}/{original_msg_id}"
-            elif str(original_chat_id_int).startswith("-"):
-                # Regular group: use group link format
-                link = f"https://t.me/{abs(original_chat_id_int)}/{original_msg_id}"
-            else:
-                # Channel or user: fallback to /c/{id}/{msg_id}
-                link = f"https://t.me/c/{original_chat_id_int}/{original_msg_id}"
-
-            text = self._("This chat was previously linked. History messages are not migrated. You can view previous messages here: {link}").format(link=link)
+            text = history_location_text(self._, storage_key)
 
             kwargs = {"chat_id": tg_chat_id, "text": text, "disable_notification": True}
             if thread_id:

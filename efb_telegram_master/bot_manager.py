@@ -20,7 +20,7 @@ from .chat_association_repository import ChatAssociationRepository
 from .metrics_runtime import configure_runtime_metrics
 from .msglog_ingestion_repository import MsgLogIngestionRepository
 from .msglog_scan import MsgLogScanScheduler
-from .mtproto import MTProtoClient, MTProtoRetryableError
+from .mtproto import MTProtoClient, MTProtoRetryableError, MTProtoSessionOwnershipError
 from .outbound import OutboundQueue
 from .ptb_compat import sync_reply_html
 from .rate_limiter import SlidingWindowRateLimiter
@@ -109,7 +109,7 @@ class TelegramBotManager:
             return
         try:
             await self.mtproto.connect()
-        except (ConnectionError, TimeoutError, OSError, MTProtoRetryableError) as error:
+        except (ConnectionError, TimeoutError, OSError, MTProtoRetryableError, MTProtoSessionOwnershipError) as error:
             self.logger.warning(
                 "MTProto startup is unavailable; MsgLog ingestion remains pending (%s).",
                 type(error).__name__,

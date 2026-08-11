@@ -39,32 +39,111 @@ class TextDelivery:
         pieces.append(html.escape(text[previous:]))
         return "".join(pieces)
 
-    def text(self, msg: Message, destination: TelegramChatID, thread_id: Optional[TelegramTopicID], template: str, reactions: str, old_message_id: Optional[OldMsgID] = None, reply_to: Optional[TelegramMessageID] = None, reply_markup: Optional[ReplyMarkup] = None, silent: bool = False) -> telegram.Message:
+    def text(
+        self,
+        msg: Message,
+        destination: TelegramChatID,
+        thread_id: Optional[TelegramTopicID],
+        template: str,
+        reactions: str,
+        old_message_id: Optional[OldMsgID] = None,
+        reply_to: Optional[TelegramMessageID] = None,
+        reply_markup: Optional[ReplyMarkup] = None,
+        silent: bool = False,
+    ) -> telegram.Message:
         assert self.bot is not None
         self.bot.send_chat_action(destination, ChatAction.TYPING, message_thread_id=thread_id)
         text = self.html_substitutions(msg)
         if old_message_id:
-            return self.bot.edit_message_text(chat_id=old_message_id[0], message_id=old_message_id[1], text=text, prefix=template, suffix=reactions, parse_mode="HTML", reply_markup=reply_markup, **edit_metadata(msg))
-        return self.bot.send_message(destination, text=text, prefix=template, suffix=reactions, parse_mode="HTML", reply_to_message_id=reply_to, message_thread_id=thread_id, reply_markup=reply_markup, disable_notification=silent, **send_identity(msg))
+            return self.bot.edit_message_text(
+                chat_id=old_message_id[0], message_id=old_message_id[1], text=text, prefix=template, suffix=reactions, parse_mode="HTML", reply_markup=reply_markup, **edit_metadata(msg)
+            )
+        return self.bot.send_message(
+            destination,
+            text=text,
+            prefix=template,
+            suffix=reactions,
+            parse_mode="HTML",
+            reply_to_message_id=reply_to,
+            message_thread_id=thread_id,
+            reply_markup=reply_markup,
+            disable_notification=silent,
+            **send_identity(msg),
+        )
 
-    def link(self, msg: Message, destination: TelegramChatID, thread_id: Optional[TelegramTopicID], template: str, reactions: str, old_message_id: Optional[OldMsgID] = None, reply_to: Optional[TelegramMessageID] = None, reply_markup: Optional[ReplyMarkup] = None, silent: bool = False) -> telegram.Message:
+    def link(
+        self,
+        msg: Message,
+        destination: TelegramChatID,
+        thread_id: Optional[TelegramTopicID],
+        template: str,
+        reactions: str,
+        old_message_id: Optional[OldMsgID] = None,
+        reply_to: Optional[TelegramMessageID] = None,
+        reply_markup: Optional[ReplyMarkup] = None,
+        silent: bool = False,
+    ) -> telegram.Message:
         assert self.bot is not None and isinstance(msg.attributes, LinkAttribute)
         self.bot.send_chat_action(destination, ChatAction.TYPING, message_thread_id=thread_id)
         attributes = msg.attributes
         thumbnail_url = urllib.parse.quote(attributes.image or "", safe="?=&#:/")
         thumbnail = f'<a href="{thumbnail_url}">🔗</a>' if thumbnail_url else "🔗"
-        text = "%s <a href=\"%s\">%s</a>\n%s" % (thumbnail, urllib.parse.quote(attributes.url, safe="?=&#:/"), html.escape(attributes.title or attributes.url), html.escape(attributes.description or ""))
+        text = '%s <a href="%s">%s</a>\n%s' % (thumbnail, urllib.parse.quote(attributes.url, safe="?=&#:/"), html.escape(attributes.title or attributes.url), html.escape(attributes.description or ""))
         if msg.text:
             text += "\n\n" + self.html_substitutions(msg)
         if old_message_id:
-            return self.bot.edit_message_text(text=text, chat_id=old_message_id[0], message_id=old_message_id[1], prefix=template, suffix=reactions, parse_mode="HTML", reply_markup=reply_markup, **edit_metadata(msg))
-        return self.bot.send_message(chat_id=destination, text=text, prefix=template, suffix=reactions, parse_mode="HTML", reply_to_message_id=reply_to, message_thread_id=thread_id, reply_markup=reply_markup, disable_notification=silent, **send_identity(msg))
+            return self.bot.edit_message_text(
+                text=text, chat_id=old_message_id[0], message_id=old_message_id[1], prefix=template, suffix=reactions, parse_mode="HTML", reply_markup=reply_markup, **edit_metadata(msg)
+            )
+        return self.bot.send_message(
+            chat_id=destination,
+            text=text,
+            prefix=template,
+            suffix=reactions,
+            parse_mode="HTML",
+            reply_to_message_id=reply_to,
+            message_thread_id=thread_id,
+            reply_markup=reply_markup,
+            disable_notification=silent,
+            **send_identity(msg),
+        )
 
-    def unsupported(self, msg: Message, destination: TelegramChatID, thread_id: Optional[TelegramTopicID], template: str, reactions: str, old_message_id: Optional[OldMsgID] = None, reply_to: Optional[TelegramMessageID] = None, reply_markup: Optional[ReplyMarkup] = None, silent: bool = False) -> telegram.Message:
+    def unsupported(
+        self,
+        msg: Message,
+        destination: TelegramChatID,
+        thread_id: Optional[TelegramTopicID],
+        template: str,
+        reactions: str,
+        old_message_id: Optional[OldMsgID] = None,
+        reply_to: Optional[TelegramMessageID] = None,
+        reply_markup: Optional[ReplyMarkup] = None,
+        silent: bool = False,
+    ) -> telegram.Message:
         assert self.bot is not None
         self.bot.send_chat_action(destination, ChatAction.TYPING, message_thread_id=thread_id)
         text = self.html_substitutions(msg) if msg.text else ""
         prefix = template + " " + self.translate("(unsupported)")
         if old_message_id:
-            return self.bot.edit_message_text(chat_id=old_message_id[0], message_id=old_message_id[1], text=text, parse_mode="HTML", prefix=prefix + self.translate(" [Edited]"), suffix=reactions, reply_markup=reply_markup, **edit_metadata(msg))
-        return self.bot.send_message(destination, text=text, parse_mode="HTML", prefix=prefix, suffix=reactions, reply_to_message_id=reply_to, message_thread_id=thread_id, reply_markup=reply_markup, disable_notification=silent, **send_identity(msg))
+            return self.bot.edit_message_text(
+                chat_id=old_message_id[0],
+                message_id=old_message_id[1],
+                text=text,
+                parse_mode="HTML",
+                prefix=prefix + self.translate(" [Edited]"),
+                suffix=reactions,
+                reply_markup=reply_markup,
+                **edit_metadata(msg),
+            )
+        return self.bot.send_message(
+            destination,
+            text=text,
+            parse_mode="HTML",
+            prefix=prefix,
+            suffix=reactions,
+            reply_to_message_id=reply_to,
+            message_thread_id=thread_id,
+            reply_markup=reply_markup,
+            disable_notification=silent,
+            **send_identity(msg),
+        )

@@ -21,7 +21,9 @@ from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 class RecipientSuggestionService:
     """Render candidate chats and deliver messages after a recipient is selected."""
 
-    def __init__(self, bot, callback_sessions: CallbackSessionStore, chat_manager, message_delivery, chats_per_page: Callable[[], int], translate: Callable[[str], str], logger: logging.Logger) -> None:
+    def __init__(
+        self, bot, callback_sessions: CallbackSessionStore, chat_manager, message_delivery, chats_per_page: Callable[[], int], translate: Callable[[str], str], logger: logging.Logger
+    ) -> None:
         self.bot = bot
         self.callback_sessions = callback_sessions
         self.chat_manager = chat_manager

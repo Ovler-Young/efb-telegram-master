@@ -96,8 +96,18 @@ class ImageDelivery:
             except telegram.error.BadRequest as e:
                 self.logger.warning("[%s] Failed to send remote image URL (%s); sending editable placeholder.", msg.uid, type(e).__name__)
                 return send_remote_image_placeholder(
-                    self.bot, self.file_transfer, self.temp_directory, tg_dest, thread_id,
-                    msg_template, reactions, text, target_msg_id, reply_markup, silent, as_document=False,
+                    self.bot,
+                    self.file_transfer,
+                    self.temp_directory,
+                    tg_dest,
+                    thread_id,
+                    msg_template,
+                    reactions,
+                    text,
+                    target_msg_id,
+                    reply_markup,
+                    silent,
+                    as_document=False,
                 )
 
         msg_file = msg.file
@@ -140,9 +150,7 @@ class ImageDelivery:
             file_too_large = self.file_transfer.check_size(msg_file)
             edit_media = msg.edit_media
             if file_too_large:
-                oversized_message, edit_media = self.notice_sender.send(
-                    msg, file_too_large, tg_dest, thread_id, msg_template, reactions, text, old_msg_id, target_msg_id, reply_markup, silent
-                )
+                oversized_message, edit_media = self.notice_sender.send(msg, file_too_large, tg_dest, thread_id, msg_template, reactions, text, old_msg_id, target_msg_id, reply_markup, silent)
                 if oversized_message is not None:
                     return oversized_message
 

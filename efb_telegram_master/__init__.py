@@ -119,6 +119,7 @@ class TelegramChannel(MasterChannel):
             self.history_migrations,
             self.chat_manager,
             self.logger,
+            self._,
         )
         self.topic_sync = TopicGroupService(
             self.telegram_runtime,

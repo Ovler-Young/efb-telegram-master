@@ -38,11 +38,7 @@ class ChatListStorage:
     def chats(self, value: List[ETMChatMixin]) -> None:
         self.__chats = value
         self.offset = 0
-        self.channels = {
-            chat.module_id: coordinator.slaves[chat.module_id]
-            for chat in value
-            if chat.module_id in coordinator.slaves
-        }
+        self.channels = {chat.module_id: coordinator.slaves[chat.module_id] for chat in value if chat.module_id in coordinator.slaves}
 
     def set_chat_suggestion(self, update: Update) -> None:
         self.update = update

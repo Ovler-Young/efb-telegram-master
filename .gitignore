@@ -11,7 +11,6 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-uv.lock
 env/
 build/
 develop-eggs/
@@ -122,6 +121,7 @@ fabric.properties
 
 # doit
 .doit.db
+.doit.db.db
 
 # Readme translations
 readme_translations/locale

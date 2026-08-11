@@ -24,7 +24,21 @@ def _bounded_error_message(error: BaseException) -> str:
 
 
 class LinkService:
-    def __init__(self, bot, runtime, channel_id: ModuleID, multiple_slave_chats: bool, msglogs, chat_associations, chat_manager, callback_sessions: CallbackSessionStore, render_chat_list: Callable, translate: Callable[[str], str], ngettext: Callable, logger: logging.Logger):
+    def __init__(
+        self,
+        bot,
+        runtime,
+        channel_id: ModuleID,
+        multiple_slave_chats: bool,
+        msglogs,
+        chat_associations,
+        chat_manager,
+        callback_sessions: CallbackSessionStore,
+        render_chat_list: Callable,
+        translate: Callable[[str], str],
+        ngettext: Callable,
+        logger: logging.Logger,
+    ):
         self.bot = bot
         self.runtime = runtime
         self.channel_id = channel_id
