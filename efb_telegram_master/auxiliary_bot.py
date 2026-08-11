@@ -89,6 +89,7 @@ class AuxiliaryBot:
 
         # Membership cache: chat_id -> (is_member, monotonic timestamp).
         self._membership_cache: OrderedDict[int, tuple[bool, float]] = OrderedDict()
+        self._membership_revisions: dict[int, int] = {}
         self._membership_lock = threading.Lock()
         self._pending_probes: set[int] = set()
         self._max_membership_cache_entries = self.MAX_MEMBERSHIP_CACHE_ENTRIES
@@ -228,11 +229,8 @@ class AuxiliaryBot:
     def update_membership(self, chat_id: int, is_member: bool) -> None:
         """Update the membership cache directly (e.g. from chat_left handler)."""
         with self._membership_lock:
-            self._membership_cache[chat_id] = (is_member, time.monotonic())
-            self._membership_cache.move_to_end(chat_id)
-            while len(self._membership_cache) > self._max_membership_cache_entries:
-                self._membership_cache.popitem(last=False)
-            callback = self._membership_changed_callback
+            self._membership_revisions[chat_id] = self._membership_revisions.get(chat_id, 0) + 1
+            callback = self._store_membership_locked(chat_id, is_member)
         if callback is not None:
             callback(self, chat_id, is_member)
 
@@ -242,7 +240,10 @@ class AuxiliaryBot:
             cached_membership = self._membership_cache.get(chat_id)
             if cached_membership is not None and not cached_membership[0]:
                 return
+            if chat_id in self._pending_probes:
+                return
             self._membership_cache.pop(chat_id, None)
+            self._membership_revisions[chat_id] = self._membership_revisions.get(chat_id, 0) + 1
         self._start_membership_probe(chat_id)
 
     def _start_membership_probe(self, chat_id: int) -> None:
@@ -254,28 +255,35 @@ class AuxiliaryBot:
                 self._record_membership_probe("queue_full")
                 return
             self._pending_probes.add(chat_id)
+            revision = self._membership_revisions.get(chat_id, 0)
         try:
-            future = self._membership_probe_executor.submit(self._probe_membership, chat_id)
+            future = self._membership_probe_executor.submit(self._probe_membership, chat_id, revision)
         except RuntimeError:
             self._finish_membership_probe(chat_id)
             return
         future.add_done_callback(lambda _future: self._finish_membership_probe(chat_id))
 
-    def _probe_membership(self, chat_id: int) -> None:
+    def _probe_membership(self, chat_id: int, revision: int | None = None) -> None:
         """Background probe: call get_chat_member and update cache."""
+        if revision is None:
+            with self._membership_lock:
+                revision = self._membership_revisions.get(chat_id, 0)
         try:
             member = _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id), self._runtime, timeout=self.MEMBERSHIP_PROBE_TIMEOUT)
             is_member = member.status in ("member", "administrator", "creator", "restricted")
-            self.update_membership(chat_id, is_member)
+            if not self._apply_probe_membership(chat_id, is_member, revision):
+                self._record_membership_probe("stale")
+                logger.debug("Discarded stale membership probe for bot %d in chat %d", self.bot_id, chat_id)
+                return
             self._record_membership_probe("ok_member" if is_member else "ok_not_member")
             logger.debug("Membership probe for bot %d in chat %d: %s (status=%s)", self.bot_id, chat_id, is_member, member.status)
         except telegram.error.Forbidden:
-            self.update_membership(chat_id, False)
-            self._record_membership_probe("forbidden")
+            outcome = "forbidden" if self._apply_probe_membership(chat_id, False, revision) else "stale"
+            self._record_membership_probe(outcome)
             logger.warning("Membership probe for bot %d in chat %d got Forbidden", self.bot_id, chat_id)
         except telegram.error.BadRequest as e:
-            self.update_membership(chat_id, False)
-            self._record_membership_probe("bad_request")
+            outcome = "bad_request" if self._apply_probe_membership(chat_id, False, revision) else "stale"
+            self._record_membership_probe(outcome)
             logger.debug("Membership probe for bot %d in chat %d failed: %s", self.bot_id, chat_id, e)
         except FutureTimeoutError:
             self._record_membership_probe("timeout")
@@ -290,6 +298,24 @@ class AuxiliaryBot:
                 return
             self._pending_probes.remove(chat_id)
             self._membership_probe_slots.release()
+            self._discard_unused_revision_locked(chat_id)
+
+    def _store_membership_locked(self, chat_id: int, is_member: bool) -> Optional[Callable[["AuxiliaryBot", int, bool], None]]:
+        self._membership_cache[chat_id] = (is_member, time.monotonic())
+        self._membership_cache.move_to_end(chat_id)
+        while len(self._membership_cache) > self._max_membership_cache_entries:
+            evicted_chat_id, _entry = self._membership_cache.popitem(last=False)
+            self._discard_unused_revision_locked(evicted_chat_id)
+        return self._membership_changed_callback
+
+    def _apply_probe_membership(self, chat_id: int, is_member: bool, revision: int) -> bool:
+        with self._membership_lock:
+            if self._membership_stopping or self._membership_revisions.get(chat_id, 0) != revision:
+                return False
+            callback = self._store_membership_locked(chat_id, is_member)
+        if callback is not None:
+            callback(self, chat_id, is_member)
+        return True
 
     def _purge_expired_membership_cache_locked(self, now: float) -> None:
         expired_chat_ids = [
@@ -297,6 +323,11 @@ class AuxiliaryBot:
         ]
         for chat_id in expired_chat_ids:
             del self._membership_cache[chat_id]
+            self._discard_unused_revision_locked(chat_id)
+
+    def _discard_unused_revision_locked(self, chat_id: int) -> None:
+        if chat_id not in self._membership_cache and chat_id not in self._pending_probes:
+            self._membership_revisions.pop(chat_id, None)
 
     def begin_membership_shutdown(self) -> None:
         """Reject new probes and cancel queued work without waiting under a lock."""

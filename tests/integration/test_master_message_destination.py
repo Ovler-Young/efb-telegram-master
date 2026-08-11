@@ -77,11 +77,11 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
     assert message.chat == chat
 
     content = "test_master_master_quick_reply send new message with quick reply"
-    text = await private_response(
+    warning_text = await private_response(
         lambda: client.send_message(bot_id, content),
         lambda timeout: helper.wait_for_message_text(in_chats(bot_id) & regex(re.escape(chat.display_name)), timeout),
     )
-    assert chat.display_name in text, f"{text!r} is not a warning message for {chat}"
+    assert chat.display_name in warning_text, f"{warning_text!r} is not a warning message for {chat}"
     message = await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
 
@@ -104,12 +104,12 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
         nonlocal message
         message = slave.send_text_message(chat_alt, author=chat_alt.other)
 
-    text = await private_response(
+    incoming_text = await private_response(
         send_incoming_message,
         lambda timeout: helper.wait_for_message_text(in_chats(bot_id) & regex(re.escape(message.text if message else "")), timeout),
     )
     assert message is not None
-    assert message.text in text  # there might be message header in ``text``
+    assert message.text in incoming_text  # there might be message header in ``incoming_text``
 
     content = "test_master_master_quick_reply this shall not be sent due to cleared cache"
     message = await private_response(

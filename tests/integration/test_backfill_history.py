@@ -300,9 +300,6 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     source_group_id = bot_group
     await _ensure_users_in_group(client, source_group_id, aux_bot_ids)
-    working_aux_bot_ids, membership_statuses = await _require_aux_membership(channel_with_auxiliary_bots, source_group_id)
-    if not working_aux_bot_ids:
-        pytest.skip(f"No auxiliary bots are members of configured test group {source_group_id}; probes={membership_statuses}")
 
     chat = slave_with_auxiliary_bots.chat_with_alias
     slave_uid = etm_utils.chat_id_to_str(chat=chat)
@@ -314,6 +311,9 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response)
+    working_aux_bot_ids, membership_statuses = await _require_aux_membership(channel_with_auxiliary_bots, source_group_id)
+    if not working_aux_bot_ids:
+        pytest.skip(f"No auxiliary bots are members of configured test group {source_group_id}; probes={membership_statuses}")
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
     await asyncio.to_thread(stream_thread.join, STREAM_SETTLE_TIMEOUT)
@@ -340,8 +340,8 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     assert set(db_indices) == _expected_stream_indices(STREAM_MESSAGE_COUNT)
     assert len(db_indices) == STREAM_MESSAGE_COUNT, "Expected exactly 120 logged stream messages in DB."
 
-    db_sender_ids = {int(log.sender_bot_id) for log in db_logs if log.sender_bot_id is not None}
-    assert db_sender_ids & set(working_aux_bot_ids), "Expected at least one stream message to be sent by an auxiliary bot."
+    persisted_auxiliary_sender_ids = {int(log.sender_bot_id) for log in db_logs if log.sender_bot_id is not None}
+    assert persisted_auxiliary_sender_ids & set(working_aux_bot_ids), "Expected at least one persisted MsgLog sender_bot_id from an auxiliary bot."
 
     group_sender_ids = {message.sender_id for message in group_messages if message.sender_id is not None}
     assert group_sender_ids & set(working_aux_bot_ids), "Expected auxiliary bot messages in the linked group."

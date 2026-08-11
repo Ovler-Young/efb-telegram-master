@@ -133,28 +133,32 @@ def test_successful_membership_recheck_discards_stale_affinities_and_deduplicate
     auxiliary.async_bot.get_chat_member.side_effect = get_chat_member
     auxiliary.update_membership(100, True)
     pool = BotPool([auxiliary])
-    pool.record_successful_auxiliary_send("slave-a", 10)
-    pool.record_possible_membership_failure("slave-a", 10, 100)
-    assert first_probe_finished.wait(1)
+    try:
+        pool.record_successful_auxiliary_send("slave-a", 10)
+        pool.record_possible_membership_failure("slave-a", 10, 100)
+        assert first_probe_finished.wait(1)
 
-    deadline = time.monotonic() + 1
-    while auxiliary.check_membership_tri(100) is None and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert auxiliary.check_membership_tri(100) is True
+        deadline = time.monotonic() + 1
+        while auxiliary.check_membership_tri(100) is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert auxiliary.check_membership_tri(100) is True
 
-    pool.record_successful_auxiliary_send("slave-b", 10)
-    pool.record_possible_membership_failure("slave-b", 10, 100)
-    assert second_probe_started.wait(1)
-    pool.record_possible_membership_failure("slave-b", 10, 100)
-    assert probe_count == 2
-    release_second_probe.set()
+        pool.record_successful_auxiliary_send("slave-b", 10)
+        pool.record_possible_membership_failure("slave-b", 10, 100)
+        assert second_probe_started.wait(1)
+        pool.record_possible_membership_failure("slave-b", 10, 100)
+        assert probe_count == 2
+        release_second_probe.set()
 
-    deadline = time.monotonic() + 1
-    while pool.preferred_sender("slave-b") is auxiliary and time.monotonic() < deadline:
-        time.sleep(0.01)
+        deadline = time.monotonic() + 1
+        while pool.preferred_sender("slave-b") is auxiliary and time.monotonic() < deadline:
+            time.sleep(0.01)
 
-    assert pool.preferred_sender("slave-a") is auxiliary
-    assert pool.preferred_sender("slave-b") is None
+        assert pool.preferred_sender("slave-a") is auxiliary
+        assert pool.preferred_sender("slave-b") is None
+    finally:
+        release_second_probe.set()
+        pool.shutdown()
 
 
 def test_shutdown_uses_one_deadline_for_all_bots_and_disables_affinity_callbacks(monkeypatch) -> None:
