@@ -30,7 +30,8 @@ from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 if TYPE_CHECKING:
     from . import TelegramChannel
     from .chat_object_cache import ChatObjectCacheManager
-    from .db import DatabaseManager, MsgLog
+    from .db import DatabaseManager
+    from .models import MsgLog
     from .telegram_api import TelegramAPI
 
 

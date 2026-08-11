@@ -11,7 +11,8 @@ from telegram import Update
 from efb_telegram_master import TelegramChannel, utils
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.constants import Flags
-from efb_telegram_master.db import DatabaseManager, HistoryMigrationEntry, MsgLog, database
+from efb_telegram_master.db import DatabaseManager
+from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, database
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
 

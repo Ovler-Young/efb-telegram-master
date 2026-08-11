@@ -7,7 +7,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 
-from .db import DatabaseManager, MsgLogIngestionLeaseLostError
+from .db import DatabaseManager
+from .models import MsgLogIngestionLeaseLostError
 from .mtproto import MTProtoClient, MTProtoRetryableError
 from .utils import EFBChannelChatIDStr
 

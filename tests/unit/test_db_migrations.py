@@ -15,9 +15,10 @@ from prometheus_client import generate_latest
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
-from efb_telegram_master.db import DatabaseManager, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
+from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.message import ETMMsg
+from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from efb_telegram_master.db import MsgLogIngestionLeaseLostError
+from efb_telegram_master.models import MsgLogIngestionLeaseLostError
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.mtproto import MTProtoRetryableError
 

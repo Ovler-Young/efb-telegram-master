@@ -15,7 +15,7 @@ from telethon.tl.types import Chat as TelethonChat
 from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
-from efb_telegram_master.db import HistoryMigrationEntry
+from efb_telegram_master.models import HistoryMigrationEntry
 
 from .utils import get_start_token
 
