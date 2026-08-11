@@ -19,7 +19,11 @@ class SlaveChatInfoRepository(ObservedRepository):
         if slave_channel_id is None or slave_chat_uid is None:
             raise ValueError("Both slave_channel_id and slave_chat_id should be provided.")
         try:
-            return SlaveChatInfo.select().where((SlaveChatInfo.slave_channel_id == slave_channel_id) & (SlaveChatInfo.slave_chat_uid == slave_chat_uid) & (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id)).first()
+            return (
+                SlaveChatInfo.select()
+                .where((SlaveChatInfo.slave_channel_id == slave_channel_id) & (SlaveChatInfo.slave_chat_uid == slave_chat_uid) & (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id))
+                .first()
+            )
         except DoesNotExist:
             return None
 
@@ -49,4 +53,8 @@ class SlaveChatInfoRepository(ObservedRepository):
 
     @observe_database_method("delete_slave_chat_info")
     def delete_slave_chat_info(self, slave_channel_id: ModuleID, slave_chat_uid: ChatID, slave_chat_group_id: Optional[ChatID] = None):
-        return SlaveChatInfo.delete().where((SlaveChatInfo.slave_channel_id == slave_channel_id) & (SlaveChatInfo.slave_chat_uid == slave_chat_uid) & (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id)).execute()
+        return (
+            SlaveChatInfo.delete()
+            .where((SlaveChatInfo.slave_channel_id == slave_channel_id) & (SlaveChatInfo.slave_chat_uid == slave_chat_uid) & (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id))
+            .execute()
+        )

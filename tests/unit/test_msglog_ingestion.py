@@ -37,7 +37,6 @@ class FakeDatabase:
         self.claims.append((source_chat_id, lease_owner, lease_seconds))
         return self.scan if self.scan.status != "complete" else None
 
-
     def persist_item(self, scan, *, source_message_id, classification, slave_uid=None, message=None, lease_owner):
         self.persisted.append((source_message_id, classification, slave_uid, message))
         scan.cursor = source_message_id - 1
@@ -61,6 +60,7 @@ class FakeChatAssociations:
     def get_topic_assoc_slave_uid(self, source_chat_id, topic_id):
         assert source_chat_id == 100
         return self.associations.get(topic_id)
+
 
 class FakeMTProto:
     def __init__(self, messages, error=None, scan_ceiling=205):

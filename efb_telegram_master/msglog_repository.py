@@ -117,7 +117,13 @@ class MsgLogRepository(ObservedRepository):
 
     @observe_database_method("get_recent_slave_chats")
     def get_recent_slave_chats(self, master_chat_id: TelegramChatID, limit: int = 5) -> List[EFBChannelChatIDStr]:
-        query = MsgLog.select(MsgLog.slave_origin_uid, fn.MAX(MsgLog.time)).where(MsgLog.master_msg_id.startswith(f"{master_chat_id}.")).group_by(MsgLog.slave_origin_uid).order_by(fn.MAX(MsgLog.time).desc()).limit(limit)
+        query = (
+            MsgLog.select(MsgLog.slave_origin_uid, fn.MAX(MsgLog.time))
+            .where(MsgLog.master_msg_id.startswith(f"{master_chat_id}."))
+            .group_by(MsgLog.slave_origin_uid)
+            .order_by(fn.MAX(MsgLog.time).desc())
+            .limit(limit)
+        )
         return [EFBChannelChatIDStr(row.slave_origin_uid) for row in query]
 
     @observe_database_method("get_last_message")

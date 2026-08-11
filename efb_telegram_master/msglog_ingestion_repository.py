@@ -31,12 +31,22 @@ class MsgLogIngestionRepository(ObservedRepository):
         now = datetime.datetime.now()
         lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
         with database.atomic():
-            updated = MsgLogIngestionScan.update(lease_owner=lease_owner, lease_expires_at=lease_expires_at, status="running", error=None, updated_at=now).where((MsgLogIngestionScan.source_chat_id == str(source_chat_id)) & (MsgLogIngestionScan.status != "complete") & (MsgLogIngestionScan.lease_expires_at.is_null(True) | (MsgLogIngestionScan.lease_expires_at <= now) | (MsgLogIngestionScan.lease_owner == lease_owner))).execute()
+            updated = (
+                MsgLogIngestionScan.update(lease_owner=lease_owner, lease_expires_at=lease_expires_at, status="running", error=None, updated_at=now)
+                .where(
+                    (MsgLogIngestionScan.source_chat_id == str(source_chat_id))
+                    & (MsgLogIngestionScan.status != "complete")
+                    & (MsgLogIngestionScan.lease_expires_at.is_null(True) | (MsgLogIngestionScan.lease_expires_at <= now) | (MsgLogIngestionScan.lease_owner == lease_owner))
+                )
+                .execute()
+            )
             if updated != 1:
                 return None
             return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
 
-    def persist_item(self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional[object] = None, lease_owner: str) -> str:
+    def persist_item(
+        self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional[object] = None, lease_owner: str
+    ) -> str:
         now = datetime.datetime.now()
         supports_for_update = bool(getattr(database.obj, "for_update", False))
         transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
@@ -63,7 +73,19 @@ class MsgLogIngestionRepository(ObservedRepository):
                 else:
                     slave_channel_id, _, _ = chat_id_str_to_id(slave_uid)
                     source_time = getattr(message, "time", None)
-                    MsgLog.create(master_msg_id=master_msg_id, slave_message_id=f"mtproto-ingested:{master_msg_id}", text=str(getattr(message, "text")), slave_origin_uid=str(slave_uid), slave_member_uid=str(chat_id_to_str(slave_channel_id, ChatID("__self__"))), media_type=str(getattr(message, "media_type")), mime=getattr(message, "mime"), msg_type=str(getattr(message, "msg_type")), sent_to=self.channel_id, provenance="mtproto_ingested", time=source_time if isinstance(source_time, datetime.datetime) else now)
+                    MsgLog.create(
+                        master_msg_id=master_msg_id,
+                        slave_message_id=f"mtproto-ingested:{master_msg_id}",
+                        text=str(getattr(message, "text")),
+                        slave_origin_uid=str(slave_uid),
+                        slave_member_uid=str(chat_id_to_str(slave_channel_id, ChatID("__self__"))),
+                        media_type=str(getattr(message, "media_type")),
+                        mime=getattr(message, "mime"),
+                        msg_type=str(getattr(message, "msg_type")),
+                        sent_to=self.channel_id,
+                        provenance="mtproto_ingested",
+                        time=source_time if isinstance(source_time, datetime.datetime) else now,
+                    )
                     current.inserted_count += 1
                     current.existing_streak = 0
                     outcome = "inserted"
@@ -79,7 +101,16 @@ class MsgLogIngestionRepository(ObservedRepository):
     def finish_scan(self, scan: MsgLogIngestionScan, *, status: str, error: Optional[str] = None, lease_owner: str) -> bool:
         now = datetime.datetime.now()
         with database.atomic():
-            updated = MsgLogIngestionScan.update(status=status, error=error, lease_owner=None, lease_expires_at=None, updated_at=now).where((MsgLogIngestionScan.id == scan.id) & (MsgLogIngestionScan.lease_owner == lease_owner) & MsgLogIngestionScan.lease_expires_at.is_null(False) & (MsgLogIngestionScan.lease_expires_at > now)).execute()
+            updated = (
+                MsgLogIngestionScan.update(status=status, error=error, lease_owner=None, lease_expires_at=None, updated_at=now)
+                .where(
+                    (MsgLogIngestionScan.id == scan.id)
+                    & (MsgLogIngestionScan.lease_owner == lease_owner)
+                    & MsgLogIngestionScan.lease_expires_at.is_null(False)
+                    & (MsgLogIngestionScan.lease_expires_at > now)
+                )
+                .execute()
+            )
             current = MsgLogIngestionScan.get_by_id(scan.id)
             if updated == 1 or current.status == "complete":
                 scan.__data__.update(current.__data__)

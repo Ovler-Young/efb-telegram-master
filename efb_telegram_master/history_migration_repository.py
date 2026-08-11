@@ -32,7 +32,9 @@ class HistoryMigrationRepository(ObservedRepository):
 
     @observe_database_method("get_history_migration_entries")
     def get_entries(self, slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None) -> List[HistoryMigrationEntry]:
-        return list(HistoryMigrationEntry.select().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id)).order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc()))
+        return list(
+            HistoryMigrationEntry.select().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id)).order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
+        )
 
     @observe_database_method("delete_history_migration_entry")
     def delete_entry(self, entry_id: int) -> int:
