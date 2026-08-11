@@ -534,6 +534,32 @@ class StateClient:
 
 
 @pytest.mark.asyncio
+async def test_private_response_passes_its_remaining_deadline_to_exact_message_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = StateMessage(button_count=0)
+    client = StateClient([expected])
+    received_timeouts: list[float] = []
+
+    async def wait_for_slot(_, *, cap: float) -> None:
+        assert cap == 65.0
+
+    async def trigger() -> None:
+        return None
+
+    async def receive(timeout: float) -> StateMessage:
+        received_timeouts.append(timeout)
+        return await helper_module.wait_for_message_state(client, 34, 12, lambda current: current.button_count == 0, timeout=timeout)
+
+    monotonic = iter((100.0, 100.0, 110.0, 110.0)).__next__
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+    monkeypatch.setattr(helper_module, "time", SimpleNamespace(monotonic=monotonic))
+    monkeypatch.setattr(helper_module, "wait_for_limiter_slot", wait_for_slot)
+
+    assert await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive) is expected
+    assert received_timeouts == [55.0]
+    assert client.calls == [(34, 12)]
+
+
+@pytest.mark.asyncio
 async def test_wait_for_message_state_returns_immediate_exact_message() -> None:
     message = StateMessage(button_count=0)
     client = StateClient([message])

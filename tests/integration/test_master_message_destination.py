@@ -22,6 +22,24 @@ from .helper.helper import wait_for_message_state
 pytestmark = mark.asyncio
 
 
+def _is_delivery_confirmation(message: Message, replied_to_message_id: int) -> bool:
+    return message.reply_to_msg_id == replied_to_message_id and re.fullmatch(r"Delivering the message to .+\.", message.raw_text or message.text or "") is not None
+
+
+async def wait_for_destination_delivery(client, prompt: Message, button: MessageButton, sent_message: Message, private_response) -> None:
+    await private_response(
+        lambda: button.click(),
+        lambda timeout: wait_for_message_state(
+            client,
+            prompt.chat_id,
+            prompt.id,
+            lambda current: _is_delivery_confirmation(current, sent_message.id),
+            timeout=timeout,
+        ),
+        target_chat_id=prompt.chat_id,
+    )
+
+
 @contextmanager
 def preserve_destination_cache(cache):
     weak_items = tuple(cache.weak.items())
@@ -179,8 +197,7 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         assert chat_buttons
         # await buttons[-1][0].click()  # Cancel the error message.
 
-        await chat_buttons[0].click()  # deliver the message
-        await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & text & regex(r"^Delivering the message to .+\.$"))
+        await wait_for_destination_delivery(client, message, chat_buttons[0], sent_message, private_response)
         slave_message = await asyncio.to_thread(slave.messages.get, timeout=15)
         slave.messages.task_done()
         assert slave_message.text == content

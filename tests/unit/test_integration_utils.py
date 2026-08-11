@@ -33,10 +33,15 @@ async def test_start_link_waits_for_the_selected_session_menu(monkeypatch: pytes
     completed = SimpleNamespace(id=41, buttons=[[SimpleNamespace(url="https://telegram.me/test?startgroup=token")]])
     helper = _StartLinkHelper(selected, completed)
     edited_calls: list[int] = []
+    replied_to: list[int | None] = []
 
     def edited(message_id: int) -> EditedSessionFilter:
         edited_calls.append(message_id)
         return EditedSessionFilter(message_id)
+
+    def reply_to(message_id: int | None) -> EditedSessionFilter:
+        replied_to.append(message_id)
+        return EditedSessionFilter(message_id or 0)
 
     calls = []
 
@@ -46,10 +51,12 @@ async def test_start_link_waits_for_the_selected_session_menu(monkeypatch: pytes
         return await receive(1)
 
     monkeypatch.setattr(integration_utils, "edited", edited)
+    monkeypatch.setattr(integration_utils, "reply_to", reply_to)
 
-    start_link = await integration_utils.get_start_link(SimpleNamespace(send_message=_async_noop), helper, 9001, "chat", private_response)
+    start_link = await integration_utils.get_start_link(SimpleNamespace(send_message=_send_link_command), helper, 9001, "chat", private_response)
 
     assert start_link == integration_utils.StartLink("token", 41)
+    assert replied_to == [99]
     assert edited_calls == [41]
     assert len(calls) == 2
 
@@ -193,8 +200,45 @@ async def test_cancel_destination_suggestion_waits_for_its_own_edit(monkeypatch:
     assert observed == [(client, 34, 12, True, 1.0)]
 
 
+@pytest.mark.asyncio
+async def test_destination_suggestion_waits_for_the_clicked_prompt_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    clicked = False
+    observed = []
+    client = object()
+    selected_button = SimpleNamespace(click=None)
+    prompt = SimpleNamespace(id=12, chat_id=34, buttons=[[SimpleNamespace(click=_async_noop)], [selected_button]])
+    sent_message = SimpleNamespace(id=77)
+
+    async def click() -> None:
+        nonlocal clicked
+        clicked = True
+
+    selected_button.click = click
+
+    async def private_response(trigger, receive, **kwargs):
+        await trigger()
+        await receive(1.0)
+        observed.append(kwargs)
+
+    async def wait_for_state(state_client, chat_id, message_id, expected, *, timeout):
+        matching = SimpleNamespace(reply_to_msg_id=77, raw_text="Delivering the message to Alice.", text="Delivering the message to Alice.")
+        wrong_reply = SimpleNamespace(reply_to_msg_id=78, raw_text="Delivering the message to Alice.", text="Delivering the message to Alice.")
+        observed.append((state_client, chat_id, message_id, expected(matching), expected(wrong_reply), timeout))
+
+    monkeypatch.setattr(destination_tests, "wait_for_message_state", wait_for_state)
+
+    await destination_tests.wait_for_destination_delivery(client, prompt, selected_button, sent_message, private_response)
+
+    assert clicked
+    assert observed == [(client, 34, 12, True, False, 1.0), {"target_chat_id": 34}]
+
+
 async def _async_noop(*_args: object, **_kwargs: object) -> None:
     return None
+
+
+async def _send_link_command(_chat_id: int, _command: str):
+    return SimpleNamespace(id=99)
 
 
 async def _send_unlink_command(_chat_id: int, _command: str):
