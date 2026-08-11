@@ -284,7 +284,7 @@ def test_api_cleans_claimed_upload_when_enqueue_fails(tmp_path) -> None:
     api, _bot, queue, _chat_binding = _api()
     upload = tmp_path / "upload.bin"
     upload.write_bytes(b"upload")
-    api._cleanup_tls.pending_cleanup = [str(upload)]
+    api.register_upload_cleanup(str(upload))
     queue.side_effect = lambda _request: (_ for _ in ()).throw(QueueEnqueueError("queue rejected request"))
 
     with pytest.raises(QueueEnqueueError, match="queue rejected request"):
@@ -321,7 +321,7 @@ def test_chat_migration_preserves_owned_upload_until_the_retried_request_finishe
     queue.start()
     try:
         api = TelegramAPI(SimpleNamespace(chat_binding=Mock()), Sender(), queue, None)
-        api._cleanup_tls.pending_cleanup = [str(upload)]
+        api.register_upload_cleanup(str(upload))
 
         receipt = api.send_document(1, upload.as_uri())
 

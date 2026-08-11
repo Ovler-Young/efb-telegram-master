@@ -156,6 +156,11 @@ class TelegramAPI:
         self._cleanup_tls.pending_cleanup = []
         return cleanup
 
+    def register_upload_cleanup(self, path: str) -> None:
+        """Attach a locally created upload path to the next queued request."""
+        pending = getattr(self._cleanup_tls, "pending_cleanup", [])
+        self._cleanup_tls.pending_cleanup = [*pending, path]
+
     def _enqueue_request(self, request: QueueRequest) -> SendReceipt:
         try:
             return self._outbound_queue.enqueue_and_wait(request)

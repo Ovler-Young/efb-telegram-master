@@ -45,7 +45,15 @@ from .outbound_types import OutboundShutdownTimeout
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .rpc_utils import RPCUtilities
-from .slave_message import SlaveMessageProcessor
+from .slave_message import SlaveMessageService
+from .slave_routing import SlaveMessageRouter
+from .slave_text_delivery import TextDelivery
+from .slave_image_delivery import ImageDelivery
+from .slave_media_delivery import SlaveMediaDelivery
+from .slave_file_delivery import SlaveFileDelivery
+from .slave_file_transfer import SlaveFileTransfer
+from .oversized_notice import OversizedNoticeSender
+from .slave_status import SlaveStatusService
 from .telegram_runtime import TelegramPollingRuntime
 from .utils import EFBChannelChatIDStr, ExperimentalFlagsManager, TelegramChatID, TelegramMessageID
 
@@ -133,8 +141,41 @@ class TelegramChannel(MasterChannel):
         self.telegram_runtime = self.bot_manager.telegram_runtime
         self.commands: CommandsManager = CommandsManager(self)
         self.chat_binding: ChatBindingManager = ChatBindingManager(self)
-        self.slave_messages: SlaveMessageProcessor = SlaveMessageProcessor(self)
         self.topic_group: Optional[TelegramChatID] = TelegramChatID(self.flag("topic_group"))
+        self.message_router = SlaveMessageRouter(
+            self.bot_manager.api, self.msglogs, self.chat_associations,
+            self.chat_dest_cache, self.chat_manager, self.config["admins"],
+            self.topic_group, self.chat_binding, self.logger,
+        )
+        self.text_delivery = TextDelivery(self.config["admins"][0], self.bot_manager.api, self._, self.logger)
+        self.file_transfer = SlaveFileTransfer(
+            self.flag, self.bot_manager.api, self.logger, self._,
+            lambda: ExperimentalFlagsManager.get_temp_dir(self),
+        )
+        self.oversized_notice_sender = OversizedNoticeSender(self.bot_manager.api)
+        self.image_delivery = ImageDelivery(
+            self.bot_manager.api, self.flag, self.logger, self._, self.text_delivery,
+            self.file_transfer, self.oversized_notice_sender,
+            lambda: ExperimentalFlagsManager.get_temp_dir(self),
+        )
+        self.media_delivery = SlaveMediaDelivery(
+            self.bot_manager.api, self.logger, self.text_delivery, self.file_transfer,
+            self.oversized_notice_sender, lambda: ExperimentalFlagsManager.get_temp_dir(self),
+        )
+        self.file_delivery = SlaveFileDelivery(
+            self.bot_manager.api, self.flag, self.logger, self._, self.text_delivery,
+            self.file_transfer, self.oversized_notice_sender,
+            lambda: ExperimentalFlagsManager.get_temp_dir(self),
+        )
+        self.message_service = SlaveMessageService(
+            self.bot_manager.api, self.flag, self.msglogs, self.chat_manager, self.commands,
+            self._, self.ngettext, self.message_router,
+            self.text_delivery, self.image_delivery, self.media_delivery, self.file_delivery,
+        )
+        self.status_service = SlaveStatusService(
+            self.logger, self.slave_chat_info, self.chat_manager, self.msglogs,
+            self.bot_manager.api, self.flag, self.message_router, self.message_service, self._,
+        )
 
         if not self.flag("auto_locale"):
             self.translator = translation("efb_telegram_master", os.fspath(LOCALE_DIR), fallback=True)
@@ -672,12 +713,12 @@ class TelegramChannel(MasterChannel):
     def send_message(self, msg: EFBMessage) -> EFBMessage:
         if self._is_stopping():
             return msg
-        return self.slave_messages.send_message(msg)
+        return self.message_service.send_message(msg)
 
     def send_status(self, status: Status):
         if self._is_stopping():
             return None
-        return self.slave_messages.send_status(status)
+        return self.status_service.send_status(status)
 
     def get_message_by_id(self, chat: Chat, msg_id: MessageID) -> Optional[EFBMessage]:
         origin_uid = etm_utils.chat_id_to_str(chat=chat)

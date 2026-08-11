@@ -58,7 +58,8 @@ def test_get_slave_msg_dest_uses_topic_group(channel, slave):
         patch.object(channel.chat_binding, "create_topic", return_value=TelegramTopicID(40004)) as create_topic,
         patch.object(channel, "topic_group", topic_group),
     ):
-        _, (tg_dest, thread_id) = channel.slave_messages.get_slave_msg_dest(msg)
+        plan = channel.message_router.route(msg)
+        tg_dest, thread_id = plan.destination, plan.thread_id
 
     assert tg_dest == topic_group
     assert thread_id == TelegramTopicID(40004)

@@ -9,7 +9,8 @@ from telegram import Update
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
-from efb_telegram_master.slave_message import ETMMsg, SlaveMessageProcessor
+from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
+from efb_telegram_master.slave_status import SlaveStatusService
 
 
 @pytest.fixture
@@ -102,9 +103,10 @@ def test_ingested_rows_are_not_remote_get_or_reaction_targets():
 
     assert TelegramChannel.get_message_by_id(channel, chat, "mtproto-ingested:100.1") is None
 
-    processor = object.__new__(SlaveMessageProcessor)
+    processor = object.__new__(SlaveStatusService)
     processor.msglogs = SimpleNamespace(get_msg_log=Mock(return_value=row))
     processor.logger = Mock()
+    processor.router = Mock()
     processor.update_reactions(SimpleNamespace(chat=chat, msg_id="mtproto-ingested:100.1", reactions={}))
 
     processor.logger.info.assert_called_once()
@@ -115,31 +117,32 @@ def test_ingested_rows_are_not_remote_get_or_reaction_targets():
     [("mtproto_ingested", None), ("live", 456)],
 )
 def test_dispatch_reply_target_respects_provenance(provenance, expected_target_msg_id):
-    processor = object.__new__(SlaveMessageProcessor)
+    processor = object.__new__(SlaveMessageService)
     processor.logger = Mock()
     processor.msglogs = SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(master_msg_id="123.456", provenance=provenance)))
     processor.chat_manager = Mock()
-    processor.channel = SimpleNamespace(commands=SimpleNamespace(register_command=Mock()))
-    processor.slave_message_text = Mock(return_value=None)
+    processor.router = Mock(resolve_reply=Mock(return_value=expected_target_msg_id))
+    processor.commands = SimpleNamespace(register_command=Mock())
+    processor.text_delivery = Mock(text=Mock(return_value=None))
     processor._release_pending_slave_message = Mock()
     target = Message(uid=MessageID("recovered"), chat=SimpleNamespace(module_id="tests.slave", uid="chat"))
     message = Message(uid=MessageID("reply"), chat=SimpleNamespace(module_id="tests.slave", uid="chat"), target=target, text="reply", type=MsgType.Text)
 
     processor.dispatch_message(message, "", None, 123, None)
 
-    assert processor.slave_message_text.call_args.args[6] == expected_target_msg_id
+    assert processor.text_delivery.text.call_args.args[6] == expected_target_msg_id
 
 
 def test_ordinary_send_writes_msglog_once_and_releases_completion(monkeypatch):
-    processor = object.__new__(SlaveMessageProcessor)
+    processor = object.__new__(SlaveMessageService)
     processor.logger = Mock()
     processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock())
     processor.chat_manager = Mock()
-    processor.channel = SimpleNamespace(commands=SimpleNamespace(register_command=Mock()))
-    processor.build_reactions_footer = Mock(return_value="")
+    processor.router = Mock(resolve_reply=Mock(return_value=None))
+    processor.commands = SimpleNamespace(register_command=Mock())
     processor._release_pending_slave_message = Mock()
     sent = SimpleNamespace(chat=SimpleNamespace(id=123), message_id=456, sender_bot_id="7")
-    processor.slave_message_text = Mock(return_value=sent)
+    processor.text_delivery = Mock(text=Mock(return_value=sent))
     etm_msg = Mock()
     monkeypatch.setattr(ETMMsg, "from_efbmsg", Mock(return_value=etm_msg))
     monkeypatch.setattr("efb_telegram_master.slave_message.get_msg_type", Mock(return_value="Text"))
