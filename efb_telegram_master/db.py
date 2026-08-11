@@ -38,7 +38,8 @@ from .utils import EFBChannelChatIDStr, OldMsgID, TelegramChatID, TelegramMessag
 
 if TYPE_CHECKING:
     from . import TelegramChannel
-    from .chat import ETMChatMember, ETMChatType
+    from .chat import ETMChatMixin
+    from .chat_member import ETMChatMember
 
 database = DatabaseProxy()
 
@@ -163,7 +164,7 @@ class MsgLog(BaseModel):
         c_module, c_id, _ = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_origin_uid))
         assert self.slave_member_uid is not None
         a_module, a_id, a_grp = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_member_uid))
-        chat: "ETMChatType" = chat_manager.get_chat(c_module, c_id, build_dummy=True)
+        chat: "ETMChatMixin" = chat_manager.get_chat(c_module, c_id, build_dummy=True)
         author: "ETMChatMember" = chat_manager.get_chat_member(a_module, a_grp, a_id, build_dummy=True)  # type: ignore
         msg = ETMMsg(
             uid=MessageID(self.slave_message_id),
@@ -906,12 +907,12 @@ class DatabaseManager:
             return None
 
     @observe_database_method("set_slave_chat_info")
-    def set_slave_chat_info(self, chat_object: "ETMChatType") -> SlaveChatInfo:
+    def set_slave_chat_info(self, chat_object: "ETMChatMixin") -> SlaveChatInfo:
         """
         Insert or update slave chat info entry
 
         Args:
-            chat_object (ETMChatType): Chat object for pickling
+            chat_object (ETMChatMixin): Chat object for pickling
 
         Returns:
             SlaveChatInfo: The inserted or updated row
@@ -922,7 +923,7 @@ class DatabaseManager:
         slave_chat_name = chat_object.name
         slave_chat_alias = chat_object.alias
         slave_chat_type = chat_object.chat_type_name
-        parent_chat: Optional["ETMChatType"] = getattr(chat_object, "chat", None)
+        parent_chat: Optional["ETMChatMixin"] = getattr(chat_object, "chat", None)
         slave_chat_group_id: Optional[ChatID]
         if parent_chat:
             slave_chat_group_id = parent_chat.uid

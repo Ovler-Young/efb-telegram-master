@@ -26,7 +26,7 @@ from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, 
 from telegram.ext._utils.types import ConversationDict
 
 from . import utils
-from .chat import ETMChatType, ETMGroupChat
+from .chat import ETMChatMixin, ETMGroupChat
 from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
@@ -58,8 +58,8 @@ class ChatListStorage:
         offset (int): Current offset to display
     """
 
-    def __init__(self, chats: List[ETMChatType], offset: int = 0):
-        self.__chats: List[ETMChatType] = []
+    def __init__(self, chats: List[ETMChatMixin], offset: int = 0):
+        self.__chats: List[ETMChatMixin] = []
         self.channels: Dict[ModuleID, SlaveChannel] = dict()
         self.chats = chats.copy()  # initialize chats with setter.
         self.offset: int = offset
@@ -71,11 +71,11 @@ class ChatListStorage:
         return len(self.chats)
 
     @property
-    def chats(self) -> List[ETMChatType]:
+    def chats(self) -> List[ETMChatMixin]:
         return self.__chats
 
     @chats.setter
-    def chats(self, value: List[ETMChatType]):
+    def chats(self, value: List[ETMChatMixin]):
         self.__chats = value
         self.offset = 0
         self.channels = dict()
@@ -276,7 +276,7 @@ class ChatBindingManager(LocaleMixin):
             msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(chat_id=TelegramChatID(rtm.chat_id), message_id=TelegramMessageID(rtm.message_id)))
             if msg_log:
                 channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(msg_log.slave_origin_uid))
-                chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
+                chat: ETMChatMixin = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id)
                 storage_id: Tuple[TelegramChatID, TelegramMessageID] = (tg_chat_id, tg_msg_id)
@@ -289,7 +289,7 @@ class ChatBindingManager(LocaleMixin):
                     slave_origin_uid = self.db.get_topic_slave(topic_chat_id=TelegramChatID(message.chat_id), message_thread_id=TelegramTopicID(topic))
                     if slave_origin_uid:
                         channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_origin_uid)
-                        topic_chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
+                        topic_chat: ETMChatMixin = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                         topic_tg_chat_id = TelegramChatID(message.chat_id)
                         topic_tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id)
                         topic_storage_id: Tuple[TelegramChatID, TelegramMessageID] = (topic_tg_chat_id, topic_tg_msg_id)
@@ -365,7 +365,7 @@ class ChatBindingManager(LocaleMixin):
                         re_filter = re.compile(pattern, re.DOTALL | re.IGNORECASE)
                     except re.error:
                         re_filter = pattern
-            chats: List[ETMChatType] = []
+            chats: List[ETMChatMixin] = []
             if source_chats:
                 for s_chat in source_chats:
                     channel_id, chat_uid, _ = utils.chat_id_str_to_id(s_chat)
@@ -510,14 +510,14 @@ class ChatBindingManager(LocaleMixin):
             return ConversationHandler.END
         if callback_idx is None or not self._is_current_selection(storage, callback_idx):
             return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, invalid_text)
-        chat: ETMChatType = storage.chats[callback_idx]
+        chat: ETMChatMixin = storage.chats[callback_idx]
 
         self.build_link_action_message(chat, tg_chat_id, tg_msg_id)
 
         self.bot.answer_callback_query(update.callback_query.id)
         return Flags.LINK_EXEC
 
-    def build_link_action_message(self, chat: ETMChatType, tg_chat_id: TelegramChatID, tg_msg_id: TelegramMessageID):
+    def build_link_action_message(self, chat: ETMChatMixin, tg_chat_id: TelegramChatID, tg_msg_id: TelegramMessageID):
         chat_display_name = chat.full_name
         self.msg_storage[(tg_chat_id, tg_msg_id)].chats = [chat]
         txt = self._("You've selected chat {0}.").format(html.escape(chat_display_name))
@@ -570,7 +570,7 @@ class ChatBindingManager(LocaleMixin):
         if callback_idx is None or not self._is_current_selection(storage, callback_idx):
             txt = self._("Invalid parameter ({0}). (IP01)").format(callback_uid)
             return self._end_callback_session(self.link_handler, storage_id, update.callback_query.id, txt)
-        chat: ETMChatType = storage.chats[callback_idx]
+        chat: ETMChatMixin = storage.chats[callback_idx]
         chat_display_name = chat.full_name
         if cmd == "unlink":
             chat.unlink()
@@ -631,7 +631,7 @@ class ChatBindingManager(LocaleMixin):
             data = self.msg_storage[storage_key]
         except KeyError:
             return sync_reply_text(self.bot, update.message, self._("Session expired or unknown parameter. (SE02)"))
-        chat: ETMChatType = data.chats[0]
+        chat: ETMChatMixin = data.chats[0]
         is_relink = chat.linked
         chat_display_name = chat.full_name
         slave_channel, slave_chat_uid = chat.module_id, chat.uid
@@ -931,7 +931,7 @@ class ChatBindingManager(LocaleMixin):
             return ConversationHandler.END
         if callback_idx is None or not self._is_current_selection(storage, callback_idx):
             return self._end_callback_session(self.chat_head_handler, storage_id, update.callback_query.id, invalid_text)
-        chat: ETMChatType = storage.chats[callback_idx]
+        chat: ETMChatMixin = storage.chats[callback_idx]
         chat_display_name = chat.full_name
         self.msg_storage.pop(storage_id, None)
         self._clear_conversation_state(self.chat_head_handler, storage_id)
@@ -1108,7 +1108,7 @@ class ChatBindingManager(LocaleMixin):
             if pic_resized and getattr(pic_resized, "close", None):
                 pic_resized.close()
 
-    def _get_chat_info_and_picture(self, chat: ETMChatType, channel: SlaveChannel) -> Tuple[Optional[str], Optional[IO], Optional[IO]]:
+    def _get_chat_info_and_picture(self, chat: ETMChatMixin, channel: SlaveChannel) -> Tuple[Optional[str], Optional[IO], Optional[IO]]:
         """
         Get chat description and picture with proper processing.
 
@@ -1298,7 +1298,7 @@ class ChatBindingManager(LocaleMixin):
             self.logger.warning("Linked channel %s is not found.", channel_id)
             return self.bot.reply_error(update, self._("Channel linked ({channel}) is not found.").format(channel=channel_id))
         channel = coordinator.slaves[channel_id]
-        etm_chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
+        etm_chat: ETMChatMixin = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
         try:
             self.bot.edit_forum_topic(
                 chat_id=update.effective_chat.id,
@@ -1343,7 +1343,7 @@ class ChatBindingManager(LocaleMixin):
                 thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
                 if not thread_id:
                     channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
-                    chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
+                    chat: ETMChatMixin = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                     try:
                         topic = self.bot.create_forum_topic(chat_id=telegram_chat_id, name=chat.chat_title)
                         thread_id = TelegramTopicID(topic.message_thread_id)

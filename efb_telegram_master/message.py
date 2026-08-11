@@ -14,7 +14,8 @@ from ehforwarderbot.types import MessageID, Reactions
 from PIL import Image
 from telegram.error import BadRequest
 
-from .chat import ETMChatMember, ETMChatType
+from .chat import ETMChatMixin
+from .chat_member import ETMChatMember
 from .chat_object_cache import ChatObjectCacheManager
 from .media import convert_tgs_to_gif, gif_conversion
 from .msg_type import TGMsgType
@@ -38,7 +39,7 @@ class ETMMsg(Message):
     """Telegram bot user ID that sent this message. None means the main bot."""
     type_telegram: TGMsgType
     """Type of message in Telegram Bot API"""
-    chat: ETMChatType
+    chat: ETMChatMixin
     author: ETMChatMember
 
     __file = None
@@ -223,7 +224,7 @@ class ETMMsg(Message):
     def from_efbmsg(source: Message, chat_manager: ChatObjectCacheManager) -> "ETMMsg":
         target = ETMMsg()
         target.__dict__.update(source.__dict__)
-        if not isinstance(target.chat, ETMChatType):
+        if not isinstance(target.chat, ETMChatMixin):
             target.chat = chat_manager.update_chat_obj(target.chat)
         if not isinstance(target.author, ETMChatMember):
             target.author = target.chat.get_member(target.author.uid)

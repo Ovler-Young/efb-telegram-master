@@ -8,7 +8,9 @@ from ehforwarderbot.exceptions import EFBChatNotFound
 from ehforwarderbot.types import ChatID, ModuleID
 from typing_extensions import Literal
 
-from .chat import ETMChatMember, ETMChatType, ETMSystemChat, convert_chat, unpickle
+from .chat import ETMChatMixin, ETMSystemChat
+from .chat_codec import convert_chat, unpickle
+from .chat_member import ETMChatMember
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -27,7 +29,7 @@ class ChatObjectCacheManager:
         self.db = channel.db
         self.logger = logging.getLogger(__name__)
 
-        self.cache: Dict[CacheKey, ETMChatType] = dict()
+        self.cache: Dict[CacheKey, ETMChatMixin] = dict()
 
         self.logger.debug("Loading chats from slave channels...")
         # load all chats from all slave channels and convert to ETMChat object
@@ -44,7 +46,7 @@ class ChatObjectCacheManager:
                 self.compound_enrol(chat)
             self.logger.debug("All %s chats from '%s' are enrolled.", len(chats), channel_id)
 
-    def compound_enrol(self, chat: Chat) -> ETMChatType:
+    def compound_enrol(self, chat: Chat) -> ETMChatMixin:
         """Convert and enrol a chat object for the first time."""
         etm_chat = convert_chat(self.db, chat)
 
@@ -53,7 +55,7 @@ class ChatObjectCacheManager:
 
         return etm_chat
 
-    def enrol(self, chat: ETMChatType):
+    def enrol(self, chat: ETMChatMixin):
         """Add a chat object to the cache storage *for the first time*.
 
         This would not update the cached object upon conflicting.
@@ -69,12 +71,12 @@ class ChatObjectCacheManager:
         return module_id, chat_id
 
     @overload
-    def get_chat(self, module_id: ModuleID, chat_id: ChatID, build_dummy: Literal[True]) -> ETMChatType: ...
+    def get_chat(self, module_id: ModuleID, chat_id: ChatID, build_dummy: Literal[True]) -> ETMChatMixin: ...
 
     @overload
-    def get_chat(self, module_id: ModuleID, chat_id: ChatID, build_dummy: bool = False) -> Optional[ETMChatType]: ...
+    def get_chat(self, module_id: ModuleID, chat_id: ChatID, build_dummy: bool = False) -> Optional[ETMChatMixin]: ...
 
-    def get_chat(self, module_id: ModuleID, chat_id: ChatID, build_dummy: bool = False) -> Optional[ETMChatType]:
+    def get_chat(self, module_id: ModuleID, chat_id: ChatID, build_dummy: bool = False) -> Optional[ETMChatMixin]:
         """
         Get an ETMChat object of a chat from cache.
 
@@ -124,7 +126,7 @@ class ChatObjectCacheManager:
             return None
         return chat.add_system_member(name=member_id, uid=member_id)
 
-    def update_chat_obj(self, chat: Chat, full_update: bool = False) -> ETMChatType:
+    def update_chat_obj(self, chat: Chat, full_update: bool = False) -> ETMChatMixin:
         """Insert or update chat object to cache.
         Only checking name and alias, not checking group/member association,
         unless full update is requested.
@@ -135,7 +137,7 @@ class ChatObjectCacheManager:
             self.logger.debug("Key %s is not in cache. Do compound enrol.", key)
             return self.compound_enrol(chat)
 
-        cached = cast(ETMChatType, self.cache[key])
+        cached = cast(ETMChatMixin, self.cache[key])
         self.logger.debug("Cached object found with key %s.", key)
 
         if full_update:
@@ -156,7 +158,7 @@ class ChatObjectCacheManager:
                 cached.update_to_db()
         return cached
 
-    def update_chat_members(self, chat: ETMChatType, members: MutableSequence[ETMChatMember], full_update: bool = False) -> MutableSequence[ETMChatMember]:
+    def update_chat_members(self, chat: ETMChatMixin, members: MutableSequence[ETMChatMember], full_update: bool = False) -> MutableSequence[ETMChatMember]:
         """Update chat members. Overwrite, add, and remove member objects if needed."""
         cached_objs = {(i.module_id, i.uid): i for i in chat.members}
         chat.members = []
@@ -170,7 +172,7 @@ class ChatObjectCacheManager:
         return chat.members
 
     @staticmethod
-    def get_or_enrol_member(cached: ETMChatType, member: ChatMember) -> ETMChatMember:
+    def get_or_enrol_member(cached: ETMChatMixin, member: ChatMember) -> ETMChatMember:
         # TODO: Add test case for this
         try:
             return cached.get_member(member.uid)
@@ -222,6 +224,6 @@ class ChatObjectCacheManager:
         chat.members = [i for i in chat.members if i.uid not in member_ids]
 
     @property
-    def all_chats(self) -> Iterator[ETMChatType]:
+    def all_chats(self) -> Iterator[ETMChatMixin]:
         """Return all chats that is not a group member and not myself."""
-        return (val for val in self.cache.values() if isinstance(val, ETMChatType))
+        return (val for val in self.cache.values() if isinstance(val, ETMChatMixin))
