@@ -17,6 +17,7 @@ from pytest import mark, raises
 from telethon.tl.custom import Message, MessageButton
 
 from .helper.filters import edited, has_button, in_chats, regex, reply_to, text
+from .helper.helper import wait_for_message_state
 
 pytestmark = mark.asyncio
 
@@ -117,7 +118,7 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
         lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & text & regex("Error: No recipient specified"), timeout),
     )  # Error message
     assert slave.messages.empty()
-    await cancel_destination_suggestion(helper, private_response, message)
+    await cancel_destination_suggestion(client, helper, private_response, message)
 
 
 async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, slave, channel, private_response):
@@ -150,7 +151,7 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
             lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & text & regex("Error: No recipient specified"), timeout),
         )
         assert slave.messages.empty()
-        await cancel_destination_suggestion(helper, private_response, message)
+        await cancel_destination_suggestion(client, helper, private_response, message)
 
 
 async def test_master_master_destination_suggestion(helper, client, bot_id, slave, channel, private_response):
@@ -195,12 +196,12 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         assert slave_message.edit
 
 
-async def cancel_destination_suggestion(helper, private_response, message: Message):
+async def cancel_destination_suggestion(client, helper, private_response, message: Message):
     """Cancel chat destination suggestions if available."""
     if not message.button_count:
         return
     await private_response(
         lambda: message.buttons[-1][-1].click(),
-        lambda timeout: helper.wait_for_message(in_chats(message.chat_id) & edited(message.id) & ~has_button, timeout),
+        lambda timeout: wait_for_message_state(client, message.chat_id, message.id, lambda current: not current.button_count, timeout=timeout),
         target_chat_id=message.chat_id,
     )

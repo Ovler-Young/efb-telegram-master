@@ -23,6 +23,7 @@ from .msglog_ingestion_repository import MsgLogIngestionRepository
 from .msglog_scan import MsgLogScanScheduler
 from .mtproto import MTProtoClient, MTProtoRetryableError, MTProtoSessionOwnershipError
 from .outbound import OutboundQueue
+from .outbound_types import SchedulerStoppedError
 from .ptb_compat import sync_reply_html
 from .rate_limiter import SlidingWindowRateLimiter
 from .telegram_api import TelegramAPI
@@ -155,6 +156,14 @@ class TelegramBotManager:
     def _handle_error(self, update: object, error: Exception) -> None:
         try:
             raise error
+        except SchedulerStoppedError:
+            if self._stopping.is_set():
+                self.logger.info(
+                    "Ignoring outbound delivery cancellation during Telegram shutdown.",
+                    extra={"event": "telegram_channel.outbound_cancelled_during_shutdown"},
+                )
+            else:
+                self._notify_unhandled_error(update, error)
         except telegram.error.Forbidden:
             self.logger.error(
                 "Telegram authorization failure while handling update (%s).", type(error).__name__, extra={"event": "telegram_channel.authorization_failed", "error_type": type(error).__name__}

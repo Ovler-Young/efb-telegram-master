@@ -125,6 +125,35 @@ def test_affinity_wins_ties_then_confirmed_auxiliary_bootstraps_affinity() -> No
     assert unbound_decision.selection.sender_bot_id == "10"
 
 
+def test_auxiliary_reservation_falls_back_to_main_until_the_auxiliary_becomes_available() -> None:
+    auxiliary_bot = auxiliary(10)
+    reserved = {"value": False}
+
+    def peek_delay(_chat_id: int) -> float:
+        return 30.0 if reserved["value"] else 0.0
+
+    def acquire(_chat_id: int) -> bool:
+        if reserved["value"]:
+            return False
+        reserved["value"] = True
+        return True
+
+    auxiliary_bot.peek_delay.side_effect = peek_delay
+    auxiliary_bot.try_acquire_limits.side_effect = acquire
+    sender_policy, _pool, main_bot, _limiter = policy(auxiliary_bot)
+
+    first = sender_policy.select(call(chat_id=100), now=1_000.0)
+    assert first.selection == SenderSelection(auxiliary_bot.bot, "10")
+    assert sender_policy.acquire(first.selection, 100)
+
+    while_reserved = sender_policy.select(call(chat_id=100), now=1_000.0)
+    assert while_reserved.selection == SenderSelection(main_bot, None)
+
+    reserved["value"] = False
+    after_quiescence = sender_policy.select(call(chat_id=100), now=1_000.0)
+    assert after_quiescence.selection == SenderSelection(auxiliary_bot.bot, "10")
+
+
 def test_affinity_is_recorded_only_after_successful_auxiliary_execution() -> None:
     sender = SimpleNamespace(send_message=Mock(return_value=object()))
     auxiliary_bot = auxiliary(10)

@@ -513,3 +513,102 @@ async def test_wait_for_limiter_slot_caps_wait_at_65_seconds(
     with pytest.raises(TimeoutError, match="65 seconds"):
         await helper_module.wait_for_limiter_slot(lambda: 70.0)
     assert sleeps == [65.0]
+
+
+class StateMessage:
+    def __init__(self, button_count: int) -> None:
+        self.button_count = button_count
+
+    def to_dict(self) -> dict[str, int]:
+        return {"buttons": self.button_count}
+
+
+class StateClient:
+    def __init__(self, messages: list[object | None]) -> None:
+        self.messages = iter(messages)
+        self.calls: list[tuple[int, int]] = []
+
+    async def get_messages(self, chat_id: int, *, ids: int) -> object | None:
+        self.calls.append((chat_id, ids))
+        return next(self.messages)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_state_returns_immediate_exact_message() -> None:
+    message = StateMessage(button_count=0)
+    client = StateClient([message])
+
+    original_message_type = helper_module.Message
+    helper_module.Message = StateMessage
+    try:
+        result = await helper_module.wait_for_message_state(client, 100, 42, lambda current: current.button_count == 0)
+    finally:
+        helper_module.Message = original_message_type
+
+    assert result is message
+    assert client.calls == [(100, 42)]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_state_observes_a_later_exact_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    message = StateMessage(button_count=0)
+    client = StateClient([None, message])
+    waits: list[float] = []
+
+    async def yield_control(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr(helper_module.asyncio, "sleep", yield_control)
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+    result = await helper_module.wait_for_message_state(client, 100, 42, lambda current: current.button_count == 0)
+
+    assert result is message
+    assert client.calls == [(100, 42), (100, 42)]
+    assert waits == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_state_reports_the_last_exact_state_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = StateClient([StateMessage(button_count=1)])
+    monkeypatch.setattr(helper_module.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+
+    with pytest.raises(TimeoutError, match="last_state={'buttons': 1}"):
+        await helper_module.wait_for_message_state(client, 100, 42, lambda current: current.button_count == 0, timeout=0.0)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_state_propagates_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    class CancelledClient:
+        async def get_messages(self, _chat_id: int, *, ids: int) -> object:
+            raise asyncio.CancelledError(ids)
+
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+    with pytest.raises(asyncio.CancelledError):
+        await helper_module.wait_for_message_state(CancelledClient(), 100, 42, lambda _current: True)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_state_rejects_unexpected_list_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+    with pytest.raises(TypeError, match="list"):
+        await helper_module.wait_for_message_state(StateClient([[StateMessage(button_count=0)]]), 100, 42, lambda _current: True)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_state_treats_message_empty_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    class EmptyMessage:
+        pass
+
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+    monkeypatch.setattr(helper_module, "MessageEmpty", EmptyMessage)
+    monkeypatch.setattr(helper_module.time, "monotonic", lambda: 100.0)
+    with pytest.raises(TimeoutError, match="last_state=missing"):
+        await helper_module.wait_for_message_state(StateClient([EmptyMessage()]), 100, 42, lambda _current: True, timeout=0.0)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_state_propagates_predicate_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+    with pytest.raises(RuntimeError, match="predicate failed"):
+        await helper_module.wait_for_message_state(StateClient([StateMessage(button_count=0)]), 100, 42, lambda _current: (_ for _ in ()).throw(RuntimeError("predicate failed")))

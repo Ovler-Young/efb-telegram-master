@@ -2,17 +2,10 @@ import asyncio
 import re
 import threading
 import time
-from typing import List, Sequence, Set
+from typing import List, Set
 from uuid import uuid4
 
 import pytest
-import telegram.error
-from telethon.errors import UserAlreadyParticipantError
-from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.tl.functions.messages import AddChatUserRequest
-from telethon.tl.types import Channel
-from telethon.tl.types import Chat as TelethonChat
-from telethon.utils import get_peer_id
 
 from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.models import HistoryMigrationEntry
@@ -89,35 +82,6 @@ async def _wait_for_messages_with_prefix(client, chat_id: int, prefix: str, *, m
     raise AssertionError(f"Timed out waiting for {minimum} migrated messages with prefix {prefix!r}")
 
 
-async def _ensure_users_in_group(client, group_id: int, user_ids: Sequence[int] | int):
-    users = [user_ids] if isinstance(user_ids, int) else list(user_ids)
-    if not users:
-        return
-
-    chat = await client.get_entity(group_id)
-    participant_ids = set()
-    async for participant in client.iter_participants(chat):
-        participant_ids.add(get_peer_id(participant))
-
-    missing_user_ids = [user_id for user_id in users if user_id not in participant_ids]
-    if not missing_user_ids:
-        return
-
-    if isinstance(chat, Channel):
-        try:
-            await client(InviteToChannelRequest(channel=chat, users=missing_user_ids))
-        except UserAlreadyParticipantError:
-            pass
-        return
-
-    assert isinstance(chat, TelethonChat)
-    for user_id in missing_user_ids:
-        try:
-            await client(AddChatUserRequest(chat_id=chat.id, user_id=user_id, fwd_limit=0))
-        except UserAlreadyParticipantError:
-            pass
-
-
 def _start_mock_stream(slave, chat, prefix: str, *, expected_count: int = STREAM_MESSAGE_COUNT):
     sent_texts: List[str] = []
     errors: List[BaseException] = []
@@ -152,66 +116,6 @@ async def _wait_for_logged_stream_messages(channel, chat, prefix: str, expected_
             return matches
         await asyncio.sleep(1)
     raise AssertionError(f"Timed out waiting for {expected_count} logged messages for {prefix!r}; got {len(matches)}")
-
-
-async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id: int):
-    pool = channel_with_auxiliary_bots.bot_manager.api.bot_pool
-    assert pool is not None
-
-    working_bot_ids = []
-    statuses = []
-    for aux_bot in pool.bots:
-        try:
-            probe_bot = aux_bot._create_bot()
-            member = await probe_bot.get_chat_member(telegram_chat_id, aux_bot.bot_id)
-        except telegram.error.TelegramError as exc:
-            statuses.append(f"{aux_bot.bot_id}:error={type(exc).__name__}:{exc}")
-            continue
-
-        statuses.append(f"{aux_bot.bot_id}:status={member.status}")
-        if member.status in ("member", "administrator", "creator", "restricted"):
-            aux_bot.update_membership(telegram_chat_id, True)
-            working_bot_ids.append(aux_bot.bot_id)
-        else:
-            aux_bot.update_membership(telegram_chat_id, False)
-
-    return working_bot_ids, statuses
-
-
-async def _wait_for_available_auxiliary(channel_with_auxiliary_bots, source_group_id: int, configured_auxiliary_ids: Sequence[int]):
-    pool = channel_with_auxiliary_bots.bot_manager.api.bot_pool
-    assert pool is not None
-    configured_ids = set(configured_auxiliary_ids)
-    deadline = time.monotonic() + STREAM_SETTLE_TIMEOUT
-    while True:
-        candidates = [
-            (auxiliary.bot_id, auxiliary.check_membership_tri(source_group_id), auxiliary.peek_delay(source_group_id))
-            for auxiliary in pool.bots
-            if auxiliary.bot_id in configured_ids and not auxiliary.disabled
-        ]
-        eligible = {bot_id for bot_id, membership, delay in candidates if membership is True and delay == 0.0}
-        if eligible:
-            return eligible
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            raise AssertionError(f"No configured auxiliary sender became eligible for {source_group_id}; candidates={candidates}")
-        delays = [delay for _bot_id, membership, delay in candidates if membership is True and delay > 0.0]
-        if not delays:
-            raise AssertionError(f"No configured auxiliary has confirmed membership for {source_group_id}; candidates={candidates}")
-        await asyncio.sleep(min(min(delays), remaining))
-
-
-async def _wait_for_provenance_log(channel_with_auxiliary_bots, chat, message, *, timeout: float = STREAM_SETTLE_TIMEOUT):
-    slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
-    deadline = time.monotonic() + timeout
-    while True:
-        row = channel_with_auxiliary_bots.msglogs.get_msg_log(slave_msg_id=message.uid, slave_origin_uid=slave_chat_id)
-        if row is not None and row.text == message.text:
-            return row
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            raise AssertionError(f"Timed out waiting for MsgLog provenance for uid={message.uid!s}, text={message.text!r}")
-        await asyncio.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
 
 async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, private_response, *, flag: str | None = None):
@@ -330,13 +234,11 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
     raise AssertionError(f"Timed out waiting for migrated stream terminal state: {last_debug}")
 
 
-async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_bots, helper, client, bot_id, bot_group, bot_topic_group, aux_bot_ids, slave_with_auxiliary_bots, private_response):
+async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_bots, helper, client, bot_id, bot_group, bot_topic_group, slave_with_auxiliary_bots, private_response):
     if bot_topic_group is None:
         pytest.skip("TOPIC_GROUP is required for backfill history relink coverage.")
 
     source_group_id = bot_group
-    await _ensure_users_in_group(client, source_group_id, aux_bot_ids)
-
     chat = slave_with_auxiliary_bots.chat_with_alias
     slave_uid = etm_utils.chat_id_to_str(chat=chat)
 
@@ -347,15 +249,6 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response)
-    working_aux_bot_ids, membership_statuses = await _require_aux_membership(channel_with_auxiliary_bots, source_group_id)
-    if not working_aux_bot_ids:
-        raise AssertionError(f"No auxiliary bots are members of configured test group {source_group_id}; probes={membership_statuses}")
-
-    eligible_auxiliary_ids = await _wait_for_available_auxiliary(channel_with_auxiliary_bots, source_group_id, aux_bot_ids)
-    provenance_message = slave_with_auxiliary_bots.send_text_message(chat, chat.other, text=f"AUXPROVENANCE{uuid4().hex}")
-    provenance_log = await _wait_for_provenance_log(channel_with_auxiliary_bots, chat, provenance_message)
-    assert provenance_log.sender_bot_id is not None
-    assert int(provenance_log.sender_bot_id) in eligible_auxiliary_ids
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
     await asyncio.to_thread(stream_thread.join, STREAM_SETTLE_TIMEOUT)

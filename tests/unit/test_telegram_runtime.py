@@ -14,7 +14,7 @@ from efb_telegram_master.bot_manager import TelegramBotManager, TelegramResource
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.master_message import MasterMessageWorker
 from efb_telegram_master.metrics_runtime import MetricsServer, parse_metrics_config
-from efb_telegram_master.outbound_types import OutboundShutdownTimeout
+from efb_telegram_master.outbound_types import OutboundShutdownTimeout, SchedulerStoppedError
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
@@ -407,6 +407,34 @@ def _manager(api: Mock, runtime: Mock) -> TelegramBotManager:
     manager.api = api
     manager.telegram_runtime = runtime
     return manager
+
+
+def test_manager_does_not_notify_through_a_stopped_outbound_queue() -> None:
+    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._stopping = threading.Event()
+    manager._stopping.set()
+
+    manager._handle_error(object(), SchedulerStoppedError("Outbound queue stopped."))
+
+    manager.logger.info.assert_called_once_with(
+        "Ignoring outbound delivery cancellation during Telegram shutdown.",
+        extra={"event": "telegram_channel.outbound_cancelled_during_shutdown"},
+    )
+
+
+def test_manager_reports_scheduler_stopped_error_while_running() -> None:
+    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._stopping = threading.Event()
+    manager._notify_unhandled_error = Mock()
+    update = object()
+    error = SchedulerStoppedError("Outbound queue stopped.")
+
+    manager._handle_error(update, error)
+
+    manager._notify_unhandled_error.assert_called_once_with(update, error)
+    manager.logger.info.assert_not_called()
 
 
 def test_manager_retries_membership_join_after_stopping_runtime() -> None:

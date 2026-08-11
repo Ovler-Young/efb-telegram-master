@@ -14,7 +14,7 @@ from telethon.events import ChatAction, MessageDeleted, MessageEdited, NewMessag
 from telethon.events.common import EventCommon
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
-from telethon.tl.types import TypeInputPeer
+from telethon.tl.types import MessageEmpty, TypeInputPeer
 
 from . import filters
 from .filters import BaseFilter
@@ -23,6 +23,7 @@ from .utils import parse_socks5_link
 CLIENT_START_TIMEOUT = 60
 CLIENT_STOP_TIMEOUT = 10
 PRIVATE_RESPONSE_WAIT_CAP = 65.0
+MESSAGE_STATE_POLL_INTERVAL_SECONDS = 1.0
 PENDING_EVENT_MAX_COUNT = 256
 PENDING_EVENT_MAX_AGE_SECONDS = PRIVATE_RESPONSE_WAIT_CAP + 10.0
 Response = TypeVar("Response")
@@ -73,6 +74,35 @@ async def wait_for_private_response(
             _private_response_cursor.reset(cursor_token)
 
     return await asyncio.wait_for(wait(), timeout=cap)
+
+
+async def wait_for_message_state(
+    client: TelegramClient,
+    chat_id: int,
+    message_id: int,
+    expected: Callable[[Message], bool],
+    *,
+    timeout: float = 20.0,
+) -> Message:
+    """Observe one known Telegram message until its state satisfies ``expected``."""
+    deadline = time.monotonic() + timeout
+    last_state = "missing"
+    first_attempt = True
+    while True:
+        if not first_attempt and time.monotonic() >= deadline:
+            raise TimeoutError(f"Telegram message {chat_id}.{message_id} did not reach the expected state within {timeout:g} seconds; last_state={last_state}")
+        first_attempt = False
+        result = await client.get_messages(chat_id, ids=message_id)
+        if isinstance(result, Message):
+            last_state = repr(result.to_dict())
+            if expected(result):
+                return result
+        elif result is not None and not isinstance(result, MessageEmpty):
+            raise TypeError(f"Telegram get_messages returned {type(result).__name__} for exact message {chat_id}.{message_id}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(f"Telegram message {chat_id}.{message_id} did not reach the expected state within {timeout:g} seconds; last_state={last_state}")
+        await asyncio.sleep(min(MESSAGE_STATE_POLL_INTERVAL_SECONDS, remaining))
 
 
 class TelegramIntegrationTestHelper:

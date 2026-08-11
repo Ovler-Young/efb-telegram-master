@@ -165,11 +165,9 @@ def test_expired_destination_lookup_restores_the_cache_snapshot() -> None:
 async def test_cancel_destination_suggestion_waits_for_its_own_edit(monkeypatch: pytest.MonkeyPatch) -> None:
     clicked = False
     calls = []
-    expected = SimpleNamespace(chat_id=34, is_edited=True, has_button=False, message=SimpleNamespace(id=12))
-    unrelated_chat = SimpleNamespace(chat_id=35, is_edited=True, has_button=False, message=SimpleNamespace(id=12))
-    wrong_message = SimpleNamespace(chat_id=34, is_edited=True, has_button=False, message=SimpleNamespace(id=13))
-    new_message = SimpleNamespace(chat_id=34, is_edited=False, has_button=False, message=SimpleNamespace(id=12))
-    helper = _QueuedHelper([unrelated_chat, wrong_message, new_message, expected])
+    helper = object()
+    client = object()
+    observed = []
 
     async def click() -> None:
         nonlocal clicked
@@ -180,19 +178,19 @@ async def test_cancel_destination_suggestion_waits_for_its_own_edit(monkeypatch:
         await trigger()
         return await receive(1.0)
 
+    async def wait_for_state(state_client, chat_id, message_id, expected, *, timeout):
+        observed.append((state_client, chat_id, message_id, expected(SimpleNamespace(button_count=0)), timeout))
+
     message = SimpleNamespace(id=12, chat_id=34, button_count=1, buttons=[[SimpleNamespace(click=click)]])
 
-    monkeypatch.setattr(destination_tests, "in_chats", lambda chat_id: EventFieldFilter(lambda event: event.chat_id == chat_id))
-    monkeypatch.setattr(destination_tests, "edited", lambda message_id: EventFieldFilter(lambda event: event.is_edited and event.message.id == message_id))
-    monkeypatch.setattr(destination_tests, "has_button", EventFieldFilter(lambda event: event.has_button))
+    monkeypatch.setattr(destination_tests, "wait_for_message_state", wait_for_state)
 
-    await destination_tests.cancel_destination_suggestion(helper, private_response, message)
+    await destination_tests.cancel_destination_suggestion(client, helper, private_response, message)
 
     assert clicked
     assert len(calls) == 1
     assert calls[0][2] == {"target_chat_id": 34}
-    assert helper.received is expected
-    assert helper.queue == [unrelated_chat, wrong_message, new_message]
+    assert observed == [(client, 34, 12, True, 1.0)]
 
 
 async def _async_noop(*_args: object, **_kwargs: object) -> None:
