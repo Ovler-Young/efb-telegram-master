@@ -2,8 +2,10 @@ import asyncio
 import inspect
 import logging
 import os
+import sys
 import threading
 import time
+import traceback
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Dict, Set
@@ -18,6 +20,8 @@ from ..bot import get_user_session
 from .helper.helper import TelegramIntegrationTestHelper, wait_for_private_response
 
 pytest.register_assert_rewrite("tests.integration.utils")
+
+POLLING_START_TIMEOUT = 30.0
 
 
 def pytest_collection_modifyitems(items):
@@ -122,21 +126,24 @@ def poll_bot_factory():
         if expected_channel is not None and channel is not expected_channel:
             return
 
-        still_alive = False
+        shutdown_error = None
         try:
-            channel.bot_manager.stop_channel_resources()
-            polling_thread.join(timeout=30)
-            still_alive = polling_thread.is_alive()
+            channel.stop_polling()
+        except BaseException as error:
+            shutdown_error = error
         finally:
-            state["channel"] = None
-            state["thread"] = None
-            state["errors"] = None
+            polling_thread.join(timeout=30)
 
-        if still_alive:
-            raise RuntimeError("Telegram bot polling thread did not stop in time.")
-
-        # Telegram may take a moment to release the previous long-poll slot.
-        time.sleep(2)
+        if polling_thread.is_alive():
+            frame = sys._current_frames().get(polling_thread.ident)
+            stack = "".join(traceback.format_stack(frame)) if frame is not None else "stack unavailable"
+            print(f"Telegram bot polling thread did not stop: name={polling_thread.name!r} ident={polling_thread.ident!r}\n{stack}")
+            raise RuntimeError("Telegram bot polling thread did not stop in time.") from shutdown_error
+        state["channel"] = None
+        state["thread"] = None
+        state["errors"] = None
+        if shutdown_error is not None:
+            raise shutdown_error
 
         if polling_errors:
             raise polling_errors[0]
@@ -160,26 +167,32 @@ def poll_bot_factory():
             polling_thread = threading.Thread(
                 target=runner,
                 name=f"pytest-poll-bot-{channel.channel_id}",
-                daemon=True,
             )
             polling_thread.start()
+            state["channel"] = channel
+            state["thread"] = polling_thread
+            state["errors"] = polling_errors
 
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                if polling_errors:
-                    raise polling_errors[0]
-                runtime_ready = channel.telegram_runtime.async_runtime._ready.wait(timeout=0.1)
-                application = channel.telegram_runtime.application
-                updater = application.updater
-                if runtime_ready and updater is not None and updater.running and application.running:
+            try:
+                deadline = time.monotonic() + POLLING_START_TIMEOUT
+                while time.monotonic() < deadline:
                     if polling_errors:
                         raise polling_errors[0]
-                    state["channel"] = channel
-                    state["thread"] = polling_thread
-                    state["errors"] = polling_errors
-                    return
-
-            raise RuntimeError("Telegram bot polling did not become ready in time.")
+                    remaining = deadline - time.monotonic()
+                    runtime_ready = channel.telegram_runtime.async_runtime._ready.wait(timeout=min(0.1, remaining))
+                    application = channel.telegram_runtime.application
+                    updater = application.updater
+                    if runtime_ready and updater is not None and updater.running and application.running:
+                        if polling_errors:
+                            raise polling_errors[0]
+                        return
+                raise RuntimeError("Telegram bot polling did not become ready in time.")
+            except BaseException as startup_error:
+                try:
+                    stop(channel)
+                except BaseException as cleanup_error:
+                    print(f"Telegram bot polling startup cleanup failed: {cleanup_error!r}")
+                raise startup_error
 
     class PollBotFactory:
         def start(self, channel):

@@ -17,6 +17,7 @@ from efb_telegram_master.paths import get_config_path
 
 from .bot import get_bot
 from .mocks.slave import MockSlaveChannel
+from .thread_diagnostics import fail_session_for_live_threads
 
 pytestmark = [pytest.mark.xfail(raises=TimedOut), pytest.mark.xfail(raises=NetworkError)]
 
@@ -291,3 +292,7 @@ def pytest_runtest_setup(item):
 
     if is_integration:
         item.fixturenames.append("poll_bot")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    fail_session_for_live_threads(session)

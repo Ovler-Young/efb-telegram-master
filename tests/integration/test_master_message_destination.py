@@ -139,8 +139,9 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
     await message.click(0)
     message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & ~has_button)
     await message.reply(content)
-    await asyncio.to_thread(slave.messages.get, timeout=5)
+    delivered = await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
+    assert delivered.text == content
 
     # Mutate only the cache entry. Patching ``time.time`` changes the shared
     # module object Telethon also uses for its transport deadlines.
@@ -176,7 +177,7 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
 
         message: Message = await private_response(
             send_message,
-            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & regex(re.escape(content)), timeout),
         )
         assert sent_message is not None
         buttons: List[List[MessageButton]] = message.buttons

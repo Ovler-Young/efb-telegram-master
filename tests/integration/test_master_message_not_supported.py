@@ -9,6 +9,7 @@ from telethon.tl.functions.messages import GetInlineBotResultsRequest, GetSticke
 from telethon.tl.types import Document, InputMediaPoll, InputStickerSetAnimatedEmoji, Poll, PollAnswer, TextWithEntities
 from telethon.tl.types.messages import StickerSet
 
+from .helper.filters import in_chats, regex
 from .utils import link_chats
 
 pytestmark = mark.asyncio
@@ -86,5 +87,5 @@ async def test_master_msg_slave_not_supported(helper, client, bot_group, slave, 
     with link_chats(channel, (chat,), bot_group), patch.multiple(slave, supported_message_types=set()):
         # Send poll
         await client.send_message(bot_group, "test_master_msg_slave_not_supported this shall be “unsupported by slave channel”")
-        content = await helper.wait_for_message_text()
+        content = await helper.wait_for_message_text(in_chats(bot_group) & regex(slave.channel_name))
         assert slave.channel_name in content

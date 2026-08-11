@@ -11,6 +11,7 @@ from efb_telegram_master import TelegramChannel
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
 from efb_telegram_master.bot_manager import TelegramBotManager, TelegramResourceShutdownError
 from efb_telegram_master.bot_pool import BotPool
+from efb_telegram_master.master_message import MasterMessageWorker
 from efb_telegram_master.metrics_runtime import MetricsServer, parse_metrics_config
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout
 from efb_telegram_master.telegram_api import TelegramAPI
@@ -333,6 +334,30 @@ def test_channel_shutdown_error_still_stops_channel_owned_workers() -> None:
     assert channel._stop_polling_called
     channel.master_message_worker.stop_worker.assert_called_once_with()
     channel.db.stop_worker.assert_called_once_with()
+
+
+def test_channel_owner_stops_the_real_master_message_worker() -> None:
+    runtime = SimpleNamespace(application=SimpleNamespace(add_handler=Mock()), as_async_callback=lambda callback: callback)
+    worker = MasterMessageWorker(runtime, Mock(), Mock(), Mock(), lambda text: text, Mock())
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    channel.bot_manager = Mock()
+    channel.master_message_worker = worker
+    channel.db = Mock()
+
+    try:
+        channel.bot_manager.stop_channel_resources()
+        assert worker.message_worker_thread.is_alive()
+
+        channel.stop_polling()
+
+        assert not worker.message_worker_thread.is_alive()
+        channel.rpc_utilities.shutdown.assert_called_once_with()
+        channel.db.stop_worker.assert_called_once_with()
+    finally:
+        worker.stop_worker()
 
 
 def _manager(api: Mock, runtime: Mock) -> TelegramBotManager:

@@ -170,7 +170,10 @@ async def _require_aux_membership(channel_with_auxiliary_bots, telegram_chat_id:
 
         statuses.append(f"{aux_bot.bot_id}:status={member.status}")
         if member.status in ("member", "administrator", "creator", "restricted"):
+            aux_bot.update_membership(telegram_chat_id, True)
             working_bot_ids.append(aux_bot.bot_id)
+        else:
+            aux_bot.update_membership(telegram_chat_id, False)
 
     return working_bot_ids, statuses
 
