@@ -4,7 +4,8 @@ from urllib.request import urlopen
 
 from prometheus_client import generate_latest
 
-from efb_telegram_master.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot, start_metrics_server
+from efb_telegram_master.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
+from efb_telegram_master.metrics_runtime import start_metrics_server
 
 
 class BrokenCpuProcess:
@@ -133,7 +134,7 @@ def test_snapshot_collectors_render_empty_snapshots_without_labels():
 
 def test_metrics_server_logs_the_port_chosen_by_the_os(caplog):
     metrics = Metrics(process_factory=SupportedProcess, network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=2))
-    with caplog.at_level(logging.INFO, logger="efb_telegram_master.etm_metrics"):
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.metrics_runtime"):
         metrics_server = start_metrics_server("127.0.0.1", 0, metrics.registry)
 
     try:

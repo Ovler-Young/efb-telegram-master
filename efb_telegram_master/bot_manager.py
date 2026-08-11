@@ -7,7 +7,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from .bot_pool import build_bot_pool
-from .etm_metrics import configure_runtime_metrics
+from .metrics_runtime import configure_runtime_metrics
 from .outbound import OutboundQueue
 from .rate_limiter import SlidingWindowRateLimiter
 from .telegram_api import TelegramAPI

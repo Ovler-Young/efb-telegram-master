@@ -20,7 +20,7 @@ T = TypeVar("T")
 
 
 class MembershipProbeMetrics(Protocol):
-    def membership_probe(self, bot_id: int, username: str, outcome: str) -> None: ...
+    def record_membership_probe(self, outcome: str) -> None: ...
 
 
 @overload
@@ -191,7 +191,7 @@ class AuxiliaryBot:
     def _record_membership_probe(self, outcome: str) -> None:
         metrics = self._metrics
         if metrics:
-            metrics.membership_probe(self.bot_id, self.username, outcome)
+            metrics.record_membership_probe(outcome)
 
     def check_membership_tri(self, chat_id: int) -> Optional[bool]:
         """Tri-state membership check: True (member), False (confirmed not member),

@@ -29,7 +29,7 @@ from .outbound import (
 
 if TYPE_CHECKING:
     from . import TelegramChannel
-    from .etm_metrics import MetricsServer
+    from .metrics_runtime import MetricsServer
 
 MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
 

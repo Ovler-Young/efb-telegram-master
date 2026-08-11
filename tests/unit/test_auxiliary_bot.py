@@ -138,7 +138,7 @@ def test_probe_membership_records_bad_request_metric():
 
     aux_bot._probe_membership(4000)
 
-    metrics.membership_probe.assert_called_once_with(123, "botA", "bad_request")
+    metrics.record_membership_probe.assert_called_once_with("bad_request")
 
 
 def test_probe_membership_forbidden_marks_non_member_without_disabling():
