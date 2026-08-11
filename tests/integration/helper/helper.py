@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import logging
 import os
+import threading
 import time
 from asyncio import QueueEmpty
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
@@ -95,12 +96,12 @@ class TelegramIntegrationTestHelper:
         # Collect mappings from message ID to its chat (as Telegram API is not sending them)
         self.message_chat_map: Dict[int, TypeInputPeer] = dict()
 
-        self.chats = list(map(abs, chats))
+        self.chats = set(map(abs, chats))
+        self._temporary_chat_counts: Dict[int, int] = {}
+        self._temporary_chat_lock = threading.Lock()
         self.client.parse_mode = "html"
         bot_ids = [bot_id] if isinstance(bot_id, int) else list(bot_id)
-        self.client.add_event_handler(self.new_message_handler, NewMessage(chats=self.chats, incoming=True, from_users=bot_ids))
-        # self.client.add_event_handler(self.new_message_handler,
-        #                               NewMessage(incoming=True))
+        self.client.add_event_handler(self.new_message_handler, NewMessage(incoming=True, from_users=bot_ids))
         self.client.add_event_handler(self.deleted_message_handler, MessageDeleted())
         self.client.add_event_handler(self.update_handler, UserUpdate(chats=self.chats))
         self.client.add_event_handler(self.update_handler, MessageEdited(chats=self.chats))
@@ -120,7 +121,33 @@ class TelegramIntegrationTestHelper:
             except QueueEmpty:
                 return
 
+    def watch_chat(self, chat_id: int) -> None:
+        """Receive bot messages from a chat created during an integration test."""
+        normalized_chat_id = abs(chat_id)
+        with self._temporary_chat_lock:
+            self._temporary_chat_counts[normalized_chat_id] = self._temporary_chat_counts.get(normalized_chat_id, 0) + 1
+
+    def unwatch_chat(self, chat_id: int) -> None:
+        normalized_chat_id = abs(chat_id)
+        with self._temporary_chat_lock:
+            count = self._temporary_chat_counts.get(normalized_chat_id, 0)
+            if count <= 1:
+                self._temporary_chat_counts.pop(normalized_chat_id, None)
+            else:
+                self._temporary_chat_counts[normalized_chat_id] = count - 1
+
+    def _watches_chat(self, chat_id: int | None) -> bool:
+        if chat_id is None:
+            return False
+        normalized_chat_id = abs(chat_id)
+        if normalized_chat_id in self.chats:
+            return True
+        with self._temporary_chat_lock:
+            return normalized_chat_id in self._temporary_chat_counts
+
     async def new_message_handler(self, event: NewMessage.Event):
+        if not self._watches_chat(event.chat_id):
+            return
         # record the mapping of message ID and its chat
         message: Message = event.message
         self.message_chat_map[message.id] = await message.get_input_chat()

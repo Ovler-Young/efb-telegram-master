@@ -93,7 +93,11 @@ def assert_is_linked(channel: TelegramChannel, slave_chats: Iterable[Chat], tele
 
 
 async def unlink_all_chats(channel: TelegramChannel, client: TelegramClient, helper, telegram_chat_id: int) -> None:
-    command = await client.send_message(telegram_chat_id, "/unlink_all")
-    await helper.wait_for_message(in_chats(telegram_chat_id) & reply_to(command.id) & text, timeout=65.0)
+    helper.watch_chat(telegram_chat_id)
+    try:
+        command = await client.send_message(telegram_chat_id, "/unlink_all")
+        await helper.wait_for_message(in_chats(telegram_chat_id) & reply_to(command.id) & text, timeout=65.0)
+    finally:
+        helper.unwatch_chat(telegram_chat_id)
     master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     assert not channel.chat_associations.get_chat_assoc(master_uid=master_str)

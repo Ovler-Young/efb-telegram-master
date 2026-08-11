@@ -66,12 +66,28 @@ async def test_unlink_all_chats_waits_for_the_confirmed_bot_reply(monkeypatch: p
     await integration_utils.unlink_all_chats(channel, client, helper, -100500)
 
     assert helper.timeout == 65.0
+    assert helper.watched == [-100500]
+    assert helper.unwatched == [-100500]
     associations.get_chat_assoc.assert_called_once()
     assert helper.event_filter(SimpleNamespace(chat_id=-100500, reply_to_msg_id=99, is_text=True))
     assert not helper.event_filter(SimpleNamespace(chat_id=-100501, reply_to_msg_id=99, is_text=True))
     assert not helper.event_filter(SimpleNamespace(chat_id=-100500, reply_to_msg_id=98, is_text=True))
     assert not helper.event_filter(SimpleNamespace(chat_id=-100500, reply_to_msg_id=99, is_text=False))
     assert not helper.event_filter(SimpleNamespace(chat_id=-100500, reply_to_msg_id=None, is_text=True))
+
+
+@pytest.mark.asyncio
+async def test_unlink_all_chats_unwatches_after_a_reply_wait_failure() -> None:
+    associations = SimpleNamespace(get_chat_assoc=Mock(return_value=[]))
+    channel = cast(integration_utils.TelegramChannel, SimpleNamespace(channel_id="blueset.telegram", chat_associations=associations))
+    helper = _FailingUnlinkHelper()
+
+    with pytest.raises(RuntimeError, match="reply wait failed"):
+        await integration_utils.unlink_all_chats(channel, SimpleNamespace(send_message=_send_unlink_command), helper, -100500)
+
+    assert helper.watched == [-100500]
+    assert helper.unwatched == [-100500]
+    associations.get_chat_assoc.assert_not_called()
 
 
 def test_link_chats_restores_only_captured_associations_after_a_context_failure() -> None:
@@ -129,10 +145,26 @@ class _UnlinkHelper:
     timeout: float | None = None
     event_filter = None
 
+    def __init__(self) -> None:
+        self.watched: list[int] = []
+        self.unwatched: list[int] = []
+
+    def watch_chat(self, chat_id: int) -> None:
+        self.watched.append(chat_id)
+
+    def unwatch_chat(self, chat_id: int) -> None:
+        self.unwatched.append(chat_id)
+
     async def wait_for_message(self, _event_filter, *, timeout: float):
         self.event_filter = _event_filter
         self.timeout = timeout
         return SimpleNamespace()
+
+
+class _FailingUnlinkHelper(_UnlinkHelper):
+    async def wait_for_message(self, _event_filter, *, timeout: float):
+        self.timeout = timeout
+        raise RuntimeError("reply wait failed")
 
 
 class _Associations:

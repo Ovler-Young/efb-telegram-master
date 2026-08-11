@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -49,6 +50,10 @@ def build_event_helper() -> helper_module.TelegramIntegrationTestHelper:
     test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
     test_helper.queue = asyncio.Queue()
     test_helper.pending_events = []
+    test_helper.message_chat_map = {}
+    test_helper.chats = {100}
+    test_helper._temporary_chat_counts = {}
+    test_helper._temporary_chat_lock = threading.Lock()
     return test_helper
 
 
@@ -147,6 +152,56 @@ def test_helper_clear_queue_discards_pending_events() -> None:
     test_helper.clear_queue()
 
     assert not test_helper.pending_events
+
+
+def test_helper_keeps_a_dynamic_chat_watched_until_its_final_unwatch() -> None:
+    test_helper = build_event_helper()
+
+    test_helper.watch_chat(-200)
+    test_helper.watch_chat(-200)
+    test_helper.watch_chat(-300)
+
+    assert test_helper._watches_chat(-200)
+    assert test_helper._watches_chat(100)
+    assert test_helper._watches_chat(-300)
+
+    test_helper.unwatch_chat(-200)
+
+    assert test_helper._watches_chat(-200)
+    assert test_helper._watches_chat(-300)
+
+    test_helper.unwatch_chat(-200)
+
+    assert not test_helper._watches_chat(-200)
+    assert test_helper._watches_chat(-300)
+
+    test_helper.unwatch_chat(-300)
+
+    assert not test_helper._watches_chat(-300)
+
+
+@pytest.mark.asyncio
+async def test_helper_records_a_bot_reply_from_a_scoped_dynamic_chat() -> None:
+    test_helper = build_event_helper()
+    test_helper.logger = logging.getLogger(__name__)
+    event = SimpleNamespace(
+        chat_id=-200,
+        message=SimpleNamespace(id=3, get_input_chat=_async_input_chat),
+        to_dict=lambda: {"message_id": 3},
+    )
+
+    await test_helper.new_message_handler(event)
+
+    assert test_helper.queue.empty()
+
+    test_helper.watch_chat(-200)
+    await test_helper.new_message_handler(event)
+
+    assert await test_helper.queue.get() is event
+
+
+async def _async_input_chat() -> str:
+    return "chat"
 
 
 @pytest.mark.asyncio

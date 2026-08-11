@@ -27,8 +27,10 @@ async def test_link_chat_start_false_skips_backfill(helper, client, bot_id, bot_
 async def test_link_chat_start_true_forces_backfill_on_relink(helper, client, bot_id, bot_group, slave, channel, private_response, backfill_flag):
     try:
         first_start_link = await get_start_link(client, helper, bot_id, slave.chat_with_alias.uid, private_response)
-        await client.send_message(bot_group, f"/start {first_start_link.token}")
-        await helper.wait_for_message(in_chats(bot_id) & edited(first_start_link.session_message_id) & text)
+        await private_response(
+            lambda: client.send_message(bot_group, f"/start {first_start_link.token}"),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & edited(first_start_link.session_message_id) & text, timeout),
+        )
 
         start_link = await get_start_link(client, helper, bot_id, slave.chat_with_alias.uid, private_response)
         migration_called = threading.Event()
@@ -42,8 +44,10 @@ async def test_link_chat_start_true_forces_backfill_on_relink(helper, client, bo
             patch.object(channel.history_replay, "start", side_effect=observe_migration) as migrate_chat_history,
             patch.object(channel.link_completion, "send_history_link") as send_history_link,
         ):
-            await client.send_message(bot_group, f"/start {start_link.token} {backfill_flag}")
-            await helper.wait_for_message(in_chats(bot_id) & edited(start_link.session_message_id) & text)
+            await private_response(
+                lambda: client.send_message(bot_group, f"/start {start_link.token} {backfill_flag}"),
+                lambda timeout: helper.wait_for_message(in_chats(bot_id) & edited(start_link.session_message_id) & text, timeout),
+            )
             assert migration_called.wait(timeout=5), "Timed out waiting for migrate_chat_history"
 
         migrate_chat_history.assert_called()

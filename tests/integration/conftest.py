@@ -12,8 +12,10 @@ import pytest
 import pytest_asyncio
 from telethon import TelegramClient
 
+from efb_telegram_master import TelegramChannel
+
 from ..bot import get_user_session
-from .helper.helper import TelegramIntegrationTestHelper
+from .helper.helper import TelegramIntegrationTestHelper, wait_for_private_response
 
 pytest.register_assert_rewrite("tests.integration.utils")
 
@@ -204,12 +206,20 @@ async def client(helper_wrap) -> AsyncGenerator[TelegramClient, None]:
     yield helper_wrap.client
 
 
-@pytest.fixture
-def private_response():
-    """Send a command and wait for its private response."""
+def _primary_bot_limiter_delay(channel: TelegramChannel, target_chat_id: int) -> float:
+    """Expose the production queue's main-bot limiter to response tests."""
+    return channel.bot_manager.outbound_queue._sender_policy._main_rate_limiter.peek_delay(target_chat_id)
 
-    async def wait(trigger, receive, **_ignored):
-        await trigger()
-        return await receive(65.0)
+
+@pytest.fixture
+def private_response(channel: TelegramChannel, bot_id: int):
+    """Use the response deadline that includes the primary-bot rate-limit wait."""
+
+    async def wait(trigger, receive, *, source_channel: TelegramChannel = channel, target_chat_id: int = bot_id):
+        return await wait_for_private_response(
+            lambda: _primary_bot_limiter_delay(source_channel, target_chat_id),
+            trigger,
+            receive,
+        )
 
     return wait
