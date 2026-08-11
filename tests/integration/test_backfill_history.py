@@ -8,7 +8,10 @@ from uuid import uuid4
 import pytest
 
 from efb_telegram_master import utils as etm_utils
+from efb_telegram_master.callback_sessions import ChatListStorage
+from efb_telegram_master.constants import Flags
 from efb_telegram_master.models import HistoryMigrationEntry
+from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
 from .utils import get_start_link
 
@@ -118,9 +121,20 @@ async def _wait_for_logged_stream_messages(channel, chat, prefix: str, expected_
     raise AssertionError(f"Timed out waiting for {expected_count} logged messages for {prefix!r}; got {len(matches)}")
 
 
-async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: int, private_response, *, flag: str | None = None):
-    start_link = await get_start_link(client, helper, bot_id, chat_uid, private_response)
-    command = f"/start {start_link.token}"
+async def _link_chat(
+    client,
+    helper,
+    bot_id: int,
+    chat_uid: str,
+    dest_chat_id: int,
+    private_response,
+    *,
+    flag: str | None = None,
+    start_token: str | None = None,
+):
+    if start_token is None:
+        start_token = (await get_start_link(client, helper, bot_id, chat_uid, private_response)).token
+    command = f"/start {start_token}"
     if flag is not None:
         command += f" {flag}"
     command_message = None
@@ -142,6 +156,17 @@ async def _link_chat(client, helper, bot_id: int, chat_uid: str, dest_chat_id: i
     await private_response(trigger, receive)
     assert command_message is not None
     return command_message
+
+
+def _create_relink_start_token(channel_with_auxiliary_bots, etm_chat, *, private_chat_id: int, session_message_id: int) -> str:
+    storage_key = (TelegramChatID(private_chat_id), TelegramMessageID(session_message_id))
+    channel_with_auxiliary_bots.callback_sessions.start(
+        channel_with_auxiliary_bots.link_handler,
+        storage_key,
+        Flags.LINK_EXEC,
+        ChatListStorage([etm_chat]),
+    )
+    return etm_utils.b64en(etm_utils.message_id_to_str(*storage_key))
 
 
 def _extract_stream_indices(text: str, prefix: str) -> List[int]:
@@ -238,6 +263,10 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     if bot_topic_group is None:
         pytest.skip("TOPIC_GROUP is required for backfill history relink coverage.")
 
+    client_user = await client.get_me()
+    assert client_user is not None and client_user.id is not None, "Telethon client user ID is required to prepare relink callback sessions."
+    private_chat_id = client_user.id
+
     source_group_id = bot_group
     chat = slave_with_auxiliary_bots.chat_with_alias
     slave_uid = etm_utils.chat_id_to_str(chat=chat)
@@ -248,7 +277,16 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     channel_with_auxiliary_bots.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
-    command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response)
+    source_start_link = await get_start_link(client, helper, bot_id, chat.uid, private_response)
+    command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response, start_token=source_start_link.token)
+
+    # Private-panel delivery is covered by the backfill tests; this test isolates history replay.
+    relink_true_token = _create_relink_start_token(
+        channel_with_auxiliary_bots,
+        etm_chat,
+        private_chat_id=private_chat_id,
+        session_message_id=source_start_link.session_message_id,
+    )
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
     await asyncio.to_thread(stream_thread.join, STREAM_SETTLE_TIMEOUT)
@@ -277,7 +315,16 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     target_group_id = bot_topic_group
     try:
-        relink_true_message = await _link_chat(client, helper, bot_id, chat.uid, target_group_id, private_response, flag="true")
+        relink_true_message = await _link_chat(
+            client,
+            helper,
+            bot_id,
+            chat.uid,
+            target_group_id,
+            private_response,
+            flag="true",
+            start_token=relink_true_token,
+        )
         await _wait_for_migrated_stream_terminal(
             channel_with_auxiliary_bots,
             client,
@@ -294,7 +341,22 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             "Relink with true should migrate history instead of sending the history-link notice."
         )
 
-        relink_false_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response, flag="false")
+        relink_false_token = _create_relink_start_token(
+            channel_with_auxiliary_bots,
+            etm_chat,
+            private_chat_id=private_chat_id,
+            session_message_id=source_start_link.session_message_id,
+        )
+        relink_false_message = await _link_chat(
+            client,
+            helper,
+            bot_id,
+            chat.uid,
+            source_group_id,
+            private_response,
+            flag="false",
+            start_token=relink_false_token,
+        )
         await asyncio.sleep(10)
         recent_source_messages = await _messages_since_id(client, source_group_id, relink_false_message.id)
         assert not any(prefix in (message.raw_text or "") for message in recent_source_messages), "Relink with false should skip migrating historical messages."
