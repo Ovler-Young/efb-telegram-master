@@ -123,6 +123,9 @@ class TelegramChannel(MasterChannel):
         self.db: DatabaseManager = DatabaseManager(self)
         self.chat_associations = self.db.chat_associations
         self.slave_chat_info = self.db.slave_chat_info
+        self.msglogs = self.db.msglogs
+        self.history_migrations = self.db.history_migrations
+        self.msglog_ingestion = self.db.msglog_ingestion
         self.mtproto = MTProtoClient(self.mtproto_config, self.config["token"], self.db._base_path)
         self.chat_manager: ChatObjectCacheManager = ChatObjectCacheManager(self)
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
@@ -408,7 +411,7 @@ class TelegramChannel(MasterChannel):
             return
 
         target: Message = message.reply_to_message
-        msg_log = self.db.get_msg_log(master_msg_id=etm_utils.message_id_to_str(chat_id=TelegramChatID(target.chat_id), message_id=TelegramMessageID(target.message_id)))
+        msg_log = self.msglogs.get_msg_log(master_msg_id=etm_utils.message_id_to_str(chat_id=TelegramChatID(target.chat_id), message_id=TelegramMessageID(target.message_id)))
         if msg_log is None:
             sync_reply_text(self.bot_manager.api, message, self._("The message you replied to is not recorded in ETM database. You cannot react to this message."))
             return
@@ -678,7 +681,7 @@ class TelegramChannel(MasterChannel):
 
     def get_message_by_id(self, chat: Chat, msg_id: MessageID) -> Optional[EFBMessage]:
         origin_uid = etm_utils.chat_id_to_str(chat=chat)
-        msg_log = self.db.get_msg_log(slave_origin_uid=origin_uid, slave_msg_id=msg_id)
+        msg_log = self.msglogs.get_msg_log(slave_origin_uid=origin_uid, slave_msg_id=msg_id)
         if msg_log is not None and msg_log.provenance != "mtproto_ingested":
             return msg_log.build_etm_msg(self.chat_manager)
         else:

@@ -11,7 +11,7 @@ from telegram import Update
 from efb_telegram_master import TelegramChannel, utils
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.constants import Flags
-from efb_telegram_master.db import DatabaseManager
+from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, database
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
@@ -217,7 +217,7 @@ def test_history_migration_dispatches_persisted_entries_through_telegram_api():
     database.initialize(test_database)
     test_database.connect()
     manager = ChatBindingManager.__new__(ChatBindingManager)
-    manager.db = object.__new__(DatabaseManager)
+    manager.history_migrations = HistoryMigrationRepository()
     manager.logger = Mock()
     manager.bot = SimpleNamespace(send_message=Mock(), copy_message=Mock())
     try:
@@ -237,7 +237,7 @@ def test_history_migration_dispatches_persisted_entries_through_telegram_api():
             position=1,
         )
 
-        assert manager._process_history_migration_target(manager.db.get_next_history_migration_target()) is True
+        assert manager._process_history_migration_target(manager.history_migrations.get_next_target()) is True
 
         manager.bot.send_message.assert_called_once_with(chat_id=12345, text="first\n", parse_mode="Markdown", disable_notification=True)
         manager.bot.copy_message.assert_called_once_with(chat_id=12345, from_chat_id=10, message_id=21, disable_notification=True)
@@ -265,7 +265,7 @@ def test_pending_history_migrations_send_entries_in_position_order_and_delete_ea
     database.initialize(test_database)
     test_database.connect()
     manager = ChatBindingManager.__new__(ChatBindingManager)
-    manager.db = object.__new__(DatabaseManager)
+    manager.history_migrations = HistoryMigrationRepository()
     manager.logger = Mock()
     manager._history_migration_lock = threading.Lock()
     manager.bot = SimpleNamespace(send_message=Mock(), copy_message=Mock())
@@ -295,7 +295,7 @@ def test_pending_history_migrations_keep_the_failed_entry_and_remaining_boundary
     database.initialize(test_database)
     test_database.connect()
     manager = ChatBindingManager.__new__(ChatBindingManager)
-    manager.db = object.__new__(DatabaseManager)
+    manager.history_migrations = HistoryMigrationRepository()
     manager.logger = Mock()
     manager._history_migration_lock = threading.Lock()
     manager.bot = SimpleNamespace(send_message=Mock(side_effect=[None, RuntimeError("Telegram failed")]), copy_message=Mock())
@@ -320,7 +320,8 @@ def test_pending_history_migrations_keep_the_failed_entry_and_remaining_boundary
 
 def test_queue_history_migration_entries_persists_pending_rows():
     manager = ChatBindingManager.__new__(ChatBindingManager)
-    manager.db = Mock()
+    manager.msglogs = Mock()
+    manager.history_migrations = Mock()
     manager.chat_manager = Mock()
     manager.logger = Mock()
     base_time = datetime.now()
@@ -335,8 +336,8 @@ def test_queue_history_migration_entries_persists_pending_rows():
     media_log.text = ""
     media_log.media_type = "Photo"
     media_log.time = base_time + timedelta(seconds=1)
-    manager.db.get_recent_messages.return_value = [text_log, media_log]
-    manager.db.replace_history_migration_entries.return_value = 2
+    manager.msglogs.get_recent_messages.return_value = [text_log, media_log]
+    manager.history_migrations.replace_entries.return_value = 2
 
     queued_count = ChatBindingManager._queue_history_migration_entries(
         manager,
@@ -344,7 +345,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
         12345,
     )
 
-    entries = manager.db.replace_history_migration_entries.call_args.args[3]
+    entries = manager.history_migrations.replace_entries.call_args.args[3]
     assert queued_count == 2
     assert len(entries) == 2
     assert entries[0]["source_master_msg_id"] == "10.20"
@@ -364,9 +365,9 @@ def test_history_migration_deletes_zero_call_entry_without_queueing():
         source_master_msg_id="",
         formatted_text="",
     )
-    manager.db = SimpleNamespace(
-        get_history_migration_entries=Mock(return_value=[entry]),
-        delete_history_migration_entry=Mock(),
+    manager.history_migrations = SimpleNamespace(
+        get_entries=Mock(return_value=[entry]),
+        delete_entry=Mock(),
     )
     manager.bot = SimpleNamespace(send_message=Mock(), copy_message=Mock())
 
@@ -375,7 +376,7 @@ def test_history_migration_deletes_zero_call_entry_without_queueing():
     assert processed is True
     manager.bot.send_message.assert_not_called()
     manager.bot.copy_message.assert_not_called()
-    manager.db.delete_history_migration_entry.assert_called_once_with(8)
+    manager.history_migrations.delete_entry.assert_called_once_with(8)
     manager.logger.info.assert_any_call("History migration entry %d completed 0 calls", 8)
 
 
@@ -404,7 +405,7 @@ def test_get_recent_messages_returns_oldest_first(channel, slave):
             time=base_time + timedelta(seconds=idx),
         )
 
-    recent = channel.db.get_recent_messages(slave_uid, limit=0)
+    recent = channel.msglogs.get_recent_messages(slave_uid, limit=0)
     assert [row.slave_message_id for row in recent] == ["slave-0", "slave-1", "slave-2"]
 
     for row in MsgLog.select().where(MsgLog.slave_origin_uid == slave_uid):

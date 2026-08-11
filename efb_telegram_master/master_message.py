@@ -30,7 +30,6 @@ from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 if TYPE_CHECKING:
     from . import TelegramChannel
     from .chat_object_cache import ChatObjectCacheManager
-    from .db import DatabaseManager
     from .models import MsgLog
     from .telegram_api import TelegramAPI
 
@@ -65,7 +64,7 @@ class MasterMessageProcessor(LocaleMixin):
         self.channel: "TelegramChannel" = channel
         self.bot: "TelegramAPI" = channel.bot_manager.api
         self.runtime = channel.telegram_runtime
-        self.db: "DatabaseManager" = channel.db
+        self.msglogs = channel.msglogs
         self.chat_associations = channel.chat_associations
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: "ChatObjectCacheManager" = channel.chat_manager
@@ -190,11 +189,11 @@ class MasterMessageProcessor(LocaleMixin):
 
         if update.edited_message or update.edited_channel_post:
             self.logger.debug("[%s] Message is edited: %s", mid, message.edit_date)
-            msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update))
+            msg_log = self.msglogs.get_msg_log(master_msg_id=utils.message_id_to_str(update=update))
             if msg_log and msg_log.provenance == "mtproto_ingested":
                 self.logger.info("Ignoring edit for ingested synthetic message %s.", mid)
                 return
-            if not msg_log or msg_log.slave_message_id == self.db.FAIL_FLAG:
+            if not msg_log or msg_log.slave_message_id == self.msglogs.FAIL_FLAG:
                 sync_reply_text(self.bot, message, self._("Error: This message cannot be edited, and thus is not sent. (ME01)"), quote=True)
                 return
             destination = EFBChannelChatIDStr(msg_log.slave_origin_uid)
@@ -238,7 +237,7 @@ class MasterMessageProcessor(LocaleMixin):
             reply_to = message.reply_to_message
             cached_dest = self.chat_dest_cache.get(str(message.chat.id))
             if reply_to:
-                dest_msg = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)))
+                dest_msg = self.msglogs.get_msg_log(master_msg_id=utils.message_id_to_str(TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)))
                 if dest_msg:
                     destination = EFBChannelChatIDStr(dest_msg.slave_origin_uid)
                     self.chat_dest_cache.set(str(message.chat.id), destination)
@@ -252,7 +251,7 @@ class MasterMessageProcessor(LocaleMixin):
 
         if destination is None:
             self.logger.debug("[%s] Destination is not found for this message", mid)
-            candidates = self.db.get_recent_slave_chats(TelegramChatID(message.chat.id), limit=5) or get_linked_slave_chats()[:5]
+            candidates = self.msglogs.get_recent_slave_chats(TelegramChatID(message.chat.id), limit=5) or get_linked_slave_chats()[:5]
             if candidates:
                 self.logger.debug("[%s] Found %d candidate suggestions for this message.", mid, len(candidates))
                 tg_err_msg = sync_reply_text(self.bot, message, self._("Error: No recipient specified.\nPlease reply to a previous message. (MS01)"), quote=True)
@@ -450,7 +449,7 @@ class MasterMessageProcessor(LocaleMixin):
             self.logger.exception("Message %s is not sent (%s).", utils.message_id_to_str(update=update), type(e).__name__)
         finally:
             if log_message:
-                self.db.add_or_update_message_log(m, update.effective_message)
+                self.msglogs.add_or_update_message_log(m, update.effective_message)
                 if m.file:
                     m.file.close()
 
@@ -459,7 +458,7 @@ class MasterMessageProcessor(LocaleMixin):
         reply_to = tg_msg.reply_to_message
         assert reply_to
 
-        target_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)))
+        target_log = self.msglogs.get_msg_log(master_msg_id=utils.message_id_to_str(TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)))
         if not target_log or not target_log.slave_origin_uid:
             self.logger.error("[%s] Quoted message not found in database, give up quoting.", tg_msg.message_id)
             return etm_msg
@@ -532,8 +531,8 @@ class MasterMessageProcessor(LocaleMixin):
         if message.reply_to_message is None:
             return self.bot.reply_error(update, self._("Reply /rm to a message to remove it from its remote chat."))
         reply: Message = message.reply_to_message
-        msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(chat_id=TelegramChatID(reply.chat_id), message_id=TelegramMessageID(reply.message_id)))
-        if not msg_log or msg_log.slave_member_uid == self.db.FAIL_FLAG:
+        msg_log = self.msglogs.get_msg_log(master_msg_id=utils.message_id_to_str(chat_id=TelegramChatID(reply.chat_id), message_id=TelegramMessageID(reply.message_id)))
+        if not msg_log or msg_log.slave_member_uid == self.msglogs.FAIL_FLAG:
             return self.bot.reply_error(update, self._("This message is not found in ETM database. You cannot remove it from its remote chat."))
         if msg_log.provenance == "mtproto_ingested":
             return self.bot.reply_error(update, self._("This recovered message cannot be removed from its remote chat."))

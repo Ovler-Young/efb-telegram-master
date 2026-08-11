@@ -24,20 +24,21 @@ class FakeDatabase:
     def __init__(self, scan_boundary=205):
         self.scan = Scan(scan_boundary=scan_boundary, cursor=scan_boundary)
         self.chat_associations = FakeChatAssociations({10: "tests.slave"})
+        self.msglog_ingestion = self
         self.persisted = []
         self.claims = []
 
-    def get_or_create_msglog_ingestion_scan(self, source_chat_id, scan_boundary):
+    def get_or_create_scan(self, source_chat_id, scan_boundary):
         assert source_chat_id == 100
         assert scan_boundary == self.scan.scan_boundary
         return self.scan
 
-    def claim_msglog_ingestion_scan(self, source_chat_id, lease_owner, lease_seconds):
+    def claim_scan(self, source_chat_id, lease_owner, lease_seconds):
         self.claims.append((source_chat_id, lease_owner, lease_seconds))
         return self.scan if self.scan.status != "complete" else None
 
 
-    def persist_msglog_ingestion_item(self, scan, *, source_message_id, classification, slave_uid=None, message=None, lease_owner):
+    def persist_item(self, scan, *, source_message_id, classification, slave_uid=None, message=None, lease_owner):
         self.persisted.append((source_message_id, classification, slave_uid, message))
         scan.cursor = source_message_id - 1
         if classification == "eligible":
@@ -48,7 +49,7 @@ class FakeDatabase:
             return "inserted"
         return "skipped"
 
-    def finish_msglog_ingestion_scan(self, scan, *, status, error=None, lease_owner):
+    def finish_scan(self, scan, *, status, error=None, lease_owner):
         scan.status = status
         scan.error = error
 
@@ -110,7 +111,7 @@ def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
         }
     )
 
-    asyncio.run(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
+    asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     assert [ids for _, ids in mtproto.calls] == [
         list(range(205, 105, -1)),
@@ -129,14 +130,14 @@ def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
 
 def test_ingestion_skips_are_neutral_and_existing_streak_completes_at_500():
     db = FakeDatabase(scan_boundary=503)
-    db.persist_msglog_ingestion_item = lambda scan, **kwargs: _five_hundred_rule(db, scan, **kwargs)
+    db.persist_item = lambda scan, **kwargs: _five_hundred_rule(db, scan, **kwargs)
     mtproto = FakeMTProto(
         {message_id: topic_message(message_id) for message_id in range(1, 504)},
         scan_ceiling=503,
     )
     mtproto.messages[502] = SimpleNamespace(id=502, message="service", action=object(), reply_to=None)
 
-    asyncio.run(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
+    asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     assert db.scan.status == "complete"
     assert db.scan.cursor == 2
@@ -158,7 +159,7 @@ def test_ingestion_collapses_media_to_generic_copyable_content():
     source_time = datetime(2026, 8, 4, 12, 30, tzinfo=timezone.utc)
     mtproto = FakeMTProto({1: topic_message(1, media=media, date=source_time)}, scan_ceiling=1)
 
-    asyncio.run(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
+    asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     stored = db.persisted[0][3]
     assert stored.media_type == "Document"
@@ -172,7 +173,7 @@ def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_c
     mtproto = FakeMTProto({}, error=MTProtoRetryableError("temporary"), scan_ceiling=5)
 
     with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
-        asyncio.run(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
+        asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     assert db.scan.status == "retryable-error"
     assert db.scan.error == "temporary"
@@ -192,7 +193,7 @@ def test_ingestion_logs_lease_loss_with_a_stable_event(caplog):
 
     mtproto.get_input_channel = lose_lease
     with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
-        asyncio.run(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
+        asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     assert [(record.event, getattr(record, "error_type", None)) for record in caplog.records] == [
         ("msglog_ingestion.start", None),
@@ -209,7 +210,7 @@ def test_ingestion_logs_unexpected_failure_with_error_type(caplog):
 
     mtproto.get_input_channel = fail
     with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
-        asyncio.run(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
+        asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     assert db.scan.status == "error"
     assert [(record.event, getattr(record, "error_type", None)) for record in caplog.records] == [

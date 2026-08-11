@@ -38,7 +38,6 @@ from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, Teleg
 if TYPE_CHECKING:
     from . import TelegramChannel
     from .chat_object_cache import ChatObjectCacheManager
-    from .db import DatabaseManager
     from .telegram_api import TelegramAPI
 
 __all__ = ["ChatBindingManager"]
@@ -107,7 +106,9 @@ class ChatBindingManager(LocaleMixin):
         self.channel: "TelegramChannel" = channel
         self.bot: "TelegramAPI" = channel.bot_manager.api
         self.runtime = channel.telegram_runtime
-        self.db: "DatabaseManager" = channel.db
+        self.msglogs = channel.msglogs
+        self.history_migrations = channel.history_migrations
+        self.msglog_ingestion = channel.msglog_ingestion
         self.chat_associations = channel.chat_associations
         self.chat_manager: "ChatObjectCacheManager" = channel.chat_manager
         self._topic_mutex = threading.Lock()
@@ -274,7 +275,7 @@ class ChatBindingManager(LocaleMixin):
         # that is recorded in database.
         if message.reply_to_message:
             rtm: Message = message.reply_to_message
-            msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(chat_id=TelegramChatID(rtm.chat_id), message_id=TelegramMessageID(rtm.message_id)))
+            msg_log = self.msglogs.get_msg_log(master_msg_id=utils.message_id_to_str(chat_id=TelegramChatID(rtm.chat_id), message_id=TelegramMessageID(rtm.message_id)))
             if msg_log:
                 channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(msg_log.slave_origin_uid))
                 chat: ETMChatMixin = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
@@ -945,7 +946,7 @@ class ChatBindingManager(LocaleMixin):
         chat_head_etm.text = txt
         chat_head_etm.type_telegram = TGMsgType.Text
         chat_head_etm.deliver_to = self.channel
-        self.db.add_or_update_message_log(chat_head_etm, update.effective_message)
+        self.msglogs.add_or_update_message_log(chat_head_etm, update.effective_message)
         self.bot.edit_message_text(text=txt, chat_id=tg_chat_id, message_id=tg_msg_id)
         self.bot.answer_callback_query(update.callback_query.id)
         return ConversationHandler.END
@@ -1414,7 +1415,7 @@ class ChatBindingManager(LocaleMixin):
             existing = self._msglog_ingestion_threads.get(source_chat_id)
             if existing is not None and existing.is_alive():
                 return "already running"
-            scan = self.db.get_or_create_msglog_ingestion_scan(
+            scan = self.msglog_ingestion.get_or_create_scan(
                 source_chat_id,
                 getattr(getattr(mtproto, "config", None), "scan_ceiling", 100_000),
             )
@@ -1434,7 +1435,7 @@ class ChatBindingManager(LocaleMixin):
     def _run_msglog_ingestion(self, source_chat_id: int) -> None:
         try:
             self.runtime.async_runtime.call(
-                MsgLogIngestionService(self.db, self.chat_associations, self.channel.mtproto).run(
+                MsgLogIngestionService(self.msglog_ingestion, self.chat_associations, self.channel.mtproto).run(
                     source_chat_id,
                     lease_owner=str(uuid.uuid4()),
                 )
@@ -1444,7 +1445,7 @@ class ChatBindingManager(LocaleMixin):
 
     def resume_pending_msglog_ingestions(self) -> None:
         try:
-            scans = self.db.get_resumable_msglog_ingestion_scans()
+            scans = self.msglog_ingestion.get_resumable_scans()
         except Exception as error:
             self.logger.warning("Failed to load resumable MsgLog ingestions (%s).", type(error).__name__)
             return
@@ -1455,7 +1456,7 @@ class ChatBindingManager(LocaleMixin):
 
     def resume_pending_history_migrations(self):
         try:
-            if self.db.has_pending_history_migrations():
+            if self.history_migrations.has_pending_entries():
                 self._start_history_migration_worker()
         except Exception as e:
             self.logger.warning("Failed to check pending history migrations (%s).", type(e).__name__)
@@ -1492,10 +1493,10 @@ class ChatBindingManager(LocaleMixin):
             )
 
     def _queue_history_migration_entries(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None) -> int:
-        recent_messages = self.db.get_recent_messages(slave_chat_id, limit=0)
+        recent_messages = self.msglogs.get_recent_messages(slave_chat_id, limit=0)
 
         if not recent_messages:
-            self.db.replace_history_migration_entries(slave_chat_id, tg_chat_id, thread_id, [])
+            self.history_migrations.replace_entries(slave_chat_id, tg_chat_id, thread_id, [])
             return 0
 
         entries: List[Dict[str, object]] = []
@@ -1521,7 +1522,7 @@ class ChatBindingManager(LocaleMixin):
                 }
             )
 
-        queued_count = self.db.replace_history_migration_entries(slave_chat_id, tg_chat_id, thread_id, entries)
+        queued_count = self.history_migrations.replace_entries(slave_chat_id, tg_chat_id, thread_id, entries)
         self.logger.info("Queued %s historical messages for chat %s", queued_count, slave_chat_id)
         return queued_count
 
@@ -1535,7 +1536,7 @@ class ChatBindingManager(LocaleMixin):
 
     def _process_pending_history_migrations_locked(self):
         while True:
-            target = self.db.get_next_history_migration_target()
+            target = self.history_migrations.get_next_target()
             if target is None:
                 return
             if not self._process_history_migration_target(target):
@@ -1545,7 +1546,7 @@ class ChatBindingManager(LocaleMixin):
         slave_chat_id = EFBChannelChatIDStr(target.slave_chat_id)
         tg_chat_id = int(target.target_chat_id)
         thread_id = TelegramTopicID(int(target.message_thread_id)) if target.message_thread_id is not None else None
-        entries = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
+        entries = self.history_migrations.get_entries(slave_chat_id, tg_chat_id, thread_id)
 
         self.logger.info("Migrating %s pending historical messages for chat %s", len(entries), slave_chat_id)
         for entry in entries:
@@ -1560,7 +1561,7 @@ class ChatBindingManager(LocaleMixin):
                 return False
 
             if prepared_call is None:
-                self.db.delete_history_migration_entry(entry.id)
+                self.history_migrations.delete_entry(entry.id)
                 self.logger.info("History migration entry %d completed 0 calls", entry.id)
                 continue
 
@@ -1578,7 +1579,7 @@ class ChatBindingManager(LocaleMixin):
                 self._log_history_migration_failure(entry.id, completed_call_count, error)
                 return False
 
-            self.db.delete_history_migration_entry(entry.id)
+            self.history_migrations.delete_entry(entry.id)
         return True
 
     @staticmethod

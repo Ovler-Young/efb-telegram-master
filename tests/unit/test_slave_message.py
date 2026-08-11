@@ -40,7 +40,7 @@ def _message(uid="message"):
 
 def _dedupe_processor() -> SlaveMessageProcessor:
     processor = object.__new__(SlaveMessageProcessor)
-    processor.db = Mock()
+    processor.msglogs = Mock()
     processor.logger = Mock()
     processor.get_slave_msg_dest = Mock(return_value=("template", (123, None)))
     processor.is_silent = Mock(return_value=False)
@@ -202,7 +202,7 @@ def test_new_slave_message_claims_memory_dedupe_without_db_lookup() -> None:
 
     assert processor.send_message(message) is message
     assert ("tests.slave chat", "message") in processor._pending_slave_messages
-    processor.db.get_msg_log.assert_not_called()
+    processor.msglogs.get_msg_log.assert_not_called()
     processor.dispatch_message.assert_called_once_with(message, "template", None, 123, None, False, dedupe_key=("tests.slave chat", "message"))
 
 
@@ -233,7 +233,7 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
     processor.logger = Mock()
     processor.channel = SimpleNamespace(commands=SimpleNamespace(register_command=Mock()))
     processor.chat_manager = Mock()
-    processor.db = SimpleNamespace(add_or_update_message_log=Mock(side_effect=RuntimeError("database unavailable")))
+    processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock(side_effect=RuntimeError("database unavailable")))
     processor._release_pending_slave_message = Mock()
     processor.slave_message_text = Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=7))
     message = SimpleNamespace(
@@ -248,7 +248,7 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
     with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()), patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"):
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"))
 
-    processor.db.add_or_update_message_log.assert_called_once()
+    processor.msglogs.add_or_update_message_log.assert_called_once()
     processor.logger.warning.assert_called_once_with(
         "DB write failed for Telegram message %s; dropping mapping (%s).",
         7,
@@ -259,7 +259,7 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
 
 def test_ingested_message_edit_has_no_telegram_side_effect() -> None:
     processor = _dedupe_processor()
-    processor.db.get_msg_log.return_value = SimpleNamespace(provenance="mtproto_ingested")
+    processor.msglogs.get_msg_log.return_value = SimpleNamespace(provenance="mtproto_ingested")
     message = _message("mtproto-ingested:100.1")
     message.edit = True
 
@@ -396,7 +396,7 @@ def _reaction_processor(row, message, *, side_effect=None):
     processor.chat_manager = Mock()
     processor.get_slave_msg_dest = Mock(return_value=("template", (100, None)))
     processor.logger = Mock()
-    processor.db = SimpleNamespace(get_msg_log=Mock(return_value=row))
+    processor.msglogs = SimpleNamespace(get_msg_log=Mock(return_value=row))
     processor.dispatch_message = Mock(side_effect=side_effect)
     return processor, SimpleNamespace(chat=SimpleNamespace(module_id="tests.slave", uid="chat"), msg_id="message", reactions={"R": [object()]})
 
@@ -415,11 +415,11 @@ def test_reaction_update_waits_for_message_log_write() -> None:
     processor, status = _reaction_processor(row, message)
     processor.REACTION_DB_WAIT_TIMEOUT = 0.1
     processor.REACTION_DB_WAIT_INTERVAL = 0
-    processor.db.get_msg_log.side_effect = [None, row]
+    processor.msglogs.get_msg_log.side_effect = [None, row]
 
     processor.update_reactions(status)
 
-    assert processor.db.get_msg_log.call_count == 2
+    assert processor.msglogs.get_msg_log.call_count == 2
     processor.dispatch_message.assert_called_once_with(message, "template", (100, 10), 100, None)
 
 

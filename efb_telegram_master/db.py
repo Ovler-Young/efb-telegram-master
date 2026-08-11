@@ -1,24 +1,18 @@
 # coding=utf-8
 
-import datetime
 import logging
-import pickle
-import time
-from functools import partial
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
-from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot import utils
-from ehforwarderbot.types import ChatID, MessageID
-from peewee import DoesNotExist, IntegrityError, PostgresqlDatabase, SqliteDatabase, fn
-from telegram import Message
+from peewee import PostgresqlDatabase, SqliteDatabase
 
 from .chat_association_repository import ChatAssociationRepository
 from .database_observability import DatabaseMetrics, observe_database_method
-from .message import ETMMsg
-from .models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, PickledDict, SlaveChatInfo, TopicAssoc, database
+from .history_migration_repository import HistoryMigrationRepository
+from .models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, TopicAssoc, database
+from .msglog_ingestion_repository import MsgLogIngestionRepository
+from .msglog_repository import MsgLogRepository
 from .slave_chat_info_repository import SlaveChatInfoRepository
-from .utils import EFBChannelChatIDStr, OldMsgID, TelegramChatID, TelegramMessageID, TelegramTopicID, TgChatMsgIDStr, chat_id_str_to_id, chat_id_to_str, message_id_to_str
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -26,7 +20,6 @@ if TYPE_CHECKING:
 
 class DatabaseManager:
     logger = logging.getLogger(__name__)
-    FAIL_FLAG = "__fail__"
     _LEGACY_OUTBOUND_TABLES = ("outbound_workflow", "outbound_task")
     _LEGACY_OUTBOUND_STATES = (
         "waiting_dependency",
@@ -44,13 +37,15 @@ class DatabaseManager:
         self._metrics: Optional[DatabaseMetrics] = None
         self.chat_associations = ChatAssociationRepository()
         self.slave_chat_info = SlaveChatInfoRepository()
+        self.msglogs = MsgLogRepository()
+        self.history_migrations = HistoryMigrationRepository()
+        self.msglog_ingestion = MsgLogIngestionRepository(channel.channel_id)
         base_path = utils.get_data_path(channel.channel_id)
         self._base_path = base_path
 
         self.logger.debug("Loading database...")
         db_config = channel.config.get("database", {})
         db_type = db_config.get("type", "sqlite")
-
         if db_type == "postgresql":
             from playhouse.postgres_ext import PooledPostgresqlExtDatabase
 
@@ -65,67 +60,44 @@ class DatabaseManager:
                 options=db_config.get("options", "-c timezone=UTC"),
             )
         else:
-            from peewee import SqliteDatabase
-
             actual_db = SqliteDatabase(
                 str(base_path / "tgdata.db"),
-                pragmas={
-                    "journal_mode": "wal",
-                    "foreign_keys": 1,
-                    "busy_timeout": 5000,
-                },
+                pragmas={"journal_mode": "wal", "foreign_keys": 1, "busy_timeout": 5000},
                 check_same_thread=False,
             )
 
         database.initialize(actual_db)
         database.connect()
         self.logger.debug("Database loaded.")
-
         self.logger.debug("Checking database migration...")
         self._create()
         self.logger.debug("Database migration finished...")
         self._observe_legacy_outbound_rows()
 
     def set_metrics(self, metrics: DatabaseMetrics) -> None:
-        """Attach the metrics recorder created after the database manager."""
         self._metrics = metrics
-        self.chat_associations._metrics = metrics
-        self.slave_chat_info._metrics = metrics
+        for repository in (self.chat_associations, self.slave_chat_info, self.msglogs, self.history_migrations, self.msglog_ingestion):
+            repository._metrics = metrics
 
     @observe_database_method("stop_worker")
-    def stop_worker(self):
+    def stop_worker(self) -> None:
         stop = getattr(database.obj, "stop", None)
         if callable(stop):
             stop()
         database.close()
 
     @staticmethod
-    def _create():
-        """
-        Initializing tables.
-        """
-        database.create_tables(
-            [
-                ChatAssoc,
-                MsgLog,
-                SlaveChatInfo,
-                TopicAssoc,
-                HistoryMigrationEntry,
-                MsgLogIngestionScan,
-            ]
-        )
+    def _create() -> None:
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan])
         DatabaseManager._ensure_msglog_provenance()
 
     @staticmethod
     def _ensure_msglog_provenance() -> None:
-        """Add the required MsgLog provenance column to databases created before it existed."""
         current_database = database.obj
         transaction_arguments: Tuple[str, ...] = ()
         if isinstance(current_database, SqliteDatabase):
             transaction_arguments = ("IMMEDIATE",)
-        elif isinstance(current_database, PostgresqlDatabase):
-            pass
-        else:
+        elif not isinstance(current_database, PostgresqlDatabase):
             raise TypeError(f"Unsupported database backend: {type(current_database).__name__}")
 
         with current_database.atomic(*transaction_arguments):
@@ -136,13 +108,11 @@ class DatabaseManager:
                 current_database.execute_sql('ALTER TABLE "msglog" ADD COLUMN "provenance" TEXT NOT NULL DEFAULT \'live\'')
 
     def _observe_legacy_outbound_rows(self) -> None:
-        """Report retained workflow rows without loading or changing them."""
         table_names = set(database.get_tables())
         workflow_table, task_table = self._LEGACY_OUTBOUND_TABLES
         workflow_count = 0
         task_count = 0
         state_counts = {state: 0 for state in self._LEGACY_OUTBOUND_STATES}
-
         if workflow_table in table_names:
             workflow_count = int(database.execute_sql(f'SELECT COUNT(*) FROM "{workflow_table}"').fetchone()[0])
         if task_table in table_names:
@@ -151,408 +121,6 @@ class DatabaseManager:
                 if state in state_counts:
                     state_counts[state] = int(count)
             task_count = sum(int(count) for _state, count in task_rows)
-
         if workflow_count or task_count:
             state_summary = ", ".join(f"{state}={state_counts[state]}" for state in self._LEGACY_OUTBOUND_STATES)
-            self.logger.warning(
-                "Retained legacy outbound rows: workflows=%d tasks=%d %s",
-                workflow_count,
-                task_count,
-                state_summary,
-            )
-
-    @observe_database_method("get_master_msg_id")
-    def get_master_msg_id(self, message: EFBMessage) -> Optional[TgChatMsgIDStr]:
-        """Get master message ID from a message object."""
-        log: Optional[MsgLog] = MsgLog.get_or_none(MsgLog.slave_origin_uid == chat_id_to_str(chat=message.chat), MsgLog.slave_message_id == message.uid)
-        if log:
-            return TgChatMsgIDStr(log.master_msg_id)
-        return None
-
-    def pickle_misc_msg(self, message: EFBMessage) -> Optional[bytes]:
-        """Pickle miscellaneous information of a message.
-
-        Since 2.0.0b34, this would be a dict that reflects the following
-        attributes of an ``EFBMessage``/``ETMMsg`` object.
-
-        - ``target``: ``master_msg_id`` of the target message
-        - ``is_system``
-        - ``attributes``
-        - ``commands``
-        - ``substitutions``: ``Dict[Tuple[int, int], SlaveChatID]``
-        - ``reactions``: ``Dict[str, Collection[SlaveChatID]]``
-        """
-
-        data: PickledDict = {}
-        if message.is_system:
-            data["is_system"] = message.is_system
-        if message.attributes:
-            data["attributes"] = message.attributes
-        if message.commands:
-            data["commands"] = message.commands
-        if message.substitutions:
-            data["substitutions"] = {k: chat_id_to_str(chat=v) for k, v in message.substitutions.items()}
-        if message.reactions:
-            data["reactions"] = {k: tuple(chat_id_to_str(chat=i) for i in v) for k, v in message.reactions.items()}
-        if message.target:
-            target_id = self.get_master_msg_id(message.target)
-            if target_id:
-                data["target"] = target_id
-
-        if data:
-            return pickle.dumps(data)
-        return None
-
-    def get_or_create_msglog_ingestion_scan(
-        self,
-        source_chat_id: int,
-        scan_boundary: int,
-    ) -> MsgLogIngestionScan:
-        """Return the durable scan for one source group without changing its boundary."""
-        if scan_boundary <= 0:
-            raise ValueError("scan boundary must be positive")
-        source_id = str(source_chat_id)
-        scan = MsgLogIngestionScan.get_or_none(MsgLogIngestionScan.source_chat_id == source_id)
-        if scan is not None:
-            return scan
-        try:
-            return MsgLogIngestionScan.create(
-                source_chat_id=source_id,
-                scan_boundary=scan_boundary,
-                cursor=scan_boundary,
-            )
-        except IntegrityError:
-            return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == source_id)
-
-    def claim_msglog_ingestion_scan(
-        self,
-        source_chat_id: int,
-        lease_owner: str,
-        lease_seconds: int,
-    ) -> Optional[MsgLogIngestionScan]:
-        """Claim a scan when no other unexpired worker owns its lease."""
-        if lease_seconds <= 0:
-            raise ValueError("lease seconds must be positive")
-        now = datetime.datetime.now()
-        lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
-        with database.atomic():
-            updated = (
-                MsgLogIngestionScan.update(
-                    lease_owner=lease_owner,
-                    lease_expires_at=lease_expires_at,
-                    status="running",
-                    error=None,
-                    updated_at=now,
-                )
-                .where(
-                    (MsgLogIngestionScan.source_chat_id == str(source_chat_id))
-                    & (MsgLogIngestionScan.status != "complete")
-                    & (MsgLogIngestionScan.lease_expires_at.is_null(True) | (MsgLogIngestionScan.lease_expires_at <= now) | (MsgLogIngestionScan.lease_owner == lease_owner))
-                )
-                .execute()
-            )
-            if updated != 1:
-                return None
-            return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
-
-    def persist_msglog_ingestion_item(
-        self,
-        scan: MsgLogIngestionScan,
-        *,
-        source_message_id: int,
-        classification: str,
-        slave_uid: Optional[EFBChannelChatIDStr] = None,
-        message: Optional[object] = None,
-        lease_owner: str,
-    ) -> str:
-        """Store one scan outcome and its cursor atomically."""
-        now = datetime.datetime.now()
-        supports_for_update = bool(getattr(database.obj, "for_update", False))
-        transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
-        with transaction:
-            query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
-            if supports_for_update:
-                query = query.for_update()
-            current = query.get()
-            if current.lease_owner != lease_owner or (current.lease_expires_at is not None and current.lease_expires_at < now):
-                raise MsgLogIngestionLeaseLostError("MsgLog ingestion lease is no longer owned by this worker")
-            if current.status == "complete":
-                return "complete"
-
-            current.cursor = source_message_id - 1
-            current.scanned_count += 1
-            if classification != "eligible":
-                current.skipped_count += 1
-                outcome = "skipped"
-            else:
-                if slave_uid is None or message is None:
-                    raise ValueError("eligible ingestion record is missing its topic association or content")
-                master_msg_id = f"{current.source_chat_id}.{source_message_id}"
-                existing = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
-                if existing is not None:
-                    current.existing_count += 1
-                    current.existing_streak += 1
-                    outcome = "existing"
-                else:
-                    slave_channel_id, _, _ = chat_id_str_to_id(slave_uid)
-                    synthetic_member_uid = chat_id_to_str(slave_channel_id, ChatID("__self__"))
-                    source_time = getattr(message, "time", None)
-                    MsgLog.create(
-                        master_msg_id=master_msg_id,
-                        slave_message_id=f"mtproto-ingested:{master_msg_id}",
-                        text=str(getattr(message, "text")),
-                        slave_origin_uid=str(slave_uid),
-                        slave_member_uid=str(synthetic_member_uid),
-                        media_type=str(getattr(message, "media_type")),
-                        mime=getattr(message, "mime"),
-                        msg_type=str(getattr(message, "msg_type")),
-                        sent_to=self.channel.channel_id,
-                        provenance="mtproto_ingested",
-                        time=source_time if isinstance(source_time, datetime.datetime) else now,
-                    )
-                    current.inserted_count += 1
-                    current.existing_streak = 0
-                    outcome = "inserted"
-            if current.cursor <= 0 or current.existing_streak >= 500:
-                current.status = "complete"
-                current.lease_owner = None
-                current.lease_expires_at = None
-            current.updated_at = now
-            current.save()
-            scan.__data__.update(current.__data__)
-            return outcome
-
-    def finish_msglog_ingestion_scan(
-        self,
-        scan: MsgLogIngestionScan,
-        *,
-        status: str,
-        error: Optional[str] = None,
-        lease_owner: str,
-    ) -> bool:
-        """Record a terminal or retryable scan state and release its lease."""
-        now = datetime.datetime.now()
-        with database.atomic():
-            updated = (
-                MsgLogIngestionScan.update(
-                    status=status,
-                    error=error,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    updated_at=now,
-                )
-                .where(
-                    (MsgLogIngestionScan.id == scan.id)
-                    & (MsgLogIngestionScan.lease_owner == lease_owner)
-                    & MsgLogIngestionScan.lease_expires_at.is_null(False)
-                    & (MsgLogIngestionScan.lease_expires_at > now)
-                )
-                .execute()
-            )
-            current = MsgLogIngestionScan.get_by_id(scan.id)
-            if updated == 1 or current.status == "complete":
-                scan.__data__.update(current.__data__)
-            return updated == 1
-
-    @observe_database_method("add_or_update_message_log")
-    def add_or_update_message_log(self, msg: ETMMsg, master_message: Message, old_message_id: Optional[OldMsgID] = None, sender_bot_id: Optional[str] = None):
-        """Add or update a message into the database."""
-        sent_message_id = message_id_to_str(TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id))
-        master_msg_id = sent_message_id
-        master_msg_id_alt = None
-        self.logger.debug("[%s] Received message logging request of %s", master_msg_id, msg.uid)
-
-        row: Optional[MsgLog] = None
-        if old_message_id is not None:
-            old_message_id_str = message_id_to_str(*old_message_id)
-            row = MsgLog.get_or_none((MsgLog.master_msg_id == old_message_id_str) | (MsgLog.master_msg_id_alt == old_message_id_str))
-            if row is not None:
-                master_msg_id = TgChatMsgIDStr(row.master_msg_id)
-                master_msg_id_alt = sent_message_id if sent_message_id != master_msg_id else row.master_msg_id_alt
-            elif sent_message_id != old_message_id_str:
-                self.logger.debug("[%s] Message has an old ID: %s", sent_message_id, old_message_id_str)
-                master_msg_id, master_msg_id_alt = old_message_id_str, sent_message_id
-
-        if row is None:
-            row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
-        if row is not None:
-            save = row.save
-            self.logger.debug("[%s] Message record is found in database, update it", master_msg_id)
-        else:
-            row = MsgLog()
-            save = partial(row.save, force_insert=True)
-            self.logger.debug("[%s] Message record is not found in database, insert it", master_msg_id)
-
-        row.master_msg_id = master_msg_id
-        row.master_msg_id_alt = master_msg_id_alt
-        row.text = msg.text
-        row.slave_origin_uid = chat_id_to_str(chat=msg.chat)
-        row.slave_member_uid = chat_id_to_str(chat=msg.author)
-        row.msg_type = msg.type.name
-        row.sent_to = msg.deliver_to.channel_id
-        row.slave_message_id = msg.uid or f"{self.FAIL_FLAG}.{time.time()}"
-        row.media_type = msg.type_telegram.value
-        row.file_id = msg.file_id
-        row.file_unique_id = msg.file_unique_id
-        row.mime = msg.mime
-        row.sender_bot_id = sender_bot_id or getattr(msg, "sender_bot_id", None)
-        row.provenance = "live"
-        pickle_data = self.pickle_misc_msg(msg)
-        row.pickle = pickle_data
-
-        result = save()
-        self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
-
-    @observe_database_method("get_msg_log")
-    def get_msg_log(self, master_msg_id: Optional[TgChatMsgIDStr] = None, slave_msg_id: Optional[MessageID] = None, slave_origin_uid: Optional[EFBChannelChatIDStr] = None) -> Optional[MsgLog]:
-        """Get message log by message ID.
-
-        Args:
-            master_msg_id: Telegram message ID in string
-            slave_msg_id: Slave message identifier in string
-            slave_origin_uid: Slave chat identifier in string
-
-        Returns:
-            Optional[MsgLog]: The queried entry, None if not exist.
-        """
-        if (master_msg_id and (slave_msg_id or slave_origin_uid)) or not (master_msg_id or (slave_msg_id or slave_origin_uid)):
-            raise ValueError("master_msg_id and slave_msg_id is mutual exclusive")
-        if not master_msg_id and not (slave_msg_id and slave_origin_uid):
-            raise ValueError("slave_msg_id and slave_origin_uid must exists together.")
-        try:
-            if master_msg_id:
-                return MsgLog.select().where(MsgLog.master_msg_id == master_msg_id).order_by(MsgLog.time.desc()).first()
-            else:
-                return MsgLog.select().where((MsgLog.slave_message_id == slave_msg_id) & (MsgLog.slave_origin_uid == slave_origin_uid)).order_by(MsgLog.time.desc()).first()
-        except DoesNotExist:
-            return None
-
-    @observe_database_method("delete_msg_log")
-    def delete_msg_log(self, master_msg_id: Optional[TgChatMsgIDStr] = None, slave_msg_id: Optional[EFBChannelChatIDStr] = None, slave_origin_uid: Optional[EFBChannelChatIDStr] = None):
-        """Remove a message log by message ID.
-
-        Args:
-            master_msg_id: Telegram message ID in string
-            slave_msg_id: Slave message identifier in string
-            slave_origin_uid: Slave chat identifier in string
-        """
-        if (master_msg_id and (slave_msg_id or slave_origin_uid)) or not (master_msg_id or (slave_msg_id or slave_origin_uid)):
-            raise ValueError("master_msg_id and slave_msg_id is mutual exclusive")
-        if not master_msg_id and not (slave_msg_id and slave_origin_uid):
-            raise ValueError("slave_msg_id and slave_origin_uid must exists together.")
-        try:
-            if master_msg_id:
-                MsgLog.delete().where(MsgLog.master_msg_id == master_msg_id).execute()
-            else:
-                MsgLog.delete().where((MsgLog.slave_message_id == slave_msg_id) & (MsgLog.slave_origin_uid == slave_origin_uid)).execute()
-        except DoesNotExist:
-            return
-
-    @observe_database_method("get_recent_slave_chats")
-    def get_recent_slave_chats(self, master_chat_id: TelegramChatID, limit=5) -> List[EFBChannelChatIDStr]:
-        query = (
-            MsgLog.select(MsgLog.slave_origin_uid, fn.MAX(MsgLog.time))
-            .where(MsgLog.master_msg_id.startswith("{}.".format(master_chat_id)))
-            .group_by(MsgLog.slave_origin_uid)
-            .order_by(fn.MAX(MsgLog.time).desc())
-            .limit(limit)
-        )
-
-        return [EFBChannelChatIDStr(i.slave_origin_uid) for i in query]
-
-    @observe_database_method("get_last_message")
-    def get_last_message(self, slave_chat_id: EFBChannelChatIDStr) -> Optional[MsgLog]:
-        try:
-            return MsgLog.select().where(MsgLog.slave_origin_uid == slave_chat_id).order_by(MsgLog.time.desc()).limit(1).first()
-        except DoesNotExist:
-            return None
-
-    @observe_database_method("get_recent_messages")
-    def get_recent_messages(self, slave_chat_id: EFBChannelChatIDStr, limit: int = 1000) -> List[MsgLog]:
-        """Get recent messages from a specific slave chat for migration purposes.
-
-        Args:
-            slave_chat_id: Slave chat identifier in string format
-            limit: Maximum number of messages to retrieve (default: 1000). Use 0 for no limit.
-
-        Returns:
-            List[MsgLog]: List of recent message logs, ordered by time (oldest first)
-        """
-        try:
-            query = MsgLog.select().where(MsgLog.slave_origin_uid == slave_chat_id).order_by(MsgLog.time.asc())
-
-            if limit > 0:
-                query = query.limit(limit)
-
-            return list(query)
-        except DoesNotExist:
-            return []
-
-    @staticmethod
-    def _history_migration_target_filter(
-        slave_chat_id: EFBChannelChatIDStr,
-        target_chat_id: int,
-        message_thread_id: Optional[TelegramTopicID] = None,
-    ):
-        thread_value = str(message_thread_id) if message_thread_id is not None else None
-        base_filter = (HistoryMigrationEntry.slave_chat_id == str(slave_chat_id)) & (HistoryMigrationEntry.target_chat_id == str(target_chat_id))
-        if thread_value is None:
-            return base_filter & HistoryMigrationEntry.message_thread_id.is_null(True)
-        return base_filter & (HistoryMigrationEntry.message_thread_id == thread_value)
-
-    @observe_database_method("replace_history_migration_entries")
-    def replace_history_migration_entries(
-        self,
-        slave_chat_id: EFBChannelChatIDStr,
-        target_chat_id: int,
-        message_thread_id: Optional[TelegramTopicID],
-        entries: List[Dict[str, object]],
-    ) -> int:
-        target_filter = self._history_migration_target_filter(
-            slave_chat_id,
-            target_chat_id,
-            message_thread_id,
-        )
-        with database.atomic():
-            HistoryMigrationEntry.delete().where(target_filter).execute()
-            if entries:
-                HistoryMigrationEntry.insert_many(entries).execute()
-        return len(entries)
-
-    @observe_database_method("has_pending_history_migrations")
-    def has_pending_history_migrations(self) -> bool:
-        return HistoryMigrationEntry.select().exists()
-
-    @observe_database_method("get_next_history_migration_target")
-    def get_next_history_migration_target(self) -> Optional[HistoryMigrationEntry]:
-        return HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id.asc()).first()
-
-    @observe_database_method("get_history_migration_entries")
-    def get_history_migration_entries(
-        self,
-        slave_chat_id: EFBChannelChatIDStr,
-        target_chat_id: int,
-        message_thread_id: Optional[TelegramTopicID] = None,
-    ) -> List[HistoryMigrationEntry]:
-        target_filter = self._history_migration_target_filter(
-            slave_chat_id,
-            target_chat_id,
-            message_thread_id,
-        )
-        return list(HistoryMigrationEntry.select().where(target_filter).order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc()))
-
-    @observe_database_method("delete_history_migration_entry")
-    def delete_history_migration_entry(self, entry_id: int) -> int:
-        return int(HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id == entry_id).execute())
-
-    @observe_database_method("get_resumable_msglog_ingestion_scans")
-    def get_resumable_msglog_ingestion_scans(self) -> List[MsgLogIngestionScan]:
-        now = datetime.datetime.now()
-        return list(
-            MsgLogIngestionScan.select()
-            .where(
-                MsgLogIngestionScan.status.in_(("pending", "retryable-error"))
-                | ((MsgLogIngestionScan.status == "running") & (MsgLogIngestionScan.lease_expires_at.is_null(True) | (MsgLogIngestionScan.lease_expires_at <= now)))
-            )
-            .order_by(MsgLogIngestionScan.updated_at.asc(), MsgLogIngestionScan.id.asc())
-        )
+            self.logger.warning("Retained legacy outbound rows: workflows=%d tasks=%d %s", workflow_count, task_count, state_summary)

@@ -95,7 +95,7 @@ class MsgLog(BaseModel):
     """Message type in EFB framework."""
     pickle = BlobField(null=True)
     """Miscellaneous data serialized with ``pickle``, per spec in
-    ``DatabaseManager.pickle_misc_msg()``.
+    ``MsgLogRepository.pickle_misc_msg()``.
     """
     sent_to = TextField()
     """Module ID of the message sent to."""

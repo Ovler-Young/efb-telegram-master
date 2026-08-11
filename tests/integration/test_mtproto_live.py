@@ -76,7 +76,7 @@ async def _wait_for_scan_terminal(source_chat_id, timeout=30):
 async def _wait_for_msg_log(channel, master_msg_id, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        row = channel.db.get_msg_log(master_msg_id=master_msg_id)
+        row = channel.msglogs.get_msg_log(master_msg_id=master_msg_id)
         if row is not None:
             return row
         await asyncio.sleep(0.1)
@@ -85,7 +85,7 @@ async def _wait_for_msg_log(channel, master_msg_id, timeout=10):
 
 def _delete_msg_logs_by_master_ids(channel, master_msg_ids):
     for master_msg_id in master_msg_ids:
-        channel.db.delete_msg_log(master_msg_id=master_msg_id)
+        channel.msglogs.delete_msg_log(master_msg_id=master_msg_id)
 
 
 async def _wait_for_ingestion_worker_exit(channel, source_chat_id, timeout=30):
@@ -150,7 +150,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         ]
 
         _delete_msg_logs_by_master_ids(channel, source_log_ids)
-        assert all(channel.db.get_msg_log(master_msg_id=master_msg_id) is None for master_msg_id in source_log_ids)
+        assert all(channel.msglogs.get_msg_log(master_msg_id=master_msg_id) is None for master_msg_id in source_log_ids)
 
         scan_boundary = max(source_ids)
         channel.mtproto.config = replace(channel.mtproto.config, scan_ceiling=scan_boundary)
@@ -187,7 +187,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
                 scan_to_delete = await _wait_for_scan_terminal(bot_topic_group)
             MsgLogIngestionScan.delete().where(MsgLogIngestionScan.id == scan_to_delete.id).execute()
         for message_id in logged_message_ids:
-            channel.db.delete_msg_log(master_msg_id=message_id)
+            channel.msglogs.delete_msg_log(master_msg_id=message_id)
         if topic_id is not None:
             channel.chat_associations.remove_topic_assoc(bot_topic_group, topic_id)
             with suppress(Exception):

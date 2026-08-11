@@ -33,6 +33,6 @@ async def test_auxiliary_bot_sender_id_can_be_recorded(poll_bot, channel_with_au
 
     slave_with_auxiliary_bots.send_text_message(chat, chat.other)
 
-    recent = channel_with_auxiliary_bots.db.get_last_message(chat.channel_id + "." + chat.uid)
+    recent = channel_with_auxiliary_bots.msglogs.get_last_message(chat.channel_id + "." + chat.uid)
     assert recent is not None
     assert recent.sender_bot_id is not None

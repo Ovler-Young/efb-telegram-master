@@ -5,7 +5,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 from ehforwarderbot import MsgType
@@ -20,6 +20,8 @@ from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
+from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
+from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 
 _OLD_MSGLOG_SCHEMA = """
@@ -100,7 +102,7 @@ def test_database_method_metrics_record_bounded_public_operation_labels(channel)
 
     assert channel.chat_associations.get_chat_assoc(master_uid="metrics-master") == []
     with pytest.raises(ValueError, match="Only one parameter"):
-        channel.db.get_msg_log()
+        channel.msglogs.get_msg_log()
 
     rendered = generate_latest(metrics.registry).decode()
 
@@ -196,8 +198,8 @@ def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):
         deliver_to=channel,
     )
 
-    channel.db.add_or_update_message_log(etm_msg, SimpleNamespace(chat_id=123456, message_id=654321), sender_bot_id="777")
-    stored = channel.db.get_msg_log(master_msg_id="123456.654321")
+    channel.msglogs.add_or_update_message_log(etm_msg, SimpleNamespace(chat_id=123456, message_id=654321), sender_bot_id="777")
+    stored = channel.msglogs.get_msg_log(master_msg_id="123456.654321")
     assert stored is not None and stored.sender_bot_id == "777"
     stored.delete_instance()
 
@@ -214,8 +216,8 @@ def test_build_etm_msg_restores_sender_bot_id(channel, slave):
         deliver_to=channel,
     )
 
-    channel.db.add_or_update_message_log(etm_msg, SimpleNamespace(chat_id=4444, message_id=5555), sender_bot_id="888")
-    row = channel.db.get_msg_log(master_msg_id="4444.5555")
+    channel.msglogs.add_or_update_message_log(etm_msg, SimpleNamespace(chat_id=4444, message_id=5555), sender_bot_id="888")
+    row = channel.msglogs.get_msg_log(master_msg_id="4444.5555")
     assert row is not None and row.build_etm_msg(channel.chat_manager).sender_bot_id == "888"
     row.delete_instance()
 
@@ -244,8 +246,7 @@ def _reaction_message(reactor, reactions):
 
 def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
     test_db = SqliteDatabase(":memory:")
-    manager = object.__new__(DatabaseManager)
-    manager.logger = Mock()
+    manager = MsgLogRepository()
     reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
     message = _reaction_message(reactor, {})
 
@@ -266,8 +267,7 @@ def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
 
 def test_reaction_alternate_db_failures_preserve_then_update_canonical_row():
     test_db = SqliteDatabase(":memory:")
-    manager = object.__new__(DatabaseManager)
-    manager.logger = Mock()
+    manager = MsgLogRepository()
     reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
     message = _reaction_message(reactor, {"NEW": [reactor]})
 
@@ -467,13 +467,12 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    manager = object.__new__(DatabaseManager)
-    manager.channel = SimpleNamespace(channel_id="tests")
+    manager = MsgLogIngestionRepository("tests")
     try:
         test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        scan = manager.get_or_create_msglog_ingestion_scan(100, 500)
-        assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
-        assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is None
+        scan = manager.get_or_create_scan(100, 500)
+        assert manager.claim_scan(100, "worker-a", 60) is not None
+        assert manager.claim_scan(100, "worker-b", 60) is None
         content = SimpleNamespace(
             text="ingested",
             media_type="Text",
@@ -482,7 +481,7 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
             time=datetime(2026, 8, 4),
         )
         assert (
-            manager.persist_msglog_ingestion_item(
+            manager.persist_item(
                 scan,
                 source_message_id=500,
                 classification="eligible",
@@ -493,7 +492,7 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
             == "inserted"
         )
         assert (
-            manager.persist_msglog_ingestion_item(
+            manager.persist_item(
                 scan,
                 source_message_id=500,
                 classification="eligible",
@@ -517,15 +516,15 @@ def test_expired_scan_is_resumable_after_restart():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    manager = object.__new__(DatabaseManager)
+    manager = MsgLogIngestionRepository("tests")
     try:
         test_db.create_tables([MsgLogIngestionScan])
-        scan = manager.get_or_create_msglog_ingestion_scan(100, 500)
-        assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
+        scan = manager.get_or_create_scan(100, 500)
+        assert manager.claim_scan(100, "worker-a", 60) is not None
         MsgLogIngestionScan.update(lease_expires_at=datetime.now() - timedelta(seconds=1)).where(MsgLogIngestionScan.id == scan.id).execute()
-        resumed = manager.get_resumable_msglog_ingestion_scans()
+        resumed = manager.get_resumable_scans()
         assert [item.source_chat_id for item in resumed] == ["100"]
-        assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is not None
+        assert manager.claim_scan(100, "worker-b", 60) is not None
     finally:
         test_db.close()
         database.initialize(original_database)
@@ -533,8 +532,7 @@ def test_expired_scan_is_resumable_after_restart():
 
 def test_live_message_overwrites_synthetic_provenance():
     test_db = SqliteDatabase(":memory:")
-    manager = object.__new__(DatabaseManager)
-    manager.logger = Mock()
+    manager = MsgLogRepository()
     message = SimpleNamespace(
         uid=MessageID("live-message"),
         chat=SimpleNamespace(module_id="tests.slave", uid="chat"),

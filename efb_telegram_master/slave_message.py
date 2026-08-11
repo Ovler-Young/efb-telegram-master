@@ -41,7 +41,6 @@ from .utils import OldMsgID, TelegramChatID, TelegramMessageID, TelegramTopicID
 
 if TYPE_CHECKING:
     from . import TelegramChannel
-    from .db import DatabaseManager
     from .telegram_api import TelegramAPI
 
 
@@ -59,7 +58,7 @@ class SlaveMessageProcessor(LocaleMixin):
         self.bot: "TelegramAPI" = self.channel.bot_manager.api
         self.logger: logging.Logger = logging.getLogger(__name__)
         self.flag: utils.ExperimentalFlagsManager = self.channel.flag
-        self.db: "DatabaseManager" = channel.db
+        self.msglogs = channel.msglogs
         self.chat_associations = channel.chat_associations
         self.slave_chat_info = channel.slave_chat_info
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
@@ -176,7 +175,7 @@ class SlaveMessageProcessor(LocaleMixin):
         try:
             slave_origin_uid = utils.chat_id_to_str(chat=msg.chat)
             if msg.edit:
-                old_msg = self.db.get_msg_log(slave_msg_id=msg.uid, slave_origin_uid=slave_origin_uid)
+                old_msg = self.msglogs.get_msg_log(slave_msg_id=msg.uid, slave_origin_uid=slave_origin_uid)
                 if old_msg and old_msg.provenance == "mtproto_ingested":
                     self.logger.info("Ignoring edit for ingested synthetic message %s.", msg.uid)
                     return msg
@@ -262,7 +261,7 @@ class SlaveMessageProcessor(LocaleMixin):
         target_msg_id = target_msg_id_override
         if target_msg_id is None and isinstance(msg.target, Message):
             self.logger.debug("[%s] Message is replying to slave message %s.", msg.uid, msg.target.uid)
-            log = self.db.get_msg_log(slave_msg_id=msg.target.uid, slave_origin_uid=utils.chat_id_to_str(chat=msg.target.chat))
+            log = self.msglogs.get_msg_log(slave_msg_id=msg.target.uid, slave_origin_uid=utils.chat_id_to_str(chat=msg.target.chat))
             if not log:
                 self.logger.debug("[%s] Target message %s is not found in database.", msg.uid, msg.target.uid)
             elif log.provenance == "mtproto_ingested":
@@ -347,7 +346,7 @@ class SlaveMessageProcessor(LocaleMixin):
         try:
             etm_msg.type_telegram = get_msg_type(tg_msg)
             etm_msg.put_telegram_file(tg_msg)
-            self.db.add_or_update_message_log(
+            self.msglogs.add_or_update_message_log(
                 etm_msg,
                 tg_msg,
                 database_old_msg_id or old_msg_id,
@@ -1444,7 +1443,7 @@ class SlaveMessageProcessor(LocaleMixin):
             self.chat_manager.update_chat_obj(chat, full_update=True)
         elif isinstance(status, MessageRemoval):
             self.logger.debug("Received message removal request from channel %s on message %s", status.source_channel, status.message)
-            old_msg = self.db.get_msg_log(slave_msg_id=status.message.uid, slave_origin_uid=utils.chat_id_to_str(chat=status.message.chat))
+            old_msg = self.msglogs.get_msg_log(slave_msg_id=status.message.uid, slave_origin_uid=utils.chat_id_to_str(chat=status.message.chat))
             if old_msg:
                 if old_msg.provenance == "mtproto_ingested":
                     self.logger.info("Ignoring removal for ingested synthetic message %s from %s.", status.message.uid, status.message.chat)
@@ -1503,11 +1502,11 @@ class SlaveMessageProcessor(LocaleMixin):
     def update_reactions(self, status: MessageReactionsUpdate):
         """Update reactions to a Telegram message."""
         slave_origin_uid = utils.chat_id_to_str(chat=status.chat)
-        old_msg_db = self.db.get_msg_log(slave_msg_id=status.msg_id, slave_origin_uid=slave_origin_uid)
+        old_msg_db = self.msglogs.get_msg_log(slave_msg_id=status.msg_id, slave_origin_uid=slave_origin_uid)
         deadline = time.monotonic() + self.REACTION_DB_WAIT_TIMEOUT
         while old_msg_db is None and time.monotonic() < deadline:
             time.sleep(self.REACTION_DB_WAIT_INTERVAL)
-            old_msg_db = self.db.get_msg_log(slave_msg_id=status.msg_id, slave_origin_uid=slave_origin_uid)
+            old_msg_db = self.msglogs.get_msg_log(slave_msg_id=status.msg_id, slave_origin_uid=slave_origin_uid)
         if old_msg_db is None:
             self.logger.error("Trying to update reactions of message, but message is not found in database. Message ID %s from %s, status: %s.", status.msg_id, status.chat, status.reactions)
             return

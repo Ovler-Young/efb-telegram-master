@@ -147,7 +147,7 @@ async def _wait_for_logged_stream_messages(channel, chat, prefix: str, expected_
     deadline = time.time() + STREAM_SETTLE_TIMEOUT
     matches = []
     while time.time() < deadline:
-        matches = [log for log in channel.db.get_recent_messages(slave_chat_id, limit=0) if (log.text or "").startswith(prefix)]
+        matches = [log for log in channel.msglogs.get_recent_messages(slave_chat_id, limit=0) if (log.text or "").startswith(prefix)]
         if len(matches) >= expected_count:
             return matches
         await asyncio.sleep(1)
@@ -228,7 +228,7 @@ def _target_migration_entry_count(slave_chat_id: str, target_chat_id: int) -> in
 
 def _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix: str):
     slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
-    return [log for log in channel_with_auxiliary_bots.db.get_recent_messages(slave_chat_id, limit=0) if (log.text or "").startswith(prefix)]
+    return [log for log in channel_with_auxiliary_bots.msglogs.get_recent_messages(slave_chat_id, limit=0) if (log.text or "").startswith(prefix)]
 
 
 async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_chat_id: int, chat, prefix: str, expected_count: int, min_message_id: int):

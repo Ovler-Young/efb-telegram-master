@@ -8,8 +8,8 @@ from datetime import datetime
 from typing import Optional
 
 from .chat_association_repository import ChatAssociationRepository
-from .db import DatabaseManager
 from .models import MsgLogIngestionLeaseLostError
+from .msglog_ingestion_repository import MsgLogIngestionRepository
 from .mtproto import MTProtoClient, MTProtoRetryableError
 from .utils import EFBChannelChatIDStr
 
@@ -31,10 +31,10 @@ class MsgLogIngestionService:
     BATCH_SIZE = 100
     EXISTING_STREAK_LIMIT = 500
 
-    def __init__(self, db: DatabaseManager, chat_associations: ChatAssociationRepository, mtproto: MTProtoClient, *, lease_seconds: int = 120) -> None:
+    def __init__(self, ingestion: MsgLogIngestionRepository, chat_associations: ChatAssociationRepository, mtproto: MTProtoClient, *, lease_seconds: int = 120) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease seconds must be positive")
-        self.db = db
+        self.ingestion = ingestion
         self.chat_associations = chat_associations
         self.mtproto = mtproto
         self.lease_seconds = lease_seconds
@@ -48,8 +48,8 @@ class MsgLogIngestionService:
         scan_ceiling = getattr(getattr(self.mtproto, "config", None), "scan_ceiling", 100_000)
         if isinstance(scan_ceiling, bool) or not isinstance(scan_ceiling, int) or scan_ceiling <= 0:
             raise ValueError("MTProto scan ceiling must be a positive integer")
-        self.db.get_or_create_msglog_ingestion_scan(source_chat_id, scan_ceiling)
-        scan = self.db.claim_msglog_ingestion_scan(source_chat_id, lease_owner, self.lease_seconds)
+        self.ingestion.get_or_create_scan(source_chat_id, scan_ceiling)
+        scan = self.ingestion.claim_scan(source_chat_id, lease_owner, self.lease_seconds)
         if scan is None:
             return
         self._log_event("start", source_chat_id)
@@ -57,7 +57,7 @@ class MsgLogIngestionService:
         try:
             source_channel = await self.mtproto.get_input_channel(source_chat_id)
             while scan.cursor > 0 and scan.existing_streak < self.EXISTING_STREAK_LIMIT:
-                renewed_scan = self.db.claim_msglog_ingestion_scan(
+                renewed_scan = self.ingestion.claim_scan(
                     source_chat_id,
                     lease_owner,
                     self.lease_seconds,
@@ -74,7 +74,7 @@ class MsgLogIngestionService:
                         by_id.get(message_id),
                         source_chat_id,
                     )
-                    self.db.persist_msglog_ingestion_item(
+                    self.ingestion.persist_item(
                         scan,
                         source_message_id=message_id,
                         classification=classification,
@@ -83,19 +83,19 @@ class MsgLogIngestionService:
                         lease_owner=lease_owner,
                     )
                     if scan.existing_streak >= self.EXISTING_STREAK_LIMIT or scan.cursor <= 0:
-                        self.db.finish_msglog_ingestion_scan(
+                        self.ingestion.finish_scan(
                             scan,
                             status="complete",
                             lease_owner=lease_owner,
                         )
                         self._log_event("complete", source_chat_id)
                         return
-            self.db.finish_msglog_ingestion_scan(scan, status="complete", lease_owner=lease_owner)
+            self.ingestion.finish_scan(scan, status="complete", lease_owner=lease_owner)
             self._log_event("complete", source_chat_id)
         except MsgLogIngestionLeaseLostError:
             self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id, extra={"event": "msglog_ingestion.lease_lost"})
         except MTProtoRetryableError as error:
-            self.db.finish_msglog_ingestion_scan(
+            self.ingestion.finish_scan(
                 scan,
                 status="retryable-error",
                 error=str(error),
@@ -103,7 +103,7 @@ class MsgLogIngestionService:
             )
             self.logger.warning("MsgLog ingestion retained at cursor %d (%s)", scan.cursor, type(error).__name__, extra={"event": "msglog_ingestion.retry", "error_type": type(error).__name__})
         except Exception as error:
-            self.db.finish_msglog_ingestion_scan(
+            self.ingestion.finish_scan(
                 scan,
                 status="error",
                 error=str(error),

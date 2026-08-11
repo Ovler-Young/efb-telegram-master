@@ -76,8 +76,8 @@ def test_sync_msglog_ignores_updates_without_an_effective_message(sync_msglog_ch
 
 def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
     manager = object.__new__(ChatBindingManager)
-    manager.db = SimpleNamespace(
-        get_resumable_msglog_ingestion_scans=Mock(
+    manager.msglog_ingestion = SimpleNamespace(
+        get_resumable_scans=Mock(
             return_value=[
                 SimpleNamespace(source_chat_id="100"),
                 SimpleNamespace(source_chat_id="200"),
@@ -97,13 +97,13 @@ def test_ingested_rows_are_not_remote_get_or_reaction_targets():
     row = SimpleNamespace(provenance="mtproto_ingested")
     chat = SimpleNamespace(module_id="tests.slave", uid="chat")
     channel = object.__new__(TelegramChannel)
-    channel.db = SimpleNamespace(get_msg_log=Mock(return_value=row))
+    channel.msglogs = SimpleNamespace(get_msg_log=Mock(return_value=row))
     channel.chat_manager = Mock()
 
     assert TelegramChannel.get_message_by_id(channel, chat, "mtproto-ingested:100.1") is None
 
     processor = object.__new__(SlaveMessageProcessor)
-    processor.db = SimpleNamespace(get_msg_log=Mock(return_value=row))
+    processor.msglogs = SimpleNamespace(get_msg_log=Mock(return_value=row))
     processor.logger = Mock()
     processor.update_reactions(SimpleNamespace(chat=chat, msg_id="mtproto-ingested:100.1", reactions={}))
 
@@ -117,7 +117,7 @@ def test_ingested_rows_are_not_remote_get_or_reaction_targets():
 def test_dispatch_reply_target_respects_provenance(provenance, expected_target_msg_id):
     processor = object.__new__(SlaveMessageProcessor)
     processor.logger = Mock()
-    processor.db = SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(master_msg_id="123.456", provenance=provenance)))
+    processor.msglogs = SimpleNamespace(get_msg_log=Mock(return_value=SimpleNamespace(master_msg_id="123.456", provenance=provenance)))
     processor.chat_manager = Mock()
     processor.channel = SimpleNamespace(commands=SimpleNamespace(register_command=Mock()))
     processor.slave_message_text = Mock(return_value=None)
@@ -133,7 +133,7 @@ def test_dispatch_reply_target_respects_provenance(provenance, expected_target_m
 def test_ordinary_send_writes_msglog_once_and_releases_completion(monkeypatch):
     processor = object.__new__(SlaveMessageProcessor)
     processor.logger = Mock()
-    processor.db = SimpleNamespace(add_or_update_message_log=Mock())
+    processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock())
     processor.chat_manager = Mock()
     processor.channel = SimpleNamespace(commands=SimpleNamespace(register_command=Mock()))
     processor.build_reactions_footer = Mock(return_value="")
@@ -154,7 +154,7 @@ def test_ordinary_send_writes_msglog_once_and_releases_completion(monkeypatch):
 
     processor.dispatch_message(message, "", None, 123, None, dedupe_key=("slave", "slave-message"))
 
-    processor.db.add_or_update_message_log.assert_called_once_with(
+    processor.msglogs.add_or_update_message_log.assert_called_once_with(
         etm_msg,
         sent,
         None,
