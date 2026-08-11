@@ -43,7 +43,7 @@ class SenderPolicy:
                 return SenderDecision(None, error="required_sender_unavailable")
             return self._available(SenderSelection(auxiliary.bot, str(auxiliary.bot_id)), call.telegram_chat_id, now)
 
-        candidates: list[tuple[int, str, SenderDecision]] = [(1, "", self._available(SenderSelection(self._main_bot, None), call.telegram_chat_id, now))]
+        candidates: list[tuple[int, str, SenderDecision]] = [(2, "", self._available(SenderSelection(self._main_bot, None), call.telegram_chat_id, now))]
         membership_retry_at: Optional[float] = None
         if self._bot_pool:
             preferred = self._bot_pool.preferred_sender(call.slave_id)
@@ -53,7 +53,7 @@ class SenderPolicy:
                     membership_retry_at = deadline if membership_retry_at is None else min(membership_retry_at, deadline)
                 elif membership:
                     selection = SenderSelection(auxiliary.bot, str(auxiliary.bot_id))
-                    candidates.append((0 if preferred is auxiliary else 2, str(auxiliary.bot_id), self._available(selection, call.telegram_chat_id, now)))
+                    candidates.append((0 if preferred is auxiliary else 1, str(auxiliary.bot_id), self._available(selection, call.telegram_chat_id, now)))
         selectable = [candidate for candidate in candidates if candidate[2].selection is not None]
         if selectable:
             return min(selectable, key=lambda candidate: candidate[:2])[2]

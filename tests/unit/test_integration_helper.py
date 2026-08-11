@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -50,10 +51,13 @@ def build_event_helper() -> helper_module.TelegramIntegrationTestHelper:
     test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
     test_helper.queue = asyncio.Queue()
     test_helper.pending_events = []
+    test_helper._event_sequence = 0
+    test_helper._event_metadata = {}
     test_helper.message_chat_map = {}
     test_helper.chats = {100}
     test_helper._temporary_chat_counts = {}
     test_helper._temporary_chat_lock = threading.Lock()
+    test_helper.logger = logging.getLogger(__name__)
     return test_helper
 
 
@@ -143,6 +147,136 @@ async def test_helper_retains_nonmatching_event_for_later_wait() -> None:
     assert await test_helper.wait_for_event(lambda event: event.kind == "matching") is matching
     assert test_helper.pending_events == [unmatched]
     assert await test_helper.wait_for_event(lambda event: event.kind == "unmatched") is unmatched
+
+
+@pytest.mark.asyncio
+async def test_helper_cursor_ignores_prior_events_without_discarding_them() -> None:
+    test_helper = build_event_helper()
+    prior = SimpleNamespace(kind="prior")
+    response = SimpleNamespace(kind="response")
+    await test_helper._queue_event(prior)
+    cursor = test_helper.event_cursor()
+
+    await test_helper._queue_event(response)
+    assert await test_helper.wait_for_event(lambda event: event.kind in {"prior", "response"}, after_cursor=cursor) is response
+
+    assert await test_helper.wait_for_event(lambda event: event.kind == "prior") is prior
+
+
+@pytest.mark.asyncio
+async def test_helper_concurrent_cursor_waits_preserve_interleaved_events() -> None:
+    test_helper = build_event_helper()
+    before_a = SimpleNamespace(kind="before-a")
+    between_a_and_b = SimpleNamespace(kind="between-a-and-b")
+    a_response = SimpleNamespace(kind="a")
+    b_response = SimpleNamespace(kind="b")
+    await test_helper._queue_event(before_a)
+    a_cursor = test_helper.event_cursor()
+    await test_helper._queue_event(between_a_and_b)
+    b_cursor = test_helper.event_cursor()
+
+    a_wait = asyncio.create_task(test_helper.wait_for_event(lambda event: event.kind == "a", after_cursor=a_cursor))
+    b_wait = asyncio.create_task(test_helper.wait_for_event(lambda event: event.kind == "b", after_cursor=b_cursor))
+    await asyncio.sleep(0)
+    await test_helper._queue_event(a_response)
+    await test_helper._queue_event(b_response)
+
+    assert await a_wait is a_response
+    assert await b_wait is b_response
+    assert await test_helper.wait_for_event(lambda event: event.kind == "before-a") is before_a
+    assert await test_helper.wait_for_event(lambda event: event.kind == "between-a-and-b") is between_a_and_b
+
+
+@pytest.mark.asyncio
+async def test_helper_prunes_expired_and_overflow_pending_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_helper = build_event_helper()
+    monkeypatch.setattr(helper_module, "PENDING_EVENT_MAX_COUNT", 2)
+    monkeypatch.setattr(helper_module, "PENDING_EVENT_MAX_AGE_SECONDS", 1.0)
+    events = [SimpleNamespace(kind=index) for index in range(4)]
+    cursor = test_helper.event_cursor()
+    for event in events:
+        await test_helper._queue_event(event)
+    with pytest.raises(asyncio.TimeoutError):
+        await test_helper.wait_for_event(lambda _: False, timeout=0.01, after_cursor=cursor)
+
+    assert [event.kind for event in test_helper.pending_events] == [2, 3]
+    metadata = test_helper._event_metadata[id(events[2])]
+    test_helper._event_metadata[id(events[2])] = helper_module.EventMetadata(metadata.sequence, time.monotonic() - 2.0)
+    test_helper.event_cursor()
+    assert [event.kind for event in test_helper.pending_events] == [3]
+
+
+@pytest.mark.asyncio
+async def test_helper_pending_events_remain_bounded_across_scoped_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_helper = build_event_helper()
+    monkeypatch.setattr(helper_module, "PENDING_EVENT_MAX_COUNT", 3)
+    for batch in range(4):
+        cursor = test_helper.event_cursor()
+        for offset in range(3):
+            await test_helper._queue_event(SimpleNamespace(kind=(batch, offset)))
+        with pytest.raises(asyncio.TimeoutError):
+            await test_helper.wait_for_event(lambda _: False, timeout=0.01, after_cursor=cursor)
+        assert len(test_helper.pending_events) <= 3
+
+
+@pytest.mark.asyncio
+async def test_helper_bounds_raw_queue_and_metadata_without_waiters() -> None:
+    test_helper = build_event_helper()
+
+    for index in range(1_000):
+        await test_helper._queue_event(SimpleNamespace(kind=index))
+
+    assert test_helper.queue.qsize() == helper_module.PENDING_EVENT_MAX_COUNT
+    assert len(test_helper._event_metadata) == helper_module.PENDING_EVENT_MAX_COUNT
+    test_helper.clear_queue()
+    assert not test_helper._event_metadata
+
+
+@pytest.mark.asyncio
+async def test_helper_discards_oldest_raw_events_before_accepting_newer_ones(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_helper = build_event_helper()
+    monkeypatch.setattr(helper_module, "PENDING_EVENT_MAX_COUNT", 3)
+
+    for index in range(5):
+        await test_helper._queue_event(SimpleNamespace(kind=index))
+
+    assert [(await test_helper.wait_for_event(timeout=0.01)).kind for _ in range(3)] == [2, 3, 4]
+    assert not test_helper._event_metadata
+
+
+@pytest.mark.asyncio
+async def test_helper_discards_expired_raw_events_before_filtering() -> None:
+    test_helper = build_event_helper()
+    expired = SimpleNamespace(kind="expired")
+    fresh = SimpleNamespace(kind="fresh")
+    await test_helper._queue_event(expired)
+    metadata = test_helper._event_metadata[id(expired)]
+    test_helper._event_metadata[id(expired)] = helper_module.EventMetadata(
+        metadata.sequence,
+        time.monotonic() - helper_module.PENDING_EVENT_MAX_AGE_SECONDS - 1.0,
+    )
+    await test_helper._queue_event(fresh)
+
+    assert await test_helper.wait_for_event(lambda event: event.kind in {"expired", "fresh"}) is fresh
+    assert id(expired) not in test_helper._event_metadata
+    assert not test_helper._event_metadata
+
+
+@pytest.mark.asyncio
+async def test_helper_bounds_combined_raw_and_pending_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_helper = build_event_helper()
+    monkeypatch.setattr(helper_module, "PENDING_EVENT_MAX_COUNT", 3)
+    for index in range(3):
+        await test_helper._queue_event(SimpleNamespace(kind=("pending", index)))
+    with pytest.raises(asyncio.TimeoutError):
+        await test_helper.wait_for_event(lambda _: False, timeout=0.01)
+
+    for index in range(3):
+        await test_helper._queue_event(SimpleNamespace(kind=("raw", index)))
+
+    assert len(test_helper.pending_events) == 3
+    assert test_helper.queue.qsize() == 3
+    assert len(test_helper._event_metadata) == 6
 
 
 def test_helper_clear_queue_discards_pending_events() -> None:
@@ -243,6 +377,69 @@ async def test_private_response_deadline_includes_trigger() -> None:
         await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive, cap=0.01)
 
     assert not response_received
+
+
+@pytest.mark.asyncio
+async def test_private_response_captures_cursor_before_fast_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_helper = build_event_helper()
+    prior = SimpleNamespace(kind="prior")
+    response = SimpleNamespace(kind="response")
+    await test_helper._queue_event(prior)
+    phases = []
+
+    async def wait_for_slot(_, *, cap):
+        phases.append(("limiter", cap))
+
+    async def trigger():
+        phases.append(("trigger", None))
+        await test_helper._queue_event(response)
+
+    async def receive(_):
+        phases.append(("receive", None))
+        return await test_helper.wait_for_event(lambda event: event.kind in {"prior", "response"})
+
+    monkeypatch.setattr(helper_module, "wait_for_limiter_slot", wait_for_slot)
+    assert await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive, response_cursor=test_helper.event_cursor) is response
+    assert [phase for phase, _ in phases] == ["limiter", "trigger", "receive"]
+    assert await test_helper.wait_for_event(lambda event: event.kind == "prior") is prior
+
+
+@pytest.mark.asyncio
+async def test_concurrent_private_responses_keep_independent_cursors() -> None:
+    test_helper = build_event_helper()
+    before_a = SimpleNamespace(kind="before-a")
+    between_a_and_b = SimpleNamespace(kind="between-a-and-b")
+    a_response = SimpleNamespace(kind="a")
+    b_response = SimpleNamespace(kind="b")
+    a_trigger_started = asyncio.Event()
+    release_a_trigger = asyncio.Event()
+    await test_helper._queue_event(before_a)
+
+    async def a_trigger() -> None:
+        a_trigger_started.set()
+        await release_a_trigger.wait()
+        await test_helper._queue_event(a_response)
+
+    async def b_trigger() -> None:
+        await test_helper._queue_event(b_response)
+
+    async def receive_a(_: float):
+        return await test_helper.wait_for_event(lambda event: event.kind == "a")
+
+    async def receive_b(_: float):
+        return await test_helper.wait_for_event(lambda event: event.kind == "b")
+
+    a_wait = asyncio.create_task(helper_module.wait_for_private_response(lambda: 0.0, a_trigger, receive_a, response_cursor=test_helper.event_cursor))
+    await a_trigger_started.wait()
+    await test_helper._queue_event(between_a_and_b)
+    b_wait = asyncio.create_task(helper_module.wait_for_private_response(lambda: 0.0, b_trigger, receive_b, response_cursor=test_helper.event_cursor))
+    await asyncio.sleep(0)
+    release_a_trigger.set()
+
+    assert await a_wait is a_response
+    assert await b_wait is b_response
+    assert await test_helper.wait_for_event(lambda event: event.kind == "before-a") is before_a
+    assert await test_helper.wait_for_event(lambda event: event.kind == "between-a-and-b") is between_a_and_b
 
 
 @pytest.mark.asyncio

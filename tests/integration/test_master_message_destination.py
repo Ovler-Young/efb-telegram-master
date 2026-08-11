@@ -16,13 +16,7 @@ from unittest.mock import patch
 from pytest import mark, raises
 from telethon.tl.custom import Message, MessageButton
 
-from .helper.filters import edited, has_button, in_chats, regex, text
-
-retry_on_integration_timeout = mark.flaky(
-    max_runs=2,
-    min_passes=1,
-    rerun_filter=lambda err, *_: bool(err and err[0] and issubclass(err[0], TimeoutError)),
-)
+from .helper.filters import edited, has_button, in_chats, regex, reply_to, text
 
 pytestmark = mark.asyncio
 
@@ -120,7 +114,7 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
     content = "test_master_master_quick_reply this shall not be sent due to cleared cache"
     message = await private_response(
         lambda: client.send_message(bot_id, content),
-        lambda timeout: helper.wait_for_message(in_chats(bot_id), timeout),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & text & regex("Error: No recipient specified"), timeout),
     )  # Error message
     assert slave.messages.empty()
     await cancel_destination_suggestion(helper, private_response, message)
@@ -153,13 +147,12 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
         content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
         message = await private_response(
             lambda: client.send_message(bot_id, content),
-            lambda timeout: helper.wait_for_message(in_chats(bot_id) & text & regex("Error: No recipient specified"), timeout),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & text & regex("Error: No recipient specified"), timeout),
         )
         assert slave.messages.empty()
         await cancel_destination_suggestion(helper, private_response, message)
 
 
-@retry_on_integration_timeout
 async def test_master_master_destination_suggestion(helper, client, bot_id, slave, channel, private_response):
     with patch.dict(channel.flag.config, send_to_last_chat="disabled"), patch.multiple(channel.chat_dest_cache, enabled=False):
         assert not channel.chat_dest_cache.enabled
@@ -177,7 +170,7 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
 
         message: Message = await private_response(
             send_message,
-            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & regex(re.escape(content)), timeout),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & reply_to(sent_message.id if sent_message else None), timeout),
         )
         assert sent_message is not None
         buttons: List[List[MessageButton]] = message.buttons

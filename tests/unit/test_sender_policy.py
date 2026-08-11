@@ -109,7 +109,7 @@ def test_unknown_auxiliary_membership_does_not_block_selectable_auxiliary_sender
     assert decision.selection.sender_bot_id == "20"
 
 
-def test_affinity_wins_ties_then_main_wins_without_affinity() -> None:
+def test_affinity_wins_ties_then_confirmed_auxiliary_bootstraps_affinity() -> None:
     preferred = auxiliary(10)
     other = auxiliary(20)
     sender_policy, pool, _main_bot, _limiter = policy(preferred, other)
@@ -122,7 +122,7 @@ def test_affinity_wins_ties_then_main_wins_without_affinity() -> None:
     assert preferred_decision.selection is not None
     assert preferred_decision.selection.sender_bot_id == "10"
     assert unbound_decision.selection is not None
-    assert unbound_decision.selection.sender_bot_id is None
+    assert unbound_decision.selection.sender_bot_id == "10"
 
 
 def test_affinity_is_recorded_only_after_successful_auxiliary_execution() -> None:
@@ -145,17 +145,17 @@ def test_affinity_is_recorded_only_after_successful_auxiliary_execution() -> Non
     assert pool.preferred_sender("slave-a") is auxiliary_bot
 
 
-def test_confirmed_non_member_excludes_affinity_sender_without_affecting_other_affinity() -> None:
+def test_confirmed_non_member_excludes_affinity_sender_and_uses_another_confirmed_auxiliary() -> None:
     first = auxiliary(10, membership=False)
     second = auxiliary(20)
-    sender_policy, pool, main_bot, _limiter = policy(first, second)
+    sender_policy, pool, _main_bot, _limiter = policy(first, second)
     assert pool is not None
     pool.record_successful_auxiliary_send("slave-a", 10)
     pool.record_successful_auxiliary_send("slave-b", 20)
 
     decision = sender_policy.select(call(slave_id="slave-a"), now=1_000.0)
 
-    assert decision.selection == SenderSelection(main_bot, None)
+    assert decision.selection == SenderSelection(second.bot, "20")
     assert pool.preferred_sender("slave-b") is second
 
 
@@ -249,6 +249,14 @@ def test_retry_after_cooldown_leaves_another_sender_for_the_same_chat_selectable
 
 def test_main_bot_remains_selectable_when_no_auxiliary_is_available() -> None:
     sender_policy, _pool, main_bot, _limiter = policy(auxiliary(10, disabled=True))
+
+    decision = sender_policy.select(call(), now=1_000.0)
+
+    assert decision.selection == SenderSelection(main_bot, None)
+
+
+def test_main_bot_falls_back_when_all_confirmed_auxiliaries_are_unavailable() -> None:
+    sender_policy, _pool, main_bot, _limiter = policy(auxiliary(10, membership=False), auxiliary(20, membership=False))
 
     decision = sender_policy.select(call(), now=1_000.0)
 

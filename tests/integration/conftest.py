@@ -224,7 +224,7 @@ def _primary_bot_limiter_delay(channel: TelegramChannel, target_chat_id: int) ->
 
 
 @pytest.fixture
-def private_response(channel: TelegramChannel, bot_id: int):
+def private_response(channel: TelegramChannel, bot_id: int, helper_wrap: TelegramIntegrationTestHelper):
     """Use the response deadline that includes the primary-bot rate-limit wait."""
 
     async def wait(trigger, receive, *, source_channel: TelegramChannel = channel, target_chat_id: int = bot_id):
@@ -232,6 +232,7 @@ def private_response(channel: TelegramChannel, bot_id: int):
             lambda: _primary_bot_limiter_delay(source_channel, target_chat_id),
             trigger,
             receive,
+            response_cursor=helper_wrap.event_cursor,
         )
 
     return wait

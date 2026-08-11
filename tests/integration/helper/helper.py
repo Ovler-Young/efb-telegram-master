@@ -5,6 +5,8 @@ import os
 import threading
 import time
 from asyncio import QueueEmpty
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
 
 from telethon import TelegramClient
@@ -21,7 +23,16 @@ from .utils import parse_socks5_link
 CLIENT_START_TIMEOUT = 60
 CLIENT_STOP_TIMEOUT = 10
 PRIVATE_RESPONSE_WAIT_CAP = 65.0
+PENDING_EVENT_MAX_COUNT = 256
+PENDING_EVENT_MAX_AGE_SECONDS = PRIVATE_RESPONSE_WAIT_CAP + 10.0
 Response = TypeVar("Response")
+_private_response_cursor: ContextVar[Optional[int]] = ContextVar("private_response_cursor", default=None)
+
+
+@dataclass(frozen=True)
+class EventMetadata:
+    sequence: int
+    arrived_at: float
 
 
 async def wait_for_limiter_slot(peek_delay: Callable[[], float], *, cap: float = PRIVATE_RESPONSE_WAIT_CAP) -> None:
@@ -43,17 +54,23 @@ async def wait_for_private_response(
     receive: Callable[[float], Awaitable[Response]],
     *,
     cap: float = PRIVATE_RESPONSE_WAIT_CAP,
+    response_cursor: Optional[Callable[[], int]] = None,
 ) -> Response:
     """Use one deadline for the limiter wait, command, and its response."""
 
     async def wait() -> Response:
         deadline = time.monotonic() + cap
         await wait_for_limiter_slot(peek_delay, cap=deadline - time.monotonic())
-        await trigger()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            raise TimeoutError(f"Private response did not arrive within {cap:g} seconds")
-        return await receive(remaining)
+        cursor = response_cursor() if response_cursor else None
+        cursor_token = _private_response_cursor.set(cursor)
+        try:
+            await trigger()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError(f"Private response did not arrive within {cap:g} seconds")
+            return await receive(remaining)
+        finally:
+            _private_response_cursor.reset(cursor_token)
 
     return await asyncio.wait_for(wait(), timeout=cap)
 
@@ -88,10 +105,12 @@ class TelegramIntegrationTestHelper:
         self.client: TelegramClient = TelegramClient(StringSession(session), api_id, api_hash, proxy=proxy, loop=loop, sequential_updates=True)
 
         # Queue for incoming messages
-        self.queue: "asyncio.queues.Queue[EventCommon]" = asyncio.queues.Queue()
+        self.queue: "asyncio.queues.Queue[EventCommon]" = asyncio.queues.Queue(maxsize=PENDING_EVENT_MAX_COUNT)
         # Events may arrive in a different order than the assertions that
         # consume them. Keep unmatched events for a later, compatible wait.
         self.pending_events: List[EventCommon] = []
+        self._event_sequence = 0
+        self._event_metadata: Dict[int, EventMetadata] = {}
 
         # Collect mappings from message ID to its chat (as Telegram API is not sending them)
         self.message_chat_map: Dict[int, TypeInputPeer] = dict()
@@ -111,15 +130,73 @@ class TelegramIntegrationTestHelper:
 
     async def update_handler(self, event):
         self.logger.debug("Got event, %s, %s", time.time(), event.to_dict())
-        await self.queue.put(event)
+        await self._queue_event(event)
+
+    async def _queue_event(self, event: EventCommon) -> None:
+        self._prune_pending_events()
+        while self.queue.full() or self.queue.qsize() >= PENDING_EVENT_MAX_COUNT:
+            try:
+                dropped = self.queue.get_nowait()
+            except QueueEmpty:
+                break
+            self.queue.task_done()
+            self._release_event(dropped)
+        self._event_sequence += 1
+        self._event_metadata[id(event)] = EventMetadata(self._event_sequence, time.monotonic())
+        self.queue.put_nowait(event)
+
+    def event_cursor(self) -> int:
+        """Return the newest observed event sequence immediately before a request trigger."""
+        self._prune_pending_events()
+        return self._event_sequence
+
+    def _event_metadata_for(self, event: EventCommon) -> EventMetadata:
+        metadata = self._event_metadata.get(id(event))
+        if metadata is None:
+            self._event_sequence += 1
+            metadata = EventMetadata(self._event_sequence, time.monotonic())
+            self._event_metadata[id(event)] = metadata
+        return metadata
+
+    def _matches_cursor(self, event: EventCommon, after_cursor: Optional[int]) -> bool:
+        return after_cursor is None or self._event_metadata_for(event).sequence > after_cursor
+
+    def _release_event(self, event: EventCommon) -> None:
+        self._event_metadata.pop(id(event), None)
+
+    def _event_is_expired(self, event: EventCommon) -> bool:
+        return self._event_metadata_for(event).arrived_at < time.monotonic() - PENDING_EVENT_MAX_AGE_SECONDS
+
+    def _prune_pending_events(self) -> None:
+        cutoff = time.monotonic() - PENDING_EVENT_MAX_AGE_SECONDS
+        retained: List[EventCommon] = []
+        dropped = 0
+        for event in self.pending_events:
+            if self._event_metadata_for(event).arrived_at < cutoff:
+                self._release_event(event)
+                dropped += 1
+            else:
+                retained.append(event)
+        overflow = max(0, len(retained) - PENDING_EVENT_MAX_COUNT)
+        for event in retained[:overflow]:
+            self._release_event(event)
+        self.pending_events[:] = retained[overflow:]
+        if dropped or overflow:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.debug("Discarded %d expired and %d overflow integration events.", dropped, overflow)
 
     def clear_queue(self):
+        for event in self.pending_events:
+            self._release_event(event)
         self.pending_events.clear()
         while not self.queue.empty():
             try:
-                self.queue.get_nowait()
+                event = self.queue.get_nowait()
             except QueueEmpty:
-                return
+                break
+            self.queue.task_done()
+            self._release_event(event)
 
     def watch_chat(self, chat_id: int) -> None:
         """Receive bot messages from a chat created during an integration test."""
@@ -152,7 +229,7 @@ class TelegramIntegrationTestHelper:
         message: Message = event.message
         self.message_chat_map[message.id] = await message.get_input_chat()
         self.logger.debug("Got new message event, %s, %s", time.time(), event.to_dict())
-        await self.queue.put(event)
+        await self._queue_event(event)
 
     async def deleted_message_handler(self, event: MessageDeleted.Event):
         # Try to recover chat of the message from the mapping
@@ -162,9 +239,9 @@ class TelegramIntegrationTestHelper:
             event._chat_peer = input_peer
             del self.message_chat_map[message_id]
         self.logger.debug("Got deleted message event, %s, %s", time.time(), event.to_dict())
-        await self.queue.put(event)
+        await self._queue_event(event)
 
-    async def wait_for_event(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0) -> EventCommon:
+    async def wait_for_event(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> EventCommon:
         """
         Args:
             event_filter: Filter updates to collect
@@ -177,30 +254,36 @@ class TelegramIntegrationTestHelper:
         Raises:
             :exc:`asyncio.TimeoutError`: when the request timed out
         """
-        for index, value in enumerate(self.pending_events):
-            if event_filter is None or event_filter(value):
-                return self.pending_events.pop(index)
-
+        self._prune_pending_events()
+        effective_cursor = _private_response_cursor.get() if after_cursor is None else after_cursor
         deadline = time.monotonic() + timeout
         while deadline > time.monotonic():
+            for index, value in enumerate(self.pending_events):
+                if self._matches_cursor(value, effective_cursor) and (event_filter is None or event_filter(value)):
+                    matched = self.pending_events.pop(index)
+                    self._release_event(matched)
+                    return matched
             time_left = deadline - time.monotonic()
-            # print("START TO WAIT FOR EVENTS")
             value = await asyncio.wait_for(self.queue.get(), time_left)
             self.queue.task_done()
-            # print("EVENT", time.time(), value)
-            if event_filter is None or event_filter(value):
+            if self._event_is_expired(value):
+                self._release_event(value)
+                continue
+            if self._matches_cursor(value, effective_cursor) and (event_filter is None or event_filter(value)):
+                self._release_event(value)
                 return value
             self.pending_events.append(value)
+            self._prune_pending_events()
 
-    async def wait_for_message(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0) -> Message:
+    async def wait_for_message(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> Message:
         """Short cut for “Wait for a message and return its entity”."""
-        event = await self.wait_for_event(filters.message & event_filter, timeout=timeout)
+        event = await self.wait_for_event(filters.message & event_filter, timeout=timeout, after_cursor=after_cursor)
         # noinspection PyUnresolvedReferences
         return event.message  # type: ignore
 
-    async def wait_for_message_text(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0) -> str:
+    async def wait_for_message_text(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> str:
         """Short cut for “Wait for a text message and return its text”."""
-        event = await self.wait_for_event(filters.text & event_filter, timeout=timeout)
+        event = await self.wait_for_event(filters.text & event_filter, timeout=timeout, after_cursor=after_cursor)
         # noinspection PyUnresolvedReferences
         return event.message.text  # type: ignore
 
