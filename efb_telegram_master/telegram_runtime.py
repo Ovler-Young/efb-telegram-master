@@ -11,7 +11,8 @@ from typing import Coroutine, Literal, Optional, ParamSpec, TypedDict, TypeVar, 
 
 import telegram
 import telegram.error
-from telegram.ext import Application
+from telegram import Update
+from telegram.ext import Application, CallbackContext
 from telegram.request import HTTPXRequest
 from typing_extensions import NotRequired
 
@@ -21,6 +22,7 @@ from .utils import normalize_request_kwargs
 P = ParamSpec("P")
 T = TypeVar("T")
 LifecycleCallback = Callable[["TelegramPollingRuntime"], Awaitable[None]]
+LocaleUpdateCallback = Callable[[Update, CallbackContext], None]
 
 
 class _BotArguments(TypedDict):
@@ -87,13 +89,12 @@ class TelegramPollingRuntime:
 
         return wrapper
 
-    def add_base_dispatchers(self, admins: object, update_locale: Callable[..., object]) -> None:
-        from telegram import Update
+    def add_base_dispatchers(self, admins: Collection[int], update_locale: LocaleUpdateCallback) -> None:
         from telegram.ext import MessageHandler, TypeHandler
 
         from .ptb_compat import Filters
 
-        self.application.add_handler(MessageHandler(~Filters.user(user_id=cast(int | Collection[int] | None, admins)), self.as_async_callback(lambda update, context: None)))
+        self.application.add_handler(MessageHandler(~Filters.user(user_id=admins), self.as_async_callback(lambda update, context: None)))
         self.application.add_handler(TypeHandler(Update, self.as_async_callback(update_locale)), group=-1)
 
     @staticmethod

@@ -8,20 +8,66 @@ from ehforwarderbot.types import MessageID
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
+from efb_telegram_master.channel_commands import LocaleState, TelegramCommandService
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
 
 
+class FakeMessageIdentifier:
+    message_id = 1
+
+
+class FakeAPI:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str]] = []
+
+    def send_message(self, chat_id: int, text: str, **_kwargs: object) -> FakeMessageIdentifier:
+        self.calls.append((chat_id, text))
+        return FakeMessageIdentifier()
+
+
+class FakeAssociations:
+    def __init__(self, topics: list[tuple[str, int]]) -> None:
+        self.topics = topics
+        self.lookups: list[int] = []
+
+    def get_topic_slaves(self, group_id: int) -> list[tuple[str, int]]:
+        self.lookups.append(group_id)
+        return self.topics
+
+
+class FakeScanScheduler:
+    def __init__(self) -> None:
+        self.scheduled: list[int] = []
+
+    def schedule(self, group_id: int) -> str:
+        self.scheduled.append(group_id)
+        return "started"
+
+
+class FakeLinkCompletion:
+    def complete(self, _update: Update, _args: list[str]) -> None:
+        return None
+
+
 @pytest.fixture
-def sync_msglog_channel():
-    channel = object.__new__(TelegramChannel)
-    channel.config = {"admins": [10]}
-    channel.chat_associations = SimpleNamespace(get_topic_slaves=Mock(return_value=[("tests.slave", 7)]))
-    channel.msglog_scan = SimpleNamespace(schedule=Mock(return_value="started"))
-    channel.bot_manager = SimpleNamespace(api=SimpleNamespace(send_message=Mock()))
-    channel.translator = SimpleNamespace(gettext=lambda text: text)
-    return channel
+def sync_msglog_service() -> TelegramCommandService:
+    return TelegramCommandService(
+        "tests.master",
+        None,
+        "test",
+        FakeAPI(),
+        FakeAssociations([("tests.slave", 7)]),
+        Mock(),
+        Mock(),
+        FakeScanScheduler(),
+        FakeLinkCompletion(),
+        [10],
+        None,
+        Mock(),
+        LocaleState(),
+    )
 
 
 def sync_msglog_update(*, user_id=10, is_forum=True):
@@ -32,14 +78,14 @@ def sync_msglog_update(*, user_id=10, is_forum=True):
     return Update(update_id=1, message=message)
 
 
-def test_sync_msglog_schedules_for_admin_in_bound_forum_group(sync_msglog_channel):
-    channel = sync_msglog_channel
+def test_sync_msglog_schedules_for_admin_in_bound_forum_group(sync_msglog_service):
+    service = sync_msglog_service
 
-    TelegramChannel.sync_msglog(channel, sync_msglog_update(), SimpleNamespace())
+    service.sync_msglog(sync_msglog_update(), Mock())
 
-    channel.chat_associations.get_topic_slaves.assert_called_once_with(100)
-    channel.msglog_scan.schedule.assert_called_once_with(100)
-    channel.bot_manager.api.send_message.assert_called_once_with(100, text="MsgLog sync started for this group.")
+    assert service.chat_associations.lookups == [100]
+    assert service.msglog_scan.scheduled == [100]
+    assert service.api.calls == [(100, "MsgLog sync started for this group.")]
 
 
 @pytest.mark.parametrize(
@@ -51,28 +97,28 @@ def test_sync_msglog_schedules_for_admin_in_bound_forum_group(sync_msglog_channe
     ],
     ids=["non-admin", "non-forum", "no-bound-topics"],
 )
-def test_sync_msglog_rejects_unqualified_requests(sync_msglog_channel, user_id, is_forum, bound_topics, expected_reply, topic_lookup_expected):
-    channel = sync_msglog_channel
-    channel.chat_associations.get_topic_slaves.return_value = bound_topics
+def test_sync_msglog_rejects_unqualified_requests(sync_msglog_service, user_id, is_forum, bound_topics, expected_reply, topic_lookup_expected):
+    service = sync_msglog_service
+    service.chat_associations.topics = bound_topics
 
-    TelegramChannel.sync_msglog(channel, sync_msglog_update(user_id=user_id, is_forum=is_forum), SimpleNamespace())
+    service.sync_msglog(sync_msglog_update(user_id=user_id, is_forum=is_forum), Mock())
 
     if topic_lookup_expected:
-        channel.chat_associations.get_topic_slaves.assert_called_once_with(100)
+        assert service.chat_associations.lookups == [100]
     else:
-        channel.chat_associations.get_topic_slaves.assert_not_called()
-    channel.msglog_scan.schedule.assert_not_called()
-    channel.bot_manager.api.send_message.assert_called_once_with(100, text=expected_reply)
+        assert service.chat_associations.lookups == []
+    assert service.msglog_scan.scheduled == []
+    assert service.api.calls == [(100, expected_reply)]
 
 
-def test_sync_msglog_ignores_updates_without_an_effective_message(sync_msglog_channel):
-    channel = sync_msglog_channel
+def test_sync_msglog_ignores_updates_without_an_effective_message(sync_msglog_service):
+    service = sync_msglog_service
 
-    TelegramChannel.sync_msglog(channel, Update(update_id=1), SimpleNamespace())
+    service.sync_msglog(Update(update_id=1), Mock())
 
-    channel.chat_associations.get_topic_slaves.assert_not_called()
-    channel.msglog_scan.schedule.assert_not_called()
-    channel.bot_manager.api.send_message.assert_not_called()
+    assert service.chat_associations.lookups == []
+    assert service.msglog_scan.scheduled == []
+    assert service.api.calls == []
 
 
 def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():

@@ -1,5 +1,6 @@
 from contextlib import ExitStack
 from datetime import datetime, timedelta
+from gettext import NullTranslations
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -11,6 +12,7 @@ from telegram import Update
 
 from efb_telegram_master import TelegramChannel, utils
 from efb_telegram_master.callback_sessions import ChatListStorage
+from efb_telegram_master.channel_commands import TelegramCommandService
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.history_replay import HistoryReplayWorker
@@ -193,11 +195,11 @@ def test_history_replay_resume_starts_a_worker_for_queued_entries():
     thread.return_value.start.assert_called_once()
 
 
-def test_channel_initialization_resumes_durable_history_replay():
+def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
     application = Mock()
     runtime = SimpleNamespace(application=application, as_async_callback=lambda callback: callback)
-    api = SimpleNamespace(session_expired=lambda *_args, **_kwargs: None)
-    bot_manager = SimpleNamespace(api=api, telegram_runtime=runtime)
+    api = SimpleNamespace(session_expired=lambda *_args, **_kwargs: None, send_message=Mock())
+    bot_manager = SimpleNamespace(api=api, telegram_runtime=runtime, msglog_scan=Mock(), error=Mock())
     database_manager = SimpleNamespace(
         chat_associations=Mock(),
         slave_chat_info=Mock(),
@@ -210,28 +212,69 @@ def test_channel_initialization_resumes_durable_history_replay():
     flag = Mock(side_effect=lambda name: flag_values.get(name, False))
     history_replay = Mock()
 
-    def load_config(channel):
-        channel.config = {"token": "token", "admins": [1]}
-        channel.mtproto_config = MTProtoConfig(enabled=False)
+    def load_config(_channel_id, _translate):
+        return {"token": "token", "admins": [1]}, MTProtoConfig(enabled=False)
 
     dependencies = [
-        "MTProtoClient", "ChatObjectCacheManager", "ChatDestinationCache", "MsgLogScanScheduler", "TopicGroupService", "CommandsManager",
-        "MasterMessageDelivery", "CallbackSessionStore", "RecipientSuggestionService", "LinkService", "LinkCompletionService", "ChatHeadService",
-        "SlaveMessageRouter", "TextDelivery", "SlaveFileTransfer", "OversizedNoticeSender", "ImageDelivery", "SlaveMediaDelivery",
-        "SlaveFileDelivery", "SlaveMessageService", "SlaveStatusService", "MasterMessageInbound", "MasterMessageMutations", "MasterMessageWorker", "RPCUtilities",
+        "MTProtoClient",
+        "ChatObjectCacheManager",
+        "ChatDestinationCache",
+        "TopicGroupService",
+        "CommandsManager",
+        "MasterMessageDelivery",
+        "CallbackSessionStore",
+        "RecipientSuggestionService",
+        "LinkService",
+        "LinkCompletionService",
+        "ChatHeadService",
+        "SlaveMessageRouter",
+        "TextDelivery",
+        "SlaveFileTransfer",
+        "OversizedNoticeSender",
+        "ImageDelivery",
+        "SlaveMediaDelivery",
+        "SlaveFileDelivery",
+        "SlaveMessageService",
+        "SlaveStatusService",
+        "MasterMessageInbound",
+        "MasterMessageMutations",
+        "MasterMessageWorker",
+        "RPCUtilities",
     ]
     with ExitStack() as stack:
         stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
-        stack.enter_context(patch.object(TelegramChannel, "load_config", new=load_config))
+        stack.enter_context(patch("efb_telegram_master.load_channel_config", new=load_config))
         stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
         stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
         stack.enter_context(patch("efb_telegram_master.TelegramBotManager", return_value=bot_manager))
         stack.enter_context(patch("efb_telegram_master.HistoryReplayWorker", return_value=history_replay))
         for dependency in dependencies:
             stack.enter_context(patch(f"efb_telegram_master.{dependency}"))
-        TelegramChannel()
+        channel = TelegramChannel()
 
     history_replay.resume.assert_called_once_with()
+    channel.chat_associations.get_topic_slaves.return_value = [("tests.slave", 7)]
+    channel.msglog_scan.schedule.return_value = "started"
+    message = Mock(chat=Mock(id=100, is_forum=True), from_user=Mock(id=1), message_thread_id=None)
+    channel.command_service.sync_msglog(Update(update_id=1, message=message), Mock())
+
+    assert channel.command_service.admins == [1]
+    channel.chat_associations.get_topic_slaves.assert_called_once_with(100)
+    channel.msglog_scan.schedule.assert_called_once_with(100)
+    api.send_message.assert_called_once_with(100, text="MsgLog sync started for this group.")
+
+    class PrefixTranslations(NullTranslations):
+        def gettext(self, message: str) -> str:
+            return f"translated:{message}"
+
+    locale_update = Update(update_id=2, message=Mock(chat=Mock(id=100), from_user=Mock(id=1, language_code="fr")))
+    with patch("efb_telegram_master.channel_commands.translation", return_value=PrefixTranslations()):
+        channel.locale_state.update(locale_update, channel.logger)
+
+    assert channel.locale == "fr"
+    assert channel._("locale") == "translated:locale"
+    assert channel.command_service._("locale") == "translated:locale"
+    assert channel.locale_state.gettext("locale") == "translated:locale"
 
 
 def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(channel, slave, bot_group):
@@ -260,7 +303,7 @@ def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(
 
 
 def test_resolve_command_args_falls_back_to_raw_message_text():
-    args = TelegramChannel._resolve_command_args("/start token true", ["token"])
+    args = TelegramCommandService.resolve_command_args("/start token true", ["token"])
 
     assert args == ["token", "true"]
 
@@ -282,7 +325,7 @@ def test_start_uses_raw_message_args_for_link_chat(channel):
     context = SimpleNamespace(args=["token"])
 
     with patch.object(channel.link_completion, "complete") as link_chat:
-        channel.start(update, context)
+        channel.command_service.start(update, context)
 
     link_chat.assert_called_once_with(update, ["token", "true"])
 

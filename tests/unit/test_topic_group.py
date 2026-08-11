@@ -58,7 +58,7 @@ def test_get_slave_msg_dest_uses_topic_group(channel, slave):
         patch.object(channel.topic_sync, "create_topic", return_value=TelegramTopicID(40004)) as create_topic,
         patch.object(channel, "topic_group", topic_group),
     ):
-        plan = channel.message_router.route(msg)
+        plan = channel.message_service.router.route(msg)
         tg_dest, thread_id = plan.destination, plan.thread_id
 
     assert tg_dest == topic_group
@@ -112,7 +112,7 @@ def test_master_message_routes_forum_thread_to_slave(channel, slave):
     update = Update(update_id=1, message=message)
 
     with patch.object(channel.master_message_delivery, "deliver") as deliver:
-        channel.master_message_inbound.msg(update, None)
+        channel.master_message_worker.inbound.msg(update, None)
 
     deliver.assert_called_once()
     args = deliver.call_args.args
@@ -137,7 +137,7 @@ def test_master_message_ignores_forum_topic_auto_reply_without_mutating_message(
     update = Update(update_id=3, message=message)
 
     with patch.object(channel.master_message_delivery, "deliver") as deliver:
-        channel.master_message_inbound.msg(update, None)
+        channel.master_message_worker.inbound.msg(update, None)
 
     deliver.assert_called_once()
     kwargs = deliver.call_args.kwargs
@@ -175,7 +175,7 @@ def test_master_message_ignores_unknown_forum_thread(channel, slave):
     update = Update(update_id=2, message=message)
 
     with patch.object(channel.master_message_delivery, "deliver") as deliver:
-        channel.master_message_inbound.msg(update, None)
+        channel.master_message_worker.inbound.msg(update, None)
 
     deliver.assert_not_called()
     channel.chat_associations.remove_topic_assoc(slave_uid=other_slave_uid)

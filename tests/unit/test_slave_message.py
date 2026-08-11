@@ -44,17 +44,32 @@ def _processor() -> SlaveMessageService:
     text_delivery = TextDelivery(1)
     processor.text_delivery = text_delivery
     processor.image_delivery = ImageDelivery(
-        processor.bot, processor.flag, processor.logger, lambda text: text, text_delivery,
-        processor.file_transfer, processor.oversized_notice_sender,
+        processor.bot,
+        processor.flag,
+        processor.logger,
+        lambda text: text,
+        text_delivery,
+        processor.file_transfer,
+        processor.oversized_notice_sender,
         processor.temp_directory,
     )
     processor.media_delivery = SlaveMediaDelivery(
-        processor.bot, processor.logger, text_delivery, processor.file_transfer,
-        processor.oversized_notice_sender, processor.temp_directory,
+        processor.bot,
+        processor.logger,
+        text_delivery,
+        processor.file_transfer,
+        processor.oversized_notice_sender,
+        processor.temp_directory,
     )
     processor.file_delivery = SlaveFileDelivery(
-        processor.bot, processor.flag, processor.logger, lambda text: text, text_delivery,
-        processor.file_transfer, processor.oversized_notice_sender, processor.temp_directory,
+        processor.bot,
+        processor.flag,
+        processor.logger,
+        lambda text: text,
+        text_delivery,
+        processor.file_transfer,
+        processor.oversized_notice_sender,
+        processor.temp_directory,
     )
     return processor
 
@@ -99,7 +114,7 @@ def test_mock_slave_message_snapshot_survives_producer_file_close() -> None:
 
 @pytest.fixture(scope="module")
 def generate_message_template(channel):
-    return channel.message_router.generate_message_template
+    return channel.message_service.router.generate_message_template
 
 
 @pytest.fixture(scope="module")

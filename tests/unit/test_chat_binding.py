@@ -198,8 +198,8 @@ def test_chat_head_selection_records_a_reply_target_and_cleans_its_session():
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     chat = SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat", self=Mock(), add_self=Mock())
-    record_chat_head = Mock()
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), "blueset.telegram", Mock(), record_chat_head, lambda text: text)
+    msglogs = Mock()
+    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text)
     handler = SimpleNamespace(_conversations={})
     service.set_handler(handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(221))
@@ -207,7 +207,7 @@ def test_chat_head_selection_records_a_reply_target_and_cleans_its_session():
 
     assert service.make_chat_head(_callback_update(*storage_id, "chat 0"), Mock()) == ConversationHandler.END
 
-    record_chat_head.assert_called_once()
+    msglogs.add_or_update_message_log.assert_called_once()
     assert callback_sessions.lookup(storage_id) is None
     assert storage_id not in handler._conversations
 
@@ -252,8 +252,8 @@ def test_recipient_selection_expires_when_the_session_is_missing():
 def test_chat_head_rejects_malformed_or_out_of_range_callbacks(callback):
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
-    record_chat_head = Mock()
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), "blueset.telegram", Mock(), record_chat_head, lambda text: text)
+    msglogs = Mock()
+    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text)
     handler = SimpleNamespace(_conversations={})
     service.set_handler(handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(224))
@@ -263,7 +263,7 @@ def test_chat_head_rejects_malformed_or_out_of_range_callbacks(callback):
         assert service.make_chat_head(_callback_update(*storage_id, callback), Mock()) == ConversationHandler.END
 
     render_chat_head.assert_not_called()
-    record_chat_head.assert_not_called()
+    msglogs.add_or_update_message_log.assert_not_called()
     assert callback_sessions.lookup(storage_id) is None
     assert storage_id not in handler._conversations
 
@@ -271,8 +271,8 @@ def test_chat_head_rejects_malformed_or_out_of_range_callbacks(callback):
 def test_chat_head_expires_when_the_session_is_missing():
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
-    record_chat_head = Mock()
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), "blueset.telegram", Mock(), record_chat_head, lambda text: text)
+    msglogs = Mock()
+    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text)
     handler = SimpleNamespace(_conversations={})
     service.set_handler(handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(225))
@@ -280,7 +280,7 @@ def test_chat_head_expires_when_the_session_is_missing():
 
     assert service.make_chat_head(_callback_update(*storage_id, "chat 0"), Mock()) == ConversationHandler.END
 
-    record_chat_head.assert_not_called()
+    msglogs.add_or_update_message_log.assert_not_called()
     assert storage_id not in handler._conversations
 
 

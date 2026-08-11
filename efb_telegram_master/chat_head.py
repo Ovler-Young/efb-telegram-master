@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Callable, List, Optional
 
 from ehforwarderbot import Channel, coordinator
-from ehforwarderbot.types import ChatID, ModuleID
+from ehforwarderbot.constants import MsgType
+from ehforwarderbot.types import ChatID, MessageID
 from telegram import InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ChatType
 from telegram.ext import CallbackContext, ConversationHandler
@@ -14,20 +15,34 @@ from . import utils
 from .callback_sessions import CallbackSessionStore
 from .chat import ETMChatMixin
 from .constants import Flags
+from .message import ETMMsg
+from .msg_type import TGMsgType
+from .msglog_repository import MsgLogRepository
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 
 
 class ChatHeadService:
     """Create chat-head messages that set the reply destination for a chat."""
 
-    def __init__(self, bot, callback_sessions: CallbackSessionStore, chat_associations, chat_manager, channel_id: ModuleID, render_chat_list: Callable, record_chat_head: Callable[[ETMChatMixin, Message, str], None], translate: Callable[[str], str]) -> None:
+    def __init__(
+        self,
+        bot,
+        callback_sessions: CallbackSessionStore,
+        chat_associations,
+        chat_manager,
+        source_channel: Channel,
+        msglogs: MsgLogRepository,
+        render_chat_list: Callable,
+        translate: Callable[[str], str],
+    ) -> None:
         self.bot = bot
         self.callback_sessions = callback_sessions
         self.chat_associations = chat_associations
         self.chat_manager = chat_manager
-        self.channel_id = channel_id
+        self.source_channel = source_channel
+        self.channel_id = source_channel.channel_id
+        self.msglogs = msglogs
         self.render_chat_list = render_chat_list
-        self.record_chat_head = record_chat_head
         self._ = translate
         self.chat_head_handler: Optional[ConversationHandler] = None
 
@@ -64,9 +79,13 @@ class ChatHeadService:
                 try:
                     channel = coordinator.get_module_by_id(slave_channel_id)
                     name = channel.channel_name if isinstance(channel, Channel) else channel.middleware_name
-                    text = self._("This group is linked to an unknown chat ({chat_id}) on channel {channel_name} ({channel_id}). Possibly you can no longer reach this chat. Send /unlink_all to unlink all chats from this group.").format(channel_name=name, channel_id=slave_channel_id, chat_id=slave_chat_id)
+                    text = self._(
+                        "This group is linked to an unknown chat ({chat_id}) on channel {channel_name} ({channel_id}). Possibly you can no longer reach this chat. Send /unlink_all to unlink all chats from this group."
+                    ).format(channel_name=name, channel_id=slave_channel_id, chat_id=slave_chat_id)
                 except NameError:
-                    text = self._("This group is linked to a chat from a channel that is not activated ({channel_id}, {chat_id}). You cannot reach this chat unless the channel is enabled. Send /unlink_all to unlink all chats from this group.").format(channel_id=slave_channel_id, chat_id=slave_chat_id)
+                    text = self._(
+                        "This group is linked to a chat from a channel that is not activated ({channel_id}, {chat_id}). You cannot reach this chat unless the channel is enabled. Send /unlink_all to unlink all chats from this group."
+                    ).format(channel_id=slave_channel_id, chat_id=slave_chat_id)
             self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id)
             return ConversationHandler.END
         text = self._("This Telegram group is linked to the following chats, choose one to start a conversation with.") if chats else "Choose a chat you want to start a conversation with."
@@ -105,7 +124,18 @@ class ChatHeadService:
         chat: ETMChatMixin = storage.chats[callback_index]
         self.callback_sessions.clear(self._handler(), storage_id)
         text = self._("Reply to this message to chat with {0}.").format(chat.full_name)
-        self.record_chat_head(chat, update.effective_message, text)
+        self._record_chat_head(chat, update.effective_message, text)
         self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id)
         self.bot.answer_callback_query(update.callback_query.id)
         return ConversationHandler.END
+
+    def _record_chat_head(self, chat: ETMChatMixin, message: Message, text: str) -> None:
+        chat_head = ETMMsg()
+        chat_head.chat = chat
+        chat_head.author = chat.self or chat.add_self()
+        chat_head.uid = MessageID("__chathead__")
+        chat_head.type = MsgType.Text
+        chat_head.text = text
+        chat_head.type_telegram = TGMsgType.Text
+        chat_head.deliver_to = self.source_channel
+        self.msglogs.add_or_update_message_log(chat_head, message)

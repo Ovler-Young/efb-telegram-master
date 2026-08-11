@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from efb_telegram_master import TelegramChannel
+from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.mtproto import (
     MTProtoClient,
     MTProtoConfig,
@@ -54,6 +54,27 @@ class LifecycleMTProto:
         self.connected = False
 
 
+class LifecycleScanScheduler:
+    def __init__(self) -> None:
+        self.resume_calls = 0
+
+    def resume(self) -> None:
+        self.resume_calls += 1
+
+
+class LifecycleAPI:
+    def __init__(self, auxiliary: Mock) -> None:
+        self.bot_pool = SimpleNamespace(bots=[auxiliary])
+
+    def send_message(self, _chat_id: int, _text: str, **_kwargs: object) -> None:
+        return None
+
+
+class LifecycleRuntime:
+    def __init__(self) -> None:
+        self.async_runtime = Mock()
+
+
 def enabled_config() -> MTProtoConfig:
     return MTProtoConfig.from_mapping({"enabled": True, "api_id": 123, "api_hash": "hash"})
 
@@ -100,20 +121,20 @@ def test_telethon_factory_disables_entity_storage_and_updates(monkeypatch: pytes
 async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
     mtproto = LifecycleMTProto()
     auxiliary = Mock()
-    channel = SimpleNamespace(
-        bot_manager=SimpleNamespace(api=SimpleNamespace(bot_pool=SimpleNamespace(bots=[auxiliary]))),
-        mtproto=mtproto,
-            msglog_scan=SimpleNamespace(resume=Mock()),
-        logger=Mock(),
-    )
-    runtime = SimpleNamespace(async_runtime=Mock())
+    scan_scheduler = LifecycleScanScheduler()
+    service = object.__new__(TelegramBotManager)
+    service.mtproto = mtproto
+    service.msglog_scan = scan_scheduler
+    service.api = LifecycleAPI(auxiliary)
+    service.logger = Mock()
+    runtime = LifecycleRuntime()
 
-    await TelegramChannel._telegram_runtime_started(channel, runtime)
-    await TelegramChannel._telegram_runtime_stopped(channel, runtime)
+    await service.runtime_started(runtime)
+    await service.runtime_stopped(runtime)
 
     assert (mtproto.connect_calls, mtproto.disconnect_calls) == (1, 1)
     auxiliary.bind_runtime.assert_called_once_with(runtime.async_runtime)
-    channel.msglog_scan.resume.assert_called_once_with()
+    assert scan_scheduler.resume_calls == 1
 
 
 @pytest.mark.asyncio
