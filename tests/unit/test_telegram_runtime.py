@@ -313,7 +313,7 @@ def test_channel_shutdown_timeout_does_not_close_the_polling_runtime() -> None:
     channel.bot_manager = Mock()
     channel.bot_manager.stop_channel_resources.side_effect = OutboundShutdownTimeout("blocked send")
     channel.telegram_runtime = Mock()
-    channel.master_messages = Mock()
+    channel.master_message_worker = Mock()
     channel.db = Mock()
 
     with pytest.raises(OutboundShutdownTimeout, match="blocked send"):
@@ -321,7 +321,7 @@ def test_channel_shutdown_timeout_does_not_close_the_polling_runtime() -> None:
 
     assert not channel._stop_polling_called
     channel.telegram_runtime.stop.assert_not_called()
-    channel.master_messages.stop_worker.assert_not_called()
+    channel.master_message_worker.stop_worker.assert_not_called()
     channel.db.stop_worker.assert_not_called()
 
 

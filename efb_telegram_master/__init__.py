@@ -21,7 +21,7 @@ from ehforwarderbot.chat import Chat
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBException, EFBMessageReactionNotPossible, EFBOperationNotSupported
 from ehforwarderbot.message import Message as EFBMessage
-from ehforwarderbot.status import ReactToMessage, Status
+from ehforwarderbot.status import MessageRemoval, ReactToMessage, Status
 from ehforwarderbot.types import ChatID, InstanceID, MessageID, ModuleID, ReactionName
 from language_tags import tags
 from PIL import Image, WebPImagePlugin
@@ -38,22 +38,24 @@ from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import CommandsManager
 from .db import DatabaseManager
-from .master_message import MasterMessageProcessor
+from .master_inbound import MasterMessageInbound
+from .master_message import MasterMessageWorker
+from .master_mutations import MasterMessageMutations
 from .message import ETMMsg
 from .mtproto import MTProtoClient, MTProtoConfig, MTProtoRetryableError
 from .outbound_types import OutboundShutdownTimeout
+from .oversized_notice import OversizedNoticeSender
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .rpc_utils import RPCUtilities
-from .slave_message import SlaveMessageService
-from .slave_routing import SlaveMessageRouter
-from .slave_text_delivery import TextDelivery
-from .slave_image_delivery import ImageDelivery
-from .slave_media_delivery import SlaveMediaDelivery
 from .slave_file_delivery import SlaveFileDelivery
 from .slave_file_transfer import SlaveFileTransfer
-from .oversized_notice import OversizedNoticeSender
+from .slave_image_delivery import ImageDelivery
+from .slave_media_delivery import SlaveMediaDelivery
+from .slave_message import SlaveMessageService
+from .slave_routing import SlaveMessageRouter
 from .slave_status import SlaveStatusService
+from .slave_text_delivery import TextDelivery
 from .telegram_runtime import TelegramPollingRuntime
 from .utils import EFBChannelChatIDStr, ExperimentalFlagsManager, TelegramChatID, TelegramMessageID
 
@@ -192,7 +194,19 @@ class TelegramChannel(MasterChannel):
 
         # Register master message handlers after commands to prevent commands
         # commands to be delivered as messages
-        self.master_messages: MasterMessageProcessor = MasterMessageProcessor(self)
+        self.master_message_inbound = MasterMessageInbound(
+            self.bot_manager.api, self.msglogs, self.chat_associations,
+            self.chat_dest_cache, self.chat_manager, self.chat_binding,
+            self.channel_id, self._, self.flag, self._send_master_message_removal, self.logger,
+        )
+        self.master_message_mutations = MasterMessageMutations(
+            self.bot_manager.api, self.msglogs, self.chat_manager,
+            self._, self.flag, self._send_master_message_removal, self.logger,
+        )
+        self.master_message_worker = MasterMessageWorker(
+            self.telegram_runtime, self.bot_manager.api, self.master_message_inbound,
+            self.master_message_mutations, self._, self.logger,
+        )
 
         self.telegram_runtime.application.add_error_handler(self.telegram_runtime.as_async_callback(self.error))
 
@@ -205,6 +219,9 @@ class TelegramChannel(MasterChannel):
     @property
     def ngettext(self) -> Callable[[str, str, int], str]:
         return self.translator.ngettext
+
+    def _send_master_message_removal(self, destination, message: ETMMsg) -> None:
+        coordinator.send_status(MessageRemoval(source_channel=self, destination_channel=destination, message=message))
 
     def load_config(self):
         """
@@ -751,7 +768,7 @@ class TelegramChannel(MasterChannel):
             self.logger.warning("Telegram delivery did not stop before the deadline", extra={"event": "telegram_channel.delivery_shutdown_timeout"})
             raise
         self.telegram_runtime.stop()
-        self.master_messages.stop_worker()
+        self.master_message_worker.stop_worker()
         self.db.stop_worker()
         self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
 

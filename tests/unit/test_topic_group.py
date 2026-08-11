@@ -111,8 +111,8 @@ def test_master_message_routes_forum_thread_to_slave(channel, slave):
 
     update = Update(update_id=1, message=message)
 
-    with patch.object(channel.master_messages, "process_telegram_message") as process_telegram_message:
-        channel.master_messages.msg(update, None)
+    with patch.object(channel.master_message_inbound, "process_telegram_message") as process_telegram_message:
+        channel.master_message_inbound.msg(update, None)
 
     process_telegram_message.assert_called_once()
     args = process_telegram_message.call_args.args
@@ -136,8 +136,8 @@ def test_master_message_ignores_forum_topic_auto_reply_without_mutating_message(
 
     update = Update(update_id=3, message=message)
 
-    with patch.object(channel.master_messages, "process_telegram_message") as process_telegram_message:
-        channel.master_messages.msg(update, None)
+    with patch.object(channel.master_message_inbound, "process_telegram_message") as process_telegram_message:
+        channel.master_message_inbound.msg(update, None)
 
     process_telegram_message.assert_called_once()
     kwargs = process_telegram_message.call_args.kwargs
@@ -174,8 +174,8 @@ def test_master_message_ignores_unknown_forum_thread(channel, slave):
 
     update = Update(update_id=2, message=message)
 
-    with patch.object(channel.master_messages, "process_telegram_message") as process_telegram_message:
-        channel.master_messages.msg(update, None)
+    with patch.object(channel.master_message_inbound, "process_telegram_message") as process_telegram_message:
+        channel.master_message_inbound.msg(update, None)
 
     process_telegram_message.assert_not_called()
     channel.chat_associations.remove_topic_assoc(slave_uid=other_slave_uid)

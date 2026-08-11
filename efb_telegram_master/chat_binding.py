@@ -1000,7 +1000,7 @@ class ChatBindingManager(LocaleMixin):
             update = update_
             slave_chat = storage.chats[callback_idx]
             slave_chat_id = utils.chat_id_to_str(chat=slave_chat)
-            self.channel.master_messages.process_telegram_message(update, context, slave_chat_id)
+            self.channel.master_message_inbound.process_telegram_message(update, context, slave_chat_id)
             self.bot.edit_message_text(text=self._("Delivering the message to {0}.").format(slave_chat.full_name), chat_id=chat_id, message_id=msg_id)
         elif param == Flags.CANCEL_PROCESS:
             self.bot.edit_message_text(text=self._("Error: No recipient specified.\nPlease reply to a previous message."), chat_id=chat_id, message_id=msg_id)

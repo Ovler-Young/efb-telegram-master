@@ -35,7 +35,7 @@ def _callback_update(chat_id, message_id, data):
 def callback_manager():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager.bot = Mock()
-    manager.channel = SimpleNamespace(_=lambda text: text, flag=lambda _name: 10, master_messages=Mock())
+    manager.channel = SimpleNamespace(_=lambda text: text, flag=lambda _name: 10, master_message_inbound=Mock())
     manager.msg_storage = {}
     manager.link_handler = SimpleNamespace(_conversations={})
     manager.suggestion_handler = SimpleNamespace(_conversations={})
@@ -113,7 +113,7 @@ def test_suggested_recipient_rejects_invalid_or_stale_selection(callback_manager
     storage_id = (TelegramChatID(1), TelegramMessageID(203))
     _store_callback_session(manager, manager.suggestion_handler, Flags.SUGGEST_RECIPIENTS, storage_id, [callback_chat])
 
-    with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"), patch.object(manager.channel.master_messages, "process_telegram_message") as process:
+    with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"), patch.object(manager.channel.master_message_inbound, "process_telegram_message") as process:
         assert manager.suggested_recipient(_callback_update(*storage_id, callback), None) == ConversationHandler.END
 
     process.assert_not_called()
