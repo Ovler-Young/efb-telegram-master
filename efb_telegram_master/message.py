@@ -14,9 +14,9 @@ from ehforwarderbot.types import MessageID, Reactions
 from PIL import Image
 from telegram.error import BadRequest
 
-from . import utils
 from .chat import ETMChatMember, ETMChatType
 from .chat_object_cache import ChatObjectCacheManager
+from .media import convert_tgs_to_gif, gif_conversion
 from .msg_type import TGMsgType
 
 if TYPE_CHECKING:
@@ -150,7 +150,7 @@ class ETMMsg(Message):
             self.__filename = self.__filename or os.path.basename(file.name)
 
             if self.type_telegram in (TGMsgType.Animation, TGMsgType.VideoSticker):
-                gif_file = utils.gif_conversion(file, self.deliver_to.channel_id)
+                gif_file = gif_conversion(file, self.deliver_to.channel_id)
 
                 self.__file = gif_file
                 self.__path = gif_file.name
@@ -167,7 +167,7 @@ class ETMMsg(Message):
                 self.__path = out_file.name
             elif self.type_telegram == TGMsgType.AnimatedSticker:
                 out_file = tempfile.NamedTemporaryFile(suffix=".gif")
-                if utils.convert_tgs_to_gif(file, out_file):
+                if convert_tgs_to_gif(file, out_file):
                     file.close()
                     out_file.seek(0)
                     self.mime = "image/gif"
