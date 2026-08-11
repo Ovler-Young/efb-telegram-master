@@ -9,7 +9,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Optional, Protocol, cast
 
-from .auxiliary_bot import AuxiliaryBot
+from .auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
 from .telegram_runtime import TelegramPollingRuntime
 from .telegram_sync_bridge import AsyncTelegramRuntime
 from .utils import normalize_request_kwargs
@@ -180,17 +180,29 @@ class BotPool:
         if bot is not None:
             bot.update_membership(chat_id, False)
 
-    def shutdown(self) -> None:
-        """Wait up to five seconds for asynchronous membership probes."""
-        deadline = time.monotonic() + 5.0
+    def begin_shutdown(self) -> None:
+        """Reject new membership probes and cancel work that has not started."""
         with self._lock:
-            if self._membership_stopping:
-                return
             self._membership_stopping = True
         for bot in self._bots:
             bot.begin_membership_shutdown()
+
+    def wait_for_shutdown(self, deadline: float) -> tuple[int, ...]:
+        """Join membership workers until the caller-owned absolute deadline."""
+        incomplete: list[int] = []
         for bot in self._bots:
-            bot.wait_for_membership_shutdown(deadline)
+            if not bot.wait_for_membership_shutdown(deadline):
+                incomplete.append(bot.bot_id)
+        return tuple(incomplete)
+
+    def shutdown(self) -> None:
+        """Stop membership workers within the five-second delivery shutdown budget."""
+        deadline = time.monotonic() + 5.0
+        self.begin_shutdown()
+        incomplete = self.wait_for_shutdown(deadline)
+        if incomplete:
+            joined = ", ".join(map(str, incomplete))
+            raise MembershipProbeShutdownTimeout(f"Auxiliary membership probes did not stop within 5 seconds for bot IDs: {joined}")
 
     def auxiliary_count_snapshot(self) -> dict[str, int]:
         """Return configured auxiliary counts grouped by enabled state."""

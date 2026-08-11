@@ -5,7 +5,9 @@ import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from efb_telegram_master.auxiliary_bot import AuxiliaryBot
+import pytest
+
+from efb_telegram_master.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
 from efb_telegram_master.bot_pool import BotPool
 
 
@@ -165,9 +167,10 @@ def test_shutdown_uses_one_deadline_for_all_bots_and_disables_affinity_callbacks
     def begin_shutdown() -> None:
         return None
 
-    def wait_for_membership_shutdown(deadline: float) -> None:
+    def wait_for_membership_shutdown(deadline: float) -> bool:
         observed_deadlines.append(deadline)
         now[0] += 3.0
+        return True
 
     first.begin_membership_shutdown.side_effect = begin_shutdown
     second.begin_membership_shutdown.side_effect = begin_shutdown
@@ -183,3 +186,19 @@ def test_shutdown_uses_one_deadline_for_all_bots_and_disables_affinity_callbacks
     assert observed_deadlines == [15.0, 15.0]
     assert pool.preferred_sender("slave-a") is first
     assert pool._membership_failure_slaves == {(10, 100): {"slave-a"}}
+
+
+def test_shutdown_reports_unjoined_membership_workers_after_stopping_every_bot() -> None:
+    first = bot(10)
+    second = bot(20)
+    first.wait_for_membership_shutdown.return_value = False
+    second.wait_for_membership_shutdown.return_value = True
+    pool = BotPool([first, second])
+
+    with pytest.raises(MembershipProbeShutdownTimeout, match="10"):
+        pool.shutdown()
+
+    first.begin_membership_shutdown.assert_called_once_with()
+    second.begin_membership_shutdown.assert_called_once_with()
+    first.wait_for_membership_shutdown.assert_called_once()
+    second.wait_for_membership_shutdown.assert_called_once()

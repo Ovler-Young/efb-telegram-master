@@ -125,7 +125,6 @@ def poll_bot_factory():
         still_alive = False
         try:
             channel.bot_manager.stop_channel_resources()
-            channel.telegram_runtime.stop()
             polling_thread.join(timeout=30)
             still_alive = polling_thread.is_alive()
         finally:
@@ -208,7 +207,7 @@ async def client(helper_wrap) -> AsyncGenerator[TelegramClient, None]:
 
 def _primary_bot_limiter_delay(channel: TelegramChannel, target_chat_id: int) -> float:
     """Expose the production queue's main-bot limiter to response tests."""
-    return channel.bot_manager.outbound_queue._sender_policy._main_rate_limiter.peek_delay(target_chat_id)
+    return channel.bot_manager.api._outbound_queue._sender_policy._main_rate_limiter.peek_delay(target_chat_id)
 
 
 @pytest.fixture

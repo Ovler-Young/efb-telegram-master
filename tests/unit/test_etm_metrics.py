@@ -132,6 +132,15 @@ def test_snapshot_collectors_render_empty_snapshots_without_labels():
     assert "etm_rate_limit_occupancy{" not in rendered
 
 
+def test_membership_probe_timeout_is_a_bounded_metric_outcome():
+    metrics = Metrics()
+
+    metrics.record_membership_probe("timeout")
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_auxiliary_membership_probes_total{outcome="timeout"} 1.0' in rendered
+
+
 def test_metrics_server_logs_the_port_chosen_by_the_os(caplog):
     metrics = Metrics(process_factory=SupportedProcess, network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=2))
     with caplog.at_level(logging.INFO, logger="efb_telegram_master.metrics_runtime"):

@@ -1,5 +1,6 @@
 import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -227,6 +228,89 @@ def test_shutdown_rejects_new_membership_probes() -> None:
     aux_bot.begin_membership_shutdown()
     assert aux_bot.check_membership_tri(100) is None
     assert aux_bot.has_pending_probes() is False
+
+
+def test_membership_probe_passes_a_bounded_timeout_to_the_runtime() -> None:
+    class Runtime:
+        def __init__(self) -> None:
+            self.timeout = None
+
+        def call(self, coroutine, *, timeout=None):
+            coroutine.close()
+            self.timeout = timeout
+            raise FutureTimeoutError()
+
+    async def get_chat_member(*_args):
+        return SimpleNamespace(status="member")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+    runtime = Runtime()
+    aux_bot._runtime = runtime
+    aux_bot.bot_id = 123
+    aux_bot.async_bot.get_chat_member.side_effect = get_chat_member
+
+    aux_bot._probe_membership(4000)
+
+    assert runtime.timeout == aux_bot.MEMBERSHIP_PROBE_TIMEOUT
+
+
+def test_membership_shutdown_joins_completed_probe_workers() -> None:
+    completed = threading.Event()
+
+    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
+        completed.set()
+        return SimpleNamespace(status="member")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+    aux_bot.bot_id = 123
+    aux_bot.async_bot.get_chat_member.side_effect = get_chat_member
+
+    assert aux_bot.check_membership_tri(4000) is None
+    assert completed.wait(1)
+    aux_bot.begin_membership_shutdown()
+
+    assert aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
+    assert not any(thread.is_alive() for thread in aux_bot._membership_probe_executor._threads)
+
+
+def test_membership_shutdown_retries_join_after_runtime_cancellation() -> None:
+    started = threading.Event()
+    released = threading.Event()
+
+    class Runtime:
+        def call(self, coroutine, *, timeout):
+            coroutine.close()
+            started.set()
+            released.wait()
+            return SimpleNamespace(status="member")
+
+        def stop(self) -> None:
+            released.set()
+
+    async def get_chat_member(*_args):
+        return SimpleNamespace(status="member")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+    aux_bot.bot_id = 123
+    aux_bot._runtime = Runtime()
+    aux_bot.async_bot.get_chat_member.side_effect = get_chat_member
+
+    try:
+        assert aux_bot.check_membership_tri(4000) is None
+        assert started.wait(1)
+        aux_bot.begin_membership_shutdown()
+        first_deadline = time.monotonic() + 0.05
+        assert not aux_bot.wait_for_membership_shutdown(first_deadline)
+
+        aux_bot._runtime.stop()
+        assert aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
+        assert not any(thread.is_alive() for thread in aux_bot._membership_probe_executor._threads)
+    finally:
+        released.set()
+        aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
 
 
 def test_network_exception_is_not_cached_as_non_membership() -> None:

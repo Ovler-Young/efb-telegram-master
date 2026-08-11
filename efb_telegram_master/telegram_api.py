@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import numbers
 import threading
+import time
 from collections.abc import Callable, Mapping
 from functools import wraps
 from typing import TYPE_CHECKING, Protocol, cast
@@ -13,6 +14,7 @@ import telegram.error
 from telegram import File, ForumTopic, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext
 
+from .auxiliary_bot import MembershipProbeShutdownTimeout
 from .bot_pool import BotPool
 from .outbound import OutboundQueue
 from .outbound_types import QueueEnqueueError, QueueRequest, SchedulerStoppedError, SendReceipt, UploadCleanup, cleanup_upload_paths, rewind_uploads
@@ -54,22 +56,62 @@ class TelegramAPI:
         self._cleanup_tls = threading.local()
         self._metrics_server: MetricsServer | None = None
         self._delivery_stop_lock = threading.Lock()
+        self._delivery_shutdown_started = False
         self._delivery_resources_stopped = False
 
     def bind_metrics_server(self, metrics_server: "MetricsServer | None") -> None:
         self._metrics_server = metrics_server
 
-    def stop_delivery_resources(self, join_timeout: float) -> None:
+    def begin_delivery_shutdown(self, join_timeout: float) -> tuple[BaseException, ...]:
+        """Stop outbound work and cancel membership probes before runtime teardown."""
         with self._delivery_stop_lock:
-            if self._delivery_resources_stopped:
-                return
+            if self._delivery_shutdown_started:
+                return ()
+            self._delivery_shutdown_started = True
+        errors: list[BaseException] = []
+        try:
             self._outbound_queue.stop()
+        except BaseException as error:
+            errors.append(error)
+        with self._delivery_stop_lock:
             if self._metrics_server is not None:
-                self._metrics_server.stop(join_timeout)
+                try:
+                    self._metrics_server.stop(join_timeout)
+                except BaseException as error:
+                    errors.append(error)
                 self._metrics_server = None
             if self.bot_pool:
-                self.bot_pool.shutdown()
-            self._delivery_resources_stopped = True
+                try:
+                    self.bot_pool.begin_shutdown()
+                except BaseException as error:
+                    errors.append(error)
+        return tuple(errors)
+
+    def finish_delivery_shutdown(self, deadline: float) -> tuple[BaseException, ...]:
+        """Join membership probe workers after the runtime has cancelled their calls."""
+        with self._delivery_stop_lock:
+            if self._delivery_resources_stopped:
+                return ()
+            bot_pool = self.bot_pool
+        errors: list[BaseException] = []
+        if bot_pool:
+            try:
+                incomplete = bot_pool.wait_for_shutdown(deadline)
+                if incomplete:
+                    joined = ", ".join(map(str, incomplete))
+                    errors.append(MembershipProbeShutdownTimeout(f"Auxiliary membership probes did not stop before the final deadline for bot IDs: {joined}"))
+            except BaseException as error:
+                errors.append(error)
+        if not errors:
+            with self._delivery_stop_lock:
+                self._delivery_resources_stopped = True
+        return tuple(errors)
+
+    def stop_delivery_resources(self, join_timeout: float) -> tuple[BaseException, ...]:
+        """Stop delivery resources without a polling runtime owner."""
+        errors = list(self.begin_delivery_shutdown(join_timeout))
+        errors.extend(self.finish_delivery_shutdown(time.monotonic() + join_timeout))
+        return tuple(errors)
 
     @staticmethod
     def _normalize_telegram_chat_id(value: object) -> int:

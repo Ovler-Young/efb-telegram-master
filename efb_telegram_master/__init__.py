@@ -19,7 +19,7 @@ from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, 
 
 from . import utils as etm_utils
 from .__version__ import __version__
-from .bot_manager import TelegramBotManager
+from .bot_manager import TelegramBotManager, TelegramResourceShutdownError
 from .callback_sessions import CallbackSessionStore
 from .channel_commands import LocaleState, TelegramCommandService, load_channel_config
 from .chat_destination_cache import ChatDestinationCache
@@ -37,7 +37,6 @@ from .master_message import MasterMessageWorker
 from .master_mutations import MasterMessageMutations
 from .message import ETMMsg
 from .mtproto import MTProtoClient
-from .outbound_types import OutboundShutdownTimeout
 from .oversized_notice import OversizedNoticeSender
 from .ptb_compat import Filters
 from .recipient_suggestions import RecipientSuggestionService
@@ -348,16 +347,18 @@ class TelegramChannel(MasterChannel):
         self._stop_polling_called = True
         self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
         self.rpc_utilities.shutdown()
+        shutdown_error = None
         try:
             self.bot_manager.stop_channel_resources()
-        except OutboundShutdownTimeout:
-            self._stop_polling_called = False
+        except TelegramResourceShutdownError as error:
+            shutdown_error = error
             self.logger.warning("Telegram delivery did not stop before the deadline", extra={"event": "telegram_channel.delivery_shutdown_timeout"})
-            raise
-        self.telegram_runtime.stop()
-        self.master_message_worker.stop_worker()
-        self.db.stop_worker()
+        finally:
+            self.master_message_worker.stop_worker()
+            self.db.stop_worker()
         self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
+        if shutdown_error is not None:
+            raise shutdown_error
 
     def get_chats(self) -> List[Chat]:
         raise EFBOperationNotSupported()

@@ -15,6 +15,7 @@ from telegram import Message, Update
 from telegram.ext import CallbackContext
 
 from . import utils as etm_utils
+from .auxiliary_bot import MembershipProbeShutdownTimeout
 from .bot_pool import build_bot_pool
 from .chat_association_repository import ChatAssociationRepository
 from .metrics_runtime import configure_runtime_metrics
@@ -29,6 +30,15 @@ from .telegram_runtime import TelegramPollingRuntime, build_telegram_polling_run
 
 if TYPE_CHECKING:
     from . import TelegramChannel
+
+
+class TelegramResourceShutdownError(RuntimeError):
+    """One or more owned Telegram resources did not stop."""
+
+    def __init__(self, errors: tuple[BaseException, ...]) -> None:
+        self.errors = errors
+        details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+        super().__init__(f"Telegram resource shutdown failed: {details}")
 
 
 class TelegramBotManager:
@@ -226,8 +236,20 @@ class TelegramBotManager:
             )
 
     def stop_channel_resources(self) -> None:
-        """Stop delivery resources before the polling runtime is stopped."""
+        """Stop delivery work, then the runtime, then join membership workers."""
         self._stopping.set()
         self.logger.info("Stopping Telegram delivery resources", extra={"event": "telegram_bot.stop_started"})
-        self.api.stop_delivery_resources(self.SHUTDOWN_JOIN_GRACE)
+        errors = list(self.api.begin_delivery_shutdown(self.SHUTDOWN_JOIN_GRACE))
+        initial_membership_errors = self.api.finish_delivery_shutdown(time.monotonic() + self.SHUTDOWN_JOIN_GRACE)
+        try:
+            self.telegram_runtime.stop()
+        except BaseException as error:
+            errors.append(error)
+        final_membership_errors = self.api.finish_delivery_shutdown(time.monotonic() + self.SHUTDOWN_DRAIN_TIMEOUT)
+        if final_membership_errors:
+            errors.extend(final_membership_errors)
+        else:
+            errors.extend(error for error in initial_membership_errors if not isinstance(error, MembershipProbeShutdownTimeout))
         self.logger.info("Stopped Telegram delivery resources", extra={"event": "telegram_bot.stop_completed"})
+        if errors:
+            raise TelegramResourceShutdownError(tuple(errors))

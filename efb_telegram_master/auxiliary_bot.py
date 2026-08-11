@@ -6,6 +6,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Coroutine
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, TypeVar, overload
 
 import telegram
@@ -27,19 +28,25 @@ class MembershipProbeMetrics(Protocol):
 def _resolve_bot_result(
     result: Coroutine[object, object, T],
     runtime: Optional["AsyncTelegramRuntime"],
+    *,
+    timeout: float | None = None,
 ) -> T: ...
 
 
 @overload
-def _resolve_bot_result(result: T, runtime: Optional["AsyncTelegramRuntime"]) -> T: ...
+def _resolve_bot_result(result: T, runtime: Optional["AsyncTelegramRuntime"], *, timeout: float | None = None) -> T: ...
 
 
-def _resolve_bot_result(result: object, runtime: Optional["AsyncTelegramRuntime"]) -> object:
+def _resolve_bot_result(result: object, runtime: Optional["AsyncTelegramRuntime"], *, timeout: float | None = None) -> object:
     if isinstance(result, Coroutine):
         if runtime is None:
             raise RuntimeError("Auxiliary bot runtime is not bound.")
-        return runtime.call(result)
+        return runtime.call(result, timeout=timeout)
     return result
+
+
+class MembershipProbeShutdownTimeout(RuntimeError):
+    """Membership probe workers did not finish before their shutdown deadline."""
 
 
 class AuxiliaryBot:
@@ -54,6 +61,7 @@ class AuxiliaryBot:
     MEMBERSHIP_PROBE_WORKERS = 2
     MAX_PENDING_MEMBERSHIP_PROBES = 32
     MAX_MEMBERSHIP_CACHE_ENTRIES = 512
+    MEMBERSHIP_PROBE_TIMEOUT = 4.0
 
     def __init__(self, token: str, *, request_kwargs: Optional[dict[str, object]] = None, base_url: Optional[str] = None, base_file_url: Optional[str] = None, local_mode: bool = False):
         self._token = token
@@ -256,7 +264,7 @@ class AuxiliaryBot:
     def _probe_membership(self, chat_id: int) -> None:
         """Background probe: call get_chat_member and update cache."""
         try:
-            member = _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id), self._runtime)
+            member = _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id), self._runtime, timeout=self.MEMBERSHIP_PROBE_TIMEOUT)
             is_member = member.status in ("member", "administrator", "creator", "restricted")
             self.update_membership(chat_id, is_member)
             self._record_membership_probe("ok_member" if is_member else "ok_not_member")
@@ -269,6 +277,9 @@ class AuxiliaryBot:
             self.update_membership(chat_id, False)
             self._record_membership_probe("bad_request")
             logger.debug("Membership probe for bot %d in chat %d failed: %s", self.bot_id, chat_id, e)
+        except FutureTimeoutError:
+            self._record_membership_probe("timeout")
+            logger.warning("Membership probe for bot %d in chat %d timed out after %.1fs", self.bot_id, chat_id, self.MEMBERSHIP_PROBE_TIMEOUT)
         except Exception as e:
             self._record_membership_probe("error")
             logger.warning("Membership probe failed for bot %d in chat %d: %s", self.bot_id, chat_id, e)
@@ -296,13 +307,22 @@ class AuxiliaryBot:
             self._membership_changed_callback = None
         self._membership_probe_executor.shutdown(wait=False, cancel_futures=True)
 
-    def wait_for_membership_shutdown(self, deadline: float) -> None:
-        """Wait only until the caller-owned absolute shutdown deadline."""
+    def wait_for_membership_shutdown(self, deadline: float) -> bool:
+        """Join probe workers before the caller-owned absolute shutdown deadline."""
         while self.has_pending_probes():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return
+                return False
             time.sleep(min(0.01, remaining))
+        self._membership_probe_executor.shutdown(wait=False, cancel_futures=True)
+        # ThreadPoolExecutor has no timeout-aware shutdown. Join the workers
+        # directly so a stalled probe is reported instead of blocking process exit.
+        for worker in tuple(self._membership_probe_executor._threads):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            worker.join(remaining)
+        return not any(worker.is_alive() for worker in self._membership_probe_executor._threads)
 
     def has_pending_probes(self) -> bool:
         """Check if there are any pending membership probes."""
