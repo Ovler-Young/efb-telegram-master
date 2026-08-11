@@ -1,0 +1,98 @@
+import logging
+from typing import List, Optional, Tuple
+
+from peewee import DoesNotExist
+
+from .database_observability import ObservedRepository, observe_database_method
+from .models import ChatAssoc, TopicAssoc
+from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramTopicID
+
+
+class ChatAssociationRepository(ObservedRepository):
+    logger = logging.getLogger(__name__)
+
+    @observe_database_method("add_chat_assoc")
+    def add_chat_assoc(self, master_uid: EFBChannelChatIDStr, slave_uid: EFBChannelChatIDStr, multiple_slave: bool = False):
+        if not multiple_slave:
+            self.remove_chat_assoc(master_uid=master_uid)
+        self.remove_chat_assoc(slave_uid=slave_uid)
+        return ChatAssoc.create(master_uid=master_uid, slave_uid=slave_uid)
+
+    @observe_database_method("remove_chat_assoc")
+    def remove_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None, slave_uid: Optional[EFBChannelChatIDStr] = None):
+        try:
+            if bool(master_uid) == bool(slave_uid):
+                raise ValueError("Only one parameter is to be provided.")
+            if master_uid:
+                slave_uids = [row.slave_uid for row in ChatAssoc.select(ChatAssoc.slave_uid).where(ChatAssoc.master_uid == master_uid)]
+                result = ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
+                if slave_uids:
+                    TopicAssoc.delete().where(TopicAssoc.slave_uid.in_(slave_uids)).execute()
+                return result
+            result = ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
+            TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
+            return result
+        except DoesNotExist:
+            return 0
+
+    @observe_database_method("get_chat_assoc")
+    def get_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None, slave_uid: Optional[EFBChannelChatIDStr] = None) -> List[EFBChannelChatIDStr]:
+        try:
+            if bool(master_uid) == bool(slave_uid):
+                raise ValueError("Only one parameter is to be provided.")
+            if master_uid:
+                return [EFBChannelChatIDStr(row.slave_uid) for row in ChatAssoc.select(ChatAssoc.slave_uid).where(ChatAssoc.master_uid == master_uid)]
+            return [EFBChannelChatIDStr(row.master_uid) for row in ChatAssoc.select(ChatAssoc.master_uid).where(ChatAssoc.slave_uid == slave_uid)]
+        except DoesNotExist:
+            return []
+
+    @observe_database_method("add_topic_assoc")
+    def add_topic_assoc(self, topic_chat_id: TelegramChatID, message_thread_id: TelegramTopicID, slave_uid: EFBChannelChatIDStr):
+        self.remove_topic_assoc(slave_uid=slave_uid)
+        self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
+        return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
+
+    @observe_database_method("get_topic_thread_id")
+    def get_topic_thread_id(self, slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
+        try:
+            query = TopicAssoc.select(TopicAssoc.message_thread_id).where(TopicAssoc.slave_uid == slave_uid)
+            if topic_chat_id:
+                query = query.where(TopicAssoc.topic_chat_id == topic_chat_id)
+            assoc = query.order_by(TopicAssoc.topic_chat_id.desc()).first()
+            return TelegramTopicID(int(assoc.message_thread_id)) if assoc else None
+        except DoesNotExist:
+            return None
+
+    @observe_database_method("get_topic_slave")
+    def get_topic_slave(self, topic_chat_id: TelegramChatID, message_thread_id: Optional[TelegramTopicID] = None) -> Optional[EFBChannelChatIDStr]:
+        try:
+            query = TopicAssoc.select(TopicAssoc.slave_uid).where(TopicAssoc.topic_chat_id == topic_chat_id)
+            if message_thread_id:
+                query = query.where(TopicAssoc.message_thread_id == message_thread_id)
+            assoc = query.first()
+            return EFBChannelChatIDStr(assoc.slave_uid) if assoc else None
+        except DoesNotExist:
+            return None
+
+    def get_topic_assoc_slave_uid(self, source_chat_id: int, topic_id: int) -> Optional[EFBChannelChatIDStr]:
+        assoc = TopicAssoc.get_or_none((TopicAssoc.topic_chat_id == str(source_chat_id)) & (TopicAssoc.message_thread_id == str(topic_id)))
+        return EFBChannelChatIDStr(assoc.slave_uid) if assoc is not None else None
+
+    @observe_database_method("get_topic_slaves")
+    def get_topic_slaves(self, topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
+        try:
+            query = TopicAssoc.select(TopicAssoc.slave_uid, TopicAssoc.message_thread_id).where(TopicAssoc.topic_chat_id == topic_chat_id).order_by(TopicAssoc.id.desc())
+            return [(EFBChannelChatIDStr(row.slave_uid), TelegramTopicID(int(row.message_thread_id))) for row in query]
+        except (DoesNotExist, AttributeError):
+            return None
+
+    @observe_database_method("remove_topic_assoc")
+    def remove_topic_assoc(self, topic_chat_id: Optional[TelegramChatID] = None, message_thread_id: Optional[TelegramTopicID] = None, slave_uid: Optional[EFBChannelChatIDStr] = None):
+        try:
+            if bool(topic_chat_id and message_thread_id) == bool(slave_uid):
+                raise ValueError("Please provide either topic_chat_id and message_thread_id or slave_uid.")
+            if topic_chat_id and message_thread_id:
+                return TopicAssoc.delete().where((TopicAssoc.topic_chat_id == str(topic_chat_id)) & (TopicAssoc.message_thread_id == str(message_thread_id))).execute()
+            return TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
+        except DoesNotExist:
+            return 0

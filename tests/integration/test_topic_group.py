@@ -48,7 +48,7 @@ async def test_slave_message_creates_topic_and_delivers(helper, slave_with_topic
     assert tg_message.reply_to_msg_id in (None, message_thread_id)
     assert sent.text in tg_message.raw_text
 
-    slave_uid = channel_with_topic_group.db.get_topic_slave(bot_topic_group, message_thread_id)
+    slave_uid = channel_with_topic_group.chat_associations.get_topic_slave(bot_topic_group, message_thread_id)
     assert slave_uid == utils.chat_id_to_str(chat=chat)
 
 

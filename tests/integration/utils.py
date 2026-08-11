@@ -20,7 +20,7 @@ def link_chats(channel: TelegramChannel, slave_chats: Iterable[Chat], telegram_c
     upon finishing.
     """
     # Link the chats
-    db = channel.db
+    db = channel.chat_associations
     slave_ids = [chat_id_to_str(chat=i) for i in slave_chats]
     master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     backup = db.get_chat_assoc(master_uid=master_str)
@@ -61,7 +61,7 @@ async def get_start_token(client, helper, bot_id, chat_uid, private_response):
 
 def assert_is_linked(channel: TelegramChannel, slave_chats: Iterable[Chat], telegram_chat_id: int):
     master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
-    chats_str = set(channel.db.get_chat_assoc(master_uid=master_str))
+    chats_str = set(channel.chat_associations.get_chat_assoc(master_uid=master_str))
     slave_ids = {chat_id_to_str(chat=i) for i in slave_chats}
     # print("ASSERT_IS_LINKED", chats_str, slave_ids)
     assert chats_str == slave_ids, f"expecting {slave_ids} linked, found {chats_str}"
@@ -69,4 +69,4 @@ def assert_is_linked(channel: TelegramChannel, slave_chats: Iterable[Chat], tele
 
 def unlink_all_chats(channel: TelegramChannel, telegram_chat_id: int):
     master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
-    channel.db.remove_chat_assoc(master_uid=master_str)
+    channel.chat_associations.remove_chat_assoc(master_uid=master_str)

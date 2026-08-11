@@ -38,15 +38,15 @@ def test_topic_assoc_crud(channel, slave):
     topic_chat_id = TelegramChatID(10001)
     thread_id = TelegramTopicID(20002)
 
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
-    channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
 
-    assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == thread_id
-    assert channel.db.get_topic_slaves(topic_chat_id) == [(slave_uid, thread_id)]
-    assert channel.db.get_topic_slave(topic_chat_id, thread_id) == slave_uid
+    assert channel.chat_associations.get_topic_thread_id(slave_uid, topic_chat_id) == thread_id
+    assert channel.chat_associations.get_topic_slaves(topic_chat_id) == [(slave_uid, thread_id)]
+    assert channel.chat_associations.get_topic_slave(topic_chat_id, thread_id) == slave_uid
 
-    channel.db.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=thread_id)
-    assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) is None
+    channel.chat_associations.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=thread_id)
+    assert channel.chat_associations.get_topic_thread_id(slave_uid, topic_chat_id) is None
 
 
 def test_get_slave_msg_dest_uses_topic_group(channel, slave):
@@ -80,7 +80,7 @@ def test_flag_manager_reads_top_level_topic_group(channel):
 def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(50005)
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
 
     forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(60006))
     with patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
@@ -90,17 +90,17 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     assert first == TelegramTopicID(60006)
     assert second == TelegramTopicID(60006)
     assert create_forum_topic.call_count == 1
-    assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(60006)
+    assert channel.chat_associations.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(60006)
 
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
 
 
 def test_master_message_routes_forum_thread_to_slave(channel, slave):
     topic_chat_id = TelegramChatID(70007)
     thread_id = TelegramTopicID(80008)
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
-    channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
 
     message = Mock()
     message.chat = SimpleNamespace(id=int(topic_chat_id), is_forum=True)
@@ -119,15 +119,15 @@ def test_master_message_routes_forum_thread_to_slave(channel, slave):
     assert args[2] == slave_uid
     assert kwargs["quote"] is True
 
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
 
 
 def test_master_message_ignores_forum_topic_auto_reply_without_mutating_message(channel, slave):
     topic_chat_id = TelegramChatID(80009)
     thread_id = TelegramTopicID(80010)
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
-    channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
 
     reply_to_topic_starter = Mock(message_id=int(thread_id), message_thread_id=int(thread_id))
     message = _ReadOnlyReplyMessage(reply_to_topic_starter)
@@ -142,7 +142,7 @@ def test_master_message_ignores_forum_topic_auto_reply_without_mutating_message(
     kwargs = process_telegram_message.call_args.kwargs
     assert kwargs["quote"] is False
 
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
 
 
 def test_sync_reply_text_keeps_forum_topic_thread():
@@ -162,8 +162,8 @@ def test_master_message_ignores_unknown_forum_thread(channel, slave):
     topic_chat_id = TelegramChatID(90009)
     thread_id = TelegramTopicID(90010)
     other_slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
-    channel.db.remove_topic_assoc(slave_uid=other_slave_uid)
-    channel.db.add_topic_assoc(topic_chat_id, TelegramTopicID(42), other_slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=other_slave_uid)
+    channel.chat_associations.add_topic_assoc(topic_chat_id, TelegramTopicID(42), other_slave_uid)
 
     message = Mock()
     message.chat = SimpleNamespace(id=int(topic_chat_id), is_forum=True)
@@ -177,4 +177,4 @@ def test_master_message_ignores_unknown_forum_thread(channel, slave):
         channel.master_messages.msg(update, None)
 
     process_telegram_message.assert_not_called()
-    channel.db.remove_topic_assoc(slave_uid=other_slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=other_slave_uid)

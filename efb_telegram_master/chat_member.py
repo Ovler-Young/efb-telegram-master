@@ -19,16 +19,18 @@ class ETMBaseChatMixin(BaseChat, ABC):  # lgtm [py/missing-equals]
     # noinspection PyMissingConstructor
     def __init__(self, db: "DatabaseManager", *args, **kwargs):
         self.db = db
+        self.chat_associations = db.chat_associations
+        self.slave_chat_info = db.slave_chat_info
         super().__init__(*args, **kwargs)
 
     def remove_from_db(self):
         """Remove this chat from database."""
-        self.db.delete_slave_chat_info(self.module_id, self.uid)
+        self.slave_chat_info.delete_slave_chat_info(self.module_id, self.uid)
 
     def __getstate__(self) -> Dict[str, Any]:
         state = self.__dict__.copy()
-        if "db" in state:
-            del state["db"]
+        for dependency in ("db", "chat_associations", "slave_chat_info"):
+            state.pop(dependency, None)
         return state
 
     def __setstate__(self, state: Dict[str, Any]):
@@ -39,6 +41,8 @@ class ETMBaseChatMixin(BaseChat, ABC):  # lgtm [py/missing-equals]
         with suppress(NameError, AttributeError):
             if isinstance(coordinator.master, TelegramChannel):
                 self.db = coordinator.master.db
+                self.chat_associations = coordinator.master.chat_associations
+                self.slave_chat_info = coordinator.master.slave_chat_info
 
     def __copy__(self):
         rv = self.__reduce_ex__(4)
@@ -46,6 +50,8 @@ class ETMBaseChatMixin(BaseChat, ABC):  # lgtm [py/missing-equals]
             return self
         obj = copy._reconstruct(self, None, *rv)
         obj.db = self.db
+        obj.chat_associations = self.chat_associations
+        obj.slave_chat_info = self.slave_chat_info
         return obj
 
 

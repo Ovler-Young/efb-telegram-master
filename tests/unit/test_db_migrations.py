@@ -98,7 +98,7 @@ def test_database_method_metrics_record_bounded_public_operation_labels(channel)
     metrics = Metrics()
     channel.db.set_metrics(metrics)
 
-    assert channel.db.get_chat_assoc(master_uid="metrics-master") == []
+    assert channel.chat_associations.get_chat_assoc(master_uid="metrics-master") == []
     with pytest.raises(ValueError, match="Only one parameter"):
         channel.db.get_msg_log()
 
@@ -154,34 +154,34 @@ def test_topic_assoc_table_exists_and_round_trips(channel, slave):
     topic_chat_id = TelegramChatID(11111)
     thread_id = TelegramTopicID(22222)
 
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
-    assoc = channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
+    assoc = channel.chat_associations.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
 
     assert isinstance(assoc, TopicAssoc)
-    assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == thread_id
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    assert channel.chat_associations.get_topic_thread_id(slave_uid, topic_chat_id) == thread_id
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
 
 
 def test_topic_assoc_is_replaced_for_same_slave_and_thread(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(33333)
 
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
-    channel.db.add_topic_assoc(topic_chat_id, TelegramTopicID(44444), slave_uid)
-    channel.db.add_topic_assoc(topic_chat_id, TelegramTopicID(55555), slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.add_topic_assoc(topic_chat_id, TelegramTopicID(44444), slave_uid)
+    channel.chat_associations.add_topic_assoc(topic_chat_id, TelegramTopicID(55555), slave_uid)
 
-    assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(55555)
+    assert channel.chat_associations.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(55555)
     assert TopicAssoc.select().where(TopicAssoc.slave_uid == slave_uid).count() == 1
-    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
 
 
 def test_remove_chat_assoc_removes_topic_assoc(channel):
-    channel.db.add_chat_assoc("master-topic-cleanup", "slave-topic-cleanup", multiple_slave=True)
-    channel.db.add_topic_assoc(TelegramChatID(66666), TelegramTopicID(77777), "slave-topic-cleanup")
+    channel.chat_associations.add_chat_assoc("master-topic-cleanup", "slave-topic-cleanup", multiple_slave=True)
+    channel.chat_associations.add_topic_assoc(TelegramChatID(66666), TelegramTopicID(77777), "slave-topic-cleanup")
 
-    channel.db.remove_chat_assoc(master_uid="master-topic-cleanup")
+    channel.chat_associations.remove_chat_assoc(master_uid="master-topic-cleanup")
 
-    assert channel.db.get_topic_thread_id("slave-topic-cleanup", TelegramChatID(66666)) is None
+    assert channel.chat_associations.get_topic_thread_id("slave-topic-cleanup", TelegramChatID(66666)) is None
 
 
 def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):

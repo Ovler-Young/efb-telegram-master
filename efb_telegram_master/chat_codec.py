@@ -122,4 +122,6 @@ def unpickle(data: bytes, db: "DatabaseManager") -> ETMChatMixin:
         data = bytes(data)
     obj = pickle.loads(data)
     obj.db = db
+    obj.chat_associations = db.chat_associations
+    obj.slave_chat_info = db.slave_chat_info
     return obj

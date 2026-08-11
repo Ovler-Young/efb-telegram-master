@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 
+from .chat_association_repository import ChatAssociationRepository
 from .db import DatabaseManager
 from .models import MsgLogIngestionLeaseLostError
 from .mtproto import MTProtoClient, MTProtoRetryableError
@@ -30,10 +31,11 @@ class MsgLogIngestionService:
     BATCH_SIZE = 100
     EXISTING_STREAK_LIMIT = 500
 
-    def __init__(self, db: DatabaseManager, mtproto: MTProtoClient, *, lease_seconds: int = 120) -> None:
+    def __init__(self, db: DatabaseManager, chat_associations: ChatAssociationRepository, mtproto: MTProtoClient, *, lease_seconds: int = 120) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease seconds must be positive")
         self.db = db
+        self.chat_associations = chat_associations
         self.mtproto = mtproto
         self.lease_seconds = lease_seconds
         self.logger = logging.getLogger(__name__)
@@ -126,7 +128,7 @@ class MsgLogIngestionService:
             topic_id = getattr(reply_to, "reply_to_msg_id", None)
         if isinstance(topic_id, bool) or not isinstance(topic_id, int) or topic_id <= 1:
             return "general-topic", None, None
-        slave_uid = self.db.get_topic_assoc_slave_uid(source_chat_id, topic_id)
+        slave_uid = self.chat_associations.get_topic_assoc_slave_uid(source_chat_id, topic_id)
         if slave_uid is None:
             return "unbound-topic", None, None
         content = self._content(message)

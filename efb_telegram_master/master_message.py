@@ -66,6 +66,7 @@ class MasterMessageProcessor(LocaleMixin):
         self.bot: "TelegramAPI" = channel.bot_manager.api
         self.runtime = channel.telegram_runtime
         self.db: "DatabaseManager" = channel.db
+        self.chat_associations = channel.chat_associations
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: "ChatObjectCacheManager" = channel.chat_manager
 
@@ -180,7 +181,7 @@ class MasterMessageProcessor(LocaleMixin):
         def get_linked_slave_chats() -> list[EFBChannelChatIDStr]:
             nonlocal linked_slave_chats
             if linked_slave_chats is None:
-                linked_slave_chats = self.db.get_chat_assoc(master_uid=master_chat_uid)
+                linked_slave_chats = self.chat_associations.get_chat_assoc(master_uid=master_chat_uid)
             return linked_slave_chats
 
         destination: Optional[EFBChannelChatIDStr] = None
@@ -207,7 +208,7 @@ class MasterMessageProcessor(LocaleMixin):
             if destination:
                 quote = message.reply_to_message is not None
                 if message.chat.is_forum:
-                    ideal_thread_id = self.db.get_topic_thread_id(slave_uid=destination, topic_chat_id=TelegramChatID(update.effective_chat.id))
+                    ideal_thread_id = self.chat_associations.get_topic_thread_id(slave_uid=destination, topic_chat_id=TelegramChatID(update.effective_chat.id))
                     if ideal_thread_id and ideal_thread_id != message.message_thread_id:
                         destination = None
                         quote = False
@@ -215,7 +216,7 @@ class MasterMessageProcessor(LocaleMixin):
 
         if destination is None:
             if message.chat.is_forum:
-                topic_destinations = self.db.get_topic_slaves(topic_chat_id=TelegramChatID(message.chat.id))
+                topic_destinations = self.chat_associations.get_topic_slaves(topic_chat_id=TelegramChatID(message.chat.id))
                 thread_id = message.message_thread_id
                 if thread_id and topic_destinations:
                     for dest, topic_id in topic_destinations:

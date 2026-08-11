@@ -121,6 +121,8 @@ class TelegramChannel(MasterChannel):
         # Initialize managers
         self.flag: ExperimentalFlagsManager = ExperimentalFlagsManager(self)
         self.db: DatabaseManager = DatabaseManager(self)
+        self.chat_associations = self.db.chat_associations
+        self.slave_chat_info = self.db.slave_chat_info
         self.mtproto = MTProtoClient(self.mtproto_config, self.config["token"], self.db._base_path)
         self.chat_manager: ChatObjectCacheManager = ChatObjectCacheManager(self)
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
@@ -234,7 +236,7 @@ class TelegramChannel(MasterChannel):
         assert isinstance(update, Update)
         assert isinstance(update.effective_message, Message)
 
-        topic_links = self.db.get_topic_slaves(topic_chat_id=TelegramChatID(update.effective_message.chat_id))
+        topic_links = self.chat_associations.get_topic_slaves(topic_chat_id=TelegramChatID(update.effective_message.chat_id))
         thread_id = update.effective_message.message_thread_id
         chat_ids: List[EFBChannelChatIDStr] = []
         if thread_id:
@@ -279,7 +281,7 @@ class TelegramChannel(MasterChannel):
         """Generate string for chat linking info of a channel."""
         chat = get_forwarded_chat(update.effective_message)
         assert chat is not None
-        links = self.db.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, chat.id))
+        links = self.chat_associations.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, chat.id))
         if links:  # Linked chat
             # TRANSLATORS: ‘channel’ here refers to a Telegram channel.
             msg = self._("The channel {group_name} ({group_id}) is linked to:").format(group_name=chat.title, group_id=chat.id)
@@ -291,7 +293,7 @@ class TelegramChannel(MasterChannel):
 
     def info_group(self, update):
         """Generate string for chat linking info of a group."""
-        links = self.db.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, update.message.chat_id))
+        links = self.chat_associations.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, update.message.chat_id))
         if links:  # Linked chat
             msg = self._("The group {group_name} ({group_id}) is linked to:").format(group_name=update.message.chat.title, group_id=update.message.chat_id)
             msg += self.build_link_chats_info_str(links)
@@ -481,7 +483,7 @@ class TelegramChannel(MasterChannel):
             sync_reply_text(self.bot_manager.api, update.effective_message, self._("This command must be used in a bound forum group."))
             return
         group_id = TelegramChatID(update.effective_chat.id)
-        if not self.db.get_topic_slaves(group_id):
+        if not self.chat_associations.get_topic_slaves(group_id):
             sync_reply_text(self.bot_manager.api, update.effective_message, self._("This forum group has no bound topics."))
             return
         state = self.chat_binding.schedule_msglog_ingestion(int(group_id))
@@ -627,10 +629,10 @@ class TelegramChannel(MasterChannel):
             assert isinstance(update.message, Message)
             old_id = ChatID(str(update.message.chat_id))
             count = 0
-            for i in self.db.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, old_id)):
+            for i in self.chat_associations.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, old_id)):
                 self.logger.info("Migrating Telegram chat association", extra={"event": "telegram_channel.chat_migrated", "old_chat_id": str(old_id), "new_chat_id": new_id})
-                self.db.remove_chat_assoc(slave_uid=i)
-                self.db.add_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, ChatID(str(new_id))), slave_uid=i)
+                self.chat_associations.remove_chat_assoc(slave_uid=i)
+                self.chat_associations.add_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, ChatID(str(new_id))), slave_uid=i)
                 count += 1
             self.bot_manager.api.send_message(
                 new_id,

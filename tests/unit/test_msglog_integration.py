@@ -16,7 +16,7 @@ from efb_telegram_master.slave_message import ETMMsg, SlaveMessageProcessor
 def sync_msglog_channel():
     channel = object.__new__(TelegramChannel)
     channel.config = {"admins": [10]}
-    channel.db = SimpleNamespace(get_topic_slaves=Mock(return_value=[("tests.slave", 7)]))
+    channel.chat_associations = SimpleNamespace(get_topic_slaves=Mock(return_value=[("tests.slave", 7)]))
     channel.chat_binding = SimpleNamespace(schedule_msglog_ingestion=Mock(return_value="started"))
     channel.bot_manager = SimpleNamespace(api=SimpleNamespace(send_message=Mock()))
     channel.translator = SimpleNamespace(gettext=lambda text: text)
@@ -36,7 +36,7 @@ def test_sync_msglog_schedules_for_admin_in_bound_forum_group(sync_msglog_channe
 
     TelegramChannel.sync_msglog(channel, sync_msglog_update(), SimpleNamespace())
 
-    channel.db.get_topic_slaves.assert_called_once_with(100)
+    channel.chat_associations.get_topic_slaves.assert_called_once_with(100)
     channel.chat_binding.schedule_msglog_ingestion.assert_called_once_with(100)
     channel.bot_manager.api.send_message.assert_called_once_with(100, text="MsgLog sync started for this group.")
 
@@ -52,14 +52,14 @@ def test_sync_msglog_schedules_for_admin_in_bound_forum_group(sync_msglog_channe
 )
 def test_sync_msglog_rejects_unqualified_requests(sync_msglog_channel, user_id, is_forum, bound_topics, expected_reply, topic_lookup_expected):
     channel = sync_msglog_channel
-    channel.db.get_topic_slaves.return_value = bound_topics
+    channel.chat_associations.get_topic_slaves.return_value = bound_topics
 
     TelegramChannel.sync_msglog(channel, sync_msglog_update(user_id=user_id, is_forum=is_forum), SimpleNamespace())
 
     if topic_lookup_expected:
-        channel.db.get_topic_slaves.assert_called_once_with(100)
+        channel.chat_associations.get_topic_slaves.assert_called_once_with(100)
     else:
-        channel.db.get_topic_slaves.assert_not_called()
+        channel.chat_associations.get_topic_slaves.assert_not_called()
     channel.chat_binding.schedule_msglog_ingestion.assert_not_called()
     channel.bot_manager.api.send_message.assert_called_once_with(100, text=expected_reply)
 
@@ -69,7 +69,7 @@ def test_sync_msglog_ignores_updates_without_an_effective_message(sync_msglog_ch
 
     TelegramChannel.sync_msglog(channel, Update(update_id=1), SimpleNamespace())
 
-    channel.db.get_topic_slaves.assert_not_called()
+    channel.chat_associations.get_topic_slaves.assert_not_called()
     channel.chat_binding.schedule_msglog_ingestion.assert_not_called()
     channel.bot_manager.api.send_message.assert_not_called()
 
@@ -82,9 +82,9 @@ def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
                 SimpleNamespace(source_chat_id="100"),
                 SimpleNamespace(source_chat_id="200"),
             ]
-        ),
-        get_topic_slaves=Mock(side_effect=[[("a", 1)], [("b", 2)]]),
+        )
     )
+    manager.chat_associations = SimpleNamespace(get_topic_slaves=Mock(side_effect=[[("a", 1)], [("b", 2)]]))
     manager.schedule_msglog_ingestion = Mock()
     manager.logger = Mock()
 

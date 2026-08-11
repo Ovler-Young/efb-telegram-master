@@ -85,11 +85,11 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
 
     def unlink(self):
         """Unlink this chat from any Telegram group."""
-        self.db.remove_chat_assoc(slave_uid=utils.chat_id_to_str(self.module_id, self.uid))
+        self.chat_associations.remove_chat_assoc(slave_uid=utils.chat_id_to_str(self.module_id, self.uid))
         self._update_linked()
 
     def link(self, channel_id: ModuleID, chat_id: ChatID, multiple_slave: bool):
-        self.db.add_chat_assoc(master_uid=utils.chat_id_to_str(channel_id, chat_id), slave_uid=utils.chat_id_to_str(self.module_id, self.uid), multiple_slave=multiple_slave)
+        self.chat_associations.add_chat_assoc(master_uid=utils.chat_id_to_str(channel_id, chat_id), slave_uid=utils.chat_id_to_str(self.module_id, self.uid), multiple_slave=multiple_slave)
         self._update_linked()
 
     @property
@@ -99,7 +99,7 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
         return self._linked or []
 
     def _update_linked(self):
-        self._linked = self.db.get_chat_assoc(slave_uid=utils.chat_id_to_str(self.module_id, self.uid))
+        self._linked = self.chat_associations.get_chat_assoc(slave_uid=utils.chat_id_to_str(self.module_id, self.uid))
 
     @property
     def full_name(self) -> str:
@@ -145,7 +145,7 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
 
     def update_to_db(self):
         """Update this object to database."""
-        self.db.set_slave_chat_info(self)
+        self.slave_chat_info.set_slave_chat_info(self)
 
     @property
     def pickle(self) -> bytes:
@@ -156,7 +156,7 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
     def remove_from_db(self):
         super().remove_from_db()
         for i in self.members:
-            self.db.delete_slave_chat_info(self.module_id, i.uid, self.uid)
+            self.slave_chat_info.delete_slave_chat_info(self.module_id, i.uid, self.uid)
 
     def add_self(self) -> ETMSelfChatMember:
         if getattr(self, "self", None) and isinstance(self.self, ETMSelfChatMember):

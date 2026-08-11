@@ -307,7 +307,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     etm_chat = channel_with_auxiliary_bots.chat_manager.get_chat(chat.module_id, chat.uid)
     assert etm_chat is not None
     etm_chat.unlink()
-    channel_with_auxiliary_bots.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel_with_auxiliary_bots.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response)

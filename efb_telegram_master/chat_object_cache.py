@@ -27,6 +27,7 @@ class ChatObjectCacheManager:
     def __init__(self, channel: "TelegramChannel"):
         self.channel = channel
         self.db = channel.db
+        self.slave_chat_info = channel.slave_chat_info
         self.logger = logging.getLogger(__name__)
 
         self.cache: Dict[CacheKey, ETMChatMixin] = dict()
@@ -90,7 +91,7 @@ class ChatObjectCacheManager:
         if key in self.cache:
             return self.cache[key]
 
-        c_log = self.db.get_slave_chat_info(module_id, chat_id)
+        c_log = self.slave_chat_info.get_slave_chat_info(module_id, chat_id)
         if c_log is not None and c_log.pickle:
             # Suppress AttributeError caused by change of class name in EFB 2.0.0b26, ETM 2.0.0b40
             with suppress(AttributeError):

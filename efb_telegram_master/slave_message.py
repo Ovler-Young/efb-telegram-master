@@ -60,6 +60,8 @@ class SlaveMessageProcessor(LocaleMixin):
         self.logger: logging.Logger = logging.getLogger(__name__)
         self.flag: utils.ExperimentalFlagsManager = self.channel.flag
         self.db: "DatabaseManager" = channel.db
+        self.chat_associations = channel.chat_associations
+        self.slave_chat_info = channel.slave_chat_info
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: ChatObjectCacheManager = channel.chat_manager
         self._pending_slave_messages: set[Tuple[str, str]] = set()
@@ -228,7 +230,7 @@ class SlaveMessageProcessor(LocaleMixin):
                         self.bot.reopen_forum_topic(chat_id=tg_dest, message_thread_id=thread_id)
                     except telegram.error.BadRequest as reopen_err:
                         self.logger.error("Failed to reopen topic (%s).", type(reopen_err).__name__)
-                        self.db.remove_topic_assoc(
+                        self.chat_associations.remove_topic_assoc(
                             topic_chat_id=tg_dest,
                             message_thread_id=thread_id,
                         )
@@ -378,7 +380,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
         chat_uid = utils.chat_id_to_str(chat=msg.chat)
         with self._timed_phase(xid, "Destination chat association lookup"):
-            tg_chats = self.db.get_chat_assoc(slave_uid=chat_uid)
+            tg_chats = self.chat_associations.get_chat_assoc(slave_uid=chat_uid)
         tg_chat = None
         tg_dest: Optional[TelegramChatID] = None
         thread_id: Optional[TelegramTopicID] = None
@@ -387,7 +389,7 @@ class SlaveMessageProcessor(LocaleMixin):
             tg_chat = tg_chats[0]
         singly_linked = True
         if tg_chat:
-            slaves = self.db.get_chat_assoc(master_uid=tg_chat)
+            slaves = self.chat_associations.get_chat_assoc(master_uid=tg_chat)
             if slaves and len(slaves) > 1:
                 singly_linked = False
                 self.logger.debug("[%s] Sender is linked with other chats in a Telegram group.", xid)
@@ -404,7 +406,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     tg_dest = TelegramChatID(self.channel.topic_group)
                 if self._get_master_chat_is_forum(xid, tg_dest):
                     with self._timed_phase(xid, f"Topic thread lookup for Telegram chat {tg_dest}"):
-                        existing_thread_id = self.db.get_topic_thread_id(
+                        existing_thread_id = self.chat_associations.get_topic_thread_id(
                             slave_uid=chat_uid,
                             topic_chat_id=tg_dest,
                         )
@@ -1428,7 +1430,7 @@ class SlaveMessageProcessor(LocaleMixin):
         if isinstance(status, ChatUpdates):
             self.logger.debug("Received chat updates from channel %s", status.channel)
             for i in status.removed_chats:
-                self.db.delete_slave_chat_info(status.channel.channel_id, i)
+                self.slave_chat_info.delete_slave_chat_info(status.channel.channel_id, i)
                 self.chat_manager.delete_chat_object(status.channel.channel_id, i)
             for i in itertools.chain(status.new_chats, status.modified_chats):
                 chat = status.channel.get_chat(i)
@@ -1436,7 +1438,7 @@ class SlaveMessageProcessor(LocaleMixin):
         elif isinstance(status, MemberUpdates):
             self.logger.debug("Received member updates from channel %s about group %s", status.channel, status.chat_id)
             for i in status.removed_members:
-                self.db.delete_slave_chat_info(status.channel.channel_id, i, status.chat_id)
+                self.slave_chat_info.delete_slave_chat_info(status.channel.channel_id, i, status.chat_id)
             self.chat_manager.delete_chat_members(status.channel.channel_id, status.chat_id, status.removed_members)
             chat = status.channel.get_chat(status.chat_id)
             self.chat_manager.update_chat_obj(chat, full_update=True)

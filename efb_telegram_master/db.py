@@ -4,54 +4,24 @@ import datetime
 import logging
 import pickle
 import time
-from functools import partial, wraps
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Protocol, Tuple
+from functools import partial
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot import utils
-from ehforwarderbot.types import ChatID, MessageID, ModuleID
+from ehforwarderbot.types import ChatID, MessageID
 from peewee import DoesNotExist, IntegrityError, PostgresqlDatabase, SqliteDatabase, fn
 from telegram import Message
 
+from .chat_association_repository import ChatAssociationRepository
+from .database_observability import DatabaseMetrics, observe_database_method
 from .message import ETMMsg
 from .models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, PickledDict, SlaveChatInfo, TopicAssoc, database
+from .slave_chat_info_repository import SlaveChatInfoRepository
 from .utils import EFBChannelChatIDStr, OldMsgID, TelegramChatID, TelegramMessageID, TelegramTopicID, TgChatMsgIDStr, chat_id_str_to_id, chat_id_to_str, message_id_to_str
 
 if TYPE_CHECKING:
     from . import TelegramChannel
-    from .chat import ETMChatMixin
-
-
-class DatabaseMetrics(Protocol):
-    """Metrics interface injected by the bot manager after construction."""
-
-    def record_database_method_call(self, method: str, seconds: float, outcome: str) -> None: ...
-
-
-def observe_database_method(method: str):
-    """Measure one public database operation with a statically bounded method label."""
-
-    def decorate(call: Callable):
-        @wraps(call)
-        def wrapped(manager: "DatabaseManager", *args, **kwargs):
-            started = time.perf_counter()
-            outcome = "success"
-            try:
-                return call(manager, *args, **kwargs)
-            except Exception:
-                outcome = "failure"
-                raise
-            finally:
-                metrics = getattr(manager, "_metrics", None)
-                if metrics is not None:
-                    try:
-                        metrics.record_database_method_call(method, time.perf_counter() - started, outcome)
-                    except Exception:
-                        manager.logger.exception("Unable to record database method metric: %s", method)
-
-        return wrapped
-
-    return decorate
 
 
 class DatabaseManager:
@@ -72,6 +42,8 @@ class DatabaseManager:
     def __init__(self, channel: "TelegramChannel"):
         self.channel: "TelegramChannel" = channel
         self._metrics: Optional[DatabaseMetrics] = None
+        self.chat_associations = ChatAssociationRepository()
+        self.slave_chat_info = SlaveChatInfoRepository()
         base_path = utils.get_data_path(channel.channel_id)
         self._base_path = base_path
 
@@ -117,6 +89,8 @@ class DatabaseManager:
     def set_metrics(self, metrics: DatabaseMetrics) -> None:
         """Attach the metrics recorder created after the database manager."""
         self._metrics = metrics
+        self.chat_associations._metrics = metrics
+        self.slave_chat_info._metrics = metrics
 
     @observe_database_method("stop_worker")
     def stop_worker(self):
@@ -187,48 +161,6 @@ class DatabaseManager:
                 state_summary,
             )
 
-    @observe_database_method("add_chat_assoc")
-    def add_chat_assoc(self, master_uid: EFBChannelChatIDStr, slave_uid: EFBChannelChatIDStr, multiple_slave: bool = False):
-        """
-        Add chat associations (chat links).
-        One Master channel with many Slave channel.
-
-        Args:
-            master_uid (str): Master chat UID ("%(chat_id)s")
-            slave_uid (str): Slave channel UID ("%(channel_id)s.%(chat_id)s")
-            multiple_slave: Allow linking to multiple slave channels.
-        """
-        if not multiple_slave:
-            self.remove_chat_assoc(master_uid=master_uid)
-        self.remove_chat_assoc(slave_uid=slave_uid)
-        return ChatAssoc.create(master_uid=master_uid, slave_uid=slave_uid)
-
-    @observe_database_method("remove_chat_assoc")
-    def remove_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None, slave_uid: Optional[EFBChannelChatIDStr] = None):
-        """
-        Remove chat associations (chat links).
-        Only one parameter is to be provided.
-
-        Args:
-            master_uid (str): Master chat UID ("%(chat_id)s")
-            slave_uid (str): Slave channel UID ("%(channel_id)s.%(chat_id)s")
-        """
-        try:
-            if bool(master_uid) == bool(slave_uid):
-                raise ValueError("Only one parameter is to be provided.")
-            elif master_uid:
-                slave_uids = [row.slave_uid for row in ChatAssoc.select(ChatAssoc.slave_uid).where(ChatAssoc.master_uid == master_uid)]
-                result = ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
-                if slave_uids:
-                    TopicAssoc.delete().where(TopicAssoc.slave_uid.in_(slave_uids)).execute()
-                return result
-            elif slave_uid:
-                result = ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
-                TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
-                return result
-        except DoesNotExist:
-            return 0
-
     @observe_database_method("get_master_msg_id")
     def get_master_msg_id(self, message: EFBMessage) -> Optional[TgChatMsgIDStr]:
         """Get master message ID from a message object."""
@@ -270,118 +202,6 @@ class DatabaseManager:
         if data:
             return pickle.dumps(data)
         return None
-
-    @observe_database_method("get_chat_assoc")
-    def get_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None, slave_uid: Optional[EFBChannelChatIDStr] = None) -> List[EFBChannelChatIDStr]:
-        """
-        Get chat association (chat link) information.
-        Only one parameter is to be provided.
-
-        Args:
-            master_uid (str): Master channel UID ("%(chat_id)s")
-            slave_uid (str): Slave channel UID ("%(channel_id)s.%(chat_id)s")
-
-        Returns:
-            list: The counterpart ID.
-        """
-        try:
-            if bool(master_uid) == bool(slave_uid):
-                raise ValueError("Only one parameter is to be provided.")
-            elif master_uid:
-                slaves = list(ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid).where(ChatAssoc.master_uid == master_uid))
-                return [EFBChannelChatIDStr(i.slave_uid) for i in slaves]
-            elif slave_uid:
-                masters = list(ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid).where(ChatAssoc.slave_uid == slave_uid))
-                return [EFBChannelChatIDStr(i.master_uid) for i in masters]
-            else:
-                return []
-        except DoesNotExist:
-            return []
-
-    @observe_database_method("add_topic_assoc")
-    def add_topic_assoc(
-        self,
-        topic_chat_id: TelegramChatID,
-        message_thread_id: TelegramTopicID,
-        slave_uid: EFBChannelChatIDStr,
-    ):
-        """
-        Add topic associations (topic links).
-        One Master channel with many Slave channel.
-
-        Args:
-            topic_chat_id (TelegramChatID): The topic group chat ID
-            message_thread_id (EFBChannelChatIDStr): The topic thread ID
-            slave_uid (EFBChannelChatIDStr): Slave channel UID ("%(channel_id)s.%(chat_id)s")
-        """
-        self.remove_topic_assoc(slave_uid=slave_uid)
-        self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
-        return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
-
-    @observe_database_method("get_topic_thread_id")
-    def get_topic_thread_id(self, slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
-        """
-        Get topic association (topic link) information.
-        Only one parameter is to be provided.
-
-        Args:
-            topic_chat_id (TelegramChatID): The topic UID
-            slave_uid (EFBChannelChatIDStr): Slave channel UID ("%(channel_id)s.%(chat_id)s")
-
-        Returns:
-            The message thread_id
-        """
-        try:
-            if topic_chat_id:
-                assoc = (
-                    TopicAssoc.select(TopicAssoc.message_thread_id)
-                    .where(TopicAssoc.slave_uid == slave_uid, TopicAssoc.topic_chat_id == topic_chat_id)
-                    .order_by(TopicAssoc.topic_chat_id.desc())
-                    .first()
-                )
-            else:
-                assoc = TopicAssoc.select(TopicAssoc.message_thread_id).where(TopicAssoc.slave_uid == slave_uid).order_by(TopicAssoc.topic_chat_id.desc()).first()
-            if assoc:
-                return TelegramTopicID(int(assoc.message_thread_id))
-        except DoesNotExist:
-            pass
-        return None
-
-    @observe_database_method("get_topic_slave")
-    def get_topic_slave(
-        self,
-        topic_chat_id: TelegramChatID,
-        message_thread_id: Optional[TelegramTopicID] = None,
-    ) -> Optional[EFBChannelChatIDStr]:
-        """
-        Get topic association (topic link) information.
-        Only one parameter is to be provided.
-
-        Args:
-            topic_chat_id (TelegramChatID): The topic chat UID
-            message_thread_id (TelegramTopicID): The message thread ID
-
-        Returns:
-            Slave channel UID ("%(channel_id)s.%(chat_id)s")
-        """
-        try:
-            if message_thread_id:
-                return TopicAssoc.select(TopicAssoc.slave_uid).where(TopicAssoc.message_thread_id == message_thread_id, TopicAssoc.topic_chat_id == topic_chat_id).first().slave_uid
-            else:
-                return TopicAssoc.select(TopicAssoc.slave_uid).where(TopicAssoc.topic_chat_id == topic_chat_id).first().slave_uid
-        except DoesNotExist:
-            return None
-        except AttributeError:
-            return None
-
-    def get_topic_assoc_slave_uid(
-        self,
-        source_chat_id: int,
-        topic_id: int,
-    ) -> Optional[EFBChannelChatIDStr]:
-        """Return the slave chat bound to one source forum topic."""
-        assoc = TopicAssoc.get_or_none((TopicAssoc.topic_chat_id == str(source_chat_id)) & (TopicAssoc.message_thread_id == str(topic_id)))
-        return EFBChannelChatIDStr(assoc.slave_uid) if assoc is not None else None
 
     def get_or_create_msglog_ingestion_scan(
         self,
@@ -534,46 +354,6 @@ class DatabaseManager:
                 scan.__data__.update(current.__data__)
             return updated == 1
 
-    @observe_database_method("get_topic_slaves")
-    def get_topic_slaves(self, topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
-        """
-        Get topic association (topic link) information.
-        Only one parameter is to be provided.
-
-        Args:
-            topic_chat_id (TelegramChatID): The topic UID
-
-        Returns:
-            List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]: A list of tuples containing slave channel UID and message thread ID
-        """
-        try:
-            query = TopicAssoc.select(TopicAssoc.slave_uid, TopicAssoc.message_thread_id).where(TopicAssoc.topic_chat_id == topic_chat_id).order_by(getattr(TopicAssoc, "id").desc())
-            return [(EFBChannelChatIDStr(row.slave_uid), TelegramTopicID(int(row.message_thread_id))) for row in query]
-        except DoesNotExist:
-            return None
-        except AttributeError:
-            return None
-
-    @observe_database_method("remove_topic_assoc")
-    def remove_topic_assoc(self, topic_chat_id: Optional[TelegramChatID] = None, message_thread_id: Optional[TelegramTopicID] = None, slave_uid: Optional[EFBChannelChatIDStr] = None):
-        """
-        Remove topic association (topic link).
-
-        Args:
-            topic_chat_id (TelegramChatID): The topic group chat ID
-            message_thread_id (EFBChannelChatIDStr): The topic thread ID
-            slave_uid (EFBChannelChatIDStr): Slave channel UID ("%(channel_id)s.%(chat_id)s")
-        """
-        try:
-            if bool(topic_chat_id and message_thread_id) == bool(slave_uid):
-                raise ValueError("Please provide either topic_chat_id and message_thread_id or slave_uid.")
-            elif topic_chat_id and message_thread_id:
-                return TopicAssoc.delete().where((TopicAssoc.topic_chat_id == str(topic_chat_id)) & (TopicAssoc.message_thread_id == str(message_thread_id))).execute()
-            elif slave_uid:
-                return TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
-        except DoesNotExist:
-            return 0
-
     @observe_database_method("add_or_update_message_log")
     def add_or_update_message_log(self, msg: ETMMsg, master_message: Message, old_message_id: Optional[OldMsgID] = None, sender_bot_id: Optional[str] = None):
         """Add or update a message into the database."""
@@ -667,78 +447,6 @@ class DatabaseManager:
                 MsgLog.delete().where((MsgLog.slave_message_id == slave_msg_id) & (MsgLog.slave_origin_uid == slave_origin_uid)).execute()
         except DoesNotExist:
             return
-
-    @observe_database_method("get_slave_chat_info")
-    def get_slave_chat_info(self, slave_channel_id: Optional[ModuleID] = None, slave_chat_uid: Optional[ChatID] = None, slave_chat_group_id: Optional[ChatID] = None) -> Optional[SlaveChatInfo]:
-        """
-        Get cached slave chat info from database.
-
-        Returns:
-            SlaveChatInfo|None: The matching slave chat info, None if not exist.
-        """
-        if slave_channel_id is None or slave_chat_uid is None:
-            raise ValueError("Both slave_channel_id and slave_chat_id should be provided.")
-        try:
-            return (
-                SlaveChatInfo.select()
-                .where((SlaveChatInfo.slave_channel_id == slave_channel_id) & (SlaveChatInfo.slave_chat_uid == slave_chat_uid) & (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id))
-                .first()
-            )
-        except DoesNotExist:
-            return None
-
-    @observe_database_method("set_slave_chat_info")
-    def set_slave_chat_info(self, chat_object: "ETMChatMixin") -> SlaveChatInfo:
-        """
-        Insert or update slave chat info entry
-
-        Args:
-            chat_object (ETMChatMixin): Chat object for pickling
-
-        Returns:
-            SlaveChatInfo: The inserted or updated row
-        """
-        slave_channel_id = chat_object.module_id
-        slave_channel_emoji = chat_object.channel_emoji
-        slave_chat_uid = chat_object.uid
-        slave_chat_name = chat_object.name
-        slave_chat_alias = chat_object.alias
-        slave_chat_type = chat_object.chat_type_name
-        parent_chat: Optional["ETMChatMixin"] = getattr(chat_object, "chat", None)
-        slave_chat_group_id: Optional[ChatID]
-        if parent_chat:
-            slave_chat_group_id = parent_chat.uid
-        else:
-            slave_chat_group_id = None
-
-        chat_info = self.get_slave_chat_info(slave_channel_id=slave_channel_id, slave_chat_uid=slave_chat_uid, slave_chat_group_id=slave_chat_group_id)
-        if chat_info is not None:
-            chat_info.slave_channel_emoji = slave_channel_emoji
-            chat_info.slave_chat_name = slave_chat_name
-            chat_info.slave_chat_alias = slave_chat_alias
-            chat_info.slave_chat_type = slave_chat_type
-            chat_info.pickle = chat_object.pickle
-            chat_info.save()
-            return chat_info
-        else:
-            return SlaveChatInfo.create(
-                slave_channel_id=slave_channel_id,
-                slave_channel_emoji=slave_channel_emoji,
-                slave_chat_uid=slave_chat_uid,
-                slave_chat_group_id=slave_chat_group_id,
-                slave_chat_name=slave_chat_name,
-                slave_chat_alias=slave_chat_alias,
-                slave_chat_type=slave_chat_type,
-                pickle=chat_object.pickle,
-            )
-
-    @observe_database_method("delete_slave_chat_info")
-    def delete_slave_chat_info(self, slave_channel_id: ModuleID, slave_chat_uid: ChatID, slave_chat_group_id: Optional[ChatID] = None):
-        return (
-            SlaveChatInfo.delete()
-            .where((SlaveChatInfo.slave_channel_id == slave_channel_id) & (SlaveChatInfo.slave_chat_uid == slave_chat_uid) & (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id))
-            .execute()
-        )
 
     @observe_database_method("get_recent_slave_chats")
     def get_recent_slave_chats(self, master_chat_id: TelegramChatID, limit=5) -> List[EFBChannelChatIDStr]:

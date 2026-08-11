@@ -176,7 +176,8 @@ def test_forum_destination_uses_cached_chat_info_until_ttl() -> None:
 
     processor.channel = SimpleNamespace(config={"admins": [1]}, topic_group=-100999, chat_binding=SimpleNamespace(create_topic=Mock(return_value=55)))
     processor.bot = SimpleNamespace(get_chat_info=Mock(return_value=SimpleNamespace(is_forum=True)))
-    processor.db = SimpleNamespace(get_chat_assoc=Mock(side_effect=get_chat_assoc), get_topic_thread_id=Mock(return_value=55))
+    processor.db = SimpleNamespace()
+    processor.chat_associations = SimpleNamespace(get_chat_assoc=Mock(side_effect=get_chat_assoc), get_topic_thread_id=Mock(return_value=55))
     processor.chat_manager = SimpleNamespace(update_chat_obj=lambda chat: chat, get_or_enrol_member=lambda chat, author: author)
     processor.chat_dest_cache = SimpleNamespace(get=Mock(return_value=chat_uid), remove=Mock())
     processor.generate_message_template = Mock(return_value="template")

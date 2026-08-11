@@ -143,7 +143,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         assert routed_message.text == marker
 
         live_rows = [await _wait_for_msg_log(channel, master_msg_id) for master_msg_id in source_log_ids]
-        expected_slave_uid = channel.db.get_topic_slave(bot_topic_group, topic_id)
+        expected_slave_uid = channel.chat_associations.get_topic_slave(bot_topic_group, topic_id)
         assert expected_slave_uid is not None
         assert [(row.master_msg_id, row.text, row.slave_origin_uid, row.provenance) for row in live_rows] == [
             (source_log_ids[0], marker, expected_slave_uid, "live"),
@@ -189,7 +189,7 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
         for message_id in logged_message_ids:
             channel.db.delete_msg_log(master_msg_id=message_id)
         if topic_id is not None:
-            channel.db.remove_topic_assoc(bot_topic_group, topic_id)
+            channel.chat_associations.remove_topic_assoc(bot_topic_group, topic_id)
             with suppress(Exception):
                 channel.bot_manager._bot.delete_forum_topic(
                     chat_id=bot_topic_group,

@@ -108,6 +108,7 @@ class ChatBindingManager(LocaleMixin):
         self.bot: "TelegramAPI" = channel.bot_manager.api
         self.runtime = channel.telegram_runtime
         self.db: "DatabaseManager" = channel.db
+        self.chat_associations = channel.chat_associations
         self.chat_manager: "ChatObjectCacheManager" = channel.chat_manager
         self._topic_mutex = threading.Lock()
         self._history_migration_lock = threading.Lock()
@@ -286,7 +287,7 @@ class ChatBindingManager(LocaleMixin):
             if message.message_thread_id:
                 topic = message.message_thread_id
                 if topic:
-                    slave_origin_uid = self.db.get_topic_slave(topic_chat_id=TelegramChatID(message.chat_id), message_thread_id=TelegramTopicID(topic))
+                    slave_origin_uid = self.chat_associations.get_topic_slave(topic_chat_id=TelegramChatID(message.chat_id), message_thread_id=TelegramTopicID(topic))
                     if slave_origin_uid:
                         channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_origin_uid)
                         topic_chat: ETMChatMixin = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
@@ -298,12 +299,12 @@ class ChatBindingManager(LocaleMixin):
                         return self.build_link_action_message(topic_chat, topic_tg_chat_id, topic_tg_msg_id)
 
         if message.chat.type != ChatType.PRIVATE:
-            links = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(message.chat.id))))
+            links = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(message.chat.id))))
             if links:
                 return self.link_chat_gen_list(TelegramChatID(message.chat.id), pattern=" ".join(args), chats=links, filter_availability=False)
         elif (forwarded_chat := get_forwarded_chat(message)) and forwarded_chat.type == ChatType.CHANNEL:
             chat_id = ChatID(str(forwarded_chat.id))
-            links = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, chat_id))
+            links = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, chat_id))
             if links:
                 return self.link_chat_gen_list(TelegramChatID(message.chat.id), pattern=" ".join(args), chats=links, filter_availability=False)
         assert message.from_user
@@ -665,7 +666,7 @@ class ChatBindingManager(LocaleMixin):
         msg = self.bot.send_message(tg_chat_to_link.id, text=txt)
 
         chat.link(self.channel.channel_id, ChatID(str(tg_chat_to_link.id)), self.channel.flag("multiple_slave_chats"))
-        self.db.remove_topic_assoc(
+        self.chat_associations.remove_topic_assoc(
             slave_uid=chat_uid,
         )
 
@@ -779,11 +780,11 @@ class ChatBindingManager(LocaleMixin):
         assert update.message
 
         if update.message.chat.type != ChatType.PRIVATE:
-            links = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(update.message.chat.id))))
+            links = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(update.message.chat.id))))
             if len(links) < 1:
                 return self.bot.send_message(update.message.chat.id, self._("No chat is linked to the group."), reply_to_message_id=update.message.message_id)
             else:
-                self.db.remove_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(update.message.chat.id))))
+                self.chat_associations.remove_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(update.message.chat.id))))
                 return self.bot.send_message(
                     update.message.chat.id,
                     self.ngettext("All {0} chat has been unlinked from this group.", "All {0} chats has been unlinked from this group.", len(links)).format(len(links)),
@@ -792,12 +793,12 @@ class ChatBindingManager(LocaleMixin):
         else:
             forwarded_chat = get_forwarded_chat(update.message)
             if forwarded_chat and forwarded_chat.type == ChatType.CHANNEL:
-                links = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(forwarded_chat.id))))
+                links = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(forwarded_chat.id))))
 
                 if len(links) < 1:
                     return self.bot.send_message(update.message.chat.id, self._("No chat is linked to the channel."), reply_to_message_id=update.message.message_id)
                 else:
-                    self.db.remove_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(forwarded_chat.id))))
+                    self.chat_associations.remove_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(forwarded_chat.id))))
                     return self.bot.send_message(
                         update.message.chat.id,
                         self.ngettext("All {0} chat has been unlinked from this channel.", "All {0} chats has been unlinked from this channel.", len(links)).format(len(links)),
@@ -819,7 +820,7 @@ class ChatBindingManager(LocaleMixin):
         args = context.args or []
         chats = None
         if update.message.chat.type != ChatType.PRIVATE:
-            chats = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(update.message.chat_id))))
+            chats = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(update.message.chat_id))))
             chats = chats or None
         if chats:
             target = TelegramChatID(update.message.chat_id)
@@ -1032,7 +1033,7 @@ class ChatBindingManager(LocaleMixin):
         else:
             tg_chat = update.effective_chat
 
-        chats = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(channel=self.channel, chat_uid=ChatID(str(tg_chat.id))))
+        chats = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(channel=self.channel, chat_uid=ChatID(str(tg_chat.id))))
 
         if tg_chat.is_forum and len(chats) > 1:
             try:
@@ -1160,7 +1161,7 @@ class ChatBindingManager(LocaleMixin):
         Returns:
             Tuple[bool, str, int]: (success, message, updated_count)
         """
-        topic_slaves = self.db.get_topic_slaves(topic_chat_id=tg_chat_id)
+        topic_slaves = self.chat_associations.get_topic_slaves(topic_chat_id=tg_chat_id)
         if not topic_slaves:
             return False, self._("No topics found in this forum group."), 0
 
@@ -1275,7 +1276,7 @@ class ChatBindingManager(LocaleMixin):
         # Check if main bot was removed
         if left_member_id == self._get_bot_user().id:
             chat_id = ChatID(str(message.chat.id))
-            self.db.remove_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, chat_id))
+            self.chat_associations.remove_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, chat_id))
             return
 
         # Check if an auxiliary bot was removed
@@ -1290,7 +1291,7 @@ class ChatBindingManager(LocaleMixin):
         thread_id = update.effective_message.message_thread_id
         if not thread_id:
             return self.bot.reply_error(update, self._("No topic found."))
-        slave_origin_uid = self.db.get_topic_slave(topic_chat_id=TelegramChatID(update.effective_message.chat_id), message_thread_id=TelegramTopicID(thread_id) if thread_id else None)
+        slave_origin_uid = self.chat_associations.get_topic_slave(topic_chat_id=TelegramChatID(update.effective_message.chat_id), message_thread_id=TelegramTopicID(thread_id) if thread_id else None)
         if not slave_origin_uid:
             return self.bot.reply_error(update, self._("This topic is not managed by this bot. Update failed"))
         channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_origin_uid)
@@ -1332,22 +1333,22 @@ class ChatBindingManager(LocaleMixin):
         assert update.effective_message
 
         message = update.effective_message
-        chats = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(message.chat.id))))
+        chats = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(message.chat.id))))
         for i in chats:
             self.create_topic(slave_uid=i, telegram_chat_id=TelegramChatID(message.chat.id))
 
     def create_topic(self, slave_uid: EFBChannelChatIDStr, telegram_chat_id: TelegramChatID) -> Optional[TelegramTopicID]:
-        thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
+        thread_id = self.chat_associations.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
         if not thread_id:
             with self._topic_mutex:
-                thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
+                thread_id = self.chat_associations.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
                 if not thread_id:
                     channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
                     chat: ETMChatMixin = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                     try:
                         topic = self.bot.create_forum_topic(chat_id=telegram_chat_id, name=chat.chat_title)
                         thread_id = TelegramTopicID(topic.message_thread_id)
-                        self.db.add_topic_assoc(
+                        self.chat_associations.add_topic_assoc(
                             topic_chat_id=telegram_chat_id,
                             message_thread_id=thread_id,
                             slave_uid=slave_uid,
@@ -1381,9 +1382,9 @@ class ChatBindingManager(LocaleMixin):
     def chat_migration_by_id(self, from_id, to_id):
         from_str = utils.chat_id_to_str(self.channel.channel_id, from_id)
         to_str = utils.chat_id_to_str(self.channel.channel_id, to_id)
-        for i in self.db.get_chat_assoc(master_uid=from_str):
-            self.db.add_chat_assoc(master_uid=to_str, slave_uid=i, multiple_slave=True)
-        self.db.remove_chat_assoc(master_uid=from_str)
+        for i in self.chat_associations.get_chat_assoc(master_uid=from_str):
+            self.chat_associations.add_chat_assoc(master_uid=to_str, slave_uid=i, multiple_slave=True)
+        self.chat_associations.remove_chat_assoc(master_uid=from_str)
 
     def migrate_chat_history(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Migrate historical messages to the newly linked chat.
@@ -1433,7 +1434,7 @@ class ChatBindingManager(LocaleMixin):
     def _run_msglog_ingestion(self, source_chat_id: int) -> None:
         try:
             self.runtime.async_runtime.call(
-                MsgLogIngestionService(self.db, self.channel.mtproto).run(
+                MsgLogIngestionService(self.db, self.chat_associations, self.channel.mtproto).run(
                     source_chat_id,
                     lease_owner=str(uuid.uuid4()),
                 )
@@ -1449,7 +1450,7 @@ class ChatBindingManager(LocaleMixin):
             return
         for scan in scans:
             source_chat_id = int(scan.source_chat_id)
-            if self.db.get_topic_slaves(TelegramChatID(source_chat_id)):
+            if self.chat_associations.get_topic_slaves(TelegramChatID(source_chat_id)):
                 self.schedule_msglog_ingestion(source_chat_id)
 
     def resume_pending_history_migrations(self):
