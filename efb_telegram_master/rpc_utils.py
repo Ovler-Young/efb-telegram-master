@@ -11,10 +11,12 @@ if TYPE_CHECKING:
 class RPCUtilities:
     """Useful functions exposed to RPC server"""
 
-    server: Optional[SimpleXMLRPCServer] = None
-
     def __init__(self, channel: "TelegramChannel"):
         self.channel = channel
+        self.server: Optional[SimpleXMLRPCServer] = None
+        self.thread: Optional[threading.Thread] = None
+        self._shutdown_lock = threading.Lock()
+        self._stopped = False
 
         rpc_config = self.channel.config.get("rpc")
         if not rpc_config:
@@ -34,12 +36,22 @@ class RPCUtilities:
         self.server.register_instance(self.channel.db)
         self.server.register_function(self.get_slave_channels_ids)
 
-        threading.Thread(target=self.server.serve_forever, name="ETM RPC server thread")
+        self.thread = threading.Thread(target=self.server.serve_forever, name="ETM RPC server thread", daemon=True)
+        self.thread.start()
 
     def shutdown(self):
         """Shutdown RPC server if running."""
-        if self.server:
-            self.server.shutdown()
+        with self._shutdown_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            server, thread = self.server, self.thread
+        if server is not None:
+            if thread is not None and thread.is_alive():
+                server.shutdown()
+            server.server_close()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1)
 
     @staticmethod
     def get_slave_channels_ids() -> List[str]:

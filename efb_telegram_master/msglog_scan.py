@@ -32,7 +32,7 @@ class MsgLogScanScheduler:
         with self._lock:
             if self._stopping:
                 return "stopping"
-            if not self.mtproto.enabled or not self.mtproto.connected:
+            if not self.mtproto.enabled:
                 return "unavailable"
             existing = self._threads.get(source_chat_id)
             if existing is not None and existing.is_alive():
@@ -62,13 +62,7 @@ class MsgLogScanScheduler:
 
     def _run(self, source_chat_id: int, lease_owner: str) -> None:
         try:
-            self.runtime.async_runtime.call(
-                MsgLogIngestionService(self.ingestion, self.chat_associations, self.mtproto).run(
-                    source_chat_id,
-                    lease_owner=lease_owner,
-                    stop_requested=self._stop_event.is_set,
-                )
-            )
+            self.runtime.async_runtime.call(self._run_ingestion(source_chat_id, lease_owner))
         except BaseException as error:
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id, exc_info=error)
         finally:
@@ -81,6 +75,14 @@ class MsgLogScanScheduler:
                 if self._owners.get(source_chat_id) == lease_owner:
                     self._threads.pop(source_chat_id, None)
                     self._owners.pop(source_chat_id, None)
+
+    async def _run_ingestion(self, source_chat_id: int, lease_owner: str) -> None:
+        await self.mtproto.connect()
+        await MsgLogIngestionService(self.ingestion, self.chat_associations, self.mtproto).run(
+            source_chat_id,
+            lease_owner=lease_owner,
+            stop_requested=self._stop_event.is_set,
+        )
 
     def resume(self) -> None:
         try:

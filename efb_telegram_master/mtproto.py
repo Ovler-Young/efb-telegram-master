@@ -1,5 +1,6 @@
 """Request-only MTProto operations used alongside the Bot API client."""
 
+import asyncio
 import os
 import threading
 from collections.abc import Mapping, Sequence
@@ -108,6 +109,7 @@ class MTProtoClient:
         self._client: TelethonClient | None = None
         self._owns_session = False
         self._session_lock_fd: int | None = None
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -137,40 +139,47 @@ class MTProtoClient:
         return self.session_path.with_suffix(".session")
 
     async def connect(self) -> None:
-        if not self.enabled or self._client is not None:
+        if not self.enabled:
             return
-        self._prepare_session_directory()
-        self._claim_session()
-        try:
-            self._client = self._build_telethon_client(self.session_path, self.config)
-            await self._client.connect()
-            await self._client.start(bot_token=self._bot_token)
-            self._protect_session_file()
-        except BaseException as error:
-            if self._client is not None:
+        async with self._lifecycle_lock:
+            client = self._client
+            if client is not None and client.is_connected():
+                return
+            if client is None:
+                self._prepare_session_directory()
+                self._claim_session()
+            try:
+                if client is None:
+                    client = self._build_telethon_client(self.session_path, self.config)
+                    self._client = client
+                await client.connect()
+                await client.start(bot_token=self._bot_token)
+                self._protect_session_file()
+            except BaseException as error:
                 try:
-                    await self._client.disconnect()
+                    await client.disconnect()
                 except BaseException:
                     pass
-            self._client = None
-            self._protect_session_file()
-            self._release_session()
-            translated = translate_mtproto_error(error)
-            if translated is error:
-                raise
-            raise translated from error
+                self._client = None
+                self._protect_session_file()
+                self._release_session()
+                translated = translate_mtproto_error(error)
+                if translated is error:
+                    raise
+                raise translated from error
 
     async def disconnect(self) -> None:
-        if self._client is None:
-            self._release_session()
-            return
-        try:
-            if self._client.is_connected():
-                await self._client.disconnect()
-        finally:
-            self._protect_session_file()
-            self._client = None
-            self._release_session()
+        async with self._lifecycle_lock:
+            if self._client is None:
+                self._release_session()
+                return
+            try:
+                if self._client.is_connected():
+                    await self._client.disconnect()
+            finally:
+                self._protect_session_file()
+                self._client = None
+                self._release_session()
 
     async def get_channel_messages(self, channel: object, message_ids: Sequence[int]) -> list[object]:
         """Request channel messages in ascending batches accepted by channels.getMessages."""
