@@ -158,6 +158,29 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
     _cleanup_link_state(channel, chat, bot_group)
 
 
+@pytest.mark.parametrize(("override", "expected_backfill"), [("yes", True), ("no", False)])
+def test_link_chat_accepts_yes_no_backfill_aliases(channel, slave, bot_group, override, expected_backfill):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(130))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
+    channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
+    update = _build_link_update(bot_group)
+
+    with (
+        patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 530)),
+        patch.object(channel.bot_manager, "edit_message_text"),
+        patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history,
+        patch.object(channel.chat_binding, "send_history_link") as send_history_link,
+    ):
+        channel.chat_binding.link_chat(update, [token, override])
+
+    assert migrate_chat_history.called is expected_backfill
+    send_history_link.assert_not_called()
+    _cleanup_link_state(channel, chat, bot_group)
+
+
 def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(104))

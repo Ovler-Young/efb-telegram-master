@@ -1,9 +1,15 @@
 """Request-only MTProto operations used alongside the Bot API client."""
 
+import asyncio
+import os
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
+
+_session_owners: set[Path] = set()
+_session_owners_lock = threading.Lock()
 
 
 class TelethonClient(Protocol):
@@ -60,6 +66,10 @@ class MTProtoRetryableError(RuntimeError):
     """A Telethon request failure that can be retried by the MsgLog scan."""
 
 
+class MTProtoSessionOwnershipError(MTProtoRetryableError):
+    """Raised when another client owns the configured Telethon session."""
+
+
 def translate_mtproto_error(error: BaseException) -> BaseException:
     """Map Telethon transport and rate-limit failures to adapter-owned errors."""
     error_name = type(error).__name__
@@ -97,6 +107,9 @@ class MTProtoClient:
         self._bot_token = bot_token
         self._database_base_path = Path(database_base_path)
         self._client: TelethonClient | None = None
+        self._owns_session = False
+        self._session_lock_fd: int | None = None
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -121,34 +134,53 @@ class MTProtoClient:
     def session_path(self) -> Path:
         return self.session_directory / self._SESSION_NAME
 
+    @property
+    def session_file(self) -> Path:
+        return self.session_path.with_suffix(".session")
+
     async def connect(self) -> None:
-        if not self.enabled or self._client is not None:
+        if not self.enabled:
             return
-        self.session_directory.mkdir(parents=True, exist_ok=True)
-        try:
-            self._client = self._build_telethon_client(self.session_path, self.config)
-            await self._client.connect()
-            await self._client.start(bot_token=self._bot_token)
-        except BaseException as error:
-            if self._client is not None:
+        async with self._lifecycle_lock:
+            client = self._client
+            if client is not None and client.is_connected():
+                return
+            if client is None:
+                self._prepare_session_directory()
+                self._claim_session()
+            try:
+                if client is None:
+                    client = self._build_telethon_client(self.session_path, self.config)
+                    self._client = client
+                await client.connect()
+                await client.start(bot_token=self._bot_token)
+                self._protect_session_file()
+            except BaseException as error:
                 try:
-                    await self._client.disconnect()
+                    if client is not None:
+                        await client.disconnect()
                 except BaseException:
                     pass
-            self._client = None
-            translated = translate_mtproto_error(error)
-            if translated is error:
-                raise
-            raise translated from error
+                self._client = None
+                self._protect_session_file()
+                self._release_session()
+                translated = translate_mtproto_error(error)
+                if translated is error:
+                    raise
+                raise translated from error
 
     async def disconnect(self) -> None:
-        if self._client is None:
-            return
-        try:
-            if self._client.is_connected():
-                await self._client.disconnect()
-        finally:
-            self._client = None
+        async with self._lifecycle_lock:
+            if self._client is None:
+                self._release_session()
+                return
+            try:
+                if self._client.is_connected():
+                    await self._client.disconnect()
+            finally:
+                self._protect_session_file()
+                self._client = None
+                self._release_session()
 
     async def get_channel_messages(self, channel: object, message_ids: Sequence[int]) -> list[object]:
         """Request channel messages in ascending batches accepted by channels.getMessages."""
@@ -183,6 +215,54 @@ class MTProtoClient:
             if translated is error:
                 raise
             raise translated from error
+
+    def _prepare_session_directory(self) -> None:
+        self.session_directory.mkdir(parents=True, exist_ok=True)
+        self._chmod(self.session_directory, 0o700)
+
+    def _protect_session_file(self) -> None:
+        if self.session_file.exists():
+            self._chmod(self.session_file, 0o600)
+
+    def _claim_session(self) -> None:
+        session_path = self.session_path.resolve()
+        with _session_owners_lock:
+            if session_path in _session_owners:
+                raise MTProtoSessionOwnershipError("MTProto session is already owned by this process")
+            _session_owners.add(session_path)
+            self._owns_session = True
+        try:
+            lock_path = self.session_directory / "owner.lock"
+            self._session_lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            self._chmod(lock_path, 0o600)
+            if os.name == "posix":
+                import fcntl
+
+                fcntl.flock(self._session_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException as error:
+            self._release_session()
+            raise MTProtoSessionOwnershipError("MTProto session is already owned by another process") from error
+
+    def _release_session(self) -> None:
+        if not self._owns_session:
+            return
+        with _session_owners_lock:
+            _session_owners.discard(self.session_path.resolve())
+            self._owns_session = False
+        if self._session_lock_fd is not None:
+            try:
+                if os.name == "posix":
+                    import fcntl
+
+                    fcntl.flock(self._session_lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._session_lock_fd)
+                self._session_lock_fd = None
+
+    @staticmethod
+    def _chmod(path: Path, mode: int) -> None:
+        if os.name == "posix":
+            path.chmod(mode)
 
     @staticmethod
     def _build_telethon_client(session_path: Path, config: MTProtoConfig) -> TelethonClient:

@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -10,6 +11,7 @@ from efb_telegram_master.mtproto import (
     MTProtoClient,
     MTProtoConfig,
     MTProtoRetryableError,
+    MTProtoSessionOwnershipError,
     translate_mtproto_error,
 )
 
@@ -17,11 +19,14 @@ from efb_telegram_master.mtproto import (
 class FakeClient:
     def __init__(self, session_path: Path, _config: MTProtoConfig):
         self.connected = False
+        self.connect_calls = 0
         self.requests: list[object] = []
         self.session_path = session_path
 
     async def connect(self) -> None:
+        self.connect_calls += 1
         self.connected = True
+        self.session_path.with_suffix(".session").touch()
 
     async def start(self, *, bot_token: str) -> None:
         assert bot_token == "bot-token"
@@ -52,6 +57,12 @@ class LifecycleMTProto:
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
         self.connected = False
+
+
+class FailingLifecycleMTProto(LifecycleMTProto):
+    async def connect(self) -> None:
+        self.connect_calls += 1
+        raise MTProtoSessionOwnershipError("session owned")
 
 
 def enabled_config() -> MTProtoConfig:
@@ -117,6 +128,24 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
 
 
 @pytest.mark.asyncio
+async def test_bot_lifecycle_leaves_polling_available_when_mtproto_session_is_owned():
+    mtproto = FailingLifecycleMTProto()
+    auxiliary = Mock()
+    channel = SimpleNamespace(
+        bot_manager=SimpleNamespace(bot_pool=SimpleNamespace(bots=[auxiliary])),
+        mtproto=mtproto,
+        chat_binding=SimpleNamespace(resume_pending_msglog_ingestions=Mock()),
+        logger=Mock(),
+    )
+
+    await TelegramChannel._telegram_runtime_started(channel, SimpleNamespace(async_runtime=Mock()))
+
+    auxiliary.bind_runtime.assert_called_once()
+    channel.chat_binding.resume_pending_msglog_ingestions.assert_not_called()
+    channel.logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_get_messages_builds_ascending_batches_of_at_most_100(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(MTProtoClient, "_build_telethon_client", staticmethod(FakeClient))
     client = MTProtoClient(enabled_config(), "bot-token", tmp_path)
@@ -131,6 +160,41 @@ async def test_get_messages_builds_ascending_batches_of_at_most_100(monkeypatch:
     ]
     assert len(responses) == 205
     await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_mtproto_reconnects_an_existing_disconnected_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr(MTProtoClient, "_build_telethon_client", staticmethod(FakeClient))
+    client = MTProtoClient(enabled_config(), "bot-token", tmp_path)
+    await client.connect()
+    existing_client = client.client
+    existing_client.connected = False
+
+    await client.connect()
+
+    assert client.client is existing_client
+    assert existing_client.connect_calls == 2
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX session permissions and file locking")
+async def test_mtproto_session_has_one_owner_and_releases_it_after_disconnect(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr(MTProtoClient, "_build_telethon_client", staticmethod(FakeClient))
+    first = MTProtoClient(enabled_config(), "bot-token", tmp_path)
+    second = MTProtoClient(enabled_config(), "bot-token", tmp_path)
+
+    await first.connect()
+    with pytest.raises(MTProtoSessionOwnershipError):
+        await second.connect()
+
+    assert (first.session_directory.stat().st_mode & 0o777) == 0o700
+    assert (first.session_file.stat().st_mode & 0o777) == 0o600
+    assert ((first.session_directory / "owner.lock").stat().st_mode & 0o777) == 0o600
+
+    await first.disconnect()
+    await second.connect()
+    await second.disconnect()
 
 
 def test_telethon_retryable_errors_use_the_base_exception():

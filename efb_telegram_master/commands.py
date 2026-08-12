@@ -1,13 +1,14 @@
 # coding=utf-8
 import html
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Tuple, Union, cast
 
 from ehforwarderbot import Channel, Middleware, coordinator
 from ehforwarderbot.channel import SlaveChannel
 from ehforwarderbot.message import MessageCommand
 from ehforwarderbot.types import ExtraCommandName
 from telegram import Message, Update
+from telegram.constants import ChatType
 from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler
 from telegram.ext._utils.types import ConversationDict
 
@@ -25,9 +26,10 @@ class ETMCommandMsgStorage:
         self.module = module
         self.prefix = prefix
         self.body = body
+        self.authorized_user_ids: Collection[int] = ()
 
     def __str__(self):
-        return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r})"
+        return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r}, {self.authorized_user_ids!r})"
 
 
 class CommandsManager(LocaleMixin):
@@ -64,6 +66,7 @@ class CommandsManager(LocaleMixin):
 
     def register_command(self, message: Message, commands: ETMCommandMsgStorage):
         message_identifier = (message.chat.id, message.message_id)
+        commands.authorized_user_ids = frozenset((message.chat.id,) if message.chat.type == ChatType.PRIVATE else self.channel.config["admins"])
         conversations = getattr(self.command_conv, "_conversations", None)
         if conversations is None:
             conversations = getattr(self.command_conv, "conversations")
@@ -85,6 +88,7 @@ class CommandsManager(LocaleMixin):
         assert update.effective_chat
         assert update.effective_message
         assert update.callback_query
+        assert update.effective_user
 
         chat_id = update.effective_chat.id
         message_id = update.effective_message.message_id
@@ -93,6 +97,11 @@ class CommandsManager(LocaleMixin):
         assert callback
 
         index = (chat_id, message_id)
+        command_storage = self.msg_storage[index]
+
+        if update.callback_query.from_user.id != update.effective_user.id or update.effective_user.id not in command_storage.authorized_user_ids:
+            self.bot.answer_callback_query(callback_query_id=update.callback_query.id, text=self._("Session expired or unknown parameter. (SE02)"))
+            return Flags.COMMAND_PENDING
 
         if not callback.isdecimal():
             msg = self._("Invalid parameter: {0}. (CE01)").format(callback)
@@ -108,7 +117,6 @@ class CommandsManager(LocaleMixin):
             return ConversationHandler.END
 
         callback_idx = int(callback)
-        command_storage = self.msg_storage[index]
         module = command_storage.module
         command = command_storage.commands[callback_idx]
         prefix = command_storage.prefix
