@@ -3,9 +3,11 @@ import re
 import threading
 import time
 from typing import List, Set
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from ehforwarderbot.types import ChatID
 
 from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.callback_sessions import ChatListStorage
@@ -131,6 +133,9 @@ async def _link_chat(
     *,
     flag: str | None = None,
     start_token: str | None = None,
+    channel=None,
+    storage_key: tuple[TelegramChatID, TelegramMessageID] | None = None,
+    slave_uid: str | None = None,
 ):
     if start_token is None:
         start_token = (await get_start_link(client, helper, bot_id, chat_uid, private_response)).token
@@ -153,7 +158,41 @@ async def _link_chat(
             timeout=timeout,
         )
 
-    await private_response(trigger, receive)
+    if channel is None or storage_key is None:
+        await private_response(trigger, receive)
+    else:
+        completed = threading.Event()
+        completion_errors: list[BaseException] = []
+        original_complete = channel.link_completion.complete
+
+        def observe_completion(update, args):
+            if not args or args[0] != start_token or (flag is not None and args[1:2] != [flag]):
+                return original_complete(update, args)
+            try:
+                result = original_complete(update, args)
+            except BaseException as error:
+                completion_errors.append(error)
+                completed.set()
+                raise
+            completed.set()
+            return result
+
+        try:
+            async with asyncio.timeout(65.0):
+                with patch.object(channel.link_completion, "complete", new=observe_completion):
+                    await trigger()
+                    await asyncio.to_thread(completed.wait)
+        except TimeoutError as error:
+            raise AssertionError("Telegram /start was not processed within 65 seconds") from error
+
+        if completion_errors:
+            raise completion_errors[0]
+
+        assert channel.callback_sessions.lookup(storage_key) is None, "Telegram /start did not consume its callback session."
+        assert channel.callback_sessions.get(channel.link_handler, storage_key) is None, "Telegram /start did not clear its callback handler state."
+        assert slave_uid is not None
+        expected_master_uid = etm_utils.chat_id_to_str(channel.channel_id, ChatID(str(dest_chat_id)))
+        assert channel.chat_associations.get_chat_assoc(slave_uid=slave_uid) == [expected_master_uid]
     assert command_message is not None
     return command_message
 
@@ -281,13 +320,6 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     assert source_storage_key[0] == private_chat_owner
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response, start_token=source_start_link.token)
 
-    # Private-panel delivery is covered by the backfill tests; this test isolates history replay.
-    relink_true_token = _create_relink_start_token(
-        channel_with_auxiliary_bots,
-        etm_chat,
-        storage_key=source_storage_key,
-    )
-
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
     await asyncio.to_thread(stream_thread.join, STREAM_SETTLE_TIMEOUT)
 
@@ -315,6 +347,12 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     target_group_id = bot_topic_group
     try:
+        # The callback-session state must remain live until the relink command is sent.
+        relink_true_token = _create_relink_start_token(
+            channel_with_auxiliary_bots,
+            etm_chat,
+            storage_key=source_storage_key,
+        )
         relink_true_message = await _link_chat(
             client,
             helper,
@@ -324,6 +362,9 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             private_response,
             flag="true",
             start_token=relink_true_token,
+            channel=channel_with_auxiliary_bots,
+            storage_key=source_storage_key,
+            slave_uid=slave_uid,
         )
         await _wait_for_migrated_stream_terminal(
             channel_with_auxiliary_bots,
@@ -355,8 +396,10 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             private_response,
             flag="false",
             start_token=relink_false_token,
+            channel=channel_with_auxiliary_bots,
+            storage_key=source_storage_key,
+            slave_uid=slave_uid,
         )
-        await asyncio.sleep(10)
         recent_source_messages = await _messages_since_id(client, source_group_id, relink_false_message.id)
         assert not any(prefix in (message.raw_text or "") for message in recent_source_messages), "Relink with false should skip migrating historical messages."
         assert not any("History messages are not migrated" in (message.raw_text or "") for message in recent_source_messages), (
