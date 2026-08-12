@@ -197,14 +197,21 @@ async def _link_chat(
     return command_message
 
 
-def _create_relink_start_token(channel_with_auxiliary_bots, etm_chat, *, storage_key: tuple[TelegramChatID, TelegramMessageID]) -> str:
+def _create_relink_start_token(channel_with_auxiliary_bots, etm_chat, *, private_chat_owner: TelegramChatID) -> tuple[str, tuple[TelegramChatID, TelegramMessageID]]:
+    placeholder = channel_with_auxiliary_bots.bot_manager.api.send_message(
+        private_chat_owner,
+        f"Relink callback placeholder {uuid4().hex}",
+        _force_main_bot=True,
+    )
+    assert placeholder.sender_bot_id is None, "Relink callback placeholder must be owned by the main bot."
+    storage_key = (private_chat_owner, TelegramMessageID(placeholder.message_id))
     channel_with_auxiliary_bots.callback_sessions.start(
         channel_with_auxiliary_bots.link_handler,
         storage_key,
         Flags.LINK_EXEC,
         ChatListStorage([etm_chat]),
     )
-    return etm_utils.b64en(etm_utils.message_id_to_str(*storage_key))
+    return etm_utils.b64en(etm_utils.message_id_to_str(*storage_key)), storage_key
 
 
 def _extract_stream_indices(text: str, prefix: str) -> List[int]:
@@ -348,10 +355,10 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
     target_group_id = bot_topic_group
     try:
         # The callback-session state must remain live until the relink command is sent.
-        relink_true_token = _create_relink_start_token(
+        relink_true_token, relink_true_storage_key = _create_relink_start_token(
             channel_with_auxiliary_bots,
             etm_chat,
-            storage_key=source_storage_key,
+            private_chat_owner=private_chat_owner,
         )
         relink_true_message = await _link_chat(
             client,
@@ -363,7 +370,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             flag="true",
             start_token=relink_true_token,
             channel=channel_with_auxiliary_bots,
-            storage_key=source_storage_key,
+            storage_key=relink_true_storage_key,
             slave_uid=slave_uid,
         )
         await _wait_for_migrated_stream_terminal(
@@ -382,11 +389,12 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             "Relink with true should migrate history instead of sending the history-link notice."
         )
 
-        relink_false_token = _create_relink_start_token(
+        relink_false_token, relink_false_storage_key = _create_relink_start_token(
             channel_with_auxiliary_bots,
             etm_chat,
-            storage_key=source_storage_key,
+            private_chat_owner=private_chat_owner,
         )
+        assert relink_false_storage_key != relink_true_storage_key, "Each relink must use its own bot-owned callback message."
         relink_false_message = await _link_chat(
             client,
             helper,
@@ -397,7 +405,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             flag="false",
             start_token=relink_false_token,
             channel=channel_with_auxiliary_bots,
-            storage_key=source_storage_key,
+            storage_key=relink_false_storage_key,
             slave_uid=slave_uid,
         )
         recent_source_messages = await _messages_since_id(client, source_group_id, relink_false_message.id)
