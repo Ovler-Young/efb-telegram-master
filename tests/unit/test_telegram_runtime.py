@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import ANY, Mock, call
 
 import pytest
 
@@ -59,6 +59,7 @@ def test_builder_assembles_injected_ptb_dependencies_without_network(monkeypatch
     assert runtime.async_bot is async_bot
     assert runtime.async_runtime is async_runtime
     assert runtime.application is not None
+    telegram_runtime.telegram.Bot.assert_called_once_with(token="token", local_mode=False, request=ANY, get_updates_request=ANY)
     assert built["bot"] is async_bot
     assert built["job_queue"] is None
     assert callable(built["post_init"])

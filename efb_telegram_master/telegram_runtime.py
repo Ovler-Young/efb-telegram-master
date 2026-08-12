@@ -9,12 +9,13 @@ import threading
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from functools import wraps
-from typing import Coroutine, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Coroutine, Literal, Optional, TypeVar, cast
 
 import telegram
 import telegram.error
 from telegram.ext import Application
 from telegram.request import HTTPXRequest
+from typing_extensions import NotRequired, TypedDict
 
 from .utils import normalize_request_kwargs
 
