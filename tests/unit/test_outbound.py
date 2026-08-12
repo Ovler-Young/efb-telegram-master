@@ -1,5 +1,6 @@
 import threading
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from telegram.error import BadRequest, RetryAfter
@@ -178,3 +179,27 @@ def test_adapter_removes_metadata_and_retries_parse_fallback():
     receipt = TelegramCallAdapter(None).execute(call, SenderSelection(Sender(), None))
     assert receipt.message == "sent"
     assert calls == [{"chat_id": 1, "text": "sent", "parse_mode": "HTML"}, {"chat_id": 1, "text": "sent"}]
+
+
+def test_adapter_attaches_full_html_content_after_truncating_message():
+    sent_messages = []
+    documents = []
+
+    class Sender:
+        def send_message(self, **kwargs):
+            sent_messages.append(kwargs)
+            return SimpleNamespace(message_id=9)
+
+        def send_document(self, *args, **kwargs):
+            documents.append((args, kwargs))
+
+    full_text = "x" * 4096
+    call = QueuedCall("send_message", (), {"chat_id": 1, "text": full_text, "parse_mode": "HTML"}, 1, None, None)
+
+    TelegramCallAdapter(None).execute(call, SenderSelection(Sender(), None))
+
+    assert sent_messages == [{"chat_id": 1, "text": full_text[:100] + "\n...\n" + full_text[-100:], "parse_mode": "HTML"}]
+    args, kwargs = documents[0]
+    assert args[0] == 1
+    assert kwargs["filename"] == "1_9.html"
+    assert args[1].read() == b"<html><head><meta charset='utf-8'></head><body><pre style='white-space:pre-wrap'>" + full_text.encode() + b"</pre></body></html>"

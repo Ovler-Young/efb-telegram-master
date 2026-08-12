@@ -91,3 +91,20 @@ def test_ordinary_send_writes_msglog_once_and_releases_completion(monkeypatch):
         sender_bot_id="7",
     )
     processor._release_pending_slave_message.assert_called_once_with(("slave", "slave-message"))
+
+
+def test_pending_slave_message_is_dispatched_once(monkeypatch):
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.logger = Mock()
+    processor._pending_slave_messages = set()
+    processor._pending_slave_messages_lock = threading.Lock()
+    processor.get_slave_msg_dest = Mock(return_value=("", (123, None)))
+    processor.is_silent = Mock(return_value=False)
+    processor.dispatch_message = Mock()
+    message = SimpleNamespace(edit=False, uid="duplicate", type=MsgType.Text, chat=SimpleNamespace())
+    monkeypatch.setattr("efb_telegram_master.slave_message.utils.chat_id_to_str", lambda **_kwargs: "slave")
+
+    processor.send_message(message)
+    processor.send_message(message)
+
+    processor.dispatch_message.assert_called_once_with(message, "", None, 123, None, False, dedupe_key=("slave", "duplicate"))

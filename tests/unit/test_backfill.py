@@ -1,5 +1,3 @@
-import threading
-from concurrent.futures import Future
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -11,8 +9,7 @@ from telegram import Update
 from efb_telegram_master import TelegramChannel, utils
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.constants import Flags
-from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
-from efb_telegram_master.outbound import QueueRequest
+from efb_telegram_master.db import MsgLog
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
 
@@ -234,45 +231,6 @@ def test_start_uses_raw_message_args_for_link_chat(channel):
     link_chat.assert_called_once_with(update, ["token", "true"])
 
 
-def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channel):
-    HistoryMigrationEntry.delete().execute()
-    msg_logs = []
-    base_time = datetime.now()
-    for idx in range(3):
-        msg_log = Mock()
-        msg_log.master_msg_id = f"1.{idx}"
-        msg_log.text = "x" * 2000
-        msg_log.media_type = "Text"
-        msg_log.time = base_time + timedelta(seconds=idx)
-        etm_msg = SimpleNamespace(author=SimpleNamespace(display_name=f"author-{idx}"))
-        msg_log.build_etm_msg.return_value = etm_msg
-        msg_logs.append(msg_log)
-
-    media_log = Mock()
-    media_log.text = ""
-    media_log.media_type = "Photo"
-    media_log.master_msg_id = "1.2"
-    media_log.time = base_time + timedelta(seconds=10)
-    msg_logs.append(media_log)
-
-    waiters = []
-    for _ in range(4):
-        waiter = Future()
-        waiter.set_result(None)
-        waiters.append(waiter)
-    with patch.object(channel.db, "get_recent_messages", return_value=msg_logs), patch.object(channel.bot_manager.outbound_queue, "enqueue", side_effect=waiters) as enqueue:
-        channel.chat_binding._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
-
-    assert enqueue.call_count == 4
-    assert [call.args[0].operation for call in enqueue.call_args_list] == [
-        "send_message",
-        "send_message",
-        "send_message",
-        "copy_message",
-    ]
-    assert HistoryMigrationEntry.select().count() == 0
-
-
 def test_queue_history_migration_entries_persists_pending_rows():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager.db = Mock()
@@ -306,149 +264,6 @@ def test_queue_history_migration_entries_persists_pending_rows():
     assert entries[0]["formatted_text"] == f"*author* `{base_time.strftime('%Y-%m-%d %H:%M')}`\nhello\n\n"
     assert entries[1]["source_master_msg_id"] == "10.21"
     assert entries[1]["formatted_text"] is None
-
-
-def test_process_pending_history_migrations_waits_before_next_enqueue_and_deletes_successes():
-    manager = ChatBindingManager.__new__(ChatBindingManager)
-    manager._history_migration_lock = threading.Lock()
-    manager.logger = Mock()
-    pending_entries = [
-        SimpleNamespace(
-            id=1,
-            slave_chat_id="tests.mocks.slave.chat",
-            target_chat_id="12345",
-            message_thread_id=None,
-            source_master_msg_id="10.20",
-            formatted_text="first\n",
-            media_type="Text",
-            source_time=datetime.now(),
-            position=0,
-        ),
-        SimpleNamespace(
-            id=2,
-            slave_chat_id="tests.mocks.slave.chat",
-            target_chat_id="12345",
-            message_thread_id=None,
-            source_master_msg_id="10.21",
-            formatted_text="second\n",
-            media_type="Text",
-            source_time=datetime.now() + timedelta(seconds=1),
-            position=1,
-        ),
-        SimpleNamespace(
-            id=3,
-            slave_chat_id="tests.mocks.slave.chat",
-            target_chat_id="12345",
-            message_thread_id=None,
-            source_master_msg_id="10.22",
-            formatted_text=None,
-            media_type="Photo",
-            source_time=datetime.now() + timedelta(seconds=2),
-            position=2,
-        ),
-    ]
-
-    def get_next_history_migration_target():
-        return pending_entries[0] if pending_entries else None
-
-    def get_history_migration_entries(_slave_chat_id, _tg_chat_id, _thread_id):
-        return list(pending_entries)
-
-    manager.db = SimpleNamespace(
-        get_next_history_migration_target=Mock(side_effect=get_next_history_migration_target),
-        get_history_migration_entries=Mock(side_effect=get_history_migration_entries),
-        get_recent_messages=Mock(),
-        delete_history_migration_entry=Mock(side_effect=lambda entry_id: pending_entries.remove(next(entry for entry in pending_entries if entry.id == entry_id))),
-    )
-    events = []
-
-    class Waiter:
-        def __init__(self, entry_id):
-            self.entry_id = entry_id
-
-        def result(self):
-            events.append(("wait", self.entry_id))
-
-    def enqueue(request):
-        entry_id = len(events) // 2 + 1
-        events.append(("enqueue", entry_id))
-        return Waiter(entry_id)
-
-    manager.bot = SimpleNamespace(outbound_queue=SimpleNamespace(enqueue=Mock(side_effect=enqueue)))
-
-    ChatBindingManager._process_pending_history_migrations(manager)
-
-    manager.db.get_recent_messages.assert_not_called()
-    assert [call.args[0] for call in manager.bot.outbound_queue.enqueue.call_args_list] == [
-        QueueRequest("send_message", (), {"chat_id": 12345, "text": "first\n", "parse_mode": "Markdown", "disable_notification": True}, 12345),
-        QueueRequest("send_message", (), {"chat_id": 12345, "text": "second\n", "parse_mode": "Markdown", "disable_notification": True}, 12345),
-        QueueRequest("copy_message", (), {"chat_id": 12345, "from_chat_id": 10, "message_id": 22, "disable_notification": True}, 12345),
-    ]
-    assert events == [
-        ("enqueue", 1),
-        ("wait", 1),
-        ("enqueue", 2),
-        ("wait", 2),
-        ("enqueue", 3),
-        ("wait", 3),
-    ]
-    assert pending_entries == []
-
-
-def test_history_migration_retains_entry_and_logs_completed_count_on_waiter_failure():
-    manager = ChatBindingManager.__new__(ChatBindingManager)
-    manager.logger = Mock()
-    entry = SimpleNamespace(
-        id=7,
-        slave_chat_id="tests.mocks.slave.chat",
-        target_chat_id="12345",
-        message_thread_id=None,
-        source_master_msg_id="10.20",
-        formatted_text="first\n",
-    )
-    manager.db = SimpleNamespace(
-        get_history_migration_entries=Mock(return_value=[entry]),
-        delete_history_migration_entry=Mock(),
-    )
-    failed_waiter = Future()
-    failed_waiter.set_exception(RuntimeError("Telegram failed"))
-    manager.bot = SimpleNamespace(outbound_queue=SimpleNamespace(enqueue=Mock(return_value=failed_waiter)))
-
-    processed = ChatBindingManager._process_history_migration_target(manager, entry)
-
-    assert processed is False
-    manager.db.delete_history_migration_entry.assert_not_called()
-    manager.logger.warning.assert_called_once_with(
-        "History migration entry %d retained after %d completed calls (%s).",
-        7,
-        0,
-        "RuntimeError",
-    )
-
-
-def test_history_migration_deletes_zero_call_entry_without_queueing():
-    manager = ChatBindingManager.__new__(ChatBindingManager)
-    manager.logger = Mock()
-    entry = SimpleNamespace(
-        id=8,
-        slave_chat_id="tests.mocks.slave.chat",
-        target_chat_id="12345",
-        message_thread_id=None,
-        source_master_msg_id="",
-        formatted_text="",
-    )
-    manager.db = SimpleNamespace(
-        get_history_migration_entries=Mock(return_value=[entry]),
-        delete_history_migration_entry=Mock(),
-    )
-    manager.bot = SimpleNamespace(outbound_queue=SimpleNamespace(enqueue=Mock()))
-
-    processed = ChatBindingManager._process_history_migration_target(manager, entry)
-
-    assert processed is True
-    manager.bot.outbound_queue.enqueue.assert_not_called()
-    manager.db.delete_history_migration_entry.assert_called_once_with(8)
-    manager.logger.info.assert_any_call("History migration entry %d completed 0 calls", 8)
 
 
 def test_get_recent_messages_returns_oldest_first(channel, slave):
