@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.parse
 from contextlib import suppress
-from typing import IO, TYPE_CHECKING, Dict, List, Optional, Pattern, Tuple, Union, cast
+from typing import IO, TYPE_CHECKING, Callable, Dict, List, Optional, Pattern, Tuple, Union, cast
 
 import telegram  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, MsgType, coordinator
@@ -53,7 +53,7 @@ class ChatListStorage:
         offset (int): Current offset to display
     """
 
-    def __init__(self, chats: List[ETMChatType], offset: int = 0):
+    def __init__(self, chats: List[ETMChatType], offset: int = 0, owner_id: Optional[int] = None):
         self.__chats: List[ETMChatType] = []
         self.channels: Dict[ModuleID, SlaveChannel] = dict()
         self.chats = chats.copy()  # initialize chats with setter.
@@ -63,6 +63,7 @@ class ChatListStorage:
         # None = auto (backfill on first link, skip on relink)
         # True = always backfill, False = never backfill
         self.backfill_mode: Optional[bool] = None
+        self.owner_id = owner_id
 
     @property
     def length(self) -> int:
@@ -248,7 +249,7 @@ class ChatBindingManager(LocaleMixin):
                 tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id)
                 storage_id: Tuple[TelegramChatID, TelegramMessageID] = (tg_chat_id, tg_msg_id)
                 self._set_conversation_state(self.link_handler, storage_id, Flags.LINK_EXEC)
-                self.msg_storage[storage_id] = ChatListStorage([chat])
+                self.msg_storage[storage_id] = ChatListStorage([chat], owner_id=message.from_user.id if message.from_user else None)
                 return self.build_link_action_message(chat, tg_chat_id, tg_msg_id)
             if message.message_thread_id:
                 topic = message.message_thread_id
@@ -261,20 +262,20 @@ class ChatBindingManager(LocaleMixin):
                         topic_tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id)
                         topic_storage_id: Tuple[TelegramChatID, TelegramMessageID] = (topic_tg_chat_id, topic_tg_msg_id)
                         self._set_conversation_state(self.link_handler, topic_storage_id, Flags.LINK_EXEC)
-                        self.msg_storage[topic_storage_id] = ChatListStorage([topic_chat])
+                        self.msg_storage[topic_storage_id] = ChatListStorage([topic_chat], owner_id=message.from_user.id if message.from_user else None)
                         return self.build_link_action_message(topic_chat, topic_tg_chat_id, topic_tg_msg_id)
 
         if message.chat.type != ChatType.PRIVATE:
             links = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(message.chat.id))))
             if links:
-                return self.link_chat_gen_list(TelegramChatID(message.chat.id), pattern=" ".join(args), chats=links, filter_availability=False)
+                return self.link_chat_gen_list(TelegramChatID(message.chat.id), owner_id=message.from_user.id if message.from_user else None, pattern=" ".join(args), chats=links, filter_availability=False)
         elif (forwarded_chat := get_forwarded_chat(message)) and forwarded_chat.type == ChatType.CHANNEL:
             chat_id = ChatID(str(forwarded_chat.id))
             links = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, chat_id))
             if links:
-                return self.link_chat_gen_list(TelegramChatID(message.chat.id), pattern=" ".join(args), chats=links, filter_availability=False)
+                return self.link_chat_gen_list(TelegramChatID(message.chat.id), owner_id=message.from_user.id if message.from_user else None, pattern=" ".join(args), chats=links, filter_availability=False)
         assert message.from_user
-        return self.link_chat_gen_list(TelegramChatID(message.from_user.id), pattern=" ".join(args))
+        return self.link_chat_gen_list(TelegramChatID(message.from_user.id), owner_id=message.from_user.id, pattern=" ".join(args))
 
     def slave_chats_pagination(
         self,
@@ -283,6 +284,7 @@ class ChatBindingManager(LocaleMixin):
         pattern: Optional[str] = "",
         source_chats: Optional[List[EFBChannelChatIDStr]] = None,
         filter_availability: bool = True,
+        owner_id: Optional[int] = None,
     ) -> Tuple[List[str], List[List[InlineKeyboardButton]]]:
         """
         Generate a list of (list of) `InlineKeyboardButton`s of chats in slave channels,
@@ -350,7 +352,7 @@ class ChatBindingManager(LocaleMixin):
                         chats.append(etm_chat)
 
             chats.sort(key=lambda a: a.last_message_time, reverse=True)
-            chat_list = self.msg_storage[storage_id] = ChatListStorage(chats, offset)
+            chat_list = self.msg_storage[storage_id] = ChatListStorage(chats, offset, owner_id)
 
         # self._db_update_slave_chats_cache(chat_list.chats)
 
@@ -392,6 +394,7 @@ class ChatBindingManager(LocaleMixin):
         pattern: str = "",
         chats: Optional[List[EFBChannelChatIDStr]] = None,
         filter_availability: bool = True,
+        owner_id: Optional[int] = None,
     ):
         """
         Generate the list for chat linking, and update it to a message.
@@ -418,7 +421,7 @@ class ChatBindingManager(LocaleMixin):
             msg_text = self._("Please choose the chat you want to link with...")
         msg_text += self._("\n\nLegend:\n")
 
-        legend, chat_btn_list = self.slave_chats_pagination((chat_id, message_id), offset, pattern=pattern, source_chats=chats, filter_availability=filter_availability)
+        legend, chat_btn_list = self.slave_chats_pagination((chat_id, message_id), offset, pattern=pattern, source_chats=chats, filter_availability=filter_availability, owner_id=owner_id)
         for i in legend:
             msg_text += "%s\n" % i
 
@@ -427,6 +430,24 @@ class ChatBindingManager(LocaleMixin):
         self._set_conversation_state(self.link_handler, (chat_id, message_id), Flags.LINK_CONFIRM)
 
         return Flags.LINK_CONFIRM
+
+    def _callback_session_is_authorized(self, update: Update, storage_id: Tuple[TelegramChatID, TelegramMessageID]) -> bool:
+        callback = update.callback_query
+        user = update.effective_user
+        session = self.msg_storage.get(storage_id)
+        owner_id = session.owner_id if session is not None else None
+        callback_user = callback.from_user if callback is not None else None
+        if (
+            owner_id is not None
+            and callback_user is not None
+            and user is not None
+            and callback_user.id == owner_id
+            and user.id == owner_id
+        ):
+            return True
+        if callback is not None:
+            self.bot.answer_callback_query(callback.id, text=self._("Session expired or unknown parameter. (SE02)"))
+        return False
 
     def link_chat_confirm(self, update: Update, context: CallbackContext) -> int:
         """
@@ -445,6 +466,8 @@ class ChatBindingManager(LocaleMixin):
 
         tg_chat_id = TelegramChatID(update.effective_chat.id)
         tg_msg_id = TelegramMessageID(update.effective_message.message_id)
+        if not self._callback_session_is_authorized(update, (tg_chat_id, tg_msg_id)):
+            return Flags.LINK_CONFIRM
         callback_uid: str = update.callback_query.data
         if callback_uid.split()[0] == "offset":
             # Offer a new page of chats
@@ -507,6 +530,8 @@ class ChatBindingManager(LocaleMixin):
 
         tg_chat_id = TelegramChatID(update.effective_chat.id)
         tg_msg_id = TelegramMessageID(update.effective_message.message_id)
+        if not self._callback_session_is_authorized(update, (tg_chat_id, tg_msg_id)):
+            return Flags.LINK_EXEC
         callback_uid = update.callback_query.data
 
         if callback_uid == Flags.CANCEL_PROCESS:
@@ -576,6 +601,9 @@ class ChatBindingManager(LocaleMixin):
             storage_key = (TelegramChatID(int(msg_id[0])), TelegramMessageID(int(msg_id[1])))
             data = self.msg_storage[storage_key]
         except KeyError:
+            return sync_reply_text(self.bot, update.message, self._("Session expired or unknown parameter. (SE02)"))
+        user = update.effective_user
+        if user is None or data.owner_id != user.id:
             return sync_reply_text(self.bot, update.message, self._("Session expired or unknown parameter. (SE02)"))
         chat: ETMChatType = data.chats[0]
         is_relink = chat.linked
@@ -752,9 +780,9 @@ class ChatBindingManager(LocaleMixin):
             target = TelegramChatID(update.message.from_user.id)
         else:
             raise Exception("No target chat is found when generating chat list.")
-        return self.chat_head_req_generate(target, pattern=" ".join(args), chats=chats)
+        return self.chat_head_req_generate(target, owner_id=update.effective_user.id if update.effective_user else None, pattern=" ".join(args), chats=chats)
 
-    def chat_head_req_generate(self, chat_id: TelegramChatID, message_id: Optional[TelegramMessageID] = None, offset: int = 0, pattern: str = "", chats: Optional[List[EFBChannelChatIDStr]] = None):
+    def chat_head_req_generate(self, chat_id: TelegramChatID, message_id: Optional[TelegramMessageID] = None, offset: int = 0, pattern: str = "", chats: Optional[List[EFBChannelChatIDStr]] = None, owner_id: Optional[int] = None):
         """
         Generate the list for chat head, and update it to a message.
 
@@ -804,7 +832,7 @@ class ChatBindingManager(LocaleMixin):
         else:
             msg_text = "Choose a chat you want to start a conversation with."
 
-        legend, chat_btn_list = self.slave_chats_pagination((chat_id, message_id), offset, pattern=pattern, source_chats=chats)
+        legend, chat_btn_list = self.slave_chats_pagination((chat_id, message_id), offset, pattern=pattern, source_chats=chats, owner_id=owner_id)
 
         msg_text += self._("\n\nLegend:\n")
         for i in legend:
@@ -827,6 +855,8 @@ class ChatBindingManager(LocaleMixin):
 
         tg_chat_id = TelegramChatID(update.effective_chat.id)
         tg_msg_id = TelegramMessageID(update.effective_message.message_id)
+        if not self._callback_session_is_authorized(update, (tg_chat_id, tg_msg_id)):
+            return Flags.CHAT_HEAD_CONFIRM
         callback_uid: str = update.callback_query.data
 
         # Refresh with a new set of pages
@@ -868,7 +898,7 @@ class ChatBindingManager(LocaleMixin):
 
     def register_suggestions(self, update: Update, candidates: List[EFBChannelChatIDStr], chat_id: TelegramChatID, message_id: TelegramMessageID):
         storage_id = (chat_id, message_id)
-        legends, buttons = self.channel.chat_binding.slave_chats_pagination(storage_id, 0, source_chats=candidates)
+        legends, buttons = self.channel.chat_binding.slave_chats_pagination(storage_id, 0, source_chats=candidates, owner_id=update.effective_user.id if update.effective_user else None)
         if len(buttons) <= 1:
             # Stop editing the message as no valid suggestion is available.
             # Remove message from cache and return
@@ -901,6 +931,8 @@ class ChatBindingManager(LocaleMixin):
         param = update.callback_query.data
 
         storage_id = (chat_id, msg_id)
+        if not self._callback_session_is_authorized(update, storage_id):
+            return Flags.SUGGEST_RECIPIENTS
         if param.startswith("chat "):
             if storage_id not in self.msg_storage:
                 self.bot.edit_message_text(text=self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nSession expired, please try again."), chat_id=chat_id, message_id=msg_id)
@@ -1348,20 +1380,34 @@ class ChatBindingManager(LocaleMixin):
         except Exception:
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id)
         finally:
+            shutdown_callback = None
             with self._msglog_ingestion_lock:
                 if self._msglog_ingestion_threads.get(source_chat_id) is threading.current_thread():
                     self._msglog_ingestion_threads.pop(source_chat_id)
+                if not self._msglog_ingestion_threads:
+                    shutdown_callback = getattr(self, "_msglog_ingestion_shutdown_callback", None)
+                    self._msglog_ingestion_shutdown_callback = None
+            if shutdown_callback is not None:
+                shutdown_callback()
 
-    def stop_msglog_ingestions(self, join: bool = True) -> None:
+    def stop_msglog_ingestions(self, join: bool = True) -> bool:
         """Cancel active command scans and optionally wait a bounded time for workers."""
         self._msglog_ingestion_stop.set()
         if not join:
-            return
+            return False
         with self._msglog_ingestion_lock:
             workers = list(self._msglog_ingestion_threads.values())
         for worker in workers:
             if worker.is_alive() and worker.ident != threading.get_ident():
                 worker.join(timeout=self.MSGLOG_INGESTION_JOIN_TIMEOUT)
+        return not any(worker.is_alive() for worker in workers)
+
+    def close_database_after_msglog_ingestions(self, close_database: Callable[[], None]) -> None:
+        with self._msglog_ingestion_lock:
+            if any(worker.is_alive() for worker in self._msglog_ingestion_threads.values()):
+                self._msglog_ingestion_shutdown_callback = close_database
+                return
+        close_database()
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Background method that performs the actual migration work.

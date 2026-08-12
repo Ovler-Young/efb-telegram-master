@@ -1,5 +1,38 @@
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+from telegram import CallbackQuery, Chat, Message, Update, User
+
 from efb_telegram_master import utils
+from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
+from efb_telegram_master.constants import Flags
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+
+
+def _callback_update(user_id, chat_id, message_id, data):
+    user = User(user_id, "test", False)
+    message = Message(message_id, datetime.now(), Chat(chat_id, "group"), from_user=user)
+    callback = CallbackQuery("query", user, "instance", message=message, data=data)
+    return Update(1, callback_query=callback)
+
+
+def test_chat_binding_callbacks_reject_other_users_without_clearing_the_session():
+    manager = object.__new__(ChatBindingManager)
+    manager.bot = Mock()
+    manager.channel = SimpleNamespace(_=lambda text: text)
+    storage_id = (TelegramChatID(-100), TelegramMessageID(10))
+    manager.msg_storage = {storage_id: ChatListStorage([], owner_id=10)}
+
+    for handler, data, expected_state in (
+        (manager.link_chat_confirm, "chat 0", Flags.LINK_CONFIRM),
+        (manager.make_chat_head, "chat 0", Flags.CHAT_HEAD_CONFIRM),
+        (manager.suggested_recipient, "chat 0", Flags.SUGGEST_RECIPIENTS),
+    ):
+        assert handler(_callback_update(20, -100, 10, data), SimpleNamespace()) == expected_state
+        assert storage_id in manager.msg_storage
+
+    assert manager.bot.answer_callback_query.call_count == 3
 
 
 def test_full_chat_pagination(channel, slave):

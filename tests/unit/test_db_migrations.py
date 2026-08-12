@@ -84,6 +84,16 @@ def test_startup_keeps_a_same_name_table_with_a_different_schema_signature(tmp_p
     assert "msglogingestionscan" in tables
 
 
+def test_legacy_scan_schema_normalization_accepts_postgresql_names_and_rejects_lookalikes():
+    postgresql_id = SimpleNamespace(name="id", data_type="integer", null=False, primary_key=True)
+    postgresql_timestamp = SimpleNamespace(name="created_at", data_type="timestamp without time zone", null=False, primary_key=False)
+    lookalike_id = SimpleNamespace(name="id", data_type="text", null=False, primary_key=True)
+
+    assert DatabaseManager._legacy_msglog_ingestion_scan_column_signature(postgresql_id) == ("id", "integer", False, True)
+    assert DatabaseManager._legacy_msglog_ingestion_scan_column_signature(postgresql_timestamp) == ("created_at", "datetime", False, False)
+    assert DatabaseManager._legacy_msglog_ingestion_scan_column_signature(lookalike_id) != ("id", "integer", False, True)
+
+
 def test_ingested_msglog_persistence_is_idempotent():
     original_database = database.obj
     test_db = SqliteDatabase(":memory:")

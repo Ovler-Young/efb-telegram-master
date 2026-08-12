@@ -270,21 +270,21 @@ class DatabaseManager:
     )
     _LEGACY_MSGLOG_INGESTION_SCAN_SIGNATURE = frozenset(
         {
-            ("id", "INTEGER", False, True),
-            ("source_chat_id", "TEXT", False, False),
-            ("scan_boundary", "INTEGER", False, False),
-            ("cursor", "INTEGER", False, False),
-            ("existing_streak", "INTEGER", False, False),
-            ("scanned_count", "INTEGER", False, False),
-            ("inserted_count", "INTEGER", False, False),
-            ("existing_count", "INTEGER", False, False),
-            ("skipped_count", "INTEGER", False, False),
-            ("lease_owner", "TEXT", True, False),
-            ("lease_expires_at", "DATETIME", True, False),
-            ("status", "TEXT", False, False),
-            ("error", "TEXT", True, False),
-            ("created_at", "DATETIME", False, False),
-            ("updated_at", "DATETIME", False, False),
+            ("id", "integer", False, True),
+            ("source_chat_id", "text", False, False),
+            ("scan_boundary", "integer", False, False),
+            ("cursor", "integer", False, False),
+            ("existing_streak", "integer", False, False),
+            ("scanned_count", "integer", False, False),
+            ("inserted_count", "integer", False, False),
+            ("existing_count", "integer", False, False),
+            ("skipped_count", "integer", False, False),
+            ("lease_owner", "text", True, False),
+            ("lease_expires_at", "datetime", True, False),
+            ("status", "text", False, False),
+            ("error", "text", True, False),
+            ("created_at", "datetime", False, False),
+            ("updated_at", "datetime", False, False),
         }
     )
     _LEGACY_OUTBOUND_TABLES = ("outbound_workflow", "outbound_task")
@@ -379,7 +379,7 @@ class DatabaseManager:
             return
         column_definitions = database.get_columns(table)
         columns = {column.name for column in column_definitions}
-        signature = {(column.name, column.data_type.upper(), column.null, column.primary_key) for column in column_definitions}
+        signature = {DatabaseManager._legacy_msglog_ingestion_scan_column_signature(column) for column in column_definitions}
         indexes = database.get_indexes(table)
         source_chat_is_unique = any(index.unique and tuple(index.columns) == ("source_chat_id",) for index in indexes)
         if (
@@ -390,6 +390,20 @@ class DatabaseManager:
             DatabaseManager.logger.warning("Retaining %s because its schema does not match the retired MsgLog ingestion scan table", table)
             return
         database.execute_sql(f'DROP TABLE "{table}"')
+
+    @staticmethod
+    def _legacy_msglog_ingestion_scan_column_signature(column: object) -> tuple[str, str, bool, bool]:
+        data_type = str(getattr(column, "data_type")).lower().replace(" ", "")
+        normalized_type = {
+            "integer": "integer",
+            "int": "integer",
+            "int4": "integer",
+            "text": "text",
+            "datetime": "datetime",
+            "timestamp": "datetime",
+            "timestampwithouttimezone": "datetime",
+        }.get(data_type, data_type)
+        return (str(getattr(column, "name")), normalized_type, bool(getattr(column, "null")), bool(getattr(column, "primary_key")))
 
     def _observe_legacy_outbound_rows(self) -> None:
         """Report retained workflow rows without loading or changing them."""

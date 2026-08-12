@@ -19,11 +19,12 @@ def _build_link_update(chat_id, *, is_forum=False):
     message.chat = effective_chat
     message.forward_from_chat = None
     message.reply_text = Mock()
+    message.from_user = SimpleNamespace(id=10)
     return Update(update_id=1, message=message)
 
 
 def _store_link_session(channel, chat, storage_key, backfill_mode=None):
-    storage = ChatListStorage([channel.chat_manager.update_chat_obj(chat)])
+    storage = ChatListStorage([channel.chat_manager.update_chat_obj(chat)], owner_id=10)
     storage.backfill_mode = backfill_mode
     channel.chat_binding.msg_storage[storage_key] = storage
 
@@ -79,6 +80,23 @@ def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
         with pytest.raises(RuntimeError, match="link failed"):
             channel.chat_binding.link_chat(update, [token])
 
+    assert storage_key in channel.chat_binding.msg_storage
+    assert channel.chat_binding.link_handler._conversations[storage_key] == Flags.LINK_EXEC
+
+
+def test_link_chat_rejects_a_non_owner_without_clearing_the_session(channel, slave, bot_group):
+    chat = channel.chat_manager.update_chat_obj(slave.chat_with_alias)
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(107))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key)
+    ChatBindingManager._set_conversation_state(channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC)
+    update = _build_link_update(bot_group)
+    update.message.from_user = SimpleNamespace(id=20)
+
+    with patch.object(chat, "link") as link:
+        channel.chat_binding.link_chat(update, [token])
+
+    link.assert_not_called()
     assert storage_key in channel.chat_binding.msg_storage
     assert channel.chat_binding.link_handler._conversations[storage_key] == Flags.LINK_EXEC
 
