@@ -15,7 +15,7 @@ from telethon.tl.types import MessageEntityCode
 from telethon.utils import get_peer_id
 
 from .helper.filters import edited, has_button, in_chats, regex
-from .helper.helper import wait_for_message_state
+from .helper.helper import wait_for_message_state, wait_for_new_message_after
 from .utils import assert_is_linked, link_chats, unlink_all_chats
 
 retry_on_message_id_invalid_error = mark.flaky(
@@ -124,7 +124,7 @@ async def test_link_chat_multi_link_flag_off(helper, client, bot_id, bot_group, 
     try:
         with link_chats(channel, (chat_0,), bot_group):
             assert_is_linked(channel, (chat_0,), bot_group)
-            await simulate_link_chat(client, helper, chat_1, bot_id, bot_group, private_response=private_response)
+            await simulate_link_chat(client, chat_1, bot_id, bot_group, private_response=private_response)
             assert_is_linked(channel, (chat_1,), bot_group)
     finally:
         channel.flag.config["multiple_slave_chats"] = backup
@@ -160,7 +160,7 @@ async def test_link_chat_group_linked_relink(helper, client, bot_id, bot_group, 
     chat = slave.chat_with_alias
     with link_chats(channel, (chat,), bot_channel):
         with link_chats(channel, tuple(), bot_group):
-            await simulate_link_chat(client, helper, chat, bot_id, bot_group, command_channel=bot_channel, private_response=private_response)
+            await simulate_link_chat(client, chat, bot_id, bot_group, command_channel=bot_channel, private_response=private_response)
             assert_is_linked(channel, tuple(), bot_channel)
             assert_is_linked(channel, (chat,), bot_group)
 
@@ -168,7 +168,7 @@ async def test_link_chat_group_linked_relink(helper, client, bot_id, bot_group, 
 async def test_link_chat_channel(helper, client, bot_id, bot_group, bot_channel, slave, channel, private_response):
     chat = slave.chat_with_alias
     with link_chats(channel, tuple(), bot_channel):
-        await simulate_link_chat(client, helper, chat, bot_id, bot_id, dest_channel=bot_channel, private_response=private_response)
+        await simulate_link_chat(client, chat, bot_id, bot_id, dest_channel=bot_channel, private_response=private_response)
         assert_is_linked(channel, (chat,), bot_channel)
 
 
@@ -197,26 +197,63 @@ async def test_link_chat_target_incoming_message(helper, client, bot_id, slave, 
     await message.click(text="Cancel")
 
 
-async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest_chat: int, private_response, command_channel: Optional[int] = None, dest_channel: Optional[int] = None):
+async def simulate_link_chat(client, chat: Chat, command_chat: int, dest_chat: int, private_response, command_channel: Optional[int] = None, dest_channel: Optional[int] = None):
     """Simulate the procedure of linking a chat.
 
     Provide command_channel to link from a channel.
     """
     if command_channel is not None:
+        command_message_id = None
 
         async def trigger():
+            nonlocal command_message_id
             message = await client.send_message(command_channel, f"/link {chat.uid}")
-            await message.forward_to(command_chat)
+            forwarded = await message.forward_to(command_chat)
+            command_message_id = forwarded.id
     else:
+        command_message_id = None
 
         async def trigger():
-            await client.send_message(command_chat, f"/link {chat.uid}")
+            nonlocal command_message_id
+            command = await client.send_message(command_chat, f"/link {chat.uid}")
+            command_message_id = command.id
 
-    receive = lambda timeout: helper.wait_for_message(in_chats(command_chat) & has_button, timeout)
-    message = await private_response(trigger, receive)
+    def has_target_selection(current: Message) -> bool:
+        return bool(current.button_count) and chat.display_name in current.buttons[0][0].text
+
+    def is_link_response(current: Message) -> bool:
+        return current.raw_text == "Processing..." or has_target_selection(current)
+
+    async def receive_selection_panel(timeout: float) -> Message:
+        assert command_message_id is not None
+        response = await wait_for_new_message_after(client, command_chat, command_message_id, is_link_response, timeout=timeout)
+        return await wait_for_message_state(client, command_chat, response.id, has_target_selection, timeout=timeout)
+
+    message = await private_response(trigger, receive_selection_panel, target_chat_id=command_chat)
     session_message_id = message.id
-    await message.buttons[0][0].click()  # choose chat
-    message = await helper.wait_for_message(in_chats(command_chat) & edited(session_message_id) & has_button)  # operation panel
+    choose_chat = message.buttons[0][0]
+    selection_text = message.raw_text
+
+    def is_operation_panel(current: Message) -> bool:
+        buttons = tuple(chain.from_iterable(current.buttons))
+        return (
+            current.raw_text != selection_text
+            and bool(current.button_count)
+            and any(button.url and "?startgroup=" in button.url for button in buttons)
+            and any(button.text.lower().startswith("manual ") for button in buttons)
+        )
+
+    message = await private_response(
+        choose_chat.click,
+        lambda timeout: wait_for_message_state(
+            client,
+            command_chat,
+            session_message_id,
+            is_operation_panel,
+            timeout=timeout,
+        ),
+        target_chat_id=command_chat,
+    )
     url = None
     # print("STIMULATE_LINK_CHAT_MESSAGE_DICT", message.to_dict())
     for i in chain.from_iterable(message.buttons):

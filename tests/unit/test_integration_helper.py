@@ -533,6 +533,22 @@ class StateClient:
         return next(self.messages)
 
 
+class RecentMessage(StateMessage):
+    def __init__(self, message_id: int, button_count: int) -> None:
+        super().__init__(button_count)
+        self.id = message_id
+
+
+class RecentMessageClient:
+    def __init__(self, messages: list[list[object]]) -> None:
+        self.messages = iter(messages)
+        self.calls: list[tuple[int, int, int, int, bool]] = []
+
+    async def get_messages(self, chat_id: int, *, min_id: int, offset_id: int, limit: int, reverse: bool) -> list[object]:
+        self.calls.append((chat_id, min_id, offset_id, limit, reverse))
+        return next(self.messages)
+
+
 @pytest.mark.asyncio
 async def test_private_response_passes_its_remaining_deadline_to_exact_message_state(monkeypatch: pytest.MonkeyPatch) -> None:
     expected = StateMessage(button_count=0)
@@ -573,6 +589,84 @@ async def test_wait_for_message_state_returns_immediate_exact_message() -> None:
 
     assert result is message
     assert client.calls == [(100, 42)]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_new_message_after_retries_after_no_match_and_excludes_the_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    command = RecentMessage(12, button_count=0)
+    response = RecentMessage(13, button_count=1)
+    unrelated = RecentMessage(14, button_count=0)
+    client = RecentMessageClient([[command, unrelated], [command, response]])
+    waits: list[float] = []
+
+    async def yield_control(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr(helper_module, "Message", RecentMessage)
+    monkeypatch.setattr(helper_module.asyncio, "sleep", yield_control)
+
+    result = await helper_module.wait_for_new_message_after(client, 100, 12, lambda current: current.button_count == 1)
+
+    assert result is response
+    assert client.calls == [(100, 12, 12, helper_module.NEW_MESSAGE_PAGE_SIZE, True)] * 2
+    assert waits == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_new_message_after_finds_the_earliest_match_before_newer_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = RecentMessage(13, button_count=1)
+    unrelated = RecentMessage(14, button_count=0)
+    client = RecentMessageClient([[response, unrelated]])
+
+    monkeypatch.setattr(helper_module, "Message", RecentMessage)
+
+    result = await helper_module.wait_for_new_message_after(client, 100, 12, lambda current: current.button_count == 1)
+
+    assert result is response
+    assert client.calls == [(100, 12, 12, helper_module.NEW_MESSAGE_PAGE_SIZE, True)]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_new_message_after_paginates_past_the_first_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    first_page = [RecentMessage(message_id, button_count=0) for message_id in range(13, 33)]
+    response = RecentMessage(43, button_count=1)
+    second_page = [RecentMessage(message_id, button_count=0) for message_id in range(33, 43)] + [response]
+    client = RecentMessageClient([[RecentMessage(12, button_count=1), *first_page], second_page])
+
+    monkeypatch.setattr(helper_module, "Message", RecentMessage)
+
+    result = await helper_module.wait_for_new_message_after(client, 100, 12, lambda current: current.button_count == 1)
+
+    assert result is response
+    assert client.calls == [
+        (100, 12, 12, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 32, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_new_message_after_advances_after_a_capped_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    pages = [[RecentMessage(message_id, button_count=0) for message_id in range(first, first + helper_module.NEW_MESSAGE_PAGE_SIZE)] for first in (13, 33, 53)]
+    response = RecentMessage(73, button_count=1)
+    client = RecentMessageClient([*pages, [response]])
+    waits: list[float] = []
+
+    async def yield_control(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr(helper_module, "Message", RecentMessage)
+    monkeypatch.setattr(helper_module.asyncio, "sleep", yield_control)
+
+    result = await helper_module.wait_for_new_message_after(client, 100, 12, lambda current: current.button_count == 1)
+
+    assert result is response
+    assert client.calls == [
+        (100, 12, 12, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 32, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 52, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 72, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+    ]
+    assert waits == [1.0]
 
 
 @pytest.mark.asyncio
