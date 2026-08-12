@@ -3,6 +3,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from efb_telegram_master.models import MsgLogIngestionLeaseLostError
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
@@ -51,6 +52,11 @@ class FakeDatabase:
     def finish_scan(self, scan, *, status, error=None, lease_owner):
         scan.status = status
         scan.error = error
+
+    def release_scan(self, source_chat_id, lease_owner):
+        assert source_chat_id == 100
+        self.scan.status = "pending"
+        self.scan.error = "shutdown"
 
 
 class FakeChatAssociations:
@@ -182,6 +188,61 @@ def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_c
         ("msglog_ingestion.start", None),
         ("msglog_ingestion.retry", "MTProtoRetryableError"),
     ]
+
+
+def test_ingestion_stops_after_blocked_fetch_without_persisting_or_fetching_again():
+    db = FakeDatabase(scan_boundary=2)
+    stop_requested = False
+    fetched = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingMTProto(FakeMTProto):
+        async def get_channel_messages(self, channel, message_ids):
+            self.calls.append((channel, list(message_ids)))
+            fetched.set()
+            await release.wait()
+            return [topic_message(message_ids[0])]
+
+    mtproto = BlockingMTProto({}, scan_ceiling=2)
+
+    async def run():
+        nonlocal stop_requested
+        task = asyncio.create_task(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="worker-a", stop_requested=lambda: stop_requested))
+        await fetched.wait()
+        stop_requested = True
+        release.set()
+        await task
+
+    asyncio.run(run())
+
+    assert db.persisted == []
+    assert len(mtproto.calls) == 1
+    assert db.scan.status == "pending"
+    assert db.scan.cursor == 2
+
+
+def test_ingestion_already_stopped_performs_no_database_or_mtproto_work():
+    ingestion = SimpleNamespace(
+        get_or_create_scan=Mock(),
+        claim_scan=Mock(),
+        persist_item=Mock(),
+        finish_scan=Mock(),
+        release_scan=Mock(),
+    )
+    mtproto = SimpleNamespace(config=SimpleNamespace(scan_ceiling=1), get_input_channel=Mock(), get_channel_messages=Mock())
+
+    asyncio.run(MsgLogIngestionService(ingestion, Mock(), mtproto).run(100, lease_owner="worker-a", stop_requested=lambda: True))
+
+    for method in (
+        ingestion.get_or_create_scan,
+        ingestion.claim_scan,
+        ingestion.persist_item,
+        ingestion.finish_scan,
+        ingestion.release_scan,
+        mtproto.get_input_channel,
+        mtproto.get_channel_messages,
+    ):
+        method.assert_not_called()
 
 
 def test_ingestion_logs_lease_loss_with_a_stable_event(caplog):

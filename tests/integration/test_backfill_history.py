@@ -209,6 +209,7 @@ def _create_relink_start_token(channel_with_auxiliary_bots, etm_chat, *, private
         channel_with_auxiliary_bots.link_handler,
         storage_key,
         Flags.LINK_EXEC,
+        int(private_chat_owner),
         ChatListStorage([etm_chat]),
     )
     return etm_utils.b64en(etm_utils.message_id_to_str(*storage_key)), storage_key

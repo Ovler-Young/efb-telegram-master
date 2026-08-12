@@ -80,7 +80,7 @@ class LinkCompletionService:
             msg_id = utils.message_id_str_to_id(TgChatMsgIDStr(utils.b64de(resolved_args[0])))
             storage_key = (TelegramChatID(int(msg_id[0])), TelegramMessageID(int(msg_id[1])))
             data = self.callback_sessions.get(self._handler(), storage_key)
-            if data is None:
+            if data is None or update.effective_user is None or not self.callback_sessions.is_owned_by(storage_key, update.effective_user.id):
                 raise KeyError(storage_key)
         except KeyError:
             return sync_reply_text(self.bot, update.message, self._("Session expired or unknown parameter. (SE02)"))

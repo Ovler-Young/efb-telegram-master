@@ -1,6 +1,7 @@
 import logging
 import os
 import pickle
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -22,6 +23,8 @@ from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, MsgLogInge
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.msglog_repository import MsgLogRepository
+from efb_telegram_master.outbound_types import SendReceipt
+from efb_telegram_master.slave_message import SlaveMessageService
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 
 _OLD_MSGLOG_SCHEMA = """
@@ -186,22 +189,45 @@ def test_remove_chat_assoc_removes_topic_assoc(channel):
     assert channel.chat_associations.get_topic_thread_id("slave-topic-cleanup", TelegramChatID(66666)) is None
 
 
-def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):
-    chat = slave.chat_with_alias
-    etm_msg = ETMMsg(
-        uid=MessageID("db-test-message"),
-        chat=channel.chat_manager.update_chat_obj(chat),
-        author=channel.chat_manager.get_or_enrol_member(chat, chat.self),
-        text="db test",
+def test_slave_delivery_receipt_persists_sender_bot_id():
+    test_db = SqliteDatabase(":memory:")
+    repository = MsgLogRepository()
+    author = SimpleNamespace(module_id="tests.slave", uid="author")
+    chat = SimpleNamespace(module_id="tests.slave", uid="chat", get_member=lambda _uid: author)
+    message = SimpleNamespace(
+        uid=MessageID("receipt-provenance-message"),
+        chat=chat,
+        author=author,
+        text="receipt provenance",
         type=MsgType.Text,
-        type_telegram=TGMsgType.Text,
-        deliver_to=channel,
+        target=None,
+        commands=None,
+        reactions={},
+        is_system=False,
+        attributes=None,
+        substitutions=None,
+        deliver_to=SimpleNamespace(channel_id="tests.master"),
     )
+    receipt = SendReceipt(
+        SimpleNamespace(chat=SimpleNamespace(id=123456), chat_id=123456, message_id=654321),
+        sender_bot_id="777",
+    )
+    processor = object.__new__(SlaveMessageService)
+    processor.logger = SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None)
+    processor.msglogs = repository
+    processor.chat_manager = SimpleNamespace(update_chat_obj=lambda value: value)
+    processor.router = SimpleNamespace(resolve_reply=lambda *_args: None)
+    processor.commands = SimpleNamespace(register_command=lambda *_args: None)
+    processor.text_delivery = SimpleNamespace(text=lambda *_args: receipt)
+    processor._pending_slave_messages = set()
+    processor._pending_slave_messages_lock = threading.Lock()
 
-    channel.msglogs.add_or_update_message_log(etm_msg, SimpleNamespace(chat_id=123456, message_id=654321), sender_bot_id="777")
-    stored = channel.msglogs.get_msg_log(master_msg_id="123456.654321")
-    assert stored is not None and stored.sender_bot_id == "777"
-    stored.delete_instance()
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        processor.dispatch_message(message, "", None, 123456, None)
+
+        stored = repository.get_msg_log(master_msg_id="123456.654321")
+        assert stored is not None and stored.sender_bot_id == "777"
 
 
 def test_build_etm_msg_restores_sender_bot_id(channel, slave):

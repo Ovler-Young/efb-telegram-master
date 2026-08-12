@@ -116,6 +116,17 @@ class MsgLogIngestionRepository(ObservedRepository):
                 scan.__data__.update(current.__data__)
             return updated == 1
 
+    def release_scan(self, source_chat_id: int, lease_owner: str) -> bool:
+        """Make a shutdown-interrupted scan resumable without changing its cursor."""
+        now = datetime.datetime.now()
+        with database.atomic():
+            return (
+                MsgLogIngestionScan.update(status="pending", error="shutdown", lease_owner=None, lease_expires_at=None, updated_at=now)
+                .where((MsgLogIngestionScan.source_chat_id == str(source_chat_id)) & (MsgLogIngestionScan.status != "complete") & (MsgLogIngestionScan.lease_owner == lease_owner))
+                .execute()
+                == 1
+            )
+
     @observe_database_method("get_resumable_msglog_ingestion_scans")
     def get_resumable_scans(self) -> List[MsgLogIngestionScan]:
         now = datetime.datetime.now()

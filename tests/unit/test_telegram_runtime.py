@@ -12,6 +12,7 @@ from efb_telegram_master import TelegramChannel
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
 from efb_telegram_master.bot_manager import TelegramBotManager, TelegramResourceShutdownError
 from efb_telegram_master.bot_pool import BotPool
+from efb_telegram_master.history_replay import HistoryReplayShutdownTimeout
 from efb_telegram_master.master_message import MasterMessageWorker
 from efb_telegram_master.metrics_runtime import MetricsServer, parse_metrics_config
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout, SchedulerStoppedError
@@ -335,6 +336,46 @@ def test_channel_shutdown_error_still_stops_channel_owned_workers() -> None:
     assert channel._stop_polling_called
     channel.master_message_worker.stop_worker.assert_called_once_with()
     channel.db.stop_worker.assert_called_once_with()
+
+
+def test_channel_does_not_close_database_while_history_worker_is_blocked() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    channel.history_replay = Mock(stop=Mock(return_value=(HistoryReplayShutdownTimeout("target 100"),)))
+    channel.bot_manager = Mock()
+    channel.master_message_worker = Mock()
+    channel.db = Mock()
+
+    with pytest.raises(TelegramResourceShutdownError, match="target 100"):
+        channel.stop_polling()
+
+    channel.master_message_worker.stop_worker.assert_called_once_with()
+    channel.db.stop_worker.assert_not_called()
+
+
+def test_channel_retries_blocked_history_shutdown_then_closes_database_once() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    timeout = HistoryReplayShutdownTimeout("target 100")
+    channel.history_replay = Mock(stop=Mock(side_effect=[(timeout,), (timeout,), (), ()]))
+    channel.bot_manager = Mock()
+    channel.master_message_worker = Mock()
+    channel.db = Mock()
+
+    with pytest.raises(TelegramResourceShutdownError, match="target 100"):
+        channel.stop_polling()
+    channel.db.stop_worker.assert_not_called()
+
+    channel.stop_polling()
+    channel.stop_polling()
+
+    channel.db.stop_worker.assert_called_once_with()
+    channel.bot_manager.stop_channel_resources.assert_called_once_with()
+    channel.master_message_worker.stop_worker.assert_called_once_with()
 
 
 def test_channel_owner_stops_the_real_master_message_worker() -> None:

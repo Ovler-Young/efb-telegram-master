@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,7 +10,7 @@ from telegram import Update
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.channel_commands import LocaleState, TelegramCommandService
-from efb_telegram_master.msglog_scan import MsgLogScanScheduler
+from efb_telegram_master.msglog_scan import MsgLogScanScheduler, MsgLogScanShutdownTimeout
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
 
@@ -138,6 +139,34 @@ def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
     MsgLogScanScheduler.resume(manager)
 
     assert [call.args for call in manager.schedule.call_args_list] == [(100,), (200,)]
+
+
+def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():
+    started, release = threading.Event(), threading.Event()
+
+    class Runtime:
+        def call(self, coroutine):
+            coroutine.close()
+            started.set()
+            release.wait()
+
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=Runtime()), SimpleNamespace(enabled=True, connected=True, config=SimpleNamespace(scan_ceiling=10)), ingestion, Mock(), Mock())
+    try:
+        assert scheduler.schedule(100) == "started"
+        assert started.wait(1)
+        assert scheduler.schedule(100) == "already running"
+        errors = scheduler.stop(0.01)
+        assert len(errors) == 1
+        assert isinstance(errors[0], MsgLogScanShutdownTimeout)
+        assert scheduler.schedule(200) == "stopping"
+        release.set()
+        assert scheduler.stop(1) == ()
+        ingestion.release_scan.assert_called_once()
+        assert not any(thread.name == "MsgLogIngestion-100" and thread.is_alive() for thread in threading.enumerate())
+    finally:
+        release.set()
+        scheduler.stop(1)
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

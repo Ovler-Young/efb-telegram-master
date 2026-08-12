@@ -2,6 +2,7 @@
 
 import logging
 import mimetypes
+import threading
 from typing import Callable, List, Optional
 from xmlrpc.server import SimpleXMLRPCServer
 
@@ -28,7 +29,7 @@ from .chat_object_cache import ChatObjectCacheManager
 from .commands import CommandsManager
 from .constants import Flags
 from .db import DatabaseManager
-from .history_replay import HistoryReplayWorker
+from .history_replay import HistoryReplayShutdownTimeout, HistoryReplayWorker
 from .link_completion import LinkCompletionService
 from .link_service import LinkService
 from .master_delivery import MasterMessageDelivery
@@ -36,6 +37,7 @@ from .master_inbound import MasterMessageInbound
 from .master_message import MasterMessageWorker
 from .master_mutations import MasterMessageMutations
 from .message import ETMMsg
+from .msglog_scan import MsgLogScanShutdownTimeout
 from .mtproto import MTProtoClient
 from .oversized_notice import OversizedNoticeSender
 from .ptb_compat import Filters
@@ -77,6 +79,11 @@ class TelegramChannel(MasterChannel):
         Initialization.
         """
         super().__init__(instance_id)  # type: ignore[arg-type]  # upstream Channel.__init__ accepts None but isn't annotated as Optional
+        self._shutdown_lock = threading.Lock()
+        self._stopping = False
+        self._resources_stopped = False
+        self._database_closed = False
+        self._shutdown_complete = False
         self.locale_state = LocaleState()
 
         # Check PIL support for WebP
@@ -342,23 +349,42 @@ class TelegramChannel(MasterChannel):
         )
 
     def stop_polling(self):
-        if getattr(self, "_stop_polling_called", False):
-            return
-        self._stop_polling_called = True
-        self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
-        self.rpc_utilities.shutdown()
-        shutdown_error = None
-        try:
-            self.bot_manager.stop_channel_resources()
-        except TelegramResourceShutdownError as error:
-            shutdown_error = error
-            self.logger.warning("Telegram delivery did not stop before the deadline", extra={"event": "telegram_channel.delivery_shutdown_timeout"})
-        finally:
-            self.master_message_worker.stop_worker()
-            self.db.stop_worker()
-        self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
-        if shutdown_error is not None:
-            raise shutdown_error
+        lock = getattr(self, "_shutdown_lock", None)
+        if lock is None:
+            lock = self._shutdown_lock = threading.Lock()
+            self._stopping = self._resources_stopped = self._database_closed = self._shutdown_complete = False
+        with lock:
+            if self._shutdown_complete:
+                return
+            self._stop_polling_called = self._stopping = True
+            self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
+            errors: list[BaseException] = []
+            history_replay = getattr(self, "history_replay", None)
+            history_errors = history_replay.stop() if history_replay is not None else ()
+            if not self._resources_stopped:
+                self.rpc_utilities.shutdown()
+                try:
+                    self.bot_manager.stop_channel_resources()
+                except TelegramResourceShutdownError as error:
+                    errors.extend(error.errors)
+                    self.logger.warning("Telegram delivery did not stop before the deadline", extra={"event": "telegram_channel.delivery_shutdown_timeout"})
+                if not any(isinstance(error, MsgLogScanShutdownTimeout) for error in errors):
+                    self._resources_stopped = True
+                self.master_message_worker.stop_worker()
+            if history_replay is not None:
+                final_history_errors = history_replay.stop()
+                if final_history_errors:
+                    errors.extend(final_history_errors)
+                elif history_errors:
+                    self.logger.warning("History replay worker exited after Telegram runtime shutdown", extra={"event": "telegram_channel.history_replay_recovered"})
+            if not any(isinstance(error, (HistoryReplayShutdownTimeout, MsgLogScanShutdownTimeout)) for error in errors):
+                if not self._database_closed:
+                    self.db.stop_worker()
+                    self._database_closed = True
+                self._shutdown_complete = True
+            self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
+            if errors:
+                raise TelegramResourceShutdownError(tuple(errors))
 
     def get_chats(self) -> List[Chat]:
         raise EFBOperationNotSupported()

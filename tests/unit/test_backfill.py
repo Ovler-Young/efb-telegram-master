@@ -1,8 +1,9 @@
+import threading
 from contextlib import ExitStack
 from datetime import datetime, timedelta
 from gettext import NullTranslations
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import pytest
 from ehforwarderbot.channel import MasterChannel
@@ -11,29 +12,30 @@ from peewee import SqliteDatabase
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel, utils
-from efb_telegram_master.callback_sessions import ChatListStorage
+from efb_telegram_master.callback_sessions import CallbackSessionStore, ChatListStorage
 from efb_telegram_master.channel_commands import TelegramCommandService
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
-from efb_telegram_master.history_replay import HistoryReplayWorker
+from efb_telegram_master.history_replay import HistoryReplayShutdownTimeout, HistoryReplayWorker
 from efb_telegram_master.link_completion import LinkCompletionService
 from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, database
 from efb_telegram_master.mtproto import MTProtoConfig
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
 
-def _build_link_update(chat_id, *, is_forum=False):
+def _build_link_update(chat_id, *, is_forum=False, user_id=1):
     effective_chat = SimpleNamespace(id=chat_id, is_forum=is_forum, type="group")
     message = Mock()
     message.chat = effective_chat
     message.forward_from_chat = None
     message.reply_text = Mock()
+    message.from_user = SimpleNamespace(id=user_id)
     return Update(update_id=1, message=message)
 
 
 def _store_link_session(channel, chat, storage_key):
     storage = ChatListStorage([channel.chat_manager.update_chat_obj(chat)])
-    channel.callback_sessions.store(storage_key, storage)
+    channel.callback_sessions.store(storage_key, 1, storage)
 
 
 def _cleanup_link_state(channel, chat, master_chat_id):
@@ -58,6 +60,7 @@ def _link_completion_service(storage_key, chat, multiple_slave_chats=lambda: Fal
     )
     callback_sessions = SimpleNamespace(
         get=Mock(return_value=SimpleNamespace(chats=[chat])),
+        is_owned_by=Mock(return_value=True),
         clear=Mock(),
     )
     service = LinkCompletionService(
@@ -94,6 +97,61 @@ def test_link_completion_reads_multiple_slave_setting_at_completion_time():
 
     multiple_slave_chats.assert_called_once_with()
     assert chat.link.call_args.args[-1] is False
+
+
+def test_forged_start_token_does_not_consume_the_owner_session():
+    storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(459))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=False, full_name="Test chat", link=Mock())
+    bot = SimpleNamespace(send_message=Mock(return_value=_sent_link_message(-100500, 601)), edit_message_text=Mock())
+    callback_sessions = CallbackSessionStore(bot, lambda: 10)
+    handler = SimpleNamespace(_conversations={})
+    callback_sessions.start(handler, storage_key, Flags.LINK_EXEC, 1, ChatListStorage([chat]))
+    service = LinkCompletionService(
+        bot,
+        ModuleID("blueset.telegram"),
+        lambda: False,
+        SimpleNamespace(remove_topic_assoc=Mock()),
+        callback_sessions,
+        Mock(),
+        Mock(),
+        lambda message: message,
+        lambda single, plural, count: single if count == 1 else plural,
+        Mock(),
+    )
+    service.set_handler(handler)
+
+    service.complete(_build_link_update(-100500, user_id=2), [token])
+
+    chat.link.assert_not_called()
+    bot.send_message.assert_called_once_with(-100500, text="Session expired or unknown parameter. (SE02)", message_thread_id=ANY)
+    assert callback_sessions.lookup(storage_key) is not None
+    assert storage_key in handler._conversations
+
+    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
+        service.complete(_build_link_update(-100500), [token])
+    chat.link.assert_called_once()
+    assert callback_sessions.lookup(storage_key) is None
+
+
+def test_start_with_missing_effective_user_does_not_consume_a_session():
+    storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(460))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=False, full_name="Test chat", link=Mock())
+    bot = SimpleNamespace(send_message=Mock(), edit_message_text=Mock())
+    callback_sessions = CallbackSessionStore(bot, lambda: 10)
+    handler = SimpleNamespace(_conversations={})
+    callback_sessions.start(handler, storage_key, Flags.LINK_EXEC, 1, ChatListStorage([chat]))
+    service = LinkCompletionService(bot, ModuleID("blueset.telegram"), lambda: False, Mock(), callback_sessions, Mock(), Mock(), lambda message: message, Mock(), Mock())
+    service.set_handler(handler)
+    update = Update(update_id=1, message=Mock())
+    update.effective_message.text = "/start " + token
+    update.effective_message.chat = SimpleNamespace(id=-100500, type="group")
+
+    service.complete(update, [token])
+
+    chat.link.assert_not_called()
+    assert callback_sessions.lookup(storage_key) is not None
 
 
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
@@ -237,8 +295,78 @@ def test_history_replay_resume_starts_a_worker_for_queued_entries():
     with patch("efb_telegram_master.history_replay.threading.Thread") as thread:
         manager.resume()
 
-    thread.assert_called_once_with(target=manager.process_pending, daemon=True, name="HistoryMigrationResume")
+    thread.assert_called_once_with(target=manager._run, name="HistoryMigrationReplay")
     thread.return_value.start.assert_called_once()
+
+
+def test_history_replay_stop_rejects_starts_and_retries_after_a_blocked_call():
+    started, release = threading.Event(), threading.Event()
+    bot = SimpleNamespace(send_message=Mock(side_effect=lambda **_kwargs: (started.set(), release.wait())))
+    worker = HistoryReplayWorker(bot, Mock(), Mock(), Mock(), Mock())
+    worker.queue_entries = Mock(return_value=0)
+    try:
+        assert worker.start("tests.slave chat", 100, source_storage_key=(1, 2))
+        assert started.wait(1)
+        errors = worker.stop(0.01)
+        assert len(errors) == 1
+        assert isinstance(errors[0], HistoryReplayShutdownTimeout)
+        assert worker.start("tests.slave chat", 100) is False
+        release.set()
+        assert worker.stop(1) == ()
+        assert not any(thread.name == "HistoryMigrationReplay" and thread.is_alive() for thread in threading.enumerate())
+    finally:
+        release.set()
+        worker.stop(1)
+
+
+def test_history_replay_one_loop_drains_multiple_targets():
+    first_started, release, second_done = threading.Event(), threading.Event(), threading.Event()
+    worker = HistoryReplayWorker(Mock(), Mock(), SimpleNamespace(get_next_target=lambda: None), Mock(), Mock())
+    queued: list[tuple[str, int]] = []
+
+    def queue_entries(slave_chat_id, target_chat_id, _thread_id):
+        queued.append((str(slave_chat_id), target_chat_id))
+        if len(queued) == 1:
+            first_started.set()
+            release.wait(1)
+        else:
+            second_done.set()
+        return 0
+
+    worker.queue_entries = Mock(side_effect=queue_entries)
+    try:
+        assert worker.start("tests.slave first", 100)
+        assert first_started.wait(1)
+        assert worker.start("tests.slave second", 200)
+        release.set()
+        assert second_done.wait(1)
+        assert worker.stop(1) == ()
+        assert queued == [("tests.slave first", 100), ("tests.slave second", 200)]
+    finally:
+        release.set()
+        worker.stop(1)
+
+
+def test_history_replay_processes_request_enqueued_after_idle_queue_observation():
+    observed_empty, second_done = threading.Event(), threading.Event()
+    worker = HistoryReplayWorker(Mock(), Mock(), SimpleNamespace(get_next_target=lambda: None), Mock(), Mock())
+    queued: list[int] = []
+    original_wait = worker._condition.wait
+
+    def observe_then_wait(*args, **kwargs):
+        observed_empty.set()
+        return original_wait(*args, **kwargs)
+
+    worker._condition.wait = observe_then_wait
+    worker.queue_entries = Mock(side_effect=lambda _slave, target, _thread: (queued.append(target), second_done.set() if target == 200 else None, 0)[2])
+    try:
+        assert worker.start("tests.slave first", 100)
+        assert observed_empty.wait(1)
+        assert worker.start("tests.slave second", 200)
+        assert second_done.wait(1)
+        assert queued == [100, 200]
+    finally:
+        worker.stop(1)
 
 
 @pytest.mark.parametrize("backfill_flag", [None, "true", "yes", "on", "1"], ids=["automatic", "true", "yes", "on", "one"])

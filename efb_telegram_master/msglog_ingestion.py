@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
@@ -43,20 +44,33 @@ class MsgLogIngestionService:
     def _log_event(self, event: str, source_chat_id: int) -> None:
         self.logger.info("MsgLog ingestion %s for source chat %d", event, source_chat_id, extra={"event": _INGESTION_EVENT_IDS[event]})
 
-    async def run(self, source_chat_id: int, *, lease_owner: str) -> None:
+    async def run(self, source_chat_id: int, *, lease_owner: str, stop_requested: Callable[[], bool] = lambda: False) -> None:
         """Resume a source-group scan unless another worker owns its lease."""
         scan_ceiling = getattr(getattr(self.mtproto, "config", None), "scan_ceiling", 100_000)
         if isinstance(scan_ceiling, bool) or not isinstance(scan_ceiling, int) or scan_ceiling <= 0:
             raise ValueError("MTProto scan ceiling must be a positive integer")
+        if stop_requested():
+            return
         self.ingestion.get_or_create_scan(source_chat_id, scan_ceiling)
+        if stop_requested():
+            return
         scan = self.ingestion.claim_scan(source_chat_id, lease_owner, self.lease_seconds)
         if scan is None:
             return
         self._log_event("start", source_chat_id)
 
         try:
+            if stop_requested():
+                self._release_for_shutdown(source_chat_id, lease_owner)
+                return
             source_channel = await self.mtproto.get_input_channel(source_chat_id)
+            if stop_requested():
+                self._release_for_shutdown(source_chat_id, lease_owner)
+                return
             while scan.cursor > 0 and scan.existing_streak < self.EXISTING_STREAK_LIMIT:
+                if stop_requested():
+                    self._release_for_shutdown(source_chat_id, lease_owner)
+                    return
                 renewed_scan = self.ingestion.claim_scan(
                     source_chat_id,
                     lease_owner,
@@ -68,8 +82,14 @@ class MsgLogIngestionService:
                 lower_bound = max(1, scan.cursor - self.BATCH_SIZE + 1)
                 message_ids = list(range(scan.cursor, lower_bound - 1, -1))
                 messages = await self.mtproto.get_channel_messages(source_channel, message_ids)
+                if stop_requested():
+                    self._release_for_shutdown(source_chat_id, lease_owner)
+                    return
                 by_id = {message_id: message for message in messages if (message_id := self._message_id(message)) is not None}
                 for message_id in message_ids:
+                    if stop_requested():
+                        self._release_for_shutdown(source_chat_id, lease_owner)
+                        return
                     classification, slave_uid, content = self._classify(
                         by_id.get(message_id),
                         source_chat_id,
@@ -90,6 +110,9 @@ class MsgLogIngestionService:
                         )
                         self._log_event("complete", source_chat_id)
                         return
+            if stop_requested():
+                self._release_for_shutdown(source_chat_id, lease_owner)
+                return
             self.ingestion.finish_scan(scan, status="complete", lease_owner=lease_owner)
             self._log_event("complete", source_chat_id)
         except MsgLogIngestionLeaseLostError:
@@ -110,6 +133,9 @@ class MsgLogIngestionService:
                 lease_owner=lease_owner,
             )
             self.logger.exception("MsgLog ingestion failed at cursor %d", scan.cursor, extra={"event": "msglog_ingestion.error", "error_type": type(error).__name__})
+
+    def _release_for_shutdown(self, source_chat_id: int, lease_owner: str) -> None:
+        self.ingestion.release_scan(source_chat_id, lease_owner)
 
     def _classify(
         self,

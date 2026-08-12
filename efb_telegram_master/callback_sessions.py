@@ -1,5 +1,6 @@
 # coding=utf-8
 
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, cast
 
 from ehforwarderbot import coordinator
@@ -13,6 +14,14 @@ from .chat import ETMChatMixin
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 
 CallbackSessionID = Tuple[TelegramChatID, TelegramMessageID]
+
+
+@dataclass
+class CallbackSession:
+    """The callback state and Telegram user authorized to consume it."""
+
+    owner_id: int
+    storage: "ChatListStorage"
 
 
 class ChatListStorage:
@@ -50,7 +59,7 @@ class CallbackSessionStore:
     def __init__(self, bot, chats_per_page: Callable[[], int]):
         self._bot = bot
         self._chats_per_page = chats_per_page
-        self._storage: Dict[CallbackSessionID, ChatListStorage] = {}
+        self._storage: Dict[CallbackSessionID, CallbackSession] = {}
 
     @staticmethod
     def set_state(handler: ConversationHandler, key: Tuple[int, ...], state: object) -> None:
@@ -76,15 +85,23 @@ class CallbackSessionStore:
         except ValueError:
             return None
 
-    def start(self, handler: ConversationHandler, session_id: CallbackSessionID, state: object, storage: ChatListStorage) -> None:
-        self.store(session_id, storage)
+    def start(self, handler: ConversationHandler, session_id: CallbackSessionID, state: object, owner_id: int, storage: ChatListStorage) -> None:
+        self.store(session_id, owner_id, storage)
         self.set_state(handler, session_id, state)
 
-    def store(self, session_id: CallbackSessionID, storage: ChatListStorage) -> None:
-        self._storage[session_id] = storage
+    def store(self, session_id: CallbackSessionID, owner_id: int, storage: ChatListStorage) -> None:
+        self._storage[session_id] = CallbackSession(owner_id, storage)
 
     def lookup(self, session_id: CallbackSessionID) -> Optional[ChatListStorage]:
-        return self._storage.get(session_id)
+        session = self._storage.get(session_id)
+        return session.storage if session else None
+
+    def is_owned_by(self, session_id: CallbackSessionID, user_id: Optional[int]) -> bool:
+        session = self._storage.get(session_id)
+        return user_id is not None and session is not None and session.owner_id == user_id
+
+    def contains(self, session_id: CallbackSessionID) -> bool:
+        return session_id in self._storage
 
     def get(self, handler: ConversationHandler, session_id: CallbackSessionID) -> Optional[ChatListStorage]:
         conversations = getattr(handler, "_conversations", None)
@@ -92,7 +109,7 @@ class CallbackSessionStore:
             conversations = getattr(handler, "conversations")
         if session_id not in cast(ConversationDict, conversations):
             return None
-        return self._storage.get(session_id)
+        return self.lookup(session_id)
 
     def end(self, handler: ConversationHandler, session_id: CallbackSessionID, callback_query_id: str, text: str) -> int:
         self._storage.pop(session_id, None)

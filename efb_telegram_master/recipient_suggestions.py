@@ -43,6 +43,7 @@ class RecipientSuggestionService:
     def render_chat_list(
         self,
         storage_id: Tuple[TelegramChatID, TelegramMessageID],
+        owner_id: int,
         offset: int = 0,
         pattern: Optional[str] = "",
         source_chats: Optional[List[EFBChannelChatIDStr]] = None,
@@ -87,7 +88,7 @@ class RecipientSuggestionService:
                 chats = [chat for chat in self.chat_manager.all_chats if chat.match(re_filter)]
             chats.sort(key=lambda chat: chat.last_message_time, reverse=True)
             chat_list = ChatListStorage(chats, offset)
-            self.callback_sessions.store(storage_id, chat_list)
+            self.callback_sessions.store(storage_id, owner_id, chat_list)
 
         chat_list.offset = offset
         for channel in chat_list.channels.values():
@@ -111,7 +112,9 @@ class RecipientSuggestionService:
 
     def register_suggestions(self, update: Update, candidates: List[EFBChannelChatIDStr], chat_id: TelegramChatID, message_id: TelegramMessageID) -> None:
         storage_id = (chat_id, message_id)
-        legends, buttons = self.render_chat_list(storage_id, source_chats=candidates)
+        if update.effective_user is None:
+            return
+        legends, buttons = self.render_chat_list(storage_id, update.effective_user.id, source_chats=candidates)
         if len(buttons) <= 1:
             self.callback_sessions.discard(storage_id)
             return
@@ -134,6 +137,13 @@ class RecipientSuggestionService:
         callback_data = update.callback_query.data
         callback_query_id = update.callback_query.id
         storage_id = (chat_id, message_id)
+        callback_user = update.callback_query.from_user if update.callback_query else None
+        effective_user = update.effective_user
+        if self.callback_sessions.contains(storage_id) and (
+            callback_user is None or effective_user is None or callback_user.id != effective_user.id or not self.callback_sessions.is_owned_by(storage_id, effective_user.id)
+        ):
+            self.bot.answer_callback_query(callback_query_id, text=self._("Session expired or unknown parameter. (SE02)"))
+            return Flags.SUGGEST_RECIPIENTS
         expired_text = self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nSession expired, please try again.")
         invalid_text = self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nInvalid parameter ({0}).").format(callback_data)
         if callback_data.split(maxsplit=1)[0] == "chat":

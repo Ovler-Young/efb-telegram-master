@@ -55,6 +55,8 @@ class ChatHeadService:
 
     def start_chat_list(self, update: Update, context: CallbackContext):
         assert update.message
+        if update.effective_user is None:
+            return ConversationHandler.END
         chats = None
         if update.message.chat.type != ChatType.PRIVATE:
             chats = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel_id, ChatID(str(update.message.chat_id)))) or None
@@ -64,9 +66,11 @@ class ChatHeadService:
             target = TelegramChatID(update.message.from_user.id)
         else:
             raise RuntimeError("No target chat is found when generating chat list.")
-        return self.render_chat_head(target, pattern=" ".join(context.args or []), chats=chats)
+        return self.render_chat_head(target, update.effective_user.id, pattern=" ".join(context.args or []), chats=chats)
 
-    def render_chat_head(self, chat_id: TelegramChatID, message_id: Optional[TelegramMessageID] = None, offset: int = 0, pattern: str = "", chats: Optional[List[EFBChannelChatIDStr]] = None):
+    def render_chat_head(
+        self, chat_id: TelegramChatID, owner_id: int, message_id: Optional[TelegramMessageID] = None, offset: int = 0, pattern: str = "", chats: Optional[List[EFBChannelChatIDStr]] = None
+    ):
         if message_id is None:
             message_id = self.bot.send_message(chat_id, text=self._("Processing..."), _force_main_bot=True).message_id
         self.bot.send_chat_action(chat_id, ChatAction.TYPING)
@@ -89,7 +93,7 @@ class ChatHeadService:
             self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id)
             return ConversationHandler.END
         text = self._("This Telegram group is linked to the following chats, choose one to start a conversation with.") if chats else "Choose a chat you want to start a conversation with."
-        legend, buttons = self.render_chat_list((chat_id, message_id), offset, pattern=pattern, source_chats=chats)
+        legend, buttons = self.render_chat_list((chat_id, message_id), owner_id, offset, pattern=pattern, source_chats=chats)
         text += self._("\n\nLegend:\n") + "".join(f"{entry}\n" for entry in legend)
         self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(buttons))
         self.callback_sessions.set_state(self._handler(), (chat_id, message_id), Flags.CHAT_HEAD_CONFIRM)
@@ -100,6 +104,11 @@ class ChatHeadService:
         message_id = TelegramMessageID(update.effective_message.message_id)
         callback_data = update.callback_query.data
         storage_id = (chat_id, message_id)
+        callback_user = update.callback_query.from_user
+        effective_user = update.effective_user
+        if self.callback_sessions.contains(storage_id) and (effective_user is None or callback_user.id != effective_user.id or not self.callback_sessions.is_owned_by(storage_id, effective_user.id)):
+            self.bot.answer_callback_query(update.callback_query.id, text=self._("Session expired or unknown parameter. (SE02)"))
+            return Flags.CHAT_HEAD_CONFIRM
         expired_text = self._("Session expired. Please try again. (SE01)")
         invalid_text = self._("Invalid command. ({0})").format(callback_data)
         if callback_data.split(maxsplit=1)[0] == "offset":
@@ -109,8 +118,9 @@ class ChatHeadService:
                 return ConversationHandler.END
             if offset is None or not self.callback_sessions.is_valid_page_offset(storage, offset):
                 return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
+            assert effective_user is not None
             self.bot.answer_callback_query(update.callback_query.id)
-            return self.render_chat_head(chat_id, message_id, offset)
+            return self.render_chat_head(chat_id, effective_user.id, message_id, offset)
         if callback_data == Flags.CANCEL_PROCESS:
             return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, self._("Cancelled."))
         if not callback_data.startswith("chat "):

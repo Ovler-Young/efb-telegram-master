@@ -106,6 +106,8 @@ class LinkService:
         """
         assert isinstance(update, Update)
         assert update.effective_message
+        if update.effective_user is None:
+            return ConversationHandler.END
 
         args = context.args or []
         message: Message = update.effective_message
@@ -124,7 +126,7 @@ class LinkService:
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id)
                 storage_id: Tuple[TelegramChatID, TelegramMessageID] = (tg_chat_id, tg_msg_id)
-                self.callback_sessions.start(self._handler(), storage_id, Flags.LINK_EXEC, ChatListStorage([chat]))
+                self.callback_sessions.start(self._handler(), storage_id, Flags.LINK_EXEC, update.effective_user.id, ChatListStorage([chat]))
                 return self.build_action(chat, tg_chat_id, tg_msg_id)
             if message.message_thread_id:
                 topic = message.message_thread_id
@@ -136,24 +138,25 @@ class LinkService:
                         topic_tg_chat_id = TelegramChatID(message.chat_id)
                         topic_tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id)
                         topic_storage_id: Tuple[TelegramChatID, TelegramMessageID] = (topic_tg_chat_id, topic_tg_msg_id)
-                        self.callback_sessions.start(self._handler(), topic_storage_id, Flags.LINK_EXEC, ChatListStorage([topic_chat]))
+                        self.callback_sessions.start(self._handler(), topic_storage_id, Flags.LINK_EXEC, update.effective_user.id, ChatListStorage([topic_chat]))
                         return self.build_action(topic_chat, topic_tg_chat_id, topic_tg_msg_id)
 
         if message.chat.type != ChatType.PRIVATE:
             links = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id))))
             if links:
-                return self.render_list(TelegramChatID(message.chat.id), pattern=" ".join(args), chats=links, filter_availability=False)
+                return self.render_list(TelegramChatID(message.chat.id), update.effective_user.id, pattern=" ".join(args), chats=links, filter_availability=False)
         elif (forwarded_chat := get_forwarded_chat(message)) and forwarded_chat.type == ChatType.CHANNEL:
             chat_id = ChatID(str(forwarded_chat.id))
             links = self.chat_associations.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel_id, chat_id))
             if links:
-                return self.render_list(TelegramChatID(message.chat.id), pattern=" ".join(args), chats=links, filter_availability=False)
+                return self.render_list(TelegramChatID(message.chat.id), update.effective_user.id, pattern=" ".join(args), chats=links, filter_availability=False)
         assert message.from_user
-        return self.render_list(TelegramChatID(message.from_user.id), pattern=" ".join(args))
+        return self.render_list(TelegramChatID(message.from_user.id), update.effective_user.id, pattern=" ".join(args))
 
     def render_list(
         self,
         chat_id: TelegramChatID,
+        owner_id: int,
         message_id: Optional[TelegramMessageID] = None,
         offset: int = 0,
         pattern: str = "",
@@ -185,7 +188,7 @@ class LinkService:
             msg_text = self._("Please choose the chat you want to link with...")
         msg_text += self._("\n\nLegend:\n")
 
-        legend, chat_btn_list = self.render_chat_list((chat_id, message_id), offset, pattern=pattern, source_chats=chats, filter_availability=filter_availability)
+        legend, chat_btn_list = self.render_chat_list((chat_id, message_id), owner_id, offset, pattern=pattern, source_chats=chats, filter_availability=filter_availability)
         for i in legend:
             msg_text += "%s\n" % i
 
@@ -214,6 +217,11 @@ class LinkService:
         tg_msg_id = TelegramMessageID(update.effective_message.message_id)
         callback_uid: str = update.callback_query.data
         storage_id = (tg_chat_id, tg_msg_id)
+        callback_user = update.callback_query.from_user
+        effective_user = update.effective_user
+        if self.callback_sessions.contains(storage_id) and (effective_user is None or callback_user.id != effective_user.id or not self.callback_sessions.is_owned_by(storage_id, effective_user.id)):
+            self.bot.answer_callback_query(update.callback_query.id, text=self._("Session expired or unknown parameter. (SE02)"))
+            return Flags.LINK_CONFIRM
         expired_text = self._("Session expired. Please try again. (SE01)")
         invalid_text = self._("Invalid parameter ({0}). (IP01)").format(callback_uid)
         if callback_uid.split(maxsplit=1)[0] == "offset":
@@ -224,8 +232,9 @@ class LinkService:
             if offset is None or not self.callback_sessions.is_valid_page_offset(storage, offset):
                 return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
             # Offer a new page of chats
+            assert effective_user is not None
             self.bot.answer_callback_query(update.callback_query.id)
-            return self.render_list(tg_chat_id, message_id=tg_msg_id, offset=offset)
+            return self.render_list(tg_chat_id, effective_user.id, message_id=tg_msg_id, offset=offset)
 
         if callback_uid == Flags.CANCEL_PROCESS:
             # Terminate the process
@@ -283,13 +292,17 @@ class LinkService:
         tg_chat_id = TelegramChatID(update.effective_chat.id)
         tg_msg_id = TelegramMessageID(update.effective_message.message_id)
         callback_uid = update.callback_query.data
+        callback_user = update.callback_query.from_user
+        effective_user = update.effective_user
+        storage_id = (tg_chat_id, tg_msg_id)
+        if self.callback_sessions.contains(storage_id) and (effective_user is None or callback_user.id != effective_user.id or not self.callback_sessions.is_owned_by(storage_id, effective_user.id)):
+            self.bot.answer_callback_query(update.callback_query.id, text=self._("Session expired or unknown parameter. (SE02)"))
+            return Flags.LINK_EXEC
 
         if callback_uid == Flags.CANCEL_PROCESS:
             txt = self._("Cancelled.")
-            storage_id = (tg_chat_id, tg_msg_id)
             return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, txt)
 
-        storage_id = (tg_chat_id, tg_msg_id)
         expired_text = self._("Session expired. Please try again. (SE01)")
         callback_parts = callback_uid.split()
         if len(callback_parts) != 2:

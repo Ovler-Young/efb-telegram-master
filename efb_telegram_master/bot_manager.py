@@ -245,15 +245,23 @@ class TelegramBotManager:
             )
 
     def stop_channel_resources(self) -> None:
-        """Stop delivery work, then the runtime, then join membership workers."""
+        """Stop scans before runtime teardown, then delivery and membership resources."""
         self._stopping.set()
         self.logger.info("Stopping Telegram delivery resources", extra={"event": "telegram_bot.stop_started"})
+        scheduler = getattr(self, "msglog_scan", None)
+        initial_scan_errors = scheduler.stop(self.SHUTDOWN_JOIN_GRACE) if scheduler is not None else ()
         errors = list(self.api.begin_delivery_shutdown(self.SHUTDOWN_JOIN_GRACE))
         initial_membership_errors = self.api.finish_delivery_shutdown(time.monotonic() + self.SHUTDOWN_JOIN_GRACE)
         try:
             self.telegram_runtime.stop()
         except BaseException as error:
             errors.append(error)
+        if scheduler is not None:
+            final_scan_errors = scheduler.stop(self.SHUTDOWN_DRAIN_TIMEOUT)
+            if final_scan_errors:
+                errors.extend(final_scan_errors)
+            elif initial_scan_errors:
+                self.logger.warning("MsgLog ingestion workers exited after runtime shutdown", extra={"event": "telegram_bot.msglog_scan_recovered"})
         final_membership_errors = self.api.finish_delivery_shutdown(time.monotonic() + self.SHUTDOWN_DRAIN_TIMEOUT)
         if final_membership_errors:
             errors.extend(final_membership_errors)
