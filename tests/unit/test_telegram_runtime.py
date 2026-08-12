@@ -341,6 +341,24 @@ def test_channel_shutdown_error_still_stops_channel_owned_workers() -> None:
     channel.db.stop_worker.assert_called_once_with()
 
 
+def test_channel_stops_master_messages_before_outbound_delivery() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    channel.bot_manager = Mock()
+    channel.master_message_worker = Mock()
+    channel.db = Mock()
+
+    events: list[str] = []
+    channel.master_message_worker.stop_worker.side_effect = lambda: events.append("master")
+    channel.bot_manager.stop_channel_resources.side_effect = lambda: events.append("outbound")
+
+    channel.stop_polling()
+
+    assert events == ["master", "outbound"]
+
+
 def test_channel_does_not_close_database_while_history_worker_is_blocked() -> None:
     channel = TelegramChannel.__new__(TelegramChannel)
     channel._stop_polling_called = False

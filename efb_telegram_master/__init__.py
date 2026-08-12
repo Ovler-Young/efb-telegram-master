@@ -190,6 +190,7 @@ class TelegramChannel(MasterChannel):
             history_errors = history_replay.stop() if history_replay is not None else ()
             if not self._resources_stopped:
                 self.rpc_utilities.shutdown()
+                self.master_message_worker.stop_worker()
                 try:
                     self.bot_manager.stop_channel_resources()
                 except TelegramResourceShutdownError as error:
@@ -197,7 +198,6 @@ class TelegramChannel(MasterChannel):
                     self.logger.warning("Telegram delivery did not stop before the deadline", extra={"event": "telegram_channel.delivery_shutdown_timeout"})
                 if not any(isinstance(error, MsgLogScanShutdownTimeout) for error in errors):
                     self._resources_stopped = True
-                self.master_message_worker.stop_worker()
             if history_replay is not None:
                 final_history_errors = history_replay.stop()
                 if final_history_errors:
