@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -7,26 +7,26 @@ from ehforwarderbot.types import MessageID
 from peewee import SqliteDatabase
 
 from efb_telegram_master import db as db_module
-from efb_telegram_master.db import DatabaseManager, MsgLog, MsgLogIngestionScan, database
+from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.msg_type import TGMsgType
 
 
-def test_fresh_database_defines_msglog_provenance_and_ingestion_scan(tmp_path, monkeypatch):
+def test_fresh_database_defines_msglog_provenance(tmp_path, monkeypatch):
     original_database = database.obj
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     manager = DatabaseManager(SimpleNamespace(channel_id="tests.fresh", config={}))
     try:
         msglog_columns = {column.name for column in database.get_columns("msglog")}
-        scan_columns = {column.name for column in database.get_columns("msglogingestionscan")}
+        tables = set(database.get_tables())
     finally:
         manager.stop_worker()
         database.initialize(original_database)
 
     assert "provenance" in msglog_columns
-    assert {"source_chat_id", "cursor", "lease_owner", "existing_streak"}.issubset(scan_columns)
+    assert "msglogingestionscan" not in tables
 
 
-def test_ingestion_claim_persist_and_idempotence_are_atomic():
+def test_ingested_msglog_persistence_is_idempotent():
     original_database = database.obj
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
@@ -34,10 +34,7 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
     manager = object.__new__(DatabaseManager)
     manager.channel = SimpleNamespace(channel_id="tests")
     try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        scan = manager.get_or_create_msglog_ingestion_scan(100, 500)
-        assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
-        assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is None
+        test_db.create_tables([MsgLog])
         content = SimpleNamespace(
             text="ingested",
             media_type="Text",
@@ -46,25 +43,11 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
             time=datetime(2026, 8, 4),
         )
         assert (
-            manager.persist_msglog_ingestion_item(
-                scan,
-                source_message_id=500,
-                classification="eligible",
-                slave_uid="tests.slave target",
-                message=content,
-                lease_owner="worker-a",
-            )
+            manager.persist_ingested_msglog(100, 500, "tests.slave target", content)
             == "inserted"
         )
         assert (
-            manager.persist_msglog_ingestion_item(
-                scan,
-                source_message_id=500,
-                classification="eligible",
-                slave_uid="tests.slave target",
-                message=content,
-                lease_owner="worker-a",
-            )
+            manager.persist_ingested_msglog(100, 500, "tests.slave target", content)
             == "existing"
         )
         row = MsgLog.get_by_id("100.500")
@@ -74,25 +57,6 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
 
     assert row.provenance == "mtproto_ingested"
     assert row.slave_message_id == "mtproto-ingested:100.500"
-
-
-def test_expired_scan_is_resumable_after_restart():
-    original_database = database.obj
-    test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
-    test_db.connect()
-    manager = object.__new__(DatabaseManager)
-    try:
-        test_db.create_tables([MsgLogIngestionScan])
-        scan = manager.get_or_create_msglog_ingestion_scan(100, 500)
-        assert manager.claim_msglog_ingestion_scan(100, "worker-a", 60) is not None
-        MsgLogIngestionScan.update(lease_expires_at=datetime.now() - timedelta(seconds=1)).where(MsgLogIngestionScan.id == scan.id).execute()
-        resumed = manager.get_resumable_msglog_ingestion_scans()
-        assert [item.source_chat_id for item in resumed] == ["100"]
-        assert manager.claim_msglog_ingestion_scan(100, "worker-b", 60) is not None
-    finally:
-        test_db.close()
-        database.initialize(original_database)
 
 
 def test_live_message_overwrites_synthetic_provenance():

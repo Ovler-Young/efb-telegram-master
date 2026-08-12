@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -28,23 +29,18 @@ def test_sync_msglog_requires_admin_and_a_bound_forum_group():
     channel.chat_binding.schedule_msglog_ingestion.assert_called_once_with(100)
 
 
-def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
+def test_stop_msglog_ingestions_joins_active_workers():
     manager = object.__new__(ChatBindingManager)
-    manager.db = SimpleNamespace(
-        get_resumable_msglog_ingestion_scans=Mock(
-            return_value=[
-                SimpleNamespace(source_chat_id="100"),
-                SimpleNamespace(source_chat_id="200"),
-            ]
-        ),
-        get_topic_slaves=Mock(side_effect=[[("a", 1)], [("b", 2)]]),
-    )
-    manager.schedule_msglog_ingestion = Mock()
-    manager.logger = Mock()
+    manager._msglog_ingestion_lock = threading.Lock()
+    manager._msglog_ingestion_stop = threading.Event()
+    worker = threading.Thread(target=manager._msglog_ingestion_stop.wait)
+    manager._msglog_ingestion_threads = {100: worker}
+    worker.start()
 
-    ChatBindingManager.resume_pending_msglog_ingestions(manager)
+    ChatBindingManager.stop_msglog_ingestions(manager)
 
-    assert [call.args for call in manager.schedule_msglog_ingestion.call_args_list] == [(100,), (200,)]
+    assert manager._msglog_ingestion_stop.is_set()
+    assert not worker.is_alive()
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

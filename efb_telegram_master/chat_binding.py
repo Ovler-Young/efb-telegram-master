@@ -8,7 +8,6 @@ import shlex
 import threading
 import time
 import urllib.parse
-import uuid
 from contextlib import suppress
 from typing import IO, TYPE_CHECKING, Dict, List, Optional, Pattern, Tuple, Union, cast
 
@@ -32,7 +31,6 @@ from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
 from .msglog_ingestion import MsgLogIngestionService
-from .outbound import QueueRequest
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TelegramTopicID, TgChatMsgIDStr
 
@@ -112,6 +110,7 @@ class ChatBindingManager(LocaleMixin):
         self._history_migration_thread: Optional[threading.Thread] = None
         self._msglog_ingestion_lock = threading.Lock()
         self._msglog_ingestion_threads: Dict[int, threading.Thread] = {}
+        self._msglog_ingestion_stop = threading.Event()
 
         # Link handler
         non_edit_filter = Filters.update.message | Filters.update.channel_post
@@ -1322,21 +1321,14 @@ class ChatBindingManager(LocaleMixin):
         migration_thread.start()
 
     def schedule_msglog_ingestion(self, source_chat_id: int) -> str:
-        """Start one non-blocking durable scan for a bound source group."""
+        """Start one non-blocking bounded scan for a bound source group."""
         mtproto = self.channel.mtproto
-        if not getattr(mtproto, "enabled", False) or not getattr(mtproto, "connected", False):
+        if self._msglog_ingestion_stop.is_set() or not getattr(mtproto, "enabled", False) or not getattr(mtproto, "connected", False):
             return "unavailable"
         with self._msglog_ingestion_lock:
             existing = self._msglog_ingestion_threads.get(source_chat_id)
             if existing is not None and existing.is_alive():
                 return "already running"
-            scan = self.db.get_or_create_msglog_ingestion_scan(
-                source_chat_id,
-                getattr(getattr(mtproto, "config", None), "scan_ceiling", 100_000),
-            )
-            if scan.status == "complete":
-                return "already complete"
-            state = "resumed" if scan.scanned_count else "started"
             thread = threading.Thread(
                 target=self._run_msglog_ingestion,
                 args=(source_chat_id,),
@@ -1345,29 +1337,27 @@ class ChatBindingManager(LocaleMixin):
             )
             self._msglog_ingestion_threads[source_chat_id] = thread
             thread.start()
-            return state
+            return "started"
 
     def _run_msglog_ingestion(self, source_chat_id: int) -> None:
         try:
             self.bot._runtime.call(
-                MsgLogIngestionService(self.db, self.channel.mtproto).run(
-                    source_chat_id,
-                    lease_owner=str(uuid.uuid4()),
-                )
+                MsgLogIngestionService(self.db, self.channel.mtproto, self._msglog_ingestion_stop.is_set).run(source_chat_id)
             )
         except Exception:
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id)
+        finally:
+            with self._msglog_ingestion_lock:
+                if self._msglog_ingestion_threads.get(source_chat_id) is threading.current_thread():
+                    self._msglog_ingestion_threads.pop(source_chat_id)
 
-    def resume_pending_msglog_ingestions(self) -> None:
-        try:
-            scans = self.db.get_resumable_msglog_ingestion_scans()
-        except Exception as error:
-            self.logger.warning("Failed to load resumable MsgLog ingestions (%s).", type(error).__name__)
-            return
-        for scan in scans:
-            source_chat_id = int(scan.source_chat_id)
-            if self.db.get_topic_slaves(TelegramChatID(source_chat_id)):
-                self.schedule_msglog_ingestion(source_chat_id)
+    def stop_msglog_ingestions(self) -> None:
+        """Cancel active command scans and wait for their worker threads."""
+        self._msglog_ingestion_stop.set()
+        with self._msglog_ingestion_lock:
+            workers = list(self._msglog_ingestion_threads.values())
+        for worker in workers:
+            worker.join()
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Background method that performs the actual migration work.
@@ -1485,8 +1475,7 @@ class ChatBindingManager(LocaleMixin):
             operation, kwargs = prepared_call
             completed_call_count = 0
             try:
-                waiter = self.bot.outbound_queue.enqueue(QueueRequest(operation, (), kwargs, tg_chat_id))
-                waiter.result()
+                getattr(self.bot, operation)(**kwargs)
                 completed_call_count += 1
             except BaseException as error:
                 self._log_history_migration_failure(entry.id, completed_call_count, error)

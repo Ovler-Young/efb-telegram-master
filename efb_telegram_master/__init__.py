@@ -469,7 +469,7 @@ class TelegramChannel(MasterChannel):
             return
 
     def sync_msglog(self, update: Update, context: CallbackContext):
-        """Schedule durable MsgLog ingestion for the current bound forum group."""
+        """Start a bounded MsgLog ingestion for the current bound forum group."""
         assert isinstance(update, Update)
         if update.effective_message is None:
             return
@@ -524,16 +524,14 @@ class TelegramChannel(MasterChannel):
             await self.mtproto.connect()
         except (ConnectionError, TimeoutError, OSError, MTProtoRetryableError) as error:
             self.logger.warning(
-                "MTProto startup is unavailable; MsgLog ingestion remains pending (%s).",
+                "MTProto startup is unavailable (%s).",
                 type(error).__name__,
                 extra={"event": "telegram_channel.mtproto_start_failed", "error_type": type(error).__name__},
             )
             return
         if not self.mtproto.connected:
-            self.logger.warning("MTProto startup did not establish a connection; MsgLog ingestion remains pending.", extra={"event": "telegram_channel.mtproto_disconnected"})
+            self.logger.warning("MTProto startup did not establish a connection.", extra={"event": "telegram_channel.mtproto_disconnected"})
             return
-        self.logger.info("Resuming pending MsgLog ingestions", extra={"event": "telegram_channel.msglog_resume"})
-        self.chat_binding.resume_pending_msglog_ingestions()
 
     async def _telegram_runtime_stopped(self, runtime: TelegramPollingRuntime) -> None:
         await self.mtproto.disconnect()
@@ -694,6 +692,7 @@ class TelegramChannel(MasterChannel):
         self._stop_polling_called = True
         self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
         self.rpc_utilities.shutdown()
+        self.chat_binding.stop_msglog_ingestions()
         self.bot_manager.stop_channel_resources()
         self.telegram_runtime.stop()
         self.master_messages.stop_worker()

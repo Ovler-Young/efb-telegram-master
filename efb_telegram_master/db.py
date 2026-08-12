@@ -21,7 +21,6 @@ from peewee import (
     DateTimeField,
     DoesNotExist,
     IntegerField,
-    IntegrityError,
     Model,
     TextField,
     fn,
@@ -219,30 +218,6 @@ class MsgLog(BaseModel):
         return msg
 
 
-class MsgLogIngestionScan(BaseModel):
-    """One leased descending MTProto scan for a bound Telegram group."""
-
-    id = AutoField()
-    source_chat_id = TextField(unique=True)
-    scan_boundary = IntegerField()
-    cursor = IntegerField()
-    existing_streak = IntegerField(default=0)
-    scanned_count = IntegerField(default=0)
-    inserted_count = IntegerField(default=0)
-    existing_count = IntegerField(default=0)
-    skipped_count = IntegerField(default=0)
-    lease_owner = TextField(null=True)
-    lease_expires_at = DateTimeField(null=True)
-    status = TextField(default="pending")
-    error = TextField(null=True)
-    created_at = DateTimeField(default=datetime.datetime.now)
-    updated_at = DateTimeField(default=datetime.datetime.now)
-
-
-class MsgLogIngestionLeaseLostError(RuntimeError):
-    """Raised when a worker no longer owns an active ingestion lease."""
-
-
 class HistoryMigrationEntry(BaseModel):
     id = AutoField()
     slave_chat_id = TextField()
@@ -353,7 +328,6 @@ class DatabaseManager:
                 SlaveChatInfo,
                 TopicAssoc,
                 HistoryMigrationEntry,
-                MsgLogIngestionScan,
             ]
         )
 
@@ -579,156 +553,28 @@ class DatabaseManager:
         assoc = TopicAssoc.get_or_none((TopicAssoc.topic_chat_id == str(source_chat_id)) & (TopicAssoc.message_thread_id == str(topic_id)))
         return EFBChannelChatIDStr(assoc.slave_uid) if assoc is not None else None
 
-    def get_or_create_msglog_ingestion_scan(
-        self,
-        source_chat_id: int,
-        scan_boundary: int,
-    ) -> MsgLogIngestionScan:
-        """Return the durable scan for one source group without changing its boundary."""
-        if scan_boundary <= 0:
-            raise ValueError("scan boundary must be positive")
-        source_id = str(source_chat_id)
-        scan = MsgLogIngestionScan.get_or_none(MsgLogIngestionScan.source_chat_id == source_id)
-        if scan is not None:
-            return scan
-        try:
-            return MsgLogIngestionScan.create(
-                source_chat_id=source_id,
-                scan_boundary=scan_boundary,
-                cursor=scan_boundary,
-            )
-        except IntegrityError:
-            return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == source_id)
-
-    def claim_msglog_ingestion_scan(
-        self,
-        source_chat_id: int,
-        lease_owner: str,
-        lease_seconds: int,
-    ) -> Optional[MsgLogIngestionScan]:
-        """Claim a scan when no other unexpired worker owns its lease."""
-        if lease_seconds <= 0:
-            raise ValueError("lease seconds must be positive")
-        now = datetime.datetime.now()
-        lease_expires_at = now + datetime.timedelta(seconds=lease_seconds)
-        with database.atomic():
-            updated = (
-                MsgLogIngestionScan.update(
-                    lease_owner=lease_owner,
-                    lease_expires_at=lease_expires_at,
-                    status="running",
-                    error=None,
-                    updated_at=now,
-                )
-                .where(
-                    (MsgLogIngestionScan.source_chat_id == str(source_chat_id))
-                    & (MsgLogIngestionScan.status != "complete")
-                    & (MsgLogIngestionScan.lease_expires_at.is_null(True) | (MsgLogIngestionScan.lease_expires_at <= now) | (MsgLogIngestionScan.lease_owner == lease_owner))
-                )
-                .execute()
-            )
-            if updated != 1:
-                return None
-            return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
-
-    def persist_msglog_ingestion_item(
-        self,
-        scan: MsgLogIngestionScan,
-        *,
-        source_message_id: int,
-        classification: str,
-        slave_uid: Optional[EFBChannelChatIDStr] = None,
-        message: Optional[object] = None,
-        lease_owner: str,
-    ) -> str:
-        """Store one scan outcome and its cursor atomically."""
-        now = datetime.datetime.now()
-        supports_for_update = bool(getattr(database.obj, "for_update", False))
-        transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
-        with transaction:
-            query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
-            if supports_for_update:
-                query = query.for_update()
-            current = query.get()
-            if current.lease_owner != lease_owner or (current.lease_expires_at is not None and current.lease_expires_at < now):
-                raise MsgLogIngestionLeaseLostError("MsgLog ingestion lease is no longer owned by this worker")
-            if current.status == "complete":
-                return "complete"
-
-            current.cursor = source_message_id - 1
-            current.scanned_count += 1
-            if classification != "eligible":
-                current.skipped_count += 1
-                outcome = "skipped"
-            else:
-                if slave_uid is None or message is None:
-                    raise ValueError("eligible ingestion record is missing its topic association or content")
-                master_msg_id = f"{current.source_chat_id}.{source_message_id}"
-                existing = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
-                if existing is not None:
-                    current.existing_count += 1
-                    current.existing_streak += 1
-                    outcome = "existing"
-                else:
-                    slave_channel_id, _, _ = chat_id_str_to_id(slave_uid)
-                    synthetic_member_uid = chat_id_to_str(slave_channel_id, ChatID("__self__"))
-                    source_time = getattr(message, "time", None)
-                    MsgLog.create(
-                        master_msg_id=master_msg_id,
-                        slave_message_id=f"mtproto-ingested:{master_msg_id}",
-                        text=str(getattr(message, "text")),
-                        slave_origin_uid=str(slave_uid),
-                        slave_member_uid=str(synthetic_member_uid),
-                        media_type=str(getattr(message, "media_type")),
-                        mime=getattr(message, "mime"),
-                        msg_type=str(getattr(message, "msg_type")),
-                        sent_to=self.channel.channel_id,
-                        provenance="mtproto_ingested",
-                        time=source_time if isinstance(source_time, datetime.datetime) else now,
-                    )
-                    current.inserted_count += 1
-                    current.existing_streak = 0
-                    outcome = "inserted"
-            if current.cursor <= 0 or current.existing_streak >= 500:
-                current.status = "complete"
-                current.lease_owner = None
-                current.lease_expires_at = None
-            current.updated_at = now
-            current.save()
-            scan.__data__.update(current.__data__)
-            return outcome
-
-    def finish_msglog_ingestion_scan(
-        self,
-        scan: MsgLogIngestionScan,
-        *,
-        status: str,
-        error: Optional[str] = None,
-        lease_owner: str,
-    ) -> bool:
-        """Record a terminal or retryable scan state and release its lease."""
+    def persist_ingested_msglog(self, source_chat_id: int, source_message_id: int, slave_uid: EFBChannelChatIDStr, message: object) -> str:
+        """Insert one MTProto message unless its Telegram identity already exists."""
+        master_msg_id = f"{source_chat_id}.{source_message_id}"
         now = datetime.datetime.now()
         with database.atomic():
-            updated = (
-                MsgLogIngestionScan.update(
-                    status=status,
-                    error=error,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    updated_at=now,
-                )
-                .where(
-                    (MsgLogIngestionScan.id == scan.id)
-                    & (MsgLogIngestionScan.lease_owner == lease_owner)
-                    & MsgLogIngestionScan.lease_expires_at.is_null(False)
-                    & (MsgLogIngestionScan.lease_expires_at > now)
-                )
-                .execute()
+            if MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id) is not None:
+                return "existing"
+            slave_channel_id, _, _ = chat_id_str_to_id(slave_uid)
+            MsgLog.create(
+                master_msg_id=master_msg_id,
+                slave_message_id=f"mtproto-ingested:{master_msg_id}",
+                text=str(getattr(message, "text")),
+                slave_origin_uid=str(slave_uid),
+                slave_member_uid=str(chat_id_to_str(slave_channel_id, ChatID("__self__"))),
+                media_type=str(getattr(message, "media_type")),
+                mime=getattr(message, "mime"),
+                msg_type=str(getattr(message, "msg_type")),
+                sent_to=self.channel.channel_id,
+                provenance="mtproto_ingested",
+                time=getattr(message, "time") if isinstance(getattr(message, "time"), datetime.datetime) else now,
             )
-            current = MsgLogIngestionScan.get_by_id(scan.id)
-            if updated == 1 or current.status == "complete":
-                scan.__data__.update(current.__data__)
-            return updated == 1
+        return "inserted"
 
     @observe_database_method("get_topic_slaves")
     def get_topic_slaves(self, topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
@@ -1032,15 +878,3 @@ class DatabaseManager:
     @observe_database_method("delete_history_migration_entry")
     def delete_history_migration_entry(self, entry_id: int) -> int:
         return int(HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id == entry_id).execute())
-
-    @observe_database_method("get_resumable_msglog_ingestion_scans")
-    def get_resumable_msglog_ingestion_scans(self) -> List[MsgLogIngestionScan]:
-        now = datetime.datetime.now()
-        return list(
-            MsgLogIngestionScan.select()
-            .where(
-                MsgLogIngestionScan.status.in_(("pending", "retryable-error"))
-                | ((MsgLogIngestionScan.status == "running") & (MsgLogIngestionScan.lease_expires_at.is_null(True) | (MsgLogIngestionScan.lease_expires_at <= now)))
-            )
-            .order_by(MsgLogIngestionScan.updated_at.asc(), MsgLogIngestionScan.id.asc())
-        )

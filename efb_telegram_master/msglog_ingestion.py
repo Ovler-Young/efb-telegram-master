@@ -1,14 +1,14 @@
-"""Durable MTProto ingestion of mapped forum-topic messages into MsgLog."""
+"""Command-invoked MTProto ingestion of mapped forum-topic messages into MsgLog."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
-from .db import DatabaseManager, MsgLogIngestionLeaseLostError
-from .mtproto import MTProtoClient, MTProtoRetryableError
+from .db import DatabaseManager
+from .mtproto import MTProtoClient
 from .utils import EFBChannelChatIDStr
 
 _INGESTION_EVENT_IDS = {"start": "msglog_ingestion.start", "complete": "msglog_ingestion.complete"}
@@ -29,84 +29,44 @@ class MsgLogIngestionService:
     BATCH_SIZE = 100
     EXISTING_STREAK_LIMIT = 500
 
-    def __init__(self, db: DatabaseManager, mtproto: MTProtoClient, *, lease_seconds: int = 120) -> None:
-        if lease_seconds <= 0:
-            raise ValueError("lease seconds must be positive")
+    def __init__(self, db: DatabaseManager, mtproto: MTProtoClient, should_stop: Optional[Callable[[], bool]] = None) -> None:
         self.db = db
         self.mtproto = mtproto
-        self.lease_seconds = lease_seconds
+        self.should_stop = should_stop or (lambda: False)
         self.logger = logging.getLogger(__name__)
 
     def _log_event(self, event: str, source_chat_id: int) -> None:
         self.logger.info("MsgLog ingestion %s for source chat %d", event, source_chat_id, extra={"event": _INGESTION_EVENT_IDS[event]})
 
-    async def run(self, source_chat_id: int, *, lease_owner: str) -> None:
-        """Resume a source-group scan unless another worker owns its lease."""
+    async def run(self, source_chat_id: int) -> None:
+        """Scan a source group from the configured ceiling during this invocation."""
         scan_ceiling = getattr(getattr(self.mtproto, "config", None), "scan_ceiling", 100_000)
         if isinstance(scan_ceiling, bool) or not isinstance(scan_ceiling, int) or scan_ceiling <= 0:
             raise ValueError("MTProto scan ceiling must be a positive integer")
-        self.db.get_or_create_msglog_ingestion_scan(source_chat_id, scan_ceiling)
-        scan = self.db.claim_msglog_ingestion_scan(source_chat_id, lease_owner, self.lease_seconds)
-        if scan is None:
+        if self.should_stop():
             return
         self._log_event("start", source_chat_id)
-
-        try:
-            source_channel = await self.mtproto.get_input_channel(source_chat_id)
-            while scan.cursor > 0 and scan.existing_streak < self.EXISTING_STREAK_LIMIT:
-                renewed_scan = self.db.claim_msglog_ingestion_scan(
-                    source_chat_id,
-                    lease_owner,
-                    self.lease_seconds,
-                )
-                if renewed_scan is None:
+        source_channel = await self.mtproto.get_input_channel(source_chat_id)
+        existing_streak = 0
+        for cursor in range(scan_ceiling, 0, -self.BATCH_SIZE):
+            if self.should_stop():
+                return
+            lower_bound = max(1, cursor - self.BATCH_SIZE + 1)
+            message_ids = list(range(cursor, lower_bound - 1, -1))
+            messages = await self.mtproto.get_channel_messages(source_channel, message_ids)
+            by_id = {message_id: message for message in messages if (message_id := self._message_id(message)) is not None}
+            for message_id in message_ids:
+                if self.should_stop():
                     return
-                scan = renewed_scan
-                lower_bound = max(1, scan.cursor - self.BATCH_SIZE + 1)
-                message_ids = list(range(scan.cursor, lower_bound - 1, -1))
-                messages = await self.mtproto.get_channel_messages(source_channel, message_ids)
-                by_id = {message_id: message for message in messages if (message_id := self._message_id(message)) is not None}
-                for message_id in message_ids:
-                    classification, slave_uid, content = self._classify(
-                        by_id.get(message_id),
-                        source_chat_id,
-                    )
-                    self.db.persist_msglog_ingestion_item(
-                        scan,
-                        source_message_id=message_id,
-                        classification=classification,
-                        slave_uid=slave_uid,
-                        message=content,
-                        lease_owner=lease_owner,
-                    )
-                    if scan.existing_streak >= self.EXISTING_STREAK_LIMIT or scan.cursor <= 0:
-                        self.db.finish_msglog_ingestion_scan(
-                            scan,
-                            status="complete",
-                            lease_owner=lease_owner,
-                        )
-                        self._log_event("complete", source_chat_id)
-                        return
-            self.db.finish_msglog_ingestion_scan(scan, status="complete", lease_owner=lease_owner)
-            self._log_event("complete", source_chat_id)
-        except MsgLogIngestionLeaseLostError:
-            self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id, extra={"event": "msglog_ingestion.lease_lost"})
-        except MTProtoRetryableError as error:
-            self.db.finish_msglog_ingestion_scan(
-                scan,
-                status="retryable-error",
-                error=str(error),
-                lease_owner=lease_owner,
-            )
-            self.logger.warning("MsgLog ingestion retained at cursor %d (%s)", scan.cursor, type(error).__name__, extra={"event": "msglog_ingestion.retry", "error_type": type(error).__name__})
-        except Exception as error:
-            self.db.finish_msglog_ingestion_scan(
-                scan,
-                status="error",
-                error=str(error),
-                lease_owner=lease_owner,
-            )
-            self.logger.exception("MsgLog ingestion failed at cursor %d", scan.cursor, extra={"event": "msglog_ingestion.error", "error_type": type(error).__name__})
+                classification, slave_uid, content = self._classify(by_id.get(message_id), source_chat_id)
+                if classification != "eligible":
+                    continue
+                outcome = self.db.persist_ingested_msglog(source_chat_id, message_id, slave_uid, content)
+                existing_streak = existing_streak + 1 if outcome == "existing" else 0
+                if existing_streak >= self.EXISTING_STREAK_LIMIT:
+                    self._log_event("complete", source_chat_id)
+                    return
+        self._log_event("complete", source_chat_id)
 
     def _classify(
         self,

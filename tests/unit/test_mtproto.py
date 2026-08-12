@@ -114,7 +114,7 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
     channel = SimpleNamespace(
         bot_manager=SimpleNamespace(bot_pool=SimpleNamespace(bots=[auxiliary])),
         mtproto=mtproto,
-        chat_binding=SimpleNamespace(resume_pending_msglog_ingestions=Mock()),
+        chat_binding=SimpleNamespace(),
         logger=Mock(),
     )
     runtime = SimpleNamespace(async_runtime=Mock())
@@ -124,7 +124,6 @@ async def test_bot_lifecycle_starts_and_stops_the_request_only_client():
 
     assert (mtproto.connect_calls, mtproto.disconnect_calls) == (1, 1)
     auxiliary.bind_runtime.assert_called_once_with(runtime.async_runtime)
-    channel.chat_binding.resume_pending_msglog_ingestions.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -134,14 +133,13 @@ async def test_bot_lifecycle_leaves_polling_available_when_mtproto_session_is_ow
     channel = SimpleNamespace(
         bot_manager=SimpleNamespace(bot_pool=SimpleNamespace(bots=[auxiliary])),
         mtproto=mtproto,
-        chat_binding=SimpleNamespace(resume_pending_msglog_ingestions=Mock()),
+        chat_binding=SimpleNamespace(),
         logger=Mock(),
     )
 
     await TelegramChannel._telegram_runtime_started(channel, SimpleNamespace(async_runtime=Mock()))
 
     auxiliary.bind_runtime.assert_called_once()
-    channel.chat_binding.resume_pending_msglog_ingestions.assert_not_called()
     channel.logger.warning.assert_called_once()
 
 
