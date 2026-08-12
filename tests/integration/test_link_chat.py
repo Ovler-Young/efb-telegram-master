@@ -15,6 +15,7 @@ from telethon.tl.types import MessageEntityCode
 from telethon.utils import get_peer_id
 
 from .helper.filters import edited, has_button, in_chats, regex
+from .helper.helper import wait_for_message_state
 from .utils import assert_is_linked, link_chats, unlink_all_chats
 
 retry_on_message_id_invalid_error = mark.flaky(
@@ -237,7 +238,13 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
 
     await private_response(
         complete_link,
-        lambda timeout: helper.wait_for_message(in_chats(command_chat) & edited(session_message_id) & ~has_button, timeout),
+        lambda timeout: wait_for_message_state(
+            client,
+            command_chat,
+            session_message_id,
+            lambda current: not current.button_count,
+            timeout=timeout,
+        ),
         target_chat_id=command_chat,
     )
 
