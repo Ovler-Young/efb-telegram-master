@@ -1,17 +1,13 @@
 import logging
-import os
 import pickle
 import threading
-import uuid
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import SqliteDatabase
+from peewee import Model, SqliteDatabase
 from prometheus_client import generate_latest
 
 from efb_telegram_master import db as db_module
@@ -19,57 +15,13 @@ from efb_telegram_master import utils
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
+from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
-from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.outbound_types import SendReceipt
 from efb_telegram_master.slave_message import SlaveMessageService
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
-
-_OLD_MSGLOG_SCHEMA = """
-CREATE TABLE "msglog" (
-    "master_msg_id" TEXT NOT NULL PRIMARY KEY,
-    "master_msg_id_alt" TEXT,
-    "slave_message_id" TEXT NOT NULL,
-    "text" TEXT NOT NULL,
-    "slave_origin_uid" TEXT NOT NULL,
-    "slave_origin_display_name" TEXT,
-    "slave_member_uid" TEXT,
-    "slave_member_display_name" TEXT,
-    "media_type" TEXT,
-    "mime" TEXT,
-    "file_id" TEXT,
-    "file_unique_id" TEXT,
-    "msg_type" TEXT NOT NULL,
-    "pickle" {blob_type},
-    "sent_to" TEXT NOT NULL,
-    "sender_bot_id" TEXT,
-    "time" {time_type}
-)
-"""
-
-
-def _create_old_msglog_schema(test_db, *, blob_type="BLOB", time_type="DATETIME"):
-    test_db.execute_sql(_OLD_MSGLOG_SCHEMA.format(blob_type=blob_type, time_type=time_type))
-    placeholders = ", ".join([test_db.param] * 6)
-    test_db.execute_sql(
-        f"INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) VALUES ({placeholders})",
-        ("100.1", "old-message", "old text", "tests.slave chat", "Text", "tests.master"),
-    )
-
-
-def _msglog_values(master_msg_id, **values):
-    return {
-        "master_msg_id": master_msg_id,
-        "slave_message_id": f"slave-{master_msg_id}",
-        "text": "text",
-        "slave_origin_uid": "tests.slave chat",
-        "slave_member_uid": "tests.slave author",
-        "msg_type": "Text",
-        "sent_to": "tests.master",
-        **values,
-    }
+from tests.support.legacy_outbound_schema import legacy_outbound_models
 
 
 def test_msglog_schema_has_sender_bot_id(channel):
@@ -126,32 +78,299 @@ def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
         database.initialize(original_database)
 
 
-def test_startup_observes_raw_legacy_rows_without_mutating_them(tmp_path, monkeypatch, caplog):
+def test_startup_retires_legacy_outbound_tables_after_current_schema_creation(tmp_path, monkeypatch, caplog):
     database_path = tmp_path / "tgdata.db"
     raw_db = SqliteDatabase(database_path)
     raw_db.connect()
     try:
-        raw_db.execute_sql("CREATE TABLE outbound_workflow (id INTEGER PRIMARY KEY, state TEXT, marker TEXT)")
-        raw_db.execute_sql("CREATE TABLE outbound_task (id INTEGER PRIMARY KEY, state TEXT, marker TEXT)")
-        raw_db.execute_sql("INSERT INTO outbound_workflow (id, state, marker) VALUES (1, 'completed', 'workflow-marker')")
-        for index, state in enumerate(DatabaseManager._LEGACY_OUTBOUND_STATES, start=1):
-            raw_db.execute_sql("INSERT INTO outbound_task (id, state, marker) VALUES (?, ?, ?)", (index, state, f"marker-{index}"))
-        snapshot = {table: raw_db.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in DatabaseManager._LEGACY_OUTBOUND_TABLES}
+        workflow, task = legacy_outbound_models(raw_db)
+        raw_db.create_tables([workflow, task])
+        workflow.create()
+        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
+        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1, step_index=1)
+        assert {
+            column.name: DatabaseManager._legacy_default_category(raw_db, "outboundworkflow", column.name, DatabaseManager._legacy_column_type(column.data_type), column.primary_key, column.default)
+            for column in raw_db.get_columns("outboundworkflow")
+        } == {
+            "id": "auto_pk",
+            "state": "none",
+            "result_task_id": "none",
+            "error_class": "none",
+            "created_at": "current_timestamp",
+            "completed_at": "none",
+        }
+        assert {
+            column.name: DatabaseManager._legacy_default_category(raw_db, "outboundtask", column.name, DatabaseManager._legacy_column_type(column.data_type), column.primary_key, column.default)
+            for column in raw_db.get_columns("outboundtask")
+        } == {
+            **{column_name: "none" for column_name, *_details in DatabaseManager._LEGACY_OUTBOUND_COLUMNS["outboundtask"]},
+            "id": "auto_pk",
+            "accepted_at": "current_timestamp",
+        }
+        assert DatabaseManager._legacy_outbound_schema_error(raw_db, "outboundworkflow") is None
+        assert DatabaseManager._legacy_outbound_schema_error(raw_db, "outboundtask") is None
     finally:
         raw_db.close()
 
     original_database = database.obj
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     with caplog.at_level(logging.WARNING, logger="efb_telegram_master.db"):
-        manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
+        first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
+    second_manager = None
     try:
-        observed = {table: database.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in DatabaseManager._LEGACY_OUTBOUND_TABLES}
+        table_names = set(database.get_tables())
+        assert not set(DatabaseManager._LEGACY_OUTBOUND_TABLES) & table_names
+        assert {"chatassoc", "msglog", "historymigrationentry", "msglogingestionscan"}.issubset(table_names)
+        first_manager.stop_worker()
+        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
     finally:
-        manager.stop_worker()
+        if second_manager is not None:
+            second_manager.stop_worker()
+        else:
+            first_manager.stop_worker()
         database.initialize(original_database)
 
-    assert observed == snapshot
-    assert "workflows=1 tasks=8" in caplog.text
+    assert "Discarding obsolete durable outbound queue rows without resumption: workflows=1 tasks=2" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("table_name", "column_name", "data_type", "primary_key", "default", "expected"),
+    (
+        ("outboundworkflow", "id", "integer", True, None, "auto_pk"),
+        ("outboundworkflow", "id", "integer", True, "nextval('outboundworkflow_id_seq'::regclass)", "auto_pk"),
+        ("outboundtask", "id", "integer", True, "nextval('public.outboundtask_id_seq'::regclass)", "auto_pk"),
+        ("outboundtask", "id", "integer", True, 'nextval(\'"public"."outboundtask_id_seq"\'::regclass)', "auto_pk"),
+        ("outboundtask", "id", "integer", True, " ( NEXTVAL ( '\"outboundtask_id_seq\"' :: REGCLASS ) ) ", "auto_pk"),
+        ("outboundtask", "id", "integer", True, "nextval('outboundworkflow_id_seq'::regclass)", "invalid:nextval('outboundworkflow_id_seq'::regclass)"),
+        ("outboundtask", "id", "integer", True, "nextval('evil.outboundtask_id_seq'::regclass)", "invalid:nextval('evil.outboundtask_id_seq'::regclass)"),
+        ("outboundtask", "id", "integer", True, "nextval('outboundtask_id_seq'::text::regclass)", "invalid:nextval('outboundtask_id_seq'::text::regclass)"),
+        ("outboundtask", "state", "text", False, "nextval('outboundtask_id_seq'::regclass)", "invalid:nextval('outboundtask_id_seq'::regclass)"),
+        ("outboundtask", "id", "integer", True, "generated by default as identity", "invalid:generated by default as identity"),
+    ),
+)
+def test_legacy_auto_primary_key_default_categories(table_name, column_name, data_type, primary_key, default, expected):
+    backend = SqliteDatabase(":memory:") if default is None else db_module.PostgresqlDatabase("tests")
+    assert DatabaseManager._legacy_default_category(backend, table_name, column_name, data_type, primary_key, default) == expected
+
+
+@pytest.mark.parametrize("failure", ("count", "drop"))
+def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, monkeypatch, failure):
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        workflow, task = legacy_outbound_models(raw_db)
+        raw_db.create_tables([workflow, task])
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    if failure == "count":
+        monkeypatch.setattr(db_module.fn, "COUNT", lambda *_args: (_ for _ in ()).throw(RuntimeError("count failed")))
+    else:
+
+        class LegacyOutboundTable(Model):
+            class Meta:
+                database = database
+                table_name = "outboundworkflow"
+
+        monkeypatch.setattr(DatabaseManager, "_legacy_table_model", staticmethod(lambda _table_name, _database: LegacyOutboundTable))
+        monkeypatch.setattr(SqliteDatabase, "drop_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("drop failed")))
+
+    try:
+        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+            DatabaseManager(SimpleNamespace(channel_id=f"tests.legacy-{failure}", config={}))
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+@pytest.mark.parametrize("legacy_table", DatabaseManager._LEGACY_OUTBOUND_TABLES)
+def test_startup_aborts_without_dropping_partial_historical_schema(tmp_path, monkeypatch, legacy_table):
+    raw_db = SqliteDatabase(tmp_path / "tgdata.db")
+    raw_db.connect()
+    try:
+        workflow, task = legacy_outbound_models(raw_db)
+        raw_db.create_tables([workflow if legacy_table == "outboundworkflow" else task])
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="partial-schema collision"):
+            DatabaseManager(SimpleNamespace(channel_id=f"tests.partial-{legacy_table}", config={}))
+        collision_db = SqliteDatabase(tmp_path / "tgdata.db")
+        collision_db.connect()
+        try:
+            assert legacy_table in collision_db.get_tables()
+        finally:
+            collision_db.close()
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+def test_startup_aborts_without_dropping_same_named_schema_collision(tmp_path, monkeypatch):
+    raw_db = SqliteDatabase(tmp_path / "tgdata.db")
+    raw_db.connect()
+    try:
+        raw_db.execute_sql("CREATE TABLE outboundworkflow (id INTEGER PRIMARY KEY, unrelated TEXT)")
+        _workflow, task = legacy_outbound_models(raw_db)
+        raw_db.create_tables([task])
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="Legacy outbound schema collision"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.collision", config={}))
+        collision_db = SqliteDatabase(tmp_path / "tgdata.db")
+        collision_db.connect()
+        try:
+            assert "outboundworkflow" in collision_db.get_tables()
+        finally:
+            collision_db.close()
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+@pytest.mark.parametrize(
+    ("table_name", "column_name"),
+    (
+        ("outboundworkflow", "created_at"),
+        ("outboundtask", "state"),
+    ),
+)
+def test_startup_refuses_legacy_tables_with_default_collisions(tmp_path, monkeypatch, table_name, column_name):
+    raw_db = SqliteDatabase(tmp_path / "tgdata.db")
+    raw_db.connect()
+    try:
+        workflow, task = legacy_outbound_models(raw_db)
+        raw_db.create_tables([workflow, task])
+        table_sql = raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)).fetchone()[0]
+        index_sql = [row[0] for row in raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL", (table_name,)).fetchall()]
+        raw_db.execute_sql(f'DROP TABLE "{table_name}"')
+        expected_default = "DEFAULT CURRENT_TIMESTAMP" if column_name == "created_at" else ""
+        changed_sql = (
+            table_sql.replace(f'"{column_name}" DATETIME NOT NULL {expected_default}', f"\"{column_name}\" DATETIME NOT NULL DEFAULT 'unexpected'")
+            if column_name == "created_at"
+            else table_sql.replace(f'"{column_name}" TEXT NOT NULL', f"\"{column_name}\" TEXT NOT NULL DEFAULT 'unexpected'")
+        )
+        raw_db.execute_sql(changed_sql)
+        for statement in index_sql:
+            raw_db.execute_sql(statement)
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="schema collision"):
+            DatabaseManager(SimpleNamespace(channel_id=f"tests.defaults-{table_name}", config={}))
+        collision_db = SqliteDatabase(tmp_path / "tgdata.db")
+        collision_db.connect()
+        try:
+            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(collision_db.get_tables())
+        finally:
+            collision_db.close()
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+def test_startup_refuses_altered_accepted_at_default_without_dropping_legacy_schema(tmp_path, monkeypatch):
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        workflow, task = legacy_outbound_models(raw_db)
+        raw_db.create_tables([workflow, task])
+        workflow.create()
+        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
+        task_sql = raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", ("outboundtask",)).fetchone()[0]
+        index_sql = [row[0] for row in raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL", ("outboundtask",)).fetchall()]
+        raw_db.execute_sql("DROP TABLE outboundtask")
+        raw_db.execute_sql(task_sql.replace("DEFAULT CURRENT_TIMESTAMP", "DEFAULT 'unexpected'"))
+        for statement in index_sql:
+            raw_db.execute_sql(statement)
+        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="schema collision"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.accepted-at-default", config={}))
+        collision_db = SqliteDatabase(database_path)
+        collision_db.connect()
+        try:
+            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(collision_db.get_tables())
+            assert collision_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
+            assert collision_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
+            assert {index.name for index in collision_db.get_indexes("outboundtask")} == {
+                "outboundtask_source_key_priority_accepted_at_id",
+                "outboundtask_state_available_at",
+                "outboundtask_workflow_id",
+                "outboundtask_workflow_id_step_index",
+            }
+        finally:
+            collision_db.close()
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, monkeypatch):
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        workflow, task = legacy_outbound_models(raw_db)
+        raw_db.create_tables([workflow, task])
+        workflow.create()
+        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    original_drop_tables = SqliteDatabase.drop_tables
+    drop_calls = 0
+
+    def fail_workflow_drop(instance, models, **kwargs):
+        nonlocal drop_calls
+        drop_calls += 1
+        if drop_calls == 2:
+            raise RuntimeError("workflow drop failed")
+        return original_drop_tables(instance, models, **kwargs)
+
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(SqliteDatabase, "drop_tables", fail_workflow_drop)
+    try:
+        with pytest.raises(RuntimeError, match="workflow drop failed"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.rollback", config={}))
+        restored_db = SqliteDatabase(database_path)
+        restored_db.connect()
+        try:
+            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(restored_db.get_tables())
+            assert restored_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
+            assert restored_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
+            assert DatabaseManager._legacy_outbound_schema_error(restored_db, "outboundtask") is None
+        finally:
+            restored_db.close()
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
 
 
 def test_topic_assoc_table_exists_and_round_trips(channel, slave):
@@ -322,275 +541,3 @@ def test_reaction_alternate_db_failures_preserve_then_update_canonical_row():
             manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=success_id), old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="900")
             row = MsgLog.get()
             assert (MsgLog.select().count(), row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == (1, "100.10", f"100.{success_id}", "900")
-
-
-@pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
-def test_postgresql_startup_observes_raw_legacy_rows_without_mutating_them(tmp_path, monkeypatch, caplog):
-    from peewee import PostgresqlDatabase
-
-    connection_kwargs = {
-        "database": os.environ["TEST_POSTGRES_DB"],
-        "host": os.environ["TEST_POSTGRES_HOST"],
-        "port": int(os.environ["TEST_POSTGRES_PORT"]),
-        "user": os.environ["TEST_POSTGRES_USER"],
-        "password": os.environ["TEST_POSTGRES_PASSWORD"],
-    }
-    database_name = f"etm_legacy_{uuid.uuid4().hex}"
-    admin_db = PostgresqlDatabase(**connection_kwargs)
-    admin_db.connect()
-    admin_db.connection().autocommit = True
-    original_database = database.obj
-    manager = None
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    try:
-        admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
-        test_db = PostgresqlDatabase(database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"})
-        test_db.connect()
-        test_db.execute_sql("CREATE TABLE outbound_workflow (id BIGSERIAL PRIMARY KEY, marker TEXT)")
-        test_db.execute_sql("CREATE TABLE outbound_task (id BIGSERIAL PRIMARY KEY, state TEXT, marker TEXT)")
-        test_db.execute_sql("INSERT INTO outbound_workflow (marker) VALUES ('workflow-marker')")
-        for index, state in enumerate(DatabaseManager._LEGACY_OUTBOUND_STATES, start=1):
-            test_db.execute_sql("INSERT INTO outbound_task (state, marker) VALUES (%s, %s)", (state, f"marker-{index}"))
-        snapshot = {table: test_db.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in DatabaseManager._LEGACY_OUTBOUND_TABLES}
-        test_db.close()
-        with caplog.at_level(logging.WARNING, logger="efb_telegram_master.db"):
-            manager = DatabaseManager(
-                SimpleNamespace(
-                    channel_id="tests.postgresql",
-                    config={"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"}}},
-                )
-            )
-        observed = {table: database.obj.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in DatabaseManager._LEGACY_OUTBOUND_TABLES}
-        assert observed == snapshot
-        assert "Retained legacy outbound rows: workflows=1 tasks=8" in caplog.text
-    finally:
-        if manager is not None:
-            manager.stop_worker()
-        database.initialize(original_database)
-        admin_db.execute_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
-        admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
-        admin_db.close()
-
-
-@pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
-def test_postgresql_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, monkeypatch):
-    from peewee import PostgresqlDatabase
-
-    connection_kwargs = {
-        "database": os.environ["TEST_POSTGRES_DB"],
-        "host": os.environ["TEST_POSTGRES_HOST"],
-        "port": int(os.environ["TEST_POSTGRES_PORT"]),
-        "user": os.environ["TEST_POSTGRES_USER"],
-        "password": os.environ["TEST_POSTGRES_PASSWORD"],
-    }
-    database_name = f"etm_msglog_{uuid.uuid4().hex}"
-    admin_db = PostgresqlDatabase(**connection_kwargs)
-    admin_db.connect()
-    admin_db.connection().autocommit = True
-    original_database = database.obj
-    first_manager = None
-    second_manager = None
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    try:
-        admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
-        test_db = PostgresqlDatabase(database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"})
-        test_db.connect()
-        _create_old_msglog_schema(test_db, blob_type="BYTEA", time_type="TIMESTAMP")
-        test_db.close()
-        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"}}}
-        first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-upgrade", config=config))
-        first_manager.stop_worker()
-        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-upgrade", config=config))
-        row = MsgLog.get_by_id("100.1")
-        provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
-    finally:
-        if second_manager is not None:
-            second_manager.stop_worker()
-        elif first_manager is not None:
-            first_manager.stop_worker()
-        database.initialize(original_database)
-        admin_db.execute_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
-        admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
-        admin_db.close()
-
-    assert provenance_columns == ["provenance"]
-    assert row.provenance == "live"
-
-
-def test_database_restart_retains_msglog_provenance_and_ingestion_scan(tmp_path, monkeypatch):
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.fresh", config={}))
-    second_manager = None
-    try:
-        first_manager.stop_worker()
-        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.fresh", config={}))
-        msglog_columns = {column.name for column in database.get_columns("msglog")}
-        scan_columns = {column.name for column in database.get_columns("msglogingestionscan")}
-        defaults = {column.name: column.default for column in database.get_columns("msglog")}
-    finally:
-        if second_manager is not None:
-            second_manager.stop_worker()
-        database.initialize(original_database)
-
-    assert "provenance" in msglog_columns
-    assert defaults["provenance"] == "'live'"
-    assert {"source_chat_id", "cursor", "lease_owner", "existing_streak"}.issubset(scan_columns)
-
-
-def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, monkeypatch):
-    database_path = tmp_path / "tgdata.db"
-    raw_db = SqliteDatabase(database_path)
-    raw_db.connect()
-    try:
-        _create_old_msglog_schema(raw_db)
-    finally:
-        raw_db.close()
-
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.upgrade", config={}))
-    second_manager = None
-    try:
-        first_manager.stop_worker()
-        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.upgrade", config={}))
-        old_row = MsgLog.get_by_id("100.1")
-        live_row = MsgLog.create(**_msglog_values("100.2"))
-        ingested_row = MsgLog.create(**_msglog_values("100.3", provenance="mtproto_ingested"))
-        provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
-    finally:
-        if second_manager is not None:
-            second_manager.stop_worker()
-        database.initialize(original_database)
-
-    assert provenance_columns == ["provenance"]
-    assert old_row.provenance == "live"
-    assert live_row.provenance == "live"
-    assert ingested_row.provenance == "mtproto_ingested"
-
-
-def test_concurrent_sqlite_msglog_provenance_upgrade_is_idempotent(tmp_path):
-    original_database = database.obj
-    test_db = SqliteDatabase(tmp_path / "tgdata.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
-    database.initialize(test_db)
-    test_db.connect()
-    try:
-        _create_old_msglog_schema(test_db)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            list(executor.map(lambda _index: DatabaseManager._create(), range(2)))
-        row = MsgLog.get_by_id("100.1")
-        provenance_columns = [column.name for column in test_db.get_columns("msglog") if column.name == "provenance"]
-    finally:
-        test_db.close()
-        database.initialize(original_database)
-
-    assert provenance_columns == ["provenance"]
-    assert row.provenance == "live"
-
-
-def test_ingestion_claim_persist_and_idempotence_are_atomic():
-    original_database = database.obj
-    test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
-    test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        scan = manager.get_or_create_scan(100, 500)
-        assert manager.claim_scan(100, "worker-a", 60) is not None
-        assert manager.claim_scan(100, "worker-b", 60) is None
-        content = SimpleNamespace(
-            text="ingested",
-            media_type="Text",
-            mime=None,
-            msg_type="Text",
-            time=datetime(2026, 8, 4),
-        )
-        assert (
-            manager.persist_item(
-                scan,
-                source_message_id=500,
-                classification="eligible",
-                slave_uid="tests.slave target",
-                message=content,
-                lease_owner="worker-a",
-            )
-            == "inserted"
-        )
-        assert (
-            manager.persist_item(
-                scan,
-                source_message_id=500,
-                classification="eligible",
-                slave_uid="tests.slave target",
-                message=content,
-                lease_owner="worker-a",
-            )
-            == "existing"
-        )
-        row = MsgLog.get_by_id("100.500")
-    finally:
-        test_db.close()
-        database.initialize(original_database)
-
-    assert row.provenance == "mtproto_ingested"
-    assert row.slave_message_id == "mtproto-ingested:100.500"
-
-
-def test_expired_scan_is_resumable_after_restart():
-    original_database = database.obj
-    test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
-    test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
-    try:
-        test_db.create_tables([MsgLogIngestionScan])
-        scan = manager.get_or_create_scan(100, 500)
-        assert manager.claim_scan(100, "worker-a", 60) is not None
-        MsgLogIngestionScan.update(lease_expires_at=datetime.now() - timedelta(seconds=1)).where(MsgLogIngestionScan.id == scan.id).execute()
-        resumed = manager.get_resumable_scans()
-        assert [item.source_chat_id for item in resumed] == ["100"]
-        assert manager.claim_scan(100, "worker-b", 60) is not None
-    finally:
-        test_db.close()
-        database.initialize(original_database)
-
-
-def test_live_message_overwrites_synthetic_provenance():
-    test_db = SqliteDatabase(":memory:")
-    manager = MsgLogRepository()
-    message = SimpleNamespace(
-        uid=MessageID("live-message"),
-        chat=SimpleNamespace(module_id="tests.slave", uid="chat"),
-        author=SimpleNamespace(module_id="tests.slave", uid="author"),
-        text="live text",
-        type=MsgType.Text,
-        type_telegram=TGMsgType.Text,
-        deliver_to=SimpleNamespace(channel_id="tests.master"),
-        file_id=None,
-        file_unique_id=None,
-        mime=None,
-        is_system=False,
-        attributes=None,
-        commands=None,
-        substitutions=None,
-        target=None,
-        sender_bot_id=None,
-        reactions={},
-    )
-    with test_db.bind_ctx([MsgLog]):
-        test_db.create_tables([MsgLog])
-        MsgLog.create(
-            master_msg_id="100.1",
-            slave_message_id="mtproto-ingested:100.1",
-            text="ingested",
-            slave_origin_uid="tests.slave stale",
-            slave_member_uid="tests.slave __self__",
-            msg_type="Text",
-            sent_to="tests.master",
-            provenance="mtproto_ingested",
-        )
-        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=1))
-        row = MsgLog.get_by_id("100.1")
-
-    assert (row.provenance, row.slave_message_id, row.text) == ("live", "live-message", "live text")
