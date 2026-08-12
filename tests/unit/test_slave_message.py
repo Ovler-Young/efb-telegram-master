@@ -328,8 +328,10 @@ def test_command_session_uses_the_telegram_message_owner() -> None:
         author=SimpleNamespace(module_id="tests.slave"),
     )
 
-    with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()), patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"), patch(
-        "efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()
+    with (
+        patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()),
+        patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"),
+        patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()),
     ):
         processor.dispatch_message(message, "template", None, 100, None)
 
