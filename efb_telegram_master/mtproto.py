@@ -157,7 +157,8 @@ class MTProtoClient:
                 self._protect_session_file()
             except BaseException as error:
                 try:
-                    await client.disconnect()
+                    if client is not None:
+                        await client.disconnect()
                 except BaseException:
                     pass
                 self._client = None
