@@ -21,14 +21,17 @@ def _identity(message: str) -> str:
     return message
 
 
-def history_location_text(translate: Callable[[str], str], source_storage_key: tuple[int, int]) -> str:
+def history_location_url(source_storage_key: tuple[int, int]) -> Optional[str]:
     source_chat_id, source_message_id = map(int, source_storage_key)
     if str(source_chat_id).startswith("-100"):
-        link = f"https://t.me/c/{str(source_chat_id)[4:]}/{source_message_id}"
-    elif source_chat_id < 0:
-        link = f"https://t.me/{abs(source_chat_id)}/{source_message_id}"
-    else:
-        link = f"https://t.me/c/{source_chat_id}/{source_message_id}"
+        return f"https://t.me/c/{str(source_chat_id)[4:]}/{source_message_id}"
+    return None
+
+
+def history_location_text(translate: Callable[[str], str], source_storage_key: tuple[int, int]) -> str:
+    link = history_location_url(source_storage_key)
+    if link is None:
+        return translate("This chat was previously linked. History messages are not migrated.")
     return translate("This chat was previously linked. History messages are not migrated. You can view previous messages here: {link}").format(link=link)
 
 

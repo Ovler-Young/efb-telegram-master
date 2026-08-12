@@ -14,7 +14,7 @@ from telegram.ext import CallbackContext, ConversationHandler
 from . import utils
 from .callback_sessions import CallbackSessionStore
 from .chat import ETMChatMixin
-from .history_replay import history_location_text
+from .history_replay import history_location_text, history_location_url
 from .ptb_compat import get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TelegramTopicID, TgChatMsgIDStr
 
@@ -85,7 +85,8 @@ class LinkCompletionService:
         except KeyError:
             return sync_reply_text(self.bot, update.message, self._("Session expired or unknown parameter. (SE02)"))
         chat: ETMChatMixin = data.chats[0]
-        is_relink = chat.linked
+        previous_master_uids = tuple(chat.linked)
+        is_relink = bool(previous_master_uids)
         chat_display_name = chat.full_name
         slave_channel, slave_chat_uid = chat.module_id, chat.uid
         chat_uid = utils.chat_id_to_str(slave_channel, slave_chat_uid)
@@ -185,7 +186,14 @@ class LinkCompletionService:
                 except Exception:
                     pass
         elif do_history_link:
-            self.send_history_link(chat_uid, tg_chat_to_link.id, storage_key, thread_id)
+            history_key = storage_key
+            for previous_master_uid in previous_master_uids:
+                _, previous_master_id, _ = utils.chat_id_str_to_id(previous_master_uid)
+                candidate_key = (TelegramChatID(int(previous_master_id)), storage_key[1])
+                if history_location_url(candidate_key) is not None:
+                    history_key = candidate_key
+                    break
+            self.send_history_link(chat_uid, tg_chat_to_link.id, history_key, thread_id)
 
     def send_history_link(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, storage_key: Tuple[int, int], thread_id: Optional[TelegramTopicID] = None):
         """Send a message with a link to the chat history."""

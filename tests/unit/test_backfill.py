@@ -16,7 +16,7 @@ from efb_telegram_master.callback_sessions import CallbackSessionStore, ChatList
 from efb_telegram_master.channel_commands import TelegramCommandService
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
-from efb_telegram_master.history_replay import HistoryReplayShutdownTimeout, HistoryReplayWorker
+from efb_telegram_master.history_replay import HistoryReplayShutdownTimeout, HistoryReplayWorker, history_location_text
 from efb_telegram_master.link_completion import LinkCompletionService
 from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, database
 from efb_telegram_master.mtproto import MTProtoConfig
@@ -58,11 +58,9 @@ def _link_completion_service(storage_key, chat, multiple_slave_chats=lambda: Fal
         send_message=Mock(return_value=_sent_link_message(-100500, 600)),
         edit_message_text=Mock(),
     )
-    callback_sessions = SimpleNamespace(
-        get=Mock(return_value=SimpleNamespace(chats=[chat])),
-        is_owned_by=Mock(return_value=True),
-        clear=Mock(),
-    )
+    callback_sessions = CallbackSessionStore(bot, lambda: 10)
+    handler = SimpleNamespace(_conversations={})
+    callback_sessions.start(handler, storage_key, Flags.LINK_EXEC, 1, ChatListStorage([chat]))
     service = LinkCompletionService(
         bot,
         ModuleID("blueset.telegram"),
@@ -75,7 +73,7 @@ def _link_completion_service(storage_key, chat, multiple_slave_chats=lambda: Fal
         lambda single, plural, count: single if count == 1 else plural,
         Mock(),
     )
-    service.set_handler(Mock())
+    service.set_handler(handler)
     return service
 
 
@@ -85,7 +83,7 @@ def test_link_completion_reads_multiple_slave_setting_at_completion_time():
     chat = SimpleNamespace(
         module_id=ModuleID("tests.slave"),
         uid=ChatID("chat"),
-        linked=False,
+        linked=[],
         full_name="Test chat",
         link=Mock(),
     )
@@ -102,7 +100,7 @@ def test_link_completion_reads_multiple_slave_setting_at_completion_time():
 def test_forged_start_token_does_not_consume_the_owner_session():
     storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(459))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
-    chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=False, full_name="Test chat", link=Mock())
+    chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=[], full_name="Test chat", link=Mock())
     bot = SimpleNamespace(send_message=Mock(return_value=_sent_link_message(-100500, 601)), edit_message_text=Mock())
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     handler = SimpleNamespace(_conversations={})
@@ -137,7 +135,7 @@ def test_forged_start_token_does_not_consume_the_owner_session():
 def test_start_with_missing_effective_user_does_not_consume_a_session():
     storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(460))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
-    chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=False, full_name="Test chat", link=Mock())
+    chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=[], full_name="Test chat", link=Mock())
     bot = SimpleNamespace(send_message=Mock(), edit_message_text=Mock())
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     handler = SimpleNamespace(_conversations={})
@@ -376,7 +374,7 @@ def test_automatic_and_truthy_links_pass_the_original_storage_key_to_replay(back
     chat = SimpleNamespace(
         module_id=ModuleID("tests.slave"),
         uid=ChatID("chat"),
-        linked=False,
+        linked=[],
         full_name="Test chat",
         link=Mock(),
     )
@@ -397,7 +395,7 @@ def test_false_link_flags_do_not_start_backfill_or_send_history_location(backfil
     chat = SimpleNamespace(
         module_id=ModuleID("tests.slave"),
         uid=ChatID("chat"),
-        linked=False,
+        linked=[],
         full_name="Test chat",
         link=Mock(),
     )
@@ -414,16 +412,43 @@ def test_empty_history_backfill_enqueues_one_location_notice_in_the_target_topic
     bot = SimpleNamespace(send_message=Mock())
     worker = HistoryReplayWorker(bot, Mock(), Mock(), Mock(), Mock())
     worker.queue_entries = Mock(return_value=0)
-    storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(456))
+    storage_key = (TelegramChatID(1044903212), TelegramMessageID(456))
 
     worker._queue_and_process("tests.slave chat", -100500, TelegramMessageID(789), storage_key)
 
     bot.send_message.assert_called_once_with(
         chat_id=-100500,
-        text="This chat was previously linked. History messages are not migrated. You can view previous messages here: https://t.me/c/1234567890/456",
+        text="This chat was previously linked. History messages are not migrated.",
         disable_notification=True,
         message_thread_id=TelegramMessageID(789),
     )
+
+
+def test_private_callback_automatic_empty_backfill_omits_an_invalid_history_url():
+    storage_key = (TelegramChatID(1044903212), TelegramMessageID(457))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(
+        module_id=ModuleID("tests.slave"),
+        uid=ChatID("chat"),
+        linked=[],
+        full_name="Test chat",
+        link=Mock(),
+    )
+    service = _link_completion_service(storage_key, chat)
+
+    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
+        service.complete(_build_link_update(-100500), [token])
+
+    service.history_replay.start.assert_called_once_with("tests.slave chat", -100500, None, storage_key)
+    worker_bot = SimpleNamespace(send_message=Mock())
+    worker = HistoryReplayWorker(worker_bot, Mock(), Mock(), Mock(), Mock())
+    worker.queue_entries = Mock(return_value=0)
+    worker._queue_and_process("tests.slave chat", -100500, None, storage_key)
+    assert "https://t.me/" not in worker_bot.send_message.call_args.kwargs["text"]
+
+
+def test_history_location_text_keeps_supergroup_history_urls():
+    assert history_location_text(lambda message: message, (TelegramChatID(-1001234567890), TelegramMessageID(458))).endswith("https://t.me/c/1234567890/458")
 
 
 @pytest.mark.parametrize("backfill_flag", ["true", "yes", "on", "1"], ids=str)
@@ -483,6 +508,27 @@ def test_automatic_empty_backfill_sends_the_original_history_location_once(chann
     assert history_calls[0].kwargs["chat_id"] == bot_group
     assert history_calls[0].kwargs["text"].endswith("https://t.me/c/1234567890/457")
     _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_private_callback_relink_uses_the_previous_supergroup_history_location():
+    storage_key = (TelegramChatID(1044903212), TelegramMessageID(458))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    previous_group_id = TelegramChatID(-1001234567890)
+    chat = SimpleNamespace(
+        module_id=ModuleID("tests.slave"),
+        uid=ChatID("chat"),
+        linked=[utils.chat_id_to_str(ModuleID("blueset.telegram"), ChatID(str(previous_group_id)))],
+        full_name="Test chat",
+        link=Mock(),
+    )
+    service = _link_completion_service(storage_key, chat)
+
+    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
+        service.complete(_build_link_update(-100500), [token])
+
+    history_calls = [call for call in service.bot.send_message.call_args_list if "previously linked" in call.kwargs.get("text", "")]
+    assert len(history_calls) == 1
+    assert history_calls[0].kwargs["text"].endswith("https://t.me/c/1234567890/458")
 
 
 def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
