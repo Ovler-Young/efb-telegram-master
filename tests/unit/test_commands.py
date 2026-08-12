@@ -58,7 +58,7 @@ async def test_command_callback_is_limited_to_the_message_owner():
     command = SimpleNamespace(callable_name="run", args=(), kwargs={})
     module = SimpleNamespace(run=Mock(return_value="done"))
     message = SimpleNamespace(chat=SimpleNamespace(id=1), message_id=401)
-    manager.register_command(message, ETMCommandMsgStorage([command], module, "", "", owner_id=1))
+    manager.register_command(message, ETMCommandMsgStorage([command], module, "", "", authorized_user_ids=(1,)))
     application = ApplicationBuilder().token("123:token").build()
 
     await _dispatch_callback(manager.command_conv, application, _callback_update(1, 401, "0", user_id=2))
@@ -77,8 +77,18 @@ async def test_command_callback_is_limited_to_the_message_owner():
     assert (1, 401) not in manager.msg_storage
 
     group_message = SimpleNamespace(chat=SimpleNamespace(id=-100500), message_id=402)
-    manager.register_command(group_message, ETMCommandMsgStorage([command], module, "", "", owner_id=None))
+    manager.register_command(group_message, ETMCommandMsgStorage([command], module, "", "", authorized_user_ids=(100,)))
 
     await _dispatch_callback(manager.command_conv, application, _callback_update(-100500, 402, "0", user_id=2))
 
+    assert manager.command_conv._conversations[(-100500, 402)] == Flags.COMMAND_PENDING
+    assert (-100500, 402) in manager.msg_storage
+    assert module.run.call_count == 1
+    assert manager.bot.edit_message_reply_markup.call_count == 1
+
+    await _dispatch_callback(manager.command_conv, application, _callback_update(-100500, 402, "0", user_id=100))
+
     assert module.run.call_count == 2
+    assert manager.bot.edit_message_reply_markup.call_count == 2
+    assert (-100500, 402) not in manager.command_conv._conversations
+    assert (-100500, 402) not in manager.msg_storage

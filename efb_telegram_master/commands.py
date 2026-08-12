@@ -1,7 +1,7 @@
 # coding=utf-8
 import html
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Tuple, Union, cast
 
 from ehforwarderbot import Channel, Middleware, coordinator
 from ehforwarderbot.channel import SlaveChannel
@@ -20,15 +20,15 @@ if TYPE_CHECKING:
 
 
 class ETMCommandMsgStorage:
-    def __init__(self, commands: List[MessageCommand], module: Union[Channel, Middleware], prefix: str, body: str, owner_id: Optional[int]):
+    def __init__(self, commands: List[MessageCommand], module: Union[Channel, Middleware], prefix: str, body: str, authorized_user_ids: Collection[int]):
         self.commands = commands
         self.module = module
         self.prefix = prefix
         self.body = body
-        self.owner_id = owner_id
+        self.authorized_user_ids = frozenset(authorized_user_ids)
 
     def __str__(self):
-        return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r}, {self.owner_id!r})"
+        return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r}, {self.authorized_user_ids!r})"
 
 
 class CommandsManager(LocaleMixin):
@@ -98,7 +98,7 @@ class CommandsManager(LocaleMixin):
         index = (chat_id, message_id)
 
         command_storage = self.msg_storage[index]
-        if update.callback_query.from_user.id != update.effective_user.id or (command_storage.owner_id is not None and command_storage.owner_id != update.effective_user.id):
+        if update.callback_query.from_user.id != update.effective_user.id or update.effective_user.id not in command_storage.authorized_user_ids:
             self.bot.answer_callback_query(callback_query_id=update.callback_query.id, text=self._("Session expired or unknown parameter. (SE02)"))
             return Flags.COMMAND_PENDING
 

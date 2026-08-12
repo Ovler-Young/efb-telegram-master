@@ -12,7 +12,7 @@ from ehforwarderbot.chat import ChatNotificationState, SelfChatMember
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.message import MessageCommand
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ChatType
 
 from . import utils
 from .chat_object_cache import ChatObjectCacheManager
@@ -265,8 +265,8 @@ class SlaveMessageService:
             )
 
         if tg_msg and commands:
-            owner_id = tg_msg.chat.id if tg_msg.chat.id in self.router.admins else None
-            self.commands.register_command(tg_msg, ETMCommandMsgStorage(commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text, owner_id))
+            authorized_user_ids = (tg_msg.chat.id,) if tg_msg.chat.type == ChatType.PRIVATE else self.router.admins
+            self.commands.register_command(tg_msg, ETMCommandMsgStorage(commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text, authorized_user_ids))
 
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. This may happen during shutdown or when Telegram API is unavailable.", xid)

@@ -13,6 +13,7 @@ from ehforwarderbot.constants import MsgType
 from ehforwarderbot.message import MessageCommand
 from ehforwarderbot.types import MessageID
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.constants import ChatType
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 
 from efb_telegram_master import TelegramChannel
@@ -315,7 +316,7 @@ def test_command_session_uses_the_telegram_message_owner() -> None:
     processor.msglogs = Mock()
     processor.router = SimpleNamespace(resolve_reply=Mock(return_value=None), admins=[100])
     processor._release_pending_slave_message = Mock()
-    telegram_message = SimpleNamespace(chat=SimpleNamespace(id=100), message_id=7)
+    telegram_message = SimpleNamespace(chat=SimpleNamespace(id=100, type=ChatType.PRIVATE), message_id=7)
     processor.text_delivery = Mock(text=Mock(return_value=telegram_message))
     command = MessageCommand("Run", "run")
     message = SimpleNamespace(
@@ -336,10 +337,10 @@ def test_command_session_uses_the_telegram_message_owner() -> None:
         processor.dispatch_message(message, "template", None, 100, None)
 
     storage = processor.commands.register_command.call_args.args[1]
-    assert storage.owner_id == 100
+    assert storage.authorized_user_ids == frozenset((100,))
 
 
-def test_command_session_in_group_has_no_single_owner() -> None:
+def test_command_session_in_group_allows_configured_admins() -> None:
     processor = object.__new__(SlaveMessageService)
     processor.logger = Mock()
     processor.commands = SimpleNamespace(register_command=Mock())
@@ -347,7 +348,7 @@ def test_command_session_in_group_has_no_single_owner() -> None:
     processor.msglogs = Mock()
     processor.router = SimpleNamespace(resolve_reply=Mock(return_value=None), admins=[100])
     processor._release_pending_slave_message = Mock()
-    telegram_message = SimpleNamespace(chat=SimpleNamespace(id=-100500), message_id=7)
+    telegram_message = SimpleNamespace(chat=SimpleNamespace(id=-100500, type=ChatType.SUPERGROUP), message_id=7)
     processor.text_delivery = Mock(text=Mock(return_value=telegram_message))
     command = MessageCommand("Run", "run")
     message = SimpleNamespace(
@@ -368,7 +369,7 @@ def test_command_session_in_group_has_no_single_owner() -> None:
         processor.dispatch_message(message, "template", None, -100500, None)
 
     storage = processor.commands.register_command.call_args.args[1]
-    assert storage.owner_id is None
+    assert storage.authorized_user_ids == frozenset((100,))
 
 
 def test_ingested_message_edit_has_no_telegram_side_effect() -> None:
