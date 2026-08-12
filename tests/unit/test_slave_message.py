@@ -313,7 +313,7 @@ def test_command_session_uses_the_telegram_message_owner() -> None:
     processor.commands = SimpleNamespace(register_command=Mock())
     processor.chat_manager = Mock()
     processor.msglogs = Mock()
-    processor.router = Mock(resolve_reply=Mock(return_value=None))
+    processor.router = SimpleNamespace(resolve_reply=Mock(return_value=None), admins=[100])
     processor._release_pending_slave_message = Mock()
     telegram_message = SimpleNamespace(chat=SimpleNamespace(id=100), message_id=7)
     processor.text_delivery = Mock(text=Mock(return_value=telegram_message))
@@ -337,6 +337,38 @@ def test_command_session_uses_the_telegram_message_owner() -> None:
 
     storage = processor.commands.register_command.call_args.args[1]
     assert storage.owner_id == 100
+
+
+def test_command_session_in_group_has_no_single_owner() -> None:
+    processor = object.__new__(SlaveMessageService)
+    processor.logger = Mock()
+    processor.commands = SimpleNamespace(register_command=Mock())
+    processor.chat_manager = Mock()
+    processor.msglogs = Mock()
+    processor.router = SimpleNamespace(resolve_reply=Mock(return_value=None), admins=[100])
+    processor._release_pending_slave_message = Mock()
+    telegram_message = SimpleNamespace(chat=SimpleNamespace(id=-100500), message_id=7)
+    processor.text_delivery = Mock(text=Mock(return_value=telegram_message))
+    command = MessageCommand("Run", "run")
+    message = SimpleNamespace(
+        uid="message",
+        target=None,
+        commands=[command],
+        reactions={},
+        text="body",
+        type=MsgType.Text,
+        author=SimpleNamespace(module_id="tests.slave"),
+    )
+
+    with (
+        patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()),
+        patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"),
+        patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()),
+    ):
+        processor.dispatch_message(message, "template", None, -100500, None)
+
+    storage = processor.commands.register_command.call_args.args[1]
+    assert storage.owner_id is None
 
 
 def test_ingested_message_edit_has_no_telegram_side_effect() -> None:

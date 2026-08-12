@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 class ETMCommandMsgStorage:
-    def __init__(self, commands: List[MessageCommand], module: Union[Channel, Middleware], prefix: str, body: str, owner_id: int):
+    def __init__(self, commands: List[MessageCommand], module: Union[Channel, Middleware], prefix: str, body: str, owner_id: Optional[int]):
         self.commands = commands
         self.module = module
         self.prefix = prefix
@@ -98,7 +98,7 @@ class CommandsManager(LocaleMixin):
         index = (chat_id, message_id)
 
         command_storage = self.msg_storage[index]
-        if update.callback_query.from_user.id != update.effective_user.id or command_storage.owner_id != update.effective_user.id:
+        if update.callback_query.from_user.id != update.effective_user.id or (command_storage.owner_id is not None and command_storage.owner_id != update.effective_user.id):
             self.bot.answer_callback_query(callback_query_id=update.callback_query.id, text=self._("Session expired or unknown parameter. (SE02)"))
             return Flags.COMMAND_PENDING
 

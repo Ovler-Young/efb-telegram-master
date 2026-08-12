@@ -265,7 +265,8 @@ class SlaveMessageService:
             )
 
         if tg_msg and commands:
-            self.commands.register_command(tg_msg, ETMCommandMsgStorage(commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text, tg_msg.chat.id))
+            owner_id = tg_msg.chat.id if tg_msg.chat.id in self.router.admins else None
+            self.commands.register_command(tg_msg, ETMCommandMsgStorage(commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text, owner_id))
 
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. This may happen during shutdown or when Telegram API is unavailable.", xid)

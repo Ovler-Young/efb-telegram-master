@@ -75,3 +75,10 @@ async def test_command_callback_is_limited_to_the_message_owner():
     manager.bot.edit_message_reply_markup.assert_called_once_with(chat_id=1, message_id=401, reply_markup=None)
     assert (1, 401) not in manager.command_conv._conversations
     assert (1, 401) not in manager.msg_storage
+
+    group_message = SimpleNamespace(chat=SimpleNamespace(id=-100500), message_id=402)
+    manager.register_command(group_message, ETMCommandMsgStorage([command], module, "", "", owner_id=None))
+
+    await _dispatch_callback(manager.command_conv, application, _callback_update(-100500, 402, "0", user_id=2))
+
+    assert module.run.call_count == 2
