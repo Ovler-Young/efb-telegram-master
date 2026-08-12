@@ -20,14 +20,15 @@ if TYPE_CHECKING:
 
 
 class ETMCommandMsgStorage:
-    def __init__(self, commands: List[MessageCommand], module: Union[Channel, Middleware], prefix: str, body: str):
+    def __init__(self, commands: List[MessageCommand], module: Union[Channel, Middleware], prefix: str, body: str, owner_id: int):
         self.commands = commands
         self.module = module
         self.prefix = prefix
         self.body = body
+        self.owner_id = owner_id
 
     def __str__(self):
-        return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r})"
+        return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r}, {self.owner_id!r})"
 
 
 class CommandsManager(LocaleMixin):
@@ -86,6 +87,7 @@ class CommandsManager(LocaleMixin):
         assert update.effective_chat
         assert update.effective_message
         assert update.callback_query
+        assert update.effective_user
 
         chat_id = update.effective_chat.id
         message_id = update.effective_message.message_id
@@ -94,6 +96,11 @@ class CommandsManager(LocaleMixin):
         assert callback
 
         index = (chat_id, message_id)
+
+        command_storage = self.msg_storage[index]
+        if update.callback_query.from_user.id != update.effective_user.id or command_storage.owner_id != update.effective_user.id:
+            self.bot.answer_callback_query(callback_query_id=update.callback_query.id, text=self._("Session expired or unknown parameter. (SE02)"))
+            return Flags.COMMAND_PENDING
 
         if not callback.isdecimal():
             msg = self._("Invalid parameter: {0}. (CE01)").format(callback)
@@ -109,7 +116,6 @@ class CommandsManager(LocaleMixin):
             return ConversationHandler.END
 
         callback_idx = int(callback)
-        command_storage = self.msg_storage[index]
         module = command_storage.module
         command = command_storage.commands[callback_idx]
         prefix = command_storage.prefix

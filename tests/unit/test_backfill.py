@@ -97,6 +97,35 @@ def test_link_completion_reads_multiple_slave_setting_at_completion_time():
     assert chat.link.call_args.args[-1] is False
 
 
+def test_link_completion_rejects_an_inactive_slave_without_consuming_its_session():
+    storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(457))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(
+        module_id=ModuleID("tests.inactive_slave"),
+        uid=ChatID("chat"),
+        linked=[],
+        full_name="Inactive chat",
+        link=Mock(),
+    )
+    service = _link_completion_service(storage_key, chat)
+
+    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id", side_effect=NameError):
+        service.complete(_build_link_update(-100500), [token])
+
+    service.bot.edit_message_text.assert_called_once_with(
+        text="tests.inactive_slave is not activated in current profile. It cannot be linked.",
+        chat_id=storage_key[0],
+        message_id=storage_key[1],
+    )
+    service.bot.send_message.assert_not_called()
+    chat.link.assert_not_called()
+    service.chat_associations.remove_topic_assoc.assert_not_called()
+    service.topic_sync.create_topic.assert_not_called()
+    service.history_replay.start.assert_not_called()
+    assert service.callback_sessions.lookup(storage_key) is not None
+    assert service._handler()._conversations[storage_key] == Flags.LINK_EXEC
+
+
 def test_forged_start_token_does_not_consume_the_owner_session():
     storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(459))
     token = utils.b64en(utils.message_id_to_str(*storage_key))

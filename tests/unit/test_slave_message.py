@@ -10,6 +10,7 @@ import pytest
 from ehforwarderbot import Chat, Message
 from ehforwarderbot.chat import ChatMember
 from ehforwarderbot.constants import MsgType
+from ehforwarderbot.message import MessageCommand
 from ehforwarderbot.types import MessageID
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
@@ -304,6 +305,36 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
         "RuntimeError",
     )
     processor._release_pending_slave_message.assert_called_once_with(("tests.slave chat", "message"))
+
+
+def test_command_session_uses_the_telegram_message_owner() -> None:
+    processor = object.__new__(SlaveMessageService)
+    processor.logger = Mock()
+    processor.commands = SimpleNamespace(register_command=Mock())
+    processor.chat_manager = Mock()
+    processor.msglogs = Mock()
+    processor.router = Mock(resolve_reply=Mock(return_value=None))
+    processor._release_pending_slave_message = Mock()
+    telegram_message = SimpleNamespace(chat=SimpleNamespace(id=100), message_id=7)
+    processor.text_delivery = Mock(text=Mock(return_value=telegram_message))
+    command = MessageCommand("Run", "run")
+    message = SimpleNamespace(
+        uid="message",
+        target=None,
+        commands=[command],
+        reactions={},
+        text="body",
+        type=MsgType.Text,
+        author=SimpleNamespace(module_id="tests.slave"),
+    )
+
+    with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()), patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"), patch(
+        "efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()
+    ):
+        processor.dispatch_message(message, "template", None, 100, None)
+
+    storage = processor.commands.register_command.call_args.args[1]
+    assert storage.owner_id == 100
 
 
 def test_ingested_message_edit_has_no_telegram_side_effect() -> None:

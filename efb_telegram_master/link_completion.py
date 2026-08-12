@@ -96,6 +96,7 @@ class LinkCompletionService:
             self.bot.edit_message_text(
                 text=self._("{module_id} is not activated in current profile. It cannot be linked.").format(module_id=slave_channel), chat_id=storage_key[0], message_id=storage_key[1]
             )
+            return
 
         # Use channel ID if command is forwarded from a channel.
         forwarded_chat = get_forwarded_chat(update.effective_message)
