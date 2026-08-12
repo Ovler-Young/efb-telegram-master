@@ -1,4 +1,6 @@
+import asyncio
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -41,6 +43,42 @@ def test_stop_msglog_ingestions_joins_active_workers():
 
     assert manager._msglog_ingestion_stop.is_set()
     assert not worker.is_alive()
+
+
+def test_channel_shutdown_disconnects_mtproto_before_joining_a_stalled_ingestion_worker():
+    manager = object.__new__(ChatBindingManager)
+    manager._msglog_ingestion_lock = threading.Lock()
+    manager._msglog_ingestion_stop = threading.Event()
+    request_released = threading.Event()
+    worker = threading.Thread(target=request_released.wait, daemon=True)
+    manager._msglog_ingestion_threads = {100: worker}
+    worker.start()
+
+    async def disconnect() -> None:
+        request_released.set()
+
+    mtproto = SimpleNamespace(disconnect=Mock(side_effect=disconnect))
+    channel = object.__new__(TelegramChannel)
+    channel.logger = Mock()
+    channel.rpc_utilities = SimpleNamespace(shutdown=Mock())
+    channel.chat_binding = manager
+    channel.bot_manager = SimpleNamespace(stop_channel_resources=Mock())
+    channel.telegram_runtime = SimpleNamespace(stop=Mock(side_effect=lambda: asyncio.run(TelegramChannel._telegram_runtime_stopped(channel, SimpleNamespace()))))
+    channel.master_messages = SimpleNamespace(stop_worker=Mock())
+    channel.db = SimpleNamespace(stop_worker=Mock())
+    channel.mtproto = mtproto
+
+    completed = threading.Event()
+    shutdown = threading.Thread(target=lambda: (TelegramChannel.stop_polling(channel), completed.set()), daemon=True)
+    started = time.monotonic()
+    shutdown.start()
+
+    assert completed.wait(timeout=1)
+    shutdown.join(timeout=1)
+    assert time.monotonic() - started < 1
+    assert manager._msglog_ingestion_stop.is_set()
+    assert not worker.is_alive()
+    mtproto.disconnect.assert_called_once()
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

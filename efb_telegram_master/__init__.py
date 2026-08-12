@@ -692,9 +692,10 @@ class TelegramChannel(MasterChannel):
         self._stop_polling_called = True
         self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
         self.rpc_utilities.shutdown()
-        self.chat_binding.stop_msglog_ingestions()
+        self.chat_binding.stop_msglog_ingestions(join=False)
         self.bot_manager.stop_channel_resources()
         self.telegram_runtime.stop()
+        self.chat_binding.stop_msglog_ingestions()
         self.master_messages.stop_worker()
         self.db.stop_worker()
         self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})

@@ -248,6 +248,45 @@ class SlaveChatInfo(BaseModel):
 class DatabaseManager:
     logger = logging.getLogger(__name__)
     FAIL_FLAG = "__fail__"
+    _LEGACY_MSGLOG_INGESTION_SCAN_TABLE = "msglogingestionscan"
+    _LEGACY_MSGLOG_INGESTION_SCAN_COLUMNS = frozenset(
+        {
+            "id",
+            "source_chat_id",
+            "scan_boundary",
+            "cursor",
+            "existing_streak",
+            "scanned_count",
+            "inserted_count",
+            "existing_count",
+            "skipped_count",
+            "lease_owner",
+            "lease_expires_at",
+            "status",
+            "error",
+            "created_at",
+            "updated_at",
+        }
+    )
+    _LEGACY_MSGLOG_INGESTION_SCAN_SIGNATURE = frozenset(
+        {
+            ("id", "INTEGER", False, True),
+            ("source_chat_id", "TEXT", False, False),
+            ("scan_boundary", "INTEGER", False, False),
+            ("cursor", "INTEGER", False, False),
+            ("existing_streak", "INTEGER", False, False),
+            ("scanned_count", "INTEGER", False, False),
+            ("inserted_count", "INTEGER", False, False),
+            ("existing_count", "INTEGER", False, False),
+            ("skipped_count", "INTEGER", False, False),
+            ("lease_owner", "TEXT", True, False),
+            ("lease_expires_at", "DATETIME", True, False),
+            ("status", "TEXT", False, False),
+            ("error", "TEXT", True, False),
+            ("created_at", "DATETIME", False, False),
+            ("updated_at", "DATETIME", False, False),
+        }
+    )
     _LEGACY_OUTBOUND_TABLES = ("outbound_workflow", "outbound_task")
     _LEGACY_OUTBOUND_STATES = (
         "waiting_dependency",
@@ -330,6 +369,27 @@ class DatabaseManager:
                 HistoryMigrationEntry,
             ]
         )
+        DatabaseManager._retire_legacy_msglog_ingestion_scan()
+
+    @staticmethod
+    def _retire_legacy_msglog_ingestion_scan() -> None:
+        """Drop the removed scan table only when it has the retired schema."""
+        table = DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_TABLE
+        if table not in database.get_tables():
+            return
+        column_definitions = database.get_columns(table)
+        columns = {column.name for column in column_definitions}
+        signature = {(column.name, column.data_type.upper(), column.null, column.primary_key) for column in column_definitions}
+        indexes = database.get_indexes(table)
+        source_chat_is_unique = any(index.unique and tuple(index.columns) == ("source_chat_id",) for index in indexes)
+        if (
+            columns != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_COLUMNS
+            or signature != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_SIGNATURE
+            or not source_chat_is_unique
+        ):
+            DatabaseManager.logger.warning("Retaining %s because its schema does not match the retired MsgLog ingestion scan table", table)
+            return
+        database.execute_sql(f'DROP TABLE "{table}"')
 
     def _observe_legacy_outbound_rows(self) -> None:
         """Report retained workflow rows without loading or changing them."""

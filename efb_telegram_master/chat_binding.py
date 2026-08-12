@@ -99,6 +99,7 @@ class ChatBindingManager(LocaleMixin):
     TELEGRAM_MIN_PROFILE_PICTURE_SIZE = 256
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
+    MSGLOG_INGESTION_JOIN_TIMEOUT = 5.0
 
     def __init__(self, channel: "TelegramChannel"):
         self.channel: "TelegramChannel" = channel
@@ -1351,13 +1352,16 @@ class ChatBindingManager(LocaleMixin):
                 if self._msglog_ingestion_threads.get(source_chat_id) is threading.current_thread():
                     self._msglog_ingestion_threads.pop(source_chat_id)
 
-    def stop_msglog_ingestions(self) -> None:
-        """Cancel active command scans and wait for their worker threads."""
+    def stop_msglog_ingestions(self, join: bool = True) -> None:
+        """Cancel active command scans and optionally wait a bounded time for workers."""
         self._msglog_ingestion_stop.set()
+        if not join:
+            return
         with self._msglog_ingestion_lock:
             workers = list(self._msglog_ingestion_threads.values())
         for worker in workers:
-            worker.join()
+            if worker.is_alive() and worker.ident != threading.get_ident():
+                worker.join(timeout=self.MSGLOG_INGESTION_JOIN_TIMEOUT)
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Background method that performs the actual migration work.

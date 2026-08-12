@@ -10,6 +10,26 @@ from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.msg_type import TGMsgType
 
+_LEGACY_INGESTION_SCAN_SCHEMA = """
+CREATE TABLE msglogingestionscan (
+    id INTEGER NOT NULL PRIMARY KEY,
+    source_chat_id TEXT NOT NULL UNIQUE,
+    scan_boundary INTEGER NOT NULL,
+    cursor INTEGER NOT NULL,
+    existing_streak INTEGER NOT NULL,
+    scanned_count INTEGER NOT NULL,
+    inserted_count INTEGER NOT NULL,
+    existing_count INTEGER NOT NULL,
+    skipped_count INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at DATETIME,
+    status TEXT NOT NULL,
+    error TEXT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+)
+"""
+
 
 def test_fresh_database_defines_msglog_provenance(tmp_path, monkeypatch):
     original_database = database.obj
@@ -24,6 +44,44 @@ def test_fresh_database_defines_msglog_provenance(tmp_path, monkeypatch):
 
     assert "provenance" in msglog_columns
     assert "msglogingestionscan" not in tables
+
+
+def test_startup_retires_the_exact_legacy_msglog_ingestion_scan_table(tmp_path, monkeypatch):
+    original_database = database.obj
+    database_path = tmp_path / "tgdata.db"
+    legacy_database = SqliteDatabase(database_path)
+    legacy_database.connect()
+    legacy_database.execute_sql(_LEGACY_INGESTION_SCAN_SCHEMA)
+    legacy_database.close()
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
+    try:
+        tables = set(database.get_tables())
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
+
+    assert "msglogingestionscan" not in tables
+
+
+def test_startup_keeps_a_same_name_table_with_a_different_schema_signature(tmp_path, monkeypatch):
+    original_database = database.obj
+    database_path = tmp_path / "tgdata.db"
+    collision_database = SqliteDatabase(database_path)
+    collision_database.connect()
+    collision_database.execute_sql(_LEGACY_INGESTION_SCAN_SCHEMA.replace("id INTEGER NOT NULL PRIMARY KEY", "id TEXT NOT NULL PRIMARY KEY", 1))
+    collision_database.close()
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.collision", config={}))
+    try:
+        tables = set(database.get_tables())
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
+
+    assert "msglogingestionscan" in tables
 
 
 def test_ingested_msglog_persistence_is_idempotent():
