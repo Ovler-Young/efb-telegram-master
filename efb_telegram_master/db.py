@@ -107,12 +107,25 @@ class DatabaseManager:
             )
 
         database.initialize(actual_db)
-        database.connect()
-        self.logger.debug("Database loaded.")
-        self.logger.debug("Checking database migration...")
-        self._create()
-        self.logger.debug("Database migration finished...")
-        self._retire_legacy_outbound_tables()
+        connected = False
+        try:
+            database.connect()
+            connected = True
+            self.logger.debug("Database loaded.")
+            self.logger.debug("Checking database migration...")
+            self._create()
+            self.logger.debug("Database migration finished...")
+            self._retire_legacy_outbound_tables()
+        except BaseException:
+            if connected:
+                try:
+                    self.stop_worker()
+                except BaseException:
+                    try:
+                        self.logger.exception("Failed to close database after database initialization failed.")
+                    except BaseException:
+                        pass
+            raise
 
     def set_metrics(self, metrics: DatabaseMetrics) -> None:
         self._metrics = metrics
@@ -238,10 +251,18 @@ class DatabaseManager:
             return f"column signature for {table_name} does not match the historical durable outbound schema"
         if table_name != "outboundtask":
             return None
-        actual_indexes = tuple((index.name, tuple(index.columns), index.unique) for index in current_database.get_indexes(table_name))
+        actual_indexes = cls._legacy_outbound_task_indexes(current_database)
         if set(actual_indexes) != set(cls._LEGACY_OUTBOUND_TASK_INDEXES):
             return "index signature for outboundtask does not match the historical durable outbound schema"
         return None
+
+    @staticmethod
+    def _legacy_outbound_task_indexes(current_database) -> tuple[tuple[str, tuple[str, ...], bool], ...]:
+        indexes = tuple((index.name, tuple(index.columns), index.unique) for index in current_database.get_indexes("outboundtask"))
+        if isinstance(current_database, PostgresqlDatabase):
+            # PostgreSQL exposes the primary-key constraint as an index; SQLite does not.
+            indexes = tuple(index for index in indexes if index != ("outboundtask_pkey", ("id",), True))
+        return indexes
 
     @classmethod
     def _validate_legacy_outbound_schema(cls, current_database, table_names: set[str]) -> tuple[str, ...]:

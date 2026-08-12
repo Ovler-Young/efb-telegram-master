@@ -11,6 +11,11 @@ from efb_telegram_master.models import database
 from tests.support.legacy_outbound_schema import legacy_outbound_models
 
 
+@pytest.fixture
+def poll_bot():
+    """Keep database-retirement tests independent of Telegram polling."""
+
+
 def _database_kwargs(config):
     return {key: value for key, value in config.items() if key != "type"}
 
@@ -78,6 +83,13 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
                 task_columns["accepted_at"].default,
             )
             == "current_timestamp"
+        )
+        assert tuple((index.name, tuple(index.columns), index.unique) for index in legacy_db.get_indexes("outboundtask")) == (
+            ("outboundtask_pkey", ("id",), True),
+            ("outboundtask_workflow_id_step_index", ("workflow_id", "step_index"), True),
+            ("outboundtask_source_key_priority_accepted_at_id", ("source_key", "priority", "accepted_at", "id"), False),
+            ("outboundtask_state_available_at", ("state", "available_at"), False),
+            ("outboundtask_workflow_id", ("workflow_id",), False),
         )
         assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundworkflow") is None
         assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundtask") is None

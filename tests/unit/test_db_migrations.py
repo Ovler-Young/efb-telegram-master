@@ -2,12 +2,12 @@ import logging
 import pickle
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import Model, SqliteDatabase
+from peewee import IndexMetadata, Model, PostgresqlDatabase, SqliteDatabase
 from prometheus_client import generate_latest
 
 from efb_telegram_master import db as db_module
@@ -75,6 +75,127 @@ def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
         assert database.obj.pragma("journal_mode").lower() == "wal"
     finally:
         manager.stop_worker()
+        database.initialize(original_database)
+
+
+def test_database_manager_closes_sqlite_when_schema_creation_fails(tmp_path, monkeypatch):
+    original_database = database.obj
+    original_close = SqliteDatabase.close
+    closed_databases = []
+
+    def close(instance, *args, **kwargs):
+        closed_databases.append(instance)
+        return original_close(instance, *args, **kwargs)
+
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("schema creation failed"))))
+    monkeypatch.setattr(SqliteDatabase, "close", close)
+    try:
+        with pytest.raises(RuntimeError, match="schema creation failed"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-failure", config={}))
+
+        assert len(closed_databases) == 1
+        assert database.is_closed()
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+def test_database_manager_closes_sqlite_when_post_connect_logging_fails(tmp_path, monkeypatch):
+    original_database = database.obj
+    original_close = SqliteDatabase.close
+    logger = Mock()
+    closed_databases = []
+
+    def close(instance, *args, **kwargs):
+        closed_databases.append(instance)
+        return original_close(instance, *args, **kwargs)
+
+    logger.debug.side_effect = lambda message: (_ for _ in ()).throw(RuntimeError("post-connect logging failed")) if message == "Database loaded." else None
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(DatabaseManager, "logger", logger)
+    monkeypatch.setattr(SqliteDatabase, "close", close)
+    try:
+        with pytest.raises(RuntimeError, match="post-connect logging failed"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-log-failure", config={}))
+
+        assert len(closed_databases) == 1
+        assert database.is_closed()
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+def test_database_manager_does_not_close_sqlite_when_connect_fails(tmp_path, monkeypatch):
+    original_database = database.obj
+    original_connect = SqliteDatabase.connect
+    original_close = SqliteDatabase.close
+    closed_databases = []
+
+    def connect(instance, *args, **kwargs):
+        raise RuntimeError("connect failed")
+
+    def close(instance, *args, **kwargs):
+        closed_databases.append(instance)
+        return original_close(instance, *args, **kwargs)
+
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(SqliteDatabase, "connect", connect)
+    monkeypatch.setattr(SqliteDatabase, "close", close)
+    try:
+        with pytest.raises(RuntimeError, match="connect failed"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-connect-failure", config={}))
+
+        assert closed_databases == []
+    finally:
+        monkeypatch.setattr(SqliteDatabase, "connect", original_connect)
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+def test_database_manager_preserves_initialization_error_when_cleanup_logging_fails(tmp_path, monkeypatch):
+    original_database = database.obj
+    logger = Mock()
+    cleanup = Mock(side_effect=RuntimeError("cleanup failed"))
+    logger.exception.side_effect = RuntimeError("cleanup logging failed")
+
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(DatabaseManager, "logger", logger)
+    monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("schema creation failed"))))
+    monkeypatch.setattr(DatabaseManager, "stop_worker", cleanup)
+    try:
+        with pytest.raises(RuntimeError, match="schema creation failed"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-cleanup-logging-failure", config={}))
+
+        cleanup.assert_called_once_with()
+        logger.exception.assert_called_once_with("Failed to close database after database initialization failed.")
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+def test_database_manager_stops_and_closes_postgresql_pool_when_retirement_fails(monkeypatch):
+    original_database = database.obj
+    pool = Mock()
+    pooled_database = patch("playhouse.postgres_ext.PooledPostgresqlExtDatabase", return_value=pool)
+    pooled_database.start()
+    pool.connect.return_value = True
+    pool.is_closed.return_value = False
+    monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: None))
+    monkeypatch.setattr(DatabaseManager, "_retire_legacy_outbound_tables", lambda _self: (_ for _ in ()).throw(RuntimeError("retirement failed")))
+    try:
+        with pytest.raises(RuntimeError, match="retirement failed"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-failure", config={"database": {"type": "postgresql"}}))
+
+        pool.connect.assert_called_once_with()
+        pool.stop.assert_called_once_with()
+        pool.close.assert_called_once_with()
+    finally:
+        pooled_database.stop()
         database.initialize(original_database)
 
 
@@ -151,6 +272,36 @@ def test_startup_retires_legacy_outbound_tables_after_current_schema_creation(tm
 def test_legacy_auto_primary_key_default_categories(table_name, column_name, data_type, primary_key, default, expected):
     backend = SqliteDatabase(":memory:") if default is None else db_module.PostgresqlDatabase("tests")
     assert DatabaseManager._legacy_default_category(backend, table_name, column_name, data_type, primary_key, default) == expected
+
+
+def test_postgresql_legacy_outbound_index_fixture_excludes_only_the_primary_key_index(monkeypatch):
+    backend = PostgresqlDatabase("tests")
+    introspected_indexes = (
+        IndexMetadata("outboundtask_pkey", "CREATE UNIQUE INDEX outboundtask_pkey ON outboundtask (id)", ["id"], True, "outboundtask"),
+        IndexMetadata(
+            "outboundtask_workflow_id_step_index",
+            "CREATE UNIQUE INDEX outboundtask_workflow_id_step_index ON outboundtask (workflow_id, step_index)",
+            ["workflow_id", "step_index"],
+            True,
+            "outboundtask",
+        ),
+        IndexMetadata(
+            "outboundtask_source_key_priority_accepted_at_id",
+            "CREATE INDEX outboundtask_source_key_priority_accepted_at_id ON outboundtask (source_key, priority, accepted_at, id)",
+            ["source_key", "priority", "accepted_at", "id"],
+            False,
+            "outboundtask",
+        ),
+        IndexMetadata("outboundtask_state_available_at", "CREATE INDEX outboundtask_state_available_at ON outboundtask (state, available_at)", ["state", "available_at"], False, "outboundtask"),
+        IndexMetadata("outboundtask_workflow_id", "CREATE INDEX outboundtask_workflow_id ON outboundtask (workflow_id)", ["workflow_id"], False, "outboundtask"),
+    )
+    monkeypatch.setattr(backend, "get_indexes", lambda _table_name: introspected_indexes)
+
+    assert set(DatabaseManager._legacy_outbound_task_indexes(backend)) == set(DatabaseManager._LEGACY_OUTBOUND_TASK_INDEXES)
+
+    monkeypatch.setattr(backend, "get_indexes", lambda _table_name: (*introspected_indexes, IndexMetadata("outboundtask_unexpected", "", ["state"], False, "outboundtask")))
+
+    assert set(DatabaseManager._legacy_outbound_task_indexes(backend)) != set(DatabaseManager._LEGACY_OUTBOUND_TASK_INDEXES)
 
 
 @pytest.mark.parametrize("failure", ("count", "drop"))

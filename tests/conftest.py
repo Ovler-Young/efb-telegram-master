@@ -281,6 +281,12 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "integration: mark test as an integration test")
 
 
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if item.module.__name__.startswith("tests.integration") and "poll_bot" not in item.fixturenames:
+            item.fixturenames.append("poll_bot")
+
+
 def pytest_runtest_setup(item):
     is_unit = item.module.__name__.startswith("tests.unit")
     is_integration = item.module.__name__.startswith("tests.integration")
@@ -289,9 +295,6 @@ def pytest_runtest_setup(item):
         pytest.skip("test is a unit test", allow_module_level=True)
     elif mode == "integration" and not is_integration:
         pytest.skip("test is an integration test", allow_module_level=True)
-
-    if is_integration:
-        item.fixturenames.append("poll_bot")
 
 
 def pytest_sessionfinish(session, exitstatus):

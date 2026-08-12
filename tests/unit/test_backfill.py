@@ -536,10 +536,10 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
         stack.enter_context(patch("efb_telegram_master.load_channel_config", new=load_config))
         stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
         stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
-        stack.enter_context(patch("efb_telegram_master.TelegramBotManager", return_value=bot_manager))
-        stack.enter_context(patch("efb_telegram_master.HistoryReplayWorker", return_value=history_replay))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager", return_value=bot_manager))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.HistoryReplayWorker", return_value=history_replay))
         for dependency in dependencies:
-            stack.enter_context(patch(f"efb_telegram_master.{dependency}"))
+            stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
         channel = TelegramChannel()
 
     history_replay.resume.assert_called_once_with()

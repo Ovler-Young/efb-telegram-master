@@ -2,10 +2,12 @@ import asyncio
 import inspect
 import threading
 import time
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from ehforwarderbot.channel import MasterChannel
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
@@ -19,6 +21,7 @@ from efb_telegram_master.outbound_types import OutboundShutdownTimeout, Schedule
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
+from tests.thread_diagnostics import live_non_daemon_threads
 
 
 def _runtime(*, application: object | None = None, async_runtime: AsyncTelegramRuntime | None = None) -> TelegramPollingRuntime:
@@ -400,6 +403,197 @@ def test_channel_owner_stops_the_real_master_message_worker() -> None:
         channel.db.stop_worker.assert_called_once_with()
     finally:
         worker.stop_worker()
+
+
+def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_cleanup_errors(caplog) -> None:
+    channel = SimpleNamespace(config={"admins": [1]}, db=Mock())
+    runtime = Mock(async_runtime=Mock(), bot=Mock())
+    dispatcher_error = RuntimeError("dispatcher registration failed")
+    delivery_error = RuntimeError("delivery shutdown failed")
+    runtime_error = RuntimeError("runtime shutdown failed")
+    runtime.add_base_dispatchers.side_effect = dispatcher_error
+    runtime.stop.side_effect = runtime_error
+
+    with (
+        patch("efb_telegram_master.bot_manager.build_telegram_polling_runtime", return_value=runtime),
+        patch("efb_telegram_master.bot_manager.build_bot_pool", return_value=None),
+        patch("efb_telegram_master.bot_manager.OutboundQueue") as queue_type,
+        patch("efb_telegram_master.bot_manager.configure_runtime_metrics", return_value=(None, None)),
+        patch.object(TelegramAPI, "stop_delivery_resources", return_value=(delivery_error,)) as stop_delivery,
+    ):
+        with pytest.raises(RuntimeError, match="dispatcher registration failed"):
+            TelegramBotManager(
+                channel,
+                Mock(),
+                Mock(),
+                Mock(),
+                TelegramChannel.channel_id,
+                lambda: 0,
+                lambda: False,
+                lambda text: text,
+                lambda singular, _plural, _count: singular,
+                Mock(),
+            )
+
+    queue_type.return_value.start.assert_called_once_with()
+    stop_delivery.assert_called_once_with(TelegramBotManager.SHUTDOWN_DRAIN_TIMEOUT)
+    runtime.stop.assert_called_once_with()
+    assert "Telegram delivery resource did not stop after initialization failed: delivery shutdown failed" in caplog.text
+    assert "Failed to stop the Telegram runtime after initialization failed." in caplog.text
+
+
+def test_channel_constructor_stops_database_when_bot_manager_creation_fails() -> None:
+    database_manager = SimpleNamespace(
+        chat_associations=Mock(),
+        slave_chat_info=Mock(),
+        msglogs=Mock(),
+        history_migrations=Mock(),
+        msglog_ingestion=Mock(),
+        _base_path="/tmp",
+        stop_worker=Mock(),
+    )
+
+    with (
+        patch.object(MasterChannel, "__init__", return_value=None),
+        patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1]}, Mock())),
+        patch("efb_telegram_master.ExperimentalFlagsManager", return_value=Mock()),
+        patch("efb_telegram_master.DatabaseManager", return_value=database_manager),
+        patch("efb_telegram_master.channel_composition.TelegramBotManager", side_effect=RuntimeError("bot setup failed")),
+        patch("efb_telegram_master.channel_composition.MTProtoClient", return_value=Mock()),
+        patch("efb_telegram_master.channel_composition.ChatObjectCacheManager", return_value=Mock()),
+        patch("efb_telegram_master.channel_composition.ChatDestinationCache", return_value=Mock()),
+        patch("efb_telegram_master.channel_composition.TelegramChatID", return_value=Mock()),
+    ):
+        with pytest.raises(RuntimeError, match="bot setup failed"):
+            TelegramChannel()
+
+    database_manager.stop_worker.assert_called_once_with()
+    assert not any(thread.name.startswith(("ETM", "HistoryMigrationReplay", "MsgLogIngestion")) for thread in live_non_daemon_threads())
+
+
+def test_channel_constructor_stops_started_history_replay_when_handler_registration_fails() -> None:
+    application = Mock()
+    runtime = SimpleNamespace(application=application, as_async_callback=lambda callback: callback)
+    api = SimpleNamespace(session_expired=lambda *_args, **_kwargs: None, send_message=Mock())
+    bot_manager = SimpleNamespace(api=api, telegram_runtime=runtime, msglog_scan=Mock(), error=Mock(), stop_channel_resources=Mock())
+    history_migrations = SimpleNamespace(has_pending_entries=lambda: True, get_next_target=lambda: None)
+    database_manager = SimpleNamespace(
+        chat_associations=Mock(),
+        slave_chat_info=Mock(),
+        msglogs=Mock(),
+        history_migrations=history_migrations,
+        msglog_ingestion=Mock(),
+        _base_path="/tmp",
+        stop_worker=Mock(),
+    )
+    flag = Mock(side_effect=lambda name: {"chats_per_page": 10, "multiple_slave_chats": False, "topic_group": 0}.get(name, False))
+    dependencies = (
+        "MTProtoClient",
+        "ChatObjectCacheManager",
+        "ChatDestinationCache",
+        "TopicGroupService",
+        "CommandsManager",
+        "MasterMessageDelivery",
+        "CallbackSessionStore",
+        "RecipientSuggestionService",
+        "LinkService",
+        "LinkCompletionService",
+        "ChatHeadService",
+    )
+    history_worker_started = threading.Event()
+
+    def fail_after_history_resume(*_args, **_kwargs):
+        if any(thread.name == "HistoryMigrationReplay" for thread in live_non_daemon_threads()):
+            history_worker_started.set()
+            raise RuntimeError("handler registration failed")
+
+    application.add_handler.side_effect = fail_after_history_resume
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
+        stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1]}, Mock())))
+        stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
+        stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager", return_value=bot_manager))
+        for dependency in dependencies:
+            stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
+
+        with pytest.raises(RuntimeError, match="handler registration failed"):
+            TelegramChannel()
+
+    assert not any(thread.name == "HistoryMigrationReplay" for thread in live_non_daemon_threads())
+    assert history_worker_started.is_set()
+    bot_manager.stop_channel_resources.assert_called_once_with()
+    database_manager.stop_worker.assert_called_once_with()
+
+
+def test_channel_constructor_failure_stops_the_real_started_message_worker() -> None:
+    application = Mock()
+    runtime = SimpleNamespace(application=application, as_async_callback=lambda callback: callback)
+    api = SimpleNamespace(session_expired=lambda *_args, **_kwargs: None, send_message=Mock())
+    bot_manager = SimpleNamespace(api=api, telegram_runtime=runtime, msglog_scan=Mock(), error=Mock(), stop_channel_resources=Mock())
+    database_manager = SimpleNamespace(
+        chat_associations=Mock(),
+        slave_chat_info=Mock(),
+        msglogs=Mock(),
+        history_migrations=Mock(),
+        msglog_ingestion=Mock(),
+        _base_path="/tmp",
+        stop_worker=Mock(),
+    )
+    history_replay = Mock()
+    flag = Mock(side_effect=lambda name: {"chats_per_page": 10, "multiple_slave_chats": False, "topic_group": 0}.get(name, False))
+    workers = []
+
+    def create_worker(*args):
+        worker = MasterMessageWorker(*args)
+        workers.append(worker)
+        return worker
+
+    dependencies = (
+        "MTProtoClient",
+        "ChatObjectCacheManager",
+        "ChatDestinationCache",
+        "TopicGroupService",
+        "CommandsManager",
+        "MasterMessageDelivery",
+        "CallbackSessionStore",
+        "RecipientSuggestionService",
+        "LinkService",
+        "LinkCompletionService",
+        "ChatHeadService",
+        "SlaveMessageRouter",
+        "TextDelivery",
+        "SlaveFileTransfer",
+        "OversizedNoticeSender",
+        "ImageDelivery",
+        "SlaveMediaDelivery",
+        "SlaveFileDelivery",
+        "SlaveMessageService",
+        "SlaveStatusService",
+        "MasterMessageInbound",
+        "MasterMessageMutations",
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
+        stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1]}, Mock())))
+        stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
+        stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager", return_value=bot_manager))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.HistoryReplayWorker", return_value=history_replay))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.MasterMessageWorker", side_effect=create_worker))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.RPCUtilities", side_effect=RuntimeError("rpc setup failed")))
+        for dependency in dependencies:
+            stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
+
+        with pytest.raises(RuntimeError, match="rpc setup failed"):
+            TelegramChannel()
+
+    worker = workers[0]
+    assert not worker.message_worker_thread.is_alive()
+    assert "ETM master messages worker thread" not in {thread.name for thread in live_non_daemon_threads()}
+    history_replay.stop.assert_called_once_with()
+    bot_manager.stop_channel_resources.assert_called_once_with()
+    database_manager.stop_worker.assert_called_once_with()
 
 
 def test_master_message_worker_shutdown_suppresses_an_in_flight_delivery_failure() -> None:

@@ -99,7 +99,28 @@ class TelegramBotManager:
         _metrics, metrics_server = configure_runtime_metrics(config, channel.db, bot_pool, outbound_queue, self.logger)
         self.api.bind_metrics_server(metrics_server)
         outbound_queue.start()
-        self.telegram_runtime.add_base_dispatchers(config["admins"], self.update_locale)
+        try:
+            self.telegram_runtime.add_base_dispatchers(config["admins"], self.update_locale)
+        except BaseException:
+            self._stop_after_initialization_failure()
+            raise
+
+    def _stop_after_initialization_failure(self) -> None:
+        try:
+            cleanup_errors = self.api.stop_delivery_resources(self.SHUTDOWN_DRAIN_TIMEOUT)
+        except BaseException:
+            self.logger.exception("Failed to stop Telegram delivery resources after initialization failed.")
+        else:
+            for cleanup_error in cleanup_errors:
+                self.logger.error(
+                    "Telegram delivery resource did not stop after initialization failed: %s",
+                    cleanup_error,
+                    exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+                )
+        try:
+            self.telegram_runtime.stop()
+        except BaseException:
+            self.logger.exception("Failed to stop the Telegram runtime after initialization failed.")
 
     @property
     def _(self) -> Callable[[str], str]:
