@@ -382,11 +382,7 @@ class DatabaseManager:
         signature = {DatabaseManager._legacy_msglog_ingestion_scan_column_signature(column) for column in column_definitions}
         indexes = database.get_indexes(table)
         source_chat_is_unique = any(index.unique and tuple(index.columns) == ("source_chat_id",) for index in indexes)
-        if (
-            columns != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_COLUMNS
-            or signature != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_SIGNATURE
-            or not source_chat_is_unique
-        ):
+        if columns != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_COLUMNS or signature != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_SIGNATURE or not source_chat_is_unique:
             DatabaseManager.logger.warning("Retaining %s because its schema does not match the retired MsgLog ingestion scan table", table)
             return
         database.execute_sql(f'DROP TABLE "{table}"')

@@ -113,6 +113,7 @@ class ChatBindingManager(LocaleMixin):
         self._msglog_ingestion_lock = threading.Lock()
         self._msglog_ingestion_threads: Dict[int, threading.Thread] = {}
         self._msglog_ingestion_stop = threading.Event()
+        self._msglog_ingestion_shutdown_callback: Optional[Callable[[], None]] = None
 
         # Link handler
         non_edit_filter = Filters.update.message | Filters.update.channel_post
@@ -268,12 +269,16 @@ class ChatBindingManager(LocaleMixin):
         if message.chat.type != ChatType.PRIVATE:
             links = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, ChatID(str(message.chat.id))))
             if links:
-                return self.link_chat_gen_list(TelegramChatID(message.chat.id), owner_id=message.from_user.id if message.from_user else None, pattern=" ".join(args), chats=links, filter_availability=False)
+                return self.link_chat_gen_list(
+                    TelegramChatID(message.chat.id), owner_id=message.from_user.id if message.from_user else None, pattern=" ".join(args), chats=links, filter_availability=False
+                )
         elif (forwarded_chat := get_forwarded_chat(message)) and forwarded_chat.type == ChatType.CHANNEL:
             chat_id = ChatID(str(forwarded_chat.id))
             links = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel.channel_id, chat_id))
             if links:
-                return self.link_chat_gen_list(TelegramChatID(message.chat.id), owner_id=message.from_user.id if message.from_user else None, pattern=" ".join(args), chats=links, filter_availability=False)
+                return self.link_chat_gen_list(
+                    TelegramChatID(message.chat.id), owner_id=message.from_user.id if message.from_user else None, pattern=" ".join(args), chats=links, filter_availability=False
+                )
         assert message.from_user
         return self.link_chat_gen_list(TelegramChatID(message.from_user.id), owner_id=message.from_user.id, pattern=" ".join(args))
 
@@ -437,13 +442,7 @@ class ChatBindingManager(LocaleMixin):
         session = self.msg_storage.get(storage_id)
         owner_id = session.owner_id if session is not None else None
         callback_user = callback.from_user if callback is not None else None
-        if (
-            owner_id is not None
-            and callback_user is not None
-            and user is not None
-            and callback_user.id == owner_id
-            and user.id == owner_id
-        ):
+        if owner_id is not None and callback_user is not None and user is not None and callback_user.id == owner_id and user.id == owner_id:
             return True
         if callback is not None:
             self.bot.answer_callback_query(callback.id, text=self._("Session expired or unknown parameter. (SE02)"))
@@ -782,7 +781,15 @@ class ChatBindingManager(LocaleMixin):
             raise Exception("No target chat is found when generating chat list.")
         return self.chat_head_req_generate(target, owner_id=update.effective_user.id if update.effective_user else None, pattern=" ".join(args), chats=chats)
 
-    def chat_head_req_generate(self, chat_id: TelegramChatID, message_id: Optional[TelegramMessageID] = None, offset: int = 0, pattern: str = "", chats: Optional[List[EFBChannelChatIDStr]] = None, owner_id: Optional[int] = None):
+    def chat_head_req_generate(
+        self,
+        chat_id: TelegramChatID,
+        message_id: Optional[TelegramMessageID] = None,
+        offset: int = 0,
+        pattern: str = "",
+        chats: Optional[List[EFBChannelChatIDStr]] = None,
+        owner_id: Optional[int] = None,
+    ):
         """
         Generate the list for chat head, and update it to a message.
 
@@ -1374,9 +1381,7 @@ class ChatBindingManager(LocaleMixin):
 
     def _run_msglog_ingestion(self, source_chat_id: int) -> None:
         try:
-            self.bot._runtime.call(
-                MsgLogIngestionService(self.db, self.channel.mtproto, self._msglog_ingestion_stop.is_set).run(source_chat_id)
-            )
+            self.bot._runtime.call(MsgLogIngestionService(self.db, self.channel.mtproto, self._msglog_ingestion_stop.is_set).run(source_chat_id))
         except Exception:
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id)
         finally:

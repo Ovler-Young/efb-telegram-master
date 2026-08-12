@@ -59,7 +59,7 @@ class MsgLogIngestionService:
                 if self.should_stop():
                     return
                 classification, slave_uid, content = self._classify(by_id.get(message_id), source_chat_id)
-                if classification != "eligible":
+                if classification != "eligible" or slave_uid is None or content is None:
                     continue
                 outcome = self.db.persist_ingested_msglog(source_chat_id, message_id, slave_uid, content)
                 existing_streak = existing_streak + 1 if outcome == "existing" else 0

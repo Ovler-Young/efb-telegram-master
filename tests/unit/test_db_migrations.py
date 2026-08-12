@@ -110,14 +110,8 @@ def test_ingested_msglog_persistence_is_idempotent():
             msg_type="Text",
             time=datetime(2026, 8, 4),
         )
-        assert (
-            manager.persist_ingested_msglog(100, 500, "tests.slave target", content)
-            == "inserted"
-        )
-        assert (
-            manager.persist_ingested_msglog(100, 500, "tests.slave target", content)
-            == "existing"
-        )
+        assert manager.persist_ingested_msglog(100, 500, "tests.slave target", content) == "inserted"
+        assert manager.persist_ingested_msglog(100, 500, "tests.slave target", content) == "existing"
         row = MsgLog.get_by_id("100.500")
     finally:
         test_db.close()

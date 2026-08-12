@@ -52,6 +52,7 @@ def test_channel_shutdown_defers_database_close_until_a_nonresponsive_ingestion_
     request_released = threading.Event()
     manager.MSGLOG_INGESTION_JOIN_TIMEOUT = 0.01
     manager.logger = Mock()
+
     def block_runtime(coroutine):
         coroutine.close()
         request_released.wait()
