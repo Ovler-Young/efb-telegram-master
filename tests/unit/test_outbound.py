@@ -29,10 +29,10 @@ class _Limiter:
         return {"global": 0.0, "chat": 0.0}
 
 
-def _queue(sender, worker_count=2):
+def _queue(sender, worker_count=2, bot_pool=None):
     queue = OutboundQueue(
         sender,
-        None,
+        bot_pool,
         _Limiter(),
         worker_count=worker_count,
         blocking_timeout=1,
@@ -95,6 +95,101 @@ def test_queue_retries_numeric_and_timedelta_retry_after(retry_after):
         waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "sent"}, 1))
         assert waiter.result(1).message == "sent"
         assert attempts == 2
+    finally:
+        queue.stop()
+
+
+def test_queue_rewinds_file_like_upload_before_retry_after():
+    upload = io.BytesIO(b"image-bytes")
+    received_uploads = []
+
+    class Sender:
+        def send_document(self, *, chat_id, document):
+            received_uploads.append(document.read())
+            if len(received_uploads) == 1:
+                raise RetryAfter(0)
+            return SimpleNamespace(message_id=7)
+
+    queue = _queue(Sender(), worker_count=1)
+    try:
+        receipt = queue.enqueue(QueueRequest("send_document", (), {"chat_id": 1, "document": upload}, 1)).result(1)
+        assert receipt.message.message_id == 7
+        assert received_uploads == [b"image-bytes", b"image-bytes"]
+    finally:
+        queue.stop()
+
+
+def test_queue_rewinds_nested_media_uploads_before_retry_after():
+    media_source = io.BytesIO(b"media-bytes")
+    thumbnail_source = io.BytesIO(b"thumbnail-bytes")
+    media = InputMediaVideo(
+        InputFile(media_source, read_file_handle=False),
+        thumbnail=InputFile(thumbnail_source, read_file_handle=False),
+    )
+    received_uploads = []
+
+    class Sender:
+        def send_media_group(self, *, chat_id, media):
+            received_uploads.append((media[0].media.input_file_content.read(), media[0].thumbnail.input_file_content.read()))
+            if len(received_uploads) == 1:
+                raise RetryAfter(0)
+            return [SimpleNamespace(message_id=7)]
+
+    queue = _queue(Sender(), worker_count=1)
+    try:
+        queue.enqueue(QueueRequest("send_media_group", (), {"chat_id": 1, "media": [media]}, 1)).result(1)
+        assert received_uploads == [(b"media-bytes", b"thumbnail-bytes"), (b"media-bytes", b"thumbnail-bytes")]
+    finally:
+        queue.stop()
+
+
+def test_queue_records_retry_after_and_cleans_unrewindable_upload(tmp_path) -> None:
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"upload")
+    available_sent = threading.Event()
+    retrying_calls = []
+
+    class UnrewindableUpload:
+        def seek(self, _offset):
+            raise OSError("rewind failed")
+
+    class RetryingSender:
+        def send_document(self, *, chat_id, document):
+            retrying_calls.append((chat_id, document))
+            raise RetryAfter(60)
+
+    class AvailableSender:
+        def send_message(self, *, chat_id, text):
+            available_sent.set()
+            return SimpleNamespace(message_id=8)
+
+    retrying_auxiliary = Mock(bot_id=10, disabled=False, check_membership_tri=Mock(return_value=True), peek_delay=Mock(return_value=0.0), try_acquire_limits=Mock(return_value=True))
+    retrying_auxiliary.bot = RetryingSender()
+    available_auxiliary = Mock(bot_id=20, disabled=False, check_membership_tri=Mock(return_value=True), peek_delay=Mock(return_value=0.0), try_acquire_limits=Mock(return_value=True))
+    available_auxiliary.bot = AvailableSender()
+    queue = _queue(SimpleNamespace(), worker_count=1, bot_pool=BotPool([retrying_auxiliary, available_auxiliary]))
+    try:
+        waiter = queue.enqueue(
+            QueueRequest(
+                "send_document",
+                (),
+                {"chat_id": 1, "document": UnrewindableUpload()},
+                1,
+                required_sender_bot_id="10",
+                cleanup=UploadCleanup((str(upload),)),
+            )
+        )
+        with pytest.raises(OSError, match="rewind failed"):
+            waiter.result(1)
+        assert queue.cooldown_snapshot()["auxiliary"] > 0.0
+        retrying_waiter = queue.enqueue(QueueRequest("send_document", (), {"chat_id": 1, "document": UnrewindableUpload()}, 1, required_sender_bot_id="10"))
+        available_waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 2, "text": "sent"}, 2, required_sender_bot_id="20"))
+        assert available_sent.wait(1)
+        receipt = available_waiter.result(1)
+        assert receipt.message.message_id == 8
+        assert not retrying_waiter.done()
+        assert len(retrying_calls) == 1
+        assert not upload.exists()
     finally:
         queue.stop()
 

@@ -13,7 +13,7 @@ from efb_telegram_master.constants import Flags
 from efb_telegram_master.models import HistoryMigrationEntry
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
-from .utils import get_start_link
+from .utils import decode_start_link_token, get_start_link
 
 pytestmark = pytest.mark.asyncio
 
@@ -158,8 +158,7 @@ async def _link_chat(
     return command_message
 
 
-def _create_relink_start_token(channel_with_auxiliary_bots, etm_chat, *, private_chat_id: int, session_message_id: int) -> str:
-    storage_key = (TelegramChatID(private_chat_id), TelegramMessageID(session_message_id))
+def _create_relink_start_token(channel_with_auxiliary_bots, etm_chat, *, storage_key: tuple[TelegramChatID, TelegramMessageID]) -> str:
     channel_with_auxiliary_bots.callback_sessions.start(
         channel_with_auxiliary_bots.link_handler,
         storage_key,
@@ -231,7 +230,7 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
     expected = _expected_stream_indices(expected_count)
     slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
     deadline = time.time() + timeout
-    activity_observed = False
+    replay_or_entry_observed = False
 
     last_debug = ""
     while time.time() < deadline:
@@ -239,15 +238,15 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
         telegram_indices = [idx for message in recent for idx in _extract_stream_indices(message.raw_text or "", prefix)]
         db_logs = _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix)
         db_indices = [idx for log in db_logs for idx in _extract_stream_indices(log.text or "", prefix)]
-        activity_observed = activity_observed or bool(telegram_indices)
         target_entry_count = _target_migration_entry_count(slave_chat_id, chat_id)
+        replay_or_entry_observed = replay_or_entry_observed or bool(telegram_indices) or target_entry_count > 0
         last_debug = (
-            f"migration_observed={activity_observed}, db_idx={len(db_indices)}/{expected_count}, "
+            f"replay_or_entry_observed={replay_or_entry_observed}, db_idx={len(db_indices)}/{expected_count}, "
             f"tg_idx={len(telegram_indices)}/{expected_count}, target_entries={target_entry_count}, "
             f"expected_migration_sends={expected_count}"
         )
         if _migration_activity_completed(
-            activity_observed=activity_observed,
+            activity_observed=replay_or_entry_observed,
             expected=expected,
             db_indices=db_indices,
             telegram_indices=telegram_indices,
@@ -265,7 +264,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     client_user = await client.get_me()
     assert client_user is not None and client_user.id is not None, "Telethon client user ID is required to prepare relink callback sessions."
-    private_chat_id = client_user.id
+    private_chat_owner = TelegramChatID(client_user.id)
 
     source_group_id = bot_group
     chat = slave_with_auxiliary_bots.chat_with_alias
@@ -278,14 +277,15 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     prefix = f"AUXSEND{uuid4().hex[:10]}"
     source_start_link = await get_start_link(client, helper, bot_id, chat.uid, private_response)
+    source_storage_key = decode_start_link_token(source_start_link.token, expected_owner=private_chat_owner)
+    assert source_storage_key[0] == private_chat_owner
     command_message = await _link_chat(client, helper, bot_id, chat.uid, source_group_id, private_response, start_token=source_start_link.token)
 
     # Private-panel delivery is covered by the backfill tests; this test isolates history replay.
     relink_true_token = _create_relink_start_token(
         channel_with_auxiliary_bots,
         etm_chat,
-        private_chat_id=private_chat_id,
-        session_message_id=source_start_link.session_message_id,
+        storage_key=source_storage_key,
     )
 
     stream_thread, sent_texts, stream_errors = _start_mock_stream(slave_with_auxiliary_bots, chat, prefix)
@@ -344,8 +344,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         relink_false_token = _create_relink_start_token(
             channel_with_auxiliary_bots,
             etm_chat,
-            private_chat_id=private_chat_id,
-            session_message_id=source_start_link.session_message_id,
+            storage_key=source_storage_key,
         )
         relink_false_message = await _link_chat(
             client,

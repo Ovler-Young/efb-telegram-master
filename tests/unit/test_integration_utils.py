@@ -4,7 +4,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.chat_destination_cache import ChatDestinationCache
+from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 from tests.integration import test_master_message_destination as destination_tests
 from tests.integration import utils as integration_utils
 from tests.integration.helper.filters import BaseFilter
@@ -16,6 +18,20 @@ class EventFieldFilter(BaseFilter):
 
     def filter(self, event) -> bool:
         return self.predicate(event)
+
+
+def test_decode_start_link_token_returns_the_complete_storage_key():
+    canonical_session_message_id = TelegramMessageID(27023)
+    start_token = etm_utils.b64en(etm_utils.message_id_to_str(TelegramChatID(1), canonical_session_message_id))
+
+    assert integration_utils.decode_start_link_token(start_token) == (TelegramChatID(1), canonical_session_message_id)
+
+
+def test_decode_start_link_token_rejects_a_mismatched_owner():
+    start_token = etm_utils.b64en(etm_utils.message_id_to_str(TelegramChatID(1), TelegramMessageID(27023)))
+
+    with pytest.raises(AssertionError, match="does not match expected owner"):
+        integration_utils.decode_start_link_token(start_token, expected_owner=TelegramChatID(2))
 
 
 @pytest.mark.asyncio

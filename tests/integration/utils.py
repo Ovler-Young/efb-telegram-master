@@ -11,7 +11,7 @@ from telethon import TelegramClient
 from telethon.tl.types import ChannelParticipantsAdmins
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.utils import chat_id_to_str
+from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TgChatMsgIDStr, b64de, chat_id_to_str, message_id_str_to_id
 
 from .helper.filters import edited, has_button, in_chats, reply_to, text
 
@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 class StartLink:
     token: str
     session_message_id: int
+
+
+def decode_start_link_token(start_token: str, *, expected_owner: TelegramChatID | None = None) -> tuple[TelegramChatID, TelegramMessageID]:
+    storage_key = message_id_str_to_id(TgChatMsgIDStr(b64de(start_token)))
+    if expected_owner is not None:
+        assert storage_key[0] == expected_owner, f"Start-link token owner {storage_key[0]} does not match expected owner {expected_owner}."
+    return storage_key
 
 
 @contextmanager

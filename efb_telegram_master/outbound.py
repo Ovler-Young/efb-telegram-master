@@ -284,8 +284,13 @@ class OutboundQueue:
                     result = future.result()
                 except RetryAfter as error:
                     self._sender_policy.record_retry_after(pending.active_call(), error, submitted.selection)
-                    pending.retry_at = time.monotonic() + retry_after_seconds(error)
-                    self._requeue_or_stop_locked(pending)
+                    try:
+                        rewind_uploads(pending.active_call().args, pending.active_call().kwargs)
+                    except BaseException as rewind_error:
+                        self._complete_pending_locked(pending, error=rewind_error)
+                    else:
+                        pending.retry_at = time.monotonic() + retry_after_seconds(error)
+                        self._requeue_or_stop_locked(pending)
                 except telegram.error.ChatMigrated as error:
                     if pending.phase is _CallPhase.PRIMARY:
                         pending.waiter.set_exception(error)
