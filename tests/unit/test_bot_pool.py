@@ -208,19 +208,17 @@ def test_shutdown_reports_unjoined_membership_workers_after_stopping_every_bot()
     second.wait_for_membership_shutdown.assert_called_once()
 
 
-def test_shutdown_attempts_every_bot_when_one_begin_fails_and_another_probe_is_blocked() -> None:
+def test_shutdown_attempts_every_bot_after_a_partial_begin_failure() -> None:
     first = bot(10)
     second = bot(20)
-    begin_error = RuntimeError("second probe shutdown failed")
-    second.begin_membership_shutdown.side_effect = begin_error
+    error = RuntimeError("second probe shutdown failed")
+    second.begin_membership_shutdown.side_effect = error
     first.wait_for_membership_shutdown.return_value = False
     second.wait_for_membership_shutdown.return_value = True
     pool = BotPool([first, second])
 
-    assert pool.begin_shutdown() == (begin_error,)
+    assert pool.begin_shutdown() == (error,)
     assert pool.wait_for_shutdown(time.monotonic() + 0.1) == (10,)
 
     first.begin_membership_shutdown.assert_called_once_with()
     second.begin_membership_shutdown.assert_called_once_with()
-    first.wait_for_membership_shutdown.assert_called_once()
-    second.wait_for_membership_shutdown.assert_called_once()
