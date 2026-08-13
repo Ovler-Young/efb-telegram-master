@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import IndexMetadata, Model, PostgresqlDatabase, SqliteDatabase
+from peewee import IndexMetadata, Model, OperationalError, PostgresqlDatabase, SqliteDatabase
 from prometheus_client import generate_latest
 
 from efb_telegram_master import db as db_module
@@ -22,6 +22,37 @@ from efb_telegram_master.outbound_types import SendReceipt
 from efb_telegram_master.slave_message import SlaveMessageService
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 from tests.support.legacy_outbound_schema import legacy_outbound_models
+
+
+def _create_historic_msglog_source(source_path):
+    source_db = SqliteDatabase(source_path)
+    source_db.connect()
+    try:
+        source_db.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, "
+            "slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) "
+            "VALUES ('1.1', 'source-message', 'source text', 'source-chat', 'Text', 'master')"
+        )
+    finally:
+        source_db.close()
+
+
+@contextmanager
+def _sqlite_import_target():
+    original_database = database.obj
+    target_db = SqliteDatabase(":memory:")
+    database.initialize(target_db)
+    target_db.connect()
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    try:
+        yield manager, target_db
+    finally:
+        target_db.close()
+        database.initialize(original_database)
 
 
 def test_msglog_schema_has_sender_bot_id(channel):
@@ -192,6 +223,70 @@ def test_sqlite_import_preserves_historic_source_when_target_initialization_fail
     finally:
         target_db.close()
         database.initialize(original_database)
+
+
+def test_sqlite_import_recovery_rejects_equal_count_content_mismatch(tmp_path):
+    source_path = tmp_path / "tgdata.db"
+    _create_historic_msglog_source(source_path)
+
+    with _sqlite_import_target() as (manager, _target_db):
+        manager._migrate_from_sqlite(source_path, finalize_source=False)
+        MsgLog.update(text="different target text").where(MsgLog.master_msg_id == "1.1").execute()
+
+        with pytest.raises(RuntimeError, match="target data does not exactly match"):
+            manager._finalize_completed_sqlite_import(source_path)
+
+        assert source_path.exists()
+        assert MsgLog.select().count() == 1
+
+
+def test_sqlite_import_retains_source_when_equal_count_content_verification_fails(tmp_path, monkeypatch):
+    source_path = tmp_path / "tgdata.db"
+    _create_historic_msglog_source(source_path)
+
+    original_insert_many = MsgLog.insert_many
+
+    def insert_altered(rows, *args, **kwargs):
+        altered_rows = [dict(row, text="different target text") for row in rows]
+        return original_insert_many(altered_rows, *args, **kwargs)
+
+    monkeypatch.setattr(MsgLog, "insert_many", insert_altered)
+    with _sqlite_import_target() as (manager, _target_db):
+        with pytest.raises(RuntimeError, match="target content differs"):
+            manager._migrate_from_sqlite(source_path, finalize_source=True)
+
+        assert source_path.exists()
+        assert not source_path.with_suffix(".db.migrated").exists()
+
+
+def test_sqlite_import_recovery_requires_matching_provenance(tmp_path):
+    source_path = tmp_path / "tgdata.db"
+    _create_historic_msglog_source(source_path)
+
+    with _sqlite_import_target() as (manager, target_db):
+        manager._migrate_from_sqlite(source_path, finalize_source=False)
+        target_db.execute_sql('DROP TABLE "sqliteimportprovenance"')
+
+        with pytest.raises(RuntimeError, match="import provenance does not match"):
+            manager._finalize_completed_sqlite_import(source_path)
+
+        assert source_path.exists()
+
+
+def test_sqlite_source_fence_blocks_source_writes_until_import_finishes(tmp_path):
+    source_path = tmp_path / "tgdata.db"
+    _create_historic_msglog_source(source_path)
+
+    models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, db_module.MsgLogIngestionScan)
+    with DatabaseManager._sqlite_source_fence(source_path, models) as snapshot:
+        writer = SqliteDatabase(source_path, pragmas={"busy_timeout": 1})
+        writer.connect()
+        try:
+            with pytest.raises(OperationalError, match="locked"):
+                writer.execute_sql("UPDATE msglog SET text = 'changed' WHERE master_msg_id = '1.1'")
+        finally:
+            writer.close()
+        assert len(snapshot.identity) == 64
 
 
 def test_postgresql_import_lifecycle_locks_before_target_preflight_and_unlocks_after_import(tmp_path, monkeypatch):

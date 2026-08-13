@@ -1,9 +1,12 @@
 # coding=utf-8
 
+import json
 import logging
 import os
 import re
 from contextlib import contextmanager
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -23,12 +26,26 @@ if TYPE_CHECKING:
     from . import TelegramChannel
 
 
+@dataclass(frozen=True)
+class _SQLiteSourceProjection:
+    model: type[Model]
+    column_names: tuple[str, ...]
+    rows: tuple[tuple[object, ...], ...]
+
+
+@dataclass(frozen=True)
+class _SQLiteImportSnapshot:
+    projections: tuple[_SQLiteSourceProjection, ...]
+    identity: str
+
+
 class DatabaseManager:
     logger = logging.getLogger(__name__)
     _LEGACY_OUTBOUND_TABLES = ("outboundworkflow", "outboundtask")
     _LEGACY_OUTBOUND_LOCK_KEY = 681_774_240_616_480_003
     _HISTORIC_SCHEMA_LOCK_KEY = 681_774_240_616_480_002
     _SQLITE_IMPORT_LOCK_KEY = 681_774_240_616_480_001
+    _SQLITE_IMPORT_PROVENANCE_TABLE = "sqliteimportprovenance"
     _LEGACY_OUTBOUND_COLUMNS = {
         "outboundworkflow": (
             ("id", "integer", False, True),
@@ -230,12 +247,109 @@ class DatabaseManager:
                 self._create()
 
     @staticmethod
-    def _sqlite_source_rows(source_database, model) -> list[dict]:
-        if model._meta.table_name not in source_database.get_tables():
-            return []
-        source_columns = {column.name for column in source_database.get_columns(model._meta.table_name)}
-        fields = [field for field in model._meta.sorted_fields if field.column_name in source_columns]
-        return list(model.select(*fields).dicts())
+    def _sqlite_snapshot_value(value: object) -> object:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, bytes):
+            return {"bytes": value.hex()}
+        isoformat = getattr(value, "isoformat", None)
+        if callable(isoformat):
+            return {"isoformat": isoformat()}
+        return {"string": str(value)}
+
+    @classmethod
+    def _sqlite_source_snapshot(cls, source_database, models: tuple[type[Model], ...]) -> _SQLiteImportSnapshot:
+        table_names = set(source_database.get_tables())
+        projections = []
+        serialized_projections = []
+        for model in models:
+            if model._meta.table_name not in table_names:
+                column_names: tuple[str, ...] = ()
+                rows: tuple[tuple[object, ...], ...] = ()
+            else:
+                source_columns = {column.name for column in source_database.get_columns(model._meta.table_name)}
+                fields = tuple(field for field in model._meta.sorted_fields if field.column_name in source_columns)
+                column_names = tuple(field.column_name for field in fields)
+                rows = tuple(tuple(row[column_name] for column_name in column_names) for row in model.select(*fields).dicts())
+            projections.append(_SQLiteSourceProjection(model, column_names, rows))
+            serialized_projections.append(
+                {
+                    "table": model._meta.table_name,
+                    "columns": column_names,
+                    "rows": sorted(
+                        (tuple(cls._sqlite_snapshot_value(value) for value in row) for row in rows),
+                        key=lambda row: json.dumps(row, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                    ),
+                }
+            )
+        serialized_snapshot = json.dumps(serialized_projections, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        return _SQLiteImportSnapshot(tuple(projections), sha256(serialized_snapshot.encode()).hexdigest())
+
+    @classmethod
+    @contextmanager
+    def _sqlite_source_fence(cls, sqlite_path: Path, models: tuple[type[Model], ...]):
+        source_database = SqliteDatabase(str(sqlite_path))
+        source_database.connect()
+        try:
+            # A reserved lock holds one immutable source view until finalization.
+            with source_database.atomic("IMMEDIATE"):
+                with source_database.bind_ctx(models):
+                    cls._reject_legacy_outbound_source_data(source_database)
+                    yield cls._sqlite_source_snapshot(source_database, models)
+        finally:
+            source_database.close()
+
+    @classmethod
+    def _target_matches_sqlite_snapshot(cls, snapshot: _SQLiteImportSnapshot) -> bool:
+        def serialized_rows(rows: tuple[tuple[object, ...], ...]) -> list[str]:
+            return sorted(
+                json.dumps(
+                    tuple(cls._sqlite_snapshot_value(value) for value in row),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                for row in rows
+            )
+
+        for projection in snapshot.projections:
+            if not projection.column_names:
+                if projection.model.select().count() != len(projection.rows):
+                    return False
+                continue
+            fields = [
+                field
+                for field in projection.model._meta.sorted_fields
+                if field.column_name in projection.column_names
+            ]
+            target_rows = tuple(tuple(row[column_name] for column_name in projection.column_names) for row in projection.model.select(*fields).dicts())
+            if serialized_rows(target_rows) != serialized_rows(projection.rows):
+                return False
+        return True
+
+    @classmethod
+    def _record_sqlite_import_provenance(cls, snapshot: _SQLiteImportSnapshot) -> None:
+        placeholder = database.obj.param
+        database.execute_sql(
+            f'CREATE TABLE IF NOT EXISTS "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" (snapshot_identity TEXT PRIMARY KEY)'
+        )
+        database.execute_sql(
+            f'INSERT INTO "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" (snapshot_identity) VALUES ({placeholder})',
+            (snapshot.identity,),
+        )
+
+    @classmethod
+    def _has_sqlite_import_provenance(cls, snapshot: _SQLiteImportSnapshot) -> bool:
+        if cls._SQLITE_IMPORT_PROVENANCE_TABLE not in database.get_tables():
+            return False
+        placeholder = database.obj.param
+        return (
+            database.execute_sql(
+                f' SELECT 1 FROM "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" WHERE snapshot_identity = {placeholder}',
+                (snapshot.identity,),
+            ).fetchone()
+            is not None
+        )
 
     @classmethod
     def _reject_legacy_outbound_source_data(cls, source_database) -> None:
@@ -284,67 +398,43 @@ class DatabaseManager:
             raise RuntimeError(f"SQLite-to-PostgreSQL migration finalization failed; source remains at {sqlite_path}") from error
         sqlite_path.unlink()
 
-    @classmethod
-    def _sqlite_source_matches_target(cls, sqlite_path: Path, models: tuple[type[Model], ...]) -> bool:
-        source_database = SqliteDatabase(str(sqlite_path))
-        source_database.connect()
-        try:
-            with source_database.bind_ctx(models):
-                cls._reject_legacy_outbound_source_data(source_database)
-                source_rows = {model: cls._sqlite_source_rows(source_database, model) for model in models}
-                source_columns = {
-                    model: {column.name for column in source_database.get_columns(model._meta.table_name)} if model._meta.table_name in source_database.get_tables() else set()
-                    for model in models
-                }
-        finally:
-            source_database.close()
-        for model in models:
-            if not source_columns[model]:
-                if model.select().count() != len(source_rows[model]):
-                    return False
-                continue
-            target_fields = [field for field in model._meta.sorted_fields if field.column_name in source_columns[model]]
-            target_rows = list(model.select(*target_fields).dicts())
-            if len(target_rows) != len(source_rows[model]) or sorted(map(repr, target_rows)) != sorted(map(repr, source_rows[model])):
-                return False
-        return True
-
     def _finalize_completed_sqlite_import(self, sqlite_path: Path) -> None:
         models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
-        if not self._sqlite_source_matches_target(sqlite_path, models):
-            raise RuntimeError(
-                "SQLite-to-PostgreSQL migration restart conflict: target data does not exactly match tgdata.db; "
-                "preserving the source. Resolve the target/source conflict before restarting."
-            )
-        self._finalize_sqlite_source(sqlite_path)
+        with self._sqlite_source_fence(sqlite_path, models) as snapshot:
+            with database.obj.bind_ctx(models):
+                if not self._has_sqlite_import_provenance(snapshot):
+                    raise RuntimeError(
+                        "SQLite-to-PostgreSQL migration restart conflict: target import provenance does not match tgdata.db; "
+                        "preserving the source. Resolve the target/source conflict before restarting."
+                    )
+                if not self._target_matches_sqlite_snapshot(snapshot):
+                    raise RuntimeError(
+                        "SQLite-to-PostgreSQL migration restart conflict: target data does not exactly match tgdata.db; "
+                        "preserving the source. Resolve the target/source conflict before restarting."
+                    )
+                self._finalize_sqlite_source(sqlite_path)
         self.logger.info("SQLite-to-PostgreSQL migration source finalization completed; source renamed to %s", sqlite_path.with_suffix(".db.migrated"))
 
     def _migrate_from_sqlite(self, sqlite_path: Path, *, finalize_source: bool) -> None:
         from peewee import chunked
 
         self.logger.info("Detected existing SQLite database. Migrating to PostgreSQL.")
-        source_database = SqliteDatabase(str(sqlite_path))
-        source_database.connect()
         models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
-        try:
-            with source_database.bind_ctx(models):
-                with source_database.atomic():
-                    self._reject_legacy_outbound_source_data(source_database)
-                    source_rows = {model: self._sqlite_source_rows(source_database, model) for model in models}
-        finally:
-            source_database.close()
+        with self._sqlite_source_fence(sqlite_path, models) as snapshot:
+            with database.obj.bind_ctx(models):
+                with database.atomic():
+                    self._create()
+                    for projection in snapshot.projections:
+                        rows = [dict(zip(projection.column_names, row)) for row in projection.rows]
+                        for batch in chunked(rows, 500):
+                            projection.model.insert_many(batch).execute()
+                    self._record_sqlite_import_provenance(snapshot)
+                    if not self._target_matches_sqlite_snapshot(snapshot):
+                        raise RuntimeError("SQLite-to-PostgreSQL migration verification failed: target content differs from the source snapshot")
 
-        with database.atomic():
-            self._create()
-            for model in models:
-                rows = source_rows[model]
-                for batch in chunked(rows, 500):
-                    model.insert_many(batch).execute()
-                if model.select().count() != len(rows):
-                    raise RuntimeError(f"SQLite-to-PostgreSQL migration verification failed for {model._meta.table_name}")
-
+            if finalize_source:
+                self._finalize_sqlite_source(sqlite_path)
         if finalize_source:
-            self._finalize_sqlite_source(sqlite_path)
             self.logger.info("SQLite-to-PostgreSQL migration completed; source renamed to %s", sqlite_path.with_suffix(".db.migrated"))
         else:
             self.logger.info("SQLite-to-PostgreSQL migration completed from preserved source %s", sqlite_path)
