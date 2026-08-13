@@ -93,10 +93,25 @@ def test_postgresql_startup_preserves_non_empty_historical_outbound_tables(integ
         assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundtask") is None
         legacy_db.close()
 
+        source_path = tmp_path / "tgdata.db"
+        source_db = SqliteDatabase(source_path)
+        source_db.connect()
+        try:
+            source_db.execute_sql("CREATE TABLE import_probe (value TEXT NOT NULL)")
+            source_db.execute_sql("INSERT INTO import_probe (value) VALUES ('preserve source')")
+        finally:
+            source_db.close()
+
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
         with pytest.raises(RuntimeError, match="automatic replay is disabled"):
             DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
         assert database.is_closed()
+        source_db = SqliteDatabase(source_path)
+        source_db.connect()
+        try:
+            assert source_db.execute_sql("SELECT value FROM import_probe").fetchone() == ("preserve source",)
+        finally:
+            source_db.close()
         check_db = PostgresqlDatabase(database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"})
         check_db.connect()
         try:

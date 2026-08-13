@@ -1,5 +1,6 @@
 import pickle
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -14,7 +15,7 @@ from efb_telegram_master import utils
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.outbound_types import SendReceipt
@@ -148,6 +149,90 @@ def test_sqlite_import_rejects_nonempty_legacy_outbound_before_altering_target_o
             source_db.close()
     finally:
         target_db.close()
+        database.initialize(original_database)
+
+
+def test_sqlite_import_preserves_historic_source_when_target_initialization_fails(tmp_path, monkeypatch):
+    source_path = tmp_path / "tgdata.db"
+    source_db = SqliteDatabase(source_path)
+    source_db.connect()
+    try:
+        source_db.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, "
+            "slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) "
+            "VALUES ('1.1', 'source-message', 'source text', 'source-chat', 'Text', 'master')"
+        )
+    finally:
+        source_db.close()
+
+    original_database = database.obj
+    target_db = SqliteDatabase(":memory:")
+    database.initialize(target_db)
+    target_db.connect()
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    original_create = DatabaseManager._create
+    monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("target initialization failed"))))
+    try:
+        with pytest.raises(RuntimeError, match="target initialization failed"):
+            manager._migrate_from_sqlite(source_path, finalize_source=True)
+        source_db = SqliteDatabase(source_path)
+        source_db.connect()
+        try:
+            assert "provenance" not in {column.name for column in source_db.get_columns("msglog")}
+            assert source_db.execute_sql("SELECT text FROM msglog WHERE master_msg_id = '1.1'").fetchone() == ("source text",)
+        finally:
+            source_db.close()
+        monkeypatch.setattr(DatabaseManager, "_create", staticmethod(original_create))
+        manager._migrate_from_sqlite(source_path, finalize_source=False)
+        assert MsgLog.get_by_id("1.1").provenance == "live"
+    finally:
+        target_db.close()
+        database.initialize(original_database)
+
+
+def test_postgresql_import_lifecycle_locks_before_target_preflight_and_unlocks_after_import(tmp_path, monkeypatch):
+    source_path = tmp_path / "tgdata.db"
+    source_path.touch()
+    original_database = database.obj
+    events = []
+    current_database = Mock()
+    manager = object.__new__(DatabaseManager)
+
+    @contextmanager
+    def import_lock(_cls, lock_database):
+        assert lock_database is current_database
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    def target_initialized():
+        events.append("target-state")
+        return False
+
+    def preflight(target_database):
+        assert target_database is current_database
+        events.append("preflight")
+
+    def import_source(_self, path, *, finalize_source):
+        assert path == source_path
+        assert finalize_source is True
+        events.append("import")
+
+    database.initialize(current_database)
+    monkeypatch.setattr(DatabaseManager, "_sqlite_import_lifecycle_lock", classmethod(import_lock))
+    monkeypatch.setattr(ChatAssoc, "table_exists", target_initialized)
+    monkeypatch.setattr(DatabaseManager, "_reject_legacy_outbound_target_data", classmethod(lambda _cls, target_database: preflight(target_database)))
+    monkeypatch.setattr(DatabaseManager, "_migrate_from_sqlite", import_source)
+    try:
+        manager._initialize_postgresql(tmp_path)
+        assert events == ["lock", "target-state", "preflight", "import", "unlock"]
+    finally:
         database.initialize(original_database)
 
 

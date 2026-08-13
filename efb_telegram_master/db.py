@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -27,6 +28,7 @@ class DatabaseManager:
     _LEGACY_OUTBOUND_TABLES = ("outboundworkflow", "outboundtask")
     _LEGACY_OUTBOUND_LOCK_KEY = 681_774_240_616_480_003
     _HISTORIC_SCHEMA_LOCK_KEY = 681_774_240_616_480_002
+    _SQLITE_IMPORT_LOCK_KEY = 681_774_240_616_480_001
     _LEGACY_OUTBOUND_COLUMNS = {
         "outboundworkflow": (
             ("id", "integer", False, True),
@@ -118,23 +120,7 @@ class DatabaseManager:
             self.logger.debug("Database loaded.")
             self.logger.debug("Checking database migration...")
             if isinstance(actual_db, PostgresqlDatabase):
-                sqlite_path = base_path / "tgdata.db"
-                migrated_path = sqlite_path.with_suffix(".db.migrated")
-                target_initialized = ChatAssoc.table_exists()
-                if sqlite_path.exists() and migrated_path.exists() and not os.path.samefile(sqlite_path, migrated_path):
-                    raise RuntimeError(
-                        "SQLite-to-PostgreSQL migration finalization collision: both tgdata.db and tgdata.db.migrated exist with different contents; "
-                        "preserving both files. Resolve the conflict before restarting."
-                    )
-                if not target_initialized and sqlite_path.exists():
-                    self._migrate_from_sqlite(sqlite_path, finalize_source=True)
-                elif not target_initialized and migrated_path.exists():
-                    self._migrate_from_sqlite(migrated_path, finalize_source=False)
-                elif target_initialized and sqlite_path.exists():
-                    self._finalize_completed_sqlite_import(sqlite_path)
-                    self._create()
-                else:
-                    self._create()
+                self._initialize_postgresql(base_path)
             else:
                 self._create()
             self.logger.debug("Database migration finished...")
@@ -210,6 +196,39 @@ class DatabaseManager:
             if migration_steps:
                 migrate(*migration_steps)
 
+    @classmethod
+    @contextmanager
+    def _sqlite_import_lifecycle_lock(cls, current_database):
+        current_database.execute_sql("SELECT pg_advisory_lock(%s)", (cls._SQLITE_IMPORT_LOCK_KEY,))
+        try:
+            yield
+        finally:
+            current_database.execute_sql("SELECT pg_advisory_unlock(%s)", (cls._SQLITE_IMPORT_LOCK_KEY,))
+
+    def _initialize_postgresql(self, base_path: Path) -> None:
+        current_database = database.obj
+        with self._sqlite_import_lifecycle_lock(current_database):
+            sqlite_path = base_path / "tgdata.db"
+            migrated_path = sqlite_path.with_suffix(".db.migrated")
+            if sqlite_path.exists() and migrated_path.exists() and not os.path.samefile(sqlite_path, migrated_path):
+                raise RuntimeError(
+                    "SQLite-to-PostgreSQL migration finalization collision: both tgdata.db and tgdata.db.migrated exist with different contents; "
+                    "preserving both files. Resolve the conflict before restarting."
+                )
+
+            target_initialized = ChatAssoc.table_exists()
+            if sqlite_path.exists() or migrated_path.exists():
+                self._reject_legacy_outbound_target_data(current_database)
+            if not target_initialized and sqlite_path.exists():
+                self._migrate_from_sqlite(sqlite_path, finalize_source=True)
+            elif not target_initialized and migrated_path.exists():
+                self._migrate_from_sqlite(migrated_path, finalize_source=False)
+            elif target_initialized and sqlite_path.exists():
+                self._finalize_completed_sqlite_import(sqlite_path)
+                self._create()
+            else:
+                self._create()
+
     @staticmethod
     def _sqlite_source_rows(source_database, model) -> list[dict]:
         if model._meta.table_name not in source_database.get_tables():
@@ -229,6 +248,21 @@ class DatabaseManager:
         if any(row_counts.values()):
             raise RuntimeError(
                 "Legacy durable outbound data detected in SQLite import source: automatic replay is disabled. "
+                "Import aborted before target initialization or source migration; "
+                f"workflows={row_counts.get('outboundworkflow', 0)} tasks={row_counts.get('outboundtask', 0)}."
+            )
+
+    @classmethod
+    def _reject_legacy_outbound_target_data(cls, target_database) -> None:
+        table_names = set(target_database.get_tables())
+        legacy_table_names = cls._validate_legacy_outbound_schema(target_database, table_names)
+        row_counts = {
+            table_name: int(target_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
+            for table_name in legacy_table_names
+        }
+        if any(row_counts.values()):
+            raise RuntimeError(
+                "Legacy durable outbound data detected in PostgreSQL import target: automatic replay is disabled. "
                 "Import aborted before target initialization or source migration; "
                 f"workflows={row_counts.get('outboundworkflow', 0)} tasks={row_counts.get('outboundtask', 0)}."
             )
@@ -258,10 +292,19 @@ class DatabaseManager:
             with source_database.bind_ctx(models):
                 cls._reject_legacy_outbound_source_data(source_database)
                 source_rows = {model: cls._sqlite_source_rows(source_database, model) for model in models}
+                source_columns = {
+                    model: {column.name for column in source_database.get_columns(model._meta.table_name)} if model._meta.table_name in source_database.get_tables() else set()
+                    for model in models
+                }
         finally:
             source_database.close()
         for model in models:
-            target_rows = list(model.select().dicts())
+            if not source_columns[model]:
+                if model.select().count() != len(source_rows[model]):
+                    return False
+                continue
+            target_fields = [field for field in model._meta.sorted_fields if field.column_name in source_columns[model]]
+            target_rows = list(model.select(*target_fields).dicts())
             if len(target_rows) != len(source_rows[model]) or sorted(map(repr, target_rows)) != sorted(map(repr, source_rows[model])):
                 return False
         return True
@@ -285,9 +328,8 @@ class DatabaseManager:
         models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
         try:
             with source_database.bind_ctx(models):
-                with source_database.atomic("IMMEDIATE"):
+                with source_database.atomic():
                     self._reject_legacy_outbound_source_data(source_database)
-                    self._ensure_historic_schema_columns(source_database)
                     source_rows = {model: self._sqlite_source_rows(source_database, model) for model in models}
         finally:
             source_database.close()
