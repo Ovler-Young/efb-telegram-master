@@ -22,6 +22,8 @@ from peewee import (
     DoesNotExist,
     IntegerField,
     Model,
+    PostgresqlDatabase,
+    SqliteDatabase,
     TextField,
     fn,
 )
@@ -369,7 +371,25 @@ class DatabaseManager:
                 HistoryMigrationEntry,
             ]
         )
+        DatabaseManager._ensure_msglog_provenance()
         DatabaseManager._retire_legacy_msglog_ingestion_scan()
+
+    @staticmethod
+    def _ensure_msglog_provenance() -> None:
+        """Add provenance to MsgLog tables created before that field existed."""
+        current_database = database.obj
+        transaction_arguments: Tuple[str, ...] = ()
+        if isinstance(current_database, SqliteDatabase):
+            transaction_arguments = ("IMMEDIATE",)
+        elif not isinstance(current_database, PostgresqlDatabase):
+            raise TypeError(f"Unsupported database backend: {type(current_database).__name__}")
+
+        with current_database.atomic(*transaction_arguments):
+            if isinstance(current_database, PostgresqlDatabase):
+                current_database.execute_sql('LOCK TABLE "msglog" IN ACCESS EXCLUSIVE MODE')
+            column_names = {column.name for column in current_database.get_columns(MsgLog._meta.table_name)}
+            if "provenance" not in column_names:
+                current_database.execute_sql('ALTER TABLE "msglog" ADD COLUMN "provenance" TEXT NOT NULL DEFAULT \'live\'')
 
     @staticmethod
     def _retire_legacy_msglog_ingestion_scan() -> None:

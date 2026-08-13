@@ -1,10 +1,11 @@
+from contextlib import nullcontext
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import SqliteDatabase
+from peewee import PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
@@ -30,6 +31,28 @@ CREATE TABLE msglogingestionscan (
 )
 """
 
+_LEGACY_MSGLOG_SCHEMA = """
+CREATE TABLE msglog (
+    master_msg_id TEXT NOT NULL PRIMARY KEY,
+    master_msg_id_alt TEXT,
+    slave_message_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    slave_origin_uid TEXT NOT NULL,
+    slave_origin_display_name TEXT,
+    slave_member_uid TEXT,
+    slave_member_display_name TEXT,
+    media_type TEXT,
+    mime TEXT,
+    file_id TEXT,
+    file_unique_id TEXT,
+    msg_type TEXT NOT NULL,
+    pickle BLOB,
+    sent_to TEXT NOT NULL,
+    sender_bot_id TEXT,
+    time DATETIME
+)
+"""
+
 
 def test_fresh_database_defines_msglog_provenance(tmp_path, monkeypatch):
     original_database = database.obj
@@ -44,6 +67,65 @@ def test_fresh_database_defines_msglog_provenance(tmp_path, monkeypatch):
 
     assert "provenance" in msglog_columns
     assert "msglogingestionscan" not in tables
+
+
+def test_startup_adds_provenance_to_legacy_sqlite_msglog_and_is_idempotent(tmp_path, monkeypatch):
+    original_database = database.obj
+    database_path = tmp_path / "tgdata.db"
+    legacy_database = SqliteDatabase(database_path)
+    legacy_database.connect()
+    legacy_database.execute_sql(_LEGACY_MSGLOG_SCHEMA)
+    legacy_database.execute_sql(
+        "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) VALUES (?, ?, ?, ?, ?, ?)",
+        ("100.1", "legacy-message", "legacy text", "tests.slave chat", "Text", "tests.master"),
+    )
+    legacy_database.close()
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+
+    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy-msglog", config={}))
+    second_manager = None
+    try:
+        first_manager.stop_worker()
+        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy-msglog", config={}))
+        columns = {column.name for column in database.get_columns("msglog")}
+        row = database.execute_sql("SELECT provenance FROM msglog WHERE master_msg_id = ?", ("100.1",)).fetchone()
+    finally:
+        if second_manager is not None:
+            second_manager.stop_worker()
+        database.initialize(original_database)
+
+    assert "provenance" in columns
+    assert row == ("live",)
+
+
+def test_msglog_provenance_migration_locks_postgresql_before_altering(monkeypatch):
+    original_database = database.obj
+    postgresql_database = PostgresqlDatabase("tests")
+    columns = [SimpleNamespace(name="master_msg_id")]
+    statements = []
+
+    monkeypatch.setattr(postgresql_database, "get_binary_type", lambda: bytes)
+    monkeypatch.setattr(postgresql_database, "atomic", lambda: nullcontext())
+    monkeypatch.setattr(postgresql_database, "get_columns", lambda _table: columns)
+
+    def execute_sql(statement):
+        statements.append(statement)
+        if statement.startswith("ALTER TABLE"):
+            columns.append(SimpleNamespace(name="provenance"))
+
+    monkeypatch.setattr(postgresql_database, "execute_sql", execute_sql)
+    database.initialize(postgresql_database)
+    try:
+        DatabaseManager._ensure_msglog_provenance()
+        DatabaseManager._ensure_msglog_provenance()
+    finally:
+        database.initialize(original_database)
+
+    assert statements == [
+        'LOCK TABLE "msglog" IN ACCESS EXCLUSIVE MODE',
+        'ALTER TABLE "msglog" ADD COLUMN "provenance" TEXT NOT NULL DEFAULT \'live\'',
+        'LOCK TABLE "msglog" IN ACCESS EXCLUSIVE MODE',
+    ]
 
 
 def test_startup_retires_the_exact_legacy_msglog_ingestion_scan_table(tmp_path, monkeypatch):
