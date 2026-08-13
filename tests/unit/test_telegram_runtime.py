@@ -4,7 +4,7 @@ import threading
 import time
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 from ehforwarderbot.channel import MasterChannel
@@ -387,6 +387,7 @@ def test_channel_defers_delivery_and_database_close_until_master_worker_exits() 
             channel.stop_polling()
 
         assert isinstance(raised.value.errors[0], MasterMessageWorkerShutdownTimeout)
+        channel.rpc_utilities.shutdown.assert_not_called()
         channel.bot_manager.stop_channel_resources.assert_not_called()
         channel.db.stop_worker.assert_not_called()
 
@@ -397,6 +398,7 @@ def test_channel_defers_delivery_and_database_close_until_master_worker_exits() 
         channel.stop_polling()
 
         channel.bot_manager.stop_channel_resources.assert_called_once_with()
+        channel.rpc_utilities.shutdown.assert_called_once_with()
         channel.db.stop_worker.assert_called_once_with()
     finally:
         release.set()
@@ -695,6 +697,66 @@ def test_master_message_worker_shutdown_suppresses_an_in_flight_delivery_failure
         release.set()
         stopped.join(1)
         worker.stop_worker()
+
+
+def test_master_message_worker_retry_preserves_stop_sentinel_after_timeout() -> None:
+    runtime = SimpleNamespace(application=SimpleNamespace(add_handler=Mock()), as_async_callback=lambda callback: callback)
+    started = threading.Event()
+    release = threading.Event()
+    inbound = Mock()
+
+    def block_message(*_args: object) -> None:
+        started.set()
+        assert release.wait(1)
+
+    inbound.msg.side_effect = block_message
+    worker = MasterMessageWorker(runtime, Mock(), inbound, Mock(), lambda text: text, Mock())
+    worker.message_queue.put((SimpleNamespace(effective_message=None), Mock()))
+    assert started.wait(1)
+
+    try:
+        assert len(worker.stop_worker(0.01)) == 1
+        assert len(worker.stop_worker(0.01)) == 1
+
+        release.set()
+        worker.message_worker_thread.join(1)
+
+        assert not worker.message_worker_thread.is_alive()
+        assert worker.stop_worker(0.01) == ()
+    finally:
+        release.set()
+        if worker.message_worker_thread.is_alive():
+            worker.message_queue.put(None)
+        worker.message_worker_thread.join(1)
+
+
+def test_constructor_failure_retains_resources_until_master_worker_stops() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    timeout = MasterMessageWorkerShutdownTimeout("blocked inbound message")
+    resources = Mock()
+    master_worker = resources.master_worker
+    master_worker.stop_worker.side_effect = [(timeout,), ()]
+    channel._owned_master_message_worker = master_worker
+    channel._owned_history_replay = resources.history_replay
+    channel.rpc_utilities = resources.rpc_utilities
+    channel._owned_bot_manager = resources.bot_manager
+    channel._owned_database = resources.database
+    channel.logger = Mock()
+
+    assert channel._stop_after_constructor_failure() == (timeout,)
+    assert resources.mock_calls == [
+        call.master_worker.stop_worker(),
+    ]
+
+    assert channel._stop_after_constructor_failure() == ()
+    assert resources.mock_calls == [
+        call.master_worker.stop_worker(),
+        call.master_worker.stop_worker(),
+        call.history_replay.stop(),
+        call.rpc_utilities.shutdown(),
+        call.bot_manager.stop_channel_resources(),
+        call.database.stop_worker(),
+    ]
 
 
 def _manager(api: Mock, runtime: Mock) -> TelegramBotManager:

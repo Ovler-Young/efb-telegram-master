@@ -86,13 +86,19 @@ class MasterMessageWorker:
         with self._queue_lock:
             self._stopping.set()
             drained_count = 0
+            stop_sentinel_drained = False
             while True:
                 try:
-                    self.message_queue.get_nowait()
+                    content = self.message_queue.get_nowait()
                     self.message_queue.task_done()
-                    drained_count += 1
+                    if content is None:
+                        stop_sentinel_drained = True
+                    else:
+                        drained_count += 1
                 except Empty:
                     break
+            if stop_sentinel_drained:
+                self._stop_sentinel_enqueued = False
             if self.message_worker_thread.is_alive() and not self._stop_sentinel_enqueued:
                 self.message_queue.put(None)
                 self._stop_sentinel_enqueued = True

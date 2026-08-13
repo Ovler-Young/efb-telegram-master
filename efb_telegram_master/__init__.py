@@ -78,6 +78,7 @@ class TelegramChannel(MasterChannel):
         self._owned_bot_manager = None
         self._owned_history_replay = None
         self._owned_master_message_worker = None
+        self._owned_rpc_utilities = None
 
         # Check PIL support for WebP
         Image.init()
@@ -101,10 +102,27 @@ class TelegramChannel(MasterChannel):
             self._stop_after_constructor_failure()
             raise
 
-    def _stop_after_constructor_failure(self) -> None:
+    def _stop_after_constructor_failure(self) -> tuple[BaseException, ...]:
+        master_message_worker = self._owned_master_message_worker
+        if master_message_worker is not None:
+            try:
+                master_errors = master_message_worker.stop_worker()
+            except BaseException as error:
+                master_errors = (error,)
+            if master_errors:
+                for error in master_errors:
+                    self.logger.error(
+                        "Master message worker did not stop after channel construction failed; retaining dependent resources for cleanup.",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                return tuple(master_errors)
+
+        rpc_utilities = getattr(self, "_owned_rpc_utilities", None)
+        if rpc_utilities is None:
+            rpc_utilities = getattr(self, "rpc_utilities", None)
         for resource, method_name in (
-            (self._owned_master_message_worker, "stop_worker"),
             (self._owned_history_replay, "stop"),
+            (rpc_utilities, "shutdown"),
             (self._owned_bot_manager, "stop_channel_resources"),
             (self._owned_database, "stop_worker"),
         ):
@@ -115,6 +133,7 @@ class TelegramChannel(MasterChannel):
                 method()
             except BaseException:
                 self.logger.exception("Failed to stop %s after channel construction failed.", type(resource).__name__)
+        return ()
 
     def _translate(self, message: str) -> str:
         return self.locale_state.gettext(message)
