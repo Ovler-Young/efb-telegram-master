@@ -85,6 +85,32 @@ def test_queue_runs_distinct_chats_concurrently():
         queue.stop()
 
 
+def test_queue_exposes_main_limiter_delay():
+    class Limiter:
+        def peek_delay(self, chat_id):
+            return float(chat_id)
+
+        def try_acquire(self, _chat_id):
+            return True
+
+        def occupancy_snapshot(self):
+            return {"global": 0.0, "chat": 0.0}
+
+    queue = OutboundQueue(
+        object(),
+        None,
+        Limiter(),
+        worker_count=1,
+        blocking_timeout=1,
+        shutdown_drain_timeout=1,
+        shutdown_join_grace=0.1,
+    )
+    try:
+        assert queue.main_limiter_delay(7) == 7.0
+    finally:
+        queue.stop()
+
+
 @pytest.mark.parametrize("retry_after", [0, timedelta(0)])
 def test_queue_retries_numeric_and_timedelta_retry_after(retry_after):
     attempts = 0

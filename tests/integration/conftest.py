@@ -208,7 +208,7 @@ async def client(helper_wrap) -> AsyncGenerator[TelegramClient, None]:
 
 def _primary_bot_limiter_delay(channel: TelegramChannel, target_chat_id: int) -> float:
     """Local integration seam for observing the primary bot's outbound limiter."""
-    return channel.bot_manager.outbound_queue._main_rate_limiter.peek_delay(target_chat_id)
+    return channel.bot_manager.outbound_queue.main_limiter_delay(target_chat_id)
 
 
 @pytest.fixture

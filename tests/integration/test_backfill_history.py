@@ -52,7 +52,7 @@ async def helper(helper_wrap, slave_with_auxiliary_bots):
 @pytest.fixture
 def private_response(channel_with_auxiliary_bots, bot_id):
     """Wait for primary-bot replies using the auxiliary channel's limiter."""
-    limiter_delay = lambda: (channel_with_auxiliary_bots.bot_manager.outbound_queue._main_rate_limiter.peek_delay(bot_id))
+    limiter_delay = lambda: channel_with_auxiliary_bots.bot_manager.outbound_queue.main_limiter_delay(bot_id)
 
     async def wait(trigger, receive):
         return await wait_for_private_response(limiter_delay, trigger, receive)
