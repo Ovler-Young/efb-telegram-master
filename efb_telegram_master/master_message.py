@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from queue import Queue
+import time
+from queue import Empty, Queue
 from threading import Thread
 from typing import Callable, Optional
 
@@ -14,8 +15,14 @@ from telegram.ext import CallbackContext, CommandHandler, MessageHandler
 from .ptb_compat import Filters, sync_reply_text
 
 
+class MasterMessageWorkerShutdownTimeout(RuntimeError):
+    """The inbound message worker retained a delivery beyond its shutdown deadline."""
+
+
 class MasterMessageWorker:
     """Register inbound handlers and process Telegram updates in order."""
+
+    DEFAULT_STOP_TIMEOUT = 5.0
 
     def __init__(self, runtime, bot, inbound, mutations, localize: Callable[[str], str], logger: logging.Logger) -> None:
         self.runtime = runtime
@@ -27,6 +34,7 @@ class MasterMessageWorker:
         self.message_queue: Queue[Optional[tuple[Update, CallbackContext]]] = Queue()
         self._stopping = threading.Event()
         self._queue_lock = threading.Lock()
+        self._stop_sentinel_enqueued = False
         self._register_handlers()
         self.message_worker_thread = Thread(target=self.message_worker, name="ETM master messages worker thread")
         self.message_worker_thread.start()
@@ -71,25 +79,31 @@ class MasterMessageWorker:
             finally:
                 self.message_queue.task_done()
 
-    def stop_worker(self) -> None:
+    def stop_worker(self, join_timeout: Optional[float] = None) -> tuple[BaseException, ...]:
+        if join_timeout is None:
+            join_timeout = self.DEFAULT_STOP_TIMEOUT
+        deadline = time.monotonic() + max(0.0, join_timeout)
         with self._queue_lock:
             self._stopping.set()
-            if not self.message_worker_thread.is_alive():
-                return
             drained_count = 0
-            while not self.message_queue.empty():
+            while True:
                 try:
                     self.message_queue.get_nowait()
                     self.message_queue.task_done()
                     drained_count += 1
-                except Exception:
+                except Empty:
                     break
-            self.message_queue.put(None)
+            if self.message_worker_thread.is_alive() and not self._stop_sentinel_enqueued:
+                self.message_queue.put(None)
+                self._stop_sentinel_enqueued = True
         if drained_count:
             self.logger.info("Drained %d pending messages from queue during shutdown", drained_count)
-        self.message_worker_thread.join(timeout=5.0)
+        if self.message_worker_thread is not threading.current_thread():
+            self.message_worker_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self.message_worker_thread.is_alive():
-            self.logger.warning("Message worker thread did not stop within timeout, continuing anyway")
+            self.logger.warning("Message worker thread did not stop within timeout")
+            return (MasterMessageWorkerShutdownTimeout(f"Master message worker did not stop within {join_timeout:g}s."),)
+        return ()
 
     def enqueue_message(self, update: Update, context: CallbackContext) -> None:
         assert isinstance(update, Update)

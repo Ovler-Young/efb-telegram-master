@@ -186,11 +186,14 @@ class TelegramChannel(MasterChannel):
             self._stop_polling_called = self._stopping = True
             self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
             errors: list[BaseException] = []
+            master_errors = self.master_message_worker.stop_worker()
+            if master_errors:
+                self.logger.warning("Master message worker did not stop before the deadline", extra={"event": "telegram_channel.master_message_shutdown_timeout"})
+                raise TelegramResourceShutdownError(master_errors)
             history_replay = getattr(self, "history_replay", None)
             history_errors = history_replay.stop() if history_replay is not None else ()
             if not self._resources_stopped:
                 self.rpc_utilities.shutdown()
-                self.master_message_worker.stop_worker()
                 try:
                     self.bot_manager.stop_channel_resources()
                 except TelegramResourceShutdownError as error:
