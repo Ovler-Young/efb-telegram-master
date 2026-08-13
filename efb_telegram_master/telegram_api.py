@@ -62,6 +62,7 @@ class TelegramAPI:
         self._delivery_stop_lock = threading.Lock()
         self._outbound_stopped = False
         self._membership_shutdown_started = False
+        self._membership_shutdown_complete = bot_pool is None
         self._delivery_resources_stopped = False
 
     def bind_metrics_server(self, metrics_server: "MetricsServer | None") -> None:
@@ -72,7 +73,7 @@ class TelegramAPI:
         with self._delivery_stop_lock:
             outbound_stopped = self._outbound_stopped
             metrics_server = self._metrics_server
-            membership_shutdown_started = self._membership_shutdown_started
+            membership_shutdown_complete = self._membership_shutdown_complete
             bot_pool = self.bot_pool
         errors: list[BaseException] = []
         if not outbound_stopped:
@@ -95,14 +96,16 @@ class TelegramAPI:
                 with self._delivery_stop_lock:
                     if self._metrics_server is metrics_server:
                         self._metrics_server = None
-        if bot_pool and not membership_shutdown_started:
+        if bot_pool and not membership_shutdown_complete:
             try:
-                bot_pool.begin_shutdown()
+                membership_errors = bot_pool.begin_shutdown()
             except BaseException as error:
-                errors.append(error)
-            else:
-                with self._delivery_stop_lock:
-                    self._membership_shutdown_started = True
+                membership_errors = (error,)
+            with self._delivery_stop_lock:
+                self._membership_shutdown_started = True
+                if not membership_errors:
+                    self._membership_shutdown_complete = True
+            errors.extend(membership_errors)
         return tuple(errors)
 
     def finish_delivery_shutdown(self, deadline: float) -> tuple[BaseException, ...]:
@@ -122,7 +125,7 @@ class TelegramAPI:
             except BaseException as error:
                 errors.append(error)
         with self._delivery_stop_lock:
-            delivery_complete = self._outbound_stopped and self._metrics_server is None
+            delivery_complete = self._outbound_stopped and self._metrics_server is None and self._membership_shutdown_complete
         if not errors and delivery_complete:
             with self._delivery_stop_lock:
                 self._delivery_resources_stopped = True

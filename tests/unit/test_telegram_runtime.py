@@ -313,6 +313,7 @@ def test_runtime_stop_timeout_is_retryable_without_shutting_down_the_async_runti
 
 def test_api_resource_shutdown_stops_metrics_server_under_its_current_owner() -> None:
     bot_pool = Mock()
+    bot_pool.begin_shutdown.return_value = ()
     bot_pool.wait_for_shutdown.return_value = ()
     api = TelegramAPI(SimpleNamespace(), Mock(), Mock(), bot_pool)
     metrics_server = Mock(thread=Mock(is_alive=Mock(return_value=False)))
@@ -332,6 +333,7 @@ def test_api_timeout_still_stops_other_delivery_resources() -> None:
     queue = Mock()
     queue.stop.side_effect = OutboundShutdownTimeout("blocked send")
     bot_pool = Mock()
+    bot_pool.begin_shutdown.return_value = ()
     bot_pool.wait_for_shutdown.return_value = ()
     api = TelegramAPI(SimpleNamespace(), Mock(), queue, bot_pool)
     metrics_server = Mock(thread=Mock(is_alive=Mock(return_value=False)))
@@ -428,6 +430,7 @@ def test_manager_uses_one_deadline_and_reports_outbound_and_membership_timeouts(
 
     queue.stop.side_effect = stop_until
     bot_pool = Mock()
+    bot_pool.begin_shutdown.return_value = ()
     bot_pool.wait_for_shutdown.return_value = (10,)
     api = TelegramAPI(SimpleNamespace(), Mock(), queue, bot_pool)
     manager = _manager(api, Mock())
@@ -712,6 +715,7 @@ def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_
     with (
         patch("efb_telegram_master.bot_manager.build_telegram_polling_runtime", return_value=runtime),
         patch("efb_telegram_master.bot_manager.build_bot_pool", return_value=None),
+        patch("efb_telegram_master.bot_manager.MsgLogScanScheduler", return_value=Mock(stop=Mock(return_value=()))),
         patch("efb_telegram_master.bot_manager.OutboundQueue") as queue_type,
         patch("efb_telegram_master.bot_manager.configure_runtime_metrics", return_value=(None, None)),
         patch.object(TelegramAPI, "begin_delivery_shutdown", return_value=(delivery_error,)) as begin_delivery,
@@ -737,6 +741,39 @@ def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_
     runtime.stop.assert_called_once()
     assert "Telegram delivery resource did not stop after initialization failed: delivery shutdown failed" in caplog.text
     assert "Failed to stop the Telegram runtime after initialization failed." in caplog.text
+
+
+def test_bot_manager_constructor_failure_stops_scans_before_the_runtime_bridge() -> None:
+    channel = SimpleNamespace(config={"admins": [1]}, db=Mock())
+    runtime = Mock(async_runtime=Mock(), bot=Mock())
+    runtime.add_base_dispatchers.side_effect = RuntimeError("dispatcher registration failed")
+    events: list[str] = []
+    runtime.stop.side_effect = lambda *_args: events.append("runtime")
+    scheduler = Mock()
+    scheduler.stop.side_effect = lambda *_args: events.append("scan") or ()
+
+    with (
+        patch("efb_telegram_master.bot_manager.build_telegram_polling_runtime", return_value=runtime),
+        patch("efb_telegram_master.bot_manager.build_bot_pool", return_value=None),
+        patch("efb_telegram_master.bot_manager.MsgLogScanScheduler", return_value=scheduler),
+        patch("efb_telegram_master.bot_manager.OutboundQueue"),
+        patch("efb_telegram_master.bot_manager.configure_runtime_metrics", return_value=(None, None)),
+    ):
+        with pytest.raises(RuntimeError, match="dispatcher registration failed"):
+            TelegramBotManager(
+                channel,
+                Mock(),
+                Mock(),
+                Mock(),
+                TelegramChannel.channel_id,
+                lambda: 0,
+                lambda: False,
+                lambda text: text,
+                lambda singular, _plural, _count: singular,
+                Mock(),
+            )
+
+    assert events == ["scan", "runtime"]
 
 
 def test_bot_manager_constructor_failure_exposes_retryable_cleanup_handle() -> None:
@@ -1155,6 +1192,36 @@ def test_channel_retries_delivery_shutdown_before_closing_database() -> None:
 
     channel.db.stop_worker.assert_called_once_with()
     assert channel.bot_manager.stop_channel_resources.call_count == 2
+
+
+def test_channel_withholds_database_close_until_partial_membership_shutdown_retries() -> None:
+    begin_error = RuntimeError("second auxiliary begin shutdown failed")
+    bot_pool = Mock()
+    bot_pool.begin_shutdown.side_effect = ((begin_error,), ())
+    bot_pool.wait_for_shutdown.side_effect = ((10,), ())
+    api = TelegramAPI(SimpleNamespace(), Mock(), Mock(), bot_pool)
+    manager = _manager(api, Mock())
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    channel.history_replay = Mock(stop=Mock(return_value=()))
+    channel.master_message_worker = Mock(stop_worker=Mock(return_value=()))
+    channel.bot_manager = manager
+    channel.db = Mock()
+
+    with pytest.raises(TelegramResourceShutdownError) as raised:
+        channel.stop_polling()
+
+    assert begin_error in raised.value.errors
+    assert any(isinstance(error, MembershipProbeShutdownTimeout) for error in raised.value.errors)
+    channel.db.stop_worker.assert_not_called()
+
+    channel.stop_polling()
+
+    channel.db.stop_worker.assert_called_once_with()
+    assert bot_pool.begin_shutdown.call_count == 2
+    assert bot_pool.wait_for_shutdown.call_count == 2
 
 
 def _manager(api: Mock, runtime: Mock) -> TelegramBotManager:

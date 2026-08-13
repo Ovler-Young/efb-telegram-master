@@ -121,22 +121,25 @@ class TelegramBotManager:
         deadline = time.monotonic() + self.SHUTDOWN_DRAIN_TIMEOUT + self.SHUTDOWN_JOIN_GRACE
         scheduler = getattr(self, "msglog_scan", None)
         cleanup_errors: list[BaseException] = []
+        scan_errors: list[BaseException] = []
         try:
             cleanup_errors.extend(self.api.begin_delivery_shutdown(deadline))
         except BaseException as error:
             cleanup_errors.append(error)
             self.logger.exception("Failed to begin Telegram delivery shutdown after initialization failed.")
-        try:
-            self.telegram_runtime.stop(deadline)
-        except BaseException as error:
-            cleanup_errors.append(error)
-            self.logger.exception("Failed to stop the Telegram runtime after initialization failed.")
         if scheduler is not None:
             try:
-                cleanup_errors.extend(scheduler.stop(max(0.0, deadline - time.monotonic())))
+                scan_errors.extend(scheduler.stop(max(0.0, deadline - time.monotonic())))
+            except BaseException as error:
+                scan_errors.append(error)
+                self.logger.exception("Failed to stop MsgLog ingestion after initialization failed.")
+        cleanup_errors.extend(scan_errors)
+        if not scan_errors:
+            try:
+                self.telegram_runtime.stop(deadline)
             except BaseException as error:
                 cleanup_errors.append(error)
-                self.logger.exception("Failed to stop MsgLog ingestion after initialization failed.")
+                self.logger.exception("Failed to stop the Telegram runtime after initialization failed.")
         try:
             cleanup_errors.extend(self.api.finish_delivery_shutdown(deadline))
         except BaseException as error:
@@ -300,18 +303,19 @@ class TelegramBotManager:
         self._stopping.set()
         self.logger.info("Stopping Telegram delivery resources", extra={"event": "telegram_bot.stop_started"})
         scheduler = getattr(self, "msglog_scan", None)
-        initial_scan_errors = scheduler.stop(0.0) if scheduler is not None else ()
         errors = list(self.api.begin_delivery_shutdown(deadline))
-        try:
-            self.telegram_runtime.stop(deadline)
-        except BaseException as error:
-            errors.append(error)
+        scan_errors: list[BaseException] = []
         if scheduler is not None:
-            final_scan_errors = scheduler.stop(max(0.0, deadline - time.monotonic()))
-            if final_scan_errors:
-                errors.extend(final_scan_errors)
-            elif initial_scan_errors:
-                self.logger.warning("MsgLog ingestion workers exited after runtime shutdown", extra={"event": "telegram_bot.msglog_scan_recovered"})
+            try:
+                scan_errors.extend(scheduler.stop(max(0.0, deadline - time.monotonic())))
+            except BaseException as error:
+                scan_errors.append(error)
+        errors.extend(scan_errors)
+        if not scan_errors:
+            try:
+                self.telegram_runtime.stop(deadline)
+            except BaseException as error:
+                errors.append(error)
         final_membership_errors = self.api.finish_delivery_shutdown(deadline)
         if final_membership_errors:
             errors.extend(final_membership_errors)

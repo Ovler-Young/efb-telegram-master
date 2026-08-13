@@ -180,12 +180,17 @@ class BotPool:
         if bot is not None:
             bot.update_membership(chat_id, False)
 
-    def begin_shutdown(self) -> None:
-        """Reject new membership probes and cancel work that has not started."""
+    def begin_shutdown(self) -> tuple[BaseException, ...]:
+        """Reject new membership probes, attempting every auxiliary even after a failure."""
         with self._lock:
             self._membership_stopping = True
+        errors: list[BaseException] = []
         for bot in self._bots:
-            bot.begin_membership_shutdown()
+            try:
+                bot.begin_membership_shutdown()
+            except BaseException as error:
+                errors.append(error)
+        return tuple(errors)
 
     def wait_for_shutdown(self, deadline: float) -> tuple[int, ...]:
         """Join membership workers until the caller-owned absolute deadline."""
@@ -198,11 +203,13 @@ class BotPool:
     def shutdown(self) -> None:
         """Stop membership workers within the five-second delivery shutdown budget."""
         deadline = time.monotonic() + 5.0
-        self.begin_shutdown()
+        errors = list(self.begin_shutdown())
         incomplete = self.wait_for_shutdown(deadline)
         if incomplete:
             joined = ", ".join(map(str, incomplete))
-            raise MembershipProbeShutdownTimeout(f"Auxiliary membership probes did not stop within 5 seconds for bot IDs: {joined}")
+            errors.append(MembershipProbeShutdownTimeout(f"Auxiliary membership probes did not stop within 5 seconds for bot IDs: {joined}"))
+        if errors:
+            raise errors[0]
 
     def auxiliary_count_snapshot(self) -> dict[str, int]:
         """Return configured auxiliary counts grouped by enabled state."""
