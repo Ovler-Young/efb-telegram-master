@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
@@ -295,7 +297,7 @@ class DatabaseManager:
             with source_database.atomic("IMMEDIATE"):
                 with source_database.bind_ctx(models):
                     cls._reject_legacy_outbound_source_data(source_database)
-                    yield cls._sqlite_source_snapshot(source_database, models)
+                    yield cls._sqlite_source_snapshot(source_database, models), source_database
         finally:
             source_database.close()
 
@@ -382,25 +384,41 @@ class DatabaseManager:
             )
 
     @staticmethod
-    def _finalize_sqlite_source(sqlite_path: Path) -> None:
+    def _create_sqlite_archive(source_database, archive_path: Path) -> None:
+        source_connection = sqlite3.connect(source_database.database)
+        archive_connection = sqlite3.connect(str(archive_path))
+        try:
+            source_connection.backup(archive_connection)
+            if archive_connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                raise RuntimeError("SQLite archive integrity check failed")
+        finally:
+            archive_connection.close()
+            source_connection.close()
+
+    @classmethod
+    def _finalize_sqlite_source(cls, source_database, sqlite_path: Path) -> None:
         migrated_path = sqlite_path.with_suffix(".db.migrated")
         if migrated_path.exists():
-            if os.path.samefile(sqlite_path, migrated_path):
-                sqlite_path.unlink()
-                return
             raise RuntimeError(
                 "SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; "
                 "preserving both files. Resolve the conflict before restarting."
             )
+        descriptor, archive_name = tempfile.mkstemp(prefix=f".{migrated_path.name}.", suffix=".tmp", dir=sqlite_path.parent)
+        os.close(descriptor)
+        archive_path = Path(archive_name)
         try:
-            os.link(sqlite_path, migrated_path)
-        except OSError as error:
+            cls._create_sqlite_archive(source_database, archive_path)
+            os.replace(archive_path, migrated_path)
+        except (OSError, RuntimeError, sqlite3.Error) as error:
             raise RuntimeError(f"SQLite-to-PostgreSQL migration finalization failed; source remains at {sqlite_path}") from error
-        sqlite_path.unlink()
+        finally:
+            archive_path.unlink(missing_ok=True)
+        for source_path in (sqlite_path, sqlite_path.with_name(f"{sqlite_path.name}-wal"), sqlite_path.with_name(f"{sqlite_path.name}-shm")):
+            source_path.unlink(missing_ok=True)
 
     def _finalize_completed_sqlite_import(self, sqlite_path: Path) -> None:
         models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
-        with self._sqlite_source_fence(sqlite_path, models) as snapshot:
+        with self._sqlite_source_fence(sqlite_path, models) as (snapshot, source_database):
             with database.obj.bind_ctx(models):
                 if not self._has_sqlite_import_provenance(snapshot):
                     raise RuntimeError(
@@ -412,7 +430,7 @@ class DatabaseManager:
                         "SQLite-to-PostgreSQL migration restart conflict: target data does not exactly match tgdata.db; "
                         "preserving the source. Resolve the target/source conflict before restarting."
                     )
-                self._finalize_sqlite_source(sqlite_path)
+                self._finalize_sqlite_source(source_database, sqlite_path)
         self.logger.info("SQLite-to-PostgreSQL migration source finalization completed; source renamed to %s", sqlite_path.with_suffix(".db.migrated"))
 
     def _migrate_from_sqlite(self, sqlite_path: Path, *, finalize_source: bool) -> None:
@@ -420,7 +438,7 @@ class DatabaseManager:
 
         self.logger.info("Detected existing SQLite database. Migrating to PostgreSQL.")
         models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
-        with self._sqlite_source_fence(sqlite_path, models) as snapshot:
+        with self._sqlite_source_fence(sqlite_path, models) as (snapshot, source_database):
             with database.obj.bind_ctx(models):
                 with database.atomic():
                     self._create()
@@ -433,7 +451,7 @@ class DatabaseManager:
                         raise RuntimeError("SQLite-to-PostgreSQL migration verification failed: target content differs from the source snapshot")
 
             if finalize_source:
-                self._finalize_sqlite_source(sqlite_path)
+                self._finalize_sqlite_source(source_database, sqlite_path)
         if finalize_source:
             self.logger.info("SQLite-to-PostgreSQL migration completed; source renamed to %s", sqlite_path.with_suffix(".db.migrated"))
         else:

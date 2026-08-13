@@ -1,4 +1,5 @@
 import pickle
+import sqlite3
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -38,6 +39,20 @@ def _create_historic_msglog_source(source_path):
         )
     finally:
         source_db.close()
+
+
+def _create_wal_historic_msglog_source(source_path):
+    source_db = SqliteDatabase(source_path, pragmas={"journal_mode": "wal"})
+    source_db.connect()
+    source_db.execute_sql(
+        "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, "
+        "slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
+    )
+    source_db.execute_sql(
+        "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) "
+        "VALUES ('1.1', 'wal-message', 'wal text', 'source-chat', 'Text', 'master')"
+    )
+    return source_db
 
 
 @contextmanager
@@ -278,7 +293,7 @@ def test_sqlite_source_fence_blocks_source_writes_until_import_finishes(tmp_path
     _create_historic_msglog_source(source_path)
 
     models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, db_module.MsgLogIngestionScan)
-    with DatabaseManager._sqlite_source_fence(source_path, models) as snapshot:
+    with DatabaseManager._sqlite_source_fence(source_path, models) as (snapshot, _source_database):
         writer = SqliteDatabase(source_path, pragmas={"busy_timeout": 1})
         writer.connect()
         try:
@@ -331,23 +346,80 @@ def test_postgresql_import_lifecycle_locks_before_target_preflight_and_unlocks_a
         database.initialize(original_database)
 
 
-def test_sqlite_source_finalization_preserves_conflicting_backup_and_failed_source(tmp_path, monkeypatch):
+def test_sqlite_import_finalization_archives_wal_content_without_source_sidecars(tmp_path):
     source_path = tmp_path / "tgdata.db"
-    source_path.write_bytes(b"source")
-    backup_path = source_path.with_suffix(".db.migrated")
-    backup_path.write_bytes(b"backup")
+    source_db = _create_wal_historic_msglog_source(source_path)
+    assert source_path.with_name("tgdata.db-wal").exists()
 
-    with pytest.raises(RuntimeError, match="finalization collision"):
-        DatabaseManager._finalize_sqlite_source(source_path)
-    assert source_path.read_bytes() == b"source"
-    assert backup_path.read_bytes() == b"backup"
+    try:
+        with _sqlite_import_target() as (manager, _target_db):
+            manager._migrate_from_sqlite(source_path, finalize_source=True)
 
-    backup_path.unlink()
-    monkeypatch.setattr(db_module.os, "link", lambda *_args: (_ for _ in ()).throw(OSError("link failed")))
-    with pytest.raises(RuntimeError, match="finalization failed"):
-        DatabaseManager._finalize_sqlite_source(source_path)
-    assert source_path.read_bytes() == b"source"
-    assert not backup_path.exists()
+        archive = SqliteDatabase(source_path.with_suffix(".db.migrated"))
+        archive.connect()
+        try:
+            assert archive.execute_sql("SELECT text FROM msglog WHERE master_msg_id = '1.1'").fetchone() == ("wal text",)
+        finally:
+            archive.close()
+    finally:
+        source_db.close()
+
+    assert not source_path.exists()
+    assert not source_path.with_name("tgdata.db-wal").exists()
+    assert not source_path.with_name("tgdata.db-shm").exists()
+
+
+def test_sqlite_import_recovery_finalization_archives_wal_content(tmp_path):
+    source_path = tmp_path / "tgdata.db"
+    source_db = _create_wal_historic_msglog_source(source_path)
+
+    try:
+        with _sqlite_import_target() as (manager, _target_db):
+            manager._migrate_from_sqlite(source_path, finalize_source=False)
+            manager._finalize_completed_sqlite_import(source_path)
+
+        archive = SqliteDatabase(source_path.with_suffix(".db.migrated"))
+        archive.connect()
+        try:
+            assert archive.execute_sql("SELECT text FROM msglog WHERE master_msg_id = '1.1'").fetchone() == ("wal text",)
+        finally:
+            archive.close()
+    finally:
+        source_db.close()
+
+    assert not source_path.exists()
+    assert not source_path.with_name("tgdata.db-wal").exists()
+    assert not source_path.with_name("tgdata.db-shm").exists()
+
+
+@pytest.mark.parametrize("failure", ["backup", "publish", "collision"])
+def test_sqlite_import_finalization_failure_retains_source_and_sidecars(tmp_path, monkeypatch, failure):
+    source_path = tmp_path / "tgdata.db"
+    source_db = _create_wal_historic_msglog_source(source_path)
+    assert source_path.with_name("tgdata.db-wal").exists()
+
+    migrated_path = source_path.with_suffix(".db.migrated")
+    if failure == "backup":
+        monkeypatch.setattr(DatabaseManager, "_create_sqlite_archive", staticmethod(lambda *_args: (_ for _ in ()).throw(sqlite3.Error("backup failed"))))
+    elif failure == "publish":
+        monkeypatch.setattr(db_module.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("publish failed")))
+    else:
+        migrated_path.write_bytes(b"existing archive")
+
+    expected_message = "finalization collision" if failure == "collision" else "finalization failed"
+    try:
+        with _sqlite_import_target() as (manager, _target_db):
+            with pytest.raises(RuntimeError, match=expected_message):
+                manager._migrate_from_sqlite(source_path, finalize_source=True)
+        assert source_path.exists()
+        assert source_path.with_name("tgdata.db-wal").exists()
+        assert source_path.with_name("tgdata.db-shm").exists()
+        if failure == "collision":
+            assert migrated_path.read_bytes() == b"existing archive"
+        else:
+            assert not migrated_path.exists()
+    finally:
+        source_db.close()
 
 
 def test_history_migration_entry_schema_retains_replay_columns_without_msglog_legacy_field():
