@@ -112,6 +112,7 @@ class ChatBindingManager(LocaleMixin):
         self._history_migration_thread: Optional[threading.Thread] = None
         self._msglog_ingestion_lock = threading.Lock()
         self._msglog_ingestion_threads: Dict[int, threading.Thread] = {}
+        self._msglog_ingestion_active_threads: set[threading.Thread] = set()
         self._msglog_ingestion_stop = threading.Event()
 
         # Link handler
@@ -1365,6 +1366,8 @@ class ChatBindingManager(LocaleMixin):
         if self._msglog_ingestion_stop.is_set() or not getattr(mtproto, "enabled", False) or not getattr(mtproto, "connected", False):
             return "unavailable"
         with self._msglog_ingestion_lock:
+            if self._msglog_ingestion_stop.is_set():
+                return "unavailable"
             existing = self._msglog_ingestion_threads.get(source_chat_id)
             if existing is not None and existing.is_alive():
                 return "already running"
@@ -1375,10 +1378,16 @@ class ChatBindingManager(LocaleMixin):
                 name=f"MsgLogIngestion-{source_chat_id}",
             )
             self._msglog_ingestion_threads[source_chat_id] = thread
+            self._msglog_ingestion_active_threads.add(thread)
             thread.start()
             return "started"
 
     def _run_msglog_ingestion(self, source_chat_id: int) -> None:
+        with self._msglog_ingestion_lock:
+            active_threads = getattr(self, "_msglog_ingestion_active_threads", None)
+            if active_threads is None:
+                active_threads = self._msglog_ingestion_active_threads = set()
+            active_threads.add(threading.current_thread())
         try:
             self.bot._runtime.call(MsgLogIngestionService(self.db, self.channel.mtproto, self._msglog_ingestion_stop.is_set).run(source_chat_id))
         except Exception:
@@ -1395,25 +1404,34 @@ class ChatBindingManager(LocaleMixin):
             return False
         with self._msglog_ingestion_lock:
             workers = list(self._msglog_ingestion_threads.values())
+        deadline = time.monotonic() + self.MSGLOG_INGESTION_JOIN_TIMEOUT
         for worker in workers:
             if worker.is_alive() and worker.ident != threading.get_ident():
-                worker.join(timeout=self.MSGLOG_INGESTION_JOIN_TIMEOUT)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                worker.join(timeout=remaining)
         return not any(worker.is_alive() for worker in workers)
 
     def close_database_after_msglog_ingestions(self, close_database: Callable[[], None]) -> None:
         """Schedule channel-owned cleanup when the final scan worker exits."""
         with self._msglog_ingestion_lock:
-            workers = tuple(self._msglog_ingestion_threads.values())
+            active_threads = getattr(self, "_msglog_ingestion_active_threads", None)
+            if active_threads is None:
+                active_threads = self._msglog_ingestion_active_threads = set()
+            active_threads.intersection_update({worker for worker in active_threads if worker.is_alive()})
+            workers = tuple(active_threads)
         if not any(worker.is_alive() for worker in workers):
             close_database()
             return
         threading.Thread(target=self._wait_for_msglog_ingestions_then_close, args=(workers, close_database), daemon=True, name="MsgLogIngestionShutdown").start()
 
-    @staticmethod
-    def _wait_for_msglog_ingestions_then_close(workers: Tuple[threading.Thread, ...], close_database: Callable[[], None]) -> None:
+    def _wait_for_msglog_ingestions_then_close(self, workers: Tuple[threading.Thread, ...], close_database: Callable[[], None]) -> None:
         for worker in workers:
             if worker is not threading.current_thread():
                 worker.join()
+        with self._msglog_ingestion_lock:
+            self._msglog_ingestion_active_threads.difference_update(workers)
         close_database()
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):

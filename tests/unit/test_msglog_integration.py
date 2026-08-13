@@ -46,6 +46,52 @@ def test_stop_msglog_ingestions_joins_active_workers():
     assert not worker.is_alive()
 
 
+def test_stop_msglog_ingestions_uses_one_deadline_for_all_workers(monkeypatch):
+    manager = object.__new__(ChatBindingManager)
+    manager._msglog_ingestion_lock = threading.Lock()
+    manager._msglog_ingestion_stop = threading.Event()
+    manager.MSGLOG_INGESTION_JOIN_TIMEOUT = 10.0
+    join_timeouts = []
+
+    class Worker:
+        ident = None
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout):
+            join_timeouts.append(timeout)
+
+    workers = [Worker(), Worker(), Worker()]
+    manager._msglog_ingestion_threads = dict(enumerate(workers))
+    monotonic_values = iter((100.0, 101.0, 104.0, 110.0))
+    monkeypatch.setattr(time, "monotonic", lambda: next(monotonic_values))
+
+    assert not ChatBindingManager.stop_msglog_ingestions(manager)
+    assert join_timeouts == [9.0, 6.0]
+
+
+def test_deferred_database_close_waits_for_worker_removed_from_mapping():
+    manager = object.__new__(ChatBindingManager)
+    manager._msglog_ingestion_lock = threading.Lock()
+    manager._msglog_ingestion_stop = threading.Event()
+    worker_may_exit = threading.Event()
+    database_closed = threading.Event()
+
+    worker = threading.Thread(target=worker_may_exit.wait, daemon=True)
+    manager._msglog_ingestion_threads = {}
+    manager._msglog_ingestion_active_threads = {worker}
+    worker.start()
+
+    ChatBindingManager.close_database_after_msglog_ingestions(manager, database_closed.set)
+    assert not database_closed.wait(timeout=0.05)
+
+    worker_may_exit.set()
+    assert database_closed.wait(timeout=1)
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+
 def test_channel_shutdown_defers_database_close_to_runtime_after_an_ingestion_worker_exits():
     manager = object.__new__(ChatBindingManager)
     manager._msglog_ingestion_lock = threading.Lock()
