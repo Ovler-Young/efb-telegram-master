@@ -1,5 +1,51 @@
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+from telegram import CallbackQuery, Chat, Message, Update, User
+
 from efb_telegram_master import utils
+from efb_telegram_master.bot_manager import TelegramBotManager
+from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
+from efb_telegram_master.constants import Flags
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+
+
+def _callback_update(user_id, chat_id, message_id, data):
+    user = User(user_id, "test", False)
+    message = Message(message_id, datetime.now(), Chat(chat_id, "group"), from_user=user)
+    callback = CallbackQuery("query", user, "instance", message=message, data=data)
+    return Update(1, callback_query=callback)
+
+
+def test_chat_binding_callbacks_reject_other_users_without_clearing_the_session():
+    manager = object.__new__(ChatBindingManager)
+    manager.bot = Mock()
+    manager.channel = SimpleNamespace(_=lambda text: text)
+    storage_id = (TelegramChatID(-100), TelegramMessageID(10))
+    manager.msg_storage = {storage_id: ChatListStorage([], owner_id=10)}
+
+    for handler, data, expected_state in (
+        (manager.link_chat_confirm, "chat 0", Flags.LINK_CONFIRM),
+        (manager.make_chat_head, "chat 0", Flags.CHAT_HEAD_CONFIRM),
+        (manager.suggested_recipient, "chat 0", Flags.SUGGEST_RECIPIENTS),
+    ):
+        assert handler(_callback_update(20, -100, 10, data), SimpleNamespace()) == expected_state
+        assert storage_id in manager.msg_storage
+
+    assert manager.bot.answer_callback_query.call_count == 3
+
+
+def test_bot_manager_identity_is_shared_with_polling_runtime():
+    manager = object.__new__(TelegramBotManager)
+    user = User(1, "test", True)
+    manager.telegram_runtime = SimpleNamespace(me=None)
+
+    assert manager.me is None
+
+    manager.me = user
+
+    assert manager.telegram_runtime.me is user
 
 
 def test_full_chat_pagination(channel, slave):
@@ -22,24 +68,17 @@ def test_source_chat_pagination(channel, slave):
 
 
 def test_chat_pagination_filters_groups_users_and_invalid_regex(channel, slave):
-    _, buttons = channel.chat_binding.slave_chats_pagination(
-        (TelegramChatID(0), TelegramMessageID(4)), pattern="wonderland"
-    )
+    _, buttons = channel.chat_binding.slave_chats_pagination((TelegramChatID(0), TelegramMessageID(4)), pattern="wonderland")
     names = [button.text for row in buttons[:-1] for button in row]
     assert names and all("Wonderland" in name for name in names)
 
-    for message_id, (pattern, chat_type) in enumerate(
-            (("type: group", "GroupChat"), ("type: private", "PrivateChat")), start=5):
-        _, buttons = channel.chat_binding.slave_chats_pagination(
-            (TelegramChatID(0), TelegramMessageID(message_id)), pattern=pattern
-        )
+    for message_id, (pattern, chat_type) in enumerate((("type: group", "GroupChat"), ("type: private", "PrivateChat")), start=5):
+        _, buttons = channel.chat_binding.slave_chats_pagination((TelegramChatID(0), TelegramMessageID(message_id)), pattern=pattern)
         names = [button.text for row in buttons[:-1] for button in row]
         expected = slave.get_chats_by_criteria(chat_type=chat_type)
         assert names and all(any(chat.display_name in name for chat in expected) for name in names)
 
-    _, buttons = channel.chat_binding.slave_chats_pagination(
-        (TelegramChatID(0), TelegramMessageID(7)), pattern="("
-    )
+    _, buttons = channel.chat_binding.slave_chats_pagination((TelegramChatID(0), TelegramMessageID(7)), pattern="(")
     assert len(buttons) == 1
 
 
@@ -51,5 +90,6 @@ def test_truncate_ellipsis(channel):
     truncated = truncate_ellipsis(long_text, 256)
     assert len(truncated) <= 256
     assert truncated.endswith("…")
+
 
 # All other methods are to be tested with integration testing.

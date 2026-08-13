@@ -1,9 +1,9 @@
 import re
-from queue import Empty
 
 import pytest
 
 from efb_telegram_master import utils
+
 from .helper.filters import in_chats, regex
 
 pytestmark = pytest.mark.asyncio
@@ -15,11 +15,7 @@ def get_message_thread_id(message):
         return message_thread_id
 
     reply_to = getattr(message, "reply_to", None)
-    return (
-        getattr(reply_to, "reply_to_top_id", None) or
-        getattr(reply_to, "reply_to_msg_id", None) or
-        getattr(message, "reply_to_msg_id", None)
-    )
+    return getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None) or getattr(message, "reply_to_msg_id", None)
 
 
 @pytest.fixture(scope="module")
@@ -40,8 +36,7 @@ async def helper(helper_wrap, slave_with_topic_group):
     yield helper_wrap
 
 
-async def test_slave_message_creates_topic_and_delivers(helper, slave_with_topic_group, bot_topic_group,
-                                                        channel_with_topic_group):
+async def test_slave_message_creates_topic_and_delivers(helper, slave_with_topic_group, bot_topic_group, channel_with_topic_group):
     chat = slave_with_topic_group.chat_with_alias
     sent = slave_with_topic_group.send_text_message(chat, chat.other)
 

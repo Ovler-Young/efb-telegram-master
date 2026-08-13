@@ -12,8 +12,7 @@ class MessageIdentifier(Protocol):
 
 
 class SupportsSendMessage(Protocol):
-    def send_message(self, chat_id: int, text: str, **kwargs: object) -> MessageIdentifier:
-        ...
+    def send_message(self, chat_id: int, text: str, **kwargs: object) -> MessageIdentifier: ...
 
 
 class _UpdateFilters:

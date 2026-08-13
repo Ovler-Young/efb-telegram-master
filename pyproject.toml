@@ -1,0 +1,5 @@
+[tool.ruff]
+line-length = 200
+
+[tool.ruff.lint]
+select = ["E9", "F", "I"]

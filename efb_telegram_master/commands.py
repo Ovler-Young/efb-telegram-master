@@ -1,16 +1,17 @@
 # coding=utf-8
 import html
 import logging
-from typing import Tuple, Dict, TYPE_CHECKING, List, Any, Union, Optional, cast
+from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Tuple, Union, cast
 
-from telegram import Message, Update
-from telegram.ext import CommandHandler, ConversationHandler, CallbackQueryHandler, MessageHandler, CallbackContext
-from telegram.ext._utils.types import ConversationDict
-
-from ehforwarderbot import coordinator, Channel, Middleware
+from ehforwarderbot import Channel, Middleware, coordinator
 from ehforwarderbot.channel import SlaveChannel
 from ehforwarderbot.message import MessageCommand
 from ehforwarderbot.types import ExtraCommandName
+from telegram import Message, Update
+from telegram.constants import ChatType
+from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler
+from telegram.ext._utils.types import ConversationDict
+
 from .constants import Flags
 from .locale_mixin import LocaleMixin
 from .ptb_compat import Filters
@@ -20,15 +21,15 @@ if TYPE_CHECKING:
 
 
 class ETMCommandMsgStorage:
-    def __init__(self, commands: List[MessageCommand], module: Union[Channel, Middleware],
-                 prefix: str, body: str):
+    def __init__(self, commands: List[MessageCommand], module: Union[Channel, Middleware], prefix: str, body: str):
         self.commands = commands
         self.module = module
         self.prefix = prefix
         self.body = body
+        self.authorized_user_ids: Collection[int] = ()
 
     def __str__(self):
-        return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r})"
+        return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r}, {self.authorized_user_ids!r})"
 
 
 class CommandsManager(LocaleMixin):
@@ -37,22 +38,15 @@ class CommandsManager(LocaleMixin):
     Additional features of slave channels.
     """
 
-    def __init__(self, channel: 'TelegramChannel'):
-        self.channel: 'TelegramChannel' = channel
+    def __init__(self, channel: "TelegramChannel"):
+        self.channel: "TelegramChannel" = channel
         self.bot = channel.bot_manager
         self.msg_storage: Dict[Tuple[int, int], ETMCommandMsgStorage] = dict()
         self.logger = logging.getLogger(__name__)
 
-        self.bot.dispatcher.add_handler(
-            CommandHandler("extra", self.bot.as_async_callback(self.extra_listing)))
-        self.bot.dispatcher.add_handler(
-            MessageHandler(
-                Filters.regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
-                self.bot.as_async_callback(self.extra_usage)))
-        self.bot.dispatcher.add_handler(
-            MessageHandler(
-                Filters.regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"),
-                self.bot.as_async_callback(self.extra_call)))
+        self.bot.dispatcher.add_handler(CommandHandler("extra", self.bot.as_async_callback(self.extra_listing)))
+        self.bot.dispatcher.add_handler(MessageHandler(Filters.regex(r"^/h_(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"), self.bot.as_async_callback(self.extra_usage)))
+        self.bot.dispatcher.add_handler(MessageHandler(Filters.regex(r"^/(?P<id>[0-9]+)_(?P<command>[a-z0-9_-]+)"), self.bot.as_async_callback(self.extra_call)))
 
         self.command_conv = ConversationHandler(
             entry_points=[],
@@ -60,18 +54,19 @@ class CommandsManager(LocaleMixin):
             fallbacks=[CallbackQueryHandler(self.bot.as_async_callback(self.bot.session_expired))],
             per_message=True,
             per_chat=True,
-            per_user=False
+            per_user=False,
         )
 
         self.bot.dispatcher.add_handler(self.command_conv)
 
-        self.modules_list: List[Any[SlaveChannel, Middleware]] = []
+        self.modules_list: List[Union[SlaveChannel, Middleware]] = []
         for i in sorted(coordinator.slaves.keys()):
             self.modules_list.append(coordinator.slaves[i])
         self.modules_list.extend(coordinator.middlewares)
 
     def register_command(self, message: Message, commands: ETMCommandMsgStorage):
         message_identifier = (message.chat.id, message.message_id)
+        commands.authorized_user_ids = frozenset((message.chat.id,) if message.chat.type == ChatType.PRIVATE else self.channel.config["admins"])
         conversations = getattr(self.command_conv, "_conversations", None)
         if conversations is None:
             conversations = getattr(self.command_conv, "conversations")
@@ -93,6 +88,7 @@ class CommandsManager(LocaleMixin):
         assert update.effective_chat
         assert update.effective_message
         assert update.callback_query
+        assert update.effective_user
 
         chat_id = update.effective_chat.id
         message_id = update.effective_message.message_id
@@ -101,6 +97,11 @@ class CommandsManager(LocaleMixin):
         assert callback
 
         index = (chat_id, message_id)
+        command_storage = self.msg_storage[index]
+
+        if update.callback_query.from_user.id != update.effective_user.id or update.effective_user.id not in command_storage.authorized_user_ids:
+            self.bot.answer_callback_query(callback_query_id=update.callback_query.id, text=self._("Session expired or unknown parameter. (SE02)"))
+            return Flags.COMMAND_PENDING
 
         if not callback.isdecimal():
             msg = self._("Invalid parameter: {0}. (CE01)").format(callback)
@@ -116,7 +117,6 @@ class CommandsManager(LocaleMixin):
             return ConversationHandler.END
 
         callback_idx = int(callback)
-        command_storage = self.msg_storage[index]
         module = command_storage.module
         command = command_storage.commands[callback_idx]
         prefix = command_storage.prefix
@@ -136,10 +136,12 @@ class CommandsManager(LocaleMixin):
                 module_id = module.channel_id
             elif isinstance(module, Middleware):
                 module_id = module.middleware_id
-            msg = self._command_fallback(*command.args,  # type: ignore
-                                         __channel_id=module_id,
-                                         __callable=command.callable_name,
-                                         **command.kwargs)
+            msg = self._command_fallback(
+                *command.args,  # type: ignore
+                __channel_id=module_id,
+                __callable=command.callable_name,
+                **command.kwargs,
+            )
         self.logger.debug("[%s.%s] Command execution outcome: %s", chat_id, message_id, msg)
         if msg is not None:
             self.msg_storage.pop(index, None)
@@ -149,7 +151,8 @@ class CommandsManager(LocaleMixin):
             self.bot.answer_callback_query(callback_query_id=update.callback_query.id)
             return None
         self.bot.answer_callback_query(
-            prefix=prefix, text=msg,
+            prefix=prefix,
+            text=msg,
             callback_query_id=update.callback_query.id,
             chat_id=update.effective_chat.id,
             message_id=update.effective_message.message_id,
@@ -167,18 +170,13 @@ class CommandsManager(LocaleMixin):
         msg = self._("<i>Click the link next to the name for usage.</i>\n")
         for idx, i in enumerate(self.modules_list):
             if isinstance(i, Channel):
-                msg += "\n\n<b>{0} {1}".format(
-                    html.escape(i.channel_emoji),
-                    html.escape(i.channel_name))
+                msg += "\n\n<b>{0} {1}".format(html.escape(i.channel_emoji), html.escape(i.channel_name))
                 if i.instance_id:
                     msg += " ({})".format(html.escape(i.instance_id))
                 msg += "</b>"
 
             elif isinstance(i, Middleware):
-                msg += "\n\n<b>{} ({})</b>".format(
-                    html.escape(i.middleware_name),
-                    html.escape(i.middleware_id)
-                )
+                msg += "\n\n<b>{} ({})</b>".format(html.escape(i.middleware_name), html.escape(i.middleware_id))
             else:
                 # This should not occur as modules_list shall
                 # consist of only Channel and Middleware instances
@@ -188,10 +186,7 @@ class CommandsManager(LocaleMixin):
                 for fn in extra_fns:
                     fn_name = f"/h_{idx}_{fn}"
                     # noinspection PyUnresolvedReferences
-                    msg += "\n- <b>{}</b> {}".format(
-                        html.escape(extra_fns[fn].name),
-                        html.escape(fn_name)
-                    )
+                    msg += "\n- <b>{}</b> {}".format(html.escape(cast(MessageCommand, extra_fns[fn]).name), html.escape(fn_name))
             else:
                 msg += "\n" + self._("No command found.")
         self.bot.send_message(update.effective_chat.id, msg, parse_mode="HTML")
@@ -202,29 +197,35 @@ class CommandsManager(LocaleMixin):
         assert update.effective_chat
 
         groupdict = context.match.groupdict()
-        if int(groupdict['id']) >= len(self.modules_list):
+        if int(groupdict["id"]) >= len(self.modules_list):
             return self.bot.reply_error(update, self._("Invalid module ID. (XC03)"))
 
-        channel = self.modules_list[int(groupdict['id'])]
+        channel = self.modules_list[int(groupdict["id"])]
         functions = channel.get_extra_functions()
 
-        if groupdict['command'] not in functions:
+        if groupdict["command"] not in functions:
             return self.bot.reply_error(update, self._("Command not found in selected module. (XC04)"))
 
-        command = getattr(channel, groupdict['command'])
+        command = cast(MessageCommand, getattr(channel, groupdict["command"]))
 
-        msg = "<b>{0} {1}".format(
-            html.escape(channel.channel_emoji),
-            html.escape(channel.channel_name))
-        if channel.instance_id:
-            msg += " ({})".format(html.escape(channel.instance_id))
-        msg += "</b>"
+        if isinstance(channel, Channel):
+            msg = "<b>{0} {1}".format(html.escape(channel.channel_emoji), html.escape(channel.channel_name))
+            if channel.instance_id:
+                msg += " ({})".format(html.escape(channel.instance_id))
+            msg += "</b>"
+        else:
+            msg = "<b>{0} ({1})</b>".format(
+                html.escape(channel.middleware_name),
+                html.escape(channel.middleware_id),
+            )
 
-        fn_name = "/%s_%s" % (groupdict['id'], groupdict['command'])
+        fn_name = "/%s_%s" % (groupdict["id"], groupdict["command"])
+        command_description = cast(str, getattr(command, "desc"))
         msg += "\n\n{} <b>({})</b>\n{}".format(
             html.escape(fn_name),
             html.escape(command.name),
-            html.escape(command.desc.format(function_name=fn_name)))
+            html.escape(command_description.format(function_name=fn_name)),
+        )
         self.bot.send_message(update.effective_chat.id, msg, parse_mode="HTML")
 
     def extra_call(self, update: Update, context: CallbackContext):
@@ -236,36 +237,31 @@ class CommandsManager(LocaleMixin):
         assert update.message
 
         groupdict = context.match.groupdict()
-        if int(groupdict['id']) >= len(coordinator.slaves):
+        if int(groupdict["id"]) >= len(coordinator.slaves):
             return self.bot.reply_error(update, self._("Invalid module ID. (XC01)"))
 
         slaves = coordinator.slaves
 
-        channel = slaves[sorted(slaves)[int(groupdict['id'])]]
+        channel = slaves[sorted(slaves)[int(groupdict["id"])]]
         functions = channel.get_extra_functions()
 
-        if groupdict['command'] not in functions:
+        if groupdict["command"] not in functions:
             return self.bot.reply_error(update, self._("Command not found in selected module. (XC02)"))
 
         # noinspection PyUnresolvedReferences
         header = "{} {}: {}\n-------\n".format(
-                channel.channel_emoji, channel.channel_name,
-                functions[groupdict['command']].name  # type: ignore
+            channel.channel_emoji,
+            channel.channel_name,
+            functions[groupdict["command"]].name,  # type: ignore
         )
-        msg = self.bot.send_message(update.message.chat.id,
-                                    prefix=header, text=self._("Please wait..."))
+        msg = self.bot.send_message(update.message.chat.id, prefix=header, text=self._("Please wait..."))
 
         assert update.message.text
-        result = functions[ExtraCommandName(groupdict['command'])](
-            " ".join(update.message.text.split(' ', 1)[1:]))
+        result = functions[ExtraCommandName(groupdict["command"])](" ".join(update.message.text.split(" ", 1)[1:]))
 
-        self.bot.edit_message_text(prefix=header, text=result,
-                                   chat_id=update.message.chat.id, message_id=msg.message_id)
+        self.bot.edit_message_text(prefix=header, text=result, chat_id=update.message.chat.id, message_id=msg.message_id)
 
     def _command_fallback(self, *args, __channel_id: str, __callable: str, **kwargs) -> str:
-        return self._("Error: Command is not found in the channel.\n"
-                      "Function: {channel_id}.{callable}\n"
-                      "Arguments: {args!r}\nKeyword Arguments: {kwargs!r}").format(channel_id=__channel_id,
-                                                                                   callable=__callable,
-                                                                                   args=args,
-                                                                                   kwargs=kwargs)
+        return self._("Error: Command is not found in the channel.\nFunction: {channel_id}.{callable}\nArguments: {args!r}\nKeyword Arguments: {kwargs!r}").format(
+            channel_id=__channel_id, callable=__callable, args=args, kwargs=kwargs
+        )

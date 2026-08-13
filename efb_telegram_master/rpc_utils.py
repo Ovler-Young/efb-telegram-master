@@ -1,5 +1,5 @@
 import threading
-from typing import TYPE_CHECKING, Optional, List
+from typing import TYPE_CHECKING, List, Optional
 from xmlrpc.server import SimpleXMLRPCRequestHandler, SimpleXMLRPCServer
 
 from ehforwarderbot import coordinator
@@ -13,22 +13,21 @@ class RPCUtilities:
 
     server: Optional[SimpleXMLRPCServer] = None
 
-    def __init__(self, channel: 'TelegramChannel'):
+    def __init__(self, channel: "TelegramChannel"):
         self.channel = channel
 
-        rpc_config = self.channel.config.get('rpc')
+        rpc_config = self.channel.config.get("rpc")
         if not rpc_config:
             return
 
         # Restrict to a particular path.
         class RequestHandler(SimpleXMLRPCRequestHandler):
-            rpc_paths = ('/', '/RPC2')
+            rpc_paths = ("/", "/RPC2")
 
-        server_addr = rpc_config['server']
-        port = rpc_config['port']
+        server_addr = rpc_config["server"]
+        port = rpc_config["port"]
 
-        self.server = SimpleXMLRPCServer((server_addr, port),
-                                         requestHandler=RequestHandler)
+        self.server = SimpleXMLRPCServer((server_addr, port), requestHandler=RequestHandler)
 
         self.server.register_introspection_functions()
         self.server.register_multicall_functions()

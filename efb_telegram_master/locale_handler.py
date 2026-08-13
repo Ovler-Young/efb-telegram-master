@@ -12,6 +12,7 @@ from .paths import LOCALE_DIR
 
 if TYPE_CHECKING:
     from telegram.ext import Application, CallbackContext
+
     from . import TelegramChannel
 
 
@@ -24,14 +25,14 @@ class LocaleHandler(BaseHandler):
     ``TelegramChannel.update_locale``.
     """
 
-    def __init__(self, channel: 'TelegramChannel'):
-        async def void_callback(update: Update, context: 'CallbackContext'):
+    def __init__(self, channel: "TelegramChannel"):
+        async def void_callback(update: Update, context: "CallbackContext"):
             return None
 
         super().__init__(void_callback, block=False)
         self.logger = logging.getLogger(__name__)
         self.channel = channel
-        self.auto_locale = self.channel.flag('auto_locale')
+        self.auto_locale = self.channel.flag("auto_locale")
 
     def check_update(self, update: object):
         if not self.auto_locale:
@@ -53,15 +54,18 @@ class LocaleHandler(BaseHandler):
             if tag.region:
                 locale += "_" + tag.region.format
         else:
-            locale = language_code.replace('-', '_')
-        self.logger.info("Updating locale to %s", locale)
+            locale = language_code.replace("-", "_")
+        self.logger.info(
+            "Telegram locale updated",
+            extra={"event": "telegram_channel.locale_updated", "locale": locale},
+        )
         self.channel.translator = gettext.translation(
             "efb_telegram_master",
             str(LOCALE_DIR),
-            languages=[locale, 'C'],
+            languages=[locale, "C"],
             fallback=True,
         )
         return False
 
-    async def handle_update(self, update: Update, application: 'Application', check_result: object, context: 'CallbackContext'):
+    async def handle_update(self, update: Update, application: "Application", check_result: object, context: "CallbackContext"):
         return None

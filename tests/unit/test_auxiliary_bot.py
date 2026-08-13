@@ -1,15 +1,13 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import pytest
 import telegram.error
 
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 
 
 def test_initialize_sets_identity():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls, \
-         patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
         bot = bot_cls.return_value
         bot.get_me = Mock(return_value=SimpleNamespace(id=123, username="auxbot"))
 
@@ -26,8 +24,7 @@ def test_initialize_uses_separate_validation_bot():
     primary_bot.get_me = Mock()
     validation_bot.get_me = Mock(return_value=SimpleNamespace(id=123, username="auxbot"))
 
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot", side_effect=[primary_bot, validation_bot]), \
-         patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot", side_effect=[primary_bot, validation_bot]):
         aux_bot = AuxiliaryBot("123:token")
         assert aux_bot.initialize() is True
         primary_bot.get_me.assert_not_called()
@@ -39,8 +36,7 @@ def test_local_mode_is_passed_to_primary_and_validation_bots():
     validation_bot = Mock()
     validation_bot.get_me = Mock(return_value=SimpleNamespace(id=123, username="auxbot"))
 
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot", side_effect=[primary_bot, validation_bot]) as bot_cls, \
-         patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot", side_effect=[primary_bot, validation_bot]) as bot_cls:
         aux_bot = AuxiliaryBot(
             "123:token",
             base_url="http://localhost:8081/bot",
@@ -54,8 +50,7 @@ def test_local_mode_is_passed_to_primary_and_validation_bots():
 
 
 def test_initialize_disables_bot_on_forbidden():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls, \
-         patch("efb_telegram_master.auxiliary_bot._resolve_bot_result", side_effect=lambda result, runtime: result):
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
         bot_cls.return_value.get_me = Mock(side_effect=telegram.error.Forbidden("bad token"))
         aux_bot = AuxiliaryBot("123:token")
         assert aux_bot.initialize() is False
@@ -94,8 +89,7 @@ def test_check_membership_tri_returns_unknown_while_refreshing_stale_entry():
     with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0):
         aux_bot.update_membership(2000, True)
 
-    with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), \
-         patch.object(aux_bot, "_start_membership_probe") as start_probe:
+    with patch("efb_telegram_master.auxiliary_bot.time.time", return_value=1000.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), patch.object(aux_bot, "_start_membership_probe") as start_probe:
         assert aux_bot.check_membership_tri(2000) is None
 
     start_probe.assert_called_once_with(2000)

@@ -7,12 +7,9 @@ import logging
 import threading
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from .auxiliary_bot import AuxiliaryBot
-
-if TYPE_CHECKING:
-    from .bot_manager import TelegramBotManager
 
 logger = logging.getLogger(__name__)
 
@@ -20,24 +17,11 @@ logger = logging.getLogger(__name__)
 class BotPool:
     """Keep auxiliary membership probes and best-effort slave affinity in memory."""
 
-    def __init__(self, aux_bots: list[AuxiliaryBot], bot_manager: 'TelegramBotManager') -> None:
+    def __init__(self, aux_bots: list[AuxiliaryBot]) -> None:
         self._bots = aux_bots
         self._bot_by_id = {bot.bot_id: bot for bot in aux_bots}
-        self._bot_manager = bot_manager
         self._lock = threading.Lock()
         self._preferred_sender_by_slave_id: dict[str, int] = {}
-        for bot in self._bots:
-            bot._membership_changed_callback = self._membership_changed
-
-    def _membership_changed(self, bot: AuxiliaryBot, chat_id: int, is_member: bool) -> None:
-        if not is_member:
-            self._bot_manager.remove_confirmed_non_member_affinity_for_sender_chat(
-                str(bot.bot_id), chat_id
-            )
-        scheduler = getattr(self._bot_manager, "_outbound_scheduler", None)
-        wake_event = getattr(scheduler, "wake_event", None)
-        if wake_event is not None:
-            wake_event.set()
 
     @property
     def bots(self) -> list[AuxiliaryBot]:
@@ -85,24 +69,8 @@ class BotPool:
         except (TypeError, ValueError):
             return
         with self._lock:
-            stale_slaves = [
-                slave_id
-                for slave_id, preferred_bot_id in self._preferred_sender_by_slave_id.items()
-                if preferred_bot_id == normalized_bot_id
-            ]
+            stale_slaves = [slave_id for slave_id, preferred_bot_id in self._preferred_sender_by_slave_id.items() if preferred_bot_id == normalized_bot_id]
             for slave_id in stale_slaves:
-                del self._preferred_sender_by_slave_id[slave_id]
-
-    def remove_failed_membership_affinity(self, slave_id: Optional[str], bot_id: str | int) -> None:
-        """Remove only the failed task's matching affinity entry."""
-        if slave_id is None:
-            return
-        try:
-            normalized_bot_id = int(bot_id)
-        except (TypeError, ValueError):
-            return
-        with self._lock:
-            if self._preferred_sender_by_slave_id.get(slave_id) == normalized_bot_id:
                 del self._preferred_sender_by_slave_id[slave_id]
 
     def disable_bot(self, bot_id: str | int) -> None:

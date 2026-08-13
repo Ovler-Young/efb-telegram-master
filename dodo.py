@@ -5,12 +5,26 @@ from pathlib import Path
 from doit.action import CmdAction
 
 PACKAGE = "efb_telegram_master"
+QUALITY_PATHS = [PACKAGE, "tests"]
 README_BASE = "./README.rst"
 DEFAULT_BUMP_MODE = "patch"
 # major, minor, patch, alpha, beta, dev, post
 DOIT_CONFIG = {
-    "default_tasks": ["msgfmt"]
+    "default_tasks": ["quality"]
 }
+
+
+def task_quality():
+    return {
+        "actions": [
+            ["ruff", "check", *QUALITY_PATHS],
+            ["ruff", "format", "--check", *QUALITY_PATHS],
+            ["pre-commit", "run", "check-yaml", "--all-files"],
+            ["pre-commit", "run", "rst-linter", "--all-files"],
+        ],
+        "file_dep": [".pre-commit-config.yaml", "pyproject.toml", README_BASE, "setup.py"],
+        "task_dep": ["mypy", "test"],
+    }
 
 
 def task_gettext():

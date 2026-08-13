@@ -14,9 +14,9 @@ exec(open(version_path).read())
 
 long_description = open('README.rst').read()
 
-tests_require = ["pytest", "telethon", "cryptg", "pytest-dotenv", "flaky",
+tests_require = ["pytest", "telethon>=1.44,<1.45", "cryptg", "pytest-dotenv", "flaky",
                  "pytest-asyncio", "mypy>=0.910", "pytest-html", "doit",
-                 "PySocks", "coverage", "sphinx"]
+                 "PySocks", "coverage", "sphinx", "pre-commit", "ruff==0.12.8"]
 
 setup(
     name='efb-telegram-master',
@@ -69,6 +69,7 @@ setup(
         "prometheus_client",
         "psutil>=5.9,<8",
         "pyrate-limiter>=3.9.0",
+        "telethon>=1.44,<1.45",
     ],
     extras_require={
         "tests": tests_require,

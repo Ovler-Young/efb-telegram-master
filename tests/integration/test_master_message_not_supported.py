@@ -4,10 +4,9 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from pytest import mark
-from telethon.tl.custom import Message, InlineResults
-from telethon.tl.functions.messages import GetStickerSetRequest, GetInlineBotResultsRequest
-from telethon.tl.types import InputStickerSetAnimatedEmoji, Document, PollAnswer, \
-    InputMediaPoll, Poll, TextWithEntities
+from telethon.tl.custom import InlineResults, Message
+from telethon.tl.functions.messages import GetInlineBotResultsRequest, GetStickerSetRequest
+from telethon.tl.types import Document, InputMediaPoll, InputStickerSetAnimatedEmoji, Poll, PollAnswer, TextWithEntities
 from telethon.tl.types.messages import StickerSet
 
 from .utils import link_chats
@@ -36,10 +35,7 @@ async def test_master_msg_game(helper, client, bot_group, slave, channel):
         # Not using client.inline_query as it does not support specifying chat to send queries
         game_bot = await client.get_input_entity("gamebot")
         input_group = await client.get_input_entity(bot_group)
-        bot_results: InlineResults = InlineResults(
-            client,
-            await client(GetInlineBotResultsRequest(game_bot, input_group, "", ""))
-        )
+        bot_results: InlineResults = InlineResults(client, await client(GetInlineBotResultsRequest(game_bot, input_group, "", "")))
         assert len(bot_results) > 1, "there should be games from @gamebot"
 
         slave.clear_messages()
@@ -49,20 +45,20 @@ async def test_master_msg_game(helper, client, bot_group, slave, channel):
         assert slave.messages.empty()
 
 
-def _build_poll(question: str, *answers: str, closed: Optional[bool] = None,
-                id: int = 0) -> InputMediaPoll:
+def _build_poll(question: str, *answers: str, closed: Optional[bool] = None, id: int = 0) -> InputMediaPoll:
     """Build a poll object.
     Message construction adapted from Pyrogram.
     https://github.com/pyrogram/pyrogram/blob/develop/pyrogram/client/methods/messages/send_poll.py
     https://github.com/pyrogram/pyrogram/blob/develop/pyrogram/client/methods/messages/stop_poll.py"""
-    return InputMediaPoll(Poll(
-        id=id, question=TextWithEntities(text=question, entities=[]), answers=[
-            PollAnswer(text=TextWithEntities(text=i, entities=[]), option=bytes([idx]))
-            for idx, i in enumerate(answers)
-        ],
-        closed=closed,
-        hash=0
-    ))
+    return InputMediaPoll(
+        Poll(
+            id=id,
+            question=TextWithEntities(text=question, entities=[]),
+            answers=[PollAnswer(text=TextWithEntities(text=i, entities=[]), option=bytes([idx])) for idx, i in enumerate(answers)],
+            closed=closed,
+            hash=0,
+        )
+    )
 
 
 async def test_master_msg_poll(helper, client, bot_group, slave, channel):
@@ -87,11 +83,8 @@ async def test_master_msg_poll(helper, client, bot_group, slave, channel):
 async def test_master_msg_slave_not_supported(helper, client, bot_group, slave, channel):
     chat = slave.chat_with_alias
 
-    with link_chats(channel, (chat,), bot_group), \
-         patch.multiple(slave, supported_message_types=set()):
+    with link_chats(channel, (chat,), bot_group), patch.multiple(slave, supported_message_types=set()):
         # Send poll
-        await client.send_message(
-            bot_group,
-            "test_master_msg_slave_not_supported this shall be “unsupported by slave channel”")
+        await client.send_message(bot_group, "test_master_msg_slave_not_supported this shall be “unsupported by slave channel”")
         content = await helper.wait_for_message_text()
         assert slave.channel_name in content

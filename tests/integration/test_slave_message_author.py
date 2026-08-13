@@ -10,8 +10,7 @@ pytestmark = mark.asyncio
 
 async def test_slave_message_author_external(helper, client, bot_group, slave, channel):
     chat = slave.chat_with_alias
-    author = chat.make_system_member(uid="member_from_middleware",
-                                     name="Middleware Member")
+    author = chat.make_system_member(uid="member_from_middleware", name="Middleware Member")
     author.module_id = "unknown.middleware"
     author.module_name = "Unknown middleware"
     author.channel_emoji = ""

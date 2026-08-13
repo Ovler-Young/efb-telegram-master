@@ -1,15 +1,12 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from ehforwarderbot import Message
 from telegram import Update
 
-from ehforwarderbot import Message
-from ehforwarderbot.types import ChatID
-
 from efb_telegram_master import utils
-from efb_telegram_master.chat_binding import ChatListStorage
 from efb_telegram_master.ptb_compat import sync_reply_text
-from efb_telegram_master.utils import TelegramChatID, TelegramTopicID, TelegramMessageID
+from efb_telegram_master.utils import TelegramChatID, TelegramTopicID
 
 
 class _ReadOnlyReplyMessage:
@@ -56,9 +53,11 @@ def test_get_slave_msg_dest_uses_topic_group(channel, slave):
     topic_group = TelegramChatID(30003)
     msg = _build_slave_message(slave)
 
-    with patch.object(channel.bot_manager, "get_chat_info", return_value=SimpleNamespace(is_forum=True)), \
-         patch.object(channel.chat_binding, "create_topic", return_value=TelegramTopicID(40004)) as create_topic, \
-         patch.object(channel, "topic_group", topic_group):
+    with (
+        patch.object(channel.bot_manager, "get_chat_info", return_value=SimpleNamespace(is_forum=True)),
+        patch.object(channel.chat_binding, "create_topic", return_value=TelegramTopicID(40004)) as create_topic,
+        patch.object(channel, "topic_group", topic_group),
+    ):
         _, (tg_dest, thread_id) = channel.slave_messages.get_slave_msg_dest(msg)
 
     assert tg_dest == topic_group

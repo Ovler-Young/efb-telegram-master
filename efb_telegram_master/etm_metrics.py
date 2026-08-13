@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from collections.abc import Callable, Iterable, Mapping
@@ -11,8 +12,7 @@ from typing import Any
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
-from .outbound import QUEUED_OPERATIONS
-
+from .outbound import QUEUED_OPERATIONS, OutboundQueue
 
 _PRIORITIES = frozenset({"blocking", "normal"})
 _SENDER_KINDS = frozenset({"main", "auxiliary"})
@@ -25,33 +25,64 @@ _AUXILIARY_STATES = frozenset({"enabled", "disabled"})
 _MEMBERSHIP_CACHE_STATES = frozenset({"member", "not_member", "unknown_probe_pending"})
 _MEMBERSHIP_PROBE_OUTCOMES = frozenset({"ok_member", "ok_not_member", "forbidden", "bad_request", "error"})
 _RATE_LIMIT_SCOPES = frozenset({"global", "chat"})
-_DATABASE_METHODS = frozenset({
-    "stop_worker",
-    "add_chat_assoc",
-    "remove_chat_assoc",
-    "get_master_msg_id",
-    "get_chat_assoc",
-    "add_topic_assoc",
-    "get_topic_thread_id",
-    "get_topic_slave",
-    "get_topic_slaves",
-    "remove_topic_assoc",
-    "add_or_update_message_log",
-    "get_msg_log",
-    "delete_msg_log",
-    "get_slave_chat_info",
-    "set_slave_chat_info",
-    "delete_slave_chat_info",
-    "get_recent_slave_chats",
-    "get_last_message",
-    "get_recent_messages",
-    "replace_history_migration_entries",
-    "has_pending_history_migrations",
-    "get_next_history_migration_target",
-    "get_history_migration_entries",
-    "delete_history_migration_entry",
-})
+_DATABASE_METHODS = frozenset(
+    {
+        "stop_worker",
+        "add_chat_assoc",
+        "remove_chat_assoc",
+        "get_master_msg_id",
+        "get_chat_assoc",
+        "add_topic_assoc",
+        "get_topic_thread_id",
+        "get_topic_slave",
+        "get_topic_slaves",
+        "remove_topic_assoc",
+        "add_or_update_message_log",
+        "get_msg_log",
+        "delete_msg_log",
+        "get_slave_chat_info",
+        "set_slave_chat_info",
+        "delete_slave_chat_info",
+        "get_recent_slave_chats",
+        "get_last_message",
+        "get_recent_messages",
+        "replace_history_migration_entries",
+        "has_pending_history_migrations",
+        "get_next_history_migration_target",
+        "get_history_migration_entries",
+        "delete_history_migration_entry",
+    }
+)
 _DATABASE_OUTCOMES = frozenset({"success", "failure"})
+
+
+def parse_metrics_config(metrics_cfg: object, logger: Any) -> tuple[int, tuple[str, int] | None]:
+    """Validate the optional Prometheus endpoint configuration."""
+    top_n = 20
+    if metrics_cfg is None:
+        return top_n, None
+    if not isinstance(metrics_cfg, Mapping):
+        logger.warning("Invalid metrics config type %s; Prometheus endpoint disabled.", type(metrics_cfg).__name__)
+        return top_n, None
+    try:
+        parsed_top_n = int(metrics_cfg.get("top_n", top_n))
+        if parsed_top_n < 0:
+            raise ValueError
+        top_n = parsed_top_n
+    except (TypeError, ValueError):
+        logger.warning("Invalid metrics top_n type %s; using default %d.", type(metrics_cfg.get("top_n")).__name__, top_n)
+    host = metrics_cfg.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host:
+        logger.warning("Invalid metrics host type %s; Prometheus endpoint disabled.", type(host).__name__)
+        return top_n, None
+    try:
+        port = int(metrics_cfg.get("port", 9101))
+        if not 0 <= port <= 65535:
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning("Invalid metrics port type %s; Prometheus endpoint disabled.", type(metrics_cfg.get("port")).__name__)
+        return top_n, None
+    return top_n, (host, port)
 
 
 @dataclass(frozen=True)
@@ -114,87 +145,28 @@ class Metrics:
         self.registry = CollectorRegistry()
         self.namespace = namespace
         self._collectors: list[_CallbackCollector] = []
-        self.enqueued = Counter(
+        self._logged_collector_failures: set[str] = set()
+        self.outbound_enqueued = Counter(
             f"{namespace}_outbound_enqueued_total",
-            "Queued rows whose insert transaction committed.",
+            "Outbound calls accepted by the in-memory queue.",
             ["priority", "operation"],
             registry=self.registry,
         )
-        self.queue_depth = Gauge(
+        self.outbound_queue_depth = Gauge(
             f"{namespace}_outbound_queue_depth",
-            "Absolute number of rows currently persisted in the outbound queue.",
+            "Outbound calls pending or in flight in the in-memory queue.",
             registry=self.registry,
         )
-        self.queue_residence = Histogram(
-            f"{namespace}_outbound_queue_residence_seconds",
-            "Seconds from enqueue until a known queue-row removal commit.",
-            ["priority", "operation", "outcome"],
-            registry=self.registry,
-        )
-        self.removals = Counter(
-            f"{namespace}_outbound_queue_removals_total",
-            "Queued rows whose removal transaction committed.",
-            ["priority", "operation", "outcome"],
-            registry=self.registry,
-        )
-        self.dequeued = Counter(
-            f"{namespace}_outbound_dequeued_total",
-            "Rows deleted before executor submission.",
-            ["priority", "operation"],
-            registry=self.registry,
-        )
-        self.dispatch_failures = Counter(
-            f"{namespace}_outbound_dispatch_failures_total",
-            "Executor submission failures after a queue-row deletion commit.",
-            ["priority", "operation"],
-            registry=self.registry,
-        )
-        self.in_flight = Gauge(
+        self.outbound_in_flight = Gauge(
             f"{namespace}_outbound_in_flight",
-            "Dequeued calls currently owned by the scheduler.",
+            "Outbound calls currently executing, by sender kind.",
             ["priority", "operation", "sender_kind"],
             registry=self.registry,
         )
-        self.completions = Counter(
+        self.outbound_completions = Counter(
             f"{namespace}_outbound_completions_total",
-            "Terminal outbound delivery outcomes.",
+            "Terminal outbound call results, by sender kind.",
             ["priority", "operation", "sender_kind", "outcome"],
-            registry=self.registry,
-        )
-        self.queue_dispatches = Counter(
-            f"{namespace}_outbound_queue_dispatches_total",
-            "Scheduler dispatch decisions by bounded outcome.",
-            ["outcome"],
-            registry=self.registry,
-        )
-        self.queue_wait = Histogram(
-            f"{namespace}_outbound_queue_wait_seconds",
-            "Seconds a queued call waits before a dispatch attempt.",
-            ["priority", "operation"],
-            registry=self.registry,
-        )
-        self.executor_attempt_duration = Histogram(
-            f"{namespace}_outbound_executor_attempt_duration_seconds",
-            "Seconds from executor submission until one attempt completes.",
-            ["priority", "operation", "outcome"],
-            registry=self.registry,
-        )
-        self.queue_lifetime = Histogram(
-            f"{namespace}_outbound_queue_lifetime_seconds",
-            "Seconds from enqueue until terminal completion.",
-            ["priority", "operation", "outcome"],
-            registry=self.registry,
-        )
-        self.retries = Counter(
-            f"{namespace}_outbound_retries_total",
-            "Queue retries by bounded reason.",
-            ["priority", "operation", "reason"],
-            registry=self.registry,
-        )
-        self.failures = Counter(
-            f"{namespace}_outbound_failures_total",
-            "Outbound failures by bounded stage.",
-            ["priority", "operation", "stage"],
             registry=self.registry,
         )
         self.membership_probes = Counter(
@@ -255,96 +227,33 @@ class Metrics:
             raise ValueError(f"{name} is invalid")
         return value
 
-    def record_enqueued(self, priority: str | bool | int, operation: str) -> None:
-        self.enqueued.labels(self._priority(priority), self._operation(operation)).inc()
+    def record_membership_probe(self, outcome: str) -> None:
+        self.membership_probes.labels(self._bounded(outcome, _MEMBERSHIP_PROBE_OUTCOMES, "membership probe outcome")).inc()
 
-    def set_queue_depth(self, depth: int) -> None:
-        self.queue_depth.set(self._count(depth, "queue depth"))
+    def record_outbound_enqueued(self, operation: str) -> None:
+        self.outbound_enqueued.labels("normal", self._operation(operation)).inc()
 
-    def record_removal(
-        self, priority: str | bool | int, operation: str, outcome: str, residence_seconds: float
-    ) -> None:
-        labels = (
-            self._priority(priority),
-            self._operation(operation),
-            self._bounded(outcome, _REMOVAL_OUTCOMES, "removal outcome"),
-        )
-        self.queue_residence.labels(*labels).observe(self._non_negative(residence_seconds, "queue residence"))
-        self.removals.labels(*labels).inc()
+    def set_outbound_queue_depth(self, depth: int) -> None:
+        self.outbound_queue_depth.set(self._count(depth, "outbound queue depth"))
 
-    def record_dequeued(self, priority: str | bool | int, operation: str) -> None:
-        self.dequeued.labels(self._priority(priority), self._operation(operation)).inc()
+    def increment_outbound_in_flight(self, operation: str, sender_kind: str) -> None:
+        self.outbound_in_flight.labels("normal", self._operation(operation), self._sender_kind(sender_kind)).inc()
 
-    def record_dispatch_failure(self, priority: str | bool | int, operation: str) -> None:
-        self.dispatch_failures.labels(self._priority(priority), self._operation(operation)).inc()
+    def decrement_outbound_in_flight(self, operation: str, sender_kind: str) -> None:
+        self.outbound_in_flight.labels("normal", self._operation(operation), self._sender_kind(sender_kind)).dec()
 
-    def increment_in_flight(self, priority: str | bool | int, operation: str, sender_kind: str) -> None:
-        self.in_flight.labels(
-            self._priority(priority), self._operation(operation), self._sender_kind(sender_kind)
-        ).inc()
-
-    def decrement_in_flight(self, priority: str | bool | int, operation: str, sender_kind: str) -> None:
-        self.in_flight.labels(
-            self._priority(priority), self._operation(operation), self._sender_kind(sender_kind)
-        ).dec()
-
-    def record_completion(
-        self, priority: str | bool | int, operation: str, sender_kind: str, outcome: str
-    ) -> None:
-        self.completions.labels(
-            self._priority(priority),
+    def record_outbound_completion(self, operation: str, sender_kind: str, outcome: str) -> None:
+        self.outbound_completions.labels(
+            "normal",
             self._operation(operation),
             self._sender_kind(sender_kind),
-            self._bounded(outcome, _COMPLETION_OUTCOMES, "completion outcome"),
-        ).inc()
-
-    def record_queue_dispatch(self, outcome: str) -> None:
-        self.queue_dispatches.labels(self._bounded(outcome, _DISPATCH_OUTCOMES, "dispatch outcome")).inc()
-
-    def record_queue_wait(self, priority: str | bool | int, operation: str, seconds: float) -> None:
-        self.queue_wait.labels(self._priority(priority), self._operation(operation)).observe(
-            self._non_negative(seconds, "queue wait")
-        )
-
-    def record_executor_attempt_duration(
-        self, priority: str | bool | int, operation: str, outcome: str, seconds: float
-    ) -> None:
-        self.executor_attempt_duration.labels(
-            self._priority(priority), self._operation(operation),
-            self._bounded(outcome, _COMPLETION_OUTCOMES, "completion outcome"),
-        ).observe(self._non_negative(seconds, "executor attempt duration"))
-
-    def record_queue_lifetime(
-        self, priority: str | bool | int, operation: str, outcome: str, seconds: float
-    ) -> None:
-        self.queue_lifetime.labels(
-            self._priority(priority), self._operation(operation),
-            self._bounded(outcome, _COMPLETION_OUTCOMES, "completion outcome"),
-        ).observe(self._non_negative(seconds, "queue lifetime"))
-
-    def record_retry(self, priority: str | bool | int, operation: str, reason: str) -> None:
-        self.retries.labels(
-            self._priority(priority), self._operation(operation),
-            self._bounded(reason, _RETRY_REASONS, "retry reason"),
-        ).inc()
-
-    def record_failure(self, priority: str | bool | int, operation: str, stage: str) -> None:
-        self.failures.labels(
-            self._priority(priority), self._operation(operation),
-            self._bounded(stage, _FAILURE_STAGES, "failure stage"),
-        ).inc()
-
-    def record_membership_probe(self, outcome: str) -> None:
-        self.membership_probes.labels(
-            self._bounded(outcome, _MEMBERSHIP_PROBE_OUTCOMES, "membership probe outcome")
+            self._bounded(outcome, _COMPLETION_OUTCOMES, "outbound completion outcome"),
         ).inc()
 
     def record_database_method_call(self, method: str, seconds: float, outcome: str) -> None:
         """Record one DatabaseManager call using only statically bounded method names."""
         labels = (self._bounded(method, _DATABASE_METHODS, "database method"),)
-        self.database_method_duration.labels(*labels).observe(
-            self._non_negative(seconds, "database method duration")
-        )
+        self.database_method_duration.labels(*labels).observe(self._non_negative(seconds, "database method duration"))
         if self._bounded(outcome, _DATABASE_OUTCOMES, "database method outcome") == "failure":
             self.database_method_failures.labels(*labels).inc()
 
@@ -356,6 +265,11 @@ class Metrics:
         collector = _CallbackCollector(collect)
         self.registry.register(collector)
         self._collectors.append(collector)
+
+    def _record_collector_failure(self, collector: str, error: Exception) -> None:
+        if collector not in self._logged_collector_failures:
+            self._logged_collector_failures.add(collector)
+            logging.getLogger(__name__).warning("Metrics collector %s failed (%s).", collector, type(error).__name__)
 
     def register_process_collector(
         self,
@@ -384,12 +298,13 @@ class Metrics:
 
         try:
             process = process_factory()
-        except Exception:
+        except Exception as error:
+            self._record_collector_failure("process_factory", error)
             return
         try:
             process.cpu_percent(interval=None)
-        except Exception:
-            pass
+        except Exception as error:
+            self._record_collector_failure("process_cpu_baseline", error)
 
         def collect() -> Iterable[Metric]:
             metrics: list[Metric] = []
@@ -402,8 +317,8 @@ class Metrics:
                 )
                 cpu.add_metric([], cpu_percent / 100)
                 metrics.append(cpu)
-            except Exception:
-                pass
+            except Exception as error:
+                self._record_collector_failure("process_cpu", error)
 
             try:
                 memory = process.memory_info()
@@ -414,8 +329,8 @@ class Metrics:
                 )
                 resident.add_metric([], resident_memory)
                 metrics.append(resident)
-            except Exception:
-                pass
+            except Exception as error:
+                self._record_collector_failure("process_memory", error)
 
             try:
                 disk = process.io_counters()
@@ -430,8 +345,8 @@ class Metrics:
                 )
                 disk_write.add_metric([], self._non_negative(disk.write_bytes, "process disk write bytes"))
                 metrics.extend((disk_read, disk_write))
-            except Exception:
-                pass
+            except Exception as error:
+                self._record_collector_failure("process_disk", error)
 
             if network_io_counters is not None:
                 try:
@@ -440,27 +355,21 @@ class Metrics:
                         f"{self.namespace}_host_network_receive_bytes_total",
                         "Cumulative network bytes received by the host.",
                     )
-                    network_receive.add_metric(
-                        [], self._non_negative(network_counters.bytes_recv, "host network received bytes")
-                    )
+                    network_receive.add_metric([], self._non_negative(network_counters.bytes_recv, "host network received bytes"))
                     network_transmit = CounterMetricFamily(
                         f"{self.namespace}_host_network_transmit_bytes_total",
                         "Cumulative network bytes transmitted by the host.",
                     )
-                    network_transmit.add_metric(
-                        [], self._non_negative(network_counters.bytes_sent, "host network transmitted bytes")
-                    )
+                    network_transmit.add_metric([], self._non_negative(network_counters.bytes_sent, "host network transmitted bytes"))
                     metrics.extend((network_receive, network_transmit))
-                except Exception:
-                    pass
+                except Exception as error:
+                    self._record_collector_failure("host_network", error)
 
             return tuple(metrics)
 
         self._register_collector(collect)
 
-    def register_destination_queue_collector(
-        self, snapshot: Callable[[], Iterable[DestinationQueueSnapshot]], top_n: int
-    ) -> None:
+    def register_destination_queue_collector(self, snapshot: Callable[[], Iterable[DestinationQueueSnapshot]], top_n: int) -> None:
         """Register a scrape-time top-N destination snapshot with no retained destination state."""
         cap = self._count(top_n, "destination top_n")
 
@@ -481,22 +390,31 @@ class Metrics:
                     raise ValueError("destination must be a non-empty string")
                 depth.add_metric([item.destination], self._count(item.depth, "destination depth"))
                 if item.oldest_age_seconds is not None:
-                    oldest.add_metric(
-                        [item.destination], self._non_negative(item.oldest_age_seconds, "destination oldest age")
-                    )
+                    oldest.add_metric([item.destination], self._non_negative(item.oldest_age_seconds, "destination oldest age"))
             return (depth, oldest)
 
         self._register_collector(collect)
 
+    def register_outbound_queue_collectors(self, queue: OutboundQueue, top_n: int) -> None:
+        """Register the outbound queue's bounded scrape snapshots."""
+
+        def destination_snapshot() -> Iterable[DestinationQueueSnapshot]:
+            return (DestinationQueueSnapshot(destination, depth, oldest_age) for destination, depth, oldest_age in queue.destination_snapshot())
+
+        def worker_snapshot() -> WorkerSnapshot:
+            healthy, in_flight = queue.worker_snapshot()
+            return WorkerSnapshot(healthy, in_flight)
+
+        self.register_destination_queue_collector(destination_snapshot, top_n)
+        self.register_worker_collector(worker_snapshot)
+        self.register_cooldown_collector(queue.cooldown_snapshot)
+
     def register_worker_collector(self, snapshot: Callable[[], WorkerSnapshot]) -> None:
         """Register aggregate worker liveness and in-flight state."""
+
         def collect() -> Iterable[GaugeMetricFamily]:
-            health = GaugeMetricFamily(
-                f"{self.namespace}_outbound_worker_healthy", "Whether the outbound worker is alive."
-            )
-            in_flight = GaugeMetricFamily(
-                f"{self.namespace}_outbound_worker_in_flight", "Calls currently owned by the outbound worker."
-            )
+            health = GaugeMetricFamily(f"{self.namespace}_outbound_worker_healthy", "Whether the outbound worker is alive.")
+            in_flight = GaugeMetricFamily(f"{self.namespace}_outbound_worker_in_flight", "Calls currently owned by the outbound worker.")
             value = snapshot()
             health.add_metric([], int(value.healthy))
             in_flight.add_metric([], self._count(value.in_flight, "worker in-flight"))
@@ -570,8 +488,9 @@ class Metrics:
 
 def start_metrics_server(host: str, port: int, registry: CollectorRegistry) -> MetricsServer:
     """Start a daemon WSGI serving thread and return its bounded-shutdown handle."""
-    from prometheus_client import make_wsgi_app
     from wsgiref.simple_server import WSGIRequestHandler, make_server
+
+    from prometheus_client import make_wsgi_app
 
     class QuietHandler(WSGIRequestHandler):
         def log_message(self, *_args: object) -> None:
@@ -580,4 +499,6 @@ def start_metrics_server(host: str, port: int, registry: CollectorRegistry) -> M
     server = make_server(host, port, make_wsgi_app(registry), handler_class=QuietHandler)
     thread = threading.Thread(target=server.serve_forever, name="ETM metrics server", daemon=True)
     thread.start()
-    return MetricsServer(server, thread)
+    metrics_server = MetricsServer(server, thread)
+    logging.getLogger(__name__).info("Metrics endpoint listening on %s", metrics_server.server_address)
+    return metrics_server

@@ -30,7 +30,7 @@ Bot API, ``python-telegram-bot``.
 Requirements
 ------------
 
--  Python >= 3.6
+-  Python >= 3.10
 -  EH Forwarder Bot >= 2.0.0
 -  ffmpeg
 -  libmagic
@@ -138,6 +138,20 @@ A sample config file can be as follows:
     #   max_connections: 8
     #   stale_timeout: 300
 
+    # [Read-only MTProto MsgLog ingestion]
+    # Required only for /sync_msglog in a bound forum group.
+    # mtproto:
+    #   enabled: true
+    #   api_id: 123456
+    #   api_hash: "your-api-hash"
+    #   scan_ceiling: 100000
+
+    # [Prometheus metrics endpoint]
+    # metrics:
+    #   host: 127.0.0.1
+    #   port: 9101
+    #   top_n: 20
+
     # [Experimental Flags]
     # This section can be used to toggle experimental functionality.
     # These features may be changed or removed at any time.
@@ -167,23 +181,6 @@ sample above) and install the optional dependency set:
 
     pip install "efb-telegram-master[postgresql]"
 
-On first startup with PostgreSQL enabled, ETM can automatically import data
-from an existing SQLite database (if present) and rename the old SQLite file
-to ``tgdata.db.migrated`` as a backup.
-
-Database migrations (what to expect)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-ETM performs basic database migrations automatically on startup.
-Notable additions in this branch include:
-
-- **Forum topics associations** (for ``topic_group``): ETM stores a mapping
-  between a forum group's chat ID + a topic thread ID (``message_thread_id``)
-  and the linked remote chat.
-- **`sender_bot_id` in message logs**: when auxiliary bots are enabled, ETM
-  records which bot token sent each Telegram message so future edits/deletes
-  can be routed to the correct bot.
-
 Optional: Auxiliary bots (higher throughput)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -197,9 +194,31 @@ Notes:
 - Each auxiliary bot must be **added to the target groups** to send messages
   there.
 - Tokens must be unique and must not duplicate the main ``token``.
-- Under heavy rate limiting, some outbound sends may be queued for delayed
-  execution; ETM will update message logs once the real Telegram message is
-  sent.
+
+Read-only MsgLog ingestion and metrics
+--------------------------------------
+
+``/sync_msglog`` is available only to configured ETM admins in a bound,
+forum-enabled group with at least one bound topic. It uses a request-only
+Telethon client to read the group's messages and write eligible mapped records
+to the local ``MsgLog``. It does not send, edit, delete, react to, or otherwise
+mutate remote Telegram messages.
+
+Set ``mtproto.enabled`` to ``true`` and supply a positive ``api_id`` plus a
+non-empty ``api_hash`` from `my.telegram.org`_. ETM authenticates Telethon with
+the configured bot token and stores its session at
+``<profile storage>/blueset.telegram/mtproto/bot.session``. Keep that session
+directory writable and protect it with the bot token and API credentials.
+
+.. _my.telegram.org: https://my.telegram.org
+
+Configure ``metrics`` to expose Prometheus metrics. ``port: 0`` asks the OS to
+select an available port; ETM logs the bound address when the server starts.
+With the sample configuration, inspect the endpoint with:
+
+.. code:: shell
+
+    curl http://127.0.0.1:9101/metrics
 
 Usage
 -----
@@ -261,24 +280,9 @@ from it.
 What happens after linking (new link vs relink)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When you link a remote chat to a Telegram destination, ETM may perform some
-post-link actions:
-
-- **First-time link**: ETM will try to backfill recent history to the newly
-  linked destination in the background (so the new group/topic has context).
-- **Relink**: ETM does not re-migrate history. Instead, it sends a link to the
-  previous conversation history message so you can jump back if needed.
-
-By default, ETM uses this behaviour automatically (backfill on first-time link,
-send a history link on relink). You can override it when using the manual
-``/start`` code:
-
-- ``/start <code>`` — default behaviour (auto).
-- ``/start <code> true`` — always backfill, even when relinking.
-- ``/start <code> false`` — never backfill (and skip the history-link message).
-
-If the background migration fails, ETM keeps the link and sends a short warning
-message.
+Use the manual linking code with ``/start <code> true`` to replay saved local
+database migration entries. Use ``/start <code> false`` to link without that
+replay.
 
 Forum topics mode (one topic per chat)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -777,7 +781,7 @@ RPC interface
 -------------
 
 A standard `Python XML RPC server`__ is implemented in ETM 2. It can be
-enabled by adding a ``rpc`` section in ETM’s ``config.yml`` file.
+enabled by adding a ``rpc`` section in ETM’s ``config.yaml`` file.
 
 __ https://docs.python.org/3/library/xmlrpc.html
 
@@ -811,7 +815,7 @@ documentation on xmlrpc`__.
 __ https://docs.python.org/3/library/xmlrpc.html
 
 .. _the db (database manager) class: https://etm.1a23.studio/blob/master/efb_telegram_master/db.py
-.. _the RPCUtilities class: https://etm.1a23.studio/blob/master/efb_telegram_master/rpc_utilities.py
+.. _the RPCUtilities class: https://etm.1a23.studio/blob/master/efb_telegram_master/rpc_utils.py
 
 Setup Webhook
 -------------
@@ -823,21 +827,12 @@ For details on how to setup a webhook, please visit this `wiki article`_.
 Development notes (CI and tooling)
 ----------------------------------
 
+- Run ``doit quality`` for the read-only YAML and README lint checks. CI runs
+  the same command after installing the ``tests`` extra.
 - **CI Python versions**: GitHub Actions workflows in this branch run tests on
   Python 3.10+ (and use Python 3.10 for Crowdin tasks).
 - **Pre-commit on Windows**: the local version bump hook is disabled in this
   branch as it is not compatible with Windows development environments.
-- **Media sending with local Bot API**: when ``local_tdlib_api`` is enabled,
-  ETM can copy files into a shared directory derived from ``api_base_file_url``
-  (when it is a ``file://`` URL) for better container/shared-filesystem
-  compatibility.
-- **Remote image URLs from slave channels**: for Telegram-specific delivery,
-  slave channels may set ``msg.vendor_specific["blueset.telegram.image_url"]``
-  on ``MsgType.Image`` messages to an HTTP(S) image URL. ETM will pass the URL
-  to Telegram for server-side download instead of requiring ``msg.file`` and
-  ``msg.path``. If Telegram cannot download the URL on first send, ETM sends
-  an editable placeholder media message so a later media edit can replace it
-  with a reachable URL.
 
 License
 -------
