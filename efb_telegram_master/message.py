@@ -99,7 +99,6 @@ class ETMMsg(Message):
         if self.file_id:
             # noinspection PyUnresolvedReferences
             bot_manager = coordinator.master.bot_manager
-            # Route get_file through the correct bot based on sender_bot_id.
             file_bot = None
             if self.sender_bot_id:
                 bot_pool = getattr(bot_manager, "bot_pool", None)

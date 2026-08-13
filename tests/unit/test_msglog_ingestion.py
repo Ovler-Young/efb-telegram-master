@@ -39,7 +39,6 @@ class _MTProto:
 
 def test_scan_persists_mapped_topic_messages_without_durable_scan_state():
     database = _Database()
-
     asyncio.run(MsgLogIngestionService(database, _MTProto()).run(100))
 
     assert database.persisted == [
