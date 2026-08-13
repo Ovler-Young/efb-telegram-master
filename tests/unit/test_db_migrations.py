@@ -71,6 +71,105 @@ def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, 
     assert (slave_info.slave_chat_name, slave_info.slave_chat_group_id) == ("Legacy chat", None)
 
 
+def test_historic_schema_migration_serializes_concurrent_sqlite_startups(tmp_path):
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        raw_db.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, "
+            "slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
+        )
+    finally:
+        raw_db.close()
+
+    ready = threading.Barrier(2)
+    errors = []
+
+    def migrate_schema():
+        connection = SqliteDatabase(database_path, pragmas={"busy_timeout": 5000})
+        connection.connect()
+        try:
+            ready.wait(5)
+            DatabaseManager._ensure_historic_schema_columns(connection)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            connection.close()
+
+    first = threading.Thread(target=migrate_schema)
+    second = threading.Thread(target=migrate_schema)
+    first.start()
+    second.start()
+    first.join(10)
+    second.join(10)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors
+    check_db = SqliteDatabase(database_path)
+    check_db.connect()
+    try:
+        assert {"file_id", "media_type", "mime", "master_msg_id_alt", "pickle", "file_unique_id", "sender_bot_id", "provenance"}.issubset(
+            {column.name for column in check_db.get_columns("msglog")}
+        )
+    finally:
+        check_db.close()
+
+
+def test_sqlite_import_rejects_nonempty_legacy_outbound_before_altering_target_or_source(tmp_path):
+    source_path = tmp_path / "tgdata.db"
+    source_db = SqliteDatabase(source_path)
+    source_db.connect()
+    try:
+        workflow, task = legacy_outbound_models(source_db)
+        source_db.create_tables([workflow, task])
+        workflow.create()
+        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
+    finally:
+        source_db.close()
+
+    original_database = database.obj
+    target_db = SqliteDatabase(":memory:")
+    database.initialize(target_db)
+    target_db.connect()
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    try:
+        with pytest.raises(RuntimeError, match="SQLite import source"):
+            manager._migrate_from_sqlite(source_path, finalize_source=True)
+        assert not set(target_db.get_tables())
+        source_db = SqliteDatabase(source_path)
+        source_db.connect()
+        try:
+            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(source_db.get_tables())
+            assert source_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
+            assert source_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
+        finally:
+            source_db.close()
+    finally:
+        target_db.close()
+        database.initialize(original_database)
+
+
+def test_sqlite_source_finalization_preserves_conflicting_backup_and_failed_source(tmp_path, monkeypatch):
+    source_path = tmp_path / "tgdata.db"
+    source_path.write_bytes(b"source")
+    backup_path = source_path.with_suffix(".db.migrated")
+    backup_path.write_bytes(b"backup")
+
+    with pytest.raises(RuntimeError, match="finalization collision"):
+        DatabaseManager._finalize_sqlite_source(source_path)
+    assert source_path.read_bytes() == b"source"
+    assert backup_path.read_bytes() == b"backup"
+
+    backup_path.unlink()
+    monkeypatch.setattr(db_module.os, "link", lambda *_args: (_ for _ in ()).throw(OSError("link failed")))
+    with pytest.raises(RuntimeError, match="finalization failed"):
+        DatabaseManager._finalize_sqlite_source(source_path)
+    assert source_path.read_bytes() == b"source"
+    assert not backup_path.exists()
+
+
 def test_history_migration_entry_schema_retains_replay_columns_without_msglog_legacy_field():
     test_db = SqliteDatabase(":memory:")
 

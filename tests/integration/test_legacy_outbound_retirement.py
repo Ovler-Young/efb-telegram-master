@@ -113,7 +113,7 @@ def test_postgresql_startup_preserves_non_empty_historical_outbound_tables(integ
 
 
 @pytest.mark.integration
-def test_postgresql_startup_imports_populated_sqlite_and_renames_source(integration_postgres_config, tmp_path, monkeypatch):
+def test_postgresql_startup_retries_sqlite_source_finalization_after_failure(integration_postgres_config, tmp_path, monkeypatch):
     admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
@@ -150,6 +150,13 @@ def test_postgresql_startup_imports_populated_sqlite_and_renames_source(integrat
         source_db.close()
         database_name, _target = _new_database(admin_db, integration_postgres_config)
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
+        original_link = db_module.os.link
+        monkeypatch.setattr(db_module.os, "link", lambda *_args: (_ for _ in ()).throw(OSError("finalization interrupted")))
+        with pytest.raises(RuntimeError, match="finalization failed"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-import", config=config))
+        assert source_path.exists()
+        assert not source_path.with_suffix(".db.migrated").exists()
+        monkeypatch.setattr(db_module.os, "link", original_link)
         manager = DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-import", config=config))
         assert ChatAssoc.select().count() == 1
         assert TopicAssoc.select().count() == 1

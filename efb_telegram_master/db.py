@@ -1,6 +1,7 @@
 # coding=utf-8
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -25,6 +26,7 @@ class DatabaseManager:
     logger = logging.getLogger(__name__)
     _LEGACY_OUTBOUND_TABLES = ("outboundworkflow", "outboundtask")
     _LEGACY_OUTBOUND_LOCK_KEY = 681_774_240_616_480_003
+    _HISTORIC_SCHEMA_LOCK_KEY = 681_774_240_616_480_002
     _LEGACY_OUTBOUND_COLUMNS = {
         "outboundworkflow": (
             ("id", "integer", False, True),
@@ -115,10 +117,22 @@ class DatabaseManager:
             connected = True
             self.logger.debug("Database loaded.")
             self.logger.debug("Checking database migration...")
-            if isinstance(actual_db, PostgresqlDatabase) and not ChatAssoc.table_exists():
+            if isinstance(actual_db, PostgresqlDatabase):
                 sqlite_path = base_path / "tgdata.db"
-                if sqlite_path.exists():
-                    self._migrate_from_sqlite(sqlite_path)
+                migrated_path = sqlite_path.with_suffix(".db.migrated")
+                target_initialized = ChatAssoc.table_exists()
+                if sqlite_path.exists() and migrated_path.exists() and not os.path.samefile(sqlite_path, migrated_path):
+                    raise RuntimeError(
+                        "SQLite-to-PostgreSQL migration finalization collision: both tgdata.db and tgdata.db.migrated exist with different contents; "
+                        "preserving both files. Resolve the conflict before restarting."
+                    )
+                if not target_initialized and sqlite_path.exists():
+                    self._migrate_from_sqlite(sqlite_path, finalize_source=True)
+                elif not target_initialized and migrated_path.exists():
+                    self._migrate_from_sqlite(migrated_path, finalize_source=False)
+                elif target_initialized and sqlite_path.exists():
+                    self._finalize_completed_sqlite_import(sqlite_path)
+                    self._create()
                 else:
                     self._create()
             else:
@@ -161,42 +175,40 @@ class DatabaseManager:
         elif not isinstance(current_database, PostgresqlDatabase):
             raise TypeError(f"Unsupported database backend: {type(current_database).__name__}")
 
-        table_names = set(current_database.get_tables())
-        migrator = SqliteMigrator(current_database) if isinstance(current_database, SqliteDatabase) else PostgresqlMigrator(current_database)
-        migration_steps: list[Operation] = []
-        if "msglog" in table_names:
-            msglog_columns = {column.name for column in current_database.get_columns("msglog")}
-            migration_steps.extend(
-                migrator.add_column("msglog", column_name, field)
-                for column_name, field in (
-                    ("file_id", MsgLog.file_id),
-                    ("media_type", MsgLog.media_type),
-                    ("mime", MsgLog.mime),
-                    ("master_msg_id_alt", MsgLog.master_msg_id_alt),
-                    ("pickle", MsgLog.pickle),
-                    ("file_unique_id", MsgLog.file_unique_id),
-                    ("sender_bot_id", MsgLog.sender_bot_id),
-                    ("provenance", MsgLog.provenance),
-                )
-                if column_name not in msglog_columns
-            )
-        if "slavechatinfo" in table_names:
-            slave_chat_info_columns = {column.name for column in current_database.get_columns("slavechatinfo")}
-            migration_steps.extend(
-                migrator.add_column("slavechatinfo", column_name, field)
-                for column_name, field in (
-                    ("pickle", SlaveChatInfo.pickle),
-                    ("slave_chat_group_id", SlaveChatInfo.slave_chat_group_id),
-                )
-                if column_name not in slave_chat_info_columns
-            )
-
-        if not migration_steps:
-            return
         with current_database.atomic(*transaction_arguments):
-            if isinstance(current_database, PostgresqlDatabase) and "msglog" in table_names:
-                current_database.execute_sql('LOCK TABLE "msglog" IN ACCESS EXCLUSIVE MODE')
-            migrate(*migration_steps)
+            if isinstance(current_database, PostgresqlDatabase):
+                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (DatabaseManager._HISTORIC_SCHEMA_LOCK_KEY,))
+            table_names = set(current_database.get_tables())
+            migrator = SqliteMigrator(current_database) if isinstance(current_database, SqliteDatabase) else PostgresqlMigrator(current_database)
+            migration_steps: list[Operation] = []
+            if "msglog" in table_names:
+                msglog_columns = {column.name for column in current_database.get_columns("msglog")}
+                migration_steps.extend(
+                    migrator.add_column("msglog", column_name, field)
+                    for column_name, field in (
+                        ("file_id", MsgLog.file_id),
+                        ("media_type", MsgLog.media_type),
+                        ("mime", MsgLog.mime),
+                        ("master_msg_id_alt", MsgLog.master_msg_id_alt),
+                        ("pickle", MsgLog.pickle),
+                        ("file_unique_id", MsgLog.file_unique_id),
+                        ("sender_bot_id", MsgLog.sender_bot_id),
+                        ("provenance", MsgLog.provenance),
+                    )
+                    if column_name not in msglog_columns
+                )
+            if "slavechatinfo" in table_names:
+                slave_chat_info_columns = {column.name for column in current_database.get_columns("slavechatinfo")}
+                migration_steps.extend(
+                    migrator.add_column("slavechatinfo", column_name, field)
+                    for column_name, field in (
+                        ("pickle", SlaveChatInfo.pickle),
+                        ("slave_chat_group_id", SlaveChatInfo.slave_chat_group_id),
+                    )
+                    if column_name not in slave_chat_info_columns
+                )
+            if migration_steps:
+                migrate(*migration_steps)
 
     @staticmethod
     def _sqlite_source_rows(source_database, model) -> list[dict]:
@@ -206,7 +218,65 @@ class DatabaseManager:
         fields = [field for field in model._meta.sorted_fields if field.column_name in source_columns]
         return list(model.select(*fields).dicts())
 
-    def _migrate_from_sqlite(self, sqlite_path: Path) -> None:
+    @classmethod
+    def _reject_legacy_outbound_source_data(cls, source_database) -> None:
+        table_names = set(source_database.get_tables())
+        legacy_table_names = cls._validate_legacy_outbound_schema(source_database, table_names)
+        row_counts = {
+            table_name: int(source_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
+            for table_name in legacy_table_names
+        }
+        if any(row_counts.values()):
+            raise RuntimeError(
+                "Legacy durable outbound data detected in SQLite import source: automatic replay is disabled. "
+                "Import aborted before target initialization or source migration; "
+                f"workflows={row_counts.get('outboundworkflow', 0)} tasks={row_counts.get('outboundtask', 0)}."
+            )
+
+    @staticmethod
+    def _finalize_sqlite_source(sqlite_path: Path) -> None:
+        migrated_path = sqlite_path.with_suffix(".db.migrated")
+        if migrated_path.exists():
+            if os.path.samefile(sqlite_path, migrated_path):
+                sqlite_path.unlink()
+                return
+            raise RuntimeError(
+                "SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; "
+                "preserving both files. Resolve the conflict before restarting."
+            )
+        try:
+            os.link(sqlite_path, migrated_path)
+        except OSError as error:
+            raise RuntimeError(f"SQLite-to-PostgreSQL migration finalization failed; source remains at {sqlite_path}") from error
+        sqlite_path.unlink()
+
+    @classmethod
+    def _sqlite_source_matches_target(cls, sqlite_path: Path, models: tuple[type[Model], ...]) -> bool:
+        source_database = SqliteDatabase(str(sqlite_path))
+        source_database.connect()
+        try:
+            with source_database.bind_ctx(models):
+                cls._reject_legacy_outbound_source_data(source_database)
+                source_rows = {model: cls._sqlite_source_rows(source_database, model) for model in models}
+        finally:
+            source_database.close()
+        for model in models:
+            target_rows = list(model.select().dicts())
+            if len(target_rows) != len(source_rows[model]) or sorted(map(repr, target_rows)) != sorted(map(repr, source_rows[model])):
+                return False
+        return True
+
+    def _finalize_completed_sqlite_import(self, sqlite_path: Path) -> None:
+        models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
+        if not self._sqlite_source_matches_target(sqlite_path, models):
+            raise RuntimeError(
+                "SQLite-to-PostgreSQL migration restart conflict: target data does not exactly match tgdata.db; "
+                "preserving the source. Resolve the target/source conflict before restarting."
+            )
+        self._finalize_sqlite_source(sqlite_path)
+        self.logger.info("SQLite-to-PostgreSQL migration source finalization completed; source renamed to %s", sqlite_path.with_suffix(".db.migrated"))
+
+    def _migrate_from_sqlite(self, sqlite_path: Path, *, finalize_source: bool) -> None:
         from peewee import chunked
 
         self.logger.info("Detected existing SQLite database. Migrating to PostgreSQL.")
@@ -215,8 +285,10 @@ class DatabaseManager:
         models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
         try:
             with source_database.bind_ctx(models):
-                self._ensure_historic_schema_columns(source_database)
-                source_rows = {model: self._sqlite_source_rows(source_database, model) for model in models}
+                with source_database.atomic("IMMEDIATE"):
+                    self._reject_legacy_outbound_source_data(source_database)
+                    self._ensure_historic_schema_columns(source_database)
+                    source_rows = {model: self._sqlite_source_rows(source_database, model) for model in models}
         finally:
             source_database.close()
 
@@ -229,9 +301,11 @@ class DatabaseManager:
                 if model.select().count() != len(rows):
                     raise RuntimeError(f"SQLite-to-PostgreSQL migration verification failed for {model._meta.table_name}")
 
-        migrated_path = sqlite_path.with_suffix(".db.migrated")
-        sqlite_path.rename(migrated_path)
-        self.logger.info("SQLite-to-PostgreSQL migration completed; source renamed to %s", migrated_path)
+        if finalize_source:
+            self._finalize_sqlite_source(sqlite_path)
+            self.logger.info("SQLite-to-PostgreSQL migration completed; source renamed to %s", sqlite_path.with_suffix(".db.migrated"))
+        else:
+            self.logger.info("SQLite-to-PostgreSQL migration completed from preserved source %s", sqlite_path)
 
     @staticmethod
     def _legacy_table_model(table_name: str, current_database) -> type[Model]:
