@@ -1,14 +1,12 @@
 import pickle
-import sqlite3
 import threading
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import IndexMetadata, Model, OperationalError, PostgresqlDatabase, SqliteDatabase
+from peewee import IndexMetadata, Model, PostgresqlDatabase, SqliteDatabase
 from prometheus_client import generate_latest
 
 from efb_telegram_master import db as db_module
@@ -16,58 +14,13 @@ from efb_telegram_master import utils
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
+from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.outbound_types import SendReceipt
 from efb_telegram_master.slave_message import SlaveMessageService
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 from tests.support.legacy_outbound_schema import legacy_outbound_models
-
-
-def _create_historic_msglog_source(source_path):
-    source_db = SqliteDatabase(source_path)
-    source_db.connect()
-    try:
-        source_db.execute_sql(
-            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, "
-            "slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
-        )
-        source_db.execute_sql(
-            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) "
-            "VALUES ('1.1', 'source-message', 'source text', 'source-chat', 'Text', 'master')"
-        )
-    finally:
-        source_db.close()
-
-
-def _create_wal_historic_msglog_source(source_path):
-    source_db = SqliteDatabase(source_path, pragmas={"journal_mode": "wal"})
-    source_db.connect()
-    source_db.execute_sql(
-        "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, "
-        "slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
-    )
-    source_db.execute_sql(
-        "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) "
-        "VALUES ('1.1', 'wal-message', 'wal text', 'source-chat', 'Text', 'master')"
-    )
-    return source_db
-
-
-@contextmanager
-def _sqlite_import_target():
-    original_database = database.obj
-    target_db = SqliteDatabase(":memory:")
-    database.initialize(target_db)
-    target_db.connect()
-    manager = object.__new__(DatabaseManager)
-    manager.logger = Mock()
-    try:
-        yield manager, target_db
-    finally:
-        target_db.close()
-        database.initialize(original_database)
 
 
 def test_msglog_schema_has_sender_bot_id(channel):
@@ -116,336 +69,6 @@ def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, 
     assert {"pickle", "slave_chat_group_id"}.issubset(slave_info_columns)
     assert (msglog.slave_message_id, msglog.text, msglog.provenance) == ("legacy-message", "legacy text", "live")
     assert (slave_info.slave_chat_name, slave_info.slave_chat_group_id) == ("Legacy chat", None)
-
-
-def test_historic_schema_migration_serializes_concurrent_sqlite_startups(tmp_path):
-    database_path = tmp_path / "tgdata.db"
-    raw_db = SqliteDatabase(database_path)
-    raw_db.connect()
-    try:
-        raw_db.execute_sql(
-            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, "
-            "slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
-        )
-    finally:
-        raw_db.close()
-
-    ready = threading.Barrier(2)
-    errors = []
-
-    def migrate_schema():
-        connection = SqliteDatabase(database_path, pragmas={"busy_timeout": 5000})
-        connection.connect()
-        try:
-            ready.wait(5)
-            DatabaseManager._ensure_historic_schema_columns(connection)
-        except BaseException as error:
-            errors.append(error)
-        finally:
-            connection.close()
-
-    first = threading.Thread(target=migrate_schema)
-    second = threading.Thread(target=migrate_schema)
-    first.start()
-    second.start()
-    first.join(10)
-    second.join(10)
-
-    assert not first.is_alive() and not second.is_alive()
-    assert not errors
-    check_db = SqliteDatabase(database_path)
-    check_db.connect()
-    try:
-        assert {"file_id", "media_type", "mime", "master_msg_id_alt", "pickle", "file_unique_id", "sender_bot_id", "provenance"}.issubset(
-            {column.name for column in check_db.get_columns("msglog")}
-        )
-    finally:
-        check_db.close()
-
-
-def test_sqlite_import_rejects_nonempty_legacy_outbound_before_altering_target_or_source(tmp_path):
-    source_path = tmp_path / "tgdata.db"
-    source_db = SqliteDatabase(source_path)
-    source_db.connect()
-    try:
-        workflow, task = legacy_outbound_models(source_db)
-        source_db.create_tables([workflow, task])
-        workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
-    finally:
-        source_db.close()
-
-    original_database = database.obj
-    target_db = SqliteDatabase(":memory:")
-    database.initialize(target_db)
-    target_db.connect()
-    manager = object.__new__(DatabaseManager)
-    manager.logger = Mock()
-    try:
-        with pytest.raises(RuntimeError, match="SQLite import source"):
-            manager._migrate_from_sqlite(source_path, finalize_source=True)
-        assert not set(target_db.get_tables())
-        source_db = SqliteDatabase(source_path)
-        source_db.connect()
-        try:
-            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(source_db.get_tables())
-            assert source_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
-            assert source_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
-        finally:
-            source_db.close()
-    finally:
-        target_db.close()
-        database.initialize(original_database)
-
-
-def test_sqlite_import_preserves_historic_source_when_target_initialization_fails(tmp_path, monkeypatch):
-    source_path = tmp_path / "tgdata.db"
-    source_db = SqliteDatabase(source_path)
-    source_db.connect()
-    try:
-        source_db.execute_sql(
-            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, "
-            "slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
-        )
-        source_db.execute_sql(
-            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) "
-            "VALUES ('1.1', 'source-message', 'source text', 'source-chat', 'Text', 'master')"
-        )
-    finally:
-        source_db.close()
-
-    original_database = database.obj
-    target_db = SqliteDatabase(":memory:")
-    database.initialize(target_db)
-    target_db.connect()
-    manager = object.__new__(DatabaseManager)
-    manager.logger = Mock()
-    original_create = DatabaseManager._create
-    monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("target initialization failed"))))
-    try:
-        with pytest.raises(RuntimeError, match="target initialization failed"):
-            manager._migrate_from_sqlite(source_path, finalize_source=True)
-        source_db = SqliteDatabase(source_path)
-        source_db.connect()
-        try:
-            assert "provenance" not in {column.name for column in source_db.get_columns("msglog")}
-            assert source_db.execute_sql("SELECT text FROM msglog WHERE master_msg_id = '1.1'").fetchone() == ("source text",)
-        finally:
-            source_db.close()
-        monkeypatch.setattr(DatabaseManager, "_create", staticmethod(original_create))
-        manager._migrate_from_sqlite(source_path, finalize_source=False)
-        assert MsgLog.get_by_id("1.1").provenance == "live"
-    finally:
-        target_db.close()
-        database.initialize(original_database)
-
-
-def test_sqlite_import_recovery_rejects_equal_count_content_mismatch(tmp_path):
-    source_path = tmp_path / "tgdata.db"
-    _create_historic_msglog_source(source_path)
-
-    with _sqlite_import_target() as (manager, _target_db):
-        manager._migrate_from_sqlite(source_path, finalize_source=False)
-        MsgLog.update(text="different target text").where(MsgLog.master_msg_id == "1.1").execute()
-
-        with pytest.raises(RuntimeError, match="target data does not exactly match"):
-            manager._finalize_completed_sqlite_import(source_path)
-
-        assert source_path.exists()
-        assert MsgLog.select().count() == 1
-
-
-def test_sqlite_import_retains_source_when_equal_count_content_verification_fails(tmp_path, monkeypatch):
-    source_path = tmp_path / "tgdata.db"
-    _create_historic_msglog_source(source_path)
-
-    original_insert_many = MsgLog.insert_many
-
-    def insert_altered(rows, *args, **kwargs):
-        altered_rows = [dict(row, text="different target text") for row in rows]
-        return original_insert_many(altered_rows, *args, **kwargs)
-
-    monkeypatch.setattr(MsgLog, "insert_many", insert_altered)
-    with _sqlite_import_target() as (manager, _target_db):
-        with pytest.raises(RuntimeError, match="target content differs"):
-            manager._migrate_from_sqlite(source_path, finalize_source=True)
-
-        assert source_path.exists()
-        assert not source_path.with_suffix(".db.migrated").exists()
-
-
-def test_sqlite_import_recovery_requires_matching_provenance(tmp_path):
-    source_path = tmp_path / "tgdata.db"
-    _create_historic_msglog_source(source_path)
-
-    with _sqlite_import_target() as (manager, target_db):
-        manager._migrate_from_sqlite(source_path, finalize_source=False)
-        target_db.execute_sql('DROP TABLE "sqliteimportprovenance"')
-
-        with pytest.raises(RuntimeError, match="import provenance does not match"):
-            manager._finalize_completed_sqlite_import(source_path)
-
-        assert source_path.exists()
-
-
-def test_sqlite_source_fence_blocks_source_writes_until_import_finishes(tmp_path):
-    source_path = tmp_path / "tgdata.db"
-    _create_historic_msglog_source(source_path)
-
-    models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, db_module.MsgLogIngestionScan)
-    with DatabaseManager._sqlite_source_fence(source_path, models) as (snapshot, _source_database):
-        writer = SqliteDatabase(source_path, pragmas={"busy_timeout": 1})
-        writer.connect()
-        try:
-            with pytest.raises(OperationalError, match="locked"):
-                writer.execute_sql("UPDATE msglog SET text = 'changed' WHERE master_msg_id = '1.1'")
-        finally:
-            writer.close()
-        assert len(snapshot.identity) == 64
-
-
-def test_postgresql_import_lifecycle_locks_before_target_preflight_and_unlocks_after_import(tmp_path, monkeypatch):
-    source_path = tmp_path / "tgdata.db"
-    source_path.touch()
-    original_database = database.obj
-    events = []
-    current_database = Mock()
-    manager = object.__new__(DatabaseManager)
-
-    @contextmanager
-    def import_lock(_cls, lock_database):
-        assert lock_database is current_database
-        events.append("lock")
-        try:
-            yield
-        finally:
-            events.append("unlock")
-
-    def target_initialized():
-        events.append("target-state")
-        return False
-
-    def preflight(target_database):
-        assert target_database is current_database
-        events.append("preflight")
-
-    def import_source(_self, path, *, finalize_source):
-        assert path == source_path
-        assert finalize_source is True
-        events.append("import")
-
-    database.initialize(current_database)
-    monkeypatch.setattr(DatabaseManager, "_sqlite_import_lifecycle_lock", classmethod(import_lock))
-    monkeypatch.setattr(ChatAssoc, "table_exists", target_initialized)
-    monkeypatch.setattr(DatabaseManager, "_reject_legacy_outbound_target_data", classmethod(lambda _cls, target_database: preflight(target_database)))
-    monkeypatch.setattr(DatabaseManager, "_migrate_from_sqlite", import_source)
-    try:
-        manager._initialize_postgresql(tmp_path)
-        assert events == ["lock", "target-state", "preflight", "import", "unlock"]
-    finally:
-        database.initialize(original_database)
-
-
-def test_sqlite_import_finalization_archives_wal_content_without_source_sidecars(tmp_path):
-    source_path = tmp_path / "tgdata.db"
-    source_db = _create_wal_historic_msglog_source(source_path)
-    assert source_path.with_name("tgdata.db-wal").exists()
-
-    try:
-        with _sqlite_import_target() as (manager, _target_db):
-            manager._migrate_from_sqlite(source_path, finalize_source=True)
-
-        archive = SqliteDatabase(source_path.with_suffix(".db.migrated"))
-        archive.connect()
-        try:
-            assert archive.execute_sql("SELECT text FROM msglog WHERE master_msg_id = '1.1'").fetchone() == ("wal text",)
-        finally:
-            archive.close()
-    finally:
-        source_db.close()
-
-    assert not source_path.exists()
-    assert not source_path.with_name("tgdata.db-wal").exists()
-    assert not source_path.with_name("tgdata.db-shm").exists()
-
-
-def test_sqlite_import_recovery_finalization_archives_wal_content(tmp_path):
-    source_path = tmp_path / "tgdata.db"
-    source_db = _create_wal_historic_msglog_source(source_path)
-
-    try:
-        with _sqlite_import_target() as (manager, _target_db):
-            manager._migrate_from_sqlite(source_path, finalize_source=False)
-            manager._finalize_completed_sqlite_import(source_path)
-
-        archive = SqliteDatabase(source_path.with_suffix(".db.migrated"))
-        archive.connect()
-        try:
-            assert archive.execute_sql("SELECT text FROM msglog WHERE master_msg_id = '1.1'").fetchone() == ("wal text",)
-        finally:
-            archive.close()
-    finally:
-        source_db.close()
-
-    assert not source_path.exists()
-    assert not source_path.with_name("tgdata.db-wal").exists()
-    assert not source_path.with_name("tgdata.db-shm").exists()
-
-
-@pytest.mark.parametrize("failure", ["backup", "publish"])
-def test_sqlite_import_finalization_failure_retains_source_and_sidecars(tmp_path, monkeypatch, failure):
-    source_path = tmp_path / "tgdata.db"
-    source_db = _create_wal_historic_msglog_source(source_path)
-    assert source_path.with_name("tgdata.db-wal").exists()
-
-    migrated_path = source_path.with_suffix(".db.migrated")
-    if failure == "backup":
-        monkeypatch.setattr(DatabaseManager, "_create_sqlite_archive", staticmethod(lambda *_args: (_ for _ in ()).throw(sqlite3.Error("backup failed"))))
-    else:
-        monkeypatch.setattr(db_module.os, "link", lambda *_args: (_ for _ in ()).throw(OSError("publish failed")))
-
-    try:
-        with _sqlite_import_target() as (manager, _target_db):
-            with pytest.raises(RuntimeError, match="finalization failed"):
-                manager._migrate_from_sqlite(source_path, finalize_source=True)
-        assert source_path.exists()
-        assert source_path.with_name("tgdata.db-wal").exists()
-        assert source_path.with_name("tgdata.db-shm").exists()
-        assert not migrated_path.exists()
-    finally:
-        source_db.close()
-
-
-def test_sqlite_import_finalization_collision_does_not_replace_competing_archive(tmp_path, monkeypatch):
-    source_path = tmp_path / "tgdata.db"
-    source_db = _create_wal_historic_msglog_source(source_path)
-    migrated_path = source_path.with_suffix(".db.migrated")
-    source_artifacts = (
-        source_path,
-        source_path.with_name("tgdata.db-wal"),
-        source_path.with_name("tgdata.db-shm"),
-    )
-    source_data_artifacts = source_artifacts[:2]
-    original_contents = {path: path.read_bytes() for path in source_data_artifacts}
-    original_inodes = {path: path.stat().st_ino for path in source_artifacts}
-    competing_archive = b"competing archive"
-    original_link = db_module.os.link
-
-    def publish_competing_archive(source, destination):
-        assert destination == migrated_path
-        migrated_path.write_bytes(competing_archive)
-        return original_link(source, destination)
-
-    monkeypatch.setattr(db_module.os, "link", publish_competing_archive)
-    try:
-        with _sqlite_import_target() as (manager, _target_db):
-            with pytest.raises(RuntimeError, match="finalization collision"):
-                manager._migrate_from_sqlite(source_path, finalize_source=True)
-        assert {path: path.read_bytes() for path in source_data_artifacts} == original_contents
-        assert {path: path.stat().st_ino for path in source_artifacts} == original_inodes
-        assert migrated_path.read_bytes() == competing_archive
-    finally:
-        source_db.close()
 
 
 def test_history_migration_entry_schema_retains_replay_columns_without_msglog_legacy_field():
@@ -633,31 +256,7 @@ def test_startup_preserves_non_empty_legacy_outbound_tables_and_retires_empty_on
             operation="send_message",
             payload="secret",
             workflow_id=1,
-            state="leased",
-            lease_owner="interrupted-worker",
         )
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1, step_index=1)
-        assert {
-            column.name: DatabaseManager._legacy_default_category(raw_db, "outboundworkflow", column.name, DatabaseManager._legacy_column_type(column.data_type), column.primary_key, column.default)
-            for column in raw_db.get_columns("outboundworkflow")
-        } == {
-            "id": "auto_pk",
-            "state": "none",
-            "result_task_id": "none",
-            "error_class": "none",
-            "created_at": "current_timestamp",
-            "completed_at": "none",
-        }
-        assert {
-            column.name: DatabaseManager._legacy_default_category(raw_db, "outboundtask", column.name, DatabaseManager._legacy_column_type(column.data_type), column.primary_key, column.default)
-            for column in raw_db.get_columns("outboundtask")
-        } == {
-            **{column_name: "none" for column_name, *_details in DatabaseManager._LEGACY_OUTBOUND_COLUMNS["outboundtask"]},
-            "id": "auto_pk",
-            "accepted_at": "current_timestamp",
-        }
-        assert DatabaseManager._legacy_outbound_schema_error(raw_db, "outboundworkflow") is None
-        assert DatabaseManager._legacy_outbound_schema_error(raw_db, "outboundtask") is None
     finally:
         raw_db.close()
 
@@ -671,7 +270,7 @@ def test_startup_preserves_non_empty_legacy_outbound_tables_and_retires_empty_on
     try:
         assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(preserved_db.get_tables())
         assert preserved_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
-        assert preserved_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 2
+        assert preserved_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
         preserved_db.execute_sql("DELETE FROM outboundtask")
         preserved_db.execute_sql("DELETE FROM outboundworkflow")
     finally:

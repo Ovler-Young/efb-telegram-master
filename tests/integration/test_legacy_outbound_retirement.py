@@ -32,11 +32,13 @@ def _drop_database(admin_db, database_name):
 
 
 @pytest.mark.integration
-def test_postgresql_startup_preserves_non_empty_historical_outbound_tables(integration_postgres_config, tmp_path, monkeypatch):
+def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgres_config, tmp_path, monkeypatch, caplog):
     admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
     original_database = database.obj
+    first_manager = None
+    second_manager = None
     database_name = None
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
@@ -93,38 +95,25 @@ def test_postgresql_startup_preserves_non_empty_historical_outbound_tables(integ
         assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundtask") is None
         legacy_db.close()
 
-        source_path = tmp_path / "tgdata.db"
-        source_db = SqliteDatabase(source_path)
-        source_db.connect()
-        try:
-            source_db.execute_sql("CREATE TABLE import_probe (value TEXT NOT NULL)")
-            source_db.execute_sql("INSERT INTO import_probe (value) VALUES ('preserve source')")
-        finally:
-            source_db.close()
-
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
-        with pytest.raises(RuntimeError, match="automatic replay is disabled"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
-        assert database.is_closed()
-        source_db = SqliteDatabase(source_path)
-        source_db.connect()
-        try:
-            assert source_db.execute_sql("SELECT value FROM import_probe").fetchone() == ("preserve source",)
-        finally:
-            source_db.close()
-        check_db = PostgresqlDatabase(database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"})
-        check_db.connect()
-        try:
-            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(check_db.get_tables())
-            assert check_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
-            assert check_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
-        finally:
-            check_db.close()
+        with caplog.at_level("WARNING", logger="efb_telegram_master.db"):
+            first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
+        table_names = set(database.get_tables())
+        assert not set(DatabaseManager._LEGACY_OUTBOUND_TABLES) & table_names
+        assert {"chatassoc", "msglog", "historymigrationentry", "msglogingestionscan"}.issubset(table_names)
+        first_manager.stop_worker()
+        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
     finally:
+        if second_manager is not None:
+            second_manager.stop_worker()
+        elif first_manager is not None:
+            first_manager.stop_worker()
         database.initialize(original_database)
         if database_name is not None:
             _drop_database(admin_db, database_name)
         admin_db.close()
+
+    assert "Discarding obsolete durable outbound queue rows without resumption: workflows=1 tasks=1" in caplog.text
 
 
 @pytest.mark.integration
@@ -225,6 +214,8 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
         legacy_db.connect()
         workflow, task = legacy_outbound_models(legacy_db)
         legacy_db.create_tables([workflow, task])
+        workflow.create()
+        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
         legacy_db.close()
         patch.setattr(DatabaseManager, "_validate_legacy_outbound_schema", classmethod(wait_after_first_lock))
         first = threading.Thread(target=retire)
@@ -272,12 +263,14 @@ def test_postgresql_retirement_rolls_back_when_workflow_drop_fails(integration_p
         legacy_db.connect()
         workflow, task = legacy_outbound_models(legacy_db)
         legacy_db.create_tables([workflow, task])
+        workflow.create()
+        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
         monkeypatch.setattr(PostgresqlDatabase, "drop_tables", fail_workflow_drop)
         with pytest.raises(RuntimeError, match="workflow drop failed"):
             DatabaseManager._retire_legacy_outbound_tables_for_database(legacy_db)
         assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(legacy_db.get_tables())
-        assert workflow.select().count() == 0
-        assert task.select().count() == 0
+        assert workflow.select().count() == 1
+        assert task.select().count() == 1
         assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundtask") is None
         legacy_db.close()
     finally:
