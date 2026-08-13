@@ -3,6 +3,7 @@
 import datetime
 import logging
 import pickle
+import re
 import time
 from contextlib import suppress
 from functools import partial, wraps
@@ -289,17 +290,56 @@ class DatabaseManager:
             ("updated_at", "datetime", False, False),
         }
     )
-    _LEGACY_OUTBOUND_TABLES = ("outbound_workflow", "outbound_task")
-    _LEGACY_OUTBOUND_STATES = (
-        "waiting_dependency",
-        "queued",
-        "leased",
-        "in_flight",
-        "sent_pending_log",
-        "completed",
-        "skipped",
-        "dead",
+    _LEGACY_OUTBOUND_TABLES = ("outboundworkflow", "outboundtask")
+    _LEGACY_OUTBOUND_LOCK_KEY = 681_774_240_616_480_003
+    _LEGACY_OUTBOUND_COLUMNS = {
+        "outboundworkflow": (
+            ("id", "integer", False, True),
+            ("state", "text", False, False),
+            ("result_task_id", "integer", True, False),
+            ("error_class", "text", True, False),
+            ("created_at", "datetime", False, False),
+            ("completed_at", "datetime", True, False),
+        ),
+        "outboundtask": (
+            ("id", "integer", False, True),
+            ("source_key", "text", False, False),
+            ("slave_id", "text", True, False),
+            ("priority", "boolean", False, False),
+            ("target_chat_id", "integer", False, False),
+            ("message_thread_id", "integer", True, False),
+            ("operation", "text", False, False),
+            ("payload", "text", False, False),
+            ("media_ref", "text", True, False),
+            ("workflow_id", "integer", False, False),
+            ("step_index", "integer", False, False),
+            ("depends_on_task_id", "integer", True, False),
+            ("run_condition", "text", False, False),
+            ("result_payload", "text", True, False),
+            ("log_payload", "text", True, False),
+            ("required_sender_bot_id", "text", True, False),
+            ("state", "text", False, False),
+            ("available_at", "datetime", True, False),
+            ("lease_owner", "text", True, False),
+            ("lease_until", "datetime", True, False),
+            ("lease_heartbeat_at", "datetime", True, False),
+            ("submitted_at", "datetime", True, False),
+            ("attempt_count", "integer", False, False),
+            ("accepted_at", "datetime", False, False),
+            ("error_class", "text", True, False),
+            ("last_error", "text", True, False),
+        ),
+    }
+    _LEGACY_OUTBOUND_TASK_INDEXES = (
+        ("outboundtask_workflow_id", ("workflow_id",), False),
+        ("outboundtask_source_key_priority_accepted_at_id", ("source_key", "priority", "accepted_at", "id"), False),
+        ("outboundtask_state_available_at", ("state", "available_at"), False),
+        ("outboundtask_workflow_id_step_index", ("workflow_id", "step_index"), True),
     )
+    _LEGACY_OUTBOUND_DEFAULT_CATEGORIES = {
+        "outboundworkflow": {"id": "auto_pk", "created_at": "current_timestamp"},
+        "outboundtask": {"id": "auto_pk", "accepted_at": "current_timestamp"},
+    }
 
     def __init__(self, channel: "TelegramChannel"):
         self.channel: "TelegramChannel" = channel
@@ -344,7 +384,7 @@ class DatabaseManager:
         self.logger.debug("Checking database migration...")
         self._create()
         self.logger.debug("Database migration finished...")
-        self._observe_legacy_outbound_rows()
+        self._retire_legacy_outbound_tables()
 
     def set_metrics(self, metrics: DatabaseMetrics) -> None:
         """Attach the metrics recorder created after the database manager."""
@@ -421,31 +461,106 @@ class DatabaseManager:
         }.get(data_type, data_type)
         return (str(getattr(column, "name")), normalized_type, bool(getattr(column, "null")), bool(getattr(column, "primary_key")))
 
-    def _observe_legacy_outbound_rows(self) -> None:
-        """Report retained workflow rows without loading or changing them."""
-        table_names = set(database.get_tables())
-        workflow_table, task_table = self._LEGACY_OUTBOUND_TABLES
-        workflow_count = 0
-        task_count = 0
-        state_counts = {state: 0 for state in self._LEGACY_OUTBOUND_STATES}
+    @staticmethod
+    def _legacy_outbound_column_type(data_type: str) -> str:
+        normalized = data_type.lower()
+        if "int" in normalized or normalized in {"serial", "bigserial"}:
+            return "integer"
+        if "bool" in normalized:
+            return "boolean"
+        if "date" in normalized or "time" in normalized:
+            return "datetime"
+        if "char" in normalized or "text" in normalized:
+            return "text"
+        return normalized
 
-        if workflow_table in table_names:
-            workflow_count = int(database.execute_sql(f'SELECT COUNT(*) FROM "{workflow_table}"').fetchone()[0])
-        if task_table in table_names:
-            task_rows = database.execute_sql(f'SELECT state, COUNT(*) FROM "{task_table}" GROUP BY state').fetchall()
-            for state, count in task_rows:
-                if state in state_counts:
-                    state_counts[state] = int(count)
-            task_count = sum(int(count) for _state, count in task_rows)
+    @staticmethod
+    def _legacy_outbound_default(default) -> Optional[str]:
+        if default is None:
+            return None
+        normalized = str(default).strip().lower()
+        while normalized.startswith("(") and normalized.endswith(")"):
+            normalized = normalized[1:-1].strip()
+        return normalized.replace("::timestamp without time zone", "").replace("::timestamp with time zone", "").replace("::text", "").strip()
 
-        if workflow_count or task_count:
-            state_summary = ", ".join(f"{state}={state_counts[state]}" for state in self._LEGACY_OUTBOUND_STATES)
-            self.logger.warning(
-                "Retained legacy outbound rows: workflows=%d tasks=%d %s",
-                workflow_count,
-                task_count,
-                state_summary,
-            )
+    @staticmethod
+    def _legacy_outbound_auto_pk_default(default) -> str:
+        normalized = str(default).strip().lower()
+        while normalized.startswith("(") and normalized.endswith(")"):
+            normalized = normalized[1:-1].strip()
+        return normalized
+
+    @classmethod
+    def _legacy_outbound_auto_pk_sequence(cls, default, table_name: str) -> bool:
+        identifier = r'(?:(?P<schema>"[^"]+"|[a-z_][a-z0-9_]*)\s*\.\s*)?(?P<sequence>"[^"]+"|[a-z_][a-z0-9_]*)'
+        match = re.fullmatch(rf"nextval\s*\(\s*'{identifier}'\s*::\s*regclass\s*\)", cls._legacy_outbound_auto_pk_default(default), flags=re.IGNORECASE)
+        if match is None:
+            return False
+        schema = match.group("schema")
+        if schema is not None and schema.strip('"').lower() != "public":
+            return False
+        return match.group("sequence").strip('"').lower() == f"{table_name}_id_seq"
+
+    @classmethod
+    def _legacy_outbound_default_category(cls, current_database, table_name: str, column) -> str:
+        data_type = cls._legacy_outbound_column_type(column.data_type)
+        expected = cls._LEGACY_OUTBOUND_DEFAULT_CATEGORIES[table_name].get(column.name, "none")
+        if expected == "auto_pk" and column.name == "id" and column.primary_key and data_type == "integer":
+            if column.default is None:
+                return "auto_pk" if isinstance(current_database, SqliteDatabase) else "none"
+            if isinstance(current_database, PostgresqlDatabase) and cls._legacy_outbound_auto_pk_sequence(column.default, table_name):
+                return "auto_pk"
+            return f"invalid:{cls._legacy_outbound_auto_pk_default(column.default)}"
+        normalized = cls._legacy_outbound_default(column.default)
+        if normalized is None:
+            return "none"
+        return "current_timestamp" if normalized == "current_timestamp" else f"invalid:{normalized}"
+
+    @classmethod
+    def _legacy_outbound_schema_error(cls, current_database, table_name: str) -> Optional[str]:
+        expected_columns = tuple(
+            (name, "integer" if isinstance(current_database, SqliteDatabase) and data_type == "boolean" else data_type, null, primary_key, cls._LEGACY_OUTBOUND_DEFAULT_CATEGORIES[table_name].get(name, "none"))
+            for name, data_type, null, primary_key in cls._LEGACY_OUTBOUND_COLUMNS[table_name]
+        )
+        actual_columns = tuple(
+            (column.name, cls._legacy_outbound_column_type(column.data_type), column.null, column.primary_key, cls._legacy_outbound_default_category(current_database, table_name, column))
+            for column in current_database.get_columns(table_name)
+        )
+        if actual_columns != expected_columns:
+            return f"column signature for {table_name} does not match the historical durable outbound schema"
+        if table_name == "outboundworkflow":
+            return None
+        indexes = tuple((index.name, tuple(index.columns), index.unique) for index in current_database.get_indexes(table_name))
+        if isinstance(current_database, PostgresqlDatabase):
+            indexes = tuple(index for index in indexes if index != ("outboundtask_pkey", ("id",), True))
+        if set(indexes) != set(cls._LEGACY_OUTBOUND_TASK_INDEXES):
+            return "index signature for outboundtask does not match the historical durable outbound schema"
+        return None
+
+    @classmethod
+    def _retire_legacy_outbound_tables(cls) -> None:
+        current_database = database.obj
+        transaction_arguments: Tuple[str, ...] = ()
+        if isinstance(current_database, SqliteDatabase):
+            transaction_arguments = ("IMMEDIATE",)
+        elif not isinstance(current_database, PostgresqlDatabase):
+            raise TypeError(f"Unsupported database backend: {type(current_database).__name__}")
+
+        with current_database.atomic(*transaction_arguments):
+            if isinstance(current_database, PostgresqlDatabase):
+                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (cls._LEGACY_OUTBOUND_LOCK_KEY,))
+            table_names = set(current_database.get_tables())
+            legacy_tables = tuple(table_name for table_name in cls._LEGACY_OUTBOUND_TABLES if table_name in table_names)
+            if not legacy_tables:
+                return
+            if len(legacy_tables) != len(cls._LEGACY_OUTBOUND_TABLES):
+                raise RuntimeError("Legacy outbound partial-schema collision: historical workflow and task tables must be present together; refusing to discard table")
+            for table_name in legacy_tables:
+                error = cls._legacy_outbound_schema_error(current_database, table_name)
+                if error is not None:
+                    raise RuntimeError(f"Legacy outbound schema collision: {error}; refusing to discard table")
+            for table_name in reversed(legacy_tables):
+                current_database.execute_sql(f'DROP TABLE "{table_name}"')
 
     @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr, slave_uid: EFBChannelChatIDStr, multiple_slave: bool = False):

@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.parse
 from contextlib import suppress
-from typing import IO, TYPE_CHECKING, Callable, Dict, List, Optional, Pattern, Tuple, Union, cast
+from typing import IO, TYPE_CHECKING, Dict, List, Optional, Pattern, Tuple, Union, cast
 
 import telegram  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, MsgType, coordinator
@@ -113,7 +113,6 @@ class ChatBindingManager(LocaleMixin):
         self._msglog_ingestion_lock = threading.Lock()
         self._msglog_ingestion_threads: Dict[int, threading.Thread] = {}
         self._msglog_ingestion_stop = threading.Event()
-        self._msglog_ingestion_shutdown_callback: Optional[Callable[[], None]] = None
 
         # Link handler
         non_edit_filter = Filters.update.message | Filters.update.channel_post
@@ -1385,15 +1384,9 @@ class ChatBindingManager(LocaleMixin):
         except Exception:
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id)
         finally:
-            shutdown_callback = None
             with self._msglog_ingestion_lock:
                 if self._msglog_ingestion_threads.get(source_chat_id) is threading.current_thread():
                     self._msglog_ingestion_threads.pop(source_chat_id)
-                if not self._msglog_ingestion_threads:
-                    shutdown_callback = getattr(self, "_msglog_ingestion_shutdown_callback", None)
-                    self._msglog_ingestion_shutdown_callback = None
-            if shutdown_callback is not None:
-                shutdown_callback()
 
     def stop_msglog_ingestions(self, join: bool = True) -> bool:
         """Cancel active command scans and optionally wait a bounded time for workers."""
@@ -1407,12 +1400,10 @@ class ChatBindingManager(LocaleMixin):
                 worker.join(timeout=self.MSGLOG_INGESTION_JOIN_TIMEOUT)
         return not any(worker.is_alive() for worker in workers)
 
-    def close_database_after_msglog_ingestions(self, close_database: Callable[[], None]) -> None:
+    def close_database_after_msglog_ingestions(self) -> bool:
+        """Report whether the database owner may close after bounded worker shutdown."""
         with self._msglog_ingestion_lock:
-            if any(worker.is_alive() for worker in self._msglog_ingestion_threads.values()):
-                self._msglog_ingestion_shutdown_callback = close_database
-                return
-        close_database()
+            return not any(worker.is_alive() for worker in self._msglog_ingestion_threads.values())
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Background method that performs the actual migration work.

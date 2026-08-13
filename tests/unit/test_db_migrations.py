@@ -3,9 +3,10 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import PostgresqlDatabase, SqliteDatabase
+from peewee import SQL, AutoField, BigIntegerField, BooleanField, DateTimeField, IntegerField, Model, PostgresqlDatabase, SqliteDatabase, TextField
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
@@ -52,6 +53,57 @@ CREATE TABLE msglog (
     time DATETIME
 )
 """
+
+
+def _legacy_outbound_models(test_database):
+    class BaseModel(Model):
+        class Meta:
+            database = test_database
+
+    class OutboundWorkflow(BaseModel):
+        id = AutoField()
+        state = TextField(default="active")
+        result_task_id = BigIntegerField(null=True)
+        error_class = TextField(null=True)
+        created_at = DateTimeField(constraints=[SQL("DEFAULT CURRENT_TIMESTAMP")])
+        completed_at = DateTimeField(null=True)
+
+    class OutboundTask(BaseModel):
+        id = AutoField()
+        source_key = TextField()
+        slave_id = TextField(null=True)
+        priority = BooleanField(default=False)
+        target_chat_id = BigIntegerField()
+        message_thread_id = BigIntegerField(null=True)
+        operation = TextField()
+        payload = TextField()
+        media_ref = TextField(null=True)
+        workflow_id = BigIntegerField(index=True)
+        step_index = IntegerField(default=0)
+        depends_on_task_id = BigIntegerField(null=True)
+        run_condition = TextField(default="always")
+        result_payload = TextField(null=True)
+        log_payload = TextField(null=True)
+        required_sender_bot_id = TextField(null=True)
+        state = TextField(default="queued")
+        available_at = DateTimeField(null=True)
+        lease_owner = TextField(null=True)
+        lease_until = DateTimeField(null=True)
+        lease_heartbeat_at = DateTimeField(null=True)
+        submitted_at = DateTimeField(null=True)
+        attempt_count = IntegerField(default=0)
+        accepted_at = DateTimeField(constraints=[SQL("DEFAULT CURRENT_TIMESTAMP")])
+        error_class = TextField(null=True)
+        last_error = TextField(null=True)
+
+        class Meta:
+            indexes = (
+                (("source_key", "priority", "accepted_at", "id"), False),
+                (("state", "available_at"), False),
+                (("workflow_id", "step_index"), True),
+            )
+
+    return OutboundWorkflow, OutboundTask
 
 
 def test_fresh_database_defines_msglog_provenance(tmp_path, monkeypatch):
@@ -164,6 +216,85 @@ def test_startup_keeps_a_same_name_table_with_a_different_schema_signature(tmp_p
         database.initialize(original_database)
 
     assert "msglogingestionscan" in tables
+
+
+def test_startup_retires_historical_outbound_tables_in_task_before_workflow_order(tmp_path, monkeypatch):
+    original_database = database.obj
+    database_path = tmp_path / "tgdata.db"
+    legacy_database = SqliteDatabase(database_path)
+    legacy_database.connect()
+    try:
+        workflow, task = _legacy_outbound_models(legacy_database)
+        legacy_database.create_tables([workflow, task])
+    finally:
+        legacy_database.close()
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    original_execute_sql = SqliteDatabase.execute_sql
+    drops = []
+
+    def record_drop(database_instance, statement, parameters=None):
+        if statement.startswith('DROP TABLE "outbound'):
+            drops.append(statement)
+        return original_execute_sql(database_instance, statement, parameters)
+
+    monkeypatch.setattr(SqliteDatabase, "execute_sql", record_drop)
+
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy-outbound", config={}))
+    try:
+        tables = set(database.get_tables())
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
+
+    assert "outboundworkflow" not in tables
+    assert "outboundtask" not in tables
+    assert drops == ['DROP TABLE "outboundtask"', 'DROP TABLE "outboundworkflow"']
+
+
+def test_startup_preserves_historical_outbound_name_collision(tmp_path, monkeypatch):
+    original_database = database.obj
+    database_path = tmp_path / "tgdata.db"
+    collision_database = SqliteDatabase(database_path)
+    collision_database.connect()
+    try:
+        collision_database.execute_sql("CREATE TABLE outboundworkflow (id INTEGER PRIMARY KEY, unrelated TEXT)")
+        _workflow, task = _legacy_outbound_models(collision_database)
+        collision_database.create_tables([task])
+    finally:
+        collision_database.close()
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+
+    try:
+        with pytest.raises(RuntimeError, match="Legacy outbound schema collision"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.outbound-collision", config={}))
+        collision_database = SqliteDatabase(database_path)
+        collision_database.connect()
+        try:
+            assert {"outboundworkflow", "outboundtask"}.issubset(collision_database.get_tables())
+        finally:
+            collision_database.close()
+    finally:
+        if not database.is_closed():
+            database.close()
+        database.initialize(original_database)
+
+
+def test_postgresql_legacy_outbound_collision_acquires_the_startup_lock(monkeypatch):
+    original_database = database.obj
+    postgresql_database = PostgresqlDatabase("tests")
+    statements = []
+    monkeypatch.setattr(postgresql_database, "get_binary_type", lambda: bytes)
+    monkeypatch.setattr(postgresql_database, "atomic", lambda: nullcontext())
+    monkeypatch.setattr(postgresql_database, "get_tables", lambda: ["outboundworkflow"])
+    monkeypatch.setattr(postgresql_database, "execute_sql", lambda statement, parameters=None: statements.append((statement, parameters)))
+    database.initialize(postgresql_database)
+    try:
+        with pytest.raises(RuntimeError, match="partial-schema collision"):
+            DatabaseManager._retire_legacy_outbound_tables()
+    finally:
+        database.initialize(original_database)
+
+    assert statements == [("SELECT pg_advisory_xact_lock(%s)", (DatabaseManager._LEGACY_OUTBOUND_LOCK_KEY,))]
 
 
 def test_legacy_scan_schema_normalization_accepts_postgresql_names_and_rejects_lookalikes():

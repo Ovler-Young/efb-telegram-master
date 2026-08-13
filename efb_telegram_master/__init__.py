@@ -698,8 +698,8 @@ class TelegramChannel(MasterChannel):
         self.master_messages.stop_worker()
         if self.chat_binding.stop_msglog_ingestions():
             self.db.stop_worker()
-        else:
-            self.chat_binding.close_database_after_msglog_ingestions(self.db.stop_worker)
+        elif self.chat_binding.close_database_after_msglog_ingestions():
+            self.db.stop_worker()
         self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
 
     def get_chats(self) -> List[Chat]:

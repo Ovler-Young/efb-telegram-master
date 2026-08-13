@@ -45,7 +45,7 @@ def test_stop_msglog_ingestions_joins_active_workers():
     assert not worker.is_alive()
 
 
-def test_channel_shutdown_defers_database_close_until_a_nonresponsive_ingestion_worker_exits():
+def test_channel_shutdown_does_not_close_database_from_an_ingestion_worker():
     manager = object.__new__(ChatBindingManager)
     manager._msglog_ingestion_lock = threading.Lock()
     manager._msglog_ingestion_stop = threading.Event()
@@ -94,7 +94,7 @@ def test_channel_shutdown_defers_database_close_until_a_nonresponsive_ingestion_
     request_released.set()
     worker.join(timeout=1)
     assert not worker.is_alive()
-    channel.db.stop_worker.assert_called_once()
+    channel.db.stop_worker.assert_not_called()
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():
