@@ -41,7 +41,10 @@ class _ThreadedXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
                 return
             thread = threading.Thread(target=self.process_request_thread, args=(request, client_address))
             self._active_handler_threads.add(thread)
-        thread.start()
+            # Keep registration and start in one critical section.  Otherwise a
+            # shutdown can observe the registered thread before it is alive,
+            # omit it from the join, and allow it to run after resource teardown.
+            thread.start()
 
     def process_request_thread(self, request, client_address) -> None:
         try:
@@ -103,15 +106,20 @@ class RPCUtilities:
                 rpc_paths = ("/", "/RPC2")
 
             server = _ThreadedXMLRPCServer((rpc_config["server"], rpc_config["port"]), requestHandler=RequestHandler)
-            server.register_introspection_functions()
-            server.register_multicall_functions()
-            server.register_instance(self.channel.db)
-            server.register_function(self.get_slave_channels_ids)
-            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, name="ETM RPC server thread")
+            try:
+                server.register_introspection_functions()
+                server.register_multicall_functions()
+                server.register_instance(self.channel.db)
+                server.register_function(self.get_slave_channels_ids)
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, name="ETM RPC server thread")
+                thread.start()
+            except BaseException:
+                server.server_close()
+                raise
+
             self.server = server
             self.thread = thread
             self._started = True
-            thread.start()
 
     def stop(self, deadline: float) -> tuple[BaseException, ...]:
         """Stop accepting work and join all RPC threads before ``deadline``."""

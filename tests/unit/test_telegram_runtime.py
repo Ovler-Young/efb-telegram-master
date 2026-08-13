@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import socket
 import threading
 import time
 from contextlib import ExitStack
@@ -20,7 +21,7 @@ from efb_telegram_master.metrics_runtime import MetricsServer, parse_metrics_con
 from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout, QueueRequest, SchedulerStoppedError
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
-from efb_telegram_master.rpc_utils import RPCShutdownTimeout
+from efb_telegram_master.rpc_utils import RPCShutdownTimeout, RPCUtilities
 from efb_telegram_master.telegram_api import MetricsServerShutdownTimeout, TelegramAPI
 from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
 from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, AsyncTelegramRuntimeShutdownTimeout, SyncBotFacade
@@ -486,6 +487,64 @@ def test_channel_retries_rpc_handler_timeout_before_closing_database() -> None:
     channel.rpc_utilities.stop.assert_has_calls([call(ANY), call(ANY)])
     channel.bot_manager.stop_channel_resources.assert_called_once_with(ANY)
     channel.db.stop_worker.assert_called_once_with()
+
+
+def test_channel_rpc_start_barrier_cannot_evade_shutdown_database_gate() -> None:
+    utilities = RPCUtilities(SimpleNamespace(config={"rpc": {"server": "127.0.0.1", "port": 0}}, db=SimpleNamespace()))
+    utilities.start()
+    assert utilities.server is not None
+
+    handler_start_blocked = threading.Event()
+    release_handler_start = threading.Event()
+    original_start = threading.Thread.start
+
+    def start_after_barrier(thread: threading.Thread) -> None:
+        if thread._target == utilities.server.process_request_thread:
+            handler_start_blocked.set()
+            assert release_handler_start.wait(1)
+        original_start(thread)
+
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel.SHUTDOWN_TIMEOUT = 0.05
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = utilities
+    channel.bot_manager = Mock()
+    channel.master_message_worker = Mock(stop_worker=Mock(return_value=()))
+    channel.db = Mock()
+    errors: list[BaseException] = []
+
+    with patch.object(threading.Thread, "start", new=start_after_barrier):
+        client = socket.create_connection(utilities.server.server_address, timeout=1)
+        client.sendall(b"POST /RPC2 HTTP/1.1\r\nContent-Length: 100\r\n\r\n<methodCall>")
+        assert handler_start_blocked.wait(1)
+
+        def stop_channel() -> None:
+            try:
+                channel.stop_polling()
+            except TelegramResourceShutdownError as error:
+                errors.extend(error.errors)
+
+        stopper = threading.Thread(target=stop_channel)
+        stopper.start()
+        time.sleep(0.02)
+        assert stopper.is_alive()
+
+        release_handler_start.set()
+        stopper.join(1)
+
+    try:
+        assert len(errors) == 1
+        assert isinstance(errors[0], RPCShutdownTimeout)
+        channel.db.stop_worker.assert_not_called()
+
+        client.close()
+        channel.stop_polling()
+        channel.db.stop_worker.assert_called_once_with()
+    finally:
+        release_handler_start.set()
+        client.close()
+        utilities.stop(time.monotonic() + 1)
 
 
 def test_channel_stops_master_messages_before_outbound_delivery() -> None:
@@ -968,19 +1027,37 @@ def test_channel_rpc_bind_failure_precedes_unrelated_service_startup() -> None:
         stop_worker=Mock(),
     )
     flag = Mock(side_effect=lambda name: {"chats_per_page": 10, "multiple_slave_chats": False, "topic_group": 0}.get(name, False))
-    with ExitStack() as stack:
-        stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
-        stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1]}, Mock())))
-        stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
-        stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
-        stack.enter_context(patch("efb_telegram_master.RPCUtilities", side_effect=RuntimeError("rpc setup failed")))
-        bot_manager = stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager"))
+    cleanup_events: list[str] = []
+    original_rpc_stop = RPCUtilities.stop
 
-        with pytest.raises(RuntimeError, match="rpc setup failed"):
-            TelegramChannel()
+    def record_rpc_cleanup(utilities: RPCUtilities, deadline: float) -> tuple[BaseException, ...]:
+        cleanup_events.append("rpc")
+        return original_rpc_stop(utilities, deadline)
+
+    def record_database_cleanup() -> None:
+        cleanup_events.append("database")
+
+    database_manager.stop_worker.side_effect = record_database_cleanup
+    with socket.socket() as occupied_listener:
+        occupied_listener.bind(("127.0.0.1", 0))
+        occupied_listener.listen()
+        occupied_port = occupied_listener.getsockname()[1]
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
+            stack.enter_context(
+                patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1], "rpc": {"server": "127.0.0.1", "port": occupied_port}}, Mock()))
+            )
+            stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
+            stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
+            stack.enter_context(patch.object(RPCUtilities, "stop", new=record_rpc_cleanup))
+            bot_manager = stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager"))
+
+            with pytest.raises(OSError):
+                TelegramChannel()
 
     bot_manager.assert_not_called()
     database_manager.stop_worker.assert_called_once_with()
+    assert cleanup_events == ["rpc", "database"]
 
 
 def test_master_message_worker_shutdown_suppresses_an_in_flight_delivery_failure() -> None:
