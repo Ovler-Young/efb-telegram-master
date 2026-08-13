@@ -392,7 +392,7 @@ def test_sqlite_import_recovery_finalization_archives_wal_content(tmp_path):
     assert not source_path.with_name("tgdata.db-shm").exists()
 
 
-@pytest.mark.parametrize("failure", ["backup", "publish", "collision"])
+@pytest.mark.parametrize("failure", ["backup", "publish"])
 def test_sqlite_import_finalization_failure_retains_source_and_sidecars(tmp_path, monkeypatch, failure):
     source_path = tmp_path / "tgdata.db"
     source_db = _create_wal_historic_msglog_source(source_path)
@@ -401,23 +401,49 @@ def test_sqlite_import_finalization_failure_retains_source_and_sidecars(tmp_path
     migrated_path = source_path.with_suffix(".db.migrated")
     if failure == "backup":
         monkeypatch.setattr(DatabaseManager, "_create_sqlite_archive", staticmethod(lambda *_args: (_ for _ in ()).throw(sqlite3.Error("backup failed"))))
-    elif failure == "publish":
-        monkeypatch.setattr(db_module.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("publish failed")))
     else:
-        migrated_path.write_bytes(b"existing archive")
+        monkeypatch.setattr(db_module.os, "link", lambda *_args: (_ for _ in ()).throw(OSError("publish failed")))
 
-    expected_message = "finalization collision" if failure == "collision" else "finalization failed"
     try:
         with _sqlite_import_target() as (manager, _target_db):
-            with pytest.raises(RuntimeError, match=expected_message):
+            with pytest.raises(RuntimeError, match="finalization failed"):
                 manager._migrate_from_sqlite(source_path, finalize_source=True)
         assert source_path.exists()
         assert source_path.with_name("tgdata.db-wal").exists()
         assert source_path.with_name("tgdata.db-shm").exists()
-        if failure == "collision":
-            assert migrated_path.read_bytes() == b"existing archive"
-        else:
-            assert not migrated_path.exists()
+        assert not migrated_path.exists()
+    finally:
+        source_db.close()
+
+
+def test_sqlite_import_finalization_collision_does_not_replace_competing_archive(tmp_path, monkeypatch):
+    source_path = tmp_path / "tgdata.db"
+    source_db = _create_wal_historic_msglog_source(source_path)
+    migrated_path = source_path.with_suffix(".db.migrated")
+    source_artifacts = (
+        source_path,
+        source_path.with_name("tgdata.db-wal"),
+        source_path.with_name("tgdata.db-shm"),
+    )
+    source_data_artifacts = source_artifacts[:2]
+    original_contents = {path: path.read_bytes() for path in source_data_artifacts}
+    original_inodes = {path: path.stat().st_ino for path in source_artifacts}
+    competing_archive = b"competing archive"
+    original_link = db_module.os.link
+
+    def publish_competing_archive(source, destination):
+        assert destination == migrated_path
+        migrated_path.write_bytes(competing_archive)
+        return original_link(source, destination)
+
+    monkeypatch.setattr(db_module.os, "link", publish_competing_archive)
+    try:
+        with _sqlite_import_target() as (manager, _target_db):
+            with pytest.raises(RuntimeError, match="finalization collision"):
+                manager._migrate_from_sqlite(source_path, finalize_source=True)
+        assert {path: path.read_bytes() for path in source_data_artifacts} == original_contents
+        assert {path: path.stat().st_ino for path in source_artifacts} == original_inodes
+        assert migrated_path.read_bytes() == competing_archive
     finally:
         source_db.close()
 

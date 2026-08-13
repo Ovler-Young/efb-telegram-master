@@ -407,10 +407,19 @@ class DatabaseManager:
         os.close(descriptor)
         archive_path = Path(archive_name)
         try:
-            cls._create_sqlite_archive(source_database, archive_path)
-            os.replace(archive_path, migrated_path)
-        except (OSError, RuntimeError, sqlite3.Error) as error:
-            raise RuntimeError(f"SQLite-to-PostgreSQL migration finalization failed; source remains at {sqlite_path}") from error
+            try:
+                cls._create_sqlite_archive(source_database, archive_path)
+            except (OSError, RuntimeError, sqlite3.Error) as error:
+                raise RuntimeError(f"SQLite-to-PostgreSQL migration finalization failed; source remains at {sqlite_path}") from error
+            try:
+                os.link(archive_path, migrated_path)
+            except FileExistsError as error:
+                raise RuntimeError(
+                    "SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; "
+                    "preserving both files. Resolve the conflict before restarting."
+                ) from error
+            except OSError as error:
+                raise RuntimeError(f"SQLite-to-PostgreSQL migration finalization failed; source remains at {sqlite_path}") from error
         finally:
             archive_path.unlink(missing_ok=True)
         for source_path in (sqlite_path, sqlite_path.with_name(f"{sqlite_path.name}-wal"), sqlite_path.with_name(f"{sqlite_path.name}-shm")):
