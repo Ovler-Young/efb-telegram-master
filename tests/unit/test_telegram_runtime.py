@@ -607,10 +607,21 @@ def test_channel_constructor_failure_stops_the_real_started_message_worker() -> 
     history_replay = Mock()
     flag = Mock(side_effect=lambda name: {"chats_per_page": 10, "multiple_slave_chats": False, "topic_group": 0}.get(name, False))
     workers = []
+    started = threading.Event()
+    release = threading.Event()
+    inbound = Mock()
+
+    def block_message(*_args: object) -> None:
+        started.set()
+        assert release.wait(1)
+
+    inbound.msg.side_effect = block_message
 
     def create_worker(*args):
         worker = MasterMessageWorker(*args)
         workers.append(worker)
+        worker.message_queue.put((SimpleNamespace(effective_message=None), Mock()))
+        assert started.wait(1)
         return worker
 
     dependencies = (
@@ -634,7 +645,6 @@ def test_channel_constructor_failure_stops_the_real_started_message_worker() -> 
         "SlaveFileDelivery",
         "SlaveMessageService",
         "SlaveStatusService",
-        "MasterMessageInbound",
         "MasterMessageMutations",
     )
     with ExitStack() as stack:
@@ -645,14 +655,27 @@ def test_channel_constructor_failure_stops_the_real_started_message_worker() -> 
         stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager", return_value=bot_manager))
         stack.enter_context(patch("efb_telegram_master.channel_composition.HistoryReplayWorker", return_value=history_replay))
         stack.enter_context(patch("efb_telegram_master.channel_composition.MasterMessageWorker", side_effect=create_worker))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.MasterMessageInbound", return_value=inbound))
         stack.enter_context(patch("efb_telegram_master.channel_composition.RPCUtilities", side_effect=RuntimeError("rpc setup failed")))
+        stack.enter_context(patch.object(MasterMessageWorker, "DEFAULT_STOP_TIMEOUT", 0.01))
         for dependency in dependencies:
             stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
 
-        with pytest.raises(RuntimeError, match="rpc setup failed"):
+        with pytest.raises(RuntimeError, match="rpc setup failed") as raised:
             TelegramChannel()
 
     worker = workers[0]
+    cleanup = raised.value.telegram_channel_cleanup
+    assert worker.message_worker_thread.is_alive()
+    history_replay.stop.assert_not_called()
+    bot_manager.stop_channel_resources.assert_not_called()
+    database_manager.stop_worker.assert_not_called()
+
+    release.set()
+    worker.message_worker_thread.join(1)
+    assert cleanup.retry() == ()
+    assert cleanup.retry() == ()
+
     assert not worker.message_worker_thread.is_alive()
     assert "ETM master messages worker thread" not in {thread.name for thread in live_non_daemon_threads()}
     history_replay.stop.assert_called_once_with()

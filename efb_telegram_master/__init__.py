@@ -41,6 +41,17 @@ if TYPE_CHECKING:
     from .topic_sync import TopicGroupService
 
 
+class TelegramChannelInitializationCleanup:
+    """Own cleanup for a channel whose constructor could not finish."""
+
+    def __init__(self, channel: "TelegramChannel") -> None:
+        self._channel = channel
+
+    def retry(self) -> tuple[BaseException, ...]:
+        """Retry cleanup after a resource shutdown timeout."""
+        return self._channel._stop_after_constructor_failure()
+
+
 class TelegramChannel(MasterChannel):
     """EFB Telegram master channel."""
 
@@ -73,6 +84,7 @@ class TelegramChannel(MasterChannel):
         self._resources_stopped = False
         self._database_closed = False
         self._shutdown_complete = False
+        self._constructor_cleanup_complete = False
         self.locale_state = LocaleState()
         self._owned_database: Optional[DatabaseManager] = None
         self._owned_bot_manager = None
@@ -98,42 +110,53 @@ class TelegramChannel(MasterChannel):
         self.msglog_ingestion = self.db.msglog_ingestion
         try:
             initialize_channel_components(self)
-        except BaseException:
-            self._stop_after_constructor_failure()
+        except BaseException as error:
+            cleanup = TelegramChannelInitializationCleanup(self)
+            cleanup_errors = cleanup.retry()
+            if cleanup_errors:
+                setattr(error, "telegram_channel_cleanup", cleanup)
             raise
 
     def _stop_after_constructor_failure(self) -> tuple[BaseException, ...]:
-        master_message_worker = self._owned_master_message_worker
-        if master_message_worker is not None:
-            try:
-                master_errors = master_message_worker.stop_worker()
-            except BaseException as error:
-                master_errors = (error,)
-            if master_errors:
-                for error in master_errors:
-                    self.logger.error(
-                        "Master message worker did not stop after channel construction failed; retaining dependent resources for cleanup.",
-                        exc_info=(type(error), error, error.__traceback__),
-                    )
-                return tuple(master_errors)
+        lock = getattr(self, "_shutdown_lock", None)
+        if lock is None:
+            lock = self._shutdown_lock = threading.Lock()
+            self._constructor_cleanup_complete = False
+        with lock:
+            if self._constructor_cleanup_complete:
+                return ()
+            master_message_worker = self._owned_master_message_worker
+            if master_message_worker is not None:
+                try:
+                    master_errors = master_message_worker.stop_worker()
+                except BaseException as error:
+                    master_errors = (error,)
+                if master_errors:
+                    for shutdown_error in master_errors:
+                        self.logger.error(
+                            "Master message worker did not stop after channel construction failed; retaining dependent resources for cleanup.",
+                            exc_info=(type(shutdown_error), shutdown_error, shutdown_error.__traceback__),
+                        )
+                    return tuple(master_errors)
 
-        rpc_utilities = getattr(self, "_owned_rpc_utilities", None)
-        if rpc_utilities is None:
-            rpc_utilities = getattr(self, "rpc_utilities", None)
-        for resource, method_name in (
-            (self._owned_history_replay, "stop"),
-            (rpc_utilities, "shutdown"),
-            (self._owned_bot_manager, "stop_channel_resources"),
-            (self._owned_database, "stop_worker"),
-        ):
-            method = getattr(resource, method_name, None)
-            if method is None:
-                continue
-            try:
-                method()
-            except BaseException:
-                self.logger.exception("Failed to stop %s after channel construction failed.", type(resource).__name__)
-        return ()
+            rpc_utilities = getattr(self, "_owned_rpc_utilities", None)
+            if rpc_utilities is None:
+                rpc_utilities = getattr(self, "rpc_utilities", None)
+            for resource, method_name in (
+                (self._owned_history_replay, "stop"),
+                (rpc_utilities, "shutdown"),
+                (self._owned_bot_manager, "stop_channel_resources"),
+                (self._owned_database, "stop_worker"),
+            ):
+                method = getattr(resource, method_name, None)
+                if method is None:
+                    continue
+                try:
+                    method()
+                except BaseException:
+                    self.logger.exception("Failed to stop %s after channel construction failed.", type(resource).__name__)
+            self._constructor_cleanup_complete = True
+            return ()
 
     def _translate(self, message: str) -> str:
         return self.locale_state.gettext(message)
