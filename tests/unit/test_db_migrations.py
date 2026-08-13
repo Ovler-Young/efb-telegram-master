@@ -71,6 +71,39 @@ def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, 
     assert (slave_info.slave_chat_name, slave_info.slave_chat_group_id) == ("Legacy chat", None)
 
 
+def test_historic_schema_migration_serializes_sqlite_startups(tmp_path):
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        raw_db.execute_sql("CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)")
+    finally:
+        raw_db.close()
+    errors = []
+    def migrate() -> None:
+        connection = SqliteDatabase(database_path, pragmas={"busy_timeout": 5000})
+        try:
+            connection.connect()
+            DatabaseManager._ensure_historic_schema_columns(connection)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            connection.close()
+    first, second = threading.Thread(target=migrate), threading.Thread(target=migrate)
+    first.start()
+    second.start()
+    first.join(5)
+    second.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors
+    check_db = SqliteDatabase(database_path)
+    check_db.connect()
+    try:
+        assert "provenance" in {column.name for column in check_db.get_columns("msglog")}
+    finally:
+        check_db.close()
+
+
 def test_history_migration_entry_schema_retains_replay_columns_without_msglog_legacy_field():
     test_db = SqliteDatabase(":memory:")
 

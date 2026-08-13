@@ -6,14 +6,26 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from prometheus_client import generate_latest
 from telegram import InputFile, InputMediaVideo
 from telegram.constants import MessageLimit
-from telegram.error import BadRequest, ChatMigrated, RetryAfter
+from telegram.error import BadRequest, ChatMigrated, NetworkError, RetryAfter
 
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
 from efb_telegram_master.bot_pool import BotPool
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import OutboundQueue
-from efb_telegram_master.outbound_types import OutboundLifecycle, OutboundShutdownTimeout, QueuedCall, QueueError, QueueRequest, SchedulerStoppedError, SenderSelection, UploadCleanup, rewind_uploads
+from efb_telegram_master.outbound_types import (
+    OutboundLifecycle,
+    OutboundShutdownTimeout,
+    QueuedCall,
+    QueueEnqueueError,
+    QueueRequest,
+    SchedulerStoppedError,
+    SenderSelection,
+    UploadCleanup,
+    rewind_uploads,
+)
 from efb_telegram_master.sender_policy import retry_after_seconds
 from efb_telegram_master.telegram_calls import TelegramCallAdapter
 
@@ -94,6 +106,26 @@ def test_queue_retries_numeric_and_timedelta_retry_after(retry_after):
     try:
         waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "sent"}, 1))
         assert waiter.result(1).message == "sent"
+        assert attempts == 2
+    finally:
+        queue.stop()
+
+
+def test_queue_retries_network_errors_before_terminal_outcome():
+    attempts = 0
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise NetworkError("temporary network failure")
+            return SimpleNamespace(message_id=7)
+
+    queue = _queue(Sender(), worker_count=1)
+    try:
+        receipt = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "sent"}, 1)).result(1)
+        assert receipt.message.message_id == 7
         assert attempts == 2
     finally:
         queue.stop()
@@ -244,6 +276,9 @@ def test_queue_retries_oversize_attachment_without_resending_primary() -> None:
         receipt = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1)).result(1)
         assert receipt.message.message_id == 7
         assert primary_calls == 1
+        deadline = time.monotonic() + 1
+        while attachment_calls != 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert attachment_calls == 2
     finally:
         queue.stop()
@@ -273,6 +308,9 @@ def test_queue_migrates_oversize_attachment_without_resending_primary() -> None:
         receipt = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1)).result(1)
         assert receipt.message.message_id == 7
         assert primary_calls == 1
+        deadline = time.monotonic() + 1
+        while attachment_chat_ids != [1, 2] and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert attachment_chat_ids == [1, 2]
     finally:
         queue.stop()
@@ -340,8 +378,10 @@ def test_repeated_attachment_migration_fails_without_resending_primary() -> None
     queue = _queue(Sender(), worker_count=1)
     try:
         waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1))
-        with pytest.raises(QueueError, match="migrated repeatedly"):
-            waiter.result(1)
+        assert waiter.result(1).message.message_id == 7
+        deadline = time.monotonic() + 1
+        while attachment_calls != 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert primary_calls == 1
         assert attachment_calls == 2
     finally:
@@ -351,6 +391,9 @@ def test_repeated_attachment_migration_fails_without_resending_primary() -> None
 def test_oversize_attachment_terminal_failure_does_not_resend_primary() -> None:
     primary_calls = 0
     full_text = "x" * int(MessageLimit.MAX_TEXT_LENGTH)
+    attachment_started = threading.Event()
+    release_attachment = threading.Event()
+    attachment_failed = threading.Event()
 
     class Sender:
         def send_message(self, *, chat_id, text):
@@ -359,16 +402,88 @@ def test_oversize_attachment_terminal_failure_does_not_resend_primary() -> None:
             return SimpleNamespace(message_id=7)
 
         def send_document(self, _chat_id, _attachment, **_kwargs):
+            attachment_started.set()
+            assert release_attachment.wait(1)
+            attachment_failed.set()
             raise ValueError("attachment failed")
 
+    metrics = Metrics()
     queue = _queue(Sender(), worker_count=1)
+    queue.bind_metrics(metrics)
     try:
         waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1))
-        with pytest.raises(ValueError, match="attachment failed"):
-            waiter.result(1)
+        assert attachment_started.wait(1)
+        assert waiter.result(1).message.message_id == 7
+        release_attachment.set()
+        assert attachment_failed.wait(1)
         assert primary_calls == 1
+        expected_metric = 'etm_outbound_outcomes_total{operation="send_document",outcome="attachment_failure"} 1.0'
+        deadline = time.monotonic() + 1
+        while expected_metric not in generate_latest(metrics.registry).decode() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert expected_metric in generate_latest(metrics.registry).decode()
+    finally:
+        release_attachment.set()
+        queue.stop()
+
+
+def test_queue_rejects_saturated_pending_work_and_releases_cancelled_request() -> None:
+    started, release = threading.Event(), threading.Event()
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            started.set()
+            assert release.wait(1)
+            return SimpleNamespace(message_id=7)
+
+    queue = OutboundQueue(Sender(), None, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1, max_pending=1)
+    queue.start()
+    try:
+        queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "active"}, 1))
+        assert started.wait(1)
+        cancelled = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 2, "text": "cancelled"}, 2))
+        assert cancelled.cancel()
+        queued = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 3, "text": "queued"}, 3))
+        with pytest.raises(QueueEnqueueError, match="pending capacity"):
+            queue.enqueue(QueueRequest("send_message", (), {"chat_id": 4, "text": "rejected"}, 4))
+        release.set()
+        assert queued.result(1).message.message_id == 7
+    finally:
+        release.set()
+        queue.stop()
+
+
+def test_queue_emits_bounded_outcome_saturation_and_latency_metrics() -> None:
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            if text == "fail":
+                raise ValueError("terminal")
+            return SimpleNamespace(message_id=chat_id)
+
+    metrics = Metrics()
+    queue = OutboundQueue(Sender(), None, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1, max_pending=0)
+    queue.bind_metrics(metrics)
+    queue.start()
+    try:
+        with pytest.raises(QueueEnqueueError, match="pending capacity"):
+            queue.enqueue(QueueRequest("send_message", (), {"chat_id": 987654, "text": "rejected"}, 987654))
     finally:
         queue.stop()
+
+    queue = _queue(Sender(), worker_count=1)
+    queue.bind_metrics(metrics)
+    try:
+        assert queue.enqueue(QueueRequest("send_message", (), {"chat_id": 987654, "text": "sent"}, 987654)).result(1).message.message_id == 987654
+        with pytest.raises(ValueError, match="terminal"):
+            queue.enqueue(QueueRequest("send_message", (), {"chat_id": 987654, "text": "fail"}, 987654)).result(1)
+    finally:
+        queue.stop()
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_outcomes_total{operation="send_message",outcome="success"} 1.0' in rendered
+    assert 'etm_outbound_saturation_total{reason="pending_capacity"} 1.0' in rendered
+    assert 'etm_outbound_outcomes_total{operation="send_message",outcome="failure"} 1.0' in rendered
+    assert "987654" not in rendered
 
 
 def test_attachment_retry_blocks_later_same_chat_call_but_not_other_chat() -> None:

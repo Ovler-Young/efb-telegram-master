@@ -117,7 +117,7 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
 
 
 @pytest.mark.integration
-def test_postgresql_startup_retries_sqlite_source_finalization_after_failure(integration_postgres_config, tmp_path, monkeypatch):
+def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_archive(integration_postgres_config, tmp_path, monkeypatch):
     admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
@@ -125,7 +125,8 @@ def test_postgresql_startup_retries_sqlite_source_finalization_after_failure(int
     manager = None
     original_database = database.obj
     source_path = tmp_path / "tgdata.db"
-    source_db = SqliteDatabase(source_path)
+    migrated_path = source_path.with_suffix(".db.migrated")
+    source_db = SqliteDatabase(source_path, pragmas={"journal_mode": "wal"})
     models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
@@ -151,9 +152,14 @@ def test_postgresql_startup_retries_sqlite_source_finalization_after_failure(int
                 sent_to="master",
             )
             HistoryMigrationEntry.create(slave_chat_id="slave", target_chat_id="10", source_master_msg_id="10.1", position=0)
-        source_db.close()
         database_name, _target = _new_database(admin_db, integration_postgres_config)
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
+        assert source_path.with_name("tgdata.db-wal").exists()
+        migrated_path.write_bytes(b"operator archive")
+        with pytest.raises(RuntimeError, match="both tgdata.db and tgdata.db.migrated exist"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-import", config=config))
+        assert migrated_path.read_bytes() == b"operator archive"
+        migrated_path.unlink()
         original_link = db_module.os.link
         monkeypatch.setattr(db_module.os, "link", lambda *_args: (_ for _ in ()).throw(OSError("finalization interrupted")))
         with pytest.raises(RuntimeError, match="finalization failed"):
@@ -167,8 +173,15 @@ def test_postgresql_startup_retries_sqlite_source_finalization_after_failure(int
         assert SlaveChatInfo.select().count() == 1
         assert MsgLog.get_by_id("10.1").text == "source text"
         assert HistoryMigrationEntry.select().count() == 1
+        provenance = database.execute_sql('SELECT snapshot_identity FROM "sqliteimportprovenance"').fetchone()
+        assert provenance is not None and len(provenance[0]) == 64
         assert not source_path.exists()
-        assert source_path.with_suffix(".db.migrated").exists()
+        archive = SqliteDatabase(migrated_path)
+        archive.connect()
+        try:
+            assert archive.execute_sql("SELECT text FROM msglog WHERE master_msg_id = '10.1'").fetchone() == ("source text",)
+        finally:
+            archive.close()
     finally:
         if not source_db.is_closed():
             source_db.close()
@@ -178,6 +191,8 @@ def test_postgresql_startup_retries_sqlite_source_finalization_after_failure(int
         if database_name is not None:
             _drop_database(admin_db, database_name)
         admin_db.close()
+
+    assert not source_path.with_name("tgdata.db-wal").exists()
 
 
 

@@ -21,7 +21,7 @@ from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout, QueueRequest, SchedulerStoppedError
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 from efb_telegram_master.telegram_api import TelegramAPI
-from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
+from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
 from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
 from tests.thread_diagnostics import live_non_daemon_threads
 
@@ -289,6 +289,23 @@ def test_stop_falls_back_to_ptb_stop_running_and_is_idempotent() -> None:
     async_runtime.call_soon.assert_called_once_with(application.stop_running)
     application.stop_running.assert_called_once_with()
     async_runtime.shutdown.assert_called_once_with(None)
+
+
+def test_runtime_stop_timeout_can_be_retried() -> None:
+    async_runtime = Mock()
+    runtime = _runtime(application=Mock(), async_runtime=async_runtime)
+    stop_event = Mock()
+    runtime._stop_event = stop_event
+    async_runtime.call_soon.side_effect = lambda callback: callback() or True
+
+    with pytest.raises(TelegramRuntimeShutdownTimeout):
+        runtime.stop(time.monotonic() + 0.01)
+
+    stop_event.set.assert_called_once_with()
+    async_runtime.shutdown.assert_not_called()
+    runtime._shutdown_complete.set()
+    runtime.stop(time.monotonic() + 0.1)
+    async_runtime.shutdown.assert_called_once_with(ANY)
 
 
 def test_api_resource_shutdown_stops_metrics_server_under_its_current_owner() -> None:
