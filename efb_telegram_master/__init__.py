@@ -28,6 +28,7 @@ from .channel_commands import LocaleState, load_channel_config
 from .channel_composition import initialize_channel_components
 from .db import DatabaseManager
 from .message import ETMMsg
+from .rpc_utils import RPCUtilities
 from .utils import ExperimentalFlagsManager
 
 if TYPE_CHECKING:
@@ -107,6 +108,9 @@ class TelegramChannel(MasterChannel):
         self.history_migrations = self.db.history_migrations
         self.msglog_ingestion = self.db.msglog_ingestion
         try:
+            self.rpc_utilities = RPCUtilities(self)
+            self._owned_rpc_utilities = self.rpc_utilities
+            self.rpc_utilities.start()
             initialize_channel_components(self)
         except BaseException as error:
             cleanup = TelegramChannelInitializationCleanup(self)
@@ -164,7 +168,7 @@ class TelegramChannel(MasterChannel):
         try:
             if name == "history_replay":
                 result = method(max(0.0, deadline - time.monotonic()))
-            elif name == "bot_manager":
+            elif name in {"bot_manager", "rpc_utilities"}:
                 result = method(deadline)
             else:
                 result = method()
@@ -180,7 +184,7 @@ class TelegramChannel(MasterChannel):
 
     def _stop_non_master_resources(self, deadline: float) -> tuple[BaseException, ...]:
         initial_history_errors = self._stop_resource("history_replay", "stop", deadline)
-        errors = list(self._stop_resource("rpc_utilities", "shutdown", deadline))
+        errors = list(self._stop_resource("rpc_utilities", "stop", deadline))
         errors.extend(self._stop_resource("bot_manager", "stop_channel_resources", deadline))
         final_history_errors = self._stop_resource("history_replay", "stop", deadline) if initial_history_errors else ()
         if final_history_errors:

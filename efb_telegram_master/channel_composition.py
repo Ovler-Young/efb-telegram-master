@@ -23,7 +23,6 @@ from .mtproto import MTProtoClient
 from .oversized_notice import OversizedNoticeSender
 from .ptb_compat import Filters
 from .recipient_suggestions import RecipientSuggestionService
-from .rpc_utils import RPCUtilities
 from .slave_file_delivery import SlaveFileDelivery
 from .slave_file_transfer import SlaveFileTransfer
 from .slave_image_delivery import ImageDelivery
@@ -156,8 +155,6 @@ def initialize_channel_components(channel) -> None:
     _register_handlers(channel)
     _build_slave_services(channel)
     channel.telegram_runtime.application.add_error_handler(channel.telegram_runtime.as_async_callback(channel.bot_manager.error))
-    channel.rpc_utilities = RPCUtilities(channel)
-    channel._owned_rpc_utilities = channel.rpc_utilities
 
 
 def _register_handlers(channel) -> None:
