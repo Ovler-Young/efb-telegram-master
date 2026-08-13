@@ -85,7 +85,7 @@ def test_queue_runs_distinct_chats_concurrently():
         queue.stop()
 
 
-def test_queue_exposes_main_limiter_delay():
+def test_queue_retains_main_rate_limiter_for_integration_limiter_delay():
     class Limiter:
         def peek_delay(self, chat_id):
             return float(chat_id)
@@ -106,7 +106,7 @@ def test_queue_exposes_main_limiter_delay():
         shutdown_join_grace=0.1,
     )
     try:
-        assert queue.main_limiter_delay(7) == 7.0
+        assert queue._main_rate_limiter.peek_delay(7) == 7.0
     finally:
         queue.stop()
 

@@ -228,9 +228,6 @@ class SenderPolicy:
             cooldowns[kind] = max(cooldowns[kind], max(0.0, deadline - now))
         return cooldowns
 
-    def main_limiter_delay(self, chat_id: int) -> float:
-        return self._limiter_delay(SenderSelection(self._main_bot, None), chat_id)
-
     def rate_limit_occupancy_snapshot(self) -> dict[str, float]:
         occupancy = self._main_rate_limiter.occupancy_snapshot()
         if self._bot_pool:
@@ -320,6 +317,7 @@ class OutboundQueue:
         shutdown_drain_timeout: float,
         shutdown_join_grace: float,
     ) -> None:
+        self._main_rate_limiter = main_rate_limiter
         self._sender_policy = SenderPolicy(main_bot, bot_pool, main_rate_limiter)
         self._call_adapter = TelegramCallAdapter(bot_pool)
         self._blocking_timeout = blocking_timeout
@@ -401,9 +399,6 @@ class OutboundQueue:
 
     def cooldown_snapshot(self) -> dict[str, float]:
         return self._sender_policy.cooldown_snapshot()
-
-    def main_limiter_delay(self, chat_id: int) -> float:
-        return self._sender_policy.main_limiter_delay(chat_id)
 
     def rate_limit_occupancy_snapshot(self) -> dict[str, float]:
         return self._sender_policy.rate_limit_occupancy_snapshot()
