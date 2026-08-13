@@ -26,6 +26,10 @@ LifecycleCallback = Callable[["TelegramPollingRuntime"], Awaitable[None]]
 LocaleUpdateCallback = Callable[[Update, CallbackContext], None]
 
 
+class TelegramRuntimeShutdownTimeout(RuntimeError):
+    """The PTB application did not finish shutdown before its deadline."""
+
+
 class _BotArguments(TypedDict):
     token: str
     local_mode: bool
@@ -70,6 +74,7 @@ class TelegramPollingRuntime:
         self._stop_event: Optional[asyncio.Event] = None
         self._shutdown_complete = threading.Event()
         self._stop_lock = threading.Lock()
+        self._stop_requested = False
         self._stopped = False
         self.async_runtime = async_runtime
         self.async_bot = async_bot
@@ -230,19 +235,23 @@ class TelegramPollingRuntime:
         with self._stop_lock:
             if self._stopped:
                 return
-            self._stopped = True
-        stop_event = self._stop_event
-        if stop_event is not None:
-            self.async_runtime.call_soon(stop_event.set)
-        elif not self.async_runtime.call_soon(self.application.stop_running):
-            try:
-                self.application.stop_running()
-            except RuntimeError:
-                pass
+            stop_event = self._stop_event
+            if not self._stop_requested:
+                self._stop_requested = True
+                if stop_event is not None:
+                    self.async_runtime.call_soon(stop_event.set)
+                elif not self.async_runtime.call_soon(self.application.stop_running):
+                    try:
+                        self.application.stop_running()
+                    except RuntimeError:
+                        pass
         remaining = 30.0 if deadline is None else max(0.0, deadline - time.monotonic())
         if stop_event is not None and not self._shutdown_complete.wait(timeout=remaining):
             self.logger.warning("Telegram post-shutdown hook timed out", extra={"event": "telegram_runtime.shutdown_timeout", "timeout_seconds": remaining})
+            raise TelegramRuntimeShutdownTimeout(f"Telegram runtime did not stop within {remaining:g}s.")
         self.async_runtime.shutdown()
+        with self._stop_lock:
+            self._stopped = True
 
 
 def build_telegram_polling_runtime(

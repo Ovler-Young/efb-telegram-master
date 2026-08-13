@@ -4,7 +4,7 @@ import threading
 import time
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import ANY, AsyncMock, Mock, call, patch
 
 import pytest
 from ehforwarderbot.channel import MasterChannel
@@ -21,7 +21,7 @@ from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout, QueueRequest, SchedulerStoppedError
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 from efb_telegram_master.telegram_api import MetricsServerShutdownTimeout, TelegramAPI
-from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
+from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
 from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
 from tests.thread_diagnostics import live_non_daemon_threads
 
@@ -291,6 +291,26 @@ def test_stop_falls_back_to_ptb_stop_running_and_is_idempotent() -> None:
     async_runtime.shutdown.assert_called_once_with()
 
 
+def test_runtime_stop_timeout_is_retryable_without_shutting_down_the_async_runtime() -> None:
+    async_runtime = Mock()
+    runtime = _runtime(application=Mock(), async_runtime=async_runtime)
+    stop_event = Mock()
+    runtime._stop_event = stop_event
+    async_runtime.call_soon.side_effect = lambda callback: callback() or True
+
+    with pytest.raises(TelegramRuntimeShutdownTimeout):
+        runtime.stop(time.monotonic() + 0.01)
+
+    stop_event.set.assert_called_once_with()
+    async_runtime.shutdown.assert_not_called()
+
+    runtime._shutdown_complete.set()
+    runtime.stop(time.monotonic() + 0.1)
+
+    stop_event.set.assert_called_once_with()
+    async_runtime.shutdown.assert_called_once_with()
+
+
 def test_api_resource_shutdown_stops_metrics_server_under_its_current_owner() -> None:
     bot_pool = Mock()
     bot_pool.wait_for_shutdown.return_value = ()
@@ -374,6 +394,7 @@ def test_channel_retries_real_blocked_outbound_before_closing_database() -> None
     manager.SHUTDOWN_DRAIN_TIMEOUT = 0.01
     manager.SHUTDOWN_JOIN_GRACE = 0.01
     channel = TelegramChannel.__new__(TelegramChannel)
+    channel.SHUTDOWN_TIMEOUT = 0.02
     channel._stop_polling_called = False
     channel.logger = Mock()
     channel.rpc_utilities = Mock()
@@ -436,7 +457,7 @@ def test_channel_shutdown_error_still_stops_channel_owned_workers() -> None:
         channel.stop_polling()
 
     assert channel._stop_polling_called
-    channel.master_message_worker.stop_worker.assert_called_once_with()
+    channel.master_message_worker.stop_worker.assert_called_once_with(deadline=ANY)
     channel.db.stop_worker.assert_not_called()
 
 
@@ -450,8 +471,8 @@ def test_channel_stops_master_messages_before_outbound_delivery() -> None:
     channel.db = Mock()
 
     events: list[str] = []
-    channel.master_message_worker.stop_worker.side_effect = lambda: events.append("master")
-    channel.bot_manager.stop_channel_resources.side_effect = lambda: events.append("outbound")
+    channel.master_message_worker.stop_worker.side_effect = lambda **_kwargs: events.append("master")
+    channel.bot_manager.stop_channel_resources.side_effect = lambda *_args: events.append("outbound")
 
     channel.stop_polling()
 
@@ -472,6 +493,7 @@ def test_channel_defers_delivery_and_database_close_until_master_worker_exits() 
     worker = MasterMessageWorker(runtime, Mock(), inbound, Mock(), lambda text: text, Mock())
     worker.DEFAULT_STOP_TIMEOUT = 0.05
     channel = TelegramChannel.__new__(TelegramChannel)
+    channel.SHUTDOWN_TIMEOUT = 0.05
     channel._stop_polling_called = False
     channel.logger = Mock()
     channel.rpc_utilities = Mock()
@@ -496,12 +518,80 @@ def test_channel_defers_delivery_and_database_close_until_master_worker_exits() 
         channel.stop_polling()
         channel.stop_polling()
 
-        channel.bot_manager.stop_channel_resources.assert_called_once_with()
+        channel.bot_manager.stop_channel_resources.assert_called_once_with(ANY)
         channel.rpc_utilities.shutdown.assert_called_once_with()
         channel.db.stop_worker.assert_called_once_with()
     finally:
         release.set()
         worker.stop_worker()
+
+
+def test_channel_retries_runtime_timeout_before_closing_database() -> None:
+    async_runtime = Mock()
+    runtime = _runtime(application=Mock(), async_runtime=async_runtime)
+    runtime._stop_event = Mock()
+    async_runtime.call_soon.side_effect = lambda callback: callback() or True
+    api = Mock()
+    api.begin_delivery_shutdown.return_value = ()
+    api.finish_delivery_shutdown.return_value = ()
+    manager = _manager(api, runtime)
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel.SHUTDOWN_TIMEOUT = 0.01
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    channel.history_replay = Mock(stop=Mock(return_value=()))
+    channel.master_message_worker = Mock(stop_worker=Mock(return_value=()))
+    channel.bot_manager = manager
+    channel.db = Mock()
+
+    with pytest.raises(TelegramResourceShutdownError) as raised:
+        channel.stop_polling()
+
+    assert isinstance(raised.value.errors[0], TelegramRuntimeShutdownTimeout)
+    channel.db.stop_worker.assert_not_called()
+    async_runtime.shutdown.assert_not_called()
+
+    runtime._shutdown_complete.set()
+    channel.SHUTDOWN_TIMEOUT = 0.1
+    channel.stop_polling()
+    channel.stop_polling()
+
+    channel.db.stop_worker.assert_called_once_with()
+    async_runtime.shutdown.assert_called_once_with()
+
+
+def test_channel_uses_one_deadline_for_master_and_downstream_shutdown_phases() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel.SHUTDOWN_TIMEOUT = 0.08
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    channel.history_replay = Mock(stop=Mock(return_value=()))
+    channel.db = Mock()
+    observed: dict[str, float] = {}
+
+    def stop_master(*, deadline: float) -> tuple[BaseException, ...]:
+        observed["master_deadline"] = deadline
+        time.sleep(0.025)
+        return ()
+
+    def stop_manager(deadline: float) -> None:
+        observed["manager_deadline"] = deadline
+        observed["manager_remaining"] = deadline - time.monotonic()
+
+    channel.master_message_worker = Mock(stop_worker=Mock(side_effect=stop_master))
+    channel.bot_manager = Mock(stop_channel_resources=Mock(side_effect=stop_manager))
+
+    started = time.monotonic()
+    channel.stop_polling()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < channel.SHUTDOWN_TIMEOUT + 0.04
+    assert observed["master_deadline"] == observed["manager_deadline"]
+    assert 0.0 <= observed["manager_remaining"] < channel.SHUTDOWN_TIMEOUT - 0.01
+    history_timeout = channel.history_replay.stop.call_args.args[0]
+    assert 0.0 <= history_timeout < channel.SHUTDOWN_TIMEOUT - 0.01
 
 
 def test_channel_does_not_close_database_while_history_worker_is_blocked() -> None:
@@ -517,7 +607,7 @@ def test_channel_does_not_close_database_while_history_worker_is_blocked() -> No
     with pytest.raises(TelegramResourceShutdownError, match="target 100"):
         channel.stop_polling()
 
-    channel.master_message_worker.stop_worker.assert_called_once_with()
+    channel.master_message_worker.stop_worker.assert_called_once_with(deadline=ANY)
     channel.db.stop_worker.assert_not_called()
 
 
@@ -540,7 +630,7 @@ def test_channel_retries_blocked_history_shutdown_then_closes_database_once() ->
     channel.stop_polling()
 
     channel.db.stop_worker.assert_called_once_with()
-    channel.bot_manager.stop_channel_resources.assert_called_once_with()
+    channel.bot_manager.stop_channel_resources.assert_called_once_with(ANY)
     assert channel.master_message_worker.stop_worker.call_count == 2
 
 
@@ -687,7 +777,7 @@ def test_channel_constructor_stops_started_history_replay_when_handler_registrat
 
     assert not any(thread.name == "HistoryMigrationReplay" for thread in live_non_daemon_threads())
     assert history_worker_started.is_set()
-    bot_manager.stop_channel_resources.assert_called_once_with()
+    bot_manager.stop_channel_resources.assert_called_once_with(ANY)
     database_manager.stop_worker.assert_called_once_with()
 
 
@@ -759,6 +849,7 @@ def test_channel_constructor_failure_stops_the_real_started_message_worker() -> 
         stack.enter_context(patch("efb_telegram_master.channel_composition.MasterMessageInbound", return_value=inbound))
         stack.enter_context(patch("efb_telegram_master.channel_composition.RPCUtilities", side_effect=RuntimeError("rpc setup failed")))
         stack.enter_context(patch.object(MasterMessageWorker, "DEFAULT_STOP_TIMEOUT", 0.01))
+        stack.enter_context(patch.object(TelegramChannel, "SHUTDOWN_TIMEOUT", 0.01))
         for dependency in dependencies:
             stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
 
@@ -779,8 +870,8 @@ def test_channel_constructor_failure_stops_the_real_started_message_worker() -> 
 
     assert not worker.message_worker_thread.is_alive()
     assert "ETM master messages worker thread" not in {thread.name for thread in live_non_daemon_threads()}
-    history_replay.stop.assert_called_once_with()
-    bot_manager.stop_channel_resources.assert_called_once_with()
+    history_replay.stop.assert_called_once_with(ANY)
+    bot_manager.stop_channel_resources.assert_called_once_with(ANY)
     database_manager.stop_worker.assert_called_once_with()
 
 
@@ -869,16 +960,16 @@ def test_constructor_failure_retains_resources_until_master_worker_stops() -> No
 
     assert channel._stop_after_constructor_failure() == (timeout,)
     assert resources.mock_calls == [
-        call.master_worker.stop_worker(),
+        call.master_worker.stop_worker(deadline=ANY),
     ]
 
     assert channel._stop_after_constructor_failure() == ()
     assert resources.mock_calls == [
-        call.master_worker.stop_worker(),
-        call.master_worker.stop_worker(),
-        call.history_replay.stop(),
+        call.master_worker.stop_worker(deadline=ANY),
+        call.master_worker.stop_worker(deadline=ANY),
+        call.history_replay.stop(ANY),
         call.rpc_utilities.shutdown(),
-        call.bot_manager.stop_channel_resources(),
+        call.bot_manager.stop_channel_resources(ANY),
         call.database.stop_worker(),
     ]
 

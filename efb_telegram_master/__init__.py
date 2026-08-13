@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import mimetypes
 import threading
+import time
 from typing import TYPE_CHECKING, Callable, List, Optional
 from xmlrpc.server import SimpleXMLRPCServer
 
@@ -22,7 +23,7 @@ from telegram.ext import CallbackContext
 
 from . import utils as etm_utils
 from .__version__ import __version__
-from .bot_manager import TelegramResourceShutdownError
+from .bot_manager import TelegramBotManager, TelegramResourceShutdownError
 from .channel_commands import LocaleState, load_channel_config
 from .channel_composition import initialize_channel_components
 from .db import DatabaseManager
@@ -61,6 +62,7 @@ class TelegramChannel(MasterChannel):
     __version__ = __version__
 
     _stop_polling = False
+    SHUTDOWN_TIMEOUT = TelegramBotManager.SHUTDOWN_DRAIN_TIMEOUT + TelegramBotManager.SHUTDOWN_JOIN_GRACE
     config: dict
     bot_manager: TelegramBotManager
     telegram_runtime: TelegramPollingRuntime
@@ -120,10 +122,11 @@ class TelegramChannel(MasterChannel):
         with lock:
             if getattr(self, "_shutdown_complete", False):
                 return ()
+            deadline = time.monotonic() + self.SHUTDOWN_TIMEOUT
             master_message_worker = self._shutdown_resource("master_message_worker")
             if master_message_worker is not None:
                 try:
-                    master_errors = master_message_worker.stop_worker()
+                    master_errors = master_message_worker.stop_worker(deadline=deadline)
                 except BaseException as error:
                     master_errors = (error,)
                 if master_errors:
@@ -134,7 +137,7 @@ class TelegramChannel(MasterChannel):
                         )
                     return tuple(master_errors)
 
-            errors = self._stop_non_master_resources()
+            errors = self._stop_non_master_resources(deadline)
             if errors:
                 return errors
             self._shutdown_complete = True
@@ -147,7 +150,7 @@ class TelegramChannel(MasterChannel):
         attribute = "db" if name == "database" else name
         return getattr(self, attribute, None)
 
-    def _stop_resource(self, name: str, method_name: str) -> tuple[BaseException, ...]:
+    def _stop_resource(self, name: str, method_name: str, deadline: float) -> tuple[BaseException, ...]:
         stopped_resources = getattr(self, "_stopped_resources", None)
         if stopped_resources is None:
             stopped_resources = self._stopped_resources = set()
@@ -159,7 +162,12 @@ class TelegramChannel(MasterChannel):
             stopped_resources.add(name)
             return ()
         try:
-            result = method()
+            if name == "history_replay":
+                result = method(max(0.0, deadline - time.monotonic()))
+            elif name == "bot_manager":
+                result = method(deadline)
+            else:
+                result = method()
         except TelegramResourceShutdownError as error:
             return error.errors
         except BaseException as error:
@@ -170,16 +178,16 @@ class TelegramChannel(MasterChannel):
             stopped_resources.add(name)
         return errors
 
-    def _stop_non_master_resources(self) -> tuple[BaseException, ...]:
-        initial_history_errors = self._stop_resource("history_replay", "stop")
-        errors = list(self._stop_resource("rpc_utilities", "shutdown"))
-        errors.extend(self._stop_resource("bot_manager", "stop_channel_resources"))
-        final_history_errors = self._stop_resource("history_replay", "stop") if initial_history_errors else ()
+    def _stop_non_master_resources(self, deadline: float) -> tuple[BaseException, ...]:
+        initial_history_errors = self._stop_resource("history_replay", "stop", deadline)
+        errors = list(self._stop_resource("rpc_utilities", "shutdown", deadline))
+        errors.extend(self._stop_resource("bot_manager", "stop_channel_resources", deadline))
+        final_history_errors = self._stop_resource("history_replay", "stop", deadline) if initial_history_errors else ()
         if final_history_errors:
             errors.extend(final_history_errors)
         if errors:
             return tuple(errors)
-        return self._stop_resource("database", "stop_worker")
+        return self._stop_resource("database", "stop_worker", deadline)
 
     def _translate(self, message: str) -> str:
         return self.locale_state.gettext(message)
@@ -249,12 +257,13 @@ class TelegramChannel(MasterChannel):
             if self._shutdown_complete:
                 return
             self._stop_polling_called = self._stopping = True
+            deadline = time.monotonic() + self.SHUTDOWN_TIMEOUT
             self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
-            master_errors = self._shutdown_resource("master_message_worker").stop_worker()
+            master_errors = self._shutdown_resource("master_message_worker").stop_worker(deadline=deadline)
             if master_errors:
                 self.logger.warning("Master message worker did not stop before the deadline", extra={"event": "telegram_channel.master_message_shutdown_timeout"})
                 raise TelegramResourceShutdownError(master_errors)
-            errors = self._stop_non_master_resources()
+            errors = self._stop_non_master_resources(deadline)
             if not errors:
                 self._shutdown_complete = True
             self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})

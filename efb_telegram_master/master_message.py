@@ -79,10 +79,12 @@ class MasterMessageWorker:
             finally:
                 self.message_queue.task_done()
 
-    def stop_worker(self, join_timeout: Optional[float] = None) -> tuple[BaseException, ...]:
-        if join_timeout is None:
-            join_timeout = self.DEFAULT_STOP_TIMEOUT
-        deadline = time.monotonic() + max(0.0, join_timeout)
+    def stop_worker(self, join_timeout: Optional[float] = None, *, deadline: Optional[float] = None) -> tuple[BaseException, ...]:
+        if deadline is None:
+            join_timeout = self.DEFAULT_STOP_TIMEOUT if join_timeout is None else join_timeout
+            deadline = time.monotonic() + max(0.0, join_timeout)
+        elif join_timeout is None:
+            join_timeout = max(0.0, deadline - time.monotonic())
         with self._queue_lock:
             self._stopping.set()
             drained_count = 0
@@ -108,7 +110,7 @@ class MasterMessageWorker:
             self.message_worker_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self.message_worker_thread.is_alive():
             self.logger.warning("Message worker thread did not stop within timeout")
-            return (MasterMessageWorkerShutdownTimeout(f"Master message worker did not stop within {join_timeout:g}s."),)
+            return (MasterMessageWorkerShutdownTimeout(f"Master message worker did not stop before its shutdown deadline ({join_timeout:g}s remaining)."),)
         return ()
 
     def enqueue_message(self, update: Update, context: CallbackContext) -> None:
