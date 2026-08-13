@@ -252,6 +252,7 @@ class DatabaseManager:
     logger = logging.getLogger(__name__)
     FAIL_FLAG = "__fail__"
     _LEGACY_MSGLOG_INGESTION_SCAN_TABLE = "msglogingestionscan"
+    _LEGACY_MSGLOG_INGESTION_SCAN_LOCK_KEY = 681_774_240_616_480_004
     _LEGACY_MSGLOG_INGESTION_SCAN_COLUMNS = frozenset(
         {
             "id",
@@ -434,18 +435,28 @@ class DatabaseManager:
     @staticmethod
     def _retire_legacy_msglog_ingestion_scan() -> None:
         """Drop the removed scan table only when it has the retired schema."""
+        current_database = database.obj
+        transaction_arguments: Tuple[str, ...] = ()
+        if isinstance(current_database, SqliteDatabase):
+            transaction_arguments = ("IMMEDIATE",)
+        elif not isinstance(current_database, PostgresqlDatabase):
+            raise TypeError(f"Unsupported database backend: {type(current_database).__name__}")
+
         table = DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_TABLE
-        if table not in database.get_tables():
-            return
-        column_definitions = database.get_columns(table)
-        columns = {column.name for column in column_definitions}
-        signature = {DatabaseManager._legacy_msglog_ingestion_scan_column_signature(column) for column in column_definitions}
-        indexes = database.get_indexes(table)
-        source_chat_is_unique = any(index.unique and tuple(index.columns) == ("source_chat_id",) for index in indexes)
-        if columns != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_COLUMNS or signature != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_SIGNATURE or not source_chat_is_unique:
-            DatabaseManager.logger.warning("Retaining %s because its schema does not match the retired MsgLog ingestion scan table", table)
-            return
-        database.execute_sql(f'DROP TABLE "{table}"')
+        with current_database.atomic(*transaction_arguments):
+            if isinstance(current_database, PostgresqlDatabase):
+                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_LOCK_KEY,))
+            if table not in current_database.get_tables():
+                return
+            column_definitions = current_database.get_columns(table)
+            columns = {column.name for column in column_definitions}
+            signature = {DatabaseManager._legacy_msglog_ingestion_scan_column_signature(column) for column in column_definitions}
+            indexes = current_database.get_indexes(table)
+            source_chat_is_unique = any(index.unique and tuple(index.columns) == ("source_chat_id",) for index in indexes)
+            if columns != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_COLUMNS or signature != DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_SIGNATURE or not source_chat_is_unique:
+                DatabaseManager.logger.warning("Retaining %s because its schema does not match the retired MsgLog ingestion scan table", table)
+                return
+            current_database.execute_sql(f'DROP TABLE "{table}"')
 
     @staticmethod
     def _legacy_msglog_ingestion_scan_column_signature(column: object) -> tuple[str, str, bool, bool]:
@@ -519,7 +530,13 @@ class DatabaseManager:
     @classmethod
     def _legacy_outbound_schema_error(cls, current_database, table_name: str) -> Optional[str]:
         expected_columns = tuple(
-            (name, "integer" if isinstance(current_database, SqliteDatabase) and data_type == "boolean" else data_type, null, primary_key, cls._LEGACY_OUTBOUND_DEFAULT_CATEGORIES[table_name].get(name, "none"))
+            (
+                name,
+                "integer" if isinstance(current_database, SqliteDatabase) and data_type == "boolean" else data_type,
+                null,
+                primary_key,
+                cls._LEGACY_OUTBOUND_DEFAULT_CATEGORIES[table_name].get(name, "none"),
+            )
             for name, data_type, null, primary_key in cls._LEGACY_OUTBOUND_COLUMNS[table_name]
         )
         actual_columns = tuple(

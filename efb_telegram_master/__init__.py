@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 import shlex
+import threading
 import time
 from gettext import NullTranslations, translation
 from typing import Callable, List, Optional
@@ -698,9 +699,31 @@ class TelegramChannel(MasterChannel):
         self.master_messages.stop_worker()
         if self.chat_binding.stop_msglog_ingestions():
             self.db.stop_worker()
-        elif self.chat_binding.close_database_after_msglog_ingestions():
-            self.db.stop_worker()
+        else:
+            self.chat_binding.close_database_after_msglog_ingestions(self._schedule_deferred_database_close)
         self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
+
+    def _schedule_deferred_database_close(self) -> None:
+        lock = getattr(self, "_database_close_lock", None)
+        if lock is None:
+            lock = self._database_close_lock = threading.Lock()
+        with lock:
+            if getattr(self, "_database_close_scheduled", False):
+                return
+            self._database_close_scheduled = True
+        if not self.telegram_runtime.async_runtime.call_soon(self._close_database_from_runtime, start_background_loop=True):
+            with lock:
+                self._database_close_scheduled = False
+            self.logger.error("Unable to schedule deferred database shutdown", extra={"event": "telegram_channel.database_shutdown_schedule_failed"})
+
+    def _close_database_from_runtime(self) -> None:
+        lock = self._database_close_lock
+        with lock:
+            if getattr(self, "_database_closed", False):
+                return
+            self.db.stop_worker()
+            self._database_closed = True
+        self.telegram_runtime.async_runtime.shutdown()
 
     def get_chats(self) -> List[Chat]:
         raise EFBOperationNotSupported()

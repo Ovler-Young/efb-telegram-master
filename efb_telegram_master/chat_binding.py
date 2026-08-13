@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.parse
 from contextlib import suppress
-from typing import IO, TYPE_CHECKING, Dict, List, Optional, Pattern, Tuple, Union, cast
+from typing import IO, TYPE_CHECKING, Callable, Dict, List, Optional, Pattern, Tuple, Union, cast
 
 import telegram  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, MsgType, coordinator
@@ -1400,10 +1400,21 @@ class ChatBindingManager(LocaleMixin):
                 worker.join(timeout=self.MSGLOG_INGESTION_JOIN_TIMEOUT)
         return not any(worker.is_alive() for worker in workers)
 
-    def close_database_after_msglog_ingestions(self) -> bool:
-        """Report whether the database owner may close after bounded worker shutdown."""
+    def close_database_after_msglog_ingestions(self, close_database: Callable[[], None]) -> None:
+        """Schedule channel-owned cleanup when the final scan worker exits."""
         with self._msglog_ingestion_lock:
-            return not any(worker.is_alive() for worker in self._msglog_ingestion_threads.values())
+            workers = tuple(self._msglog_ingestion_threads.values())
+        if not any(worker.is_alive() for worker in workers):
+            close_database()
+            return
+        threading.Thread(target=self._wait_for_msglog_ingestions_then_close, args=(workers, close_database), daemon=True, name="MsgLogIngestionShutdown").start()
+
+    @staticmethod
+    def _wait_for_msglog_ingestions_then_close(workers: Tuple[threading.Thread, ...], close_database: Callable[[], None]) -> None:
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join()
+        close_database()
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
         """Background method that performs the actual migration work.

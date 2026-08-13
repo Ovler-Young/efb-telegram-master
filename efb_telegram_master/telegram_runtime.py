@@ -119,9 +119,13 @@ class AsyncTelegramRuntime:
         if loop is None:
             self.clear_loop()
 
-    def call_soon(self, callback: Callable[..., object], *args: object) -> bool:
+    def call_soon(self, callback: Callable[..., object], *args: object, start_background_loop: bool = False) -> bool:
         with self._lock:
             loop = self._loop
+        if loop is None and start_background_loop:
+            self._ensure_background_loop()
+            with self._lock:
+                loop = self._loop
         if loop is None:
             return False
         loop.call_soon_threadsafe(callback, *args)

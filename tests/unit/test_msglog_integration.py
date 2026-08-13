@@ -10,6 +10,7 @@ from telegram import Update
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.chat_binding import ChatBindingManager
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageProcessor
+from efb_telegram_master.telegram_runtime import AsyncTelegramRuntime
 
 
 def test_sync_msglog_requires_admin_and_a_bound_forum_group():
@@ -45,7 +46,7 @@ def test_stop_msglog_ingestions_joins_active_workers():
     assert not worker.is_alive()
 
 
-def test_channel_shutdown_does_not_close_database_from_an_ingestion_worker():
+def test_channel_shutdown_defers_database_close_to_runtime_after_an_ingestion_worker_exits():
     manager = object.__new__(ChatBindingManager)
     manager._msglog_ingestion_lock = threading.Lock()
     manager._msglog_ingestion_stop = threading.Event()
@@ -73,9 +74,21 @@ def test_channel_shutdown_does_not_close_database_from_an_ingestion_worker():
     channel.rpc_utilities = SimpleNamespace(shutdown=Mock())
     channel.chat_binding = manager
     channel.bot_manager = SimpleNamespace(stop_channel_resources=Mock())
-    channel.telegram_runtime = SimpleNamespace(stop=Mock(side_effect=lambda: asyncio.run(TelegramChannel._telegram_runtime_stopped(channel, SimpleNamespace()))))
+    runtime = AsyncTelegramRuntime(Mock())
+    channel.telegram_runtime = SimpleNamespace(
+        stop=Mock(side_effect=lambda: asyncio.run(TelegramChannel._telegram_runtime_stopped(channel, SimpleNamespace()))),
+        async_runtime=runtime,
+    )
     channel.master_messages = SimpleNamespace(stop_worker=Mock())
-    channel.db = SimpleNamespace(stop_worker=Mock())
+    database_closed = threading.Event()
+    close_thread_names = []
+
+    def close_database() -> None:
+        assert not worker.is_alive()
+        close_thread_names.append(threading.current_thread().name)
+        database_closed.set()
+
+    channel.db = SimpleNamespace(stop_worker=Mock(side_effect=close_database))
     channel.mtproto = mtproto
 
     completed = threading.Event()
@@ -91,10 +104,15 @@ def test_channel_shutdown_does_not_close_database_from_an_ingestion_worker():
     mtproto.disconnect.assert_called_once()
     channel.db.stop_worker.assert_not_called()
 
-    request_released.set()
-    worker.join(timeout=1)
-    assert not worker.is_alive()
-    channel.db.stop_worker.assert_not_called()
+    try:
+        request_released.set()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert database_closed.wait(timeout=1)
+        channel.db.stop_worker.assert_called_once_with()
+        assert close_thread_names != [worker.name]
+    finally:
+        runtime.shutdown()
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

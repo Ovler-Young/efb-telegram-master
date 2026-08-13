@@ -307,6 +307,50 @@ def test_legacy_scan_schema_normalization_accepts_postgresql_names_and_rejects_l
     assert DatabaseManager._legacy_msglog_ingestion_scan_column_signature(lookalike_id) != ("id", "integer", False, True)
 
 
+def test_legacy_scan_retirement_locks_postgresql_before_rechecking_for_the_table(monkeypatch):
+    original_database = database.obj
+    postgresql_database = PostgresqlDatabase("tests")
+    statements = []
+
+    monkeypatch.setattr(postgresql_database, "get_binary_type", lambda: bytes)
+    monkeypatch.setattr(postgresql_database, "atomic", lambda: nullcontext())
+    monkeypatch.setattr(postgresql_database, "get_tables", lambda: [])
+    monkeypatch.setattr(postgresql_database, "execute_sql", lambda statement, parameters=None: statements.append((statement, parameters)))
+    database.initialize(postgresql_database)
+    try:
+        DatabaseManager._retire_legacy_msglog_ingestion_scan()
+    finally:
+        database.initialize(original_database)
+
+    assert statements == [("SELECT pg_advisory_xact_lock(%s)", (DatabaseManager._LEGACY_MSGLOG_INGESTION_SCAN_LOCK_KEY,))]
+
+
+def test_legacy_scan_retirement_serializes_each_sqlite_initializer(monkeypatch):
+    original_database = database.obj
+    sqlite_database = SqliteDatabase(":memory:")
+    transactions = []
+    original_atomic = sqlite_database.atomic
+
+    def atomic(*arguments):
+        transactions.append(arguments)
+        return original_atomic(*arguments)
+
+    monkeypatch.setattr(sqlite_database, "atomic", atomic)
+    database.initialize(sqlite_database)
+    sqlite_database.connect()
+    sqlite_database.execute_sql(_LEGACY_INGESTION_SCAN_SCHEMA)
+    try:
+        DatabaseManager._retire_legacy_msglog_ingestion_scan()
+        DatabaseManager._retire_legacy_msglog_ingestion_scan()
+        tables = set(sqlite_database.get_tables())
+    finally:
+        sqlite_database.close()
+        database.initialize(original_database)
+
+    assert transactions == [("IMMEDIATE",), ("IMMEDIATE",)]
+    assert "msglogingestionscan" not in tables
+
+
 def test_ingested_msglog_persistence_is_idempotent():
     original_database = database.obj
     test_db = SqliteDatabase(":memory:")
