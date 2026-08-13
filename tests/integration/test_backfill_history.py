@@ -475,7 +475,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
             min_message_id=relink_true_message.id,
             metrics_before=migration_metrics_before,
         )
-        assert _queue_activity_completed(
+        assert _queue_activity_completed_with_additional_control_sends(
             migration_metrics_before,
             migration_metrics_after,
             expected_count=STREAM_MESSAGE_COUNT,
