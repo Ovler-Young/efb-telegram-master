@@ -249,7 +249,7 @@ class TelegramPollingRuntime:
         if stop_event is not None and not self._shutdown_complete.wait(timeout=remaining):
             self.logger.warning("Telegram post-shutdown hook timed out", extra={"event": "telegram_runtime.shutdown_timeout", "timeout_seconds": remaining})
             raise TelegramRuntimeShutdownTimeout(f"Telegram runtime did not stop within {remaining:g}s.")
-        self.async_runtime.shutdown()
+        self.async_runtime.shutdown(deadline)
         with self._stop_lock:
             self._stopped = True
 

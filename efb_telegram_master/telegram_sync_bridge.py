@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Callable, Coroutine
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -14,6 +15,10 @@ from typing import Optional, TypeVar, cast
 import telegram
 
 T = TypeVar("T")
+
+
+class AsyncTelegramRuntimeShutdownTimeout(RuntimeError):
+    """An owned bridge loop remained alive after its shutdown deadline."""
 
 
 class AsyncTelegramRuntime:
@@ -83,13 +88,16 @@ class AsyncTelegramRuntime:
         if not started.wait(timeout=30):
             raise RuntimeError("Failed to start Telegram runtime loop thread.")
 
-    def shutdown(self) -> None:
+    def shutdown(self, deadline: float | None = None) -> None:
         with self._lock:
             loop, thread = (self._loop, self._loop_thread) if self._owns_loop_thread else (None, None)
         if loop is not None:
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None and thread.ident != threading.get_ident():
-            thread.join(timeout=5)
+            timeout = 5.0 if deadline is None else max(0.0, deadline - time.monotonic())
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise AsyncTelegramRuntimeShutdownTimeout(f"Telegram bridge loop did not stop within {timeout:g}s.")
         if loop is None:
             self.clear_loop()
 

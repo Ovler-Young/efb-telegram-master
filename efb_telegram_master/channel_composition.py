@@ -42,18 +42,24 @@ def initialize_channel_components(channel) -> None:
     channel.chat_manager = ChatObjectCacheManager(channel)
     channel.chat_dest_cache = ChatDestinationCache(channel.flag("send_to_last_chat"))
     channel.topic_group = TelegramChatID(channel.flag("topic_group"))
-    channel.bot_manager = TelegramBotManager(
-        channel,
-        channel.mtproto,
-        channel.msglog_ingestion,
-        channel.chat_associations,
-        channel.channel_id,
-        lambda: int(channel.flag("network_error_prompt_interval")),
-        lambda: bool(channel.flag("auto_locale")),
-        channel._,
-        channel.ngettext,
-        channel.locale_state.update,
-    )
+    try:
+        channel.bot_manager = TelegramBotManager(
+            channel,
+            channel.mtproto,
+            channel.msglog_ingestion,
+            channel.chat_associations,
+            channel.channel_id,
+            lambda: int(channel.flag("network_error_prompt_interval")),
+            lambda: bool(channel.flag("auto_locale")),
+            channel._,
+            channel.ngettext,
+            channel.locale_state.update,
+        )
+    except BaseException as error:
+        cleanup = getattr(error, "telegram_bot_manager_cleanup", None)
+        if cleanup is not None:
+            channel._owned_bot_manager = cleanup.manager
+        raise
     channel._owned_bot_manager = channel.bot_manager
     channel.telegram_runtime = channel.bot_manager.telegram_runtime
     channel.msglog_scan = channel.bot_manager.msglog_scan

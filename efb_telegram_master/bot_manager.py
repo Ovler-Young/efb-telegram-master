@@ -41,6 +41,16 @@ class TelegramResourceShutdownError(RuntimeError):
         super().__init__(f"Telegram resource shutdown failed: {details}")
 
 
+class TelegramBotManagerInitializationCleanup:
+    """Retain delivery shutdown ownership after manager construction fails."""
+
+    def __init__(self, manager: "TelegramBotManager") -> None:
+        self.manager = manager
+
+    def retry(self) -> tuple[BaseException, ...]:
+        return self.manager._stop_after_initialization_failure()
+
+
 class TelegramBotManager:
     """Construct and stop the Telegram runtime and its delivery collaborator."""
 
@@ -100,11 +110,14 @@ class TelegramBotManager:
         outbound_queue.start()
         try:
             self.telegram_runtime.add_base_dispatchers(config["admins"], self.update_locale)
-        except BaseException:
-            self._stop_after_initialization_failure()
+        except BaseException as error:
+            cleanup = TelegramBotManagerInitializationCleanup(self)
+            cleanup_errors = cleanup.retry()
+            if cleanup_errors:
+                setattr(error, "telegram_bot_manager_cleanup", cleanup)
             raise
 
-    def _stop_after_initialization_failure(self) -> None:
+    def _stop_after_initialization_failure(self) -> tuple[BaseException, ...]:
         deadline = time.monotonic() + self.SHUTDOWN_DRAIN_TIMEOUT + self.SHUTDOWN_JOIN_GRACE
         scheduler = getattr(self, "msglog_scan", None)
         cleanup_errors: list[BaseException] = []
@@ -118,9 +131,13 @@ class TelegramBotManager:
         except BaseException as error:
             cleanup_errors.append(error)
             self.logger.exception("Failed to stop the Telegram runtime after initialization failed.")
-        try:
-            if scheduler is not None:
+        if scheduler is not None:
+            try:
                 cleanup_errors.extend(scheduler.stop(max(0.0, deadline - time.monotonic())))
+            except BaseException as error:
+                cleanup_errors.append(error)
+                self.logger.exception("Failed to stop MsgLog ingestion after initialization failed.")
+        try:
             cleanup_errors.extend(self.api.finish_delivery_shutdown(deadline))
         except BaseException as error:
             cleanup_errors.append(error)
@@ -131,6 +148,7 @@ class TelegramBotManager:
                 cleanup_error,
                 exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
             )
+        return tuple(cleanup_errors)
 
     @property
     def _(self) -> Callable[[str], str]:
