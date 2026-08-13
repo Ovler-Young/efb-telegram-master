@@ -166,6 +166,7 @@ class TelegramBotManager(LocaleMixin):
             blocking_timeout=self.BLOCKING_SEND_TIMEOUT,
             shutdown_drain_timeout=self.SHUTDOWN_DRAIN_TIMEOUT,
             shutdown_join_grace=self.SHUTDOWN_JOIN_GRACE,
+            metrics=self._metrics,
         )
         self._register_runtime_metric_collectors(metrics_top_n)
 

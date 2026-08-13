@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from prometheus_client import CollectorRegistry, Counter, Histogram
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
 from .outbound import QUEUED_OPERATIONS, OutboundQueue
@@ -146,6 +146,29 @@ class Metrics:
         self.namespace = namespace
         self._collectors: list[_CallbackCollector] = []
         self._logged_collector_failures: set[str] = set()
+        self.outbound_enqueued = Counter(
+            f"{namespace}_outbound_enqueued_total",
+            "Outbound calls accepted by the in-memory queue.",
+            ["priority", "operation"],
+            registry=self.registry,
+        )
+        self.outbound_queue_depth = Gauge(
+            f"{namespace}_outbound_queue_depth",
+            "Outbound calls pending or in flight in the in-memory queue.",
+            registry=self.registry,
+        )
+        self.outbound_in_flight = Gauge(
+            f"{namespace}_outbound_in_flight",
+            "Outbound calls currently executing, by sender kind.",
+            ["priority", "operation", "sender_kind"],
+            registry=self.registry,
+        )
+        self.outbound_completions = Counter(
+            f"{namespace}_outbound_completions_total",
+            "Terminal outbound call results, by sender kind.",
+            ["priority", "operation", "sender_kind", "outcome"],
+            registry=self.registry,
+        )
         self.membership_probes = Counter(
             f"{namespace}_auxiliary_membership_probes_total",
             "Auxiliary membership probes by bounded outcome.",
@@ -206,6 +229,26 @@ class Metrics:
 
     def record_membership_probe(self, outcome: str) -> None:
         self.membership_probes.labels(self._bounded(outcome, _MEMBERSHIP_PROBE_OUTCOMES, "membership probe outcome")).inc()
+
+    def record_outbound_enqueued(self, operation: str) -> None:
+        self.outbound_enqueued.labels("normal", self._operation(operation)).inc()
+
+    def set_outbound_queue_depth(self, depth: int) -> None:
+        self.outbound_queue_depth.set(self._count(depth, "outbound queue depth"))
+
+    def increment_outbound_in_flight(self, operation: str, sender_kind: str) -> None:
+        self.outbound_in_flight.labels("normal", self._operation(operation), self._sender_kind(sender_kind)).inc()
+
+    def decrement_outbound_in_flight(self, operation: str, sender_kind: str) -> None:
+        self.outbound_in_flight.labels("normal", self._operation(operation), self._sender_kind(sender_kind)).dec()
+
+    def record_outbound_completion(self, operation: str, sender_kind: str, outcome: str) -> None:
+        self.outbound_completions.labels(
+            "normal",
+            self._operation(operation),
+            self._sender_kind(sender_kind),
+            self._bounded(outcome, _COMPLETION_OUTCOMES, "outbound completion outcome"),
+        ).inc()
 
     def record_database_method_call(self, method: str, seconds: float, outcome: str) -> None:
         """Record one DatabaseManager call using only statically bounded method names."""

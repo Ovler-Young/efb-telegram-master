@@ -19,6 +19,7 @@ from .rate_limiter import SlidingWindowRateLimiter
 
 if TYPE_CHECKING:
     from .bot_pool import BotPool
+    from .etm_metrics import Metrics
 
 
 QUEUED_OPERATIONS = frozenset(
@@ -316,6 +317,7 @@ class OutboundQueue:
         blocking_timeout: float,
         shutdown_drain_timeout: float,
         shutdown_join_grace: float,
+        metrics: Optional["Metrics"] = None,
     ) -> None:
         self._main_rate_limiter = main_rate_limiter
         self._sender_policy = SenderPolicy(main_bot, bot_pool, main_rate_limiter)
@@ -323,6 +325,7 @@ class OutboundQueue:
         self._blocking_timeout = blocking_timeout
         self._shutdown_drain_timeout = shutdown_drain_timeout
         self._shutdown_join_grace = shutdown_join_grace
+        self._metrics = metrics
         self._executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ETM-send")
         self._pending: collections.deque[_PendingCall] = collections.deque()
         self._in_flight: dict[QueueFuture, _SubmittedCall] = {}
@@ -364,6 +367,8 @@ class OutboundQueue:
             if self._stopping:
                 raise SchedulerStoppedError("Outbound queue stopped.")
             self._pending.append(pending)
+            self._record_enqueued_locked(pending.call)
+            self._set_queue_depth_locked()
             self._wake_event.set()
         return waiter
 
@@ -435,6 +440,8 @@ class OutboundQueue:
                 decision = self._sender_policy.select(pending.call, now)
                 if decision.error is not None:
                     pending.waiter.set_exception(QueueError(decision.error.replace("_", " ")))
+                    self._record_completion(pending.call, None, "failure")
+                    self._set_queue_depth_locked()
                     self._capacity.release()
                     continue
                 if decision.selection is None:
@@ -451,10 +458,14 @@ class OutboundQueue:
                     future = self._executor.submit(self._call_adapter.execute, pending.call, decision.selection)
                 except BaseException as error:
                     pending.waiter.set_exception(ExecutorSubmitError(str(error)))
+                    self._record_completion(pending.call, decision.selection, "failure")
+                    self._set_queue_depth_locked()
                     self._capacity.release()
                     continue
                 self._in_flight[future] = _SubmittedCall(pending, decision.selection)
                 self._in_flight_chats.add(pending.call.telegram_chat_id)
+                self._increment_in_flight(pending.call, decision.selection)
+                self._set_queue_depth_locked()
 
     def _harvest_completed(self) -> None:
         with self._lock:
@@ -464,10 +475,14 @@ class OutboundQueue:
                 pending = submitted.pending
                 self._in_flight_chats.discard(pending.call.telegram_chat_id)
                 self._capacity.release()
+                self._decrement_in_flight(pending.call, submitted.selection)
                 if pending.waiter.done():
+                    self._set_queue_depth_locked()
                     continue
                 try:
-                    pending.waiter.set_result(future.result())
+                    result = future.result()
+                    self._record_completion(pending.call, submitted.selection, "success")
+                    pending.waiter.set_result(result)
                 except RetryAfter as error:
                     self._sender_policy.record_retry_after(pending.call, error, submitted.selection)
                     pending.retry_at = time.monotonic() + retry_after_seconds(error)
@@ -475,8 +490,11 @@ class OutboundQueue:
                         self._pending.append(pending)
                     else:
                         pending.waiter.set_exception(SchedulerStoppedError("Outbound queue stopped."))
+                        self._record_completion(pending.call, submitted.selection, "failure")
                 except BaseException as error:
                     pending.waiter.set_exception(error)
+                    self._record_completion(pending.call, submitted.selection, "failure")
+                self._set_queue_depth_locked()
             if completed:
                 self._wake_event.set()
 
@@ -500,6 +518,32 @@ class OutboundQueue:
             pending = self._pending.popleft()
             if not pending.waiter.done():
                 pending.waiter.set_exception(error)
+                self._record_completion(pending.call, None, "failure")
+        self._set_queue_depth_locked()
+
+    def _record_enqueued_locked(self, call: QueuedCall) -> None:
+        if self._metrics is not None:
+            self._metrics.record_outbound_enqueued(call.operation)
+
+    def _set_queue_depth_locked(self) -> None:
+        if self._metrics is not None:
+            self._metrics.set_outbound_queue_depth(len(self._pending) + len(self._in_flight))
+
+    def _increment_in_flight(self, call: QueuedCall, selection: SenderSelection) -> None:
+        if self._metrics is not None:
+            self._metrics.increment_outbound_in_flight(call.operation, self._sender_kind(selection))
+
+    def _decrement_in_flight(self, call: QueuedCall, selection: SenderSelection) -> None:
+        if self._metrics is not None:
+            self._metrics.decrement_outbound_in_flight(call.operation, self._sender_kind(selection))
+
+    def _record_completion(self, call: QueuedCall, selection: Optional[SenderSelection], outcome: str) -> None:
+        if self._metrics is not None:
+            self._metrics.record_outbound_completion(call.operation, self._sender_kind(selection), outcome)
+
+    @staticmethod
+    def _sender_kind(selection: Optional[SenderSelection]) -> str:
+        return "auxiliary" if selection is not None and selection.sender_bot_id is not None else "main"
 
     def _finalize_resources(self) -> None:
         with self._lock:

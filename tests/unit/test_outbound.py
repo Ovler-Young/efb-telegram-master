@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from telegram.error import BadRequest, RetryAfter
 
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import (
     OutboundQueue,
     QueuedCall,
@@ -81,6 +82,34 @@ def test_queue_runs_distinct_chats_concurrently():
         second = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 2, "text": "second"}, 2))
         assert first.result(1).message == "first"
         assert second.result(1).message == "second"
+    finally:
+        queue.stop()
+
+
+def test_queue_records_in_memory_delivery_lifecycle_metrics():
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            return text
+
+    metrics = Metrics(namespace="test_outbound")
+    queue = OutboundQueue(
+        Sender(),
+        None,
+        _Limiter(),
+        worker_count=1,
+        blocking_timeout=1,
+        shutdown_drain_timeout=1,
+        shutdown_join_grace=0.1,
+        metrics=metrics,
+    )
+    queue.start()
+    try:
+        assert queue.enqueue_and_wait(QueueRequest("send_message", (), {"chat_id": 1, "text": "sent"}, 1)).message == "sent"
+        labels = {"priority": "normal", "operation": "send_message"}
+        assert metrics.registry.get_sample_value("test_outbound_outbound_enqueued_total", labels) == 1
+        assert metrics.registry.get_sample_value("test_outbound_outbound_completions_total", {**labels, "sender_kind": "main", "outcome": "success"}) == 1
+        assert metrics.registry.get_sample_value("test_outbound_outbound_queue_depth") == 0
+        assert metrics.registry.get_sample_value("test_outbound_outbound_in_flight", {**labels, "sender_kind": "main"}) == 0
     finally:
         queue.stop()
 
