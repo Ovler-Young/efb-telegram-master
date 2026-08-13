@@ -10,6 +10,7 @@ from efb_telegram_master.outbound import (
     OutboundQueue,
     QueuedCall,
     QueueRequest,
+    SchedulerStoppedError,
     SenderPolicy,
     SenderSelection,
     TelegramCallAdapter,
@@ -177,6 +178,42 @@ def test_stop_drains_in_flight_call():
     release.set()
     queue.stop()
     assert waiter.result(1).message == "sent"
+
+
+def test_stop_timeout_accounts_for_abandoned_in_flight_call_metrics():
+    started = threading.Event()
+    release = threading.Event()
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            started.set()
+            assert release.wait(1)
+            return text
+
+    metrics = Metrics(namespace="test_outbound_timeout")
+    queue = OutboundQueue(
+        Sender(),
+        None,
+        _Limiter(),
+        worker_count=1,
+        blocking_timeout=1,
+        shutdown_drain_timeout=0.01,
+        shutdown_join_grace=0.01,
+        metrics=metrics,
+    )
+    queue.start()
+    waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "sent"}, 1))
+    assert started.wait(1)
+    try:
+        queue.stop()
+        with pytest.raises(SchedulerStoppedError):
+            waiter.result(1)
+        labels = {"priority": "normal", "operation": "send_message", "sender_kind": "main"}
+        assert metrics.registry.get_sample_value("test_outbound_timeout_outbound_queue_depth") == 0
+        assert metrics.registry.get_sample_value("test_outbound_timeout_outbound_in_flight", labels) == 0
+        assert metrics.registry.get_sample_value("test_outbound_timeout_outbound_completions_total", {**labels, "outcome": "failure"}) == 1
+    finally:
+        release.set()
 
 
 def test_sender_policy_prefers_affinity_and_honors_required_sender():

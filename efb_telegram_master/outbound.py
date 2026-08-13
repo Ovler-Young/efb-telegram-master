@@ -508,9 +508,16 @@ class OutboundQueue:
             time.sleep(0.01)
         with self._lock:
             error = SchedulerStoppedError("Outbound queue stopped.")
-            for submitted in self._in_flight.values():
+            for future, submitted in tuple(self._in_flight.items()):
+                self._in_flight.pop(future)
+                future.cancel()
+                self._in_flight_chats.discard(submitted.pending.call.telegram_chat_id)
+                self._capacity.release()
+                self._decrement_in_flight(submitted.pending.call, submitted.selection)
                 if not submitted.pending.waiter.done():
                     submitted.pending.waiter.set_exception(error)
+                self._record_completion(submitted.pending.call, submitted.selection, "failure")
+            self._set_queue_depth_locked()
 
     def _fail_pending_locked(self) -> None:
         error = SchedulerStoppedError("Outbound queue stopped.")
