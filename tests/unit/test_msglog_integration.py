@@ -1,4 +1,6 @@
+import asyncio
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,6 +15,7 @@ from efb_telegram_master.channel_commands import LocaleState, TelegramCommandSer
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler, MsgLogScanShutdownTimeout
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
+from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime
 
 
 class FakeMessageIdentifier:
@@ -26,6 +29,35 @@ class FakeAPI:
     def send_message(self, chat_id: int, text: str, **_kwargs: object) -> FakeMessageIdentifier:
         self.calls.append((chat_id, text))
         return FakeMessageIdentifier()
+
+
+class SharedAsyncRuntime:
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        self.second_submission = threading.Event()
+        self._calls = 0
+        self._calls_lock = threading.Lock()
+        self.thread = threading.Thread(target=self._run, name="TestSharedAsyncRuntime")
+        self.thread.start()
+        assert self.ready.wait(1)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.ready.set()
+        self.loop.run_forever()
+
+    def call(self, coroutine, timeout=None):
+        with self._calls_lock:
+            self._calls += 1
+            if self._calls == 2:
+                self.second_submission.set()
+        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout)
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(1)
+        self.loop.close()
 
 
 class FakeAssociations:
@@ -145,10 +177,15 @@ def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():
     started, release = threading.Event(), threading.Event()
 
     class Runtime:
-        def call(self, coroutine):
+        def __init__(self):
+            self.calls = 0
+
+        def call(self, coroutine, timeout=None):
+            self.calls += 1
             coroutine.close()
-            started.set()
-            release.wait()
+            if self.calls == 1:
+                started.set()
+                release.wait()
 
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
     scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=Runtime()), SimpleNamespace(enabled=True, connected=True, config=SimpleNamespace(scan_ceiling=10)), ingestion, Mock(), Mock())
@@ -167,6 +204,225 @@ def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():
     finally:
         release.set()
         scheduler.stop(1)
+
+
+def test_msglog_scan_stop_uses_one_deadline_for_all_stalled_workers(monkeypatch):
+    class StalledWorker:
+        def __init__(self, name):
+            self.name = name
+            self.join_timeouts = []
+
+        def join(self, timeout):
+            self.join_timeouts.append(timeout)
+            clock[0] += timeout
+
+        def is_alive(self):
+            return True
+
+    clock = [0.0]
+    first, second = StalledWorker("MsgLogIngestion-100"), StalledWorker("MsgLogIngestion-200")
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=Mock()), SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)), Mock(), Mock(), Mock())
+    scheduler._stopping = True
+    scheduler._threads = {100: first, 200: second}
+    monkeypatch.setattr("efb_telegram_master.msglog_scan.time.monotonic", lambda: clock[0])
+
+    errors = scheduler.stop(5)
+
+    assert len(errors) == 1
+    assert first.join_timeouts == [5]
+    assert second.join_timeouts == [0]
+
+
+def test_msglog_scan_stop_waits_for_unregistered_worker_exit():
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait, name="MsgLogIngestion-100")
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=Mock()), SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)), Mock(), Mock(), Mock())
+    scheduler._stopping = True
+    scheduler._retiring_threads = {worker}
+    worker.start()
+    try:
+        assert len(scheduler.stop(0.01)) == 1
+        assert worker.is_alive()
+        release.set()
+        assert scheduler.stop(1) == ()
+    finally:
+        release.set()
+        worker.join(1)
+
+
+def test_msglog_scan_stop_joins_workers_after_runtime_rejects_admission(recwarn):
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait, name="MsgLogIngestion-100")
+    async_runtime = AsyncTelegramRuntime(Mock())
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=async_runtime), SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)), Mock(), Mock(), Mock())
+    scheduler._threads = {100: worker}
+    scheduler._retiring_threads = {worker}
+    async_runtime.begin_delivery_shutdown()
+    worker.start()
+    try:
+        errors = scheduler.stop(0.01)
+        assert len(errors) == 1
+        assert isinstance(errors[0], MsgLogScanShutdownTimeout)
+        release.set()
+        assert scheduler.stop(1) == ()
+        assert not worker.is_alive()
+        assert not [warning for warning in recwarn if "was never awaited" in str(warning.message)]
+    finally:
+        release.set()
+        worker.join(1)
+
+
+def test_msglog_scan_stopped_before_coroutine_start_does_not_connect():
+    queued, release = threading.Event(), threading.Event()
+
+    class Runtime:
+        def __init__(self):
+            self.calls = 0
+
+        def call(self, coroutine, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                queued.set()
+                release.wait()
+            asyncio.run(coroutine)
+
+    class MTProto:
+        enabled = True
+        connected = False
+        config = SimpleNamespace(scan_ceiling=10)
+
+        def __init__(self):
+            self.connect_calls = 0
+
+        async def connect(self):
+            self.connect_calls += 1
+
+    mtproto = MTProto()
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=Runtime()), mtproto, ingestion, Mock(), Mock())
+    try:
+        assert scheduler.schedule(100) == "started"
+        assert queued.wait(1)
+        assert len(scheduler.stop(0.01)) == 1
+        release.set()
+        assert scheduler.stop(1) == ()
+        assert mtproto.connect_calls == 0
+    finally:
+        release.set()
+        scheduler.stop(1)
+
+
+def test_msglog_scan_stop_waits_for_pre_stop_connect_admission():
+    connected, release = threading.Event(), threading.Event()
+
+    class MTProto:
+        enabled = True
+        connected = False
+        config = SimpleNamespace(scan_ceiling=10)
+
+        def __init__(self):
+            self.connect_calls = 0
+
+        async def connect(self):
+            self.connect_calls += 1
+            connected.set()
+            await asyncio.to_thread(release.wait)
+
+    mtproto = MTProto()
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    runtime = SharedAsyncRuntime()
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), mtproto, ingestion, Mock(), Mock())
+    stop_result = []
+    stop_finished = threading.Event()
+    try:
+        assert scheduler.schedule(100) == "started"
+        assert connected.wait(1)
+        stop_thread = threading.Thread(target=lambda: (stop_result.extend(scheduler.stop(1)), stop_finished.set()))
+        stop_thread.start()
+        assert scheduler._stop_event.wait(1)
+        assert not stop_finished.wait(0.05)
+        release.set()
+        assert stop_finished.wait(1)
+        stop_thread.join(1)
+        assert not stop_thread.is_alive()
+        assert stop_result == []
+        assert mtproto.connect_calls == 1
+    finally:
+        release.set()
+        scheduler.stop(1)
+        runtime.close()
+
+
+def test_msglog_scan_stop_times_out_while_connect_is_active():
+    connected, release = threading.Event(), threading.Event()
+
+    class MTProto:
+        enabled = True
+        connected = False
+        config = SimpleNamespace(scan_ceiling=10)
+
+        async def connect(self):
+            connected.set()
+            await asyncio.to_thread(release.wait)
+
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    runtime = SharedAsyncRuntime()
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Mock(), Mock())
+    try:
+        assert scheduler.schedule(100) == "started"
+        assert connected.wait(1)
+        started = time.monotonic()
+        errors = scheduler.stop(0.01)
+        assert time.monotonic() - started < 0.2
+        assert len(errors) == 1
+        assert isinstance(errors[0], MsgLogScanShutdownTimeout)
+    finally:
+        release.set()
+        assert scheduler.stop(1) == ()
+        runtime.close()
+
+
+def test_msglog_scan_waiting_for_admission_does_not_block_shared_runtime():
+    connected, release, second_submitted = threading.Event(), threading.Event(), threading.Event()
+
+    class MTProto:
+        enabled = True
+        connected = False
+        config = SimpleNamespace(scan_ceiling=10)
+
+        def __init__(self):
+            self.connect_calls = 0
+
+        async def connect(self):
+            self.connect_calls += 1
+            connected.set()
+            await asyncio.to_thread(release.wait)
+
+    runtime = SharedAsyncRuntime()
+    mtproto = MTProto()
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), mtproto, ingestion, Mock(), Mock())
+    try:
+        assert scheduler.schedule(100) == "started"
+        assert connected.wait(1)
+        assert scheduler.schedule(200) == "started"
+        assert runtime.second_submission.wait(1)
+
+        async def confirm_loop_progress():
+            second_submitted.set()
+
+        runtime.call(confirm_loop_progress(), timeout=0.2)
+        assert second_submitted.is_set()
+        started = time.monotonic()
+        errors = scheduler.stop(0.01)
+        assert time.monotonic() - started < 0.2
+        assert len(errors) == 1
+        assert isinstance(errors[0], MsgLogScanShutdownTimeout)
+        assert mtproto.connect_calls == 1
+    finally:
+        release.set()
+        assert scheduler.stop(1) == ()
+        runtime.close()
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

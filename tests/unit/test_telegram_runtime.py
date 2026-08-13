@@ -1276,6 +1276,20 @@ def test_manager_retries_membership_join_after_stopping_runtime() -> None:
     assert api.finish_delivery_shutdown.call_count == 2
 
 
+def test_manager_stops_msglog_scans_before_rejecting_runtime_calls() -> None:
+    events: list[str] = []
+    api, runtime = Mock(), Mock()
+    manager = _manager(api, runtime)
+    manager.msglog_scan = Mock(stop=Mock(side_effect=lambda _timeout: events.append("scan") or ()))
+    api.begin_delivery_shutdown.side_effect = lambda _deadline: events.append("delivery") or ()
+    api.finish_delivery_shutdown.return_value = ()
+
+    manager.stop_channel_resources()
+
+    assert events == ["scan", "delivery"]
+    runtime.stop.assert_called_once()
+
+
 def test_manager_runtime_stop_releases_a_real_membership_worker() -> None:
     started = threading.Event()
     released = threading.Event()
