@@ -27,6 +27,10 @@ if TYPE_CHECKING:
 MAX_CALLBACK_QUERY_ANSWER_LENGTH = 200
 
 
+class MetricsServerShutdownTimeout(RuntimeError):
+    """The metrics serving thread remained alive after its shutdown deadline."""
+
+
 class SyncBotProtocol(Protocol):
     def __getattr__(self, item: str) -> Callable[..., object]: ...
 
@@ -56,35 +60,49 @@ class TelegramAPI:
         self._cleanup_tls = threading.local()
         self._metrics_server: MetricsServer | None = None
         self._delivery_stop_lock = threading.Lock()
-        self._delivery_shutdown_started = False
+        self._outbound_stopped = False
+        self._membership_shutdown_started = False
         self._delivery_resources_stopped = False
 
     def bind_metrics_server(self, metrics_server: "MetricsServer | None") -> None:
         self._metrics_server = metrics_server
 
-    def begin_delivery_shutdown(self, join_timeout: float) -> tuple[BaseException, ...]:
+    def begin_delivery_shutdown(self, deadline: float) -> tuple[BaseException, ...]:
         """Stop outbound work and cancel membership probes before runtime teardown."""
         with self._delivery_stop_lock:
-            if self._delivery_shutdown_started:
-                return ()
-            self._delivery_shutdown_started = True
+            outbound_stopped = self._outbound_stopped
+            metrics_server = self._metrics_server
+            membership_shutdown_started = self._membership_shutdown_started
+            bot_pool = self.bot_pool
         errors: list[BaseException] = []
-        try:
-            self._outbound_queue.stop()
-        except BaseException as error:
-            errors.append(error)
-        with self._delivery_stop_lock:
-            if self._metrics_server is not None:
-                try:
-                    self._metrics_server.stop(join_timeout)
-                except BaseException as error:
-                    errors.append(error)
-                self._metrics_server = None
-            if self.bot_pool:
-                try:
-                    self.bot_pool.begin_shutdown()
-                except BaseException as error:
-                    errors.append(error)
+        if not outbound_stopped:
+            try:
+                self._outbound_queue.stop(deadline)
+            except BaseException as error:
+                errors.append(error)
+            else:
+                with self._delivery_stop_lock:
+                    self._outbound_stopped = True
+        if metrics_server is not None:
+            try:
+                metrics_server.stop(max(0.0, deadline - time.monotonic()))
+                thread = getattr(metrics_server, "thread", None)
+                if thread is not None and thread.is_alive():
+                    raise MetricsServerShutdownTimeout("Metrics server did not stop before the shutdown deadline.")
+            except BaseException as error:
+                errors.append(error)
+            else:
+                with self._delivery_stop_lock:
+                    if self._metrics_server is metrics_server:
+                        self._metrics_server = None
+        if bot_pool and not membership_shutdown_started:
+            try:
+                bot_pool.begin_shutdown()
+            except BaseException as error:
+                errors.append(error)
+            else:
+                with self._delivery_stop_lock:
+                    self._membership_shutdown_started = True
         return tuple(errors)
 
     def finish_delivery_shutdown(self, deadline: float) -> tuple[BaseException, ...]:
@@ -93,8 +111,9 @@ class TelegramAPI:
             if self._delivery_resources_stopped:
                 return ()
             bot_pool = self.bot_pool
+            membership_shutdown_started = self._membership_shutdown_started
         errors: list[BaseException] = []
-        if bot_pool:
+        if bot_pool and membership_shutdown_started:
             try:
                 incomplete = bot_pool.wait_for_shutdown(deadline)
                 if incomplete:
@@ -102,15 +121,17 @@ class TelegramAPI:
                     errors.append(MembershipProbeShutdownTimeout(f"Auxiliary membership probes did not stop before the final deadline for bot IDs: {joined}"))
             except BaseException as error:
                 errors.append(error)
-        if not errors:
+        with self._delivery_stop_lock:
+            delivery_complete = self._outbound_stopped and self._metrics_server is None
+        if not errors and delivery_complete:
             with self._delivery_stop_lock:
                 self._delivery_resources_stopped = True
         return tuple(errors)
 
-    def stop_delivery_resources(self, join_timeout: float) -> tuple[BaseException, ...]:
-        """Stop delivery resources without a polling runtime owner."""
-        errors = list(self.begin_delivery_shutdown(join_timeout))
-        errors.extend(self.finish_delivery_shutdown(time.monotonic() + join_timeout))
+    def stop_delivery_resources(self, deadline: float) -> tuple[BaseException, ...]:
+        """Stop delivery resources without a polling runtime owner by one deadline."""
+        errors = list(self.begin_delivery_shutdown(deadline))
+        errors.extend(self.finish_delivery_shutdown(deadline))
         return tuple(errors)
 
     @staticmethod

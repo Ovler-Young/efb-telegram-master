@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from typing import Coroutine, Literal, Optional, ParamSpec, TypedDict, TypeVar, cast
 
@@ -225,7 +226,7 @@ class TelegramPollingRuntime:
             self._stop_event = None
             self._shutdown_complete.set()
 
-    def stop(self) -> None:
+    def stop(self, deadline: float | None = None) -> None:
         with self._stop_lock:
             if self._stopped:
                 return
@@ -238,8 +239,9 @@ class TelegramPollingRuntime:
                 self.application.stop_running()
             except RuntimeError:
                 pass
-        if stop_event is not None and not self._shutdown_complete.wait(timeout=30):
-            self.logger.warning("Telegram post-shutdown hook timed out", extra={"event": "telegram_runtime.shutdown_timeout", "timeout_seconds": 30})
+        remaining = 30.0 if deadline is None else max(0.0, deadline - time.monotonic())
+        if stop_event is not None and not self._shutdown_complete.wait(timeout=remaining):
+            self.logger.warning("Telegram post-shutdown hook timed out", extra={"event": "telegram_runtime.shutdown_timeout", "timeout_seconds": remaining})
         self.async_runtime.shutdown()
 
 

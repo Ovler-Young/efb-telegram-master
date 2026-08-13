@@ -140,8 +140,9 @@ class OutboundQueue:
         except FutureTimeoutError as error:
             raise RuntimeError(f"Telegram call to chat {request.telegram_chat_id} timed out after {self._blocking_timeout:g}s") from error
 
-    def stop(self) -> None:
-        deadline = time.monotonic() + self._shutdown_drain_timeout + self._shutdown_join_grace
+    def stop(self, deadline: float | None = None) -> None:
+        if deadline is None:
+            deadline = time.monotonic() + self._shutdown_drain_timeout + self._shutdown_join_grace
         with self._lock:
             if self._lifecycle is OutboundLifecycle.FINALIZED:
                 return
@@ -159,7 +160,7 @@ class OutboundQueue:
             self._mark_quiescent()
             self._finalize_resources()
         if not self._finalized.wait(max(0.0, deadline - time.monotonic())):
-            raise OutboundShutdownTimeout(f"Outbound queue did not stop within {self._shutdown_drain_timeout + self._shutdown_join_grace:g}s.")
+            raise OutboundShutdownTimeout("Outbound queue did not stop before the shutdown deadline.")
 
     def destination_snapshot(self) -> list[tuple[str, int, Optional[float]]]:
         with self._lock:
