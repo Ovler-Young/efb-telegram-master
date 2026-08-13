@@ -5,6 +5,7 @@ from unittest.mock import Mock
 from telegram import CallbackQuery, Chat, Message, Update, User
 
 from efb_telegram_master import utils
+from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
@@ -33,6 +34,18 @@ def test_chat_binding_callbacks_reject_other_users_without_clearing_the_session(
         assert storage_id in manager.msg_storage
 
     assert manager.bot.answer_callback_query.call_count == 3
+
+
+def test_bot_manager_identity_is_shared_with_polling_runtime():
+    manager = object.__new__(TelegramBotManager)
+    user = User(1, "test", True)
+    manager.telegram_runtime = SimpleNamespace(me=None)
+
+    assert manager.me is None
+
+    manager.me = user
+
+    assert manager.telegram_runtime.me is user
 
 
 def test_full_chat_pagination(channel, slave):

@@ -78,7 +78,6 @@ class TelegramBotManager(LocaleMixin):
 
     # Type declarations for instance attributes assigned in __init__
     _bot: SyncBotProtocol
-    me: Optional[User]
     admins: List[int]
     bot_pool: Optional["BotPool"]
     _stopping: threading.Event
@@ -183,6 +182,14 @@ class TelegramBotManager(LocaleMixin):
 
         self._add_base_dispatchers()
         self.logger.debug("Base dispatchers added", extra={"event": "telegram_bot.dispatchers_initialized"})
+
+    @property
+    def me(self) -> Optional[User]:
+        return self.telegram_runtime.me
+
+    @me.setter
+    def me(self, user: Optional[User]) -> None:
+        self.telegram_runtime.me = user
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
