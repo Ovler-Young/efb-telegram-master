@@ -338,7 +338,7 @@ def test_channel_shutdown_error_still_stops_channel_owned_workers() -> None:
 
     assert channel._stop_polling_called
     channel.master_message_worker.stop_worker.assert_called_once_with()
-    channel.db.stop_worker.assert_called_once_with()
+    channel.db.stop_worker.assert_not_called()
 
 
 def test_channel_stops_master_messages_before_outbound_delivery() -> None:
@@ -780,6 +780,74 @@ def test_constructor_failure_retains_resources_until_master_worker_stops() -> No
         call.bot_manager.stop_channel_resources(),
         call.database.stop_worker(),
     ]
+
+
+def test_constructor_failure_retries_history_shutdown_before_closing_database() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    timeout = HistoryReplayShutdownTimeout("target 100")
+    resources = Mock()
+    channel._owned_master_message_worker = resources.master_worker
+    channel._owned_history_replay = resources.history_replay
+    channel._owned_rpc_utilities = resources.rpc_utilities
+    channel._owned_bot_manager = resources.bot_manager
+    channel._owned_database = resources.database
+    channel.logger = Mock()
+    resources.master_worker.stop_worker.return_value = ()
+    resources.history_replay.stop.side_effect = [(timeout,), (timeout,), ()]
+
+    assert channel._stop_after_constructor_failure() == (timeout,)
+    resources.database.stop_worker.assert_not_called()
+
+    assert channel._stop_after_constructor_failure() == ()
+    resources.database.stop_worker.assert_called_once_with()
+    assert resources.history_replay.stop.call_count == 3
+
+
+def test_constructor_failure_retries_delivery_shutdown_before_closing_database() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    outbound_timeout = OutboundShutdownTimeout("blocked send")
+    membership_timeout = MembershipProbeShutdownTimeout("bot 10")
+    resources = Mock()
+    channel._owned_master_message_worker = resources.master_worker
+    channel._owned_history_replay = resources.history_replay
+    channel._owned_rpc_utilities = resources.rpc_utilities
+    channel._owned_bot_manager = resources.bot_manager
+    channel._owned_database = resources.database
+    channel.logger = Mock()
+    resources.master_worker.stop_worker.return_value = ()
+    resources.history_replay.stop.return_value = ()
+    resources.bot_manager.stop_channel_resources.side_effect = [TelegramResourceShutdownError((outbound_timeout, membership_timeout)), None]
+
+    assert channel._stop_after_constructor_failure() == (outbound_timeout, membership_timeout)
+    resources.database.stop_worker.assert_not_called()
+
+    assert channel._stop_after_constructor_failure() == ()
+    resources.database.stop_worker.assert_called_once_with()
+    assert resources.bot_manager.stop_channel_resources.call_count == 2
+
+
+def test_channel_retries_delivery_shutdown_before_closing_database() -> None:
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._stop_polling_called = False
+    channel.logger = Mock()
+    channel.rpc_utilities = Mock()
+    channel.history_replay = Mock(stop=Mock(return_value=()))
+    channel.master_message_worker = Mock(stop_worker=Mock(return_value=()))
+    channel.db = Mock()
+    outbound_timeout = OutboundShutdownTimeout("blocked send")
+    membership_timeout = MembershipProbeShutdownTimeout("bot 10")
+    channel.bot_manager = Mock(stop_channel_resources=Mock(side_effect=[TelegramResourceShutdownError((outbound_timeout, membership_timeout)), None]))
+
+    with pytest.raises(TelegramResourceShutdownError) as raised:
+        channel.stop_polling()
+    assert raised.value.errors == (outbound_timeout, membership_timeout)
+    channel.db.stop_worker.assert_not_called()
+
+    channel.stop_polling()
+    channel.stop_polling()
+
+    channel.db.stop_worker.assert_called_once_with()
+    assert channel.bot_manager.stop_channel_resources.call_count == 2
 
 
 def _manager(api: Mock, runtime: Mock) -> TelegramBotManager:

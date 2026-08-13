@@ -26,9 +26,7 @@ from .bot_manager import TelegramResourceShutdownError
 from .channel_commands import LocaleState, load_channel_config
 from .channel_composition import initialize_channel_components
 from .db import DatabaseManager
-from .history_replay import HistoryReplayShutdownTimeout
 from .message import ETMMsg
-from .msglog_scan import MsgLogScanShutdownTimeout
 from .utils import ExperimentalFlagsManager
 
 if TYPE_CHECKING:
@@ -81,10 +79,8 @@ class TelegramChannel(MasterChannel):
         super().__init__(instance_id)  # type: ignore[arg-type]  # upstream Channel.__init__ accepts None but isn't annotated as Optional
         self._shutdown_lock = threading.Lock()
         self._stopping = False
-        self._resources_stopped = False
-        self._database_closed = False
         self._shutdown_complete = False
-        self._constructor_cleanup_complete = False
+        self._stopped_resources: set[str] = set()
         self.locale_state = LocaleState()
         self._owned_database: Optional[DatabaseManager] = None
         self._owned_bot_manager = None
@@ -121,11 +117,10 @@ class TelegramChannel(MasterChannel):
         lock = getattr(self, "_shutdown_lock", None)
         if lock is None:
             lock = self._shutdown_lock = threading.Lock()
-            self._constructor_cleanup_complete = False
         with lock:
-            if self._constructor_cleanup_complete:
+            if getattr(self, "_shutdown_complete", False):
                 return ()
-            master_message_worker = self._owned_master_message_worker
+            master_message_worker = self._shutdown_resource("master_message_worker")
             if master_message_worker is not None:
                 try:
                     master_errors = master_message_worker.stop_worker()
@@ -139,24 +134,52 @@ class TelegramChannel(MasterChannel):
                         )
                     return tuple(master_errors)
 
-            rpc_utilities = getattr(self, "_owned_rpc_utilities", None)
-            if rpc_utilities is None:
-                rpc_utilities = getattr(self, "rpc_utilities", None)
-            for resource, method_name in (
-                (self._owned_history_replay, "stop"),
-                (rpc_utilities, "shutdown"),
-                (self._owned_bot_manager, "stop_channel_resources"),
-                (self._owned_database, "stop_worker"),
-            ):
-                method = getattr(resource, method_name, None)
-                if method is None:
-                    continue
-                try:
-                    method()
-                except BaseException:
-                    self.logger.exception("Failed to stop %s after channel construction failed.", type(resource).__name__)
-            self._constructor_cleanup_complete = True
+            errors = self._stop_non_master_resources()
+            if errors:
+                return errors
+            self._shutdown_complete = True
             return ()
+
+    def _shutdown_resource(self, name: str):
+        resource = getattr(self, f"_owned_{name}", None)
+        if resource is not None:
+            return resource
+        attribute = "db" if name == "database" else name
+        return getattr(self, attribute, None)
+
+    def _stop_resource(self, name: str, method_name: str) -> tuple[BaseException, ...]:
+        stopped_resources = getattr(self, "_stopped_resources", None)
+        if stopped_resources is None:
+            stopped_resources = self._stopped_resources = set()
+        if name in stopped_resources:
+            return ()
+        resource = self._shutdown_resource(name)
+        method = getattr(resource, method_name, None)
+        if method is None:
+            stopped_resources.add(name)
+            return ()
+        try:
+            result = method()
+        except TelegramResourceShutdownError as error:
+            return error.errors
+        except BaseException as error:
+            self.logger.exception("Failed to stop %s.", type(resource).__name__)
+            return (error,)
+        errors = result if isinstance(result, tuple) else ()
+        if not errors:
+            stopped_resources.add(name)
+        return errors
+
+    def _stop_non_master_resources(self) -> tuple[BaseException, ...]:
+        initial_history_errors = self._stop_resource("history_replay", "stop")
+        errors = list(self._stop_resource("rpc_utilities", "shutdown"))
+        errors.extend(self._stop_resource("bot_manager", "stop_channel_resources"))
+        final_history_errors = self._stop_resource("history_replay", "stop") if initial_history_errors else ()
+        if final_history_errors:
+            errors.extend(final_history_errors)
+        if errors:
+            return tuple(errors)
+        return self._stop_resource("database", "stop_worker")
 
     def _translate(self, message: str) -> str:
         return self.locale_state.gettext(message)
@@ -221,38 +244,18 @@ class TelegramChannel(MasterChannel):
         lock = getattr(self, "_shutdown_lock", None)
         if lock is None:
             lock = self._shutdown_lock = threading.Lock()
-            self._stopping = self._resources_stopped = self._database_closed = self._shutdown_complete = False
+            self._stopping = self._shutdown_complete = False
         with lock:
             if self._shutdown_complete:
                 return
             self._stop_polling_called = self._stopping = True
             self.logger.info("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
-            errors: list[BaseException] = []
-            master_errors = self.master_message_worker.stop_worker()
+            master_errors = self._shutdown_resource("master_message_worker").stop_worker()
             if master_errors:
                 self.logger.warning("Master message worker did not stop before the deadline", extra={"event": "telegram_channel.master_message_shutdown_timeout"})
                 raise TelegramResourceShutdownError(master_errors)
-            history_replay = getattr(self, "history_replay", None)
-            history_errors = history_replay.stop() if history_replay is not None else ()
-            if not self._resources_stopped:
-                self.rpc_utilities.shutdown()
-                try:
-                    self.bot_manager.stop_channel_resources()
-                except TelegramResourceShutdownError as error:
-                    errors.extend(error.errors)
-                    self.logger.warning("Telegram delivery did not stop before the deadline", extra={"event": "telegram_channel.delivery_shutdown_timeout"})
-                if not any(isinstance(error, MsgLogScanShutdownTimeout) for error in errors):
-                    self._resources_stopped = True
-            if history_replay is not None:
-                final_history_errors = history_replay.stop()
-                if final_history_errors:
-                    errors.extend(final_history_errors)
-                elif history_errors:
-                    self.logger.warning("History replay worker exited after Telegram runtime shutdown", extra={"event": "telegram_channel.history_replay_recovered"})
-            if not any(isinstance(error, (HistoryReplayShutdownTimeout, MsgLogScanShutdownTimeout)) for error in errors):
-                if not self._database_closed:
-                    self.db.stop_worker()
-                    self._database_closed = True
+            errors = self._stop_non_master_resources()
+            if not errors:
                 self._shutdown_complete = True
             self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
             if errors:
