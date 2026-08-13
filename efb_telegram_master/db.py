@@ -2,10 +2,12 @@
 
 import logging
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from ehforwarderbot import utils
-from peewee import Model, PostgresqlDatabase, SqliteDatabase, fn
+from peewee import Model, PostgresqlDatabase, SqliteDatabase
+from playhouse.migrate import Operation, PostgresqlMigrator, SqliteMigrator, migrate
 
 from .chat_association_repository import ChatAssociationRepository
 from .database_observability import DatabaseMetrics, observe_database_method
@@ -113,7 +115,14 @@ class DatabaseManager:
             connected = True
             self.logger.debug("Database loaded.")
             self.logger.debug("Checking database migration...")
-            self._create()
+            if isinstance(actual_db, PostgresqlDatabase) and not ChatAssoc.table_exists():
+                sqlite_path = base_path / "tgdata.db"
+                if sqlite_path.exists():
+                    self._migrate_from_sqlite(sqlite_path)
+                else:
+                    self._create()
+            else:
+                self._create()
             self.logger.debug("Database migration finished...")
             self._retire_legacy_outbound_tables()
         except BaseException:
@@ -142,23 +151,87 @@ class DatabaseManager:
     @staticmethod
     def _create() -> None:
         database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan])
-        DatabaseManager._ensure_msglog_provenance()
+        DatabaseManager._ensure_historic_schema_columns(database.obj)
 
     @staticmethod
-    def _ensure_msglog_provenance() -> None:
-        current_database = database.obj
+    def _ensure_historic_schema_columns(current_database) -> None:
         transaction_arguments: Tuple[str, ...] = ()
         if isinstance(current_database, SqliteDatabase):
             transaction_arguments = ("IMMEDIATE",)
         elif not isinstance(current_database, PostgresqlDatabase):
             raise TypeError(f"Unsupported database backend: {type(current_database).__name__}")
 
+        table_names = set(current_database.get_tables())
+        migrator = SqliteMigrator(current_database) if isinstance(current_database, SqliteDatabase) else PostgresqlMigrator(current_database)
+        migration_steps: list[Operation] = []
+        if "msglog" in table_names:
+            msglog_columns = {column.name for column in current_database.get_columns("msglog")}
+            migration_steps.extend(
+                migrator.add_column("msglog", column_name, field)
+                for column_name, field in (
+                    ("file_id", MsgLog.file_id),
+                    ("media_type", MsgLog.media_type),
+                    ("mime", MsgLog.mime),
+                    ("master_msg_id_alt", MsgLog.master_msg_id_alt),
+                    ("pickle", MsgLog.pickle),
+                    ("file_unique_id", MsgLog.file_unique_id),
+                    ("sender_bot_id", MsgLog.sender_bot_id),
+                    ("provenance", MsgLog.provenance),
+                )
+                if column_name not in msglog_columns
+            )
+        if "slavechatinfo" in table_names:
+            slave_chat_info_columns = {column.name for column in current_database.get_columns("slavechatinfo")}
+            migration_steps.extend(
+                migrator.add_column("slavechatinfo", column_name, field)
+                for column_name, field in (
+                    ("pickle", SlaveChatInfo.pickle),
+                    ("slave_chat_group_id", SlaveChatInfo.slave_chat_group_id),
+                )
+                if column_name not in slave_chat_info_columns
+            )
+
+        if not migration_steps:
+            return
         with current_database.atomic(*transaction_arguments):
-            if isinstance(current_database, PostgresqlDatabase):
+            if isinstance(current_database, PostgresqlDatabase) and "msglog" in table_names:
                 current_database.execute_sql('LOCK TABLE "msglog" IN ACCESS EXCLUSIVE MODE')
-            column_names = {column.name for column in current_database.get_columns(MsgLog._meta.table_name)}
-            if "provenance" not in column_names:
-                current_database.execute_sql('ALTER TABLE "msglog" ADD COLUMN "provenance" TEXT NOT NULL DEFAULT \'live\'')
+            migrate(*migration_steps)
+
+    @staticmethod
+    def _sqlite_source_rows(source_database, model) -> list[dict]:
+        if model._meta.table_name not in source_database.get_tables():
+            return []
+        source_columns = {column.name for column in source_database.get_columns(model._meta.table_name)}
+        fields = [field for field in model._meta.sorted_fields if field.column_name in source_columns]
+        return list(model.select(*fields).dicts())
+
+    def _migrate_from_sqlite(self, sqlite_path: Path) -> None:
+        from peewee import chunked
+
+        self.logger.info("Detected existing SQLite database. Migrating to PostgreSQL.")
+        source_database = SqliteDatabase(str(sqlite_path))
+        source_database.connect()
+        models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
+        try:
+            with source_database.bind_ctx(models):
+                self._ensure_historic_schema_columns(source_database)
+                source_rows = {model: self._sqlite_source_rows(source_database, model) for model in models}
+        finally:
+            source_database.close()
+
+        with database.atomic():
+            self._create()
+            for model in models:
+                rows = source_rows[model]
+                for batch in chunked(rows, 500):
+                    model.insert_many(batch).execute()
+                if model.select().count() != len(rows):
+                    raise RuntimeError(f"SQLite-to-PostgreSQL migration verification failed for {model._meta.table_name}")
+
+        migrated_path = sqlite_path.with_suffix(".db.migrated")
+        sqlite_path.rename(migrated_path)
+        self.logger.info("SQLite-to-PostgreSQL migration completed; source renamed to %s", migrated_path)
 
     @staticmethod
     def _legacy_table_model(table_name: str, current_database) -> type[Model]:
@@ -297,13 +370,16 @@ class DatabaseManager:
             legacy_table_names = cls._validate_legacy_outbound_schema(current_database, table_names)
             if not legacy_table_names:
                 return
+            row_counts = {
+                table_name: int(current_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
+                for table_name in legacy_table_names
+            }
+            if any(row_counts.values()):
+                raise RuntimeError(
+                    "Legacy durable outbound data detected: automatic replay is disabled. "
+                    "Export or explicitly retire outboundworkflow/outboundtask rows before restarting; "
+                    f"workflows={row_counts.get('outboundworkflow', 0)} tasks={row_counts.get('outboundtask', 0)}."
+                )
             legacy_tables = [cls._legacy_table_model(table_name, current_database) for table_name in legacy_table_names]
-
-            row_counts = {table._meta.table_name: int(table.select(fn.COUNT(table._meta.primary_key)).scalar()) for table in legacy_tables}
-            cls.logger.warning(
-                "Discarding obsolete durable outbound queue rows without resumption: workflows=%d tasks=%d",
-                row_counts.get("outboundworkflow", 0),
-                row_counts.get("outboundtask", 0),
-            )
             for legacy_table in reversed(legacy_tables):
                 current_database.drop_tables([legacy_table], safe=False)

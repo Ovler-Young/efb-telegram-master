@@ -3,11 +3,11 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-from peewee import PostgresqlDatabase
+from peewee import PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
 from tests.support.legacy_outbound_schema import legacy_outbound_models
 
 
@@ -32,13 +32,11 @@ def _drop_database(admin_db, database_name):
 
 
 @pytest.mark.integration
-def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgres_config, tmp_path, monkeypatch, caplog):
+def test_postgresql_startup_preserves_non_empty_historical_outbound_tables(integration_postgres_config, tmp_path, monkeypatch):
     admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
     original_database = database.obj
-    first_manager = None
-    second_manager = None
     database_name = None
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
@@ -96,24 +94,80 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
         legacy_db.close()
 
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
-        with caplog.at_level("WARNING", logger="efb_telegram_master.db"):
-            first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
-        table_names = set(database.get_tables())
-        assert not set(DatabaseManager._LEGACY_OUTBOUND_TABLES) & table_names
-        assert {"chatassoc", "msglog", "historymigrationentry", "msglogingestionscan"}.issubset(table_names)
-        first_manager.stop_worker()
-        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
+        with pytest.raises(RuntimeError, match="automatic replay is disabled"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
+        assert database.is_closed()
+        check_db = PostgresqlDatabase(database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"})
+        check_db.connect()
+        try:
+            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(check_db.get_tables())
+            assert check_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
+            assert check_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
+        finally:
+            check_db.close()
     finally:
-        if second_manager is not None:
-            second_manager.stop_worker()
-        elif first_manager is not None:
-            first_manager.stop_worker()
         database.initialize(original_database)
         if database_name is not None:
             _drop_database(admin_db, database_name)
         admin_db.close()
 
-    assert "Discarding obsolete durable outbound queue rows without resumption: workflows=1 tasks=1" in caplog.text
+
+@pytest.mark.integration
+def test_postgresql_startup_imports_populated_sqlite_and_renames_source(integration_postgres_config, tmp_path, monkeypatch):
+    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
+    admin_db.connect()
+    admin_db.connection().autocommit = True
+    database_name = None
+    manager = None
+    original_database = database.obj
+    source_path = tmp_path / "tgdata.db"
+    source_db = SqliteDatabase(source_path)
+    models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        source_db.connect()
+        with source_db.bind_ctx(models):
+            source_db.create_tables(models)
+            ChatAssoc.create(master_uid="master", slave_uid="slave")
+            TopicAssoc.create(topic_chat_id="10", message_thread_id="20", slave_uid="slave")
+            SlaveChatInfo.create(
+                slave_channel_id="tests.slave",
+                slave_channel_emoji="x",
+                slave_chat_uid="slave",
+                slave_chat_name="Source chat",
+                slave_chat_type="group",
+            )
+            MsgLog.create(
+                master_msg_id="10.1",
+                slave_message_id="source-message",
+                text="source text",
+                slave_origin_uid="slave",
+                slave_member_uid="member",
+                msg_type="Text",
+                sent_to="master",
+            )
+            HistoryMigrationEntry.create(slave_chat_id="slave", target_chat_id="10", source_master_msg_id="10.1", position=0)
+        source_db.close()
+        database_name, _target = _new_database(admin_db, integration_postgres_config)
+        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
+        manager = DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-import", config=config))
+        assert ChatAssoc.select().count() == 1
+        assert TopicAssoc.select().count() == 1
+        assert SlaveChatInfo.select().count() == 1
+        assert MsgLog.get_by_id("10.1").text == "source text"
+        assert HistoryMigrationEntry.select().count() == 1
+        assert not source_path.exists()
+        assert source_path.with_suffix(".db.migrated").exists()
+    finally:
+        if not source_db.is_closed():
+            source_db.close()
+        if manager is not None:
+            manager.stop_worker()
+        database.initialize(original_database)
+        if database_name is not None:
+            _drop_database(admin_db, database_name)
+        admin_db.close()
+
 
 
 @pytest.mark.integration
@@ -149,8 +203,6 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
         legacy_db.connect()
         workflow, task = legacy_outbound_models(legacy_db)
         legacy_db.create_tables([workflow, task])
-        workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
         legacy_db.close()
         patch.setattr(DatabaseManager, "_validate_legacy_outbound_schema", classmethod(wait_after_first_lock))
         first = threading.Thread(target=retire)
@@ -198,14 +250,12 @@ def test_postgresql_retirement_rolls_back_when_workflow_drop_fails(integration_p
         legacy_db.connect()
         workflow, task = legacy_outbound_models(legacy_db)
         legacy_db.create_tables([workflow, task])
-        workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
         monkeypatch.setattr(PostgresqlDatabase, "drop_tables", fail_workflow_drop)
         with pytest.raises(RuntimeError, match="workflow drop failed"):
             DatabaseManager._retire_legacy_outbound_tables_for_database(legacy_db)
         assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(legacy_db.get_tables())
-        assert workflow.select().count() == 1
-        assert task.select().count() == 1
+        assert workflow.select().count() == 0
+        assert task.select().count() == 0
         assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundtask") is None
         legacy_db.close()
     finally:

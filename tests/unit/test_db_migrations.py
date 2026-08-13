@@ -1,4 +1,3 @@
-import logging
 import pickle
 import threading
 from types import SimpleNamespace
@@ -15,7 +14,7 @@ from efb_telegram_master import utils
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, TopicAssoc, database
+from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.outbound_types import SendReceipt
@@ -26,6 +25,50 @@ from tests.support.legacy_outbound_schema import legacy_outbound_models
 
 def test_msglog_schema_has_sender_bot_id(channel):
     assert "sender_bot_id" in {column.name for column in database.get_columns("msglog")}
+
+
+def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, monkeypatch):
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        raw_db.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, master_msg_id_alt TEXT, slave_message_id TEXT NOT NULL, "
+            "text TEXT NOT NULL, slave_origin_uid TEXT NOT NULL, slave_origin_display_name TEXT, slave_member_uid TEXT, "
+            "slave_member_display_name TEXT, media_type TEXT, mime TEXT, file_id TEXT, file_unique_id TEXT, msg_type TEXT NOT NULL, "
+            "pickle BLOB, sent_to TEXT NOT NULL, time DATETIME)"
+        )
+        raw_db.execute_sql(
+            "CREATE TABLE slavechatinfo (id INTEGER PRIMARY KEY, slave_channel_id TEXT NOT NULL, slave_channel_emoji TEXT NOT NULL, slave_chat_uid TEXT NOT NULL, "
+            "slave_chat_name TEXT NOT NULL, slave_chat_alias TEXT, slave_chat_type TEXT NOT NULL)"
+        )
+        raw_db.execute_sql(
+            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) VALUES (?, ?, ?, ?, ?, ?)",
+            ("100.1", "legacy-message", "legacy text", "tests.slave chat", "Text", "tests.master"),
+        )
+        raw_db.execute_sql(
+            "INSERT INTO slavechatinfo (slave_channel_id, slave_channel_emoji, slave_chat_uid, slave_chat_name, slave_chat_type) VALUES (?, ?, ?, ?, ?)",
+            ("tests.slave", "x", "tests.slave chat", "Legacy chat", "group"),
+        )
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.pre-migration-four", config={}))
+    try:
+        msglog_columns = {column.name for column in database.get_columns("msglog")}
+        slave_info_columns = {column.name for column in database.get_columns("slavechatinfo")}
+        msglog = MsgLog.get_by_id("100.1")
+        slave_info = SlaveChatInfo.get(SlaveChatInfo.slave_chat_uid == "tests.slave chat")
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
+
+    assert {"file_id", "media_type", "mime", "master_msg_id_alt", "pickle", "file_unique_id", "sender_bot_id", "provenance"}.issubset(msglog_columns)
+    assert {"pickle", "slave_chat_group_id"}.issubset(slave_info_columns)
+    assert (msglog.slave_message_id, msglog.text, msglog.provenance) == ("legacy-message", "legacy text", "live")
+    assert (slave_info.slave_chat_name, slave_info.slave_chat_group_id) == ("Legacy chat", None)
 
 
 def test_history_migration_entry_schema_retains_replay_columns_without_msglog_legacy_field():
@@ -199,7 +242,7 @@ def test_database_manager_stops_and_closes_postgresql_pool_when_retirement_fails
         database.initialize(original_database)
 
 
-def test_startup_retires_legacy_outbound_tables_after_current_schema_creation(tmp_path, monkeypatch, caplog):
+def test_startup_preserves_non_empty_legacy_outbound_tables_and_retires_empty_ones(tmp_path, monkeypatch):
     database_path = tmp_path / "tgdata.db"
     raw_db = SqliteDatabase(database_path)
     raw_db.connect()
@@ -207,7 +250,15 @@ def test_startup_retires_legacy_outbound_tables_after_current_schema_creation(tm
         workflow, task = legacy_outbound_models(raw_db)
         raw_db.create_tables([workflow, task])
         workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
+        task.create(
+            source_key="source",
+            target_chat_id=1,
+            operation="send_message",
+            payload="secret",
+            workflow_id=1,
+            state="leased",
+            lease_owner="interrupted-worker",
+        )
         task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1, step_index=1)
         assert {
             column.name: DatabaseManager._legacy_default_category(raw_db, "outboundworkflow", column.name, DatabaseManager._legacy_column_type(column.data_type), column.primary_key, column.default)
@@ -235,23 +286,30 @@ def test_startup_retires_legacy_outbound_tables_after_current_schema_creation(tm
 
     original_database = database.obj
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.db"):
-        first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
-    second_manager = None
+    with pytest.raises(RuntimeError, match="automatic replay is disabled"):
+        DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
+    assert database.is_closed()
+    preserved_db = SqliteDatabase(database_path)
+    preserved_db.connect()
     try:
+        assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(preserved_db.get_tables())
+        assert preserved_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
+        assert preserved_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 2
+        preserved_db.execute_sql("DELETE FROM outboundtask")
+        preserved_db.execute_sql("DELETE FROM outboundworkflow")
+    finally:
+        preserved_db.close()
+
+    manager = None
+    try:
+        manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
         table_names = set(database.get_tables())
         assert not set(DatabaseManager._LEGACY_OUTBOUND_TABLES) & table_names
         assert {"chatassoc", "msglog", "historymigrationentry", "msglogingestionscan"}.issubset(table_names)
-        first_manager.stop_worker()
-        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
     finally:
-        if second_manager is not None:
-            second_manager.stop_worker()
-        else:
-            first_manager.stop_worker()
+        if manager is not None:
+            manager.stop_worker()
         database.initialize(original_database)
-
-    assert "Discarding obsolete durable outbound queue rows without resumption: workflows=1 tasks=2" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -304,7 +362,7 @@ def test_postgresql_legacy_outbound_index_fixture_excludes_only_the_primary_key_
     assert set(DatabaseManager._legacy_outbound_task_indexes(backend)) != set(DatabaseManager._LEGACY_OUTBOUND_TASK_INDEXES)
 
 
-@pytest.mark.parametrize("failure", ("count", "drop"))
+@pytest.mark.parametrize("failure", ("drop",))
 def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, monkeypatch, failure):
     database_path = tmp_path / "tgdata.db"
     raw_db = SqliteDatabase(database_path)
@@ -317,17 +375,13 @@ def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, mo
 
     original_database = database.obj
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    if failure == "count":
-        monkeypatch.setattr(db_module.fn, "COUNT", lambda *_args: (_ for _ in ()).throw(RuntimeError("count failed")))
-    else:
+    class LegacyOutboundTable(Model):
+        class Meta:
+            database = database
+            table_name = "outboundworkflow"
 
-        class LegacyOutboundTable(Model):
-            class Meta:
-                database = database
-                table_name = "outboundworkflow"
-
-        monkeypatch.setattr(DatabaseManager, "_legacy_table_model", staticmethod(lambda _table_name, _database: LegacyOutboundTable))
-        monkeypatch.setattr(SqliteDatabase, "drop_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("drop failed")))
+    monkeypatch.setattr(DatabaseManager, "_legacy_table_model", staticmethod(lambda _table_name, _database: LegacyOutboundTable))
+    monkeypatch.setattr(SqliteDatabase, "drop_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("drop failed")))
 
     try:
         with pytest.raises(RuntimeError, match=f"{failure} failed"):
@@ -444,8 +498,6 @@ def test_startup_refuses_altered_accepted_at_default_without_dropping_legacy_sch
     try:
         workflow, task = legacy_outbound_models(raw_db)
         raw_db.create_tables([workflow, task])
-        workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
         task_sql = raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", ("outboundtask",)).fetchone()[0]
         index_sql = [row[0] for row in raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL", ("outboundtask",)).fetchall()]
         raw_db.execute_sql("DROP TABLE outboundtask")
@@ -465,7 +517,7 @@ def test_startup_refuses_altered_accepted_at_default_without_dropping_legacy_sch
         collision_db.connect()
         try:
             assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(collision_db.get_tables())
-            assert collision_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
+            assert collision_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 0
             assert collision_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
             assert {index.name for index in collision_db.get_indexes("outboundtask")} == {
                 "outboundtask_source_key_priority_accepted_at_id",
@@ -488,8 +540,6 @@ def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, 
     try:
         workflow, task = legacy_outbound_models(raw_db)
         raw_db.create_tables([workflow, task])
-        workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
     finally:
         raw_db.close()
 
@@ -513,8 +563,8 @@ def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, 
         restored_db.connect()
         try:
             assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(restored_db.get_tables())
-            assert restored_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
-            assert restored_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
+            assert restored_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 0
+            assert restored_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 0
             assert DatabaseManager._legacy_outbound_schema_error(restored_db, "outboundtask") is None
         finally:
             restored_db.close()
