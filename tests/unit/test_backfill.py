@@ -11,6 +11,7 @@ from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from tests.integration.test_backfill_history import QueueMetricSnapshot, _queue_activity_completed_with_additional_control_sends
 
 
 def _build_link_update(chat_id, *, is_forum=False):
@@ -314,3 +315,10 @@ def test_get_recent_messages_returns_oldest_first(channel, slave):
 
     for row in MsgLog.select().where(MsgLog.slave_origin_uid == slave_uid):
         row.delete_instance()
+
+
+def test_migration_queue_completion_accepts_relink_control_sends():
+    before = QueueMetricSnapshot(0, 0, 0, 0, 0, 0, 0, 0)
+    after = QueueMetricSnapshot(123, 69, 54, 0, 0, 0, 0, 0)
+
+    assert _queue_activity_completed_with_additional_control_sends(before, after, expected_count=120)

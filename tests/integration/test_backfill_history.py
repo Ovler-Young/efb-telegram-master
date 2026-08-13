@@ -282,6 +282,19 @@ def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricS
     )
 
 
+def _queue_activity_completed_with_additional_control_sends(before: QueueMetricSnapshot, current: QueueMetricSnapshot, *, expected_count: int) -> bool:
+    success_delta = current.main_successes + current.auxiliary_successes - before.main_successes - before.auxiliary_successes
+    failure_delta = current.main_failures + current.auxiliary_failures - before.main_failures - before.auxiliary_failures
+    return (
+        current.enqueued - before.enqueued >= expected_count
+        and success_delta >= expected_count
+        and failure_delta == 0
+        and current.queue_depth == 0
+        and current.main_in_flight == 0
+        and current.auxiliary_in_flight == 0
+    )
+
+
 def _migration_activity_completed(*, activity_observed: bool, expected: Set[int], db_indices: List[int], telegram_indices: List[int], target_entry_count: int, queue_completed: bool) -> bool:
     expected_count = len(expected)
     return (
@@ -361,7 +374,7 @@ async def _wait_for_migrated_stream_terminal(
         enqueue_delta = metrics_current.enqueued - metrics_before.enqueued
         activity_observed = activity_observed or enqueue_delta > 0 or bool(telegram_indices)
         target_entry_count = _target_migration_entry_count(slave_chat_id, chat_id)
-        queue_completed = _queue_activity_completed(
+        queue_completed = _queue_activity_completed_with_additional_control_sends(
             metrics_before,
             metrics_current,
             expected_count=expected_count,
