@@ -90,13 +90,16 @@ def _delete_msg_logs_by_master_ids(channel, master_msg_ids):
 
 async def _wait_for_ingestion_worker_exit(channel, source_chat_id, timeout=30):
     scheduler = channel.msglog_scan
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with scheduler._lock:
+            if source_chat_id not in scheduler._threads:
+                return
+        await asyncio.sleep(0.1)
     with scheduler._lock:
-        worker = scheduler._threads.get(source_chat_id)
-    if worker is None:
-        return
-    await asyncio.to_thread(worker.join, timeout)
-    if worker.is_alive():
-        raise TimeoutError("MsgLog ingestion worker did not stop")
+        if source_chat_id not in scheduler._threads:
+            return
+    raise TimeoutError("MsgLog ingestion worker did not stop")
 
 
 async def test_sync_msglog_ingests_unlogged_topic_messages_live(

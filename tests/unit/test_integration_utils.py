@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
@@ -8,6 +10,7 @@ from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.chat_destination_cache import ChatDestinationCache
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 from tests.integration import test_master_message_destination as destination_tests
+from tests.integration import test_mtproto_live as mtproto_live_tests
 from tests.integration import utils as integration_utils
 from tests.integration.helper.filters import BaseFilter
 
@@ -32,6 +35,35 @@ def test_decode_start_link_token_rejects_a_mismatched_owner():
 
     with pytest.raises(AssertionError, match="does not match expected owner"):
         integration_utils.decode_start_link_token(start_token, expected_owner=TelegramChatID(2))
+
+
+@pytest.mark.asyncio
+async def test_msglog_cleanup_waits_for_source_mapping_removal_not_pool_worker_exit() -> None:
+    lock = threading.Lock()
+    persistent_worker = threading.current_thread()
+    scheduler = SimpleNamespace(_lock=lock, _threads={100: persistent_worker})
+    channel = SimpleNamespace(msglog_scan=scheduler)
+
+    async def remove_source_mapping() -> None:
+        await asyncio.sleep(0)
+        with lock:
+            scheduler._threads.pop(100)
+
+    removal = asyncio.create_task(remove_source_mapping())
+
+    await mtproto_live_tests._wait_for_ingestion_worker_exit(channel, 100, timeout=0.2)
+    await removal
+
+    assert persistent_worker.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_msglog_cleanup_reports_timeout_when_source_mapping_remains() -> None:
+    scheduler = SimpleNamespace(_lock=threading.Lock(), _threads={100: object()})
+    channel = SimpleNamespace(msglog_scan=scheduler)
+
+    with pytest.raises(TimeoutError, match="MsgLog ingestion worker did not stop"):
+        await mtproto_live_tests._wait_for_ingestion_worker_exit(channel, 100, timeout=0)
 
 
 @pytest.mark.asyncio
