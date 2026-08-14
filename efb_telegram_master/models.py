@@ -57,10 +57,16 @@ class TopicAssoc(BaseModel):
     message_thread_id = TextField()
     slave_uid = TextField()
 
+    class Meta:
+        indexes = ((('slave_uid',), True), (('topic_chat_id', 'message_thread_id'), True))
+
 
 class ChatAssoc(BaseModel):
     master_uid = TextField()
     slave_uid = TextField()
+
+    class Meta:
+        indexes = ((('slave_uid',), True),)
 
 
 class MsgLog(BaseModel):
@@ -201,6 +207,29 @@ class HistoryMigrationEntry(BaseModel):
 
     class Meta:
         indexes = ((("slave_chat_id", "target_chat_id", "message_thread_id", "position"), False),)
+
+
+HistoryMigrationEntry.add_index(
+    HistoryMigrationEntry.index(
+        HistoryMigrationEntry.slave_chat_id,
+        HistoryMigrationEntry.target_chat_id,
+        HistoryMigrationEntry.position,
+        unique=True,
+        where=HistoryMigrationEntry.message_thread_id.is_null(True),
+        name="historymigrationentry_target_position_without_thread_unique",
+    )
+)
+HistoryMigrationEntry.add_index(
+    HistoryMigrationEntry.index(
+        HistoryMigrationEntry.slave_chat_id,
+        HistoryMigrationEntry.target_chat_id,
+        HistoryMigrationEntry.message_thread_id,
+        HistoryMigrationEntry.position,
+        unique=True,
+        where=HistoryMigrationEntry.message_thread_id.is_null(False),
+        name="historymigrationentry_target_position_with_thread_unique",
+    )
+)
 
 
 class SlaveChatInfo(BaseModel):

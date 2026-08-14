@@ -1,37 +1,59 @@
 import logging
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
-from peewee import DoesNotExist
+from peewee import DoesNotExist, PostgresqlDatabase, SqliteDatabase
 
 from .database_observability import ObservedRepository, observe_database_method
-from .models import ChatAssoc, TopicAssoc
+from .models import ChatAssoc, TopicAssoc, database
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramTopicID
 
 
 class ChatAssociationRepository(ObservedRepository):
     logger = logging.getLogger(__name__)
+    _LOCK_KEY = 681_774_240_616_480_004
+
+    @classmethod
+    @contextmanager
+    def _mutation_transaction(cls):
+        current_database = database.obj
+        transaction = database.atomic("IMMEDIATE") if isinstance(current_database, SqliteDatabase) else database.atomic()
+        with transaction:
+            if isinstance(current_database, PostgresqlDatabase):
+                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (cls._LOCK_KEY,))
+            yield
 
     @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr, slave_uid: EFBChannelChatIDStr, multiple_slave: bool = False):
-        if not multiple_slave:
-            self.remove_chat_assoc(master_uid=master_uid)
-        self.remove_chat_assoc(slave_uid=slave_uid)
-        return ChatAssoc.create(master_uid=master_uid, slave_uid=slave_uid)
+        with self._mutation_transaction():
+            if not multiple_slave:
+                previous_slaves = [row.slave_uid for row in ChatAssoc.select(ChatAssoc.slave_uid).where(ChatAssoc.master_uid == master_uid)]
+                ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
+                if previous_slaves:
+                    TopicAssoc.delete().where(TopicAssoc.slave_uid.in_(previous_slaves)).execute()
+            ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
+            TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
+            ChatAssoc.insert(master_uid=master_uid, slave_uid=slave_uid).on_conflict(
+                conflict_target=[ChatAssoc.slave_uid],
+                update={ChatAssoc.master_uid: master_uid},
+            ).execute()
+            return ChatAssoc.get(ChatAssoc.slave_uid == slave_uid)
 
     @observe_database_method("remove_chat_assoc")
     def remove_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None, slave_uid: Optional[EFBChannelChatIDStr] = None):
         try:
             if bool(master_uid) == bool(slave_uid):
                 raise ValueError("Only one parameter is to be provided.")
-            if master_uid:
-                slave_uids = [row.slave_uid for row in ChatAssoc.select(ChatAssoc.slave_uid).where(ChatAssoc.master_uid == master_uid)]
-                result = ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
-                if slave_uids:
-                    TopicAssoc.delete().where(TopicAssoc.slave_uid.in_(slave_uids)).execute()
+            with self._mutation_transaction():
+                if master_uid:
+                    slave_uids = [row.slave_uid for row in ChatAssoc.select(ChatAssoc.slave_uid).where(ChatAssoc.master_uid == master_uid)]
+                    result = ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
+                    if slave_uids:
+                        TopicAssoc.delete().where(TopicAssoc.slave_uid.in_(slave_uids)).execute()
+                    return result
+                result = ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
+                TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
                 return result
-            result = ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
-            TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
-            return result
         except DoesNotExist:
             return 0
 
@@ -48,9 +70,11 @@ class ChatAssociationRepository(ObservedRepository):
 
     @observe_database_method("add_topic_assoc")
     def add_topic_assoc(self, topic_chat_id: TelegramChatID, message_thread_id: TelegramTopicID, slave_uid: EFBChannelChatIDStr):
-        self.remove_topic_assoc(slave_uid=slave_uid)
-        self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
-        return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
+        with self._mutation_transaction():
+            pair_filter = (TopicAssoc.topic_chat_id == str(topic_chat_id)) & (TopicAssoc.message_thread_id == str(message_thread_id))
+            TopicAssoc.delete().where((TopicAssoc.slave_uid == slave_uid) | pair_filter).execute()
+            TopicAssoc.insert(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid).execute()
+            return TopicAssoc.get(TopicAssoc.slave_uid == slave_uid)
 
     @observe_database_method("get_topic_thread_id")
     def get_topic_thread_id(self, slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
@@ -91,8 +115,9 @@ class ChatAssociationRepository(ObservedRepository):
         try:
             if bool(topic_chat_id and message_thread_id) == bool(slave_uid):
                 raise ValueError("Please provide either topic_chat_id and message_thread_id or slave_uid.")
-            if topic_chat_id and message_thread_id:
-                return TopicAssoc.delete().where((TopicAssoc.topic_chat_id == str(topic_chat_id)) & (TopicAssoc.message_thread_id == str(message_thread_id))).execute()
-            return TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
+            with self._mutation_transaction():
+                if topic_chat_id and message_thread_id:
+                    return TopicAssoc.delete().where((TopicAssoc.topic_chat_id == str(topic_chat_id)) & (TopicAssoc.message_thread_id == str(message_thread_id))).execute()
+                return TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
         except DoesNotExist:
             return 0

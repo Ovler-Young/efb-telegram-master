@@ -1,21 +1,23 @@
 import pickle
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import IndexMetadata, Model, PostgresqlDatabase, SqliteDatabase
+from peewee import IndexMetadata, IntegrityError, Model, PostgresqlDatabase, SqliteDatabase
 from prometheus_client import generate_latest
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
+from efb_telegram_master.chat_association_repository import ChatAssociationRepository
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.outbound_types import SendReceipt
@@ -104,6 +106,123 @@ def test_historic_schema_migration_serializes_sqlite_startups(tmp_path):
         assert DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX in {index.name for index in check_db.get_indexes("msglog")}
     finally:
         check_db.close()
+
+
+def test_association_schema_upgrade_deduplicates_rows_and_enforces_canonical_identity(tmp_path, monkeypatch):
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        raw_db.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
+        raw_db.execute_sql("CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)")
+        raw_db.execute_sql(
+            "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
+            "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
+            "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
+        )
+        raw_db.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
+        raw_db.execute_sql("INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')")
+        raw_db.execute_sql(
+            "INSERT INTO historymigrationentry VALUES "
+            "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(2, 'slave-a', '100', NULL, '10.2', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(3, 'slave-a', '100', '200', '10.3', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(4, 'slave-a', '100', '200', '10.4', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP)"
+        )
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.association-upgrade", config={}))
+    try:
+        assert [(row.master_uid, row.slave_uid) for row in ChatAssoc.select()] == [("master-new", "slave-a")]
+        assert [(row.topic_chat_id, row.message_thread_id, row.slave_uid) for row in TopicAssoc.select()] == [("101", "201", "slave-b")]
+        assert [row.source_master_msg_id for row in HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id)] == ["10.2", "10.4"]
+        assert {
+            DatabaseManager._CHAT_ASSOC_SLAVE_INDEX,
+            DatabaseManager._TOPIC_ASSOC_SLAVE_INDEX,
+            DatabaseManager._TOPIC_ASSOC_TOPIC_THREAD_INDEX,
+        }.issubset({index.name for index in database.get_indexes("topicassoc")} | {index.name for index in database.get_indexes("chatassoc")})
+        assert {
+            DatabaseManager._HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX,
+            DatabaseManager._HISTORY_TARGET_POSITION_WITH_THREAD_INDEX,
+        }.issubset({index.name for index in database.get_indexes("historymigrationentry")})
+        with pytest.raises(IntegrityError):
+            ChatAssoc.create(master_uid="master-other", slave_uid="slave-a")
+        with pytest.raises(IntegrityError):
+            TopicAssoc.create(topic_chat_id="101", message_thread_id="201", slave_uid="slave-c")
+        with pytest.raises(IntegrityError):
+            HistoryMigrationEntry.create(slave_chat_id="slave-a", target_chat_id="100", source_master_msg_id="10.5", position=0)
+        with pytest.raises(IntegrityError):
+            HistoryMigrationEntry.create(slave_chat_id="slave-a", target_chat_id="100", message_thread_id="200", source_master_msg_id="10.6", position=0)
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
+
+
+def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):
+    original_database = database.obj
+    test_database = SqliteDatabase(tmp_path / "association.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
+    database.initialize(test_database)
+    test_database.connect()
+    repository = ChatAssociationRepository()
+    try:
+        test_database.create_tables([ChatAssoc, TopicAssoc])
+
+        def replace(index):
+            test_database.connect(reuse_if_open=True)
+            try:
+                repository.add_chat_assoc(f"master-{index}", "slave-a")
+                repository.add_topic_assoc(TelegramChatID(100 + index), TelegramTopicID(200 + index), "slave-a")
+            finally:
+                test_database.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(replace, range(2)))
+
+        assert ChatAssoc.select().where(ChatAssoc.slave_uid == "slave-a").count() == 1
+        assert TopicAssoc.select().where(TopicAssoc.slave_uid == "slave-a").count() == 1
+        assert TopicAssoc.select().count() == 1
+    finally:
+        if not test_database.is_closed():
+            test_database.close()
+        database.initialize(original_database)
+
+
+def test_concurrent_history_replacements_leave_one_coherent_target(tmp_path):
+    original_database = database.obj
+    test_database = SqliteDatabase(tmp_path / "history.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
+    database.initialize(test_database)
+    test_database.connect()
+    repository = HistoryMigrationRepository()
+    try:
+        test_database.create_tables([HistoryMigrationEntry])
+
+        def replace(source_prefix):
+            test_database.connect(reuse_if_open=True)
+            try:
+                return repository.replace_entries(
+                    "slave-a",
+                    100,
+                    None,
+                    [
+                        {"slave_chat_id": "slave-a", "target_chat_id": "100", "source_master_msg_id": f"{source_prefix}.1", "position": 0},
+                        {"slave_chat_id": "slave-a", "target_chat_id": "100", "source_master_msg_id": f"{source_prefix}.2", "position": 1},
+                    ],
+                )
+            finally:
+                test_database.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            assert list(executor.map(replace, ("10", "20"))) == [2, 2]
+
+        source_ids = [row.source_master_msg_id for row in HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.position)]
+        assert source_ids in (["10.1", "10.2"], ["20.1", "20.2"])
+    finally:
+        if not test_database.is_closed():
+            test_database.close()
+        database.initialize(original_database)
 
 
 def test_history_migration_entry_schema_retains_replay_columns_without_msglog_legacy_field():

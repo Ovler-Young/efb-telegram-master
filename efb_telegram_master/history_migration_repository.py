@@ -5,6 +5,8 @@ from itertools import islice
 from tempfile import TemporaryDirectory
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from peewee import PostgresqlDatabase, SqliteDatabase
+
 from .database_observability import ObservedRepository, observe_database_method
 from .models import HistoryMigrationEntry, database
 from .utils import EFBChannelChatIDStr, TelegramTopicID
@@ -12,6 +14,17 @@ from .utils import EFBChannelChatIDStr, TelegramTopicID
 
 class HistoryMigrationRepository(ObservedRepository):
     INSERT_BATCH_SIZE = 100
+    _LOCK_KEY = 681_774_240_616_480_005
+
+    @classmethod
+    @contextmanager
+    def _replacement_transaction(cls):
+        current_database = database.obj
+        transaction = database.atomic("IMMEDIATE") if isinstance(current_database, SqliteDatabase) else database.atomic()
+        with transaction:
+            if isinstance(current_database, PostgresqlDatabase):
+                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (cls._LOCK_KEY,))
+            yield
 
     @contextmanager
     def _staged_entry_batches(self, entries: Iterable[Dict[str, object]]):
@@ -52,7 +65,7 @@ class HistoryMigrationRepository(ObservedRepository):
     @observe_database_method("replace_history_migration_entries")
     def replace_entries(self, slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, message_thread_id: Optional[TelegramTopicID], entries: Iterable[Dict[str, object]]) -> int:
         with self._staged_entry_batches(entries) as (count, staged_batches):
-            with database.atomic():
+            with self._replacement_transaction():
                 HistoryMigrationEntry.delete().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id)).execute()
                 for batch in staged_batches:
                     HistoryMigrationEntry.insert_many(batch).execute()

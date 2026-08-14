@@ -50,6 +50,11 @@ class DatabaseManager:
     _SQLITE_IMPORT_LOCK_KEY = 681_774_240_616_480_001
     _SQLITE_IMPORT_PROVENANCE_TABLE = "sqliteimportprovenance"
     _MSGLOG_REPLAY_SOURCE_INDEX = "msglog_slave_origin_uid_time_master_msg_id"
+    _CHAT_ASSOC_SLAVE_INDEX = "chatassoc_slave_uid"
+    _TOPIC_ASSOC_SLAVE_INDEX = "topicassoc_slave_uid"
+    _TOPIC_ASSOC_TOPIC_THREAD_INDEX = "topicassoc_topic_chat_id_message_thread_id"
+    _HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX = "historymigrationentry_target_position_without_thread_unique"
+    _HISTORY_TARGET_POSITION_WITH_THREAD_INDEX = "historymigrationentry_target_position_with_thread_unique"
     _LEGACY_OUTBOUND_COLUMNS = {
         "outboundworkflow": (
             ("id", "integer", False, True),
@@ -171,6 +176,9 @@ class DatabaseManager:
 
     @staticmethod
     def _create() -> None:
+        existing_tables = set(database.get_tables())
+        if {"chatassoc", "topicassoc", "historymigrationentry"} & existing_tables:
+            DatabaseManager._ensure_historic_schema_columns(database.obj)
         database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan])
         DatabaseManager._ensure_historic_schema_columns(database.obj)
 
@@ -222,6 +230,60 @@ class DatabaseManager:
                     f"CREATE INDEX IF NOT EXISTS {DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX} "
                     "ON msglog (slave_origin_uid, time, master_msg_id)"
                 )
+            if "chatassoc" in table_names:
+                DatabaseManager._deduplicate_by_key(ChatAssoc, (ChatAssoc.slave_uid,))
+                current_database.execute_sql(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._CHAT_ASSOC_SLAVE_INDEX} ON chatassoc (slave_uid)"
+                )
+            if "topicassoc" in table_names:
+                DatabaseManager._deduplicate_by_key(TopicAssoc, (TopicAssoc.slave_uid,))
+                DatabaseManager._deduplicate_by_key(TopicAssoc, (TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id))
+                current_database.execute_sql(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._TOPIC_ASSOC_SLAVE_INDEX} ON topicassoc (slave_uid)"
+                )
+                current_database.execute_sql(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._TOPIC_ASSOC_TOPIC_THREAD_INDEX} "
+                    "ON topicassoc (topic_chat_id, message_thread_id)"
+                )
+            if "historymigrationentry" in table_names:
+                DatabaseManager._deduplicate_history_positions()
+                current_database.execute_sql(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX} "
+                    "ON historymigrationentry (slave_chat_id, target_chat_id, position) WHERE message_thread_id IS NULL"
+                )
+                current_database.execute_sql(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._HISTORY_TARGET_POSITION_WITH_THREAD_INDEX} "
+                    "ON historymigrationentry (slave_chat_id, target_chat_id, message_thread_id, position) "
+                    "WHERE message_thread_id IS NOT NULL"
+                )
+
+    @staticmethod
+    def _deduplicate_by_key(model: type[Model], fields: tuple) -> None:
+        seen = set()
+        duplicate_ids = []
+        primary_key = model._meta.primary_key
+        if primary_key is False:
+            raise ValueError(f"{model.__name__} has no primary key")
+        for row in model.select(primary_key, *fields).order_by(primary_key.desc()):
+            key = tuple(getattr(row, field.name) for field in fields)
+            if key in seen:
+                duplicate_ids.append(getattr(row, primary_key.name))
+            else:
+                seen.add(key)
+        if duplicate_ids:
+            model.delete().where(primary_key.in_(duplicate_ids)).execute()
+
+    @staticmethod
+    def _deduplicate_history_positions() -> None:
+        DatabaseManager._deduplicate_by_key(
+            HistoryMigrationEntry,
+            (
+                HistoryMigrationEntry.slave_chat_id,
+                HistoryMigrationEntry.target_chat_id,
+                HistoryMigrationEntry.message_thread_id,
+                HistoryMigrationEntry.position,
+            ),
+        )
 
     @classmethod
     @contextmanager
