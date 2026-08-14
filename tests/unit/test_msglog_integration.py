@@ -1,6 +1,8 @@
 import asyncio
 import gc
 import threading
+import time
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,11 +10,14 @@ import pytest
 from ehforwarderbot import Message
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.types import MessageID
+from peewee import SqliteDatabase
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.channel_commands import LocaleState, TelegramCommandService
+from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
+from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler, MsgLogScanShutdownTimeout
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
@@ -262,6 +267,72 @@ def test_association_reschedule_uses_persisted_request_when_another_worker_is_ru
         ingestion.request_association_rescan.assert_called_once_with(100)
     finally:
         assert scheduler.stop(1) == ()
+
+
+def test_association_reschedule_recovers_a_stale_lease_and_completes_scan(tmp_path):
+    class Associations:
+        def get_topic_assoc_slave_uid(self, source_chat_id, topic_id):
+            assert (source_chat_id, topic_id) == (100, 10)
+            return "tests.slave target"
+
+    class MTProto:
+        enabled = True
+        config = SimpleNamespace(scan_ceiling=1)
+
+        async def connect(self):
+            return None
+
+        async def get_input_channel(self, source_chat_id):
+            return source_chat_id
+
+        async def get_channel_messages(self, _channel, message_ids):
+            assert message_ids == [1]
+            return [
+                SimpleNamespace(
+                    id=1,
+                    message="message 1",
+                    date=None,
+                    reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
+                    action=None,
+                    media=None,
+                )
+            ]
+
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "msglog.db")
+    database.initialize(test_db)
+    test_db.connect()
+    ingestion = MsgLogIngestionRepository("tests.master")
+    runtime = SharedAsyncRuntime()
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        scan = ingestion.get_or_create_scan(100, 1)
+        assert ingestion.claim_scan(100, "stale-worker", 60) is not None
+        MsgLogIngestionScan.update(
+            status="running",
+            cursor=0,
+            rescan_requested=True,
+            lease_owner="stale-worker",
+            lease_expires_at=datetime.now() - timedelta(seconds=1),
+        ).where(MsgLogIngestionScan.id == scan.id).execute()
+
+        assert scheduler.schedule_for_association(100) == "started"
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
+                break
+            time.sleep(0.01)
+        recovered = MsgLogIngestionScan.get_by_id(scan.id)
+        row = MsgLog.get_by_id("100.1")
+    finally:
+        assert scheduler.stop(1) == ()
+        runtime.close()
+        test_db.close()
+        database.initialize(original_database)
+
+    assert (recovered.status, recovered.rescan_requested, recovered.lease_owner) == ("complete", False, None)
+    assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
 
 
 def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():

@@ -187,6 +187,53 @@ def test_association_rescan_resets_completed_scans_and_marks_active_leases():
         database.initialize(original_database)
 
 
+@pytest.mark.parametrize(
+    ("lease_owner", "lease_expires_at"),
+    [("worker-a", datetime.now() - timedelta(seconds=1)), (None, None)],
+    ids=["expired", "missing"],
+)
+def test_association_rescan_recovers_stale_running_leases(lease_owner, lease_expires_at):
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    manager = MsgLogIngestionRepository("tests")
+    try:
+        test_db.create_tables([MsgLogIngestionScan])
+        scan = manager.get_or_create_scan(100, 500)
+        MsgLogIngestionScan.update(
+            status="running",
+            cursor=1,
+            existing_streak=499,
+            scanned_count=499,
+            inserted_count=20,
+            existing_count=30,
+            skipped_count=40,
+            rescan_requested=True,
+            lease_owner=lease_owner,
+            lease_expires_at=lease_expires_at,
+        ).where(MsgLogIngestionScan.id == scan.id).execute()
+
+        assert manager.request_association_rescan(100) == "pending"
+        recovered = MsgLogIngestionScan.get_by_id(scan.id)
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+    assert (
+        recovered.status,
+        recovered.cursor,
+        recovered.existing_streak,
+        recovered.scanned_count,
+        recovered.inserted_count,
+        recovered.existing_count,
+        recovered.skipped_count,
+        recovered.rescan_requested,
+        recovered.lease_owner,
+        recovered.lease_expires_at,
+    ) == ("pending", 500, 0, 0, 0, 0, 0, False, None, None)
+
+
 def test_active_association_request_restarts_scan_without_releasing_its_lease():
     original_database = database.obj
     test_db = SqliteDatabase(":memory:")

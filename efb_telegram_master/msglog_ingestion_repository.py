@@ -44,6 +44,20 @@ class MsgLogIngestionRepository(ObservedRepository):
                 return None
             return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
 
+    @staticmethod
+    def _reset_for_association_rescan(scan: MsgLogIngestionScan) -> None:
+        scan.cursor = scan.scan_boundary
+        scan.existing_streak = 0
+        scan.scanned_count = 0
+        scan.inserted_count = 0
+        scan.existing_count = 0
+        scan.skipped_count = 0
+        scan.rescan_requested = False
+        scan.lease_owner = None
+        scan.lease_expires_at = None
+        scan.status = "pending"
+        scan.error = None
+
     def request_association_rescan(self, source_chat_id: int) -> Optional[str]:
         """Durably request a follow-up after a topic becomes eligible."""
         now = datetime.datetime.now()
@@ -55,17 +69,12 @@ class MsgLogIngestionRepository(ObservedRepository):
             if scan is None:
                 return None
             if scan.status == "complete" and scan.lease_owner is None and scan.lease_expires_at is None:
-                scan.cursor = scan.scan_boundary
-                scan.existing_streak = 0
-                scan.scanned_count = 0
-                scan.inserted_count = 0
-                scan.existing_count = 0
-                scan.skipped_count = 0
-                scan.status = "pending"
-                scan.error = None
-                scan.rescan_requested = False
+                self._reset_for_association_rescan(scan)
             elif scan.status == "running":
-                scan.rescan_requested = True
+                if scan.lease_owner is not None and scan.lease_expires_at is not None and scan.lease_expires_at > now:
+                    scan.rescan_requested = True
+                else:
+                    self._reset_for_association_rescan(scan)
             scan.updated_at = now
             scan.save()
             return scan.status
@@ -79,7 +88,7 @@ class MsgLogIngestionRepository(ObservedRepository):
         with transaction:
             query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
             current = query.for_update().get() if supports_for_update else query.get()
-            if current.lease_owner != lease_owner or (current.lease_expires_at is not None and current.lease_expires_at < now):
+            if current.lease_owner != lease_owner or (current.lease_expires_at is not None and current.lease_expires_at <= now):
                 raise MsgLogIngestionLeaseLostError("MsgLog ingestion lease is no longer owned by this worker")
             if current.status == "complete":
                 return "complete"
