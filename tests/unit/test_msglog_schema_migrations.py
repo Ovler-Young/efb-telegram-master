@@ -105,8 +105,7 @@ def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, m
         provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
         msglog_indexes = {index.name for index in database.get_indexes("msglog")}
         query_plan = database.execute_sql(
-            "EXPLAIN QUERY PLAN SELECT master_msg_id FROM msglog "
-            "WHERE slave_origin_uid = ? ORDER BY time ASC, master_msg_id ASC LIMIT 2",
+            "EXPLAIN QUERY PLAN SELECT master_msg_id FROM msglog WHERE slave_origin_uid = ? ORDER BY time ASC, master_msg_id ASC LIMIT 2",
             ("tests.slave chat",),
         ).fetchall()
     finally:

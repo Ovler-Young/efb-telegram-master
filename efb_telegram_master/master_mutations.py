@@ -21,7 +21,9 @@ from .utils import TelegramChatID, TelegramMessageID
 class MasterMessageMutations:
     """Handle deletion commands and unsupported Telegram updates."""
 
-    def __init__(self, bot, msglogs, message_reconstructor, localize: Callable[[str], str], flags: Callable[[str], object], send_removal: Callable[[object, ETMMsg], None], logger: logging.Logger) -> None:
+    def __init__(
+        self, bot, msglogs, message_reconstructor, localize: Callable[[str], str], flags: Callable[[str], object], send_removal: Callable[[object, ETMMsg], None], logger: logging.Logger
+    ) -> None:
         self.bot = bot
         self.msglogs = msglogs
         self.message_reconstructor = message_reconstructor

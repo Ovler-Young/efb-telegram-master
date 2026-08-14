@@ -79,10 +79,13 @@ def test_historic_schema_migration_serializes_sqlite_startups(tmp_path):
     raw_db = SqliteDatabase(database_path)
     raw_db.connect()
     try:
-        raw_db.execute_sql("CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)")
+        raw_db.execute_sql(
+            "CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY, slave_message_id TEXT NOT NULL, text TEXT NOT NULL, slave_origin_uid TEXT NOT NULL, msg_type TEXT NOT NULL, sent_to TEXT NOT NULL)"
+        )
     finally:
         raw_db.close()
     errors = []
+
     def migrate() -> None:
         connection = SqliteDatabase(database_path, pragmas={"busy_timeout": 5000})
         try:
@@ -92,6 +95,7 @@ def test_historic_schema_migration_serializes_sqlite_startups(tmp_path):
             errors.append(error)
         finally:
             connection.close()
+
     first, second = threading.Thread(target=migrate), threading.Thread(target=migrate)
     first.start()
     second.start()
@@ -167,18 +171,14 @@ def test_sqlite_import_snapshot_canonicalizes_legacy_historic_identities_without
     source_db.connect()
     try:
         source_db.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
-        source_db.execute_sql(
-            "CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)"
-        )
+        source_db.execute_sql("CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)")
         source_db.execute_sql(
             "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
             "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
             "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
         )
         source_db.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
-        source_db.execute_sql(
-            "INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')"
-        )
+        source_db.execute_sql("INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')")
         source_db.execute_sql(
             "INSERT INTO historymigrationentry VALUES "
             "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
@@ -189,10 +189,7 @@ def test_sqlite_import_snapshot_canonicalizes_legacy_historic_identities_without
         with source_db.bind_ctx(models):
             snapshot = DatabaseManager._sqlite_source_snapshot(source_db, models)
 
-        rows_by_model = {
-            projection.model: [dict(zip(projection.column_names, row)) for row in projection.rows]
-            for projection in snapshot.projections
-        }
+        rows_by_model = {projection.model: [dict(zip(projection.column_names, row)) for row in projection.rows] for projection in snapshot.projections}
         assert rows_by_model[ChatAssoc] == [{"id": 2, "master_uid": "master-new", "slave_uid": "slave-a"}]
         assert rows_by_model[TopicAssoc] == [{"id": 3, "topic_chat_id": "101", "message_thread_id": "201", "slave_uid": "slave-b"}]
         assert [row["source_master_msg_id"] for row in rows_by_model[HistoryMigrationEntry]] == ["10.2", "10.4"]
@@ -576,6 +573,7 @@ def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, mo
 
     original_database = database.obj
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+
     class LegacyOutboundTable(Model):
         class Meta:
             database = database

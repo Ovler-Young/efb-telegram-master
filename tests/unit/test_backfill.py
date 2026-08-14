@@ -914,9 +914,7 @@ def test_history_migration_replacement_stages_source_before_acquiring_sqlite_wri
         concurrent_database.connect()
         try:
             concurrent_database.execute_sql(
-                "INSERT INTO historymigrationentry "
-                "(slave_chat_id, target_chat_id, source_master_msg_id, formatted_text, position, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO historymigrationentry (slave_chat_id, target_chat_id, source_master_msg_id, formatted_text, position, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 ("tests.mocks.slave.chat", "12345", "10.23", "concurrent", 2, datetime.now()),
             )
         finally:

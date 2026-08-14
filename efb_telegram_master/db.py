@@ -226,25 +226,15 @@ class DatabaseManager:
             if migration_steps:
                 migrate(*migration_steps)
             if "msglog" in table_names:
-                current_database.execute_sql(
-                    f"CREATE INDEX IF NOT EXISTS {DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX} "
-                    "ON msglog (slave_origin_uid, time, master_msg_id)"
-                )
+                current_database.execute_sql(f"CREATE INDEX IF NOT EXISTS {DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX} ON msglog (slave_origin_uid, time, master_msg_id)")
             if "chatassoc" in table_names:
                 DatabaseManager._deduplicate_by_key(ChatAssoc, (ChatAssoc.slave_uid,))
-                current_database.execute_sql(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._CHAT_ASSOC_SLAVE_INDEX} ON chatassoc (slave_uid)"
-                )
+                current_database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._CHAT_ASSOC_SLAVE_INDEX} ON chatassoc (slave_uid)")
             if "topicassoc" in table_names:
                 DatabaseManager._deduplicate_by_key(TopicAssoc, (TopicAssoc.slave_uid,))
                 DatabaseManager._deduplicate_by_key(TopicAssoc, (TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id))
-                current_database.execute_sql(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._TOPIC_ASSOC_SLAVE_INDEX} ON topicassoc (slave_uid)"
-                )
-                current_database.execute_sql(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._TOPIC_ASSOC_TOPIC_THREAD_INDEX} "
-                    "ON topicassoc (topic_chat_id, message_thread_id)"
-                )
+                current_database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._TOPIC_ASSOC_SLAVE_INDEX} ON topicassoc (slave_uid)")
+                current_database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._TOPIC_ASSOC_TOPIC_THREAD_INDEX} ON topicassoc (topic_chat_id, message_thread_id)")
             if "historymigrationentry" in table_names:
                 DatabaseManager._deduplicate_history_positions()
                 current_database.execute_sql(
@@ -443,15 +433,8 @@ class DatabaseManager:
                 if projection.model.select().count() != len(projection.rows):
                     return False
                 continue
-            fields = [
-                field
-                for field in projection.model._meta.sorted_fields
-                if field.column_name in projection.column_names
-            ]
-            target_rows = tuple(
-                DatabaseManager._sqlite_dict_row_values(row, projection.column_names)
-                for row in projection.model.select(*fields).dicts()
-            )
+            fields = [field for field in projection.model._meta.sorted_fields if field.column_name in projection.column_names]
+            target_rows = tuple(DatabaseManager._sqlite_dict_row_values(row, projection.column_names) for row in projection.model.select(*fields).dicts())
             if serialized_rows(target_rows) != serialized_rows(projection.rows):
                 return False
         return True
@@ -459,9 +442,7 @@ class DatabaseManager:
     @classmethod
     def _record_sqlite_import_provenance(cls, snapshot: _SQLiteImportSnapshot) -> None:
         placeholder = database.obj.param
-        database.execute_sql(
-            f'CREATE TABLE IF NOT EXISTS "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" (snapshot_identity TEXT PRIMARY KEY)'
-        )
+        database.execute_sql(f'CREATE TABLE IF NOT EXISTS "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" (snapshot_identity TEXT PRIMARY KEY)')
         database.execute_sql(
             f'INSERT INTO "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" (snapshot_identity) VALUES ({placeholder})',
             (snapshot.identity,),
@@ -484,10 +465,7 @@ class DatabaseManager:
     def _reject_legacy_outbound_source_data(cls, source_database) -> None:
         table_names = set(source_database.get_tables())
         legacy_table_names = cls._validate_legacy_outbound_schema(source_database, table_names)
-        row_counts = {
-            table_name: int(source_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
-            for table_name in legacy_table_names
-        }
+        row_counts = {table_name: int(source_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]) for table_name in legacy_table_names}
         if any(row_counts.values()):
             raise RuntimeError(
                 "Legacy durable outbound data detected in SQLite import source: automatic replay is disabled. "
@@ -499,10 +477,7 @@ class DatabaseManager:
     def _reject_legacy_outbound_target_data(cls, target_database) -> None:
         table_names = set(target_database.get_tables())
         legacy_table_names = cls._validate_legacy_outbound_schema(target_database, table_names)
-        row_counts = {
-            table_name: int(target_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
-            for table_name in legacy_table_names
-        }
+        row_counts = {table_name: int(target_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]) for table_name in legacy_table_names}
         if any(row_counts.values()):
             raise RuntimeError(
                 "Legacy durable outbound data detected in PostgreSQL import target: automatic replay is disabled. "
@@ -526,10 +501,7 @@ class DatabaseManager:
     def _finalize_sqlite_source(cls, source_database, sqlite_path: Path) -> None:
         migrated_path = sqlite_path.with_suffix(".db.migrated")
         if migrated_path.exists():
-            raise RuntimeError(
-                "SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; "
-                "preserving both files. Resolve the conflict before restarting."
-            )
+            raise RuntimeError("SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; preserving both files. Resolve the conflict before restarting.")
         descriptor, archive_name = tempfile.mkstemp(prefix=f".{migrated_path.name}.", suffix=".tmp", dir=sqlite_path.parent)
         os.close(descriptor)
         archive_path = Path(archive_name)
@@ -542,8 +514,7 @@ class DatabaseManager:
                 os.link(archive_path, migrated_path)
             except FileExistsError as error:
                 raise RuntimeError(
-                    "SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; "
-                    "preserving both files. Resolve the conflict before restarting."
+                    "SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; preserving both files. Resolve the conflict before restarting."
                 ) from error
             except OSError as error:
                 raise RuntimeError(f"SQLite-to-PostgreSQL migration finalization failed; source remains at {sqlite_path}") from error
@@ -563,8 +534,7 @@ class DatabaseManager:
                     )
                 if not self._target_matches_sqlite_snapshot(snapshot):
                     raise RuntimeError(
-                        "SQLite-to-PostgreSQL migration restart conflict: target data does not exactly match tgdata.db; "
-                        "preserving the source. Resolve the target/source conflict before restarting."
+                        "SQLite-to-PostgreSQL migration restart conflict: target data does not exactly match tgdata.db; preserving the source. Resolve the target/source conflict before restarting."
                     )
                 self._finalize_sqlite_source(source_database, sqlite_path)
         self.logger.info("SQLite-to-PostgreSQL migration source finalization completed; source renamed to %s", sqlite_path.with_suffix(".db.migrated"))
@@ -730,10 +700,7 @@ class DatabaseManager:
             legacy_table_names = cls._validate_legacy_outbound_schema(current_database, table_names)
             if not legacy_table_names:
                 return
-            row_counts = {
-                table_name: int(current_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
-                for table_name in legacy_table_names
-            }
+            row_counts = {table_name: int(current_database.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]) for table_name in legacy_table_names}
             if any(row_counts.values()):
                 raise RuntimeError(
                     "Legacy durable outbound data detected: automatic replay is disabled. "

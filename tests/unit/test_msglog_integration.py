@@ -244,6 +244,7 @@ def test_msglog_scan_caps_concurrent_workers_and_admits_pending_groups_fairly(mo
     monkeypatch.setattr(MsgLogIngestionService, "run", run)
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
     runtime = SharedAsyncRuntime()
+
     async def connect():
         return None
 
@@ -283,6 +284,7 @@ def test_msglog_scan_shutdown_discards_pending_groups(monkeypatch):
     monkeypatch.setattr(MsgLogIngestionService, "run", run)
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
     runtime = SharedAsyncRuntime()
+
     async def connect():
         return None
 

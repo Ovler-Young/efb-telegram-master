@@ -45,7 +45,9 @@ class MasterMessageDelivery:
         TGMsgType.Dice: MsgType.Text,
     }
 
-    def __init__(self, bot, msglogs, chat_manager, message_reconstructor, localize: Callable[[str], str], flags: Callable[[str], object], send_removal: Callable[[object, ETMMsg], None], logger: logging.Logger) -> None:
+    def __init__(
+        self, bot, msglogs, chat_manager, message_reconstructor, localize: Callable[[str], str], flags: Callable[[str], object], send_removal: Callable[[object, ETMMsg], None], logger: logging.Logger
+    ) -> None:
         self.bot = bot
         self.msglogs = msglogs
         self.chat_manager = chat_manager

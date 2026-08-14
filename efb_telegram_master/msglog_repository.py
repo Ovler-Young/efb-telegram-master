@@ -151,9 +151,7 @@ class MsgLogRepository(ObservedRepository):
             after_time, after_message_id = after
             nulls_first = not isinstance(database.obj, PostgresqlDatabase)
             if after_time is None and nulls_first:
-                query = query.where(
-                    ((MsgLog.time.is_null(True)) & (MsgLog.master_msg_id > after_message_id)) | MsgLog.time.is_null(False)
-                )
+                query = query.where(((MsgLog.time.is_null(True)) & (MsgLog.master_msg_id > after_message_id)) | MsgLog.time.is_null(False))
             elif after_time is None:
                 query = query.where((MsgLog.time.is_null(True)) & (MsgLog.master_msg_id > after_message_id))
             else:

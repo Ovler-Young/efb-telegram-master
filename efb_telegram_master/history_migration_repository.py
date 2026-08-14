@@ -91,10 +91,7 @@ class HistoryMigrationRepository(ObservedRepository):
         query = HistoryMigrationEntry.select().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id))
         if after is not None:
             after_position, after_id = after
-            query = query.where(
-                (HistoryMigrationEntry.position > after_position)
-                | ((HistoryMigrationEntry.position == after_position) & (HistoryMigrationEntry.id > after_id))
-            )
+            query = query.where((HistoryMigrationEntry.position > after_position) | ((HistoryMigrationEntry.position == after_position) & (HistoryMigrationEntry.id > after_id)))
         return list(query.order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc()).limit(page_size))
 
     @observe_database_method("delete_history_migration_entry")

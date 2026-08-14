@@ -211,18 +211,14 @@ def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_
     try:
         source_db.connect()
         source_db.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
-        source_db.execute_sql(
-            "CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)"
-        )
+        source_db.execute_sql("CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)")
         source_db.execute_sql(
             "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
             "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
             "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
         )
         source_db.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
-        source_db.execute_sql(
-            "INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')"
-        )
+        source_db.execute_sql("INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')")
         source_db.execute_sql(
             "INSERT INTO historymigrationentry VALUES "
             "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
@@ -272,7 +268,6 @@ def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_
         if database_name is not None:
             _drop_database(admin_db, database_name)
         admin_db.close()
-
 
 
 @pytest.mark.integration

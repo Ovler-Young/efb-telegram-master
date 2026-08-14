@@ -48,7 +48,7 @@ class TopicAssoc(BaseModel):
     slave_uid = TextField()
 
     class Meta:
-        indexes = ((('slave_uid',), True), (('topic_chat_id', 'message_thread_id'), True))
+        indexes = ((("slave_uid",), True), (("topic_chat_id", "message_thread_id"), True))
 
 
 class ChatAssoc(BaseModel):
@@ -56,7 +56,7 @@ class ChatAssoc(BaseModel):
     slave_uid = TextField()
 
     class Meta:
-        indexes = ((('slave_uid',), True),)
+        indexes = ((("slave_uid",), True),)
 
 
 class MsgLog(BaseModel):
@@ -104,6 +104,7 @@ class MsgLog(BaseModel):
 
     class Meta:
         indexes = ((("slave_origin_uid", "time", "master_msg_id"), False),)
+
 
 class MsgLogIngestionScan(BaseModel):
     """One leased descending MTProto scan for a bound Telegram group."""
