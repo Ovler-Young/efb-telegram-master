@@ -181,7 +181,7 @@ class DatabaseManager:
     @staticmethod
     def _create() -> None:
         existing_tables = set(database.get_tables())
-        if {"chatassoc", "topicassoc", "historymigrationentry", "slavechatinfo", "slavemessagedelivery"} & existing_tables:
+        if {"chatassoc", "topicassoc", "historymigrationentry", "slavechatinfo"} & existing_tables:
             DatabaseManager._ensure_historic_schema_columns(database.obj)
         database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery])
         DatabaseManager._ensure_historic_schema_columns(database.obj)
@@ -239,15 +239,6 @@ class DatabaseManager:
                     f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX} "
                     "ON slavechatinfo (slave_channel_id, slave_chat_uid, slave_chat_group_id) WHERE slave_chat_group_id IS NOT NULL"
                 )
-            if "slavemessagedelivery" in table_names:
-                delivery_columns = {column.name for column in current_database.get_columns("slavemessagedelivery")}
-                delivery_migrations = tuple(
-                    migrator.add_column("slavemessagedelivery", column_name, field)
-                    for column_name, field in (("state", SlaveMessageDelivery.state), ("lease_expires_at", SlaveMessageDelivery.lease_expires_at))
-                    if column_name not in delivery_columns
-                )
-                if delivery_migrations:
-                    migrate(*delivery_migrations)
             if "msglog" in table_names:
                 current_database.execute_sql(f"CREATE INDEX IF NOT EXISTS {DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX} ON msglog (slave_origin_uid, time, master_msg_id)")
             if "chatassoc" in table_names:

@@ -967,11 +967,8 @@ def test_slave_message_delivery_claim_persists_across_repository_instances(tmp_p
             test_db.create_tables([SlaveMessageDelivery])
             assert first.claim("tests.slave chat", "message")
             assert not restarted.claim("tests.slave chat", "message")
-            restarted.complete("tests.slave chat", "message")
-            assert not first.claim("tests.slave chat", "message", lease_seconds=0)
             restarted.release("tests.slave chat", "message")
-            assert first.claim("tests.slave chat", "retry", lease_seconds=-1)
-            assert restarted.claim("tests.slave chat", "retry")
+            assert first.claim("tests.slave chat", "message")
         finally:
             test_db.close()
 

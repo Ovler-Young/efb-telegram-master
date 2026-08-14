@@ -284,7 +284,6 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
     processor.commands = SimpleNamespace(register_command=Mock())
     processor.chat_manager = Mock()
     processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock(side_effect=RuntimeError("database unavailable")))
-    processor.delivery_claims = Mock()
     processor.router = Mock(resolve_reply=Mock(return_value=None))
     processor._release_pending_slave_message = Mock()
     processor.text_delivery = Mock(text=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=7)))
@@ -301,7 +300,6 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"))
 
     processor.msglogs.add_or_update_message_log.assert_called_once()
-    processor.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message")
     processor.logger.warning.assert_called_once_with(
         "DB write failed for Telegram message %s; dropping mapping (%s).",
         7,

@@ -268,8 +268,6 @@ class SlaveMessageService:
             return
 
         self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.", xid, tg_msg.chat.id, tg_msg.message_id)
-        if dedupe_key is not None:
-            self.delivery_claims.complete(*dedupe_key)
         etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
         try:
             etm_msg.type_telegram = get_msg_type(tg_msg)
