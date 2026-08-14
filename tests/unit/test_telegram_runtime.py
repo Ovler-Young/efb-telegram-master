@@ -525,7 +525,13 @@ def test_channel_withholds_database_until_a_real_outbound_send_exits() -> None:
 
 def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_cleanup_errors(caplog) -> None:
     channel = SimpleNamespace(config={"admins": [1]}, db=Mock())
-    runtime = Mock(async_runtime=Mock(), bot=Mock())
+    async_runtime = Mock()
+
+    def consume_runtime_call(coroutine, **_kwargs):
+        coroutine.close()
+
+    async_runtime.call.side_effect = consume_runtime_call
+    runtime = Mock(async_runtime=async_runtime, bot=Mock())
     dispatcher_error = RuntimeError("dispatcher registration failed")
     delivery_error = RuntimeError("delivery shutdown failed")
     runtime_error = RuntimeError("runtime shutdown failed")
