@@ -373,14 +373,14 @@ def test_dispatch_reply_target_respects_provenance(provenance, expected_target_m
     assert processor.text_delivery.text.call_args.args[6] == expected_target_msg_id
 
 
-def test_ordinary_send_writes_msglog_once_and_completes_delivery_claim(monkeypatch):
+def test_ordinary_send_writes_msglog_once_and_releases_completion(monkeypatch):
     processor = object.__new__(SlaveMessageService)
     processor.logger = Mock()
     processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock())
-    processor.delivery_claims = Mock()
     processor.chat_manager = Mock()
     processor.router = Mock(resolve_reply=Mock(return_value=None))
     processor.commands = SimpleNamespace(register_command=Mock())
+    processor._release_pending_slave_message = Mock()
     sent = SimpleNamespace(chat=SimpleNamespace(id=123), message_id=456, sender_bot_id="7")
     processor.text_delivery = Mock(text=Mock(return_value=sent))
     etm_msg = Mock()
@@ -403,4 +403,4 @@ def test_ordinary_send_writes_msglog_once_and_completes_delivery_claim(monkeypat
         None,
         sender_bot_id="7",
     )
-    processor.delivery_claims.complete.assert_called_once_with("slave", "slave-message")
+    processor._release_pending_slave_message.assert_called_once_with(("slave", "slave-message"))
