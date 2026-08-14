@@ -106,7 +106,6 @@ class TelegramChannel(MasterChannel):
         self._owned_database = self.db
         self.chat_associations = self.db.chat_associations
         self.slave_chat_info = self.db.slave_chat_info
-        self.slave_message_deliveries = self.db.slave_message_deliveries
         self.msglogs = self.db.msglogs
         self.history_migrations = self.db.history_migrations
         self.msglog_ingestion = self.db.msglog_ingestion

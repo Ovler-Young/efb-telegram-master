@@ -616,7 +616,6 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
             stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
         channel = TelegramChannel()
 
-    assert channel.slave_message_deliveries is database_manager.slave_message_deliveries
     history_replay.resume.assert_called_once_with()
     channel.chat_associations.get_topic_slaves.return_value = [("tests.slave", 7)]
     channel.msglog_scan.schedule.return_value = "started"
