@@ -32,6 +32,7 @@ class LinkCompletionService:
         translate,
         ngettext,
         logger: logging.Logger,
+        conversation_handler: ConversationHandler,
     ):
         self.bot = bot
         self.channel_id = channel_id
@@ -43,14 +44,7 @@ class LinkCompletionService:
         self._ = translate
         self.ngettext = ngettext
         self.logger = logger
-        self.link_handler: Optional[ConversationHandler] = None
-
-    def set_handler(self, handler) -> None:
-        self.link_handler = handler
-
-    def _handler(self) -> ConversationHandler:
-        assert self.link_handler is not None
-        return self.link_handler
+        self._conversation_handler = conversation_handler
 
     def complete(self, update: Update, args: Optional[List[str]]):
         """Actual code of linking a chat by manipulating database.
@@ -75,7 +69,7 @@ class LinkCompletionService:
         try:
             msg_id = utils.message_id_str_to_id(TgChatMsgIDStr(utils.b64de(resolved_args[0])))
             storage_key = (TelegramChatID(int(msg_id[0])), TelegramMessageID(int(msg_id[1])))
-            data = self.callback_sessions.get(self._handler(), storage_key)
+            data = self.callback_sessions.get(self._conversation_handler, storage_key)
             if data is None or update.effective_user is None or not self.callback_sessions.is_owned_by(storage_key, update.effective_user.id):
                 raise KeyError(storage_key)
         except KeyError:
@@ -153,7 +147,7 @@ class LinkCompletionService:
         )
 
         self.bot.edit_message_text(chat_id=storage_key[0], message_id=storage_key[1], text=txt)
-        self.callback_sessions.clear(self._handler(), storage_key)
+        self.callback_sessions.clear(self._conversation_handler, storage_key)
 
         # migrate history
         # auto:   backfill on first link, send history link on relink

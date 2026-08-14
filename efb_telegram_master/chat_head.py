@@ -34,6 +34,7 @@ class ChatHeadService:
         msglogs: MsgLogRepository,
         render_chat_list: Callable,
         translate: Callable[[str], str],
+        conversation_handler: ConversationHandler,
     ) -> None:
         self.bot = bot
         self.callback_sessions = callback_sessions
@@ -44,14 +45,7 @@ class ChatHeadService:
         self.msglogs = msglogs
         self.render_chat_list = render_chat_list
         self._ = translate
-        self.chat_head_handler: Optional[ConversationHandler] = None
-
-    def set_handler(self, handler: ConversationHandler) -> None:
-        self.chat_head_handler = handler
-
-    def _handler(self) -> ConversationHandler:
-        assert self.chat_head_handler is not None
-        return self.chat_head_handler
+        self._conversation_handler = conversation_handler
 
     def start_chat_list(self, update: Update, context: CallbackContext):
         assert update.message
@@ -96,7 +90,7 @@ class ChatHeadService:
         legend, buttons = self.render_chat_list((chat_id, message_id), owner_id, offset, pattern=pattern, source_chats=chats)
         text += self._("\n\nLegend:\n") + "".join(f"{entry}\n" for entry in legend)
         self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(buttons))
-        self.callback_sessions.set_state(self._handler(), (chat_id, message_id), Flags.CHAT_HEAD_CONFIRM)
+        self.callback_sessions.set_state(self._conversation_handler, (chat_id, message_id), Flags.CHAT_HEAD_CONFIRM)
 
     def make_chat_head(self, update: Update, context: CallbackContext) -> int:
         assert update.effective_chat and update.effective_message and update.callback_query and update.callback_query.data
@@ -113,26 +107,26 @@ class ChatHeadService:
         invalid_text = self._("Invalid command. ({0})").format(callback_data)
         if callback_data.split(maxsplit=1)[0] == "offset":
             offset = self.callback_sessions.parse_index(callback_data, "offset")
-            storage = self.callback_sessions.expired(self._handler(), storage_id, update.callback_query.id, expired_text)
+            storage = self.callback_sessions.expired(self._conversation_handler, storage_id, update.callback_query.id, expired_text)
             if storage is None:
                 return ConversationHandler.END
             if offset is None or not self.callback_sessions.is_valid_page_offset(storage, offset):
-                return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
+                return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, invalid_text)
             assert effective_user is not None
             self.bot.answer_callback_query(update.callback_query.id)
             return self.render_chat_head(chat_id, effective_user.id, message_id, offset)
         if callback_data == Flags.CANCEL_PROCESS:
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, self._("Cancelled."))
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, self._("Cancelled."))
         if not callback_data.startswith("chat "):
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, invalid_text)
         callback_index = self.callback_sessions.parse_index(callback_data, "chat")
-        storage = self.callback_sessions.expired(self._handler(), storage_id, update.callback_query.id, expired_text)
+        storage = self.callback_sessions.expired(self._conversation_handler, storage_id, update.callback_query.id, expired_text)
         if storage is None:
             return ConversationHandler.END
         if callback_index is None or not self.callback_sessions.is_current_selection(storage, callback_index):
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, invalid_text)
         chat: ETMChatMixin = storage.chats[callback_index]
-        self.callback_sessions.clear(self._handler(), storage_id)
+        self.callback_sessions.clear(self._conversation_handler, storage_id)
         text = self._("Reply to this message to chat with {0}.").format(chat.full_name)
         self._record_chat_head(chat, update.effective_message, text)
         self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id)

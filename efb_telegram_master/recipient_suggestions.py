@@ -22,7 +22,15 @@ class RecipientSuggestionService:
     """Render candidate chats and deliver messages after a recipient is selected."""
 
     def __init__(
-        self, bot, callback_sessions: CallbackSessionStore, chat_manager, message_delivery, chats_per_page: Callable[[], int], translate: Callable[[str], str], logger: logging.Logger
+        self,
+        bot,
+        callback_sessions: CallbackSessionStore,
+        chat_manager,
+        message_delivery,
+        chats_per_page: Callable[[], int],
+        translate: Callable[[str], str],
+        logger: logging.Logger,
+        conversation_handler: ConversationHandler,
     ) -> None:
         self.bot = bot
         self.callback_sessions = callback_sessions
@@ -31,14 +39,7 @@ class RecipientSuggestionService:
         self.chats_per_page = chats_per_page
         self._ = translate
         self.logger = logger
-        self.suggestion_handler: Optional[ConversationHandler] = None
-
-    def set_handler(self, handler: ConversationHandler) -> None:
-        self.suggestion_handler = handler
-
-    def _handler(self) -> ConversationHandler:
-        assert self.suggestion_handler is not None
-        return self.suggestion_handler
+        self._conversation_handler = conversation_handler
 
     def render_chat_list(
         self,
@@ -127,7 +128,7 @@ class RecipientSuggestionService:
             message_id=message_id,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
-        self.callback_sessions.set_state(self._handler(), storage_id, Flags.SUGGEST_RECIPIENTS)
+        self.callback_sessions.set_state(self._conversation_handler, storage_id, Flags.SUGGEST_RECIPIENTS)
 
     def suggested_recipient(self, update: Update, context: CallbackContext) -> int:
         """Deliver an undirected Telegram message to the selected slave chat."""
@@ -148,11 +149,11 @@ class RecipientSuggestionService:
         invalid_text = self._("Error: No recipient specified.\nPlease reply to a previous message.\n\nInvalid parameter ({0}).").format(callback_data)
         if callback_data.split(maxsplit=1)[0] == "chat":
             callback_index = self.callback_sessions.parse_index(callback_data, "chat")
-            storage = self.callback_sessions.expired(self._handler(), storage_id, callback_query_id, expired_text)
+            storage = self.callback_sessions.expired(self._conversation_handler, storage_id, callback_query_id, expired_text)
             if storage is None:
                 return ConversationHandler.END
             if callback_index is None or storage.update is None or not self.callback_sessions.is_current_selection(storage, callback_index):
-                return self.callback_sessions.end(self._handler(), storage_id, callback_query_id, invalid_text)
+                return self.callback_sessions.end(self._conversation_handler, storage_id, callback_query_id, invalid_text)
             slave_chat = storage.chats[callback_index]
             self.message_delivery.deliver(storage.update, context, utils.chat_id_to_str(chat=slave_chat))
             self.bot.edit_message_text(text=self._("Delivering the message to {0}.").format(slave_chat.full_name), chat_id=chat_id, message_id=message_id)
@@ -160,6 +161,6 @@ class RecipientSuggestionService:
             self.bot.edit_message_text(text=self._("Error: No recipient specified.\nPlease reply to a previous message."), chat_id=chat_id, message_id=message_id)
         else:
             self.bot.edit_message_text(text=invalid_text, chat_id=chat_id, message_id=message_id)
-        self.callback_sessions.clear(self._handler(), storage_id)
+        self.callback_sessions.clear(self._conversation_handler, storage_id)
         self.bot.answer_callback_query(callback_query_id)
         return ConversationHandler.END

@@ -34,6 +34,7 @@ class LinkService:
         translate: Callable[[str], str],
         ngettext: Callable,
         logger: logging.Logger,
+        conversation_handler: ConversationHandler,
     ):
         self.bot = bot
         self.runtime = runtime
@@ -47,14 +48,7 @@ class LinkService:
         self._ = translate
         self.ngettext = ngettext
         self.logger = logger
-        self.link_handler: Optional[ConversationHandler] = None
-
-    def set_handler(self, handler: ConversationHandler) -> None:
-        self.link_handler = handler
-
-    def _handler(self) -> ConversationHandler:
-        assert self.link_handler is not None
-        return self.link_handler
+        self._conversation_handler = conversation_handler
 
     def _get_bot_user(self) -> telegram.User:
         bot_user = self.runtime.me
@@ -122,7 +116,7 @@ class LinkService:
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id)
                 storage_id: Tuple[TelegramChatID, TelegramMessageID] = (tg_chat_id, tg_msg_id)
-                self.callback_sessions.start(self._handler(), storage_id, Flags.LINK_EXEC, update.effective_user.id, ChatListStorage([chat]))
+                self.callback_sessions.start(self._conversation_handler, storage_id, Flags.LINK_EXEC, update.effective_user.id, ChatListStorage([chat]))
                 return self.build_action(chat, tg_chat_id, tg_msg_id)
             if message.message_thread_id:
                 topic = message.message_thread_id
@@ -134,7 +128,7 @@ class LinkService:
                         topic_tg_chat_id = TelegramChatID(message.chat_id)
                         topic_tg_msg_id = TelegramMessageID(sync_reply_text(self.bot, message, self._("Processing..."), _force_main_bot=True).message_id)
                         topic_storage_id: Tuple[TelegramChatID, TelegramMessageID] = (topic_tg_chat_id, topic_tg_msg_id)
-                        self.callback_sessions.start(self._handler(), topic_storage_id, Flags.LINK_EXEC, update.effective_user.id, ChatListStorage([topic_chat]))
+                        self.callback_sessions.start(self._conversation_handler, topic_storage_id, Flags.LINK_EXEC, update.effective_user.id, ChatListStorage([topic_chat]))
                         return self.build_action(topic_chat, topic_tg_chat_id, topic_tg_msg_id)
 
         if message.chat.type != ChatType.PRIVATE:
@@ -190,7 +184,7 @@ class LinkService:
 
         self.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=msg_text, reply_markup=InlineKeyboardMarkup(chat_btn_list))
 
-        self.callback_sessions.set_state(self._handler(), (chat_id, message_id), Flags.LINK_CONFIRM)
+        self.callback_sessions.set_state(self._conversation_handler, (chat_id, message_id), Flags.LINK_CONFIRM)
 
         return Flags.LINK_CONFIRM
 
@@ -222,11 +216,11 @@ class LinkService:
         invalid_text = self._("Invalid parameter ({0}). (IP01)").format(callback_uid)
         if callback_uid.split(maxsplit=1)[0] == "offset":
             offset = self.callback_sessions.parse_index(callback_uid, "offset")
-            storage = self.callback_sessions.expired(self._handler(), storage_id, update.callback_query.id, expired_text)
+            storage = self.callback_sessions.expired(self._conversation_handler, storage_id, update.callback_query.id, expired_text)
             if storage is None:
                 return ConversationHandler.END
             if offset is None or not self.callback_sessions.is_valid_page_offset(storage, offset):
-                return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
+                return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, invalid_text)
             # Offer a new page of chats
             assert effective_user is not None
             self.bot.answer_callback_query(update.callback_query.id)
@@ -235,18 +229,18 @@ class LinkService:
         if callback_uid == Flags.CANCEL_PROCESS:
             # Terminate the process
             txt = self._("Cancelled.")
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, txt)
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, txt)
 
         if callback_uid[:4] != "chat":
             # The only possible command now is "chat".
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, invalid_text)
 
         callback_idx = self.callback_sessions.parse_index(callback_uid, "chat")
-        storage = self.callback_sessions.expired(self._handler(), storage_id, update.callback_query.id, expired_text)
+        storage = self.callback_sessions.expired(self._conversation_handler, storage_id, update.callback_query.id, expired_text)
         if storage is None:
             return ConversationHandler.END
         if callback_idx is None or not self.callback_sessions.is_current_selection(storage, callback_idx):
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, invalid_text)
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, invalid_text)
         chat: ETMChatMixin = storage.chats[callback_idx]
 
         self.bot.answer_callback_query(update.callback_query.id)
@@ -297,21 +291,21 @@ class LinkService:
 
         if callback_uid == Flags.CANCEL_PROCESS:
             txt = self._("Cancelled.")
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, txt)
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, txt)
 
         expired_text = self._("Session expired. Please try again. (SE01)")
         callback_parts = callback_uid.split()
         if len(callback_parts) != 2:
             txt = self._("Command ‘{command}’ ({query}) is not recognised, please try again.").format(command=callback_parts[0] if callback_parts else "", query=callback_uid)
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, txt)
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, txt)
         cmd, _ = callback_parts
         callback_idx = self.callback_sessions.parse_index(callback_uid, cmd)
-        storage = self.callback_sessions.expired(self._handler(), storage_id, update.callback_query.id, expired_text)
+        storage = self.callback_sessions.expired(self._conversation_handler, storage_id, update.callback_query.id, expired_text)
         if storage is None:
             return ConversationHandler.END
         if callback_idx is None or not self.callback_sessions.is_current_selection(storage, callback_idx):
             txt = self._("Invalid parameter ({0}). (IP01)").format(callback_uid)
-            return self.callback_sessions.end(self._handler(), storage_id, update.callback_query.id, txt)
+            return self.callback_sessions.end(self._conversation_handler, storage_id, update.callback_query.id, txt)
         chat: ETMChatMixin = storage.chats[callback_idx]
         chat_display_name = chat.full_name
         if cmd == "unlink":
@@ -343,5 +337,5 @@ class LinkService:
             txt = self._("Command ‘{command}’ ({query}) is not recognised, please try again.").format(command=cmd, query=callback_uid)
             self.bot.edit_message_text(text=txt, chat_id=tg_chat_id, message_id=tg_msg_id)
         self.bot.answer_callback_query(update.callback_query.id)
-        self.callback_sessions.clear(self._handler(), storage_id)
+        self.callback_sessions.clear(self._conversation_handler, storage_id)
         return ConversationHandler.END

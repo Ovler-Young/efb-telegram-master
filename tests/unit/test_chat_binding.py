@@ -41,7 +41,7 @@ def callback_manager():
     manager.channel = SimpleNamespace(_=lambda text: text, flag=lambda _name: 10)
     manager._ = lambda text: text
     manager.callback_sessions = CallbackSessionStore(manager.bot, lambda: manager.channel.flag("chats_per_page"))
-    manager.link_handler = SimpleNamespace(_conversations={})
+    manager._conversation_handler = SimpleNamespace(_conversations={})
     return manager
 
 
@@ -61,10 +61,17 @@ async def _dispatch_callback(handler, application, update):
     await handler.handle_update(update, application, check_result, context)
 
 
+def test_channel_injects_conversation_handlers_into_binding_services(channel):
+    assert channel.link_service._conversation_handler is channel.link_handler
+    assert channel.link_completion._conversation_handler is channel.link_handler
+    assert channel.chat_head._conversation_handler is channel.chat_head_handler
+    assert channel.recipient_suggestions._conversation_handler is channel.suggestion_handler
+
+
 @pytest.mark.parametrize(
     ("handler_name", "state", "callback"),
     [
-        ("link_handler", Flags.LINK_EXEC, "manual_link 0"),
+        ("_conversation_handler", Flags.LINK_EXEC, "manual_link 0"),
     ],
 )
 def test_callback_handlers_expire_missing_sessions(callback_manager, handler_name, state, callback):
@@ -74,7 +81,7 @@ def test_callback_handlers_expire_missing_sessions(callback_manager, handler_nam
     manager.callback_sessions.set_state(handler, storage_id, state)
     update = _callback_update(*storage_id, callback)
     method = {
-        "link_handler": manager.execute,
+        "_conversation_handler": manager.execute,
     }[handler_name]
 
     with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query") as answer_callback_query:
@@ -88,33 +95,33 @@ def test_callback_handlers_expire_missing_sessions(callback_manager, handler_nam
 def test_link_exec_rejects_malformed_callback_tokens(callback_manager, callback_chat, callback):
     manager = callback_manager
     storage_id = (TelegramChatID(1), TelegramMessageID(202))
-    _store_callback_session(manager, manager.link_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
+    _store_callback_session(manager, manager._conversation_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
 
     with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"):
         assert manager.execute(_callback_update(*storage_id, callback), None) == ConversationHandler.END
 
     assert manager.callback_sessions.lookup(storage_id) is None
-    assert storage_id not in manager.link_handler._conversations
+    assert storage_id not in manager._conversation_handler._conversations
 
 
 @pytest.mark.parametrize("callback", ["offset", "offset nope", "offset 999", "chat nope", "chat 4"])
 def test_link_confirmation_rejects_invalid_callback_indexes(callback_manager, callback_chat, callback):
     manager = callback_manager
     storage_id = (TelegramChatID(1), TelegramMessageID(206))
-    _store_callback_session(manager, manager.link_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
+    _store_callback_session(manager, manager._conversation_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
 
     with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"), patch.object(manager, "render_list") as generate:
         assert manager.confirm(_callback_update(*storage_id, callback), None) == ConversationHandler.END
 
     generate.assert_not_called()
     assert manager.callback_sessions.lookup(storage_id) is None
-    assert storage_id not in manager.link_handler._conversations
+    assert storage_id not in manager._conversation_handler._conversations
 
 
 def test_link_confirmation_answers_before_building_the_action_menu(callback_manager, callback_chat):
     manager = callback_manager
     storage_id = (TelegramChatID(1), TelegramMessageID(208))
-    _store_callback_session(manager, manager.link_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
+    _store_callback_session(manager, manager._conversation_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
     calls = []
     manager.bot.answer_callback_query.side_effect = lambda *_args: calls.append("answer")
 
@@ -127,7 +134,7 @@ def test_link_confirmation_answers_before_building_the_action_menu(callback_mana
 def test_link_exec_keeps_valid_manual_link_callback_active(callback_manager, callback_chat):
     manager = callback_manager
     storage_id = (TelegramChatID(1), TelegramMessageID(205))
-    _store_callback_session(manager, manager.link_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
+    _store_callback_session(manager, manager._conversation_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
 
     with patch.object(manager, "build_action") as build_link_action_message, patch.object(manager.bot, "answer_callback_query") as answer_callback_query:
         assert manager.execute(_callback_update(*storage_id, "manual_link 0"), None) == Flags.LINK_EXEC
@@ -139,7 +146,7 @@ def test_link_exec_keeps_valid_manual_link_callback_active(callback_manager, cal
 
 def test_other_user_cannot_use_link_callback_and_owner_can_continue(callback_manager, callback_chat):
     storage_id = (TelegramChatID(1), TelegramMessageID(210))
-    _store_callback_session(callback_manager, callback_manager.link_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
+    _store_callback_session(callback_manager, callback_manager._conversation_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
 
     assert callback_manager.execute(_callback_update(*storage_id, "manual_link 0", user_id=2), None) == Flags.LINK_EXEC
 
@@ -151,14 +158,14 @@ def test_other_user_cannot_use_link_callback_and_owner_can_continue(callback_man
 
 def test_other_user_cannot_paginate_link_session(callback_manager, callback_chat):
     storage_id = (TelegramChatID(1), TelegramMessageID(211))
-    _store_callback_session(callback_manager, callback_manager.link_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
+    _store_callback_session(callback_manager, callback_manager._conversation_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
 
     with patch.object(callback_manager, "render_list") as render_list:
         assert callback_manager.confirm(_callback_update(*storage_id, "offset 0", user_id=2), None) == Flags.LINK_CONFIRM
 
     render_list.assert_not_called()
     assert callback_manager.callback_sessions.lookup(storage_id) is not None
-    assert storage_id in callback_manager.link_handler._conversations
+    assert storage_id in callback_manager._conversation_handler._conversations
 
 
 @pytest.mark.asyncio
@@ -177,7 +184,7 @@ async def test_conversation_handler_keeps_link_session_for_an_unauthorized_callb
         per_chat=True,
         per_user=False,
     )
-    manager.set_handler(handler)
+    manager._conversation_handler = handler
     manager.callback_sessions.start(handler, storage_id, Flags.LINK_CONFIRM, 1, ChatListStorage([callback_chat]))
     application = ApplicationBuilder().token("123:token").build()
 
@@ -219,7 +226,7 @@ async def test_conversation_handler_keeps_link_execute_session_for_unauthorized_
         per_chat=True,
         per_user=False,
     )
-    manager.set_handler(handler)
+    manager._conversation_handler = handler
     manager.callback_sessions.start(handler, storage_id, Flags.LINK_EXEC, 1, ChatListStorage([chat]))
     application = ApplicationBuilder().token("123:token").build()
     attacker = _callback_update(*storage_id, "unlink 0", user_id=2)
@@ -246,7 +253,6 @@ async def test_conversation_handler_keeps_chat_head_session_for_unauthorized_cal
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     chat = SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat", self=Mock(), add_self=Mock())
     msglogs = Mock()
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text)
     storage_id = (TelegramChatID(1), TelegramMessageID(228))
 
     async def make_chat_head(update, context):
@@ -260,7 +266,7 @@ async def test_conversation_handler_keeps_chat_head_session_for_unauthorized_cal
         per_chat=True,
         per_user=False,
     )
-    service.set_handler(handler)
+    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text, handler)
     callback_sessions.start(handler, storage_id, Flags.CHAT_HEAD_CONFIRM, 1, ChatListStorage([chat]))
     application = ApplicationBuilder().token("123:token").build()
     attacker = _callback_update(*storage_id, "chat 0", user_id=2)
@@ -286,7 +292,6 @@ async def test_conversation_handler_keeps_recipient_session_for_unauthorized_cal
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     delivery = Mock()
-    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock())
     storage_id = (TelegramChatID(1), TelegramMessageID(229))
     chat = SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat")
     storage = ChatListStorage([chat])
@@ -304,7 +309,7 @@ async def test_conversation_handler_keeps_recipient_session_for_unauthorized_cal
         per_chat=True,
         per_user=False,
     )
-    service.set_handler(handler)
+    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock(), handler)
     callback_sessions.start(handler, storage_id, Flags.SUGGEST_RECIPIENTS, 1, storage)
     application = ApplicationBuilder().token("123:token").build()
     attacker = _callback_update(*storage_id, "chat 0", user_id=2)
@@ -338,7 +343,7 @@ def test_link_actions_accept_zero_index_after_second_page_selection(callback_man
     chats = [SimpleNamespace(module_id="tests.mocks.slave", full_name=f"Test chat {index}", linked=False) for index in range(10)]
     selected_chat = SimpleNamespace(module_id="tests.mocks.slave", full_name="Selected chat", linked=linked, unlink=Mock())
     chats.append(selected_chat)
-    _store_callback_session(manager, manager.link_handler, Flags.LINK_CONFIRM, storage_id, chats)
+    _store_callback_session(manager, manager._conversation_handler, Flags.LINK_CONFIRM, storage_id, chats)
     manager.callback_sessions.lookup(storage_id).offset = manager.channel.flag("chats_per_page")
     manager.logger = Mock()
 
@@ -360,7 +365,7 @@ def test_link_actions_reject_stale_second_page_index_after_selection(callback_ma
     manager = callback_manager
     storage_id = (TelegramChatID(1), TelegramMessageID(208))
     selected_chat = SimpleNamespace(module_id="tests.mocks.slave", full_name="Selected chat", linked=False, unlink=Mock())
-    _store_callback_session(manager, manager.link_handler, Flags.LINK_EXEC, storage_id, [selected_chat])
+    _store_callback_session(manager, manager._conversation_handler, Flags.LINK_EXEC, storage_id, [selected_chat])
     manager.callback_sessions.lookup(storage_id).offset = manager.channel.flag("chats_per_page")
 
     with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query"):
@@ -384,9 +389,8 @@ def test_recipient_selection_delivers_the_stored_update_to_the_selected_chat():
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     message_delivery = Mock()
-    service = RecipientSuggestionService(bot, callback_sessions, Mock(), message_delivery, lambda: 10, lambda text: text, Mock())
     handler = SimpleNamespace(_conversations={})
-    service.set_handler(handler)
+    service = RecipientSuggestionService(bot, callback_sessions, Mock(), message_delivery, lambda: 10, lambda text: text, Mock(), handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(220))
     selected_chat = SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat")
     storage = ChatListStorage([selected_chat])
@@ -405,9 +409,8 @@ def test_other_user_cannot_select_recipient_and_owner_can_continue():
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     delivery = Mock()
-    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock())
     handler = SimpleNamespace(_conversations={})
-    service.set_handler(handler)
+    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock(), handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(226))
     storage = ChatListStorage([SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat")])
     original_update = Mock()
@@ -427,9 +430,8 @@ def test_chat_head_selection_records_a_reply_target_and_cleans_its_session():
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     chat = SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat", self=Mock(), add_self=Mock())
     msglogs = Mock()
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text)
     handler = SimpleNamespace(_conversations={})
-    service.set_handler(handler)
+    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text, handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(221))
     callback_sessions.start(handler, storage_id, Flags.CHAT_HEAD_CONFIRM, 1, ChatListStorage([chat]))
 
@@ -445,9 +447,8 @@ def test_other_user_cannot_create_chat_head():
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     chat = SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat", self=Mock(), add_self=Mock())
     msglogs = Mock()
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text)
     handler = SimpleNamespace(_conversations={})
-    service.set_handler(handler)
+    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text, handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(227))
     callback_sessions.start(handler, storage_id, Flags.CHAT_HEAD_CONFIRM, 1, ChatListStorage([chat]))
 
@@ -462,9 +463,8 @@ def test_recipient_selection_rejects_malformed_or_stale_callbacks(callback):
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     delivery = Mock()
-    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock())
     handler = SimpleNamespace(_conversations={})
-    service.set_handler(handler)
+    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock(), handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(222))
     storage = ChatListStorage([SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat")])
     storage.set_chat_suggestion(Mock())
@@ -481,9 +481,8 @@ def test_recipient_selection_expires_when_the_session_is_missing():
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     delivery = Mock()
-    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock())
     handler = SimpleNamespace(_conversations={})
-    service.set_handler(handler)
+    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock(), handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(223))
     callback_sessions.set_state(handler, storage_id, Flags.SUGGEST_RECIPIENTS)
 
@@ -498,9 +497,8 @@ def test_chat_head_rejects_malformed_or_out_of_range_callbacks(callback):
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     msglogs = Mock()
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text)
     handler = SimpleNamespace(_conversations={})
-    service.set_handler(handler)
+    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text, handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(224))
     callback_sessions.start(handler, storage_id, Flags.CHAT_HEAD_CONFIRM, 1, ChatListStorage([SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat")]))
 
@@ -517,9 +515,8 @@ def test_chat_head_expires_when_the_session_is_missing():
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     msglogs = Mock()
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text)
     handler = SimpleNamespace(_conversations={})
-    service.set_handler(handler)
+    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text, handler)
     storage_id = (TelegramChatID(1), TelegramMessageID(225))
     callback_sessions.set_state(handler, storage_id, Flags.CHAT_HEAD_CONFIRM)
 
