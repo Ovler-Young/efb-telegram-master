@@ -231,10 +231,18 @@ class TelegramPollingRuntime:
     async def _run_application_lifecycle(self, *, drop_pending_updates: bool, timeout: int) -> None:
         stop_event = asyncio.Event()
         try:
+            with self._stop_lock:
+                self._stop_event = stop_event
+                stop_requested = self._stop_requested
+            if stop_requested:
+                return
             await self.application.initialize()
             if self.application.post_init:
                 await self.application.post_init(self.application)
-            self._stop_event = stop_event
+            with self._stop_lock:
+                stop_requested = self._stop_requested
+            if stop_requested:
+                return
             updater = self.application.updater
             if updater is None:
                 raise RuntimeError("Application.run_polling requires an Updater.")
@@ -290,6 +298,10 @@ class TelegramPollingRuntime:
                 raise ValueError("webhook.start_webhook must be a mapping")
             start_webhook = _webhook_start_arguments(configured_webhook)
         with self._stop_lock:
+            if self._stopped or self._stop_requested:
+                raise RuntimeError("Telegram polling runtime has been stopped.")
+            if self._lifecycle_active:
+                raise RuntimeError("Telegram polling runtime is already active.")
             self._shutdown_complete.clear()
             self._lifecycle_active = True
         if start_webhook is not None:
