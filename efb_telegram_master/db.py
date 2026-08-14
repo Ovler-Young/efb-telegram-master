@@ -201,6 +201,7 @@ class DatabaseManager:
                         ("file_unique_id", MsgLog.file_unique_id),
                         ("sender_bot_id", MsgLog.sender_bot_id),
                         ("provenance", MsgLog.provenance),
+                        ("time", MsgLog.time),
                     )
                     if column_name not in msglog_columns
                 )

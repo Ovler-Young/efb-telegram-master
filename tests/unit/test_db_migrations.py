@@ -13,6 +13,7 @@ from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
+from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
@@ -99,7 +100,8 @@ def test_historic_schema_migration_serializes_sqlite_startups(tmp_path):
     check_db = SqliteDatabase(database_path)
     check_db.connect()
     try:
-        assert "provenance" in {column.name for column in check_db.get_columns("msglog")}
+        assert {"provenance", "time"}.issubset({column.name for column in check_db.get_columns("msglog")})
+        assert DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX in {index.name for index in check_db.get_indexes("msglog")}
     finally:
         check_db.close()
 
@@ -134,12 +136,41 @@ def test_database_method_metrics_record_bounded_public_operation_labels(channel)
     assert channel.chat_associations.get_chat_assoc(master_uid="metrics-master") == []
     with pytest.raises(ValueError, match="Only one parameter"):
         channel.msglogs.get_msg_log()
+    assert channel.history_migrations.get_entries_page("metrics-slave", 12345, None, None, 1) == []
+    assert channel.msglogs.get_recent_message_page("metrics-slave", None, 1) == []
 
     rendered = generate_latest(metrics.registry).decode()
 
     assert 'etm_database_method_duration_seconds_count{method="get_chat_assoc"} 1.0' in rendered
     assert 'etm_database_method_failures_total{method="get_msg_log"} 1.0' in rendered
+    assert 'etm_database_method_duration_seconds_count{method="get_history_migration_entry_page"} 1.0' in rendered
+    assert 'etm_database_method_duration_seconds_count{method="get_recent_msglog_page"} 1.0' in rendered
     assert "metrics-master" not in rendered
+
+
+def test_database_method_metrics_record_paged_history_operation_labels():
+    original_database = database.obj
+    test_database = SqliteDatabase(":memory:")
+    database.initialize(test_database)
+    test_database.connect()
+    metrics = Metrics()
+    history_migrations = HistoryMigrationRepository()
+    msglogs = MsgLogRepository()
+    history_migrations._metrics = metrics
+    msglogs._metrics = metrics
+    try:
+        test_database.create_tables([HistoryMigrationEntry, MsgLog])
+
+        assert history_migrations.get_entries_page("metrics-slave", 12345, None, None, 1) == []
+        assert msglogs.get_recent_message_page("metrics-slave", None, 1) == []
+
+        rendered = generate_latest(metrics.registry).decode()
+    finally:
+        test_database.close()
+        database.initialize(original_database)
+
+    assert 'etm_database_method_duration_seconds_count{method="get_history_migration_entry_page"} 1.0' in rendered
+    assert 'etm_database_method_duration_seconds_count{method="get_recent_msglog_page"} 1.0' in rendered
 
 
 def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):

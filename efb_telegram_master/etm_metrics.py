@@ -52,8 +52,9 @@ _DATABASE_METHODS = frozenset(
         "replace_history_migration_entries",
         "has_pending_history_migrations",
         "get_next_history_migration_target",
-        "get_history_migration_entries",
+        "get_history_migration_entry_page",
         "delete_history_migration_entry",
+        "get_recent_msglog_page",
     }
 )
 _DATABASE_OUTCOMES = frozenset({"success", "failure"})

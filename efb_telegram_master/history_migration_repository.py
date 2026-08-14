@@ -1,4 +1,8 @@
+import pickle
+import sqlite3
+from contextlib import contextmanager
 from itertools import islice
+from tempfile import TemporaryDirectory
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .database_observability import ObservedRepository, observe_database_method
@@ -8,6 +12,34 @@ from .utils import EFBChannelChatIDStr, TelegramTopicID
 
 class HistoryMigrationRepository(ObservedRepository):
     INSERT_BATCH_SIZE = 100
+
+    @contextmanager
+    def _staged_entry_batches(self, entries: Iterable[Dict[str, object]]):
+        """Stage source entries on disk before replacing target rows."""
+        with TemporaryDirectory(prefix="etm-history-migration-") as temporary_directory:
+            with sqlite3.connect(f"{temporary_directory}/entries.db") as staging_database:
+                staging_database.execute("CREATE TABLE entries (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)")
+                batch = []
+                count = 0
+                for entry in entries:
+                    batch.append((sqlite3.Binary(pickle.dumps(entry, protocol=pickle.HIGHEST_PROTOCOL)),))
+                    if len(batch) == self.INSERT_BATCH_SIZE:
+                        staging_database.executemany("INSERT INTO entries (payload) VALUES (?)", batch)
+                        staging_database.commit()
+                        count += len(batch)
+                        batch.clear()
+                if batch:
+                    staging_database.executemany("INSERT INTO entries (payload) VALUES (?)", batch)
+                    staging_database.commit()
+                    count += len(batch)
+
+                cursor = staging_database.execute("SELECT payload FROM entries ORDER BY id ASC")
+
+                def staged_batches():
+                    while rows := list(islice(cursor, self.INSERT_BATCH_SIZE)):
+                        yield [pickle.loads(payload) for (payload,) in rows]
+
+                yield count, staged_batches()
 
     @staticmethod
     def _target_filter(slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None):
@@ -19,13 +51,11 @@ class HistoryMigrationRepository(ObservedRepository):
 
     @observe_database_method("replace_history_migration_entries")
     def replace_entries(self, slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, message_thread_id: Optional[TelegramTopicID], entries: Iterable[Dict[str, object]]) -> int:
-        count = 0
-        with database.atomic():
-            HistoryMigrationEntry.delete().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id)).execute()
-            entry_iterator = iter(entries)
-            while batch := list(islice(entry_iterator, self.INSERT_BATCH_SIZE)):
-                HistoryMigrationEntry.insert_many(batch).execute()
-                count += len(batch)
+        with self._staged_entry_batches(entries) as (count, staged_batches):
+            with database.atomic():
+                HistoryMigrationEntry.delete().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id)).execute()
+                for batch in staged_batches:
+                    HistoryMigrationEntry.insert_many(batch).execute()
         return count
 
     @observe_database_method("has_pending_history_migrations")
