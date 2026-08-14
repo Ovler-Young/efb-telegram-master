@@ -197,6 +197,22 @@ def test_queue_records_cancelled_outcomes_once_for_shutdown_and_stop_during_retr
     assert "987654" not in rendered
 
 
+def test_queue_collector_emits_oldest_age_for_a_live_pending_call() -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(Mock(), None, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
+    metrics.register_outbound_queue_collectors(queue, top_n=1)
+    try:
+        queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "pending"}, 1))
+
+        rendered = generate_latest(metrics.registry).decode()
+    finally:
+        queue.stop()
+
+    age_lines = [line for line in rendered.splitlines() if line.startswith('etm_outbound_destination_oldest_age_seconds{destination="rank_1"}')]
+    assert len(age_lines) == 1
+    assert float(age_lines[0].rsplit(" ", 1)[1]) >= 0.0
+
+
 def test_queue_rewinds_file_like_upload_before_retry_after():
     upload = io.BytesIO(b"image-bytes")
     received_uploads = []

@@ -192,13 +192,14 @@ class OutboundQueue:
         if not self._finalized.wait(max(0.0, deadline - time.monotonic())):
             raise OutboundShutdownTimeout("Outbound queue did not stop before the shutdown deadline.")
 
-    def destination_snapshot(self) -> list[tuple[str, int, Optional[float]]]:
+    def destination_snapshot(self) -> list[tuple[str, int, float]]:
         with self._lock:
             destinations: dict[int, list[float]] = {}
             for pending in self._pending:
-                destinations.setdefault(pending.call.telegram_chat_id, []).append(pending.retry_at)
-        ranked = sorted(destinations.values(), key=len, reverse=True)
-        return [(f"rank_{index}", len(retries), None) for index, retries in enumerate(ranked, start=1)]
+                destinations.setdefault(pending.call.telegram_chat_id, []).append(pending.enqueued_at)
+            now = time.monotonic()
+            ranked = sorted(destinations.values(), key=len, reverse=True)
+            return [(f"rank_{index}", len(enqueued_at), max(0.0, now - min(enqueued_at))) for index, enqueued_at in enumerate(ranked, start=1)]
 
     @property
     def lifecycle(self) -> OutboundLifecycle:
