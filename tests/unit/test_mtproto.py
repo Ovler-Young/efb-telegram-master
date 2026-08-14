@@ -12,6 +12,7 @@ from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.mtproto import (
+    MAX_SCAN_CONCURRENCY,
     MTProtoClient,
     MTProtoConfig,
     MTProtoRetryableError,
@@ -96,12 +97,14 @@ def enabled_config() -> MTProtoConfig:
 def test_config_defaults_to_disabled_and_rejects_invalid_enabled_values():
     assert MTProtoConfig.from_mapping(None) == MTProtoConfig(enabled=False)
     assert MTProtoConfig.from_mapping({"enabled": True, "api_id": 123, "api_hash": "hash", "scan_concurrency": 2}).scan_concurrency == 2
+    assert MTProtoConfig.from_mapping({"enabled": True, "api_id": 123, "api_hash": "hash", "scan_concurrency": MAX_SCAN_CONCURRENCY}).scan_concurrency == MAX_SCAN_CONCURRENCY
     for config in (
         {"enabled": "yes"},
         {"enabled": True, "api_id": 0, "api_hash": "hash"},
         {"enabled": True, "api_id": 123, "api_hash": ""},
         {"enabled": True, "api_id": 123, "api_hash": "hash", "scan_ceiling": 0},
         {"enabled": True, "api_id": 123, "api_hash": "hash", "scan_concurrency": 0},
+        {"enabled": True, "api_id": 123, "api_hash": "hash", "scan_concurrency": MAX_SCAN_CONCURRENCY + 1},
     ):
         with pytest.raises(ValueError):
             MTProtoConfig.from_mapping(config)

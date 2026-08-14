@@ -10,6 +10,7 @@ from typing import Optional, Protocol
 
 _session_owners: set[Path] = set()
 _session_owners_lock = threading.Lock()
+MAX_SCAN_CONCURRENCY = 4
 
 
 class TelethonClient(Protocol):
@@ -61,8 +62,8 @@ class MTProtoConfig:
         if isinstance(scan_ceiling, bool) or not isinstance(scan_ceiling, int) or scan_ceiling <= 0:
             raise ValueError("mtproto.scan_ceiling must be a positive integer")
         scan_concurrency = value.get("scan_concurrency", 1)
-        if isinstance(scan_concurrency, bool) or not isinstance(scan_concurrency, int) or scan_concurrency <= 0:
-            raise ValueError("mtproto.scan_concurrency must be a positive integer")
+        if isinstance(scan_concurrency, bool) or not isinstance(scan_concurrency, int) or not 1 <= scan_concurrency <= MAX_SCAN_CONCURRENCY:
+            raise ValueError(f"mtproto.scan_concurrency must be between 1 and {MAX_SCAN_CONCURRENCY}")
         return cls(enabled=True, api_id=api_id, api_hash=api_hash, scan_ceiling=scan_ceiling, scan_concurrency=scan_concurrency)
 
 
