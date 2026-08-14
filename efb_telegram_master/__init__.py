@@ -108,7 +108,7 @@ class TelegramChannel(MasterChannel):
         self.history_migrations = self.db.history_migrations
         self.msglog_ingestion = self.db.msglog_ingestion
         try:
-            self.rpc_utilities = RPCUtilities(self)
+            self.rpc_utilities = RPCUtilities(self.config.get("rpc"), self.db, coordinator)
             self._owned_rpc_utilities = self.rpc_utilities
             self.rpc_utilities.start()
             initialize_channel_components(self)

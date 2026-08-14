@@ -1,11 +1,19 @@
 import socket
 import threading
 import time
-from types import SimpleNamespace
 
 from pytest import fixture
 
 from efb_telegram_master.rpc_utils import RPCShutdownTimeout, RPCUtilities
+
+
+class FakeDatabase:
+    pass
+
+
+class FakeCoordinator:
+    def __init__(self) -> None:
+        self.slaves = {}
 
 
 @fixture(scope="module")
@@ -18,7 +26,12 @@ def test_rpc_channels_id(rpc, coordinator):
 
 
 def test_configured_rpc_server_requires_explicit_start_and_stops_idempotently():
-    utilities = RPCUtilities(SimpleNamespace(config={"rpc": {"server": "127.0.0.1", "port": 0}}, db=SimpleNamespace()))
+    database = FakeDatabase()
+    coordinator_module = FakeCoordinator()
+    utilities = RPCUtilities({"server": "127.0.0.1", "port": 0}, database, coordinator_module)
+
+    assert not hasattr(database, "config")
+    assert not hasattr(coordinator_module, "db")
 
     assert utilities.thread is None
     utilities.start()
@@ -32,7 +45,7 @@ def test_configured_rpc_server_requires_explicit_start_and_stops_idempotently():
 
 
 def test_rpc_stop_reports_an_active_handler_until_a_retry_joins_it():
-    utilities = RPCUtilities(SimpleNamespace(config={"rpc": {"server": "127.0.0.1", "port": 0}}, db=SimpleNamespace()))
+    utilities = RPCUtilities({"server": "127.0.0.1", "port": 0}, FakeDatabase(), FakeCoordinator())
     utilities.start()
     assert utilities.server is not None
 

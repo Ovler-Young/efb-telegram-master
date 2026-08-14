@@ -1,13 +1,24 @@
 import threading
 import time
+from collections.abc import Mapping
 from socketserver import ThreadingMixIn
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Protocol, TypedDict
 from xmlrpc.server import SimpleXMLRPCRequestHandler, SimpleXMLRPCServer
 
-from ehforwarderbot import coordinator
+from ehforwarderbot.types import ModuleID
 
 if TYPE_CHECKING:
-    from . import TelegramChannel
+    from .db import DatabaseManager
+
+
+class RPCConfig(TypedDict):
+    server: str
+    port: int
+
+
+class SlaveChannelCoordinator(Protocol):
+    @property
+    def slaves(self) -> Mapping[ModuleID, object]: ...
 
 
 class RPCShutdownTimeout(TimeoutError):
@@ -61,8 +72,8 @@ class _ThreadedXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
         SimpleXMLRPCServer.server_close(self)
 
     def request_shutdown(self) -> None:
-        # BaseServer.shutdown() waits indefinitely for serve_forever(); channel
-        # shutdown owns that wait so it can enforce one absolute deadline.
+        # BaseServer.shutdown() waits indefinitely for serve_forever(); the
+        # lifecycle owner enforces the absolute deadline instead.
         self._BaseServer__shutdown_request = True
 
     def join_handlers(self, deadline: float) -> int:
@@ -81,8 +92,10 @@ class _ThreadedXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
 class RPCUtilities:
     """Functions exposed through the optional XML-RPC server."""
 
-    def __init__(self, channel: "TelegramChannel"):
-        self.channel = channel
+    def __init__(self, rpc_config: Optional[RPCConfig], database: "DatabaseManager", coordinator_module: SlaveChannelCoordinator):
+        self._rpc_config = rpc_config
+        self._database = database
+        self._coordinator_module = coordinator_module
         self.server: Optional[_ThreadedXMLRPCServer] = None
         self.thread: Optional[threading.Thread] = None
         self._shutdown_lock = threading.Lock()
@@ -90,14 +103,14 @@ class RPCUtilities:
         self._stopped = False
 
     def start(self) -> None:
-        """Bind and start the RPC server after its channel dependencies exist."""
+        """Bind and start the RPC server after its collaborators exist."""
         with self._shutdown_lock:
             if self._started:
                 return
             if self._stopped:
                 raise RuntimeError("Cannot restart a stopped RPC server.")
 
-            rpc_config = self.channel.config.get("rpc")
+            rpc_config = self._rpc_config
             if not rpc_config:
                 self._started = True
                 return
@@ -109,7 +122,7 @@ class RPCUtilities:
             try:
                 server.register_introspection_functions()
                 server.register_multicall_functions()
-                server.register_instance(self.channel.db)
+                server.register_instance(self._database)
                 server.register_function(self.get_slave_channels_ids)
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, name="ETM RPC server thread")
                 thread.start()
@@ -145,7 +158,6 @@ class RPCUtilities:
             self._stopped = True
             return ()
 
-    @staticmethod
-    def get_slave_channels_ids() -> List[str]:
+    def get_slave_channels_ids(self) -> List[str]:
         """Get the collection of slave channel IDs in current instance."""
-        return list(coordinator.slaves.keys())
+        return list(self._coordinator_module.slaves.keys())
