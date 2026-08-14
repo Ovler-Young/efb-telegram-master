@@ -345,6 +345,26 @@ def test_webhook_stop_waits_for_blocked_ptb_teardown_before_shutting_down_runtim
     async_runtime.shutdown.assert_called_once_with(ANY)
 
 
+def test_webhook_runtime_forwards_typed_start_arguments() -> None:
+    application = Mock()
+    runtime = _runtime(
+        application=application,
+        webhook={"start_webhook": {"listen": "0.0.0.0", "port": 8443, "allowed_updates": ["message"], "secret_token": "secret"}},
+    )
+
+    runtime.poll(drop_pending_updates=True)
+
+    application.run_webhook.assert_called_once_with(
+        listen="0.0.0.0",
+        port=8443,
+        allowed_updates=["message"],
+        secret_token="secret",
+        drop_pending_updates=True,
+        close_loop=True,
+        stop_signals=None,
+    )
+
+
 def test_invalid_webhook_configuration_does_not_leave_lifecycle_active() -> None:
     async_runtime = Mock()
     runtime = _runtime(application=Mock(), async_runtime=async_runtime, webhook={"start_webhook": None})
