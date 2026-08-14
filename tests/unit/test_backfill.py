@@ -567,7 +567,6 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
     database_manager = SimpleNamespace(
         chat_associations=Mock(),
         slave_chat_info=Mock(),
-        slave_message_deliveries=Mock(),
         msglogs=Mock(),
         history_migrations=Mock(),
         msglog_ingestion=Mock(),
