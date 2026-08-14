@@ -604,7 +604,6 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
         "MasterMessageInbound",
         "MasterMessageMutations",
         "MasterMessageWorker",
-        "RPCUtilities",
     ]
     with ExitStack() as stack:
         stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
