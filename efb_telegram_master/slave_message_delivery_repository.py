@@ -56,6 +56,21 @@ class SlaveMessageDeliveryRepository(ObservedRepository):
             == 1
         )
 
+    @observe_database_method("renew_slave_message_delivery")
+    def renew(self, slave_origin_uid: EFBChannelChatIDStr, slave_message_id: str, owner_token: str, lease_seconds: int = LEASE_SECONDS) -> bool:
+        lease_expires_at = datetime.now() + timedelta(seconds=lease_seconds)
+        return (
+            SlaveMessageDelivery.update(lease_expires_at=lease_expires_at)
+            .where(
+                (SlaveMessageDelivery.slave_origin_uid == slave_origin_uid)
+                & (SlaveMessageDelivery.slave_message_id == slave_message_id)
+                & (SlaveMessageDelivery.state == "pending")
+                & (SlaveMessageDelivery.owner_token == owner_token)
+            )
+            .execute()
+            == 1
+        )
+
     @observe_database_method("release_slave_message_delivery")
     def release(self, slave_origin_uid: EFBChannelChatIDStr, slave_message_id: str, owner_token: str) -> bool:
         return (

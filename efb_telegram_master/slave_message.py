@@ -1,6 +1,8 @@
 # coding=utf-8
 
 import logging
+import threading
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import telegram  # lgtm [py/import-and-import-from]
@@ -32,6 +34,7 @@ class SlaveMessageService:
 
     REACTION_DB_WAIT_TIMEOUT = 2.0
     REACTION_DB_WAIT_INTERVAL = 0.05
+    CLAIM_RENEW_INTERVAL = 60.0
 
     def __init__(
         self,
@@ -77,6 +80,26 @@ class SlaveMessageService:
         if key is None or owner_token is None:
             return
         self.delivery_claims.release(*key, owner_token)
+
+    @contextmanager
+    def _renew_delivery_claim(self, key: Optional[Tuple[str, str]], owner_token: Optional[str]):
+        if key is None or owner_token is None:
+            yield
+            return
+        stopped = threading.Event()
+
+        def renew() -> None:
+            while not stopped.wait(self.CLAIM_RENEW_INTERVAL):
+                if not self.delivery_claims.renew(*key, owner_token):
+                    return
+
+        worker = threading.Thread(target=renew, daemon=True, name="SlaveMessageClaimRenewal")
+        worker.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            worker.join(timeout=1)
 
     @staticmethod
     def _dedupe_key(msg: Message, slave_origin_uid: str) -> Optional[Tuple[str, str]]:
@@ -168,7 +191,8 @@ class SlaveMessageService:
                 msg.vendor_specific = msg.vendor_specific or {}
                 msg.vendor_specific["_sender_bot_id"] = _edit_sender_bot_id
 
-            self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent, dedupe_key=dedupe_key, claim_token=claim_token)
+            with self._renew_delivery_claim(dedupe_key, claim_token):
+                self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent, dedupe_key=dedupe_key, claim_token=claim_token)
         except Exception as e:
             if pending_claimed:
                 self._release_pending_slave_message(dedupe_key, claim_token)

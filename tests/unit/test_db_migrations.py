@@ -973,6 +973,12 @@ def test_slave_message_delivery_claim_persists_across_repository_instances(tmp_p
 
             stale_token = first.claim("tests.slave chat", "retry", lease_seconds=-1)
             assert stale_token is not None
+            assert first.renew("tests.slave chat", "retry", stale_token)
+            assert restarted.claim("tests.slave chat", "retry") is None
+            assert not restarted.renew("tests.slave chat", "retry", "wrong-owner")
+            assert first.release("tests.slave chat", "retry", stale_token)
+            stale_token = first.claim("tests.slave chat", "retry", lease_seconds=-1)
+            assert stale_token is not None
             replacement_token = restarted.claim("tests.slave chat", "retry")
             assert replacement_token is not None and replacement_token != stale_token
             assert not first.complete("tests.slave chat", "retry", stale_token)
