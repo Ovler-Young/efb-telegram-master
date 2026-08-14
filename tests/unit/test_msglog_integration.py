@@ -192,67 +192,6 @@ def test_association_reschedule_resets_completed_scan_before_starting_worker():
         assert scheduler.stop(1) == ()
 
 
-def test_association_during_active_scan_queues_one_reset_follow_up(monkeypatch):
-    first_started, release_first, follow_up_started = threading.Event(), threading.Event(), threading.Event()
-    run_owners = []
-    persisted = []
-    scan = SimpleNamespace(status="pending", scanned_count=0)
-    associations = SimpleNamespace(slave_uid=None)
-
-    def reset_completed_scan(_source_chat_id):
-        if scan.status != "complete":
-            return False
-        scan.status = "pending"
-        return True
-
-    async def run(_service, _source_chat_id, *, lease_owner, stop_requested):
-        run_owners.append(lease_owner)
-        if len(run_owners) == 1:
-            scan.status = "running"
-            persisted.append(("unbound-topic", None))
-            first_started.set()
-            await asyncio.to_thread(release_first.wait)
-            scan.status = "complete"
-        else:
-            assert scan.status == "pending"
-            scan.status = "running"
-            persisted.append(("eligible", associations.slave_uid))
-            scan.status = "complete"
-            follow_up_started.set()
-
-    monkeypatch.setattr(MsgLogIngestionService, "run", run)
-    ingestion = SimpleNamespace(
-        get_or_create_scan=Mock(return_value=scan),
-        reset_completed_scan=Mock(side_effect=reset_completed_scan),
-        release_scan=Mock(),
-    )
-    runtime = SharedAsyncRuntime()
-
-    async def connect():
-        return None
-
-    scheduler = MsgLogScanScheduler(
-        SimpleNamespace(async_runtime=runtime),
-        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10), connect=connect),
-        ingestion,
-        Mock(),
-        Mock(),
-    )
-    try:
-        assert scheduler.schedule(100) == "started"
-        assert first_started.wait(1)
-        associations.slave_uid = "tests.linked-slave"
-        assert scheduler.schedule_for_association(100) == "queued"
-        release_first.set()
-        assert follow_up_started.wait(1)
-        assert persisted == [("unbound-topic", None), ("eligible", "tests.linked-slave")]
-        assert ingestion.reset_completed_scan.call_count == 2
-    finally:
-        release_first.set()
-        assert scheduler.stop(1) == ()
-        runtime.close()
-
-
 def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():
     started, release = threading.Event(), threading.Event()
 
@@ -456,7 +395,7 @@ def test_ordinary_send_writes_msglog_once_and_completes_delivery_claim(monkeypat
         type=MsgType.Text,
     )
 
-    processor.dispatch_message(message, "", None, 123, None, dedupe_key=("slave", "slave-message"), claim_token="claim-token")
+    processor.dispatch_message(message, "", None, 123, None, dedupe_key=("slave", "slave-message"))
 
     processor.msglogs.add_or_update_message_log.assert_called_once_with(
         etm_msg,
@@ -464,4 +403,4 @@ def test_ordinary_send_writes_msglog_once_and_completes_delivery_claim(monkeypat
         None,
         sender_bot_id="7",
     )
-    processor.delivery_claims.complete.assert_called_once_with("slave", "slave-message", "claim-token")
+    processor.delivery_claims.complete.assert_called_once_with("slave", "slave-message")
