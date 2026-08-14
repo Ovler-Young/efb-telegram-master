@@ -243,7 +243,7 @@ class DatabaseManager:
                 delivery_columns = {column.name for column in current_database.get_columns("slavemessagedelivery")}
                 delivery_migrations = tuple(
                     migrator.add_column("slavemessagedelivery", column_name, field)
-                    for column_name, field in (("state", SlaveMessageDelivery.state), ("lease_expires_at", SlaveMessageDelivery.lease_expires_at), ("owner_token", SlaveMessageDelivery.owner_token))
+                    for column_name, field in (("state", SlaveMessageDelivery.state), ("lease_expires_at", SlaveMessageDelivery.lease_expires_at))
                     if column_name not in delivery_columns
                 )
                 if delivery_migrations:
