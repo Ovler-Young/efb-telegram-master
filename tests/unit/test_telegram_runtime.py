@@ -524,7 +524,7 @@ def test_channel_withholds_database_until_a_real_outbound_send_exits() -> None:
 
 
 def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_cleanup_errors(caplog) -> None:
-    channel = SimpleNamespace(config={"admins": [1]}, db=Mock())
+    channel = SimpleNamespace(config={"admins": [1], "outbound": {"max_pending": 17}}, db=Mock())
     async_runtime = Mock()
 
     def consume_runtime_call(coroutine, **_kwargs):
@@ -561,6 +561,7 @@ def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_
             )
 
     queue_type.return_value.start.assert_called_once_with()
+    assert queue_type.call_args.kwargs["max_pending"] == 17
     begin_delivery.assert_called_once_with(ANY)
     finish_delivery.assert_called_once_with(ANY)
     runtime.stop.assert_called_once_with(ANY)

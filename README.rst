@@ -120,10 +120,16 @@ A sample config file can be as follows:
     # [Auxiliary bots]
     # Optional extra bot tokens for higher outbound throughput.
     # Each auxiliary bot must be a distinct bot token, and should be added
-    # to groups where you expect high message volume.
+    # to groups where you expect high message volume. At most 16 are accepted.
     # auxiliary_bots:
     # - token: "111111:AUX_BOT_TOKEN_1"
     # - token: "222222:AUX_BOT_TOKEN_2"
+
+    # [Outbound queue]
+    # Pending outbound calls are rejected when this limit is reached.
+    # Must be a positive integer. Default: 1000.
+    # outbound:
+    #   max_pending: 1000
 
     # [Database]
     # Default: SQLite (tgdata.db under the profile directory).
@@ -194,6 +200,14 @@ Notes:
 - Each auxiliary bot must be **added to the target groups** to send messages
   there.
 - Tokens must be unique and must not duplicate the main ``token``.
+- ETM accepts at most 16 ``auxiliary_bots`` entries.
+
+Optional: Outbound queue capacity
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set ``outbound.max_pending`` to a positive integer to limit pending outbound
+calls held in memory. ETM rejects new outbound calls once the limit is reached.
+The default is ``1000``.
 
 Read-only MsgLog ingestion and metrics
 --------------------------------------

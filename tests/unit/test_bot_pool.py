@@ -263,6 +263,43 @@ def test_load_channel_config_rejects_too_many_auxiliary_bots(tmp_path, monkeypat
         load_channel_config("tests.channel", str)
 
 
+def test_load_channel_config_defaults_outbound_pending_limit(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text('token: "main"\nadmins: [1]\n')
+    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+
+    config, _mtproto_config = load_channel_config("tests.channel", str)
+
+    assert config["outbound"]["max_pending"] == 1000
+
+
+def test_load_channel_config_reads_outbound_pending_limit(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text('token: "main"\nadmins: [1]\noutbound:\n  max_pending: 17\n')
+    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+
+    config, _mtproto_config = load_channel_config("tests.channel", str)
+
+    assert config["outbound"]["max_pending"] == 17
+
+
+@pytest.mark.parametrize(
+    ("outbound_config", "message"),
+    [
+        ("outbound: []\n", "outbound must be a mapping"),
+        ("outbound:\n  max_pending: 0\n", "outbound.max_pending must be a positive integer"),
+        ("outbound:\n  max_pending: true\n", "outbound.max_pending must be a positive integer"),
+    ],
+)
+def test_load_channel_config_rejects_invalid_outbound_pending_limit(tmp_path, monkeypatch, outbound_config: str, message: str) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f'token: "main"\nadmins: [1]\n{outbound_config}')
+    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+
+    with pytest.raises(ValueError, match=message):
+        load_channel_config("tests.channel", str)
+
+
 def test_shutdown_attempts_every_bot_after_a_partial_begin_failure() -> None:
     first = bot(10)
     second = bot(20)

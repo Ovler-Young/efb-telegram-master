@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 _CHAT_ID_ARGUMENT_INDICES = {"edit_message_text": 1}
 _TRANSPORT_RETRY_LIMIT = 2
 _TRANSPORT_RETRY_DELAY = 0.05
+DEFAULT_MAX_PENDING = 1000
 
 
 class OutboundMetrics(Protocol):
@@ -101,7 +102,7 @@ class OutboundQueue:
         shutdown_drain_timeout: float,
         shutdown_join_grace: float,
         cancel_active_calls: Callable[[], None] | None = None,
-        max_pending: int = 1000,
+        max_pending: int = DEFAULT_MAX_PENDING,
     ) -> None:
         self._sender_policy = SenderPolicy(main_bot, bot_pool, main_rate_limiter)
         self._call_adapter = TelegramCallAdapter(bot_pool)

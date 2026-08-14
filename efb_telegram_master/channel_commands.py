@@ -28,6 +28,7 @@ from .link_completion import LinkCompletionService
 from .msglog_repository import MsgLogRepository
 from .msglog_scan import MsgLogScanScheduler
 from .mtproto import MTProtoConfig
+from .outbound import DEFAULT_MAX_PENDING
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import SupportsSendMessage, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
@@ -322,4 +323,12 @@ def load_channel_config(channel_id: ModuleID, translate: Callable[[str], str]) -
         if entry["token"] in seen_tokens:
             raise ValueError(translate("Duplicate token found in auxiliary_bots[{idx}].").format(idx=index))
         seen_tokens.add(entry["token"])
+    outbound = data.get("outbound", {})
+    if not isinstance(outbound, Mapping):
+        raise ValueError(translate("outbound must be a mapping."))
+    max_pending = outbound.get("max_pending", DEFAULT_MAX_PENDING)
+    if type(max_pending) is not int or max_pending <= 0:
+        raise ValueError(translate("outbound.max_pending must be a positive integer."))
+    data["outbound"] = dict(outbound)
+    data["outbound"]["max_pending"] = max_pending
     return data.copy(), mtproto_config
