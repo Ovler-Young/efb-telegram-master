@@ -1,3 +1,5 @@
+import asyncio
+import gc
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -10,6 +12,7 @@ from telegram import Update
 
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.channel_commands import LocaleState, TelegramCommandService
+from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler, MsgLogScanShutdownTimeout
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
@@ -26,6 +29,28 @@ class FakeAPI:
     def send_message(self, chat_id: int, text: str, **_kwargs: object) -> FakeMessageIdentifier:
         self.calls.append((chat_id, text))
         return FakeMessageIdentifier()
+
+
+class SharedAsyncRuntime:
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="TestSharedAsyncRuntime")
+        self.thread.start()
+        assert self.ready.wait(1)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.ready.set()
+        self.loop.run_forever()
+
+    def call(self, coroutine, timeout=None):
+        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout)
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(1)
+        self.loop.close()
 
 
 class FakeAssociations:
@@ -178,6 +203,107 @@ def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():
     finally:
         release.set()
         scheduler.stop(1)
+
+
+def test_msglog_scan_closes_runtime_coroutines_when_runtime_call_raises(recwarn):
+    class RejectingRuntime:
+        def call(self, _coroutine, timeout=None):
+            raise RuntimeError("Telegram runtime is stopping.")
+
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    scheduler = MsgLogScanScheduler(
+        SimpleNamespace(async_runtime=RejectingRuntime()),
+        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)),
+        ingestion,
+        Mock(),
+        Mock(),
+    )
+
+    assert scheduler.schedule(100) == "started"
+    assert scheduler.stop(1) == ()
+    gc.collect()
+
+    assert not [warning for warning in recwarn if "was never awaited" in str(warning.message)]
+
+
+def test_msglog_scan_caps_concurrent_workers_and_admits_pending_groups_fairly(monkeypatch):
+    started, release = [], threading.Event()
+    first_two_started, third_started = threading.Event(), threading.Event()
+
+    async def run(_service, source_chat_id, *, lease_owner, stop_requested):
+        assert lease_owner
+        assert not stop_requested()
+        started.append(source_chat_id)
+        if len(started) == 2:
+            first_two_started.set()
+        if source_chat_id == 300:
+            third_started.set()
+        await asyncio.to_thread(release.wait)
+
+    monkeypatch.setattr(MsgLogIngestionService, "run", run)
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    runtime = SharedAsyncRuntime()
+    async def connect():
+        return None
+
+    scheduler = MsgLogScanScheduler(
+        SimpleNamespace(async_runtime=runtime),
+        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10, scan_concurrency=2), connect=connect),
+        ingestion,
+        Mock(),
+        Mock(),
+    )
+    try:
+        assert scheduler.schedule(100) == "started"
+        assert scheduler.schedule(200) in {"started", "queued"}
+        assert first_two_started.wait(1)
+        assert scheduler.schedule(300) == "queued"
+        assert set(started) == {100, 200}
+
+        release.set()
+        assert third_started.wait(1)
+        assert started[-1] == 300
+    finally:
+        release.set()
+        assert scheduler.stop(1) == ()
+        runtime.close()
+
+
+def test_msglog_scan_shutdown_discards_pending_groups(monkeypatch):
+    started, release = [], threading.Event()
+    first_started = threading.Event()
+
+    async def run(_service, source_chat_id, *, lease_owner, stop_requested):
+        assert lease_owner
+        started.append(source_chat_id)
+        first_started.set()
+        await asyncio.to_thread(release.wait)
+
+    monkeypatch.setattr(MsgLogIngestionService, "run", run)
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    runtime = SharedAsyncRuntime()
+    async def connect():
+        return None
+
+    scheduler = MsgLogScanScheduler(
+        SimpleNamespace(async_runtime=runtime),
+        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10, scan_concurrency=1), connect=connect),
+        ingestion,
+        Mock(),
+        Mock(),
+    )
+    try:
+        assert scheduler.schedule(100) == "started"
+        assert first_started.wait(1)
+        assert scheduler.schedule(200) == "queued"
+        assert len(scheduler.stop(0.01)) == 1
+        release.set()
+        assert scheduler.stop(1) == ()
+        assert started == [100]
+    finally:
+        release.set()
+        scheduler.stop(1)
+        runtime.close()
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

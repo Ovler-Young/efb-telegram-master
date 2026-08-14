@@ -36,6 +36,7 @@ class MTProtoConfig:
     api_id: Optional[int] = None
     api_hash: Optional[str] = None
     scan_ceiling: int = 100_000
+    scan_concurrency: int = 1
 
     @classmethod
     def from_mapping(cls, value: object) -> "MTProtoConfig":
@@ -59,7 +60,10 @@ class MTProtoConfig:
         scan_ceiling = value.get("scan_ceiling", 100_000)
         if isinstance(scan_ceiling, bool) or not isinstance(scan_ceiling, int) or scan_ceiling <= 0:
             raise ValueError("mtproto.scan_ceiling must be a positive integer")
-        return cls(enabled=True, api_id=api_id, api_hash=api_hash, scan_ceiling=scan_ceiling)
+        scan_concurrency = value.get("scan_concurrency", 1)
+        if isinstance(scan_concurrency, bool) or not isinstance(scan_concurrency, int) or scan_concurrency <= 0:
+            raise ValueError("mtproto.scan_concurrency must be a positive integer")
+        return cls(enabled=True, api_id=api_id, api_hash=api_hash, scan_ceiling=scan_ceiling, scan_concurrency=scan_concurrency)
 
 
 class MTProtoRetryableError(RuntimeError):

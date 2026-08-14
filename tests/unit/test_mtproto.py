@@ -95,11 +95,13 @@ def enabled_config() -> MTProtoConfig:
 
 def test_config_defaults_to_disabled_and_rejects_invalid_enabled_values():
     assert MTProtoConfig.from_mapping(None) == MTProtoConfig(enabled=False)
+    assert MTProtoConfig.from_mapping({"enabled": True, "api_id": 123, "api_hash": "hash", "scan_concurrency": 2}).scan_concurrency == 2
     for config in (
         {"enabled": "yes"},
         {"enabled": True, "api_id": 0, "api_hash": "hash"},
         {"enabled": True, "api_id": 123, "api_hash": ""},
         {"enabled": True, "api_id": 123, "api_hash": "hash", "scan_ceiling": 0},
+        {"enabled": True, "api_id": 123, "api_hash": "hash", "scan_concurrency": 0},
     ):
         with pytest.raises(ValueError):
             MTProtoConfig.from_mapping(config)
@@ -241,7 +243,7 @@ def test_msglog_scan_recovers_mtproto_before_running_pending_work(monkeypatch: p
     completed = threading.Event()
 
     class Runtime:
-        def call(self, coroutine):
+        def call(self, coroutine, timeout=None):
             asyncio.run(coroutine)
 
     class MTProto:
@@ -269,6 +271,7 @@ def test_msglog_scan_recovers_mtproto_before_running_pending_work(monkeypatch: p
     assert scheduler.schedule(100) == "resumed"
     assert completed.wait(1)
     assert mtproto.connect_calls == 1
+    assert scheduler.stop(1) == ()
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,8 @@ import logging
 import threading
 import time
 import uuid
+from collections import deque
+from collections.abc import Coroutine
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
 from .msglog_ingestion import MsgLogIngestionService
@@ -18,38 +20,43 @@ class MsgLogScanShutdownTimeout(RuntimeError):
 
 
 class MsgLogScanScheduler:
-    """Own one non-daemon scan worker per lease-protected source group."""
+    """Run a bounded FIFO set of MTProto scan workers."""
 
     DEFAULT_JOIN_TIMEOUT = 5.0
 
     def __init__(self, runtime, mtproto, ingestion, chat_associations, logger: logging.Logger) -> None:
         self.runtime, self.mtproto, self.ingestion, self.chat_associations, self.logger = runtime, mtproto, ingestion, chat_associations, logger
         self._lock = threading.Lock()
+        self._pending_available = threading.Condition(self._lock)
         self._connect_lock: asyncio.Lock | None = None
         self._stopping = False
         self._stop_event = threading.Event()
         self._threads: dict[int, threading.Thread] = {}
         self._retiring_threads: set[threading.Thread] = set()
         self._owners: dict[int, str] = {}
+        self._pending: deque[tuple[int, str]] = deque()
+        self._pending_source_chat_ids: set[int] = set()
 
     def schedule(self, source_chat_id: int) -> str:
         with self._lock:
             if self._stopping:
                 return "stopping"
-            self._retiring_threads = {thread for thread in self._retiring_threads if thread.is_alive()}
+            self._reap_threads_locked()
             if not self.mtproto.enabled:
                 return "unavailable"
-            existing = self._threads.get(source_chat_id)
-            if existing is not None and existing.is_alive():
+            if source_chat_id in self._threads or source_chat_id in self._pending_source_chat_ids:
                 return "already running"
             scan = self.ingestion.get_or_create_scan(source_chat_id, self.mtproto.config.scan_ceiling)
             if scan.status == "complete":
                 return "already complete"
             owner = str(uuid.uuid4())
-            thread = threading.Thread(target=self._run, args=(source_chat_id, owner), name=f"MsgLogIngestion-{source_chat_id}")
-            self._threads[source_chat_id], self._owners[source_chat_id] = thread, owner
-            self._retiring_threads.add(thread)
-            thread.start()
+            self._pending.append((source_chat_id, owner))
+            self._pending_source_chat_ids.add(source_chat_id)
+            self._pending_available.notify()
+            admitted = len(self._retiring_threads) < self._scan_concurrency()
+            self._admit_workers_locked()
+            if not admitted:
+                return "queued"
             return "resumed" if scan.scanned_count else "started"
 
     def stop(self, join_timeout: float = DEFAULT_JOIN_TIMEOUT) -> tuple[BaseException, ...]:
@@ -58,11 +65,13 @@ class MsgLogScanScheduler:
             admission_fence_needed = not self._stopping
             self._stopping = True
             self._stop_event.set()
-            active_workers = tuple(self._threads.values())
-            workers = active_workers + tuple(thread for thread in self._retiring_threads if thread not in active_workers)
+            self._pending.clear()
+            self._pending_source_chat_ids.clear()
+            self._pending_available.notify_all()
+            workers = tuple(self._retiring_threads)
         if admission_fence_needed:
             try:
-                self.runtime.async_runtime.call(self._wait_for_connect_admission(), timeout=max(0.0, deadline - time.monotonic()))
+                self._call_runtime(self._wait_for_connect_admission(), timeout=max(0.0, deadline - time.monotonic()))
             except (FutureTimeoutError, RuntimeError):
                 pass
         for thread in workers:
@@ -70,14 +79,14 @@ class MsgLogScanScheduler:
                 thread.join(max(0.0, deadline - time.monotonic()))
         alive = tuple(thread.name.removeprefix("MsgLogIngestion-") for thread in workers if thread.is_alive())
         with self._lock:
-            self._retiring_threads = {thread for thread in self._retiring_threads if thread.is_alive()}
+            self._reap_threads_locked()
         if alive:
             return (MsgLogScanShutdownTimeout(f"MsgLog ingestion workers did not stop within {join_timeout:g}s (groups: {', '.join(alive)})."),)
         return ()
 
     def _run(self, source_chat_id: int, lease_owner: str) -> None:
         try:
-            self.runtime.async_runtime.call(self._run_ingestion(source_chat_id, lease_owner))
+            self._call_runtime(self._run_ingestion(source_chat_id, lease_owner))
         except BaseException as error:
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id, exc_info=error)
         finally:
@@ -90,6 +99,48 @@ class MsgLogScanScheduler:
                 if self._owners.get(source_chat_id) == lease_owner:
                     self._threads.pop(source_chat_id, None)
                     self._owners.pop(source_chat_id, None)
+
+    def _worker(self) -> None:
+        while True:
+            with self._pending_available:
+                while not self._stopping and not self._pending:
+                    self._pending_available.wait()
+                if self._stopping:
+                    return
+                source_chat_id, lease_owner = self._pending.popleft()
+                self._pending_source_chat_ids.remove(source_chat_id)
+                self._threads[source_chat_id] = threading.current_thread()
+                self._owners[source_chat_id] = lease_owner
+                threading.current_thread().name = f"MsgLogIngestion-{source_chat_id}"
+            self._run(source_chat_id, lease_owner)
+
+    def _admit_workers_locked(self) -> None:
+        max_workers = self._scan_concurrency()
+        while self._pending and len(self._retiring_threads) < max_workers:
+            thread = threading.Thread(target=self._worker, name="MsgLogIngestion-worker")
+            self._retiring_threads.add(thread)
+            thread.start()
+
+    def _scan_concurrency(self) -> int:
+        value = getattr(self.mtproto.config, "scan_concurrency", 1)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("MTProto scan concurrency must be a positive integer")
+        return value
+
+    def _reap_threads_locked(self) -> None:
+        self._retiring_threads = {thread for thread in self._retiring_threads if thread.is_alive()}
+
+    def _call_runtime(self, coroutine: Coroutine[object, object, object], timeout: float | None = None) -> object:
+        try:
+            if timeout is None:
+                return self.runtime.async_runtime.call(coroutine)
+            return self.runtime.async_runtime.call(coroutine, timeout=timeout)
+        except BaseException:
+            try:
+                coroutine.close()
+            except (RuntimeError, ValueError):
+                pass
+            raise
 
     async def _run_ingestion(self, source_chat_id: int, lease_owner: str) -> None:
         async with self._get_connect_lock():
