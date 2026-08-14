@@ -79,7 +79,6 @@ def initialize_channel_components(channel) -> None:
         channel.bot_manager.api,
         channel.chat_associations,
         channel.chat_manager,
-        channel.msglog_scan,
         channel.channel_id,
         channel._,
         channel.ngettext,
@@ -260,19 +259,7 @@ def _build_slave_services(channel) -> None:
     media_delivery = SlaveMediaDelivery(api, channel.logger, text_delivery, file_transfer, oversized_notice_sender, temp_dir)
     file_delivery = SlaveFileDelivery(api, channel.flag, channel.logger, channel._, text_delivery, file_transfer, oversized_notice_sender, temp_dir)
     channel.message_service = SlaveMessageService(
-        api,
-        channel.flag,
-        channel.msglogs,
-        channel.slave_message_deliveries,
-        channel.chat_manager,
-        channel.commands,
-        channel._,
-        channel.ngettext,
-        router,
-        text_delivery,
-        image_delivery,
-        media_delivery,
-        file_delivery,
+        api, channel.flag, channel.msglogs, channel.chat_manager, channel.commands, channel._, channel.ngettext, router, text_delivery, image_delivery, media_delivery, file_delivery
     )
     channel.status_service = SlaveStatusService(
         channel.logger, channel.slave_chat_info, channel.chat_manager, channel.msglogs, channel.message_reconstructor, api, channel.flag, router, channel.message_service, channel._

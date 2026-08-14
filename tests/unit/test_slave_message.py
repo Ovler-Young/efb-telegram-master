@@ -92,8 +92,8 @@ def _dedupe_processor() -> SlaveMessageService:
     processor.router = Mock(route=Mock(return_value=DeliveryPlan("template", 123, None)))
     processor.is_silent = Mock(return_value=False)
     processor.dispatch_message = Mock()
-    processor.delivery_claims = Mock()
-    processor.delivery_claims.claim.return_value = True
+    processor._pending_slave_messages = set()
+    processor._pending_slave_messages_lock = threading.Lock()
     return processor
 
 
@@ -246,26 +246,26 @@ def test_forum_destination_uses_cached_chat_info_until_ttl() -> None:
     assert processor.bot.get_chat_info.call_count == 2
 
 
-def test_new_slave_message_claims_durable_dedupe_without_msglog_lookup() -> None:
+def test_new_slave_message_claims_memory_dedupe_without_db_lookup() -> None:
     processor = _dedupe_processor()
     message = _message()
 
     assert processor.send_message(message) is message
-    processor.delivery_claims.claim.assert_called_once_with("tests.slave chat", "message")
+    assert ("tests.slave chat", "message") in processor._pending_slave_messages
     processor.msglogs.get_msg_log.assert_not_called()
     processor.dispatch_message.assert_called_once_with(message, "template", None, 123, None, False, dedupe_key=("tests.slave chat", "message"))
 
 
 def test_pending_duplicate_and_muted_message_do_not_dispatch() -> None:
     processor = _dedupe_processor()
-    processor.delivery_claims.claim.return_value = False
+    processor._pending_slave_messages.add(("tests.slave chat", "message"))
     assert processor.send_message(_message()) is not None
     processor.dispatch_message.assert_not_called()
 
     processor = _dedupe_processor()
     processor.is_silent.return_value = None
     assert processor.send_message(_message()) is not None
-    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message")
+    assert not processor._pending_slave_messages
     processor.dispatch_message.assert_not_called()
 
 
@@ -274,7 +274,7 @@ def test_destination_mapping_failure_releases_the_pending_dedupe_claim() -> None
     processor.router.route.side_effect = RuntimeError("database unavailable")
 
     assert processor.send_message(_message()) is not None
-    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message")
+    assert processor._pending_slave_messages == set()
     processor.dispatch_message.assert_not_called()
 
 
@@ -305,7 +305,7 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
         7,
         "RuntimeError",
     )
-    processor._release_pending_slave_message.assert_not_called()
+    processor._release_pending_slave_message.assert_called_once_with(("tests.slave chat", "message"))
 
 
 def test_command_session_uses_the_telegram_message_owner() -> None:

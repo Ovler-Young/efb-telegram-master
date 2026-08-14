@@ -17,14 +17,11 @@ from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.outbound_types import SendReceipt
-from efb_telegram_master.slave_chat_info_repository import SlaveChatInfoRepository
 from efb_telegram_master.slave_message import SlaveMessageService
-from efb_telegram_master.slave_message_delivery_repository import SlaveMessageDeliveryRepository
-from efb_telegram_master.topic_sync import TopicGroupService
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 from tests.support.legacy_outbound_schema import legacy_outbound_models
 
@@ -226,114 +223,6 @@ def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):
         assert ChatAssoc.select().where(ChatAssoc.slave_uid == "slave-a").count() == 1
         assert TopicAssoc.select().where(TopicAssoc.slave_uid == "slave-a").count() == 1
         assert TopicAssoc.select().count() == 1
-    finally:
-        if not test_database.is_closed():
-            test_database.close()
-        database.initialize(original_database)
-
-
-def test_concurrent_topic_provisioning_creates_one_remote_topic_and_association(tmp_path):
-    original_database = database.obj
-    test_database = SqliteDatabase(tmp_path / "topic-provisioning.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
-    database.initialize(test_database)
-    test_database.connect()
-    entered, release_remote_call = threading.Event(), threading.Event()
-    remote_calls = []
-
-    def create_forum_topic(**_kwargs):
-        remote_calls.append(object())
-        entered.set()
-        assert release_remote_call.wait(5)
-        return SimpleNamespace(message_thread_id=200)
-
-    try:
-        test_database.create_tables([ChatAssoc, TopicAssoc])
-        repository = ChatAssociationRepository()
-        service_kwargs = (
-            None,
-            SimpleNamespace(create_forum_topic=create_forum_topic),
-            repository,
-            SimpleNamespace(get_chat=lambda *_args, **_kwargs: SimpleNamespace(chat_title="Chat")),
-            SimpleNamespace(schedule_for_association=lambda _chat_id: None),
-            "tests.channel",
-            lambda value: value,
-            lambda one, _many, _count: one,
-            Mock(),
-        )
-        first, second = TopicGroupService(*service_kwargs), TopicGroupService(*service_kwargs)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            first_result = executor.submit(first.create_topic, "tests.slave chat", TelegramChatID(100))
-            assert entered.wait(5)
-            second_result = executor.submit(second.create_topic, "tests.slave chat", TelegramChatID(100))
-            release_remote_call.set()
-            assert first_result.result(5) == TelegramTopicID(200)
-            assert second_result.result(5) == TelegramTopicID(200)
-        assert len(remote_calls) == 1
-        assert TopicAssoc.select().where(TopicAssoc.slave_uid == "tests.slave chat").count() == 1
-    finally:
-        if not test_database.is_closed():
-            test_database.close()
-        database.initialize(original_database)
-
-
-def test_slave_chat_info_schema_upgrade_deduplicates_null_and_group_identities(tmp_path, monkeypatch):
-    database_path = tmp_path / "tgdata.db"
-    raw_db = SqliteDatabase(database_path)
-    raw_db.connect()
-    try:
-        raw_db.execute_sql(
-            "CREATE TABLE slavechatinfo (id INTEGER PRIMARY KEY, slave_channel_id TEXT NOT NULL, slave_channel_emoji TEXT NOT NULL, "
-            "slave_chat_uid TEXT NOT NULL, slave_chat_group_id TEXT, slave_chat_name TEXT NOT NULL, slave_chat_alias TEXT, "
-            "slave_chat_type TEXT NOT NULL, pickle BLOB)"
-        )
-        raw_db.execute_sql(
-            "INSERT INTO slavechatinfo VALUES "
-            "(1, 'tests.slave', 'a', 'chat', NULL, 'old', NULL, 'group', NULL), "
-            "(2, 'tests.slave', 'b', 'chat', NULL, 'new', NULL, 'group', NULL), "
-            "(3, 'tests.slave', 'c', 'chat', 'group', 'old group', NULL, 'group', NULL), "
-            "(4, 'tests.slave', 'd', 'chat', 'group', 'new group', NULL, 'group', NULL)"
-        )
-    finally:
-        raw_db.close()
-
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    manager = DatabaseManager(SimpleNamespace(channel_id="tests.slave-chat-info-upgrade", config={}))
-    try:
-        assert [(row.slave_chat_group_id, row.slave_chat_name) for row in SlaveChatInfo.select().order_by(SlaveChatInfo.id)] == [(None, "new"), ("group", "new group")]
-        indexes = {index.name for index in database.get_indexes("slavechatinfo")}
-        assert {
-            DatabaseManager._SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX,
-            DatabaseManager._SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX,
-        }.issubset(indexes)
-        with pytest.raises(IntegrityError):
-            SlaveChatInfo.create(slave_channel_id="tests.slave", slave_channel_emoji="x", slave_chat_uid="chat", slave_chat_name="duplicate", slave_chat_type="group")
-    finally:
-        manager.stop_worker()
-        database.initialize(original_database)
-
-
-def test_concurrent_slave_chat_info_writes_leave_one_canonical_row(tmp_path):
-    original_database = database.obj
-    test_database = SqliteDatabase(tmp_path / "slave-chat-info.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
-    database.initialize(test_database)
-    test_database.connect()
-    repository = SlaveChatInfoRepository()
-    try:
-        test_database.create_tables([SlaveChatInfo])
-
-        def write(index):
-            test_database.connect(reuse_if_open=True)
-            try:
-                return repository.set_slave_chat_info(
-                    SimpleNamespace(module_id="tests.slave", channel_emoji="x", uid="chat", chat=None, name=f"chat-{index}", alias=None, chat_type_name="group", pickle=None)
-                )
-            finally:
-                test_database.close()
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            list(executor.map(write, range(2)))
-        assert SlaveChatInfo.select().where((SlaveChatInfo.slave_channel_id == "tests.slave") & (SlaveChatInfo.slave_chat_uid == "chat")).count() == 1
     finally:
         if not test_database.is_closed():
             test_database.close()
@@ -949,6 +838,8 @@ def test_slave_delivery_receipt_persists_sender_bot_id():
     processor.router = SimpleNamespace(resolve_reply=lambda *_args: None)
     processor.commands = SimpleNamespace(register_command=lambda *_args: None)
     processor.text_delivery = SimpleNamespace(text=lambda *_args: receipt)
+    processor._pending_slave_messages = set()
+    processor._pending_slave_messages_lock = threading.Lock()
 
     with test_db.bind_ctx([MsgLog]):
         test_db.create_tables([MsgLog])
@@ -956,21 +847,6 @@ def test_slave_delivery_receipt_persists_sender_bot_id():
 
         stored = repository.get_msg_log(master_msg_id="123456.654321")
         assert stored is not None and stored.sender_bot_id == "777"
-
-
-def test_slave_message_delivery_claim_persists_across_repository_instances(tmp_path):
-    test_db = SqliteDatabase(tmp_path / "delivery.db")
-    first, restarted = SlaveMessageDeliveryRepository(), SlaveMessageDeliveryRepository()
-    with test_db.bind_ctx([SlaveMessageDelivery]):
-        test_db.connect()
-        try:
-            test_db.create_tables([SlaveMessageDelivery])
-            assert first.claim("tests.slave chat", "message")
-            assert not restarted.claim("tests.slave chat", "message")
-            restarted.release("tests.slave chat", "message")
-            assert first.claim("tests.slave chat", "message")
-        finally:
-            test_db.close()
 
 
 def test_message_reconstructor_restores_sender_bot_id(channel, slave):

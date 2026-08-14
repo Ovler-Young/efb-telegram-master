@@ -20,11 +20,10 @@ from playhouse.migrate import Operation, PostgresqlMigrator, SqliteMigrator, mig
 from .chat_association_repository import ChatAssociationRepository
 from .database_observability import DatabaseMetrics, observe_database_method
 from .history_migration_repository import HistoryMigrationRepository
-from .models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
+from .models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, TopicAssoc, database
 from .msglog_ingestion_repository import MsgLogIngestionRepository
 from .msglog_repository import MsgLogRepository
 from .slave_chat_info_repository import SlaveChatInfoRepository
-from .slave_message_delivery_repository import SlaveMessageDeliveryRepository
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -54,8 +53,6 @@ class DatabaseManager:
     _CHAT_ASSOC_SLAVE_INDEX = "chatassoc_slave_uid"
     _TOPIC_ASSOC_SLAVE_INDEX = "topicassoc_slave_uid"
     _TOPIC_ASSOC_TOPIC_THREAD_INDEX = "topicassoc_topic_chat_id_message_thread_id"
-    _SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX = "slavechatinfo_identity_without_group_unique"
-    _SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX = "slavechatinfo_identity_with_group_unique"
     _HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX = "historymigrationentry_target_position_without_thread_unique"
     _HISTORY_TARGET_POSITION_WITH_THREAD_INDEX = "historymigrationentry_target_position_with_thread_unique"
     _LEGACY_OUTBOUND_COLUMNS = {
@@ -112,7 +109,6 @@ class DatabaseManager:
         self._metrics: Optional[DatabaseMetrics] = None
         self.chat_associations = ChatAssociationRepository()
         self.slave_chat_info = SlaveChatInfoRepository()
-        self.slave_message_deliveries = SlaveMessageDeliveryRepository()
         self.msglogs = MsgLogRepository()
         self.history_migrations = HistoryMigrationRepository()
         self.msglog_ingestion = MsgLogIngestionRepository(channel.channel_id)
@@ -168,7 +164,7 @@ class DatabaseManager:
 
     def set_metrics(self, metrics: DatabaseMetrics) -> None:
         self._metrics = metrics
-        for repository in (self.chat_associations, self.slave_chat_info, self.slave_message_deliveries, self.msglogs, self.history_migrations, self.msglog_ingestion):
+        for repository in (self.chat_associations, self.slave_chat_info, self.msglogs, self.history_migrations, self.msglog_ingestion):
             repository._metrics = metrics
 
     @observe_database_method("stop_worker")
@@ -181,9 +177,9 @@ class DatabaseManager:
     @staticmethod
     def _create() -> None:
         existing_tables = set(database.get_tables())
-        if {"chatassoc", "topicassoc", "historymigrationentry", "slavechatinfo"} & existing_tables:
+        if {"chatassoc", "topicassoc", "historymigrationentry"} & existing_tables:
             DatabaseManager._ensure_historic_schema_columns(database.obj)
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery])
+        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, MsgLogIngestionScan])
         DatabaseManager._ensure_historic_schema_columns(database.obj)
 
     @staticmethod
@@ -229,16 +225,6 @@ class DatabaseManager:
                 )
             if migration_steps:
                 migrate(*migration_steps)
-            if "slavechatinfo" in table_names:
-                DatabaseManager._deduplicate_slave_chat_info()
-                current_database.execute_sql(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX} "
-                    "ON slavechatinfo (slave_channel_id, slave_chat_uid) WHERE slave_chat_group_id IS NULL"
-                )
-                current_database.execute_sql(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DatabaseManager._SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX} "
-                    "ON slavechatinfo (slave_channel_id, slave_chat_uid, slave_chat_group_id) WHERE slave_chat_group_id IS NOT NULL"
-                )
             if "msglog" in table_names:
                 current_database.execute_sql(f"CREATE INDEX IF NOT EXISTS {DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX} ON msglog (slave_origin_uid, time, master_msg_id)")
             if "chatassoc" in table_names:
@@ -270,13 +256,6 @@ class DatabaseManager:
         duplicate_ids = candidate_ids - DatabaseManager._newest_primary_key_values(model, fields, candidate_ids)
         if duplicate_ids:
             model.delete().where(primary_key.in_(duplicate_ids)).execute()
-
-    @staticmethod
-    def _deduplicate_slave_chat_info() -> None:
-        DatabaseManager._deduplicate_by_key(
-            SlaveChatInfo,
-            (SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id),
-        )
 
     @staticmethod
     def _historic_identity_keys(model: type[Model]) -> tuple[tuple, ...]:
@@ -545,7 +524,7 @@ class DatabaseManager:
             source_path.unlink(missing_ok=True)
 
     def _finalize_completed_sqlite_import(self, sqlite_path: Path) -> None:
-        models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery)
+        models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
         with self._sqlite_source_fence(sqlite_path, models) as (snapshot, source_database):
             with database.obj.bind_ctx(models):
                 if not self._has_sqlite_import_provenance(snapshot):
@@ -564,7 +543,7 @@ class DatabaseManager:
         from peewee import chunked
 
         self.logger.info("Detected existing SQLite database. Migrating to PostgreSQL.")
-        models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery)
+        models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
         with self._sqlite_source_fence(sqlite_path, models) as (snapshot, source_database):
             with database.obj.bind_ctx(models):
                 with database.atomic():

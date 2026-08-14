@@ -1,6 +1,7 @@
 # coding=utf-8
 
 import logging
+import threading
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import telegram  # lgtm [py/import-and-import-from]
@@ -38,7 +39,6 @@ class SlaveMessageService:
         bot: "TelegramAPI",
         flag: utils.ExperimentalFlagsManager,
         msglogs,
-        delivery_claims,
         chat_manager: ChatObjectCacheManager,
         commands: CommandsManager,
         translate: Callable[[str], str],
@@ -53,7 +53,6 @@ class SlaveMessageService:
         self.logger: logging.Logger = logging.getLogger(__name__)
         self.flag = flag
         self.msglogs = msglogs
-        self.delivery_claims = delivery_claims
         self.chat_manager = chat_manager
         self.commands = commands
         self.translate = translate
@@ -63,6 +62,8 @@ class SlaveMessageService:
         self.image_delivery = image_delivery
         self.media_delivery = media_delivery
         self.file_delivery = file_delivery
+        self._pending_slave_messages: set[Tuple[str, str]] = set()
+        self._pending_slave_messages_lock = threading.Lock()
 
     def _(self, text: str) -> str:
         return getattr(self, "translate", lambda value: value)(text)
@@ -71,12 +72,17 @@ class SlaveMessageService:
         return getattr(self, "translate_plural", lambda one, many, amount: one if amount == 1 else many)(singular, plural, count)
 
     def _claim_pending_slave_message(self, key: Tuple[str, str]) -> bool:
-        return self.delivery_claims.claim(*key)
+        with self._pending_slave_messages_lock:
+            if key in self._pending_slave_messages:
+                return False
+            self._pending_slave_messages.add(key)
+            return True
 
     def _release_pending_slave_message(self, key: Optional[Tuple[str, str]]):
         if key is None:
             return
-        self.delivery_claims.release(*key)
+        with self._pending_slave_messages_lock:
+            self._pending_slave_messages.discard(key)
 
     @staticmethod
     def _dedupe_key(msg: Message, slave_origin_uid: str) -> Optional[Tuple[str, str]]:
@@ -284,3 +290,5 @@ class SlaveMessageService:
                 getattr(tg_msg, "message_id", "?"),
                 type(error).__name__,
             )
+        finally:
+            self._release_pending_slave_message(dedupe_key)
