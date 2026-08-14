@@ -51,11 +51,16 @@ class MsgLogScanScheduler:
             resumable = None if reset or active else self.ingestion.get_resumable_scan(source_chat_id)
             if not reset and not active and resumable is None:
                 return "unchanged"
-            return self._schedule_locked(
+            state = self._schedule_locked(
                 source_chat_id,
                 queue_after_active=reset or active,
                 reset_before_run=not reset and active,
             )
+            if state != "already complete" or resumable is None:
+                return state
+            if not self.ingestion.reset_completed_scan(source_chat_id):
+                return state
+            return self._schedule_locked(source_chat_id)
 
     def _schedule_locked(self, source_chat_id: int, *, queue_after_active: bool = False, reset_before_run: bool = False) -> str:
         if self._stopping:

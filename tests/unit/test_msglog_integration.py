@@ -246,6 +246,35 @@ def test_association_reschedule_starts_an_existing_retryable_scan():
         assert scheduler.stop(1) == ()
 
 
+def test_association_reschedule_resets_retryable_scan_that_completes_before_scheduling():
+    class Runtime:
+        def call(self, coroutine, timeout=None):
+            coroutine.close()
+
+    retryable_scan = SimpleNamespace(status="retryable-error", scanned_count=1)
+    completed_scan = SimpleNamespace(status="complete", scanned_count=1)
+    reset_scan = SimpleNamespace(status="pending", scanned_count=0)
+    ingestion = SimpleNamespace(
+        reset_completed_scan=Mock(side_effect=[False, True]),
+        get_resumable_scan=Mock(return_value=retryable_scan),
+        get_or_create_scan=Mock(side_effect=[completed_scan, reset_scan]),
+        release_scan=Mock(),
+    )
+    scheduler = MsgLogScanScheduler(
+        SimpleNamespace(async_runtime=Runtime()),
+        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)),
+        ingestion,
+        Mock(),
+        Mock(),
+    )
+    try:
+        assert scheduler.schedule_for_association(100) == "started"
+        assert ingestion.reset_completed_scan.call_count == 2
+        assert ingestion.get_or_create_scan.call_count == 2
+    finally:
+        assert scheduler.stop(1) == ()
+
+
 def test_association_during_active_scan_queues_one_reset_follow_up(monkeypatch):
     first_started, release_first, follow_up_started = threading.Event(), threading.Event(), threading.Event()
     run_owners = []
