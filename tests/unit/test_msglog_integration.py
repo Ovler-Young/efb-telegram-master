@@ -167,6 +167,31 @@ def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
     assert [call.args for call in manager.schedule.call_args_list] == [(100,), (200,)]
 
 
+def test_association_reschedule_resets_completed_scan_before_starting_worker():
+    class Runtime:
+        def call(self, coroutine, timeout=None):
+            coroutine.close()
+
+    ingestion = SimpleNamespace(
+        reset_completed_scan=Mock(return_value=True),
+        get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)),
+        release_scan=Mock(),
+    )
+    scheduler = MsgLogScanScheduler(
+        SimpleNamespace(async_runtime=Runtime()),
+        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)),
+        ingestion,
+        Mock(),
+        Mock(),
+    )
+    try:
+        assert scheduler.schedule_for_association(100) == "started"
+        ingestion.reset_completed_scan.assert_called_once_with(100)
+        ingestion.get_or_create_scan.assert_called_once_with(100, 10)
+    finally:
+        assert scheduler.stop(1) == ()
+
+
 def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():
     started, release = threading.Event(), threading.Event()
 

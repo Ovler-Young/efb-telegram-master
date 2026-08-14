@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -6,6 +7,7 @@ from telegram import Update
 
 from efb_telegram_master import utils
 from efb_telegram_master.ptb_compat import sync_reply_text
+from efb_telegram_master.topic_sync import TopicGroupService
 from efb_telegram_master.utils import TelegramChatID, TelegramTopicID
 
 
@@ -94,6 +96,38 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     assert channel.chat_associations.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(60006)
 
     channel.chat_associations.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_create_topic_schedules_association_rescan_after_persistence():
+    calls = []
+
+    class Associations:
+        @contextmanager
+        def topic_provisioning_transaction(self):
+            calls.append("transaction-enter")
+            yield
+            calls.append("transaction-exit")
+
+        def get_topic_thread_id(self, **_kwargs):
+            return None
+
+        def add_topic_assoc(self, _chat_id, _thread_id, _slave_uid):
+            calls.append("association-persisted")
+
+    service = TopicGroupService(
+        SimpleNamespace(),
+        SimpleNamespace(create_forum_topic=Mock(return_value=SimpleNamespace(message_thread_id=7))),
+        Associations(),
+        SimpleNamespace(get_chat=Mock(return_value=SimpleNamespace(chat_title="Test chat"))),
+        SimpleNamespace(schedule_for_association=lambda _source_chat_id: calls.append("rescan-scheduled")),
+        "tests.master",
+        lambda text: text,
+        lambda single, _plural, _count: single,
+        Mock(),
+    )
+
+    assert service.create_topic("tests.slave target", TelegramChatID(100)) == TelegramTopicID(7)
+    assert calls == ["transaction-enter", "association-persisted", "transaction-exit", "rescan-scheduled"]
 
 
 def test_master_message_routes_forum_thread_to_slave(channel, slave):

@@ -38,6 +38,16 @@ class FakeDatabase:
         self.claims.append((source_chat_id, lease_owner, lease_seconds))
         return self.scan if self.scan.status != "complete" else None
 
+    def reset_completed_scan(self, source_chat_id):
+        assert source_chat_id == 100
+        if self.scan.status != "complete":
+            return False
+        self.scan.cursor = self.scan.scan_boundary
+        self.scan.existing_streak = 0
+        self.scan.status = "pending"
+        self.scan.error = None
+        return True
+
     def persist_item(self, scan, *, source_message_id, classification, slave_uid=None, message=None, lease_owner):
         self.persisted.append((source_message_id, classification, slave_uid, message))
         scan.cursor = source_message_id - 1
@@ -132,6 +142,25 @@ def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
     ordinary_reply_entry = next(entry for entry in db.persisted if entry[0] == 4)
     assert ordinary_reply_entry[1:] == ("not-topic", None, None)
     assert db.scan.status == "complete"
+
+
+def test_completed_unbound_topic_is_ingested_once_after_association_rescan():
+    db = FakeDatabase(scan_boundary=1)
+    db.chat_associations.associations.clear()
+    mtproto = FakeMTProto({1: topic_message(1)}, scan_ceiling=1)
+    service = MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto)
+
+    asyncio.run(service.run(100, lease_owner="worker-a"))
+
+    assert db.scan.status == "complete"
+    assert db.persisted == [(1, "unbound-topic", None, None)]
+
+    db.chat_associations.associations[10] = "tests.linked-slave"
+    assert db.reset_completed_scan(100) is True
+    asyncio.run(service.run(100, lease_owner="worker-b"))
+
+    eligible = [entry for entry in db.persisted if entry[1] == "eligible"]
+    assert [(message_id, slave_uid) for message_id, _classification, slave_uid, _content in eligible] == [(1, "tests.linked-slave")]
 
 
 def test_ingestion_skips_are_neutral_and_existing_streak_completes_at_500():

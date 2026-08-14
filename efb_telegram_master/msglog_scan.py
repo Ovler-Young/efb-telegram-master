@@ -39,25 +39,43 @@ class MsgLogScanScheduler:
 
     def schedule(self, source_chat_id: int) -> str:
         with self._lock:
+            return self._schedule_locked(source_chat_id)
+
+    def schedule_for_association(self, source_chat_id: int) -> str:
+        """Rescan a completed group after a topic becomes eligible for ingestion."""
+        with self._lock:
             if self._stopping:
                 return "stopping"
-            self._reap_threads_locked()
-            if not self.mtproto.enabled:
-                return "unavailable"
-            if source_chat_id in self._threads or source_chat_id in self._pending_source_chat_ids:
+            reset = self.ingestion.reset_completed_scan(source_chat_id)
+            return self._schedule_locked(source_chat_id, queue_after_active=reset)
+
+    def _schedule_locked(self, source_chat_id: int, *, queue_after_active: bool = False) -> str:
+        if self._stopping:
+            return "stopping"
+        self._reap_threads_locked()
+        if not self.mtproto.enabled:
+            return "unavailable"
+        if source_chat_id in self._pending_source_chat_ids:
+            return "already running"
+        if source_chat_id in self._threads:
+            if not queue_after_active:
                 return "already running"
-            scan = self.ingestion.get_or_create_scan(source_chat_id, self.mtproto.config.scan_ceiling)
-            if scan.status == "complete":
-                return "already complete"
-            owner = str(uuid.uuid4())
-            self._pending.append((source_chat_id, owner))
-            self._pending_source_chat_ids.add(source_chat_id)
-            self._pending_available.notify()
-            admitted = len(self._retiring_threads) < self._scan_concurrency()
-            self._admit_workers_locked()
-            if not admitted:
-                return "queued"
-            return "resumed" if scan.scanned_count else "started"
+            self._enqueue_locked(source_chat_id)
+            return "queued"
+        scan = self.ingestion.get_or_create_scan(source_chat_id, self.mtproto.config.scan_ceiling)
+        if scan.status == "complete":
+            return "already complete"
+        admitted = len(self._retiring_threads) < self._scan_concurrency()
+        self._enqueue_locked(source_chat_id)
+        if not admitted:
+            return "queued"
+        return "resumed" if scan.scanned_count else "started"
+
+    def _enqueue_locked(self, source_chat_id: int) -> None:
+        self._pending.append((source_chat_id, str(uuid.uuid4())))
+        self._pending_source_chat_ids.add(source_chat_id)
+        self._pending_available.notify()
+        self._admit_workers_locked()
 
     def stop(self, join_timeout: float = DEFAULT_JOIN_TIMEOUT) -> tuple[BaseException, ...]:
         deadline = time.monotonic() + join_timeout
