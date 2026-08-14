@@ -1,6 +1,6 @@
 import logging
 from contextlib import suppress
-from typing import Collection, Dict, Iterator, Mapping, MutableSequence, Optional, Tuple, cast, overload
+from typing import Collection, Dict, Iterator, Mapping, MutableSequence, Optional, Protocol, Tuple, cast, overload
 
 from ehforwarderbot.chat import BaseChat, Chat, ChatMember, SelfChatMember, SystemChatMember
 from ehforwarderbot.exceptions import EFBChatNotFound
@@ -15,12 +15,20 @@ CacheKey = Tuple[ModuleID, ChatID]
 """Cache storage key: module_id, chat_id"""
 
 
+class SlaveChatProvider(Protocol):
+    """Minimum slave-channel interface required by the chat cache."""
+
+    def get_chats(self) -> Collection[Chat]: ...
+
+    def get_chat(self, chat_uid: ChatID) -> Chat: ...
+
+
 class ChatObjectCacheManager:
     """Maintain and update chat objects from all slave channels and
     middlewares.
     """
 
-    def __init__(self, db, slave_chat_info, slaves: Mapping[ModuleID, object]):
+    def __init__(self, db, slave_chat_info, slaves: Mapping[ModuleID, SlaveChatProvider]):
         self.db = db
         self.slave_chat_info = slave_chat_info
         self.slaves = slaves

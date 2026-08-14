@@ -36,7 +36,7 @@ class MsgLogReconstructor:
         assert row.slave_member_uid is not None
         a_module, a_id, a_grp = chat_id_str_to_id(EFBChannelChatIDStr(row.slave_member_uid))
         chat = self.chat_manager.get_chat(c_module, c_id, build_dummy=True)
-        author = self.chat_manager.get_chat_member(a_module, a_grp, a_id, build_dummy=True)
+        author = self.chat_manager.get_chat_member(a_module, a_grp or c_id, a_id, build_dummy=True)
         msg = ETMMsg(
             uid=MessageID(row.slave_message_id),
             chat=chat,
@@ -80,6 +80,6 @@ class MsgLogReconstructor:
                     reactions[reaction] = []
                     for reactor in reactors:
                         module_id, chat_id, group_id = chat_id_str_to_id(reactor)
-                        reactions[reaction].append(self.chat_manager.get_chat_member(module_id, group_id, chat_id, build_dummy=True))
+                        reactions[reaction].append(self.chat_manager.get_chat_member(module_id, group_id or c_id, chat_id, build_dummy=True))
                 msg.reactions = reactions
         return msg

@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from .bot_manager import TelegramBotManager
     from .chat_object_cache import ChatObjectCacheManager
     from .master_message import MasterMessageWorker
+    from .msglog_reconstruction import MsgLogReconstructor
     from .slave_message import SlaveMessageService
     from .slave_status import SlaveStatusService
     from .telegram_runtime import TelegramPollingRuntime
@@ -72,6 +73,7 @@ class TelegramChannel(MasterChannel):
     message_service: SlaveMessageService
     status_service: SlaveStatusService
     master_message_worker: MasterMessageWorker
+    message_reconstructor: MsgLogReconstructor
     # RPC server
     rpc_server: Optional[SimpleXMLRPCServer] = None
 

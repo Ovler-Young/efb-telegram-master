@@ -1,7 +1,7 @@
 # coding=utf-8
 import html
 import logging
-from typing import Callable, Collection, Dict, List, Optional, Tuple, Union, cast
+from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 from ehforwarderbot import Channel, Middleware
 from ehforwarderbot.channel import SlaveChannel
@@ -33,7 +33,7 @@ class CommandsManager:
     Additional features of slave channels.
     """
 
-    def __init__(self, bot, runtime, localize: Callable[[str], str], modules: Callable[[], Collection[Union[SlaveChannel, Middleware]]]):
+    def __init__(self, bot, runtime, localize: Callable[[str], str], modules: Callable[[], Sequence[Union[SlaveChannel, Middleware]]]):
         self.bot = bot
         self.runtime = runtime
         self._ = localize
@@ -240,12 +240,12 @@ class CommandsManager:
         if groupdict["command"] not in functions:
             return self.bot.reply_error(update, self._("Command not found in selected module. (XC02)"))
 
-        # noinspection PyUnresolvedReferences
-        header = "{} {}: {}\n-------\n".format(
-            channel.channel_emoji,
-            channel.channel_name,
-            functions[groupdict["command"]].name,  # type: ignore
-        )
+        command = functions[ExtraCommandName(groupdict["command"])]
+        command_name = command.__name__
+        if isinstance(channel, Channel):
+            header = "{} {}: {}\n-------\n".format(channel.channel_emoji, channel.channel_name, command_name)
+        else:
+            header = "{}: {}\n-------\n".format(channel.middleware_name, command_name)
         msg = self.bot.send_message(update.message.chat.id, prefix=header, text=self._("Please wait..."))
 
         assert update.message.text
