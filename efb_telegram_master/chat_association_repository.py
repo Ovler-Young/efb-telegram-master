@@ -23,6 +23,13 @@ class ChatAssociationRepository(ObservedRepository):
                 current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (cls._LOCK_KEY,))
             yield
 
+    @classmethod
+    @contextmanager
+    def topic_provisioning_transaction(cls):
+        """Serialize association lookup, remote topic creation, and persistence."""
+        with cls._mutation_transaction():
+            yield
+
     @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr, slave_uid: EFBChannelChatIDStr, multiple_slave: bool = False):
         with self._mutation_transaction():

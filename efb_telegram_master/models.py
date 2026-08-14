@@ -178,3 +178,32 @@ class SlaveChatInfo(BaseModel):
     slave_chat_alias = TextField(null=True)
     slave_chat_type = CharField()
     pickle = BlobField(null=True)
+
+
+class SlaveMessageDelivery(BaseModel):
+    slave_origin_uid = TextField()
+    slave_message_id = TextField()
+
+    class Meta:
+        indexes = ((("slave_origin_uid", "slave_message_id"), True),)
+
+
+SlaveChatInfo.add_index(
+    SlaveChatInfo.index(
+        SlaveChatInfo.slave_channel_id,
+        SlaveChatInfo.slave_chat_uid,
+        unique=True,
+        where=SlaveChatInfo.slave_chat_group_id.is_null(True),
+        name="slavechatinfo_identity_without_group_unique",
+    )
+)
+SlaveChatInfo.add_index(
+    SlaveChatInfo.index(
+        SlaveChatInfo.slave_channel_id,
+        SlaveChatInfo.slave_chat_uid,
+        SlaveChatInfo.slave_chat_group_id,
+        unique=True,
+        where=SlaveChatInfo.slave_chat_group_id.is_null(False),
+        name="slavechatinfo_identity_with_group_unique",
+    )
+)

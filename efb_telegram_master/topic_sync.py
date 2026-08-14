@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import logging
-import threading
 import time
 from contextlib import suppress
 from typing import IO, Callable, Optional
@@ -33,16 +32,18 @@ class TopicGroupService:
     MAX_TITLE_LENGTH = 255
     MAX_DESCRIPTION_LENGTH = 255
 
-    def __init__(self, runtime, bot, chat_associations, chat_manager, channel_id, localize: Callable[[str], str], ngettext: Callable[[str, str, int], str], logger: logging.Logger) -> None:
+    def __init__(
+        self, runtime, bot, chat_associations, chat_manager, msglog_scan, channel_id, localize: Callable[[str], str], ngettext: Callable[[str, str, int], str], logger: logging.Logger
+    ) -> None:
         self.runtime = runtime
         self.bot = bot
         self.chat_associations = chat_associations
         self.chat_manager = chat_manager
+        self.msglog_scan = msglog_scan
         self.channel_id = channel_id
         self._ = localize
         self.ngettext = ngettext
         self.logger = logger
-        self._topic_mutex = threading.Lock()
 
     def register_handlers(self) -> None:
         self.runtime.application.add_handler(CommandHandler("update_info", self.runtime.as_async_callback(self.update_group_info)))
@@ -59,7 +60,7 @@ class TopicGroupService:
         thread_id = self.chat_associations.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
         if thread_id:
             return thread_id
-        with self._topic_mutex:
+        with self.chat_associations.topic_provisioning_transaction():
             thread_id = self.chat_associations.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
             if thread_id:
                 return thread_id
@@ -72,7 +73,8 @@ class TopicGroupService:
                 return None
             thread_id = TelegramTopicID(topic.message_thread_id)
             self.chat_associations.add_topic_assoc(telegram_chat_id, thread_id, slave_uid)
-            return thread_id
+        self.msglog_scan.schedule_for_association(int(telegram_chat_id))
+        return thread_id
 
     def update_group_info(self, update: Update, context: CallbackContext):
         assert update.effective_message and update.effective_chat
