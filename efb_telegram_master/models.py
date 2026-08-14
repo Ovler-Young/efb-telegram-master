@@ -185,6 +185,7 @@ class SlaveMessageDelivery(BaseModel):
     slave_message_id = TextField()
     state = TextField(default="pending", constraints=[SQL("DEFAULT 'pending'")])
     lease_expires_at = DateTimeField(null=True)
+    owner_token = TextField(null=True)
 
     class Meta:
         indexes = ((("slave_origin_uid", "slave_message_id"), True),)
