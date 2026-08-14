@@ -3,9 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ehforwarderbot import Message
+from ehforwarderbot.types import ChatID, ModuleID
 from telegram import Update
+from telegram.error import ChatMigrated
 
 from efb_telegram_master import utils
+from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.ptb_compat import sync_reply_text
 from efb_telegram_master.topic_sync import TopicGroupService
 from efb_telegram_master.utils import TelegramChatID, TelegramTopicID
@@ -128,6 +131,53 @@ def test_create_topic_schedules_association_rescan_after_persistence():
 
     assert service.create_topic("tests.slave target", TelegramChatID(100)) == TelegramTopicID(7)
     assert calls == ["transaction-enter", "association-persisted", "transaction-exit", "rescan-scheduled"]
+
+
+def test_chat_migration_preserves_all_associations_and_recreates_forum_topics(channel, slave, bot_group):
+    first_slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    second_slave_uid = "tests.slave.second"
+    old_chat_id = TelegramChatID(bot_group)
+    new_chat_id = TelegramChatID(-100710)
+    old_master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(old_chat_id)))
+    new_master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(new_chat_id)))
+    channel.chat_associations.add_chat_assoc(old_master_uid, first_slave_uid)
+    channel.chat_associations.add_chat_assoc(old_master_uid, second_slave_uid, multiple_slave=True)
+
+    with (
+        patch.object(channel.bot_manager, "get_chat_info", return_value=SimpleNamespace(is_forum=True)),
+        patch.object(channel.topic_sync, "create_topic") as create_topic,
+    ):
+        channel.topic_sync.migrate_chat_associations(old_chat_id, new_chat_id)
+
+    assert set(channel.chat_associations.get_chat_assoc(master_uid=new_master_uid)) == {first_slave_uid, second_slave_uid}
+    assert channel.chat_associations.get_chat_assoc(master_uid=old_master_uid) == []
+    assert create_topic.call_args_list == [
+        ((first_slave_uid, new_chat_id), {}),
+        ((second_slave_uid, new_chat_id), {}),
+    ]
+    channel.chat_associations.remove_chat_assoc(master_uid=new_master_uid)
+
+
+def test_manager_chat_migration_keeps_multiple_slave_associations() -> None:
+    old_chat_id, new_chat_id = -100720, -100721
+    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager.channel_id = ModuleID("blueset.telegram")
+    manager.chat_associations = Mock()
+    manager.chat_associations.get_chat_assoc.return_value = ["tests.slave.one", "tests.slave.two"]
+    manager.api = Mock()
+    manager._ngettext = lambda single, _plural, _count: single
+    update = Update.de_json(
+        {"update_id": 1, "message": {"message_id": 1, "date": 1, "chat": {"id": old_chat_id, "type": "supergroup"}}},
+        SimpleNamespace(defaults=SimpleNamespace(tzinfo=None)),
+    )
+
+    manager._handle_chat_migration(update, ChatMigrated(new_chat_id))
+
+    new_master_uid = utils.chat_id_to_str(manager.channel_id, ChatID(str(new_chat_id)))
+    assert manager.chat_associations.add_chat_assoc.call_args_list == [
+        ((), {"master_uid": new_master_uid, "slave_uid": "tests.slave.one", "multiple_slave": True}),
+        ((), {"master_uid": new_master_uid, "slave_uid": "tests.slave.two", "multiple_slave": True}),
+    ]
 
 
 def test_master_message_routes_forum_thread_to_slave(channel, slave):

@@ -65,7 +65,7 @@ def _link_completion_service(storage_key, chat, multiple_slave_chats=lambda: Fal
         bot,
         ModuleID("blueset.telegram"),
         multiple_slave_chats,
-        SimpleNamespace(remove_topic_assoc=Mock()),
+        SimpleNamespace(remove_topic_assoc=Mock(), get_chat_assoc=Mock(return_value=[])),
         callback_sessions,
         Mock(),
         Mock(),
@@ -138,7 +138,7 @@ def test_forged_start_token_does_not_consume_the_owner_session():
         bot,
         ModuleID("blueset.telegram"),
         lambda: False,
-        SimpleNamespace(remove_topic_assoc=Mock()),
+        SimpleNamespace(remove_topic_assoc=Mock(), get_chat_assoc=Mock(return_value=[])),
         callback_sessions,
         Mock(),
         Mock(),
@@ -202,6 +202,50 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     send_history_link.assert_not_called()
     assert storage_key not in channel.link_handler._conversations
     _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_initial_link_backfills_to_the_chat_migrated_during_status_edit(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    migrated_chat_id = -100700
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(109))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key)
+    update = _build_link_update(bot_group)
+
+    def migrate_status_edit(**kwargs):
+        if kwargs["chat_id"] == bot_group:
+            channel.topic_sync.migrate_chat_associations(bot_group, migrated_chat_id)
+
+    with (
+        patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 509)),
+        patch.object(channel.bot_manager, "get_chat_info", return_value=SimpleNamespace(is_forum=False)),
+        patch.object(channel.bot_manager, "edit_message_text", side_effect=migrate_status_edit),
+        patch.object(channel.history_replay, "start") as start,
+    ):
+        channel.link_completion.complete(update, [token])
+
+    start.assert_called_once_with(utils.chat_id_to_str(chat=chat), migrated_chat_id, None, storage_key)
+    _cleanup_link_state(channel, chat, migrated_chat_id)
+
+
+def test_replacing_a_chat_association_discards_its_pending_history(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    slave_uid = utils.chat_id_to_str(chat=chat)
+    old_master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
+    replacement_master_uid = utils.chat_id_to_str(channel.channel_id, ChatID("-100701"))
+    channel.chat_associations.add_chat_assoc(old_master_uid, slave_uid)
+    HistoryMigrationEntry.create(
+        slave_chat_id=slave_uid,
+        target_chat_id=str(bot_group),
+        source_master_msg_id="10.20",
+        formatted_text="pending",
+        position=0,
+    )
+
+    channel.chat_associations.add_chat_assoc(replacement_master_uid, slave_uid)
+
+    assert not HistoryMigrationEntry.select().where(HistoryMigrationEntry.slave_chat_id == slave_uid).exists()
+    _cleanup_link_state(channel, chat, -100701)
 
 
 def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):

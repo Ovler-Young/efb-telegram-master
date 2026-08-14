@@ -267,7 +267,7 @@ class TelegramBotManager:
         links = self.chat_associations.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, old_id))
         for link in links:
             self.chat_associations.remove_chat_assoc(slave_uid=link)
-            self.chat_associations.add_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, ChatID(str(new_id))), slave_uid=link)
+            self.chat_associations.add_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, ChatID(str(new_id))), slave_uid=link, multiple_slave=True)
         self.api.send_message(
             new_id,
             self.ngettext(

@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 from peewee import DoesNotExist, PostgresqlDatabase, SqliteDatabase
 
 from .database_observability import ObservedRepository, observe_database_method
-from .models import ChatAssoc, TopicAssoc, database
+from .models import ChatAssoc, HistoryMigrationEntry, TopicAssoc, database
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramTopicID
 
 
@@ -30,16 +30,24 @@ class ChatAssociationRepository(ObservedRepository):
         with cls._mutation_transaction():
             yield
 
+    @staticmethod
+    def _invalidate_history_entries(slave_uids: list[str]) -> None:
+        if slave_uids:
+            HistoryMigrationEntry.delete().where(HistoryMigrationEntry.slave_chat_id.in_(slave_uids)).execute()
+
     @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr, slave_uid: EFBChannelChatIDStr, multiple_slave: bool = False):
         with self._mutation_transaction():
+            invalidated_slaves = [str(slave_uid)]
             if not multiple_slave:
                 previous_slaves = [row.slave_uid for row in ChatAssoc.select(ChatAssoc.slave_uid).where(ChatAssoc.master_uid == master_uid)]
+                invalidated_slaves.extend(previous_slaves)
                 ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
                 if previous_slaves:
                     TopicAssoc.delete().where(TopicAssoc.slave_uid.in_(previous_slaves)).execute()
             ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
             TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
+            self._invalidate_history_entries(invalidated_slaves)
             ChatAssoc.insert(master_uid=master_uid, slave_uid=slave_uid).on_conflict(
                 conflict_target=[ChatAssoc.slave_uid],
                 update={ChatAssoc.master_uid: master_uid},
@@ -57,9 +65,11 @@ class ChatAssociationRepository(ObservedRepository):
                     result = ChatAssoc.delete().where(ChatAssoc.master_uid == master_uid).execute()
                     if slave_uids:
                         TopicAssoc.delete().where(TopicAssoc.slave_uid.in_(slave_uids)).execute()
+                        self._invalidate_history_entries(slave_uids)
                     return result
                 result = ChatAssoc.delete().where(ChatAssoc.slave_uid == slave_uid).execute()
                 TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
+                self._invalidate_history_entries([str(slave_uid)])
                 return result
         except DoesNotExist:
             return 0

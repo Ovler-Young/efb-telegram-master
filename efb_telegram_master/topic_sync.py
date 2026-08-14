@@ -214,7 +214,9 @@ class TopicGroupService:
 
     def topic_migration(self, update: Update, context: CallbackContext):
         assert update.effective_message
-        chat_id = TelegramChatID(update.effective_message.chat.id)
+        self._create_topics_for_chat(TelegramChatID(update.effective_message.chat.id))
+
+    def _create_topics_for_chat(self, chat_id: TelegramChatID) -> None:
         master_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(chat_id)))
         for slave_uid in self.chat_associations.get_chat_assoc(master_uid=master_uid):
             self.create_topic(slave_uid, chat_id)
@@ -226,15 +228,17 @@ class TopicGroupService:
             return self.migrate_chat_associations(message.migrate_from_chat_id, message.chat.id)
         if message.migrate_to_chat_id is not None:
             self.migrate_chat_associations(message.chat.id, message.migrate_to_chat_id)
-            if str(message.migrate_to_chat_id).startswith("-100") and self.bot.get_chat_info(message.migrate_to_chat_id).is_forum:
-                self.topic_migration(update, context)
 
     def migrate_chat_associations(self, from_id: int, to_id: int) -> None:
         from_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(from_id)))
         to_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(to_id)))
-        for slave_uid in self.chat_associations.get_chat_assoc(master_uid=from_uid):
+        slave_uids = self.chat_associations.get_chat_assoc(master_uid=from_uid)
+        for slave_uid in slave_uids:
             self.chat_associations.add_chat_assoc(to_uid, slave_uid, multiple_slave=True)
         self.chat_associations.remove_chat_assoc(master_uid=from_uid)
+        if self.bot.get_chat_info(to_id).is_forum:
+            for slave_uid in slave_uids:
+                self.create_topic(slave_uid, TelegramChatID(to_id))
 
     def chat_joined(self, update: Update, context: CallbackContext):
         assert update.effective_message

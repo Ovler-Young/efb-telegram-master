@@ -149,6 +149,15 @@ class LinkCompletionService:
         self.bot.edit_message_text(chat_id=storage_key[0], message_id=storage_key[1], text=txt)
         self.callback_sessions.clear(self._conversation_handler, storage_key)
 
+        target_chat_id = tg_chat_to_link.id
+        target_thread_id = thread_id
+        current_master_uids = self.chat_associations.get_chat_assoc(slave_uid=chat_uid)
+        if current_master_uids:
+            _, linked_chat_id, _ = utils.chat_id_str_to_id(current_master_uids[0])
+            target_chat_id = int(linked_chat_id)
+            if target_chat_id != tg_chat_to_link.id:
+                target_thread_id = self.chat_associations.get_topic_thread_id(chat_uid, TelegramChatID(target_chat_id))
+
         # migrate history
         # auto:   backfill on first link, send history link on relink
         # True:   always backfill (even on relink)
@@ -158,7 +167,7 @@ class LinkCompletionService:
 
         if do_backfill:
             try:
-                self.history_replay.start(chat_uid, tg_chat_to_link.id, thread_id, storage_key)
+                self.history_replay.start(chat_uid, target_chat_id, target_thread_id, storage_key)
             except Exception as error:
                 self.logger.warning(
                     "History migration failed for %s.",
@@ -170,9 +179,9 @@ class LinkCompletionService:
                     },
                 )
                 try:
-                    notice_kwargs = {"chat_id": tg_chat_to_link.id, "text": self._("⚠️ History backfill failed, but the chat is linked."), "disable_notification": True}
-                    if thread_id:
-                        notice_kwargs["message_thread_id"] = thread_id
+                    notice_kwargs = {"chat_id": target_chat_id, "text": self._("⚠️ History backfill failed, but the chat is linked."), "disable_notification": True}
+                    if target_thread_id:
+                        notice_kwargs["message_thread_id"] = target_thread_id
                     self.bot.send_message(**notice_kwargs)
                 except Exception:
                     pass
@@ -184,7 +193,7 @@ class LinkCompletionService:
                 if history_location_url(candidate_key) is not None:
                     history_key = candidate_key
                     break
-            self.send_history_link(chat_uid, tg_chat_to_link.id, history_key, thread_id)
+            self.send_history_link(chat_uid, target_chat_id, history_key, target_thread_id)
 
     def send_history_link(self, slave_chat_id: EFBChannelChatIDStr, tg_chat_id: int, storage_key: Tuple[int, int], thread_id: Optional[TelegramTopicID] = None):
         """Send a message with a link to the chat history."""
