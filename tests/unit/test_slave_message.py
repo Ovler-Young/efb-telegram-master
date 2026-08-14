@@ -545,6 +545,7 @@ def _reaction_processor(row, message, *, side_effect=None):
     service.router = Mock(route=Mock(return_value=DeliveryPlan("template", 100, None)))
     service.logger = Mock()
     service.msglogs = SimpleNamespace(get_msg_log=Mock(return_value=row))
+    service.message_reconstructor = Mock(build=Mock(return_value=message))
     service.reaction_dispatcher = Mock(dispatch_message=Mock(side_effect=side_effect))
     return service, SimpleNamespace(chat=SimpleNamespace(module_id="tests.slave", uid="chat"), msg_id="message", reactions={"R": [object()]})
 

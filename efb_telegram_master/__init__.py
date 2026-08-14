@@ -238,7 +238,7 @@ class TelegramChannel(MasterChannel):
         origin_uid = etm_utils.chat_id_to_str(chat=chat)
         msg_log = self.msglogs.get_msg_log(slave_origin_uid=origin_uid, slave_msg_id=msg_id)
         if msg_log is not None and msg_log.provenance != "mtproto_ingested":
-            return msg_log.build_etm_msg(self.chat_manager)
+            return self.message_reconstructor.build(msg_log)
         else:
             # Message is not found.
             return None

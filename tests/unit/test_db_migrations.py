@@ -851,7 +851,7 @@ def test_slave_delivery_receipt_persists_sender_bot_id():
         assert stored is not None and stored.sender_bot_id == "777"
 
 
-def test_build_etm_msg_restores_sender_bot_id(channel, slave):
+def test_message_reconstructor_restores_sender_bot_id(channel, slave):
     chat = slave.chat_with_alias
     etm_msg = ETMMsg(
         uid=MessageID("restored-message"),
@@ -865,7 +865,7 @@ def test_build_etm_msg_restores_sender_bot_id(channel, slave):
 
     channel.msglogs.add_or_update_message_log(etm_msg, SimpleNamespace(chat_id=4444, message_id=5555), sender_bot_id="888")
     row = channel.msglogs.get_msg_log(master_msg_id="4444.5555")
-    assert row is not None and row.build_etm_msg(channel.chat_manager).sender_bot_id == "888"
+    assert row is not None and channel.message_reconstructor.build(row).sender_bot_id == "888"
     row.delete_instance()
 
 

@@ -42,8 +42,8 @@ class HistoryReplayWorker:
     SOURCE_PAGE_SIZE = 100
     REPLAY_PAGE_SIZE = 100
 
-    def __init__(self, bot, msglogs, history_migrations: HistoryMigrationRepository, chat_manager, logger: logging.Logger, translate: Callable[[str], str] = _identity) -> None:
-        self.bot, self.msglogs, self.history_migrations, self.chat_manager = bot, msglogs, history_migrations, chat_manager
+    def __init__(self, bot, msglogs, history_migrations: HistoryMigrationRepository, message_reconstructor, logger: logging.Logger, translate: Callable[[str], str] = _identity) -> None:
+        self.bot, self.msglogs, self.history_migrations, self.message_reconstructor = bot, msglogs, history_migrations, message_reconstructor
         self.logger, self._ = logger, translate
         self._process_lock = threading.Lock()
         self._condition = threading.Condition()
@@ -143,7 +143,7 @@ class HistoryReplayWorker:
                     text = msg_log.text or ""
                     formatted_text = None
                     if msg_log.provenance != "mtproto_ingested" and text.strip() and not (msg_log.media_type and msg_log.media_type != "Text"):
-                        message = msg_log.build_etm_msg(self.chat_manager, recur=False)
+                        message = self.message_reconstructor.build(msg_log, recur=False)
                         timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
                         author = message.author.display_name if message.author else "Unknown"
                         formatted_text = f"*{author}* `{timestamp}`\n{text}\n\n"

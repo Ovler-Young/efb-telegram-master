@@ -1,24 +1,14 @@
 # coding=utf-8
 
 import datetime
-import pickle
-from contextlib import suppress
-from typing import TYPE_CHECKING, Collection, Dict, List, Tuple
+from typing import Collection, Dict, Tuple
 
-from ehforwarderbot import Channel, MsgType, coordinator
-from ehforwarderbot.message import MessageAttribute, MessageCommands, Substitutions
-from ehforwarderbot.types import MessageID, ModuleID, ReactionName
+from ehforwarderbot.message import MessageAttribute, MessageCommands
+from ehforwarderbot.types import ReactionName
 from peewee import SQL, AutoField, BlobField, CharField, DatabaseProxy, DateTimeField, IntegerField, Model, TextField
 from typing_extensions import TypedDict
 
-from .chat_object_cache import ChatObjectCacheManager
-from .message import ETMMsg
-from .msg_type import TGMsgType
-from .utils import EFBChannelChatIDStr, TgChatMsgIDStr, chat_id_str_to_id
-
-if TYPE_CHECKING:
-    from .chat import ETMChatMixin
-    from .chat_member import ETMChatMember
+from .utils import EFBChannelChatIDStr, TgChatMsgIDStr
 
 database = DatabaseProxy()
 
@@ -114,60 +104,6 @@ class MsgLog(BaseModel):
 
     class Meta:
         indexes = ((("slave_origin_uid", "time", "master_msg_id"), False),)
-
-    def build_etm_msg(self, chat_manager: ChatObjectCacheManager, recur: bool = True) -> ETMMsg:
-        c_module, c_id, _ = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_origin_uid))
-        assert self.slave_member_uid is not None
-        a_module, a_id, a_grp = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_member_uid))
-        chat: "ETMChatMixin" = chat_manager.get_chat(c_module, c_id, build_dummy=True)
-        author: "ETMChatMember" = chat_manager.get_chat_member(a_module, a_grp, a_id, build_dummy=True)  # type: ignore
-        msg = ETMMsg(
-            uid=MessageID(self.slave_message_id),
-            chat=chat,
-            author=author,
-            text=self.text,
-            type=MsgType(self.msg_type),
-            type_telegram=TGMsgType(self.media_type),
-            mime=self.mime or None,
-            file_id=self.file_id or None,
-        )
-        msg.sender_bot_id = self.sender_bot_id
-        with suppress(NameError):
-            to_module = coordinator.get_module_by_id(ModuleID(self.sent_to))
-            if isinstance(to_module, Channel):
-                msg.deliver_to = to_module
-        if self.pickle:
-            pickle_data = bytes(self.pickle) if isinstance(self.pickle, memoryview) else self.pickle
-            misc_data: PickledDict = pickle.loads(pickle_data)
-            if "target" in misc_data and recur:
-                target_row = self.get_or_none(MsgLog.master_msg_id == misc_data["target"])
-                if target_row:
-                    msg.target = target_row.build_etm_msg(chat_manager, recur=False)
-            if "is_system" in misc_data:
-                msg.is_system = misc_data["is_system"]
-            if "attributes" in misc_data:
-                msg.attributes = misc_data["attributes"]
-            if "commands" in misc_data:
-                msg.commands = misc_data["commands"]
-            if "substitutions" in misc_data:
-                subs = Substitutions({})
-                for sk, sv in misc_data["substitutions"].items():
-                    module_id, chat_id, group_id = chat_id_str_to_id(sv)
-                    if group_id:
-                        subs[sk] = chat_manager.get_chat_member(module_id, group_id, chat_id, build_dummy=True)
-                    else:
-                        subs[sk] = chat_manager.get_chat(module_id, chat_id, build_dummy=True)
-                msg.substitutions = subs
-            if "reactions" in misc_data:
-                reactions: Dict[ReactionName, List[ETMChatMember]] = {}
-                for rk, rv in misc_data["reactions"].items():
-                    reactions[rk] = []
-                    for idx in rv:
-                        module_id, chat_id, group_id = chat_id_str_to_id(idx)
-                        reactions[rk].append(chat_manager.get_chat_member(module_id, group_id, chat_id, build_dummy=True))  # type: ignore
-                msg.reactions = reactions
-        return msg
-
 
 class MsgLogIngestionScan(BaseModel):
     """One leased descending MTProto scan for a bound Telegram group."""

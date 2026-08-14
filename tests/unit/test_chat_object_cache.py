@@ -1,5 +1,7 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from ehforwarderbot import coordinator
 from ehforwarderbot.chat import PrivateChat
 from pytest import fixture
 
@@ -10,7 +12,7 @@ from efb_telegram_master.chat_object_cache import ChatObjectCacheManager
 def chat_manager(channel):
     # Prevent the manager to get a list of available chats in the list
     with patch.dict("ehforwarderbot.coordinator.slaves", {}, clear=True):
-        yield ChatObjectCacheManager(channel)
+        yield ChatObjectCacheManager(channel.db, channel.slave_chat_info, coordinator.slaves)
 
 
 def test_chat_manager_enrol_single(chat_manager, slave):
@@ -38,6 +40,12 @@ def test_chat_manager_build_dummy(chat_manager):
     assert generated is not None
     assert generated.module_id == module_id
     assert generated.uid == id
+
+
+def test_chat_manager_requires_explicit_dependencies():
+    manager = ChatObjectCacheManager(SimpleNamespace(), SimpleNamespace(get_slave_chat_info=lambda *_args: None), {})
+
+    assert manager.get_chat("module", "chat") is None
 
 
 def test_chat_manager_update_chat_obj(chat_manager, slave):

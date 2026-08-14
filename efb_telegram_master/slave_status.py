@@ -43,11 +43,12 @@ class SlaveStatusService:
     REACTION_DB_WAIT_TIMEOUT = 2.0
     REACTION_DB_WAIT_INTERVAL = 0.05
 
-    def __init__(self, logger: logging.Logger, slave_chat_info, chat_manager, msglogs, bot, flag, router, reaction_dispatcher: ReactionDispatcher, translate) -> None:
+    def __init__(self, logger: logging.Logger, slave_chat_info, chat_manager, msglogs, message_reconstructor, bot, flag, router, reaction_dispatcher: ReactionDispatcher, translate) -> None:
         self.logger = logger
         self.slave_chat_info = slave_chat_info
         self.chat_manager = chat_manager
         self.msglogs = msglogs
+        self.message_reconstructor = message_reconstructor
         self.bot = bot
         self.flag = flag
         self.router = router
@@ -119,7 +120,7 @@ class SlaveStatusService:
         if getattr(row, "provenance", "live") == "mtproto_ingested":
             self.logger.info("Ignoring reaction update for ingested synthetic message %s from %s.", status.msg_id, status.chat)
             return
-        message: ETMMsg = row.build_etm_msg(chat_manager=self.chat_manager)
+        message: ETMMsg = self.message_reconstructor.build(row)
         message.reactions, message.edit, message.edit_media = status.reactions, True, False
         if row.sender_bot_id:
             message.vendor_specific = message.vendor_specific or {}

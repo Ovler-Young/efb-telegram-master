@@ -87,6 +87,7 @@ def sync_msglog_service() -> TelegramCommandService:
         FakeAssociations([("tests.slave", 7)]),
         Mock(),
         Mock(),
+        Mock(),
         FakeScanScheduler(),
         FakeLinkCompletion(),
         [10],

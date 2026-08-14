@@ -72,8 +72,8 @@ def _link_completion_service(storage_key, chat, multiple_slave_chats=lambda: Fal
         lambda message: message,
         lambda single, plural, count: single if count == 1 else plural,
         Mock(),
+        handler,
     )
-    service.set_handler(handler)
     return service
 
 
@@ -123,7 +123,7 @@ def test_link_completion_rejects_an_inactive_slave_without_consuming_its_session
     service.topic_sync.create_topic.assert_not_called()
     service.history_replay.start.assert_not_called()
     assert service.callback_sessions.lookup(storage_key) is not None
-    assert service._handler()._conversations[storage_key] == Flags.LINK_EXEC
+    assert service._conversation_handler._conversations[storage_key] == Flags.LINK_EXEC
 
 
 def test_forged_start_token_does_not_consume_the_owner_session():
@@ -145,8 +145,8 @@ def test_forged_start_token_does_not_consume_the_owner_session():
         lambda message: message,
         lambda single, plural, count: single if count == 1 else plural,
         Mock(),
+        handler,
     )
-    service.set_handler(handler)
 
     service.complete(_build_link_update(-100500, user_id=2), [token])
 
@@ -169,8 +169,7 @@ def test_start_with_missing_effective_user_does_not_consume_a_session():
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
     handler = SimpleNamespace(_conversations={})
     callback_sessions.start(handler, storage_key, Flags.LINK_EXEC, 1, ChatListStorage([chat]))
-    service = LinkCompletionService(bot, ModuleID("blueset.telegram"), lambda: False, Mock(), callback_sessions, Mock(), Mock(), lambda message: message, Mock(), Mock())
-    service.set_handler(handler)
+    service = LinkCompletionService(bot, ModuleID("blueset.telegram"), lambda: False, Mock(), callback_sessions, Mock(), Mock(), lambda message: message, Mock(), Mock(), handler)
     update = Update(update_id=1, message=Mock())
     update.effective_message.text = "/start " + token
     update.effective_message.chat = SimpleNamespace(id=-100500, type="group")
@@ -814,7 +813,8 @@ def test_queue_history_migration_entries_persists_pending_rows():
     text_log.text = "hello"
     text_log.media_type = "Text"
     text_log.time = base_time
-    text_log.build_etm_msg.return_value = SimpleNamespace(author=SimpleNamespace(display_name="author"))
+    message_reconstructor = Mock()
+    message_reconstructor.build.return_value = SimpleNamespace(author=SimpleNamespace(display_name="author"))
     media_log = Mock()
     media_log.master_msg_id = "10.21"
     media_log.text = ""
@@ -822,6 +822,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
     media_log.time = base_time + timedelta(seconds=1)
     manager.SOURCE_PAGE_SIZE = 1
     manager.msglogs.get_recent_message_page.side_effect = [[text_log], [media_log], []]
+    manager.message_reconstructor = message_reconstructor
 
     def replace_entries(_slave_chat_id, _target_chat_id, _thread_id, entries):
         queued_entries.extend(entries)

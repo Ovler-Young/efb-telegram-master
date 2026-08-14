@@ -25,6 +25,7 @@ class MasterMessageInbound:
         chat_associations,
         chat_dest_cache: ChatDestinationCache,
         chat_manager,
+        message_reconstructor,
         recipient_suggestions,
         delivery,
         channel_id: ModuleID,
@@ -37,6 +38,7 @@ class MasterMessageInbound:
         self.chat_associations = chat_associations
         self.chat_dest_cache = chat_dest_cache
         self.chat_manager = chat_manager
+        self.message_reconstructor = message_reconstructor
         self.recipient_suggestions = recipient_suggestions
         self.delivery = delivery
         self.channel_id = channel_id
@@ -72,7 +74,7 @@ class MasterMessageInbound:
                 return
             destination = EFBChannelChatIDStr(message_log.slave_origin_uid)
             edited = message_log
-            quote = message_log.build_etm_msg(self.chat_manager).target is not None
+            quote = self.message_reconstructor.build(message_log).target is not None
         if destination is None:
             chats = get_linked_slave_chats()
             if len(chats) == 1:

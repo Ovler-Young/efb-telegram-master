@@ -21,10 +21,10 @@ from .utils import TelegramChatID, TelegramMessageID
 class MasterMessageMutations:
     """Handle deletion commands and unsupported Telegram updates."""
 
-    def __init__(self, bot, msglogs, chat_manager, localize: Callable[[str], str], flags: Callable[[str], object], send_removal: Callable[[object, ETMMsg], None], logger: logging.Logger) -> None:
+    def __init__(self, bot, msglogs, message_reconstructor, localize: Callable[[str], str], flags: Callable[[str], object], send_removal: Callable[[object, ETMMsg], None], logger: logging.Logger) -> None:
         self.bot = bot
         self.msglogs = msglogs
-        self.chat_manager = chat_manager
+        self.message_reconstructor = message_reconstructor
         self.localize = localize
         self.flags = flags
         self.send_removal = send_removal
@@ -45,7 +45,7 @@ class MasterMessageMutations:
             self.bot.reply_error(update, self.localize("This recovered message cannot be removed from its remote chat."))
             return
         try:
-            etm_msg: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
+            etm_msg: ETMMsg = self.message_reconstructor.build(msg_log)
         except UnpicklingError:
             self.bot.reply_error(update, self.localize("This message is not found in ETM database. You cannot remove it from its remote chat."))
             return

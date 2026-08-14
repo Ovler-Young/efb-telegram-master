@@ -49,6 +49,7 @@ def test_edited_oversized_attachment_removal_skips_download_eligibility(monkeypa
         bot,
         msglogs,
         SimpleNamespace(get_chat=Mock(return_value=chat)),
+        Mock(),
         lambda text: text,
         lambda _: False,
         lambda destination, etm_message: removals.append((destination, etm_message)),

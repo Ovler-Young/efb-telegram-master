@@ -47,6 +47,7 @@ class TelegramCommandService:
         chat_associations: ChatAssociationRepository,
         chat_manager: ChatObjectCacheManager,
         msglogs: MsgLogRepository,
+        message_reconstructor,
         msglog_scan: MsgLogScanScheduler,
         link_completion: LinkCompletionService,
         admins: list[int],
@@ -57,7 +58,7 @@ class TelegramCommandService:
         self.channel_id, self.instance_id, self.version = channel_id, instance_id, version
         self.api = api
         self.chat_associations, self.chat_manager = chat_associations, chat_manager
-        self.msglogs, self.msglog_scan, self.link_completion = msglogs, msglog_scan, link_completion
+        self.msglogs, self.message_reconstructor, self.msglog_scan, self.link_completion = msglogs, message_reconstructor, msglog_scan, link_completion
         self.admins, self.topic_group, self.logger = admins, topic_group, logger
         self.locale_state = locale_state
 
@@ -224,7 +225,7 @@ class TelegramCommandService:
             sync_reply_text(self.api, message, self._("This recovered message cannot be reacted to from its remote chat."))
             return
         if reaction is None:
-            reactors = msg_log.build_etm_msg(self.chat_manager).reactions
+            reactors = self.message_reconstructor.build(msg_log).reactions
             if not reactors:
                 sync_reply_html(self.api, message, self._("This message has no reactions yet. Reply to a message with this command and an emoji to send a reaction. Ex.: <code>/react 👍</code>."))
                 return

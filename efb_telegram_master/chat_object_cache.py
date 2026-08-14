@@ -1,8 +1,7 @@
 import logging
 from contextlib import suppress
-from typing import TYPE_CHECKING, Collection, Dict, Iterator, MutableSequence, Optional, Tuple, cast, overload
+from typing import Collection, Dict, Iterator, Mapping, MutableSequence, Optional, Tuple, cast, overload
 
-from ehforwarderbot import coordinator
 from ehforwarderbot.chat import BaseChat, Chat, ChatMember, SelfChatMember, SystemChatMember
 from ehforwarderbot.exceptions import EFBChatNotFound
 from ehforwarderbot.types import ChatID, ModuleID
@@ -11,9 +10,6 @@ from typing_extensions import Literal
 from .chat import ETMChatMixin, ETMSystemChat
 from .chat_codec import convert_chat, unpickle
 from .chat_member import ETMChatMember
-
-if TYPE_CHECKING:
-    from . import TelegramChannel
 
 CacheKey = Tuple[ModuleID, ChatID]
 """Cache storage key: module_id, chat_id"""
@@ -24,17 +20,17 @@ class ChatObjectCacheManager:
     middlewares.
     """
 
-    def __init__(self, channel: "TelegramChannel"):
-        self.channel = channel
-        self.db = channel.db
-        self.slave_chat_info = channel.slave_chat_info
+    def __init__(self, db, slave_chat_info, slaves: Mapping[ModuleID, object]):
+        self.db = db
+        self.slave_chat_info = slave_chat_info
+        self.slaves = slaves
         self.logger = logging.getLogger(__name__)
 
         self.cache: Dict[CacheKey, ETMChatMixin] = dict()
 
         self.logger.debug("Loading chats from slave channels...")
         # load all chats from all slave channels and convert to ETMChat object
-        for channel_id, module in coordinator.slaves.items():
+        for channel_id, module in self.slaves.items():
             # noinspection PyBroadException
             try:
                 self.logger.debug("Loading chats from '%s'...", channel_id)
@@ -100,9 +96,9 @@ class ChatObjectCacheManager:
                 return obj
 
         # Only look up from slave channels as middlewares don’t have get_chat_by_id method.
-        if module_id in coordinator.slaves:
+        if module_id in self.slaves:
             with suppress(EFBChatNotFound, KeyError):
-                chat_obj = coordinator.slaves[module_id].get_chat(chat_id)
+                chat_obj = self.slaves[module_id].get_chat(chat_id)
                 return self.compound_enrol(chat_obj)
 
         if build_dummy:

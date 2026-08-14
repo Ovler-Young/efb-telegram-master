@@ -1,9 +1,9 @@
 # coding=utf-8
 import html
 import logging
-from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Tuple, Union, cast
+from typing import Callable, Collection, Dict, List, Optional, Tuple, Union, cast
 
-from ehforwarderbot import Channel, Middleware, coordinator
+from ehforwarderbot import Channel, Middleware
 from ehforwarderbot.channel import SlaveChannel
 from ehforwarderbot.message import MessageCommand
 from ehforwarderbot.types import ExtraCommandName
@@ -12,11 +12,7 @@ from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, 
 from telegram.ext._utils.types import ConversationDict
 
 from .constants import Flags
-from .locale_mixin import LocaleMixin
 from .ptb_compat import Filters
-
-if TYPE_CHECKING:
-    from . import TelegramChannel
 
 
 class ETMCommandMsgStorage:
@@ -31,16 +27,17 @@ class ETMCommandMsgStorage:
         return f"ETMCommandMsgStorage({self.commands!r}, {self.module!r}, {self.prefix!r}, {self.body!r}, {self.authorized_user_ids!r})"
 
 
-class CommandsManager(LocaleMixin):
+class CommandsManager:
     """
     Functions related to Command messages and
     Additional features of slave channels.
     """
 
-    def __init__(self, channel: "TelegramChannel"):
-        self.channel: "TelegramChannel" = channel
-        self.bot = channel.bot_manager.api
-        self.runtime = channel.telegram_runtime
+    def __init__(self, bot, runtime, localize: Callable[[str], str], modules: Callable[[], Collection[Union[SlaveChannel, Middleware]]]):
+        self.bot = bot
+        self.runtime = runtime
+        self._ = localize
+        self.modules = modules
         self.msg_storage: Dict[Tuple[int, int], ETMCommandMsgStorage] = dict()
         self.logger = logging.getLogger(__name__)
 
@@ -59,10 +56,7 @@ class CommandsManager(LocaleMixin):
 
         self.runtime.application.add_handler(self.command_conv)
 
-        self.modules_list: List[Union[SlaveChannel, Middleware]] = []
-        for i in sorted(coordinator.slaves.keys()):
-            self.modules_list.append(coordinator.slaves[i])
-        self.modules_list.extend(coordinator.middlewares)
+        self.modules_list = list(self.modules())
 
     def register_command(self, message: Message, commands: ETMCommandMsgStorage):
         message_identifier = (message.chat.id, message.message_id)
@@ -236,12 +230,11 @@ class CommandsManager(LocaleMixin):
         assert update.message
 
         groupdict = context.match.groupdict()
-        if int(groupdict["id"]) >= len(coordinator.slaves):
+        modules = self.modules()
+        if int(groupdict["id"]) >= len(modules):
             return self.bot.reply_error(update, self._("Invalid module ID. (XC01)"))
 
-        slaves = coordinator.slaves
-
-        channel = slaves[sorted(slaves)[int(groupdict["id"])]]
+        channel = modules[int(groupdict["id"])]
         functions = channel.get_extra_functions()
 
         if groupdict["command"] not in functions:
