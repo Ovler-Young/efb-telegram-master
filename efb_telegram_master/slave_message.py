@@ -70,13 +70,13 @@ class SlaveMessageService:
     def ngettext(self, singular: str, plural: str, count: int) -> str:
         return getattr(self, "translate_plural", lambda one, many, amount: one if amount == 1 else many)(singular, plural, count)
 
-    def _claim_pending_slave_message(self, key: Tuple[str, str]) -> bool:
+    def _claim_pending_slave_message(self, key: Tuple[str, str]) -> Optional[str]:
         return self.delivery_claims.claim(*key)
 
-    def _release_pending_slave_message(self, key: Optional[Tuple[str, str]]):
-        if key is None:
+    def _release_pending_slave_message(self, key: Optional[Tuple[str, str]], owner_token: Optional[str]):
+        if key is None or owner_token is None:
             return
-        self.delivery_claims.release(*key)
+        self.delivery_claims.release(*key, owner_token)
 
     @staticmethod
     def _dedupe_key(msg: Message, slave_origin_uid: str) -> Optional[Tuple[str, str]]:
@@ -115,6 +115,7 @@ class SlaveMessageService:
             msg (Message): The message.
         """
         dedupe_key: Optional[Tuple[str, str]] = None
+        claim_token: Optional[str] = None
         pending_claimed = False
         tg_dest = None
         thread_id = None
@@ -131,7 +132,8 @@ class SlaveMessageService:
             if dedupe_key is not None:
                 # Claim delivery durably with a database-backed lease so
                 # concurrent workers and process restarts share the claim.
-                if not self._claim_pending_slave_message(dedupe_key):
+                claim_token = self._claim_pending_slave_message(dedupe_key)
+                if claim_token is None:
                     self.logger.info("[%s] Duplicate slave message is already pending delivery; skipping.", xid)
                     return msg
                 pending_claimed = True
@@ -141,11 +143,11 @@ class SlaveMessageService:
 
             silent = self.is_silent(msg)
             if silent is None:
-                self._release_pending_slave_message(dedupe_key)
+                self._release_pending_slave_message(dedupe_key, claim_token)
                 return msg
 
             if tg_dest is None:
-                self._release_pending_slave_message(dedupe_key)
+                self._release_pending_slave_message(dedupe_key, claim_token)
                 return msg
 
             # When editing message
@@ -166,10 +168,10 @@ class SlaveMessageService:
                 msg.vendor_specific = msg.vendor_specific or {}
                 msg.vendor_specific["_sender_bot_id"] = _edit_sender_bot_id
 
-            self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent, dedupe_key=dedupe_key)
+            self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent, dedupe_key=dedupe_key, claim_token=claim_token)
         except Exception as e:
             if pending_claimed:
-                self._release_pending_slave_message(dedupe_key)
+                self._release_pending_slave_message(dedupe_key, claim_token)
             if isinstance(e, telegram.error.BadRequest) and e.message:
                 if "Topic" in e.message:
                     try:
@@ -195,6 +197,7 @@ class SlaveMessageService:
         thread_id: Optional[TelegramTopicID],
         silent: bool = False,
         dedupe_key: Optional[Tuple[str, str]] = None,
+        claim_token: Optional[str] = None,
         database_old_msg_id: Optional[OldMsgID] = None,
         target_msg_id_override: Optional[TelegramMessageID] = None,
     ):
@@ -242,7 +245,7 @@ class SlaveMessageService:
             tg_msg = self.file_delivery.video(msg, tg_dest, thread_id, msg_template, reactions, old_msg_id, target_msg_id, reply_markup, silent)
         elif msg.type == MsgType.Status:
             # Status messages are not to be recorded in databases
-            self._release_pending_slave_message(dedupe_key)
+            self._release_pending_slave_message(dedupe_key, claim_token)
             return deliver_message_status(self.bot, msg, tg_dest, thread_id)
         elif msg.type == MsgType.Unsupported:
             tg_msg = self.text_delivery.unsupported(msg, tg_dest, thread_id, msg_template, reactions, old_msg_id, target_msg_id, reply_markup, silent)
@@ -264,12 +267,12 @@ class SlaveMessageService:
 
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. This may happen during shutdown or when Telegram API is unavailable.", xid)
-            self._release_pending_slave_message(dedupe_key)
+            self._release_pending_slave_message(dedupe_key, claim_token)
             return
 
         self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.", xid, tg_msg.chat.id, tg_msg.message_id)
-        if dedupe_key is not None:
-            self.delivery_claims.complete(*dedupe_key)
+        if dedupe_key is not None and claim_token is not None:
+            self.delivery_claims.complete(*dedupe_key, claim_token)
         etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
         try:
             etm_msg.type_telegram = get_msg_type(tg_msg)
