@@ -90,7 +90,13 @@ class SlaveMessageService:
 
         def renew() -> None:
             while not stopped.wait(self.CLAIM_RENEW_INTERVAL):
-                if not self.delivery_claims.renew(*key, owner_token):
+                try:
+                    renewed = self.delivery_claims.renew(*key, owner_token)
+                except Exception as error:
+                    self.logger.exception("Failed to renew delivery claim (%s).", type(error).__name__)
+                    ownership_lost.set()
+                    return
+                if not renewed:
                     ownership_lost.set()
                     return
 
@@ -297,10 +303,6 @@ class SlaveMessageService:
                 **send_identity(msg),
             )
 
-        if tg_msg and commands:
-            authorized_user_ids = (tg_msg.chat.id,) if tg_msg.chat.type == ChatType.PRIVATE else self.router.admins
-            self.commands.register_command(tg_msg, ETMCommandMsgStorage(commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text, authorized_user_ids))
-
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. This may happen during shutdown or when Telegram API is unavailable.", xid)
             self._release_pending_slave_message(dedupe_key, claim_token)
@@ -312,7 +314,12 @@ class SlaveMessageService:
 
         self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.", xid, tg_msg.chat.id, tg_msg.message_id)
         if dedupe_key is not None and claim_token is not None:
-            self.delivery_claims.complete(*dedupe_key, claim_token)
+            if not self.delivery_claims.complete(*dedupe_key, claim_token):
+                self.logger.warning("[%s] Delivery claim ownership was lost before completion.", xid)
+                return
+        if commands:
+            authorized_user_ids = (tg_msg.chat.id,) if tg_msg.chat.type == ChatType.PRIVATE else self.router.admins
+            self.commands.register_command(tg_msg, ETMCommandMsgStorage(commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text, authorized_user_ids))
         etm_msg = ETMMsg.from_efbmsg(msg, self.chat_manager)
         try:
             etm_msg.type_telegram = get_msg_type(tg_msg)

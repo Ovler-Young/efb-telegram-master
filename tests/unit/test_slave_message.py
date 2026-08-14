@@ -305,6 +305,32 @@ def test_active_delivery_renews_the_owned_claim() -> None:
         worker.join(1)
 
 
+def test_renewal_exception_fences_post_send_side_effects() -> None:
+    processor = _dedupe_processor()
+    processor.CLAIM_RENEW_INTERVAL = 0.01
+    processor.delivery_claims.renew.side_effect = RuntimeError("database unavailable")
+    started, release = threading.Event(), threading.Event()
+
+    def dispatch(*_args, **_kwargs):
+        started.set()
+        assert release.wait(1)
+
+    processor.dispatch_message.side_effect = dispatch
+    worker = threading.Thread(target=processor.send_message, args=(_message(),))
+    worker.start()
+    try:
+        assert started.wait(1)
+        ownership_lost = processor.dispatch_message.call_args.kwargs["ownership_lost"]
+        deadline = time.monotonic() + 1
+        while not ownership_lost.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ownership_lost.is_set()
+        processor.logger.exception.assert_called_once_with("Failed to renew delivery claim (%s).", "RuntimeError")
+    finally:
+        release.set()
+        worker.join(1)
+
+
 def test_lost_renewal_fences_post_send_side_effects() -> None:
     processor = object.__new__(SlaveMessageService)
     processor.logger = Mock()
@@ -313,16 +339,46 @@ def test_lost_renewal_fences_post_send_side_effects() -> None:
     processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock())
     processor.delivery_claims = Mock()
     processor.router = Mock(resolve_reply=Mock(return_value=None))
-    processor.text_delivery = Mock(text=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=7)))
+    processor.text_delivery = Mock(text=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100, type=ChatType.PRIVATE), message_id=7)))
     ownership_lost = threading.Event()
     ownership_lost.set()
-    message = SimpleNamespace(uid="message", target=None, commands=None, reactions={}, text="body", type=MsgType.Text, author=SimpleNamespace(module_id="tests.slave"))
+    message = SimpleNamespace(uid="message", target=None, commands=[MessageCommand("Run", "run")], reactions={}, text="body", type=MsgType.Text, author=SimpleNamespace(module_id="tests.slave"))
 
-    processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token", ownership_lost=ownership_lost)
+    with patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()):
+        processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token", ownership_lost=ownership_lost)
 
     processor.delivery_claims.complete.assert_not_called()
+    processor.commands.register_command.assert_not_called()
     processor.msglogs.add_or_update_message_log.assert_not_called()
     processor.logger.warning.assert_called_once_with("[%s] Delivery claim ownership was lost before post-send processing.", "message")
+
+
+def test_failed_completion_fences_command_registration_and_message_logging() -> None:
+    processor = object.__new__(SlaveMessageService)
+    processor.logger = Mock()
+    processor.commands = SimpleNamespace(register_command=Mock())
+    processor.chat_manager = Mock()
+    processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock())
+    processor.delivery_claims = Mock(complete=Mock(return_value=False))
+    processor.router = SimpleNamespace(resolve_reply=Mock(return_value=None), admins=[100])
+    processor.text_delivery = Mock(text=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100, type=ChatType.PRIVATE), message_id=7)))
+    message = SimpleNamespace(
+        uid="message",
+        target=None,
+        commands=[MessageCommand("Run", "run")],
+        reactions={},
+        text="body",
+        type=MsgType.Text,
+        author=SimpleNamespace(module_id="tests.slave"),
+    )
+
+    with patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()):
+        processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token")
+
+    processor.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.commands.register_command.assert_not_called()
+    processor.msglogs.add_or_update_message_log.assert_not_called()
+    processor.logger.warning.assert_called_once_with("[%s] Delivery claim ownership was lost before completion.", "message")
 
 
 def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
