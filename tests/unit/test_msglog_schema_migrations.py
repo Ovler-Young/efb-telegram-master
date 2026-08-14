@@ -80,7 +80,7 @@ def test_database_restart_retains_msglog_provenance_and_ingestion_scan(tmp_path,
 
     assert "provenance" in msglog_columns
     assert defaults["provenance"] == "'live'"
-    assert {"source_chat_id", "cursor", "lease_owner", "existing_streak"}.issubset(scan_columns)
+    assert {"source_chat_id", "cursor", "lease_owner", "existing_streak", "rescan_requested"}.issubset(scan_columns)
 
 
 def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, monkeypatch):
@@ -186,6 +186,29 @@ def test_completed_ingestion_scan_reset_rejects_active_leases():
         database.initialize(original_database)
 
 
+def test_active_association_request_restarts_scan_without_releasing_its_lease():
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    manager = MsgLogIngestionRepository("tests")
+    try:
+        test_db.create_tables([MsgLogIngestionScan])
+        manager.get_or_create_scan(100, 500)
+        scan = manager.claim_scan(100, "remote-worker", 60)
+
+        assert scan is not None
+        assert manager.request_association_rescan(100) == "running"
+        assert manager.complete_scan(scan, lease_owner="remote-worker") is True
+        restarted = MsgLogIngestionScan.get_by_id(scan.id)
+        assert (restarted.status, restarted.cursor, restarted.rescan_requested, restarted.lease_owner) == ("running", 500, False, "remote-worker")
+        assert manager.complete_scan(scan, lease_owner="remote-worker") is False
+        assert MsgLogIngestionScan.get_by_id(scan.id).status == "complete"
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+
 def test_expired_scan_is_resumable_after_restart():
     original_database = database.obj
     test_db = SqliteDatabase(":memory:")
@@ -248,6 +271,43 @@ def test_live_message_overwrites_synthetic_provenance():
             provenance="mtproto_ingested",
         )
         manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=1))
+        row = MsgLog.get_by_id("100.1")
+
+    assert (row.provenance, row.slave_message_id, row.text) == ("live", "live-message", "live text")
+
+
+def test_live_message_upsert_wins_when_ingestion_inserts_after_lookup(monkeypatch):
+    test_db = SqliteDatabase(":memory:")
+    manager = MsgLogRepository()
+    message = ETMMsg(
+        uid=MessageID("live-message"),
+        chat=SimpleNamespace(module_id="tests.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.slave", uid="author"),
+        text="live text",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=SimpleNamespace(channel_id="tests.master"),
+    )
+    original_get_or_none = MsgLog.get_or_none
+
+    def insert_ingested_after_lookup(*_args, **_kwargs):
+        MsgLog.create(
+            master_msg_id="100.1",
+            slave_message_id="mtproto-ingested:100.1",
+            text="ingested",
+            slave_origin_uid="tests.slave stale",
+            slave_member_uid="tests.slave __self__",
+            msg_type="Text",
+            sent_to="tests.master",
+            provenance="mtproto_ingested",
+        )
+        return None
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        monkeypatch.setattr(MsgLog, "get_or_none", insert_ingested_after_lookup)
+        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=1))
+        monkeypatch.setattr(MsgLog, "get_or_none", original_get_or_none)
         row = MsgLog.get_by_id("100.1")
 
     assert (row.provenance, row.slave_message_id, row.text) == ("live", "live-message", "live text")

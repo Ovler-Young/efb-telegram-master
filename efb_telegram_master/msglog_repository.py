@@ -2,7 +2,6 @@ import logging
 import pickle
 import time
 from datetime import datetime
-from functools import partial
 from typing import List, Optional, Tuple
 
 from ehforwarderbot import Message as EFBMessage
@@ -64,11 +63,9 @@ class MsgLogRepository(ObservedRepository):
         if row is None:
             row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
         if row is not None:
-            save = row.save
             self.logger.debug("[%s] Message record is found in database, update it", master_msg_id)
         else:
             row = MsgLog()
-            save = partial(row.save, force_insert=True)
             self.logger.debug("[%s] Message record is not found in database, insert it", master_msg_id)
 
         row.master_msg_id = master_msg_id
@@ -86,7 +83,23 @@ class MsgLogRepository(ObservedRepository):
         row.sender_bot_id = sender_bot_id or getattr(msg, "sender_bot_id", None)
         row.provenance = "live"
         row.pickle = self.pickle_misc_msg(msg)
-        result = save()
+        fields = {
+            MsgLog.master_msg_id_alt: row.master_msg_id_alt,
+            MsgLog.text: row.text,
+            MsgLog.slave_origin_uid: row.slave_origin_uid,
+            MsgLog.slave_member_uid: row.slave_member_uid,
+            MsgLog.msg_type: row.msg_type,
+            MsgLog.sent_to: row.sent_to,
+            MsgLog.slave_message_id: row.slave_message_id,
+            MsgLog.media_type: row.media_type,
+            MsgLog.file_id: row.file_id,
+            MsgLog.file_unique_id: row.file_unique_id,
+            MsgLog.mime: row.mime,
+            MsgLog.sender_bot_id: row.sender_bot_id,
+            MsgLog.provenance: row.provenance,
+            MsgLog.pickle: row.pickle,
+        }
+        result = MsgLog.insert(row.__data__).on_conflict(conflict_target=[MsgLog.master_msg_id], update=fields).execute()
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
 
     @observe_database_method("get_msg_log")

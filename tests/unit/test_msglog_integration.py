@@ -173,7 +173,7 @@ def test_association_reschedule_resets_completed_scan_before_starting_worker():
             coroutine.close()
 
     ingestion = SimpleNamespace(
-        reset_completed_scan=Mock(return_value=True),
+        request_association_rescan=Mock(return_value="pending"),
         get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)),
         release_scan=Mock(),
     )
@@ -186,7 +186,7 @@ def test_association_reschedule_resets_completed_scan_before_starting_worker():
     )
     try:
         assert scheduler.schedule_for_association(100) == "started"
-        ingestion.reset_completed_scan.assert_called_once_with(100)
+        ingestion.request_association_rescan.assert_called_once_with(100)
         ingestion.get_or_create_scan.assert_called_once_with(100, 10)
     finally:
         assert scheduler.stop(1) == ()
@@ -198,9 +198,7 @@ def test_association_reschedule_does_not_start_a_new_scan():
             coroutine.close()
 
     ingestion = SimpleNamespace(
-        reset_completed_scan=Mock(return_value=False),
-        get_resumable_scan=Mock(return_value=None),
-        get_or_create_scan=Mock(),
+        request_association_rescan=Mock(return_value=None),
         release_scan=Mock(),
     )
     scheduler = MsgLogScanScheduler(
@@ -212,9 +210,7 @@ def test_association_reschedule_does_not_start_a_new_scan():
     )
     try:
         assert scheduler.schedule_for_association(100) == "unchanged"
-        ingestion.reset_completed_scan.assert_called_once_with(100)
-        ingestion.get_resumable_scan.assert_called_once_with(100)
-        ingestion.get_or_create_scan.assert_not_called()
+        ingestion.request_association_rescan.assert_called_once_with(100)
     finally:
         assert scheduler.stop(1) == ()
 
@@ -226,8 +222,7 @@ def test_association_reschedule_starts_an_existing_retryable_scan():
 
     retryable_scan = SimpleNamespace(status="retryable-error", scanned_count=1)
     ingestion = SimpleNamespace(
-        reset_completed_scan=Mock(return_value=False),
-        get_resumable_scan=Mock(return_value=retryable_scan),
+        request_association_rescan=Mock(return_value="retryable-error"),
         get_or_create_scan=Mock(return_value=retryable_scan),
         release_scan=Mock(),
     )
@@ -240,24 +235,19 @@ def test_association_reschedule_starts_an_existing_retryable_scan():
     )
     try:
         assert scheduler.schedule_for_association(100) == "resumed"
-        ingestion.get_resumable_scan.assert_called_once_with(100)
+        ingestion.request_association_rescan.assert_called_once_with(100)
         ingestion.get_or_create_scan.assert_called_once_with(100, 10)
     finally:
         assert scheduler.stop(1) == ()
 
 
-def test_association_reschedule_resets_retryable_scan_that_completes_before_scheduling():
+def test_association_reschedule_uses_persisted_request_when_another_worker_is_running():
     class Runtime:
         def call(self, coroutine, timeout=None):
             coroutine.close()
 
-    retryable_scan = SimpleNamespace(status="retryable-error", scanned_count=1)
-    completed_scan = SimpleNamespace(status="complete", scanned_count=1)
-    reset_scan = SimpleNamespace(status="pending", scanned_count=0)
     ingestion = SimpleNamespace(
-        reset_completed_scan=Mock(side_effect=[False, True]),
-        get_resumable_scan=Mock(return_value=retryable_scan),
-        get_or_create_scan=Mock(side_effect=[completed_scan, reset_scan]),
+        request_association_rescan=Mock(return_value="running"),
         release_scan=Mock(),
     )
     scheduler = MsgLogScanScheduler(
@@ -268,73 +258,10 @@ def test_association_reschedule_resets_retryable_scan_that_completes_before_sche
         Mock(),
     )
     try:
-        assert scheduler.schedule_for_association(100) == "started"
-        assert ingestion.reset_completed_scan.call_count == 2
-        assert ingestion.get_or_create_scan.call_count == 2
-    finally:
-        assert scheduler.stop(1) == ()
-
-
-def test_association_during_active_scan_queues_one_reset_follow_up(monkeypatch):
-    first_started, release_first, follow_up_started = threading.Event(), threading.Event(), threading.Event()
-    run_owners = []
-    persisted = []
-    scan = SimpleNamespace(status="pending", scanned_count=0)
-    associations = SimpleNamespace(slave_uid=None)
-
-    def reset_completed_scan(_source_chat_id):
-        if scan.status != "complete":
-            return False
-        scan.status = "pending"
-        return True
-
-    async def run(_service, _source_chat_id, *, lease_owner, stop_requested):
-        run_owners.append(lease_owner)
-        if len(run_owners) == 1:
-            scan.status = "running"
-            persisted.append(("unbound-topic", None))
-            first_started.set()
-            await asyncio.to_thread(release_first.wait)
-            scan.status = "complete"
-        else:
-            assert scan.status == "pending"
-            scan.status = "running"
-            persisted.append(("eligible", associations.slave_uid))
-            scan.status = "complete"
-            follow_up_started.set()
-
-    monkeypatch.setattr(MsgLogIngestionService, "run", run)
-    ingestion = SimpleNamespace(
-        get_or_create_scan=Mock(return_value=scan),
-        get_resumable_scan=Mock(return_value=None),
-        reset_completed_scan=Mock(side_effect=reset_completed_scan),
-        release_scan=Mock(),
-    )
-    runtime = SharedAsyncRuntime()
-
-    async def connect():
-        return None
-
-    scheduler = MsgLogScanScheduler(
-        SimpleNamespace(async_runtime=runtime),
-        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10), connect=connect),
-        ingestion,
-        associations,
-        Mock(),
-    )
-    try:
-        assert scheduler.schedule(100) == "started"
-        assert first_started.wait(1)
-        associations.slave_uid = "tests.linked-slave"
         assert scheduler.schedule_for_association(100) == "queued"
-        release_first.set()
-        assert follow_up_started.wait(1)
-        assert persisted == [("unbound-topic", None), ("eligible", "tests.linked-slave")]
-        assert ingestion.reset_completed_scan.call_count == 2
+        ingestion.request_association_rescan.assert_called_once_with(100)
     finally:
-        release_first.set()
         assert scheduler.stop(1) == ()
-        runtime.close()
 
 
 def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():

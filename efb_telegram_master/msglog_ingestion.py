@@ -67,54 +67,50 @@ class MsgLogIngestionService:
             if stop_requested():
                 self._release_for_shutdown(source_chat_id, lease_owner)
                 return
-            while scan.cursor > 0 and scan.existing_streak < self.EXISTING_STREAK_LIMIT:
-                if stop_requested():
-                    self._release_for_shutdown(source_chat_id, lease_owner)
-                    return
-                renewed_scan = self.ingestion.claim_scan(
-                    source_chat_id,
-                    lease_owner,
-                    self.lease_seconds,
-                )
-                if renewed_scan is None:
-                    return
-                scan = renewed_scan
-                lower_bound = max(1, scan.cursor - self.BATCH_SIZE + 1)
-                message_ids = list(range(scan.cursor, lower_bound - 1, -1))
-                messages = await self.mtproto.get_channel_messages(source_channel, message_ids)
-                if stop_requested():
-                    self._release_for_shutdown(source_chat_id, lease_owner)
-                    return
-                by_id = {message_id: message for message in messages if (message_id := self._message_id(message)) is not None}
-                for message_id in message_ids:
+            while True:
+                while scan.cursor > 0 and scan.existing_streak < self.EXISTING_STREAK_LIMIT:
                     if stop_requested():
                         self._release_for_shutdown(source_chat_id, lease_owner)
                         return
-                    classification, slave_uid, content = self._classify(
-                        by_id.get(message_id),
+                    renewed_scan = self.ingestion.claim_scan(
                         source_chat_id,
+                        lease_owner,
+                        self.lease_seconds,
                     )
-                    self.ingestion.persist_item(
-                        scan,
-                        source_message_id=message_id,
-                        classification=classification,
-                        slave_uid=slave_uid,
-                        message=content,
-                        lease_owner=lease_owner,
-                    )
-                    if scan.existing_streak >= self.EXISTING_STREAK_LIMIT or scan.cursor <= 0:
-                        self.ingestion.finish_scan(
+                    if renewed_scan is None:
+                        return
+                    scan = renewed_scan
+                    lower_bound = max(1, scan.cursor - self.BATCH_SIZE + 1)
+                    message_ids = list(range(scan.cursor, lower_bound - 1, -1))
+                    messages = await self.mtproto.get_channel_messages(source_channel, message_ids)
+                    if stop_requested():
+                        self._release_for_shutdown(source_chat_id, lease_owner)
+                        return
+                    by_id = {message_id: message for message in messages if (message_id := self._message_id(message)) is not None}
+                    for message_id in message_ids:
+                        if stop_requested():
+                            self._release_for_shutdown(source_chat_id, lease_owner)
+                            return
+                        classification, slave_uid, content = self._classify(
+                            by_id.get(message_id),
+                            source_chat_id,
+                        )
+                        self.ingestion.persist_item(
                             scan,
-                            status="complete",
+                            source_message_id=message_id,
+                            classification=classification,
+                            slave_uid=slave_uid,
+                            message=content,
                             lease_owner=lease_owner,
                         )
-                        self._log_event("complete", source_chat_id)
-                        return
-            if stop_requested():
-                self._release_for_shutdown(source_chat_id, lease_owner)
-                return
-            self.ingestion.finish_scan(scan, status="complete", lease_owner=lease_owner)
-            self._log_event("complete", source_chat_id)
+                        if scan.existing_streak >= self.EXISTING_STREAK_LIMIT or scan.cursor <= 0:
+                            break
+                if stop_requested():
+                    self._release_for_shutdown(source_chat_id, lease_owner)
+                    return
+                if not self.ingestion.complete_scan(scan, lease_owner=lease_owner):
+                    self._log_event("complete", source_chat_id)
+                    return
         except MsgLogIngestionLeaseLostError:
             self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id, extra={"event": "msglog_ingestion.lease_lost"})
         except MTProtoRetryableError as error:

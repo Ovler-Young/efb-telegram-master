@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from ehforwarderbot import utils
-from peewee import Model, PostgresqlDatabase, SqliteDatabase
+from peewee import AutoField, Model, PostgresqlDatabase, SqliteDatabase
 from playhouse.migrate import Operation, PostgresqlMigrator, SqliteMigrator, migrate
 
 from .chat_association_repository import ChatAssociationRepository
@@ -217,6 +217,15 @@ class DatabaseManager:
                     )
                     if column_name not in msglog_columns
                 )
+            if "msglogingestionscan" in table_names:
+                scan_columns = {column.name for column in current_database.get_columns("msglogingestionscan")}
+                scan_migrations = tuple(
+                    migrator.add_column("msglogingestionscan", column_name, field)
+                    for column_name, field in (("rescan_requested", MsgLogIngestionScan.rescan_requested),)
+                    if column_name not in scan_columns
+                )
+                if scan_migrations:
+                    migrate(*scan_migrations)
             if "slavechatinfo" in table_names:
                 slave_chat_info_columns = {column.name for column in current_database.get_columns("slavechatinfo")}
                 migration_steps.extend(
@@ -470,6 +479,19 @@ class DatabaseManager:
         return True
 
     @classmethod
+    def _reconcile_postgresql_import_sequences(cls, models: tuple[type[Model], ...]) -> None:
+        for model in models:
+            primary_key = model._meta.primary_key
+            if not isinstance(primary_key, AutoField):
+                continue
+            database.execute_sql(
+                f'SELECT setval(pg_get_serial_sequence({database.obj.param}, {database.obj.param}), '
+                f'COALESCE(MAX("{primary_key.column_name}"), 1), MAX("{primary_key.column_name}") IS NOT NULL) '
+                f'FROM "{model._meta.table_name}"',
+                (model._meta.table_name, primary_key.column_name),
+            )
+
+    @classmethod
     def _record_sqlite_import_provenance(cls, snapshot: _SQLiteImportSnapshot) -> None:
         placeholder = database.obj.param
         database.execute_sql(f'CREATE TABLE IF NOT EXISTS "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" (snapshot_identity TEXT PRIMARY KEY)')
@@ -582,6 +604,7 @@ class DatabaseManager:
                         rows = [dict(zip(projection.column_names, row)) for row in projection.rows]
                         for batch in chunked(rows, 500):
                             projection.model.insert_many(batch).execute()
+                    self._reconcile_postgresql_import_sequences(models)
                     self._record_sqlite_import_provenance(snapshot)
                     if not self._target_matches_sqlite_snapshot(snapshot):
                         raise RuntimeError("SQLite-to-PostgreSQL migration verification failed: target content differs from the source snapshot")

@@ -63,6 +63,10 @@ class FakeDatabase:
         scan.status = status
         scan.error = error
 
+    def complete_scan(self, scan, *, lease_owner):
+        scan.status = "complete"
+        return False
+
     def release_scan(self, source_chat_id, lease_owner):
         assert source_chat_id == 100
         self.scan.status = "pending"
@@ -161,6 +165,39 @@ def test_completed_unbound_topic_is_ingested_once_after_association_rescan():
 
     eligible = [entry for entry in db.persisted if entry[1] == "eligible"]
     assert [(message_id, slave_uid) for message_id, _classification, slave_uid, _content in eligible] == [(1, "tests.linked-slave")]
+
+
+def test_ingestion_repeats_the_current_lease_when_an_association_requests_a_rescan():
+    class RescanDatabase(FakeDatabase):
+        def __init__(self):
+            super().__init__(scan_boundary=1)
+            self.rescan_requested = False
+            self.completed_passes = 0
+
+        def persist_item(self, scan, **kwargs):
+            outcome = super().persist_item(scan, **kwargs)
+            if self.completed_passes == 0:
+                self.rescan_requested = True
+            return outcome
+
+        def complete_scan(self, scan, *, lease_owner):
+            self.completed_passes += 1
+            if self.rescan_requested:
+                self.rescan_requested = False
+                scan.cursor = scan.scan_boundary
+                scan.status = "running"
+                return True
+            scan.status = "complete"
+            return False
+
+    db = RescanDatabase()
+    mtproto = FakeMTProto({1: topic_message(1)}, scan_ceiling=1)
+
+    asyncio.run(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="remote-worker"))
+
+    assert [ids for _channel, ids in mtproto.calls] == [[1], [1]]
+    assert db.completed_passes == 2
+    assert db.scan.status == "complete"
 
 
 def test_ingestion_skips_are_neutral_and_existing_streak_completes_at_500():

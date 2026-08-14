@@ -5,7 +5,7 @@ from typing import Collection, Dict, Tuple
 
 from ehforwarderbot.message import MessageAttribute, MessageCommands
 from ehforwarderbot.types import ReactionName
-from peewee import SQL, AutoField, BlobField, CharField, DatabaseProxy, DateTimeField, IntegerField, Model, TextField
+from peewee import SQL, AutoField, BlobField, BooleanField, CharField, DatabaseProxy, DateTimeField, IntegerField, Model, TextField
 from typing_extensions import TypedDict
 
 from .utils import EFBChannelChatIDStr, TgChatMsgIDStr
@@ -118,6 +118,7 @@ class MsgLogIngestionScan(BaseModel):
     inserted_count = IntegerField(default=0)
     existing_count = IntegerField(default=0)
     skipped_count = IntegerField(default=0)
+    rescan_requested = BooleanField(default=False)
     lease_owner = TextField(null=True)
     lease_expires_at = DateTimeField(null=True)
     status = TextField(default="pending")

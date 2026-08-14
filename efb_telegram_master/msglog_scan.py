@@ -46,20 +46,11 @@ class MsgLogScanScheduler:
         with self._lock:
             if self._stopping:
                 return "stopping"
-            reset = self.ingestion.reset_completed_scan(source_chat_id)
-            active = source_chat_id in self._threads
-            resumable = None if reset or active else self.ingestion.get_resumable_scan(source_chat_id)
-            if not reset and not active and resumable is None:
+            scan_status = self.ingestion.request_association_rescan(source_chat_id)
+            if scan_status is None:
                 return "unchanged"
-            state = self._schedule_locked(
-                source_chat_id,
-                queue_after_active=reset or active,
-                reset_before_run=not reset and active,
-            )
-            if state != "already complete" or resumable is None:
-                return state
-            if not self.ingestion.reset_completed_scan(source_chat_id):
-                return state
+            if scan_status == "running":
+                return "queued"
             return self._schedule_locked(source_chat_id)
 
     def _schedule_locked(self, source_chat_id: int, *, queue_after_active: bool = False, reset_before_run: bool = False) -> str:
@@ -180,8 +171,6 @@ class MsgLogScanScheduler:
             await self.mtproto.connect()
         if self._stop_event.is_set():
             return
-        if reset_before_run:
-            self.ingestion.reset_completed_scan(source_chat_id)
         await MsgLogIngestionService(self.ingestion, self.chat_associations, self.mtproto).run(
             source_chat_id,
             lease_owner=lease_owner,

@@ -72,6 +72,32 @@ class MsgLogIngestionRepository(ObservedRepository):
                 == 1
             )
 
+    def request_association_rescan(self, source_chat_id: int) -> Optional[str]:
+        """Durably request a follow-up after a topic becomes eligible."""
+        now = datetime.datetime.now()
+        supports_for_update = bool(getattr(database.obj, "for_update", False))
+        transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
+        with transaction:
+            query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
+            scan = query.for_update().get_or_none() if supports_for_update else query.get_or_none()
+            if scan is None:
+                return None
+            if scan.status == "complete" and scan.lease_owner is None and scan.lease_expires_at is None:
+                scan.cursor = scan.scan_boundary
+                scan.existing_streak = 0
+                scan.scanned_count = 0
+                scan.inserted_count = 0
+                scan.existing_count = 0
+                scan.skipped_count = 0
+                scan.status = "pending"
+                scan.error = None
+                scan.rescan_requested = False
+            elif scan.status == "running":
+                scan.rescan_requested = True
+            scan.updated_at = now
+            scan.save()
+            return scan.status
+
     def persist_item(
         self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional[object] = None, lease_owner: str
     ) -> str:
@@ -117,10 +143,6 @@ class MsgLogIngestionRepository(ObservedRepository):
                     current.inserted_count += 1
                     current.existing_streak = 0
                     outcome = "inserted"
-            if current.cursor <= 0 or current.existing_streak >= 500:
-                current.status = "complete"
-                current.lease_owner = None
-                current.lease_expires_at = None
             current.updated_at = now
             current.save()
             scan.__data__.update(current.__data__)
@@ -143,6 +165,37 @@ class MsgLogIngestionRepository(ObservedRepository):
             if updated == 1 or current.status == "complete":
                 scan.__data__.update(current.__data__)
             return updated == 1
+
+    def complete_scan(self, scan: MsgLogIngestionScan, *, lease_owner: str) -> bool:
+        """Complete the current pass and retain its lease for a requested rescan."""
+        now = datetime.datetime.now()
+        supports_for_update = bool(getattr(database.obj, "for_update", False))
+        transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
+        with transaction:
+            query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
+            current = query.for_update().get() if supports_for_update else query.get()
+            if current.lease_owner != lease_owner or current.lease_expires_at is None or current.lease_expires_at <= now:
+                return False
+            if current.rescan_requested:
+                current.cursor = current.scan_boundary
+                current.existing_streak = 0
+                current.scanned_count = 0
+                current.inserted_count = 0
+                current.existing_count = 0
+                current.skipped_count = 0
+                current.rescan_requested = False
+                current.error = None
+                current.updated_at = now
+                current.save()
+                scan.__data__.update(current.__data__)
+                return True
+            current.status = "complete"
+            current.lease_owner = None
+            current.lease_expires_at = None
+            current.updated_at = now
+            current.save()
+            scan.__data__.update(current.__data__)
+            return False
 
     def release_scan(self, source_chat_id: int, lease_owner: str) -> bool:
         """Make a shutdown-interrupted scan resumable without changing its cursor."""
