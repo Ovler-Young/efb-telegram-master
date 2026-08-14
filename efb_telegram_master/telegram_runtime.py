@@ -62,7 +62,6 @@ def _webhook_start_arguments(config: Mapping[str, object]) -> _WebhookStartArgum
         ("listen", "port", "url_path", "cert", "key", "bootstrap_retries", "webhook_url", "allowed_updates", "ip_address", "max_connections", "secret_token", "unix")
     ):
         raise ValueError(f"webhook.start_webhook contains unsupported option(s): {', '.join(sorted(unexpected))}")
-
     for name in ("listen", "url_path"):
         value = config.get(name)
         if value is not None:
@@ -75,7 +74,7 @@ def _webhook_start_arguments(config: Mapping[str, object]) -> _WebhookStartArgum
     for name in ("port", "bootstrap_retries", "max_connections"):
         value = config.get(name)
         if value is not None:
-            if not isinstance(value, int):
+            if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(f"webhook.start_webhook.{name} must be an integer")
             if name == "port":
                 arguments["port"] = value
@@ -378,7 +377,8 @@ def build_telegram_polling_runtime(
         identity["base_file_url"] = base_file_url
     async_bot = telegram.Bot(**identity)
     async_runtime = AsyncTelegramRuntime(logger)
-    webhook = config.get("webhook")
+    if (webhook := config.get("webhook")) is not None and not isinstance(webhook, Mapping):
+        raise ValueError("webhook must be a mapping")
     runtime = TelegramPollingRuntime(
         logger,
         None,
@@ -386,7 +386,7 @@ def build_telegram_polling_runtime(
         async_runtime,
         on_started,
         on_stopped,
-        webhook if isinstance(webhook, Mapping) else None,
+        webhook,
     )
 
     async def post_init(application: Application) -> None:
