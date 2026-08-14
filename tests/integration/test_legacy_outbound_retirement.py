@@ -7,7 +7,7 @@ from peewee import PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, TopicAssoc, database
 from tests.support.legacy_outbound_schema import legacy_outbound_models
 
 
@@ -193,6 +193,85 @@ def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_arc
         admin_db.close()
 
     assert not source_path.with_name("tgdata.db-wal").exists()
+
+
+@pytest.mark.integration
+def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_postgres_config, tmp_path, monkeypatch):
+    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
+    admin_db.connect()
+    admin_db.connection().autocommit = True
+    database_name = None
+    manager = None
+    original_database = database.obj
+    source_path = tmp_path / "tgdata.db"
+    migrated_path = source_path.with_suffix(".db.migrated")
+    source_db = SqliteDatabase(source_path)
+    models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        source_db.connect()
+        source_db.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
+        source_db.execute_sql(
+            "CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
+            "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
+            "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
+        )
+        source_db.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
+        source_db.execute_sql(
+            "INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')"
+        )
+        source_db.execute_sql(
+            "INSERT INTO historymigrationentry VALUES "
+            "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(2, 'slave-a', '100', NULL, '10.2', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(3, 'slave-a', '100', '200', '10.3', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(4, 'slave-a', '100', '200', '10.4', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP)"
+        )
+        database_name, _target = _new_database(admin_db, integration_postgres_config)
+        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
+
+        manager = DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-import-canonical", config=config))
+
+        assert [(row.master_uid, row.slave_uid) for row in ChatAssoc.select()] == [("master-new", "slave-a")]
+        assert [(row.topic_chat_id, row.message_thread_id, row.slave_uid) for row in TopicAssoc.select()] == [("101", "201", "slave-b")]
+        assert [row.source_master_msg_id for row in HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id)] == ["10.2", "10.4"]
+        assert {
+            DatabaseManager._CHAT_ASSOC_SLAVE_INDEX,
+            DatabaseManager._TOPIC_ASSOC_SLAVE_INDEX,
+            DatabaseManager._TOPIC_ASSOC_TOPIC_THREAD_INDEX,
+            DatabaseManager._HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX,
+            DatabaseManager._HISTORY_TARGET_POSITION_WITH_THREAD_INDEX,
+        }.issubset(
+            {index.name for index in database.get_indexes("chatassoc")}
+            | {index.name for index in database.get_indexes("topicassoc")}
+            | {index.name for index in database.get_indexes("historymigrationentry")}
+        )
+        provenance = database.execute_sql('SELECT snapshot_identity FROM "sqliteimportprovenance"').fetchone()
+        assert provenance is not None
+        assert not source_path.exists()
+        archive = SqliteDatabase(migrated_path)
+        archive.connect()
+        try:
+            assert archive.execute_sql("SELECT COUNT(*) FROM chatassoc").fetchone() == (2,)
+            assert archive.execute_sql("SELECT COUNT(*) FROM topicassoc").fetchone() == (3,)
+            assert archive.execute_sql("SELECT COUNT(*) FROM historymigrationentry").fetchone() == (4,)
+            with archive.bind_ctx(models):
+                snapshot = DatabaseManager._sqlite_source_snapshot(archive, models)
+            assert provenance == (snapshot.identity,)
+        finally:
+            archive.close()
+    finally:
+        if not source_db.is_closed():
+            source_db.close()
+        if manager is not None:
+            manager.stop_worker()
+        database.initialize(original_database)
+        if database_name is not None:
+            _drop_database(admin_db, database_name)
+        admin_db.close()
 
 
 

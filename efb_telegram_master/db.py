@@ -259,19 +259,60 @@ class DatabaseManager:
 
     @staticmethod
     def _deduplicate_by_key(model: type[Model], fields: tuple) -> None:
-        seen = set()
-        duplicate_ids = []
         primary_key = model._meta.primary_key
         if primary_key is False:
             raise ValueError(f"{model.__name__} has no primary key")
-        for row in model.select(primary_key, *fields).order_by(primary_key.desc()):
-            key = tuple(getattr(row, field.name) for field in fields)
-            if key in seen:
-                duplicate_ids.append(getattr(row, primary_key.name))
-            else:
-                seen.add(key)
+        candidate_ids = {getattr(row, primary_key.name) for row in model.select(primary_key)}
+        duplicate_ids = candidate_ids - DatabaseManager._newest_primary_key_values(model, fields, candidate_ids)
         if duplicate_ids:
             model.delete().where(primary_key.in_(duplicate_ids)).execute()
+
+    @staticmethod
+    def _historic_identity_keys(model: type[Model]) -> tuple[tuple, ...]:
+        if model is ChatAssoc:
+            return ((ChatAssoc.slave_uid,),)
+        if model is TopicAssoc:
+            return (
+                (TopicAssoc.slave_uid,),
+                (TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id),
+            )
+        if model is HistoryMigrationEntry:
+            return (
+                (
+                    HistoryMigrationEntry.slave_chat_id,
+                    HistoryMigrationEntry.target_chat_id,
+                    HistoryMigrationEntry.message_thread_id,
+                    HistoryMigrationEntry.position,
+                ),
+            )
+        return ()
+
+    @staticmethod
+    def _newest_primary_key_values(model: type[Model], fields: tuple, candidates: set[object]) -> set[object]:
+        primary_key = model._meta.primary_key
+        if primary_key is False:
+            raise ValueError(f"{model.__name__} has no primary key")
+        seen = set()
+        canonical_ids = set()
+        for row in model.select(primary_key, *fields).where(primary_key.in_(candidates)).order_by(primary_key.desc()):
+            key = tuple(getattr(row, field.name) for field in fields)
+            if key not in seen:
+                seen.add(key)
+                canonical_ids.add(getattr(row, primary_key.name))
+        return canonical_ids
+
+    @classmethod
+    def _canonical_historic_primary_key_values(cls, model: type[Model]) -> set[object] | None:
+        identity_keys = cls._historic_identity_keys(model)
+        if not identity_keys:
+            return None
+        primary_key = model._meta.primary_key
+        if primary_key is False:
+            raise ValueError(f"{model.__name__} has no primary key")
+        canonical_ids = {getattr(row, primary_key.name) for row in model.select(primary_key)}
+        for fields in identity_keys:
+            canonical_ids = cls._newest_primary_key_values(model, fields, canonical_ids)
+        return canonical_ids
 
     @staticmethod
     def _deduplicate_history_positions() -> None:
@@ -348,7 +389,14 @@ class DatabaseManager:
                 source_columns = {column.name for column in source_database.get_columns(model._meta.table_name)}
                 fields = tuple(field for field in model._meta.sorted_fields if field.column_name in source_columns)
                 column_names = tuple(field.column_name for field in fields)
-                rows = tuple(DatabaseManager._sqlite_dict_row_values(row, column_names) for row in model.select(*fields).dicts())
+                canonical_primary_keys = cls._canonical_historic_primary_key_values(model)
+                primary_key = model._meta.primary_key
+                query = model.select(*fields)
+                if canonical_primary_keys is not None:
+                    if primary_key is False:
+                        raise ValueError(f"{model.__name__} has no primary key")
+                    query = query.where(primary_key.in_(canonical_primary_keys))
+                rows = tuple(DatabaseManager._sqlite_dict_row_values(row, column_names) for row in query.dicts())
             projections.append(_SQLiteSourceProjection(model, column_names, rows))
             serialized_projections.append(
                 {

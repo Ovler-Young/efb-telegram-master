@@ -161,6 +161,48 @@ def test_association_schema_upgrade_deduplicates_rows_and_enforces_canonical_ide
         database.initialize(original_database)
 
 
+def test_sqlite_import_snapshot_canonicalizes_legacy_historic_identities_without_mutating_source(tmp_path):
+    source_db = SqliteDatabase(tmp_path / "tgdata.db")
+    models = (ChatAssoc, TopicAssoc, HistoryMigrationEntry)
+    source_db.connect()
+    try:
+        source_db.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
+        source_db.execute_sql(
+            "CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)"
+        )
+        source_db.execute_sql(
+            "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
+            "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
+            "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
+        )
+        source_db.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
+        source_db.execute_sql(
+            "INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')"
+        )
+        source_db.execute_sql(
+            "INSERT INTO historymigrationentry VALUES "
+            "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(2, 'slave-a', '100', NULL, '10.2', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(3, 'slave-a', '100', '200', '10.3', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(4, 'slave-a', '100', '200', '10.4', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP)"
+        )
+        with source_db.bind_ctx(models):
+            snapshot = DatabaseManager._sqlite_source_snapshot(source_db, models)
+
+        rows_by_model = {
+            projection.model: [dict(zip(projection.column_names, row)) for row in projection.rows]
+            for projection in snapshot.projections
+        }
+        assert rows_by_model[ChatAssoc] == [{"id": 2, "master_uid": "master-new", "slave_uid": "slave-a"}]
+        assert rows_by_model[TopicAssoc] == [{"id": 3, "topic_chat_id": "101", "message_thread_id": "201", "slave_uid": "slave-b"}]
+        assert [row["source_master_msg_id"] for row in rows_by_model[HistoryMigrationEntry]] == ["10.2", "10.4"]
+        assert source_db.execute_sql("SELECT COUNT(*) FROM chatassoc").fetchone() == (2,)
+        assert source_db.execute_sql("SELECT COUNT(*) FROM topicassoc").fetchone() == (3,)
+        assert source_db.execute_sql("SELECT COUNT(*) FROM historymigrationentry").fetchone() == (4,)
+    finally:
+        source_db.close()
+
+
 def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):
     original_database = database.obj
     test_database = SqliteDatabase(tmp_path / "association.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
