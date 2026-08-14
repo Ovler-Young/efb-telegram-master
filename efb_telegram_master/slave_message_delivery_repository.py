@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta
 
 from peewee import IntegrityError
 
@@ -9,15 +10,36 @@ from .utils import EFBChannelChatIDStr
 
 class SlaveMessageDeliveryRepository(ObservedRepository):
     logger = logging.getLogger(__name__)
+    LEASE_SECONDS = 300
 
     @observe_database_method("claim_slave_message_delivery")
-    def claim(self, slave_origin_uid: EFBChannelChatIDStr, slave_message_id: str) -> bool:
+    def claim(self, slave_origin_uid: EFBChannelChatIDStr, slave_message_id: str, lease_seconds: int = LEASE_SECONDS) -> bool:
+        now = datetime.now()
+        lease_expires_at = now + timedelta(seconds=lease_seconds)
         try:
-            SlaveMessageDelivery.create(slave_origin_uid=slave_origin_uid, slave_message_id=slave_message_id)
+            SlaveMessageDelivery.create(slave_origin_uid=slave_origin_uid, slave_message_id=slave_message_id, state="pending", lease_expires_at=lease_expires_at)
         except IntegrityError:
-            return False
+            return (
+                SlaveMessageDelivery.update(state="pending", lease_expires_at=lease_expires_at)
+                .where(
+                    (SlaveMessageDelivery.slave_origin_uid == slave_origin_uid)
+                    & (SlaveMessageDelivery.slave_message_id == slave_message_id)
+                    & (SlaveMessageDelivery.state == "pending")
+                    & (SlaveMessageDelivery.lease_expires_at <= now)
+                )
+                .execute()
+                == 1
+            )
         return True
+
+    @observe_database_method("complete_slave_message_delivery")
+    def complete(self, slave_origin_uid: EFBChannelChatIDStr, slave_message_id: str) -> None:
+        SlaveMessageDelivery.update(state="delivered", lease_expires_at=None).where(
+            (SlaveMessageDelivery.slave_origin_uid == slave_origin_uid) & (SlaveMessageDelivery.slave_message_id == slave_message_id)
+        ).execute()
 
     @observe_database_method("release_slave_message_delivery")
     def release(self, slave_origin_uid: EFBChannelChatIDStr, slave_message_id: str) -> None:
-        SlaveMessageDelivery.delete().where((SlaveMessageDelivery.slave_origin_uid == slave_origin_uid) & (SlaveMessageDelivery.slave_message_id == slave_message_id)).execute()
+        SlaveMessageDelivery.delete().where(
+            (SlaveMessageDelivery.slave_origin_uid == slave_origin_uid) & (SlaveMessageDelivery.slave_message_id == slave_message_id) & (SlaveMessageDelivery.state == "pending")
+        ).execute()
