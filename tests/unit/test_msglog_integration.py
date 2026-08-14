@@ -199,6 +199,7 @@ def test_association_reschedule_does_not_start_a_new_scan():
 
     ingestion = SimpleNamespace(
         reset_completed_scan=Mock(return_value=False),
+        get_resumable_scan=Mock(return_value=None),
         get_or_create_scan=Mock(),
         release_scan=Mock(),
     )
@@ -212,7 +213,35 @@ def test_association_reschedule_does_not_start_a_new_scan():
     try:
         assert scheduler.schedule_for_association(100) == "unchanged"
         ingestion.reset_completed_scan.assert_called_once_with(100)
+        ingestion.get_resumable_scan.assert_called_once_with(100)
         ingestion.get_or_create_scan.assert_not_called()
+    finally:
+        assert scheduler.stop(1) == ()
+
+
+def test_association_reschedule_starts_an_existing_retryable_scan():
+    class Runtime:
+        def call(self, coroutine, timeout=None):
+            coroutine.close()
+
+    retryable_scan = SimpleNamespace(status="retryable-error", scanned_count=1)
+    ingestion = SimpleNamespace(
+        reset_completed_scan=Mock(return_value=False),
+        get_resumable_scan=Mock(return_value=retryable_scan),
+        get_or_create_scan=Mock(return_value=retryable_scan),
+        release_scan=Mock(),
+    )
+    scheduler = MsgLogScanScheduler(
+        SimpleNamespace(async_runtime=Runtime()),
+        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)),
+        ingestion,
+        Mock(),
+        Mock(),
+    )
+    try:
+        assert scheduler.schedule_for_association(100) == "resumed"
+        ingestion.get_resumable_scan.assert_called_once_with(100)
+        ingestion.get_or_create_scan.assert_called_once_with(100, 10)
     finally:
         assert scheduler.stop(1) == ()
 
@@ -248,6 +277,7 @@ def test_association_during_active_scan_queues_one_reset_follow_up(monkeypatch):
     monkeypatch.setattr(MsgLogIngestionService, "run", run)
     ingestion = SimpleNamespace(
         get_or_create_scan=Mock(return_value=scan),
+        get_resumable_scan=Mock(return_value=None),
         reset_completed_scan=Mock(side_effect=reset_completed_scan),
         release_scan=Mock(),
     )

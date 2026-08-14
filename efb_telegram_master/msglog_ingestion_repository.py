@@ -155,6 +155,16 @@ class MsgLogIngestionRepository(ObservedRepository):
                 == 1
             )
 
+    def get_resumable_scan(self, source_chat_id: int) -> Optional[MsgLogIngestionScan]:
+        now = datetime.datetime.now()
+        return MsgLogIngestionScan.get_or_none(
+            (MsgLogIngestionScan.source_chat_id == str(source_chat_id))
+            & (
+                MsgLogIngestionScan.status.in_(("pending", "retryable-error"))
+                | ((MsgLogIngestionScan.status == "running") & (MsgLogIngestionScan.lease_expires_at.is_null(True) | (MsgLogIngestionScan.lease_expires_at <= now)))
+            )
+        )
+
     @observe_database_method("get_resumable_msglog_ingestion_scans")
     def get_resumable_scans(self) -> List[MsgLogIngestionScan]:
         now = datetime.datetime.now()
