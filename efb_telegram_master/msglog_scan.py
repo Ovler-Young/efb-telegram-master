@@ -47,10 +47,13 @@ class MsgLogScanScheduler:
             if self._stopping:
                 return "stopping"
             reset = self.ingestion.reset_completed_scan(source_chat_id)
+            active = source_chat_id in self._threads
+            if not reset and not active:
+                return "unchanged"
             return self._schedule_locked(
                 source_chat_id,
-                queue_after_active=reset or source_chat_id in self._threads,
-                reset_before_run=not reset and source_chat_id in self._threads,
+                queue_after_active=reset or active,
+                reset_before_run=not reset and active,
             )
 
     def _schedule_locked(self, source_chat_id: int, *, queue_after_active: bool = False, reset_before_run: bool = False) -> str:
