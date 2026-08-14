@@ -26,12 +26,7 @@ from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncB
 from tests.thread_diagnostics import live_non_daemon_threads
 
 
-def _runtime(
-    *,
-    application: object | None = None,
-    async_runtime: AsyncTelegramRuntime | None = None,
-    webhook: dict[str, object] | None = None,
-) -> TelegramPollingRuntime:
+def _runtime(*, application: object | None = None, async_runtime: AsyncTelegramRuntime | None = None) -> TelegramPollingRuntime:
     return TelegramPollingRuntime(
         Mock(),
         application,
@@ -39,7 +34,6 @@ def _runtime(
         async_runtime or AsyncTelegramRuntime(Mock()),
         AsyncMock(),
         AsyncMock(),
-        webhook,
     )
 
 
@@ -311,37 +305,6 @@ def test_runtime_stop_timeout_can_be_retried() -> None:
     async_runtime.shutdown.assert_not_called()
     runtime._shutdown_complete.set()
     runtime.stop(time.monotonic() + 0.1)
-    async_runtime.shutdown.assert_called_once_with(ANY)
-
-
-def test_webhook_stop_waits_for_blocked_ptb_teardown_before_shutting_down_runtime() -> None:
-    async_runtime = Mock()
-    teardown_started = threading.Event()
-    release_teardown = threading.Event()
-    application = Mock()
-
-    def run_webhook(**_kwargs: object) -> None:
-        teardown_started.set()
-        release_teardown.wait()
-
-    application.run_webhook.side_effect = run_webhook
-    runtime = _runtime(application=application, async_runtime=async_runtime, webhook={"start_webhook": {}})
-    poll_thread = threading.Thread(target=runtime.poll)
-    poll_thread.start()
-    try:
-        assert teardown_started.wait(timeout=1)
-
-        with pytest.raises(TelegramRuntimeShutdownTimeout):
-            runtime.stop(time.monotonic() + 0.01)
-
-        async_runtime.shutdown.assert_not_called()
-    finally:
-        release_teardown.set()
-        poll_thread.join(timeout=1)
-    assert not poll_thread.is_alive()
-
-    runtime.stop(time.monotonic() + 0.1)
-
     async_runtime.shutdown.assert_called_once_with(ANY)
 
 
