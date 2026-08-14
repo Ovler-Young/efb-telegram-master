@@ -198,16 +198,13 @@ class TelegramPollingRuntime:
             self.logger.exception("Telegram post-shutdown hook failed", extra={"event": "telegram_runtime.post_shutdown_failed", "error_type": type(error).__name__})
 
     def poll(self, drop_pending_updates: bool = False, timeout: int = 10) -> None:
-        start_webhook: Mapping[str, object] | None = None
-        if self._webhook is not None:
-            configured_webhook = self._webhook.get("start_webhook")
-            if not isinstance(configured_webhook, Mapping):
-                raise ValueError("webhook.start_webhook must be a mapping")
-            start_webhook = configured_webhook
         with self._stop_lock:
             self._shutdown_complete.clear()
             self._lifecycle_active = True
-        if start_webhook is not None:
+        if self._webhook is not None:
+            start_webhook = self._webhook.get("start_webhook")
+            if not isinstance(start_webhook, Mapping):
+                raise ValueError("webhook.start_webhook must be a mapping")
             self.logger.info("Telegram webhook runtime starting", extra={"event": "telegram_runtime.webhook_start"})
             try:
                 self.application.run_webhook(

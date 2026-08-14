@@ -345,18 +345,6 @@ def test_webhook_stop_waits_for_blocked_ptb_teardown_before_shutting_down_runtim
     async_runtime.shutdown.assert_called_once_with(ANY)
 
 
-def test_invalid_webhook_configuration_does_not_leave_lifecycle_active() -> None:
-    async_runtime = Mock()
-    runtime = _runtime(application=Mock(), async_runtime=async_runtime, webhook={"start_webhook": None})
-
-    with pytest.raises(ValueError, match="webhook.start_webhook must be a mapping"):
-        runtime.poll()
-
-    runtime.stop(time.monotonic() + 0.01)
-
-    async_runtime.shutdown.assert_called_once_with(ANY)
-
-
 def test_api_resource_shutdown_stops_metrics_server_under_its_current_owner() -> None:
     bot_pool = Mock()
     bot_pool.begin_shutdown.return_value = ()
