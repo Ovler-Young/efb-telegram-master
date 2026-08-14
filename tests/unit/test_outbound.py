@@ -546,6 +546,9 @@ def test_queue_emits_bounded_outcome_saturation_and_latency_metrics() -> None:
         queue.stop()
 
     rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_outcomes_total{operation="send_message",outcome="rejected"} 1.0' in rendered
+    assert 'etm_outbound_latency_seconds_count{operation="send_message",outcome="rejected"} 1.0' in rendered
+    assert 'etm_outbound_latency_seconds_sum{operation="send_message",outcome="rejected"} 0.0' in rendered
     assert 'etm_outbound_outcomes_total{operation="send_message",outcome="success"} 1.0' in rendered
     assert 'etm_outbound_saturation_total{reason="pending_capacity"} 1.0' in rendered
     assert 'etm_outbound_outcomes_total{operation="send_message",outcome="failure"} 1.0' in rendered

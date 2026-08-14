@@ -149,6 +149,7 @@ class OutboundQueue:
                 raise SchedulerStoppedError("Outbound queue stopped.")
             if len(self._pending) >= self._max_pending:
                 cleanup_upload_paths(request.cleanup)
+                self._record_rejected(request.operation)
                 self._record_saturation("pending_capacity")
                 raise QueueEnqueueError("Outbound queue pending capacity reached.")
             pending = _PendingCall(_call_with_chat_id(call, self._resolve_chat_id_locked(call.telegram_chat_id)), waiter)
@@ -345,7 +346,7 @@ class OutboundQueue:
                         self._requeue_or_stop_locked(pending)
                 except telegram.error.ChatMigrated as error:
                     if pending.phase is _CallPhase.PRIMARY:
-                        self._finish_terminal_error_locked(pending, submitted.selection, error)
+                        pending.waiter.set_exception(error)
                     elif pending.attachment_migrated:
                         self._finish_terminal_error_locked(pending, submitted.selection, QueueError("Attachment chat migrated repeatedly."))
                     else:
@@ -443,6 +444,10 @@ class OutboundQueue:
     def _record_retry(self, call: QueuedCall, reason: str) -> None:
         if self._metrics is not None:
             self._metrics.record_outbound_retry(call.operation, reason)
+
+    def _record_rejected(self, operation: str) -> None:
+        if self._metrics is not None:
+            self._metrics.record_outbound_outcome(operation, "rejected", 0.0)
 
     def _record_saturation(self, reason: str) -> None:
         if self._metrics is not None:
