@@ -210,7 +210,8 @@ def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):
     test_database.connect()
     repository = ChatAssociationRepository()
     try:
-        test_database.create_tables([ChatAssoc, TopicAssoc])
+        test_database.create_tables([ChatAssoc, TopicAssoc, HistoryMigrationEntry])
+        HistoryMigrationEntry.create(slave_chat_id="slave-a", target_chat_id="100", source_master_msg_id="100.1", position=0)
 
         def replace(index):
             test_database.connect(reuse_if_open=True)
@@ -226,6 +227,7 @@ def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):
         assert ChatAssoc.select().where(ChatAssoc.slave_uid == "slave-a").count() == 1
         assert TopicAssoc.select().where(TopicAssoc.slave_uid == "slave-a").count() == 1
         assert TopicAssoc.select().count() == 1
+        assert HistoryMigrationEntry.select().where(HistoryMigrationEntry.slave_chat_id == "slave-a").count() == 0
     finally:
         if not test_database.is_closed():
             test_database.close()
@@ -1103,9 +1105,12 @@ def test_reaction_alternate_db_failures_preserve_then_update_canonical_row():
                 sender_bot_id="700",
                 pickle=pickle.dumps({"reactions": {"OLD": ("tests.mocks.slave reactor",)}}),
             )
-            with patch.object(MsgLog, "save", side_effect=RuntimeError("db failed")):
-                with pytest.raises(RuntimeError, match="db failed"):
-                    manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=failed_id), old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="800")
+            with patch.object(MsgLog, "insert", wraps=MsgLog.insert) as insert:
+                with patch("peewee.ModelInsert.execute", side_effect=RuntimeError("db failed")) as execute:
+                    with pytest.raises(RuntimeError, match="db failed"):
+                        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=failed_id), old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="800")
+            assert insert.call_count == 1
+            assert execute.call_count == 1
             row = MsgLog.get()
             assert (row.master_msg_id_alt, row.sender_bot_id, pickle.loads(bytes(row.pickle))["reactions"]) == (initial_alt, "700", {"OLD": ("tests.mocks.slave reactor",)})
 

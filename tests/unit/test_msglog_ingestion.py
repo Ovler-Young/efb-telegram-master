@@ -5,8 +5,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from efb_telegram_master.models import MsgLogIngestionLeaseLostError
+from peewee import SqliteDatabase
+
+from efb_telegram_master.models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
+from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.mtproto import MTProtoRetryableError
 
 
@@ -138,59 +141,49 @@ def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
     assert db.scan.status == "complete"
 
 
-def test_completed_unbound_topic_is_ingested_once_after_association_rescan():
-    db = FakeDatabase(scan_boundary=1)
-    db.chat_associations.associations.clear()
-    mtproto = FakeMTProto({1: topic_message(1)}, scan_ceiling=1)
-    service = MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto)
-
-    asyncio.run(service.run(100, lease_owner="worker-a"))
-
-    assert db.scan.status == "complete"
-    assert db.persisted == [(1, "unbound-topic", None, None)]
-
-    db.chat_associations.associations[10] = "tests.linked-slave"
-    db.scan.cursor = db.scan.scan_boundary
-    db.scan.existing_streak = 0
-    db.scan.status = "pending"
-    db.scan.error = None
-    asyncio.run(service.run(100, lease_owner="worker-b"))
-
-    eligible = [entry for entry in db.persisted if entry[1] == "eligible"]
-    assert [(message_id, slave_uid) for message_id, _classification, slave_uid, _content in eligible] == [(1, "tests.linked-slave")]
-
-
-def test_ingestion_repeats_the_current_lease_when_an_association_requests_a_rescan():
-    class RescanDatabase(FakeDatabase):
+def test_association_rescan_restarts_completed_scan_and_repeats_active_lease():
+    class Associations:
         def __init__(self):
-            super().__init__(scan_boundary=1)
-            self.rescan_requested = False
-            self.completed_passes = 0
+            self.slave_uid = None
+            self.requested_during_active_lease = False
 
-        def persist_item(self, scan, **kwargs):
-            outcome = super().persist_item(scan, **kwargs)
-            if self.completed_passes == 0:
-                self.rescan_requested = True
-            return outcome
+        def get_topic_assoc_slave_uid(self, source_chat_id, topic_id):
+            assert (source_chat_id, topic_id) == (100, 10)
+            if self.slave_uid is not None and not self.requested_during_active_lease:
+                self.requested_during_active_lease = True
+                assert ingestion.request_association_rescan(100) == "running"
+            return self.slave_uid
 
-        def complete_scan(self, scan, *, lease_owner):
-            self.completed_passes += 1
-            if self.rescan_requested:
-                self.rescan_requested = False
-                scan.cursor = scan.scan_boundary
-                scan.status = "running"
-                return True
-            scan.status = "complete"
-            return False
-
-    db = RescanDatabase()
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    ingestion = MsgLogIngestionRepository("tests.master")
+    associations = Associations()
     mtproto = FakeMTProto({1: topic_message(1)}, scan_ceiling=1)
+    service = MsgLogIngestionService(ingestion, associations, mtproto)
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        asyncio.run(service.run(100, lease_owner="worker-a"))
 
-    asyncio.run(MsgLogIngestionService(db, db.chat_associations, mtproto).run(100, lease_owner="remote-worker"))
+        completed = MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == "100")
+        assert completed.status == "complete"
+        assert MsgLog.select().count() == 0
 
-    assert [ids for _channel, ids in mtproto.calls] == [[1], [1]]
-    assert db.completed_passes == 2
-    assert db.scan.status == "complete"
+        associations.slave_uid = "tests.slave target"
+        assert ingestion.request_association_rescan(100) == "pending"
+        asyncio.run(service.run(100, lease_owner="worker-b"))
+
+        scan = MsgLogIngestionScan.get_by_id(completed.id)
+        row = MsgLog.get_by_id("100.1")
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+    assert associations.requested_during_active_lease
+    assert [ids for _channel, ids in mtproto.calls] == [[1], [1], [1]]
+    assert (scan.status, scan.lease_owner, scan.rescan_requested) == ("complete", None, False)
+    assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
 
 
 def test_ingestion_skips_are_neutral_and_existing_streak_completes_at_500():
