@@ -965,15 +965,47 @@ def test_slave_message_delivery_claim_persists_across_repository_instances(tmp_p
         test_db.connect()
         try:
             test_db.create_tables([SlaveMessageDelivery])
-            assert first.claim("tests.slave chat", "message")
-            assert not restarted.claim("tests.slave chat", "message")
-            restarted.complete("tests.slave chat", "message")
-            assert not first.claim("tests.slave chat", "message", lease_seconds=0)
-            restarted.release("tests.slave chat", "message")
-            assert first.claim("tests.slave chat", "retry", lease_seconds=-1)
-            assert restarted.claim("tests.slave chat", "retry")
+            first_token = first.claim("tests.slave chat", "message")
+            assert first_token is not None
+            assert restarted.claim("tests.slave chat", "message") is None
+            assert restarted.complete("tests.slave chat", "message", first_token)
+            assert first.claim("tests.slave chat", "message", lease_seconds=0) is None
+
+            stale_token = first.claim("tests.slave chat", "retry", lease_seconds=-1)
+            assert stale_token is not None
+            replacement_token = restarted.claim("tests.slave chat", "retry")
+            assert replacement_token is not None and replacement_token != stale_token
+            assert not first.complete("tests.slave chat", "retry", stale_token)
+            assert not first.release("tests.slave chat", "retry", stale_token)
+            assert restarted.complete("tests.slave chat", "retry", replacement_token)
         finally:
             test_db.close()
+
+
+def test_slave_message_delivery_schema_upgrade_adds_owner_token(tmp_path, monkeypatch):
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        raw_db.execute_sql(
+            "CREATE TABLE slavemessagedelivery (id INTEGER PRIMARY KEY, slave_origin_uid TEXT NOT NULL, slave_message_id TEXT NOT NULL, "
+            "state TEXT NOT NULL DEFAULT 'pending', lease_expires_at DATETIME, UNIQUE(slave_origin_uid, slave_message_id))"
+        )
+        raw_db.execute_sql("INSERT INTO slavemessagedelivery (slave_origin_uid, slave_message_id, state) VALUES ('tests.slave chat', 'message', 'delivered')")
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.delivery-owner-token-upgrade", config={}))
+    try:
+        row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "message"))
+        assert row.state == "delivered"
+        assert row.owner_token is None
+        assert "owner_token" in {column.name for column in database.get_columns("slavemessagedelivery")}
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
 
 
 def test_message_reconstructor_restores_sender_bot_id(channel, slave):

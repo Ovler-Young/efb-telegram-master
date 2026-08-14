@@ -34,7 +34,7 @@ class MsgLogScanScheduler:
         self._threads: dict[int, threading.Thread] = {}
         self._retiring_threads: set[threading.Thread] = set()
         self._owners: dict[int, str] = {}
-        self._pending: deque[tuple[int, str, bool]] = deque()
+        self._pending: deque[tuple[int, str]] = deque()
         self._pending_source_chat_ids: set[int] = set()
 
     def schedule(self, source_chat_id: int) -> str:
@@ -47,13 +47,9 @@ class MsgLogScanScheduler:
             if self._stopping:
                 return "stopping"
             reset = self.ingestion.reset_completed_scan(source_chat_id)
-            return self._schedule_locked(
-                source_chat_id,
-                queue_after_active=reset or source_chat_id in self._threads,
-                reset_before_run=not reset and source_chat_id in self._threads,
-            )
+            return self._schedule_locked(source_chat_id, queue_after_active=reset)
 
-    def _schedule_locked(self, source_chat_id: int, *, queue_after_active: bool = False, reset_before_run: bool = False) -> str:
+    def _schedule_locked(self, source_chat_id: int, *, queue_after_active: bool = False) -> str:
         if self._stopping:
             return "stopping"
         self._reap_threads_locked()
@@ -64,7 +60,7 @@ class MsgLogScanScheduler:
         if source_chat_id in self._threads:
             if not queue_after_active:
                 return "already running"
-            self._enqueue_locked(source_chat_id, reset_before_run=reset_before_run)
+            self._enqueue_locked(source_chat_id)
             return "queued"
         scan = self.ingestion.get_or_create_scan(source_chat_id, self.mtproto.config.scan_ceiling)
         if scan.status == "complete":
@@ -75,8 +71,8 @@ class MsgLogScanScheduler:
             return "queued"
         return "resumed" if scan.scanned_count else "started"
 
-    def _enqueue_locked(self, source_chat_id: int, *, reset_before_run: bool = False) -> None:
-        self._pending.append((source_chat_id, str(uuid.uuid4()), reset_before_run))
+    def _enqueue_locked(self, source_chat_id: int) -> None:
+        self._pending.append((source_chat_id, str(uuid.uuid4())))
         self._pending_source_chat_ids.add(source_chat_id)
         self._pending_available.notify()
         self._admit_workers_locked()
@@ -106,9 +102,9 @@ class MsgLogScanScheduler:
             return (MsgLogScanShutdownTimeout(f"MsgLog ingestion workers did not stop within {join_timeout:g}s (groups: {', '.join(alive)})."),)
         return ()
 
-    def _run(self, source_chat_id: int, lease_owner: str, *, reset_before_run: bool = False) -> None:
+    def _run(self, source_chat_id: int, lease_owner: str) -> None:
         try:
-            self._call_runtime(self._run_ingestion(source_chat_id, lease_owner, reset_before_run=reset_before_run))
+            self._call_runtime(self._run_ingestion(source_chat_id, lease_owner))
         except BaseException as error:
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id, exc_info=error)
         finally:
@@ -129,12 +125,12 @@ class MsgLogScanScheduler:
                     self._pending_available.wait()
                 if self._stopping:
                     return
-                source_chat_id, lease_owner, reset_before_run = self._pending.popleft()
+                source_chat_id, lease_owner = self._pending.popleft()
                 self._pending_source_chat_ids.remove(source_chat_id)
                 self._threads[source_chat_id] = threading.current_thread()
                 self._owners[source_chat_id] = lease_owner
                 threading.current_thread().name = f"MsgLogIngestion-{source_chat_id}"
-            self._run(source_chat_id, lease_owner, reset_before_run=reset_before_run)
+            self._run(source_chat_id, lease_owner)
 
     def _admit_workers_locked(self) -> None:
         max_workers = self._scan_concurrency()
@@ -164,15 +160,13 @@ class MsgLogScanScheduler:
                 pass
             raise
 
-    async def _run_ingestion(self, source_chat_id: int, lease_owner: str, *, reset_before_run: bool = False) -> None:
+    async def _run_ingestion(self, source_chat_id: int, lease_owner: str) -> None:
         async with self._get_connect_lock():
             if self._stop_event.is_set():
                 return
             await self.mtproto.connect()
         if self._stop_event.is_set():
             return
-        if reset_before_run:
-            self.ingestion.reset_completed_scan(source_chat_id)
         await MsgLogIngestionService(self.ingestion, self.chat_associations, self.mtproto).run(
             source_chat_id,
             lease_owner=lease_owner,

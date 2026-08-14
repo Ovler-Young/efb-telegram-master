@@ -456,7 +456,7 @@ def test_ordinary_send_writes_msglog_once_and_completes_delivery_claim(monkeypat
         type=MsgType.Text,
     )
 
-    processor.dispatch_message(message, "", None, 123, None, dedupe_key=("slave", "slave-message"))
+    processor.dispatch_message(message, "", None, 123, None, dedupe_key=("slave", "slave-message"), claim_token="claim-token")
 
     processor.msglogs.add_or_update_message_log.assert_called_once_with(
         etm_msg,
@@ -464,4 +464,4 @@ def test_ordinary_send_writes_msglog_once_and_completes_delivery_claim(monkeypat
         None,
         sender_bot_id="7",
     )
-    processor.delivery_claims.complete.assert_called_once_with("slave", "slave-message")
+    processor.delivery_claims.complete.assert_called_once_with("slave", "slave-message", "claim-token")
