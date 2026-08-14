@@ -165,15 +165,16 @@ def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_arc
     source_path = tmp_path / "tgdata.db"
     migrated_path = source_path.with_suffix(".db.migrated")
     source_db = SqliteDatabase(source_path, pragmas={"journal_mode": "wal"})
-    models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
+    models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery)
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         source_db.connect()
         with source_db.bind_ctx(models):
             source_db.create_tables(models)
-            ChatAssoc.create(master_uid="master", slave_uid="slave")
-            TopicAssoc.create(topic_chat_id="10", message_thread_id="20", slave_uid="slave")
+            ChatAssoc.create(id=101, master_uid="master", slave_uid="slave")
+            TopicAssoc.create(id=102, topic_chat_id="10", message_thread_id="20", slave_uid="slave")
             SlaveChatInfo.create(
+                id=103,
                 slave_channel_id="tests.slave",
                 slave_channel_emoji="x",
                 slave_chat_uid="slave",
@@ -189,7 +190,9 @@ def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_arc
                 msg_type="Text",
                 sent_to="master",
             )
-            HistoryMigrationEntry.create(slave_chat_id="slave", target_chat_id="10", source_master_msg_id="10.1", position=0)
+            HistoryMigrationEntry.create(id=104, slave_chat_id="slave", target_chat_id="10", source_master_msg_id="10.1", position=0)
+            MsgLogIngestionScan.create(id=105, source_chat_id="10", scan_boundary=100, cursor=100)
+            SlaveMessageDelivery.create(id=106, slave_origin_uid="slave", slave_message_id="source-message")
         database_name, _target = _new_database(admin_db, integration_postgres_config)
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
         assert source_path.with_name("tgdata.db-wal").exists()
@@ -211,6 +214,23 @@ def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_arc
         assert SlaveChatInfo.select().count() == 1
         assert MsgLog.get_by_id("10.1").text == "source text"
         assert HistoryMigrationEntry.select().count() == 1
+        assert MsgLogIngestionScan.select().count() == 1
+        assert SlaveMessageDelivery.select().count() == 1
+        assert ChatAssoc.create(master_uid="master-next", slave_uid="slave-next").id == 102
+        assert TopicAssoc.create(topic_chat_id="11", message_thread_id="21", slave_uid="slave-next").id == 103
+        assert (
+            SlaveChatInfo.create(
+                slave_channel_id="tests.slave",
+                slave_channel_emoji="x",
+                slave_chat_uid="slave-next",
+                slave_chat_name="Imported chat",
+                slave_chat_type="group",
+            ).id
+            == 104
+        )
+        assert HistoryMigrationEntry.create(slave_chat_id="slave-next", target_chat_id="11", source_master_msg_id="11.1", position=0).id == 105
+        assert MsgLogIngestionScan.create(source_chat_id="11", scan_boundary=101, cursor=101).id == 106
+        assert SlaveMessageDelivery.create(slave_origin_uid="slave-next", slave_message_id="next-message").id == 107
         provenance = database.execute_sql('SELECT snapshot_identity FROM "sqliteimportprovenance"').fetchone()
         assert provenance is not None and len(provenance[0]) == 64
         assert not source_path.exists()
