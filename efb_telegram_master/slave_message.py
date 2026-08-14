@@ -129,8 +129,8 @@ class SlaveMessageService:
                     return msg
             dedupe_key = self._dedupe_key(msg, slave_origin_uid)
             if dedupe_key is not None:
-                # In-memory only; process restarts can redeliver duplicates.
-                # The DB hot-path query was intentionally removed.
+                # Claim delivery durably with a database-backed lease so
+                # concurrent workers and process restarts share the claim.
                 if not self._claim_pending_slave_message(dedupe_key):
                     self.logger.info("[%s] Duplicate slave message is already pending delivery; skipping.", xid)
                     return msg
