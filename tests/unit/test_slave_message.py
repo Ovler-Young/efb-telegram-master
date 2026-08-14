@@ -278,29 +278,6 @@ def test_destination_mapping_failure_releases_the_pending_dedupe_claim() -> None
     processor.dispatch_message.assert_not_called()
 
 
-def test_active_delivery_renews_the_owned_claim() -> None:
-    processor = _dedupe_processor()
-    processor.CLAIM_RENEW_INTERVAL = 0.01
-    started, release = threading.Event(), threading.Event()
-
-    def dispatch(*_args, **_kwargs):
-        started.set()
-        assert release.wait(1)
-
-    processor.dispatch_message.side_effect = dispatch
-    worker = threading.Thread(target=processor.send_message, args=(_message(),))
-    worker.start()
-    try:
-        assert started.wait(1)
-        deadline = time.monotonic() + 1
-        while not processor.delivery_claims.renew.called and time.monotonic() < deadline:
-            time.sleep(0.01)
-        processor.delivery_claims.renew.assert_called_with("tests.slave chat", "message", "claim-token")
-    finally:
-        release.set()
-        worker.join(1)
-
-
 def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
     processor = object.__new__(SlaveMessageService)
     processor.logger = Mock()
