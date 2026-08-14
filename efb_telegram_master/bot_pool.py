@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from typing import Optional, Protocol, cast
 
@@ -72,26 +73,34 @@ def build_bot_pool(
 class BotPool:
     """Keep auxiliary membership probes and best-effort slave affinity in memory."""
 
+    AFFINITY_TTL = 86400.0
+    MAX_AFFINITY_ENTRIES = 4096
+    MEMBERSHIP_FAILURE_TTL = 300.0
+    MAX_MEMBERSHIP_FAILURE_ENTRIES = 512
+    MAX_FAILURE_SLAVES_PER_MEMBERSHIP_PROBE = 64
+
     def __init__(self, aux_bots: list[AuxiliaryBot]) -> None:
         self._bots = aux_bots
         self._bot_by_id = {bot.bot_id: bot for bot in aux_bots}
         self._lock = threading.Lock()
         self._membership_stopping = False
-        self._preferred_sender_by_slave_id: dict[str, int] = {}
-        self._membership_failure_slaves: dict[tuple[int, int], set[str]] = {}
+        self._preferred_sender_by_slave_id: OrderedDict[str, tuple[int, float]] = OrderedDict()
+        self._membership_failure_slaves: OrderedDict[tuple[int, int], OrderedDict[str, float]] = OrderedDict()
         for bot in aux_bots:
             bot._membership_changed_callback = self._membership_changed
 
     def _membership_changed(self, bot: AuxiliaryBot, chat_id: int, is_member: bool) -> None:
         key = (bot.bot_id, chat_id)
         with self._lock:
+            self._purge_expired_state_locked(time.monotonic())
+            slave_ids = self._membership_failure_slaves.pop(key, OrderedDict())
             if self._membership_stopping:
                 return
-            slave_ids = self._membership_failure_slaves.pop(key, set())
             if is_member:
                 return
             for slave_id in slave_ids:
-                if self._preferred_sender_by_slave_id.get(slave_id) == bot.bot_id:
+                affinity = self._preferred_sender_by_slave_id.get(slave_id)
+                if affinity is not None and affinity[0] == bot.bot_id:
                     del self._preferred_sender_by_slave_id[slave_id]
 
     @property
@@ -119,7 +128,13 @@ class BotPool:
         if slave_id is None:
             return None
         with self._lock:
-            bot_id = self._preferred_sender_by_slave_id.get(slave_id)
+            now = time.monotonic()
+            self._purge_expired_state_locked(now)
+            affinity = self._preferred_sender_by_slave_id.get(slave_id)
+            if affinity is not None:
+                self._preferred_sender_by_slave_id[slave_id] = (affinity[0], now)
+                self._preferred_sender_by_slave_id.move_to_end(slave_id)
+        bot_id = affinity[0] if affinity is not None else None
         bot = self.get_bot_by_id(bot_id)
         return bot if bot is not None and not bot.disabled else None
 
@@ -133,7 +148,12 @@ class BotPool:
         with self._lock:
             if self._membership_stopping:
                 return
-            self._preferred_sender_by_slave_id[slave_id] = bot.bot_id
+            now = time.monotonic()
+            self._purge_expired_state_locked(now)
+            if slave_id not in self._preferred_sender_by_slave_id and len(self._preferred_sender_by_slave_id) >= self.MAX_AFFINITY_ENTRIES:
+                return
+            self._preferred_sender_by_slave_id[slave_id] = (bot.bot_id, now)
+            self._preferred_sender_by_slave_id.move_to_end(slave_id)
 
     def remove_affinity_for_bot(self, bot_id: str | int) -> None:
         """Remove every affinity entry for a disabled auxiliary bot."""
@@ -142,7 +162,7 @@ class BotPool:
         except (TypeError, ValueError):
             return
         with self._lock:
-            stale_slaves = [slave_id for slave_id, preferred_bot_id in self._preferred_sender_by_slave_id.items() if preferred_bot_id == normalized_bot_id]
+            stale_slaves = [slave_id for slave_id, (preferred_bot_id, _timestamp) in self._preferred_sender_by_slave_id.items() if preferred_bot_id == normalized_bot_id]
             for slave_id in stale_slaves:
                 del self._preferred_sender_by_slave_id[slave_id]
 
@@ -156,7 +176,18 @@ class BotPool:
             if self._membership_stopping:
                 return
             if slave_id is not None:
-                self._membership_failure_slaves.setdefault((normalized_bot_id, chat_id), set()).add(slave_id)
+                now = time.monotonic()
+                self._purge_expired_state_locked(now)
+                key = (normalized_bot_id, chat_id)
+                failures = self._membership_failure_slaves.get(key)
+                if failures is None:
+                    if len(self._membership_failure_slaves) < self.MAX_MEMBERSHIP_FAILURE_ENTRIES:
+                        failures = OrderedDict()
+                        self._membership_failure_slaves[key] = failures
+                if failures is not None and (slave_id in failures or len(failures) < self.MAX_FAILURE_SLAVES_PER_MEMBERSHIP_PROBE):
+                    failures[slave_id] = now
+                    failures.move_to_end(slave_id)
+                    self._membership_failure_slaves.move_to_end(key)
         bot = self.get_bot_by_id(normalized_bot_id)
         if bot is not None and not bot.disabled:
             bot.recheck_membership(chat_id)
@@ -184,6 +215,8 @@ class BotPool:
         """Reject new membership probes, attempting every auxiliary even after a failure."""
         with self._lock:
             self._membership_stopping = True
+            self._preferred_sender_by_slave_id.clear()
+            self._membership_failure_slaves.clear()
         errors: list[BaseException] = []
         for bot in self._bots:
             try:
@@ -237,3 +270,18 @@ class BotPool:
 
     def __len__(self) -> int:
         return len(self._bots)
+
+    def _purge_expired_state_locked(self, now: float) -> None:
+        expired_affinities = [slave_id for slave_id, (_bot_id, timestamp) in self._preferred_sender_by_slave_id.items() if now - timestamp >= self.AFFINITY_TTL]
+        for slave_id in expired_affinities:
+            del self._preferred_sender_by_slave_id[slave_id]
+
+        expired_failure_keys: list[tuple[int, int]] = []
+        for key, failures in self._membership_failure_slaves.items():
+            expired_slave_ids = [slave_id for slave_id, timestamp in failures.items() if now - timestamp >= self.MEMBERSHIP_FAILURE_TTL]
+            for slave_id in expired_slave_ids:
+                del failures[slave_id]
+            if not failures:
+                expired_failure_keys.append(key)
+        for key in expired_failure_keys:
+            del self._membership_failure_slaves[key]

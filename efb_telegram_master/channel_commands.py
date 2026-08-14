@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from gettext import NullTranslations, translation
 from typing import List, Optional
 
@@ -31,6 +31,8 @@ from .mtproto import MTProtoConfig
 from .paths import LOCALE_DIR, get_config_path
 from .ptb_compat import SupportsSendMessage, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
+
+MAX_AUXILIARY_BOTS = 16
 
 
 class TelegramCommandService:
@@ -287,7 +289,10 @@ def load_channel_config(channel_id: ModuleID, translate: Callable[[str], str]) -
     if not config_path.exists():
         raise FileNotFoundError(translate("Config File does not exist. ({path})").format(path=config_path))
     with config_path.open() as config_file:
-        data = YAML().load(config_file)
+        parsed_data = YAML().load(config_file)
+    if not isinstance(parsed_data, Mapping):
+        raise ValueError(translate("Config file must contain a mapping."))
+    data = dict(parsed_data)
     if not isinstance(data.get("token"), str):
         raise ValueError(translate("Telegram bot token must be a string"))
     mtproto_config = MTProtoConfig.from_mapping(data.get("mtproto"))
@@ -305,8 +310,10 @@ def load_channel_config(channel_id: ModuleID, translate: Callable[[str], str]) -
         invalid = next(admin for admin in data["admins"] if not isinstance(admin, int))
         raise ValueError(translate("Admin ID is expected to be an int, but {data} is found.").format(data=invalid))
     auxiliary_bots = data.get("auxiliary_bots", [])
-    if auxiliary_bots and not isinstance(auxiliary_bots, list):
+    if not isinstance(auxiliary_bots, list):
         raise ValueError(translate("auxiliary_bots must be a list."))
+    if len(auxiliary_bots) > MAX_AUXILIARY_BOTS:
+        raise ValueError(translate("auxiliary_bots must contain at most {count} entries.").format(count=MAX_AUXILIARY_BOTS))
     seen_tokens = {data["token"]}
     for index, entry in enumerate(auxiliary_bots):
         if not isinstance(entry, dict) or not isinstance(entry.get("token"), str):
