@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import threading
 import time
@@ -34,8 +35,9 @@ class MsgLogScanScheduler:
         self._threads: dict[int, threading.Thread] = {}
         self._retiring_threads: set[threading.Thread] = set()
         self._owners: dict[int, str] = {}
-        self._pending: deque[tuple[int, str, bool]] = deque()
+        self._pending: deque[tuple[int, str, bool, float]] = deque()
         self._pending_source_chat_ids: set[int] = set()
+        self._wake_timers: set[threading.Timer] = set()
 
     def schedule(self, source_chat_id: int) -> str:
         with self._lock:
@@ -50,9 +52,8 @@ class MsgLogScanScheduler:
             if scan_status is None:
                 return "unchanged"
             if scan_status == "running":
-                if source_chat_id not in self._threads:
-                    return "queued"
-                return self._schedule_locked(source_chat_id, queue_after_active=True)
+                self._schedule_locked(source_chat_id, queue_after_active=True)
+                return "queued"
             return self._schedule_locked(source_chat_id, queue_after_active=scan_status == "pending")
 
     def _schedule_locked(self, source_chat_id: int, *, queue_after_active: bool = False, reset_before_run: bool = False) -> str:
@@ -77,11 +78,32 @@ class MsgLogScanScheduler:
             return "queued"
         return "resumed" if scan.scanned_count else "started"
 
-    def _enqueue_locked(self, source_chat_id: int, *, reset_before_run: bool = False) -> None:
-        self._pending.append((source_chat_id, str(uuid.uuid4()), reset_before_run))
+    def _enqueue_locked(self, source_chat_id: int, *, reset_before_run: bool = False, not_before: float = 0.0) -> None:
+        self._pending.append((source_chat_id, str(uuid.uuid4()), reset_before_run, not_before))
         self._pending_source_chat_ids.add(source_chat_id)
+        if not_before:
+            self._schedule_wakeup_locked(not_before)
         self._pending_available.notify()
         self._admit_workers_locked()
+
+    def _schedule_wakeup_locked(self, not_before: float) -> None:
+        delay = max(0.0, not_before - time.monotonic())
+        if delay == 0.0:
+            return
+
+        def wake() -> None:
+            with self._pending_available:
+                self._wake_timers.discard(threading.current_thread())
+                if self._stopping:
+                    return
+                self._reap_threads_locked()
+                self._admit_workers_locked()
+                self._pending_available.notify_all()
+
+        timer = threading.Timer(delay, wake)
+        timer.daemon = True
+        self._wake_timers.add(timer)
+        timer.start()
 
     def stop(self, join_timeout: float = DEFAULT_JOIN_TIMEOUT) -> tuple[BaseException, ...]:
         deadline = time.monotonic() + join_timeout
@@ -91,6 +113,9 @@ class MsgLogScanScheduler:
             self._stop_event.set()
             self._pending.clear()
             self._pending_source_chat_ids.clear()
+            for timer in self._wake_timers:
+                timer.cancel()
+            self._wake_timers.clear()
             self._pending_available.notify_all()
             workers = tuple(self._retiring_threads)
         if admission_fence_needed:
@@ -109,8 +134,10 @@ class MsgLogScanScheduler:
         return ()
 
     def _run(self, source_chat_id: int, lease_owner: str, *, reset_before_run: bool = False) -> None:
+        claimed: bool | None = None
         try:
-            self._call_runtime(self._run_ingestion(source_chat_id, lease_owner, reset_before_run=reset_before_run))
+            result = self._call_runtime(self._run_ingestion(source_chat_id, lease_owner, reset_before_run=reset_before_run))
+            claimed = result if isinstance(result, bool) else None
         except BaseException as error:
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id, exc_info=error)
         finally:
@@ -120,23 +147,55 @@ class MsgLogScanScheduler:
                 except Exception:
                     self.logger.exception("Failed to release MsgLog ingestion lease for group %s", source_chat_id)
             with self._lock:
+                if claimed is False and not self._stopping:
+                    self._defer_unclaimed_scan_locked(source_chat_id)
                 if self._owners.get(source_chat_id) == lease_owner:
                     self._threads.pop(source_chat_id, None)
                     self._owners.pop(source_chat_id, None)
+                self._pending_available.notify_all()
+
+    def _defer_unclaimed_scan_locked(self, source_chat_id: int) -> None:
+        scan = self.ingestion.get_or_create_scan(source_chat_id, self.mtproto.config.scan_ceiling)
+        if scan.status == "complete":
+            return
+        lease_expires_at = getattr(scan, "lease_expires_at", None)
+        delay = 0.0
+        if isinstance(lease_expires_at, datetime.datetime):
+            delay = max(0.0, (lease_expires_at - datetime.datetime.now()).total_seconds())
+        not_before = time.monotonic() + delay
+        if source_chat_id in self._pending_source_chat_ids:
+            self._pending = deque(
+                (pending_source_chat_id, owner, reset_before_run, max(pending_not_before, not_before) if pending_source_chat_id == source_chat_id else pending_not_before)
+                for pending_source_chat_id, owner, reset_before_run, pending_not_before in self._pending
+            )
+            if delay:
+                self._schedule_wakeup_locked(not_before)
+            return
+        self._enqueue_locked(source_chat_id, not_before=not_before)
 
     def _worker(self) -> None:
         while True:
             with self._pending_available:
-                while not self._stopping and not self._pending:
-                    self._pending_available.wait()
+                pending = self._next_runnable_pending_locked()
                 if self._stopping:
                     return
-                source_chat_id, lease_owner, reset_before_run = self._pending.popleft()
+                if pending is None:
+                    return
+                source_chat_id, lease_owner, reset_before_run = pending
                 self._pending_source_chat_ids.remove(source_chat_id)
                 self._threads[source_chat_id] = threading.current_thread()
                 self._owners[source_chat_id] = lease_owner
                 threading.current_thread().name = f"MsgLogIngestion-{source_chat_id}"
             self._run(source_chat_id, lease_owner, reset_before_run=reset_before_run)
+
+    def _next_runnable_pending_locked(self) -> tuple[int, str, bool] | None:
+        now = time.monotonic()
+        for _ in range(len(self._pending)):
+            source_chat_id, lease_owner, reset_before_run, not_before = self._pending.popleft()
+            if source_chat_id not in self._threads and not_before <= now:
+                return source_chat_id, lease_owner, reset_before_run
+            self._pending.append((source_chat_id, lease_owner, reset_before_run, not_before))
+        return None
 
     def _admit_workers_locked(self) -> None:
         max_workers = self._scan_concurrency()
@@ -166,14 +225,14 @@ class MsgLogScanScheduler:
                 pass
             raise
 
-    async def _run_ingestion(self, source_chat_id: int, lease_owner: str, *, reset_before_run: bool = False) -> None:
+    async def _run_ingestion(self, source_chat_id: int, lease_owner: str, *, reset_before_run: bool = False) -> bool | None:
         async with self._get_connect_lock():
             if self._stop_event.is_set():
-                return
+                return None
             await self.mtproto.connect()
         if self._stop_event.is_set():
-            return
-        await MsgLogIngestionService(self.ingestion, self.chat_associations, self.mtproto).run(
+            return None
+        return await MsgLogIngestionService(self.ingestion, self.chat_associations, self.mtproto).run(
             source_chat_id,
             lease_owner=lease_owner,
             stop_requested=self._stop_event.is_set,

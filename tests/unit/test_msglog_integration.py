@@ -254,6 +254,7 @@ def test_association_reschedule_uses_persisted_request_when_another_worker_is_ru
 
     ingestion = SimpleNamespace(
         request_association_rescan=Mock(return_value="running"),
+        get_or_create_scan=Mock(return_value=SimpleNamespace(status="running", scanned_count=0)),
         release_scan=Mock(),
     )
     scheduler = MsgLogScanScheduler(
@@ -274,6 +275,8 @@ def test_association_reschedule_queues_a_successor_after_active_lease_expires(tm
     first_fetch_started = threading.Event()
     allow_expired_worker_to_exit = threading.Event()
     fetches = 0
+    active_fetches = 0
+    max_active_fetches = 0
 
     class Associations:
         def get_topic_assoc_slave_uid(self, source_chat_id, topic_id):
@@ -282,7 +285,7 @@ def test_association_reschedule_queues_a_successor_after_active_lease_expires(tm
 
     class MTProto:
         enabled = True
-        config = SimpleNamespace(scan_ceiling=1)
+        config = SimpleNamespace(scan_ceiling=1, scan_concurrency=2)
 
         async def connect(self):
             return None
@@ -291,22 +294,27 @@ def test_association_reschedule_queues_a_successor_after_active_lease_expires(tm
             return source_chat_id
 
         async def get_channel_messages(self, _channel, message_ids):
-            nonlocal fetches
+            nonlocal active_fetches, fetches, max_active_fetches
             assert message_ids == [1]
             fetches += 1
-            if fetches == 1:
-                first_fetch_started.set()
-                await asyncio.to_thread(allow_expired_worker_to_exit.wait)
-            return [
-                SimpleNamespace(
-                    id=1,
-                    message="message 1",
-                    date=None,
-                    reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
-                    action=None,
-                    media=None,
-                )
-            ]
+            active_fetches += 1
+            max_active_fetches = max(max_active_fetches, active_fetches)
+            try:
+                if fetches == 1:
+                    first_fetch_started.set()
+                    await asyncio.to_thread(allow_expired_worker_to_exit.wait)
+                return [
+                    SimpleNamespace(
+                        id=1,
+                        message="message 1",
+                        date=None,
+                        reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
+                        action=None,
+                        media=None,
+                    )
+                ]
+            finally:
+                active_fetches -= 1
 
     original_database = database.obj
     test_db = SqliteDatabase(tmp_path / "msglog.db")
@@ -344,6 +352,96 @@ def test_association_reschedule_queues_a_successor_after_active_lease_expires(tm
     assert (recovered.status, recovered.rescan_requested, recovered.lease_owner) == ("complete", False, None)
     assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
     assert fetches == 3
+    assert max_active_fetches == 1
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "prior_process"),
+    [("expired", False), ("retryable-error", False), ("expired", True)],
+    ids=["external-expiry", "external-retryable-error", "prior-process-expiry"],
+)
+def test_association_reschedule_recovers_untracked_active_lease(tmp_path, terminal_state, prior_process):
+    rejected_claim = threading.Event()
+    fetches = 0
+
+    class Associations:
+        def get_topic_assoc_slave_uid(self, source_chat_id, topic_id):
+            assert (source_chat_id, topic_id) == (100, 10)
+            return "tests.slave target"
+
+        def get_topic_slaves(self, source_chat_id):
+            assert source_chat_id == 100
+            return [("tests.slave", 10)]
+
+    class MTProto:
+        enabled = True
+        config = SimpleNamespace(scan_ceiling=1)
+
+        async def connect(self):
+            return None
+
+        async def get_input_channel(self, source_chat_id):
+            return source_chat_id
+
+        async def get_channel_messages(self, _channel, message_ids):
+            nonlocal fetches
+            assert message_ids == [1]
+            fetches += 1
+            return [
+                SimpleNamespace(
+                    id=1,
+                    message="message 1",
+                    date=None,
+                    reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
+                    action=None,
+                    media=None,
+                )
+            ]
+
+    class TrackingRepository(MsgLogIngestionRepository):
+        def claim_scan(self, source_chat_id, lease_owner, lease_seconds):
+            claimed = super().claim_scan(source_chat_id, lease_owner, lease_seconds)
+            if lease_owner != "other-process" and claimed is None:
+                rejected_claim.set()
+            return claimed
+
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "msglog.db")
+    database.initialize(test_db)
+    test_db.connect()
+    ingestion = TrackingRepository("tests.master")
+    runtime = SharedAsyncRuntime()
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        scan = ingestion.get_or_create_scan(100, 1)
+        assert ingestion.claim_scan(100, "other-process", 1) is not None
+        MsgLogIngestionScan.update(lease_expires_at=datetime.now() + timedelta(milliseconds=100)).where(MsgLogIngestionScan.id == scan.id).execute()
+        if prior_process:
+            scheduler.resume()
+            assert not rejected_claim.is_set()
+
+        assert scheduler.schedule_for_association(100) == "queued"
+        assert rejected_claim.wait(1)
+        if terminal_state == "retryable-error":
+            MsgLogIngestionScan.update(status="retryable-error", lease_owner=None, lease_expires_at=None).where(MsgLogIngestionScan.id == scan.id).execute()
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
+                break
+            time.sleep(0.01)
+        recovered = MsgLogIngestionScan.get_by_id(scan.id)
+        row = MsgLog.get_by_id("100.1")
+    finally:
+        assert scheduler.stop(1) == ()
+        runtime.close()
+        test_db.close()
+        database.initialize(original_database)
+
+    assert (recovered.status, recovered.rescan_requested, recovered.lease_owner) == ("complete", False, None)
+    assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
+    assert fetches == 2
 
 
 def test_association_reschedule_queues_a_successor_after_retryable_error(tmp_path):
