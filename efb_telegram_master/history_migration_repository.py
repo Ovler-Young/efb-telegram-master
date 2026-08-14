@@ -1,4 +1,5 @@
-from typing import Dict, List, Optional
+from itertools import islice
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .database_observability import ObservedRepository, observe_database_method
 from .models import HistoryMigrationEntry, database
@@ -6,6 +7,8 @@ from .utils import EFBChannelChatIDStr, TelegramTopicID
 
 
 class HistoryMigrationRepository(ObservedRepository):
+    INSERT_BATCH_SIZE = 100
+
     @staticmethod
     def _target_filter(slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None):
         thread_value = str(message_thread_id) if message_thread_id is not None else None
@@ -15,12 +18,15 @@ class HistoryMigrationRepository(ObservedRepository):
         return base_filter & (HistoryMigrationEntry.message_thread_id == thread_value)
 
     @observe_database_method("replace_history_migration_entries")
-    def replace_entries(self, slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, message_thread_id: Optional[TelegramTopicID], entries: List[Dict[str, object]]) -> int:
+    def replace_entries(self, slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, message_thread_id: Optional[TelegramTopicID], entries: Iterable[Dict[str, object]]) -> int:
+        count = 0
         with database.atomic():
             HistoryMigrationEntry.delete().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id)).execute()
-            if entries:
-                HistoryMigrationEntry.insert_many(entries).execute()
-        return len(entries)
+            entry_iterator = iter(entries)
+            while batch := list(islice(entry_iterator, self.INSERT_BATCH_SIZE)):
+                HistoryMigrationEntry.insert_many(batch).execute()
+                count += len(batch)
+        return count
 
     @observe_database_method("has_pending_history_migrations")
     def has_pending_entries(self) -> bool:
@@ -30,11 +36,23 @@ class HistoryMigrationRepository(ObservedRepository):
     def get_next_target(self) -> Optional[HistoryMigrationEntry]:
         return HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id.asc()).first()
 
-    @observe_database_method("get_history_migration_entries")
-    def get_entries(self, slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None) -> List[HistoryMigrationEntry]:
-        return list(
-            HistoryMigrationEntry.select().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id)).order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
-        )
+    @observe_database_method("get_history_migration_entry_page")
+    def get_entries_page(
+        self,
+        slave_chat_id: EFBChannelChatIDStr,
+        target_chat_id: int,
+        message_thread_id: Optional[TelegramTopicID],
+        after: Optional[Tuple[int, int]],
+        page_size: int,
+    ) -> List[HistoryMigrationEntry]:
+        query = HistoryMigrationEntry.select().where(self._target_filter(slave_chat_id, target_chat_id, message_thread_id))
+        if after is not None:
+            after_position, after_id = after
+            query = query.where(
+                (HistoryMigrationEntry.position > after_position)
+                | ((HistoryMigrationEntry.position == after_position) & (HistoryMigrationEntry.id > after_id))
+            )
+        return list(query.order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc()).limit(page_size))
 
     @observe_database_method("delete_history_migration_entry")
     def delete_entry(self, entry_id: int) -> int:

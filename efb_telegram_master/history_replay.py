@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Optional
 
 from . import utils
@@ -43,6 +43,8 @@ class HistoryReplayWorker:
     """Own one replay loop that drains durable migration entries."""
 
     DEFAULT_JOIN_TIMEOUT = 5.0
+    SOURCE_PAGE_SIZE = 100
+    REPLAY_PAGE_SIZE = 100
 
     def __init__(self, bot, msglogs, history_migrations: HistoryMigrationRepository, chat_manager, logger: logging.Logger, translate: Callable[[str], str] = _identity) -> None:
         self.bot, self.msglogs, self.history_migrations, self.chat_manager = bot, msglogs, history_migrations, chat_manager
@@ -137,28 +139,33 @@ class HistoryReplayWorker:
             self._active_target = None
 
     def queue_entries(self, slave_chat_id: EFBChannelChatIDStr, target_chat_id: int, thread_id: Optional[TelegramTopicID] = None) -> int:
-        entries = []
-        for position, msg_log in enumerate(self.msglogs.get_recent_messages(slave_chat_id, limit=0)):
-            text = msg_log.text or ""
-            formatted_text = None
-            if msg_log.provenance != "mtproto_ingested" and text.strip() and not (msg_log.media_type and msg_log.media_type != "Text"):
-                message = msg_log.build_etm_msg(self.chat_manager, recur=False)
-                timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
-                author = message.author.display_name if message.author else "Unknown"
-                formatted_text = f"*{author}* `{timestamp}`\n{text}\n\n"
-            entries.append(
-                {
-                    "slave_chat_id": str(slave_chat_id),
-                    "target_chat_id": str(target_chat_id),
-                    "message_thread_id": str(thread_id) if thread_id is not None else None,
-                    "source_master_msg_id": msg_log.master_msg_id,
-                    "formatted_text": formatted_text,
-                    "media_type": msg_log.media_type,
-                    "source_time": msg_log.time,
-                    "position": position,
-                }
-            )
-        count = self.history_migrations.replace_entries(slave_chat_id, target_chat_id, thread_id, entries)
+        def entries() -> Iterator[dict[str, object]]:
+            after = None
+            position = 0
+            while page := self.msglogs.get_recent_message_page(slave_chat_id, after, self.SOURCE_PAGE_SIZE):
+                for msg_log in page:
+                    text = msg_log.text or ""
+                    formatted_text = None
+                    if msg_log.provenance != "mtproto_ingested" and text.strip() and not (msg_log.media_type and msg_log.media_type != "Text"):
+                        message = msg_log.build_etm_msg(self.chat_manager, recur=False)
+                        timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
+                        author = message.author.display_name if message.author else "Unknown"
+                        formatted_text = f"*{author}* `{timestamp}`\n{text}\n\n"
+                    yield {
+                        "slave_chat_id": str(slave_chat_id),
+                        "target_chat_id": str(target_chat_id),
+                        "message_thread_id": str(thread_id) if thread_id is not None else None,
+                        "source_master_msg_id": msg_log.master_msg_id,
+                        "formatted_text": formatted_text,
+                        "media_type": msg_log.media_type,
+                        "source_time": msg_log.time,
+                        "position": position,
+                    }
+                    position += 1
+                last = page[-1]
+                after = (last.time, last.master_msg_id)
+
+        count = self.history_migrations.replace_entries(slave_chat_id, target_chat_id, thread_id, entries())
         self.logger.info("Queued %s historical messages for chat %s", count, slave_chat_id)
         return count
 
@@ -184,21 +191,29 @@ class HistoryReplayWorker:
         slave_chat_id = EFBChannelChatIDStr(target.slave_chat_id)
         target_chat_id = int(target.target_chat_id)
         thread_id = TelegramTopicID(int(target.message_thread_id)) if target.message_thread_id is not None else None
-        entries = self.history_migrations.get_entries(slave_chat_id, target_chat_id, thread_id)
-        self.logger.info("Migrating %s pending historical messages for chat %s", len(entries), slave_chat_id)
-        for entry in entries:
-            try:
-                prepared = self.prepare_call(entry, target_chat_id, thread_id)
-                if prepared is None:
+        after = None
+        logged = False
+        while True:
+            entries = self.history_migrations.get_entries_page(slave_chat_id, target_chat_id, thread_id, after, self.REPLAY_PAGE_SIZE)
+            if not entries:
+                return True
+            if not logged:
+                self.logger.info("Migrating pending historical messages for chat %s", slave_chat_id)
+                logged = True
+            for entry in entries:
+                after = (entry.position, entry.id)
+                try:
+                    prepared = self.prepare_call(entry, target_chat_id, thread_id)
+                    if prepared is None:
+                        self.history_migrations.delete_entry(entry.id)
+                        self.logger.info("History migration entry %d completed 0 calls", entry.id)
+                        continue
+                    operation, kwargs = prepared
+                    getattr(self.bot, operation)(**kwargs)
                     self.history_migrations.delete_entry(entry.id)
-                    self.logger.info("History migration entry %d completed 0 calls", entry.id)
-                    continue
-                operation, kwargs = prepared
-                getattr(self.bot, operation)(**kwargs)
-                self.history_migrations.delete_entry(entry.id)
-            except BaseException as error:
-                self._log_failure(entry.id, 0, error)
-                return False
+                except BaseException as error:
+                    self._log_failure(entry.id, 0, error)
+                    return False
         return True
 
     @staticmethod

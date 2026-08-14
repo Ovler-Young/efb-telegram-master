@@ -106,6 +106,9 @@ class MsgLog(BaseModel):
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
+    class Meta:
+        indexes = ((("slave_origin_uid", "time", "master_msg_id"), False),)
+
     def build_etm_msg(self, chat_manager: ChatObjectCacheManager, recur: bool = True) -> ETMMsg:
         c_module, c_id, _ = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_origin_uid))
         assert self.slave_member_uid is not None

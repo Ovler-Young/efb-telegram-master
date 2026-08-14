@@ -1,17 +1,18 @@
 import logging
 import pickle
 import time
+from datetime import datetime
 from functools import partial
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot.types import MessageID
-from peewee import DoesNotExist, fn
+from peewee import DoesNotExist, PostgresqlDatabase, fn
 from telegram import Message
 
 from .database_observability import ObservedRepository, observe_database_method
 from .message import ETMMsg
-from .models import MsgLog, PickledDict
+from .models import MsgLog, PickledDict, database
 from .utils import EFBChannelChatIDStr, OldMsgID, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, chat_id_to_str, message_id_to_str
 
 
@@ -142,3 +143,20 @@ class MsgLogRepository(ObservedRepository):
             return list(query)
         except DoesNotExist:
             return []
+
+    @observe_database_method("get_recent_msglog_page")
+    def get_recent_message_page(self, slave_chat_id: EFBChannelChatIDStr, after: Optional[Tuple[Optional[datetime], TgChatMsgIDStr]], page_size: int) -> List[MsgLog]:
+        query = MsgLog.select().where(MsgLog.slave_origin_uid == slave_chat_id)
+        if after is not None:
+            after_time, after_message_id = after
+            nulls_first = not isinstance(database.obj, PostgresqlDatabase)
+            if after_time is None and nulls_first:
+                query = query.where(
+                    ((MsgLog.time.is_null(True)) & (MsgLog.master_msg_id > after_message_id)) | MsgLog.time.is_null(False)
+                )
+            elif after_time is None:
+                query = query.where((MsgLog.time.is_null(True)) & (MsgLog.master_msg_id > after_message_id))
+            else:
+                after_filter = (MsgLog.time > after_time) | ((MsgLog.time == after_time) & (MsgLog.master_msg_id > after_message_id))
+                query = query.where(after_filter if nulls_first else after_filter | MsgLog.time.is_null(True))
+        return list(query.order_by(MsgLog.time.asc(), MsgLog.master_msg_id.asc()).limit(page_size))

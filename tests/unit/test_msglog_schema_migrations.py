@@ -103,6 +103,12 @@ def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, m
         live_row = MsgLog.create(**_msglog_values("100.2"))
         ingested_row = MsgLog.create(**_msglog_values("100.3", provenance="mtproto_ingested"))
         provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
+        msglog_indexes = {index.name for index in database.get_indexes("msglog")}
+        query_plan = database.execute_sql(
+            "EXPLAIN QUERY PLAN SELECT master_msg_id FROM msglog "
+            "WHERE slave_origin_uid = ? ORDER BY time ASC, master_msg_id ASC LIMIT 2",
+            ("tests.slave chat",),
+        ).fetchall()
     finally:
         if second_manager is not None:
             second_manager.stop_worker()
@@ -112,6 +118,8 @@ def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, m
     assert old_row.provenance == "live"
     assert live_row.provenance == "live"
     assert ingested_row.provenance == "mtproto_ingested"
+    assert "msglog_slave_origin_uid_time_master_msg_id" in msglog_indexes
+    assert any("msglog_slave_origin_uid_time_master_msg_id" in detail for *_ignored, detail in query_plan)
 
 
 def test_concurrent_sqlite_msglog_provenance_upgrade_is_idempotent(tmp_path):

@@ -49,6 +49,7 @@ class DatabaseManager:
     _HISTORIC_SCHEMA_LOCK_KEY = 681_774_240_616_480_002
     _SQLITE_IMPORT_LOCK_KEY = 681_774_240_616_480_001
     _SQLITE_IMPORT_PROVENANCE_TABLE = "sqliteimportprovenance"
+    _MSGLOG_REPLAY_SOURCE_INDEX = "msglog_slave_origin_uid_time_master_msg_id"
     _LEGACY_OUTBOUND_COLUMNS = {
         "outboundworkflow": (
             ("id", "integer", False, True),
@@ -215,6 +216,11 @@ class DatabaseManager:
                 )
             if migration_steps:
                 migrate(*migration_steps)
+            if "msglog" in table_names:
+                current_database.execute_sql(
+                    f"CREATE INDEX IF NOT EXISTS {DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX} "
+                    "ON msglog (slave_origin_uid, time, master_msg_id)"
+                )
 
     @classmethod
     @contextmanager
