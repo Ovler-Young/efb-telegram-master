@@ -379,10 +379,11 @@ class OutboundQueue:
             if result.attachment is not None:
                 pending.primary_result, pending.attachment, pending.phase, pending.retry_at = result.receipt, result.attachment, _CallPhase.ATTACHMENT, 0.0
                 self._call_adapter.record_successful_send(pending.call, selection)
-                if not pending.waiter.cancelled():
-                    pending.waiter.set_result(result.receipt)
-                    self._record_outcome(pending, "success")
-                self._pending.appendleft(pending)
+                if self._lifecycle is OutboundLifecycle.RUNNING:
+                    self._pending.appendleft(pending)
+                else:
+                    self._record_outcome(pending, "cancelled")
+                    self._complete_pending_locked(pending, error=SchedulerStoppedError("Outbound queue stopped."))
                 return
             receipt = result.receipt
             self._call_adapter.record_successful_send(pending.call, selection)
@@ -395,7 +396,7 @@ class OutboundQueue:
     def _finish_terminal_error_locked(self, pending: _PendingCall, selection: SenderSelection, error: BaseException) -> None:
         if pending.phase is _CallPhase.ATTACHMENT and pending.primary_result is not None:
             self._record_outcome(pending, "attachment_failure")
-            cleanup_upload_paths(pending.call.cleanup)
+            self._complete_pending_locked(pending, error=error)
             return
         self._sender_policy.record_send_failure(pending.call, selection)
         self._record_outcome(pending, "failure")

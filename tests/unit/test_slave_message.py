@@ -282,6 +282,15 @@ def test_destination_mapping_failure_releases_the_pending_dedupe_claim() -> None
     processor.dispatch_message.assert_not_called()
 
 
+def test_terminal_delivery_failure_releases_the_dedupe_claim_without_completing_it() -> None:
+    processor = _dedupe_processor()
+    processor.dispatch_message.side_effect = ValueError("attachment failed")
+
+    assert processor.send_message(_message()) is not None
+    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.delivery_claims.complete.assert_not_called()
+
+
 def test_active_delivery_renews_the_owned_claim() -> None:
     processor = _dedupe_processor()
     processor.CLAIM_RENEW_INTERVAL = 0.01

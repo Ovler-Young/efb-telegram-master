@@ -20,6 +20,7 @@ from efb_telegram_master.outbound_types import (
     OutboundShutdownTimeout,
     QueuedCall,
     QueueEnqueueError,
+    QueueError,
     QueueRequest,
     SchedulerStoppedError,
     SenderSelection,
@@ -460,10 +461,8 @@ def test_repeated_attachment_migration_fails_without_resending_primary() -> None
     queue = _queue(Sender(), worker_count=1)
     try:
         waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1))
-        assert waiter.result(1).message.message_id == 7
-        deadline = time.monotonic() + 1
-        while attachment_calls != 2 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        with pytest.raises(QueueError, match="migrated repeatedly"):
+            waiter.result(1)
         assert primary_calls == 1
         assert attachment_calls == 2
     finally:
@@ -495,9 +494,11 @@ def test_oversize_attachment_terminal_failure_does_not_resend_primary() -> None:
     try:
         waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1))
         assert attachment_started.wait(1)
-        assert waiter.result(1).message.message_id == 7
+        assert not waiter.done()
         release_attachment.set()
         assert attachment_failed.wait(1)
+        with pytest.raises(ValueError, match="attachment failed"):
+            waiter.result(1)
         assert primary_calls == 1
         expected_metric = 'etm_outbound_outcomes_total{operation="send_document",outcome="attachment_failure"} 1.0'
         deadline = time.monotonic() + 1
@@ -506,6 +507,46 @@ def test_oversize_attachment_terminal_failure_does_not_resend_primary() -> None:
         assert expected_metric in generate_latest(metrics.registry).decode()
     finally:
         release_attachment.set()
+        queue.stop()
+
+
+def test_shutdown_after_oversize_primary_cleans_owned_upload_without_queuing_attachment(tmp_path) -> None:
+    upload = tmp_path / "owned-upload.bin"
+    upload.write_bytes(b"upload")
+    primary_started = threading.Event()
+    release_primary = threading.Event()
+    full_text = "x" * int(MessageLimit.MAX_TEXT_LENGTH)
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            primary_started.set()
+            assert release_primary.wait(1)
+            return SimpleNamespace(message_id=7)
+
+        def send_document(self, *_args, **_kwargs):
+            pytest.fail("attachment must not start after shutdown begins")
+
+    queue = _queue(Sender(), worker_count=1)
+    try:
+        waiter = queue.enqueue(
+            QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1, cleanup=UploadCleanup((str(upload),)))
+        )
+        assert primary_started.wait(1)
+        stopper = threading.Thread(target=queue.stop)
+        stopper.start()
+        deadline = time.monotonic() + 1
+        while queue.lifecycle is OutboundLifecycle.RUNNING and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert queue.lifecycle is OutboundLifecycle.STOPPING
+        release_primary.set()
+        stopper.join(1)
+        assert not stopper.is_alive()
+        with pytest.raises(SchedulerStoppedError):
+            waiter.result()
+        assert queue.destination_snapshot() == []
+        assert not upload.exists()
+    finally:
+        release_primary.set()
         queue.stop()
 
 
