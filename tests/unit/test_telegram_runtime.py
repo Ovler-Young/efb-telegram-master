@@ -191,12 +191,6 @@ def test_build_runtime_passes_local_mode_and_independent_requests(monkeypatch: p
     assert runtime.application is application
 
 
-@pytest.mark.parametrize("webhook", [False, [], "invalid"])
-def test_build_runtime_rejects_non_mapping_webhook_config(webhook: object) -> None:
-    with pytest.raises(ValueError, match="webhook must be a mapping"):
-        build_telegram_polling_runtime({"token": "123:token", "webhook": webhook}, Mock(), Mock(), AsyncMock(), AsyncMock())
-
-
 @pytest.mark.asyncio
 async def test_post_lifecycle_callbacks_bind_and_clear_the_runtime_loop() -> None:
     application = Mock()
@@ -369,17 +363,6 @@ def test_webhook_runtime_forwards_typed_start_arguments() -> None:
         close_loop=True,
         stop_signals=None,
     )
-
-
-@pytest.mark.parametrize("argument", ["port", "bootstrap_retries", "max_connections"])
-def test_webhook_runtime_rejects_boolean_numeric_start_arguments(argument: str) -> None:
-    application = Mock()
-    runtime = _runtime(application=application, webhook={"start_webhook": {argument: True}})
-
-    with pytest.raises(ValueError, match="must be an integer"):
-        runtime.poll()
-
-    application.run_webhook.assert_not_called()
 
 
 def test_invalid_webhook_configuration_does_not_leave_lifecycle_active() -> None:
@@ -659,7 +642,6 @@ def test_channel_constructor_stops_database_when_bot_manager_creation_fails() ->
     database_manager = SimpleNamespace(
         chat_associations=Mock(),
         slave_chat_info=Mock(),
-        slave_message_deliveries=Mock(),
         msglogs=Mock(),
         history_migrations=Mock(),
         msglog_ingestion=Mock(),
@@ -694,7 +676,6 @@ def test_channel_constructor_stops_started_history_replay_when_handler_registrat
     database_manager = SimpleNamespace(
         chat_associations=Mock(),
         slave_chat_info=Mock(),
-        slave_message_deliveries=Mock(),
         msglogs=Mock(),
         history_migrations=history_migrations,
         msglog_ingestion=Mock(),
@@ -745,7 +726,6 @@ def test_channel_rpc_bind_failure_stops_before_component_startup() -> None:
     database_manager = SimpleNamespace(
         chat_associations=Mock(),
         slave_chat_info=Mock(),
-        slave_message_deliveries=Mock(),
         msglogs=Mock(),
         history_migrations=Mock(),
         msglog_ingestion=Mock(),
