@@ -76,6 +76,7 @@ class TelegramPollingRuntime:
         self._stop_lock = threading.Lock()
         self._stop_requested = False
         self._stopped = False
+        self._lifecycle_active = False
         self.async_runtime = async_runtime
         self.async_bot = async_bot
         self.bot = SyncBotFacade(self.async_bot, self.async_runtime)
@@ -197,6 +198,9 @@ class TelegramPollingRuntime:
             self.logger.exception("Telegram post-shutdown hook failed", extra={"event": "telegram_runtime.post_shutdown_failed", "error_type": type(error).__name__})
 
     def poll(self, drop_pending_updates: bool = False, timeout: int = 10) -> None:
+        with self._stop_lock:
+            self._shutdown_complete.clear()
+            self._lifecycle_active = True
         if self._webhook is not None:
             start_webhook = self._webhook.get("start_webhook")
             if not isinstance(start_webhook, Mapping):
@@ -217,6 +221,8 @@ class TelegramPollingRuntime:
                 raise
             finally:
                 self._shutdown_complete.set()
+                with self._stop_lock:
+                    self._lifecycle_active = False
                 self.logger.info("Telegram webhook runtime stopped", extra={"event": "telegram_runtime.webhook_stop"})
             return
         try:
@@ -230,12 +236,15 @@ class TelegramPollingRuntime:
         finally:
             self._stop_event = None
             self._shutdown_complete.set()
+            with self._stop_lock:
+                self._lifecycle_active = False
 
     def stop(self, deadline: float | None = None) -> None:
         with self._stop_lock:
             if self._stopped:
                 return
             stop_event = self._stop_event
+            lifecycle_active = self._lifecycle_active
             if not self._stop_requested:
                 self._stop_requested = True
                 if stop_event is not None:
@@ -246,7 +255,7 @@ class TelegramPollingRuntime:
                     except RuntimeError:
                         pass
         remaining = 30.0 if deadline is None else max(0.0, deadline - time.monotonic())
-        if stop_event is not None and not self._shutdown_complete.wait(timeout=remaining):
+        if (lifecycle_active or stop_event is not None) and not self._shutdown_complete.wait(timeout=remaining):
             self.logger.warning("Telegram post-shutdown hook timed out", extra={"event": "telegram_runtime.shutdown_timeout", "timeout_seconds": remaining})
             raise TelegramRuntimeShutdownTimeout(f"Telegram runtime did not stop within {remaining:g}s.")
         self.async_runtime.shutdown(deadline)
