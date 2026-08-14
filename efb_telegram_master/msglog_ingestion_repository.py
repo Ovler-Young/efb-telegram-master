@@ -44,34 +44,6 @@ class MsgLogIngestionRepository(ObservedRepository):
                 return None
             return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
 
-    def reset_completed_scan(self, source_chat_id: int) -> bool:
-        """Make a completed scan eligible to revisit messages after a new topic binding."""
-        now = datetime.datetime.now()
-        with database.atomic():
-            return (
-                MsgLogIngestionScan.update(
-                    cursor=MsgLogIngestionScan.scan_boundary,
-                    existing_streak=0,
-                    scanned_count=0,
-                    inserted_count=0,
-                    existing_count=0,
-                    skipped_count=0,
-                    status="pending",
-                    error=None,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    updated_at=now,
-                )
-                .where(
-                    (MsgLogIngestionScan.source_chat_id == str(source_chat_id))
-                    & (MsgLogIngestionScan.status == "complete")
-                    & MsgLogIngestionScan.lease_owner.is_null(True)
-                    & MsgLogIngestionScan.lease_expires_at.is_null(True)
-                )
-                .execute()
-                == 1
-            )
-
     def persist_item(
         self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional[object] = None, lease_owner: str
     ) -> str:
