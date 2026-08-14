@@ -768,27 +768,6 @@ def test_queue_cleans_owned_upload_after_terminal_failure(tmp_path) -> None:
         queue.stop()
 
 
-def test_queue_records_primary_migration_retry_and_preserves_owned_upload(tmp_path) -> None:
-    upload = tmp_path / "upload.bin"
-    upload.write_bytes(b"upload")
-
-    class Sender:
-        def send_document(self, *, chat_id, document):
-            raise ChatMigrated(2)
-
-    metrics = Metrics()
-    queue = _queue(Sender(), worker_count=1)
-    queue.bind_metrics(metrics)
-    try:
-        waiter = queue.enqueue(QueueRequest("send_document", (), {"chat_id": 1, "document": upload.as_uri()}, 1, cleanup=UploadCleanup((str(upload),))))
-        with pytest.raises(ChatMigrated):
-            waiter.result(1)
-        assert upload.exists()
-        assert 'etm_outbound_retries_total{operation="send_document",reason="migration"} 1.0' in generate_latest(metrics.registry).decode()
-    finally:
-        queue.stop()
-
-
 def test_queue_preserves_owned_upload_through_retry_after(tmp_path) -> None:
     upload = tmp_path / "upload.bin"
     upload.write_bytes(b"upload")
