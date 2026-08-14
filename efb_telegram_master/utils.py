@@ -135,6 +135,10 @@ def b64de(s: str) -> str:
     return base64.urlsafe_b64decode(s).decode()
 
 
+def bounded_error_message(error: BaseException) -> str:
+    return str(error)[:200]
+
+
 def message_id_to_str(chat_id: Optional[TelegramChatID] = None, message_id: Optional[TelegramMessageID] = None, update: Optional[telegram.Update] = None) -> TgChatMsgIDStr:
     """
     Convert an unique identifier of Telegram message to a string.

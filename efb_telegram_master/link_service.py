@@ -19,10 +19,6 @@ from .ptb_compat import get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TelegramTopicID
 
 
-def _bounded_error_message(error: BaseException) -> str:
-    return str(error)[:200]
-
-
 class LinkService:
     def __init__(
         self,

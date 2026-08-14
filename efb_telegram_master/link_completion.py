@@ -16,11 +16,7 @@ from .callback_sessions import CallbackSessionStore
 from .chat import ETMChatMixin
 from .history_replay import history_location_text, history_location_url
 from .ptb_compat import get_forwarded_chat, sync_reply_text
-from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TelegramTopicID, TgChatMsgIDStr
-
-
-def _bounded_error_message(error: BaseException) -> str:
-    return str(error)[:200]
+from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TelegramTopicID, TgChatMsgIDStr, bounded_error_message
 
 
 class LinkCompletionService:
@@ -144,7 +140,7 @@ class LinkCompletionService:
                         extra={
                             "event": "chat_binding.link_topic_info_failed",
                             "error_type": type(error).__name__,
-                            "error_message": _bounded_error_message(error),
+                            "error_message": bounded_error_message(error),
                         },
                     )
 
@@ -176,7 +172,7 @@ class LinkCompletionService:
                     extra={
                         "event": "chat_binding.link_history_migration_failed",
                         "error_type": type(error).__name__,
-                        "error_message": _bounded_error_message(error),
+                        "error_message": bounded_error_message(error),
                     },
                 )
                 try:
@@ -213,7 +209,7 @@ class LinkCompletionService:
                 extra={
                     "event": "chat_binding.link_history_link_failed",
                     "error_type": type(error).__name__,
-                    "error_message": _bounded_error_message(error),
+                    "error_message": bounded_error_message(error),
                 },
             )
 

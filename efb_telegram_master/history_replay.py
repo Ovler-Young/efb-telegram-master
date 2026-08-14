@@ -10,11 +10,7 @@ from typing import Optional
 
 from . import utils
 from .history_migration_repository import HistoryMigrationRepository
-from .utils import EFBChannelChatIDStr, TelegramTopicID, TgChatMsgIDStr
-
-
-def _bounded_error_message(error: BaseException) -> str:
-    return str(error)[:200]
+from .utils import EFBChannelChatIDStr, TelegramTopicID, TgChatMsgIDStr, bounded_error_message
 
 
 def _identity(message: str) -> str:
@@ -133,7 +129,7 @@ class HistoryReplayWorker:
             self.logger.error(
                 "History migration failed for %s.",
                 slave_chat_id,
-                extra={"event": "chat_binding.history_migration_failed", "error_type": type(error).__name__, "error_message": _bounded_error_message(error)},
+                extra={"event": "chat_binding.history_migration_failed", "error_type": type(error).__name__, "error_message": bounded_error_message(error)},
             )
         finally:
             self._active_target = None
@@ -236,5 +232,5 @@ class HistoryReplayWorker:
             "History migration entry %d retained after %d completed calls.",
             entry_id,
             completed_call_count,
-            extra={"event": "chat_binding.history_migration_entry_failed", "error_type": type(error).__name__, "error_message": _bounded_error_message(error)},
+            extra={"event": "chat_binding.history_migration_entry_failed", "error_type": type(error).__name__, "error_message": bounded_error_message(error)},
         )

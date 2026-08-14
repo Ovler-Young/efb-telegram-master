@@ -5,7 +5,7 @@ import pytest
 from pytest import raises
 
 from efb_telegram_master.media import _maybe_scale_wechat_gif, convert_tgs_to_gif
-from efb_telegram_master.utils import b64de, b64en, chat_id_str_to_id, chat_id_to_str, message_id_str_to_id, message_id_to_str, normalize_request_kwargs
+from efb_telegram_master.utils import b64de, b64en, bounded_error_message, chat_id_str_to_id, chat_id_to_str, message_id_str_to_id, message_id_to_str, normalize_request_kwargs
 
 
 def test_normalize_request_kwargs_filters_legacy_fields_and_embeds_proxy_auth() -> None:
@@ -20,7 +20,6 @@ def test_normalize_request_kwargs_filters_legacy_fields_and_embeds_proxy_auth() 
         "read_timeout": 15.0,
         "proxy": "socks5://user%40example:p%40ss@proxy.example:1080",
     }
-
     assert normalize_request_kwargs(
         {
             "proxy": "http://embedded:auth@proxy.example:8080",
@@ -32,6 +31,10 @@ def test_normalize_request_kwargs_filters_legacy_fields_and_embeds_proxy_auth() 
         "connection_pool_size": 8,
         "proxy": "http://embedded:auth@proxy.example:8080",
     }
+
+
+def test_bounded_error_message_limits_log_value_to_200_characters() -> None:
+    assert bounded_error_message(RuntimeError("x" * 201)) == "x" * 200
 
 
 def test_flag(channel):
