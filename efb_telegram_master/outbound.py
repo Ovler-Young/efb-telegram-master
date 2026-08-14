@@ -7,7 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 import telegram.error
 from telegram.error import RetryAfter
@@ -36,6 +36,16 @@ if TYPE_CHECKING:
 
 
 _CHAT_ID_ARGUMENT_INDICES = {"edit_message_text": 1}
+_TRANSPORT_RETRY_LIMIT = 2
+_TRANSPORT_RETRY_DELAY = 0.05
+
+
+class OutboundMetrics(Protocol):
+    def record_outbound_outcome(self, operation: str, outcome: str, seconds: float) -> None: ...
+
+    def record_outbound_retry(self, operation: str, reason: str) -> None: ...
+
+    def record_outbound_saturation(self, reason: str) -> None: ...
 
 
 class _CallPhase(Enum):
@@ -52,6 +62,8 @@ class _PendingCall:
     primary_result: Optional[SendReceipt] = None
     attachment: Optional[QueuedCall] = None
     attachment_migrated: bool = False
+    transport_retries: int = 0
+    enqueued_at: float = field(default_factory=time.monotonic)
 
     def active_call(self) -> QueuedCall:
         if self.phase is _CallPhase.PRIMARY:
@@ -89,6 +101,7 @@ class OutboundQueue:
         shutdown_drain_timeout: float,
         shutdown_join_grace: float,
         cancel_active_calls: Callable[[], None] | None = None,
+        max_pending: int = 1000,
     ) -> None:
         self._sender_policy = SenderPolicy(main_bot, bot_pool, main_rate_limiter)
         self._call_adapter = TelegramCallAdapter(bot_pool)
@@ -96,6 +109,9 @@ class OutboundQueue:
         self._shutdown_drain_timeout = shutdown_drain_timeout
         self._shutdown_join_grace = shutdown_join_grace
         self._cancel_active_calls = cancel_active_calls
+        if max_pending < 0:
+            raise ValueError("max_pending must be non-negative")
+        self._max_pending = max_pending
         self._executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ETM-send")
         self._pending: collections.deque[_PendingCall] = collections.deque()
         self._in_flight: dict[Future[object], _SubmittedCall] = {}
@@ -109,6 +125,7 @@ class OutboundQueue:
         self._lifecycle = OutboundLifecycle.RUNNING
         self._finalizing = False
         self._finalized = threading.Event()
+        self._metrics: OutboundMetrics | None = None
         self._worker = threading.Thread(target=self._run, name="ETM queued send worker", daemon=True)
 
     def start(self) -> None:
@@ -130,9 +147,20 @@ class OutboundQueue:
             if self._lifecycle is not OutboundLifecycle.RUNNING:
                 cleanup_upload_paths(request.cleanup)
                 raise SchedulerStoppedError("Outbound queue stopped.")
-            self._pending.append(_PendingCall(_call_with_chat_id(call, self._resolve_chat_id_locked(call.telegram_chat_id)), waiter))
+            if len(self._pending) >= self._max_pending:
+                cleanup_upload_paths(request.cleanup)
+                self._record_saturation("pending_capacity")
+                raise QueueEnqueueError("Outbound queue pending capacity reached.")
+            pending = _PendingCall(_call_with_chat_id(call, self._resolve_chat_id_locked(call.telegram_chat_id)), waiter)
+            self._pending.append(pending)
+            waiter.add_done_callback(self._discard_cancelled_pending)
+            self._record_outcome(pending, "enqueued")
             self._wake_event.set()
         return waiter
+
+    def bind_metrics(self, metrics: OutboundMetrics) -> None:
+        with self._lock:
+            self._metrics = metrics
 
     def enqueue_and_wait(self, request: QueueRequest) -> SendReceipt:
         try:
@@ -167,7 +195,8 @@ class OutboundQueue:
             destinations: dict[int, list[float]] = {}
             for pending in self._pending:
                 destinations.setdefault(pending.call.telegram_chat_id, []).append(pending.retry_at)
-        return [(str(chat_id), len(retries), None) for chat_id, retries in destinations.items()]
+        ranked = sorted(destinations.values(), key=len, reverse=True)
+        return [(f"rank_{index}", len(retries), None) for index, retries in enumerate(ranked, start=1)]
 
     @property
     def lifecycle(self) -> OutboundLifecycle:
@@ -211,6 +240,11 @@ class OutboundQueue:
                 if not self._capacity.acquire(blocking=False):
                     return
                 pending = self._pending.popleft()
+                if pending.waiter.cancelled():
+                    cleanup_upload_paths(pending.call.cleanup)
+                    self._record_outcome(pending, "cancelled")
+                    self._capacity.release()
+                    continue
                 chat_id = pending.call.telegram_chat_id
                 if chat_id in blocked_chats:
                     self._pending.append(pending)
@@ -223,6 +257,7 @@ class OutboundQueue:
                     continue
                 decision = self._sender_policy.select(pending.active_call(), now)
                 if decision.error is not None:
+                    self._record_outcome(pending, "failure")
                     self._complete_pending_locked(pending, error=QueueError(decision.error.replace("_", " ")))
                     self._capacity.release()
                     continue
@@ -240,6 +275,7 @@ class OutboundQueue:
                     execute = self._call_adapter.execute_primary if pending.phase is _CallPhase.PRIMARY else self._call_adapter.execute_attachment
                     future = self._executor.submit(execute, pending.active_call(), decision.selection)
                 except BaseException as error:
+                    self._record_outcome(pending, "failure")
                     self._complete_pending_locked(pending, error=ExecutorSubmitError(str(error)))
                     self._capacity.release()
                     continue
@@ -278,35 +314,49 @@ class OutboundQueue:
                 pending = submitted.pending
                 self._in_flight_chats.discard(pending.call.telegram_chat_id)
                 self._capacity.release()
-                if pending.waiter.done():
+                if pending.waiter.cancelled():
                     cleanup_upload_paths(pending.call.cleanup)
+                    self._record_outcome(pending, "cancelled")
                     continue
                 try:
                     result = future.result()
                 except RetryAfter as error:
                     self._sender_policy.record_retry_after(pending.active_call(), error, submitted.selection)
+                    self._record_retry(pending.active_call(), "rate_limit")
                     try:
                         rewind_uploads(pending.active_call().args, pending.active_call().kwargs)
                     except BaseException as rewind_error:
-                        self._complete_pending_locked(pending, error=rewind_error)
+                        self._finish_terminal_error_locked(pending, submitted.selection, rewind_error)
                     else:
                         pending.retry_at = time.monotonic() + retry_after_seconds(error)
                         self._requeue_or_stop_locked(pending)
+                except telegram.error.NetworkError as error:
+                    if pending.transport_retries >= _TRANSPORT_RETRY_LIMIT:
+                        self._finish_terminal_error_locked(pending, submitted.selection, error)
+                        continue
+                    try:
+                        rewind_uploads(pending.active_call().args, pending.active_call().kwargs)
+                    except BaseException as rewind_error:
+                        self._finish_terminal_error_locked(pending, submitted.selection, rewind_error)
+                    else:
+                        pending.transport_retries += 1
+                        pending.retry_at = time.monotonic() + _TRANSPORT_RETRY_DELAY * pending.transport_retries
+                        self._record_retry(pending.active_call(), "transport")
+                        self._requeue_or_stop_locked(pending)
                 except telegram.error.ChatMigrated as error:
                     if pending.phase is _CallPhase.PRIMARY:
-                        pending.waiter.set_exception(error)
+                        self._finish_terminal_error_locked(pending, submitted.selection, error)
                     elif pending.attachment_migrated:
-                        self._complete_pending_locked(pending, error=QueueError("Attachment chat migrated repeatedly."))
+                        self._finish_terminal_error_locked(pending, submitted.selection, QueueError("Attachment chat migrated repeatedly."))
                     else:
                         try:
                             self._migrate_attachment_locked(pending, error.new_chat_id)
                         except BaseException as migration_error:
-                            self._complete_pending_locked(pending, error=migration_error)
+                            self._finish_terminal_error_locked(pending, submitted.selection, migration_error)
                         else:
                             self._requeue_or_stop_locked(pending)
                 except BaseException as error:
-                    self._sender_policy.record_send_failure(pending.call, submitted.selection)
-                    self._complete_pending_locked(pending, error=error)
+                    self._finish_terminal_error_locked(pending, submitted.selection, error)
                 else:
                     self._complete_success_locked(pending, result, submitted.selection)
             if completed:
@@ -316,6 +366,7 @@ class OutboundQueue:
         if self._lifecycle is OutboundLifecycle.RUNNING:
             self._pending.appendleft(pending)
         else:
+            self._record_outcome(pending, "cancelled")
             self._complete_pending_locked(pending, error=SchedulerStoppedError("Outbound queue stopped."))
 
     def _complete_success_locked(self, pending: _PendingCall, result: object, selection: SenderSelection) -> None:
@@ -323,14 +374,28 @@ class OutboundQueue:
             assert isinstance(result, PrimaryExecution)
             if result.attachment is not None:
                 pending.primary_result, pending.attachment, pending.phase, pending.retry_at = result.receipt, result.attachment, _CallPhase.ATTACHMENT, 0.0
+                self._call_adapter.record_successful_send(pending.call, selection)
+                if not pending.waiter.cancelled():
+                    pending.waiter.set_result(result.receipt)
+                    self._record_outcome(pending, "success")
                 self._pending.appendleft(pending)
                 return
             receipt = result.receipt
-        else:
-            assert pending.primary_result is not None
-            receipt = pending.primary_result
-        self._call_adapter.record_successful_send(pending.call, selection)
-        self._complete_pending_locked(pending, result=receipt)
+            self._call_adapter.record_successful_send(pending.call, selection)
+            self._record_outcome(pending, "success")
+            self._complete_pending_locked(pending, result=receipt)
+            return
+        assert pending.primary_result is not None
+        self._complete_pending_locked(pending, result=pending.primary_result)
+
+    def _finish_terminal_error_locked(self, pending: _PendingCall, selection: SenderSelection, error: BaseException) -> None:
+        if pending.phase is _CallPhase.ATTACHMENT and pending.primary_result is not None:
+            self._record_outcome(pending, "attachment_failure")
+            cleanup_upload_paths(pending.call.cleanup)
+            return
+        self._sender_policy.record_send_failure(pending.call, selection)
+        self._record_outcome(pending, "failure")
+        self._complete_pending_locked(pending, error=error)
 
     def _drain_in_flight(self) -> None:
         while True:
@@ -342,10 +407,11 @@ class OutboundQueue:
 
     def _fail_pending_locked(self) -> None:
         while self._pending:
-            self._complete_pending_locked(self._pending.popleft(), error=SchedulerStoppedError("Outbound queue stopped."))
+            pending = self._pending.popleft()
+            self._record_outcome(pending, "cancelled")
+            self._complete_pending_locked(pending, error=SchedulerStoppedError("Outbound queue stopped."))
 
-    @staticmethod
-    def _complete_pending_locked(pending: _PendingCall, *, result: Optional[SendReceipt] = None, error: Optional[BaseException] = None) -> None:
+    def _complete_pending_locked(self, pending: _PendingCall, *, result: Optional[SendReceipt] = None, error: Optional[BaseException] = None) -> None:
         cleanup_upload_paths(pending.call.cleanup)
         if pending.waiter.done():
             return
@@ -354,6 +420,33 @@ class OutboundQueue:
         else:
             assert result is not None
             pending.waiter.set_result(result)
+
+    def _discard_cancelled_pending(self, waiter: QueueFuture) -> None:
+        if not waiter.cancelled():
+            return
+        with self._lock:
+            retained: collections.deque[_PendingCall] = collections.deque()
+            while self._pending:
+                pending = self._pending.popleft()
+                if pending.waiter is waiter:
+                    cleanup_upload_paths(pending.call.cleanup)
+                    self._record_outcome(pending, "cancelled")
+                else:
+                    retained.append(pending)
+            self._pending = retained
+            self._wake_event.set()
+
+    def _record_outcome(self, pending: _PendingCall, outcome: str) -> None:
+        if self._metrics is not None:
+            self._metrics.record_outbound_outcome(pending.active_call().operation, outcome, time.monotonic() - pending.enqueued_at)
+
+    def _record_retry(self, call: QueuedCall, reason: str) -> None:
+        if self._metrics is not None:
+            self._metrics.record_outbound_retry(call.operation, reason)
+
+    def _record_saturation(self, reason: str) -> None:
+        if self._metrics is not None:
+            self._metrics.record_outbound_saturation(reason)
 
     def _finalize_resources(self) -> None:
         with self._lock:

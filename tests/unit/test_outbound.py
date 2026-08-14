@@ -131,6 +131,72 @@ def test_queue_retries_network_errors_before_terminal_outcome():
         queue.stop()
 
 
+def test_queue_records_rate_limit_and_transport_retry_metrics_before_transport_exhaustion():
+    attempts = 0
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RetryAfter(0)
+            raise NetworkError("temporary network failure")
+
+    metrics = Metrics()
+    queue = _queue(Sender(), worker_count=1)
+    queue.bind_metrics(metrics)
+    try:
+        with pytest.raises(NetworkError, match="temporary network failure"):
+            queue.enqueue(QueueRequest("send_message", (), {"chat_id": 987654, "text": "sent"}, 987654)).result(2)
+    finally:
+        queue.stop()
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert attempts == 4
+    assert 'etm_outbound_retries_total{operation="send_message",reason="rate_limit"} 1.0' in rendered
+    assert 'etm_outbound_retries_total{operation="send_message",reason="transport"} 2.0' in rendered
+    assert 'etm_outbound_outcomes_total{operation="send_message",outcome="failure"} 1.0' in rendered
+    assert "987654" not in rendered
+
+
+def test_queue_records_cancelled_outcomes_once_for_shutdown_and_stop_during_retry():
+    metrics = Metrics()
+    pending_queue = OutboundQueue(Mock(), None, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
+    pending_queue.bind_metrics(metrics)
+    pending = pending_queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "pending"}, 1))
+    pending_queue.stop()
+    with pytest.raises(SchedulerStoppedError):
+        pending.result()
+
+    attempted = threading.Event()
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            attempted.set()
+            raise RetryAfter(60)
+
+    retry_queue = _queue(Sender(), worker_count=1)
+    retry_queue.bind_metrics(metrics)
+    metrics.register_outbound_queue_collectors(retry_queue, top_n=1)
+    retrying = retry_queue.enqueue(QueueRequest("send_message", (), {"chat_id": 987654, "text": "retry"}, 987654))
+    assert attempted.wait(1)
+    expected_retry = 'etm_outbound_retries_total{operation="send_message",reason="rate_limit"} 1.0'
+    deadline = time.monotonic() + 1
+    while expected_retry not in generate_latest(metrics.registry).decode() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert expected_retry in generate_latest(metrics.registry).decode()
+    retry_rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_destination_queue_depth{destination="rank_1"} 1.0' in retry_rendered
+    assert "987654" not in retry_rendered
+    retry_queue.stop()
+    with pytest.raises(SchedulerStoppedError):
+        retrying.result()
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_outcomes_total{operation="send_message",outcome="cancelled"} 2.0' in rendered
+    assert "987654" not in rendered
+
+
 def test_queue_rewinds_file_like_upload_before_retry_after():
     upload = io.BytesIO(b"image-bytes")
     received_uploads = []

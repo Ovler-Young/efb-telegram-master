@@ -20,6 +20,9 @@ _REMOVAL_OUTCOMES = frozenset({"submitted", "terminal_discard"})
 _COMPLETION_OUTCOMES = frozenset({"success", "failure"})
 _DISPATCH_OUTCOMES = frozenset({"submitted", "deferred", "failed"})
 _RETRY_REASONS = frozenset({"rate_limit", "membership", "worker_capacity"})
+_OUTBOUND_OUTCOMES = frozenset({"enqueued", "success", "failure", "attachment_failure", "cancelled", "rejected"})
+_OUTBOUND_RETRY_REASONS = frozenset({"rate_limit", "transport"})
+_OUTBOUND_SATURATION_REASONS = frozenset({"pending_capacity"})
 _FAILURE_STAGES = frozenset({"dispatch", "execution", "terminal"})
 _AUXILIARY_STATES = frozenset({"enabled", "disabled"})
 _MEMBERSHIP_CACHE_STATES = frozenset({"member", "not_member", "unknown_probe_pending"})
@@ -102,6 +105,30 @@ class Metrics:
             ["outcome"],
             registry=self.registry,
         )
+        self.outbound_outcomes = Counter(
+            f"{namespace}_outbound_outcomes_total",
+            "Outbound queue outcomes by operation.",
+            ["operation", "outcome"],
+            registry=self.registry,
+        )
+        self.outbound_retries = Counter(
+            f"{namespace}_outbound_retries_total",
+            "Outbound queue retries by operation and bounded reason.",
+            ["operation", "reason"],
+            registry=self.registry,
+        )
+        self.outbound_saturation = Counter(
+            f"{namespace}_outbound_saturation_total",
+            "Outbound queue admission rejections by bounded reason.",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.outbound_latency = Histogram(
+            f"{namespace}_outbound_latency_seconds",
+            "Elapsed outbound queue ownership time by operation and outcome.",
+            ["operation", "outcome"],
+            registry=self.registry,
+        )
         self.database_method_duration = Histogram(
             f"{namespace}_database_method_duration_seconds",
             "Elapsed seconds for a DatabaseManager method call.",
@@ -156,6 +183,17 @@ class Metrics:
 
     def record_membership_probe(self, outcome: str) -> None:
         self.membership_probes.labels(self._bounded(outcome, _MEMBERSHIP_PROBE_OUTCOMES, "membership probe outcome")).inc()
+
+    def record_outbound_outcome(self, operation: str, outcome: str, seconds: float) -> None:
+        labels = (self._operation(operation), self._bounded(outcome, _OUTBOUND_OUTCOMES, "outbound outcome"))
+        self.outbound_outcomes.labels(*labels).inc()
+        self.outbound_latency.labels(*labels).observe(self._non_negative(seconds, "outbound latency"))
+
+    def record_outbound_retry(self, operation: str, reason: str) -> None:
+        self.outbound_retries.labels(self._operation(operation), self._bounded(reason, _OUTBOUND_RETRY_REASONS, "outbound retry reason")).inc()
+
+    def record_outbound_saturation(self, reason: str) -> None:
+        self.outbound_saturation.labels(self._bounded(reason, _OUTBOUND_SATURATION_REASONS, "outbound saturation reason")).inc()
 
     def record_database_method_call(self, method: str, seconds: float, outcome: str) -> None:
         """Record one DatabaseManager call using only statically bounded method names."""
@@ -300,6 +338,7 @@ class Metrics:
 
     def register_outbound_queue_collectors(self, queue: OutboundQueue, top_n: int) -> None:
         """Register the outbound queue's bounded scrape snapshots."""
+        queue.bind_metrics(self)
 
         def destination_snapshot() -> Iterable[DestinationQueueSnapshot]:
             return (DestinationQueueSnapshot(destination, depth, oldest_age) for destination, depth, oldest_age in queue.destination_snapshot())
