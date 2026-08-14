@@ -485,7 +485,7 @@ class DatabaseManager:
             if not isinstance(primary_key, AutoField):
                 continue
             database.execute_sql(
-                f'SELECT setval(pg_get_serial_sequence({database.obj.param}, {database.obj.param}), '
+                f"SELECT setval(pg_get_serial_sequence({database.obj.param}, {database.obj.param}), "
                 f'COALESCE(MAX("{primary_key.column_name}"), 1), MAX("{primary_key.column_name}") IS NOT NULL) '
                 f'FROM "{model._meta.table_name}"',
                 (model._meta.table_name, primary_key.column_name),

@@ -1108,7 +1108,9 @@ def test_reaction_alternate_db_failures_preserve_then_update_canonical_row():
             with patch.object(MsgLog, "insert", wraps=MsgLog.insert) as insert:
                 with patch("peewee.ModelInsert.execute", side_effect=RuntimeError("db failed")) as execute:
                     with pytest.raises(RuntimeError, match="db failed"):
-                        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=failed_id), old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="800")
+                        manager.add_or_update_message_log(
+                            message, SimpleNamespace(chat_id=100, message_id=failed_id), old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="800"
+                        )
             assert insert.call_count == 1
             assert execute.call_count == 1
             row = MsgLog.get()

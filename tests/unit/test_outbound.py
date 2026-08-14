@@ -528,9 +528,7 @@ def test_shutdown_after_oversize_primary_cleans_owned_upload_without_queuing_att
 
     queue = _queue(Sender(), worker_count=1)
     try:
-        waiter = queue.enqueue(
-            QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1, cleanup=UploadCleanup((str(upload),)))
-        )
+        waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1, cleanup=UploadCleanup((str(upload),))))
         assert primary_started.wait(1)
         stopper = threading.Thread(target=queue.stop)
         stopper.start()
