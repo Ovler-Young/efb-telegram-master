@@ -19,6 +19,7 @@ from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler, MsgLogScanShutdownTimeout
+from efb_telegram_master.mtproto import MTProtoRetryableError
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
 
@@ -269,9 +270,9 @@ def test_association_reschedule_uses_persisted_request_when_another_worker_is_ru
         assert scheduler.stop(1) == ()
 
 
-def test_association_reschedule_recovers_a_stale_lease_and_completes_scan(tmp_path):
+def test_association_reschedule_queues_a_successor_after_active_lease_expires(tmp_path):
     first_fetch_started = threading.Event()
-    allow_stale_worker_to_exit = threading.Event()
+    allow_expired_worker_to_exit = threading.Event()
     fetches = 0
 
     class Associations:
@@ -295,7 +296,7 @@ def test_association_reschedule_recovers_a_stale_lease_and_completes_scan(tmp_pa
             fetches += 1
             if fetches == 1:
                 first_fetch_started.set()
-                await asyncio.to_thread(allow_stale_worker_to_exit.wait)
+                await asyncio.to_thread(allow_expired_worker_to_exit.wait)
             return [
                 SimpleNamespace(
                     id=1,
@@ -319,16 +320,13 @@ def test_association_reschedule_recovers_a_stale_lease_and_completes_scan(tmp_pa
         scan = ingestion.get_or_create_scan(100, 1)
         assert scheduler.schedule(100) == "started"
         assert first_fetch_started.wait(1)
+        assert scheduler.schedule_for_association(100) == "queued"
         MsgLogIngestionScan.update(
             status="running",
-            cursor=0,
-            rescan_requested=True,
             lease_expires_at=datetime.now() - timedelta(seconds=1),
         ).where(MsgLogIngestionScan.id == scan.id).execute()
 
-        assert scheduler.schedule_for_association(100) == "queued"
-        assert MsgLogIngestionScan.get_by_id(scan.id).lease_owner is None
-        allow_stale_worker_to_exit.set()
+        allow_expired_worker_to_exit.set()
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
@@ -337,7 +335,7 @@ def test_association_reschedule_recovers_a_stale_lease_and_completes_scan(tmp_pa
         recovered = MsgLogIngestionScan.get_by_id(scan.id)
         row = MsgLog.get_by_id("100.1")
     finally:
-        allow_stale_worker_to_exit.set()
+        allow_expired_worker_to_exit.set()
         assert scheduler.stop(1) == ()
         runtime.close()
         test_db.close()
@@ -345,7 +343,79 @@ def test_association_reschedule_recovers_a_stale_lease_and_completes_scan(tmp_pa
 
     assert (recovered.status, recovered.rescan_requested, recovered.lease_owner) == ("complete", False, None)
     assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
-    assert fetches == 2
+    assert fetches == 3
+
+
+def test_association_reschedule_queues_a_successor_after_retryable_error(tmp_path):
+    first_fetch_started = threading.Event()
+    allow_retryable_error = threading.Event()
+    fetches = 0
+
+    class Associations:
+        def get_topic_assoc_slave_uid(self, source_chat_id, topic_id):
+            assert (source_chat_id, topic_id) == (100, 10)
+            return "tests.slave target"
+
+    class MTProto:
+        enabled = True
+        config = SimpleNamespace(scan_ceiling=1)
+
+        async def connect(self):
+            return None
+
+        async def get_input_channel(self, source_chat_id):
+            return source_chat_id
+
+        async def get_channel_messages(self, _channel, message_ids):
+            nonlocal fetches
+            assert message_ids == [1]
+            fetches += 1
+            if fetches == 1:
+                first_fetch_started.set()
+                await asyncio.to_thread(allow_retryable_error.wait)
+                raise MTProtoRetryableError("temporary")
+            return [
+                SimpleNamespace(
+                    id=1,
+                    message="message 1",
+                    date=None,
+                    reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
+                    action=None,
+                    media=None,
+                )
+            ]
+
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "msglog.db")
+    database.initialize(test_db)
+    test_db.connect()
+    ingestion = MsgLogIngestionRepository("tests.master")
+    runtime = SharedAsyncRuntime()
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        scan = ingestion.get_or_create_scan(100, 1)
+        assert scheduler.schedule(100) == "started"
+        assert first_fetch_started.wait(1)
+        assert scheduler.schedule_for_association(100) == "queued"
+        allow_retryable_error.set()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
+                break
+            time.sleep(0.01)
+        recovered = MsgLogIngestionScan.get_by_id(scan.id)
+        row = MsgLog.get_by_id("100.1")
+    finally:
+        allow_retryable_error.set()
+        assert scheduler.stop(1) == ()
+        runtime.close()
+        test_db.close()
+        database.initialize(original_database)
+
+    assert (recovered.status, recovered.rescan_requested, recovered.lease_owner) == ("complete", False, None)
+    assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
+    assert fetches == 3
 
 
 def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():

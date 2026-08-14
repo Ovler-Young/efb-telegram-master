@@ -50,7 +50,9 @@ class MsgLogScanScheduler:
             if scan_status is None:
                 return "unchanged"
             if scan_status == "running":
-                return "queued"
+                if source_chat_id not in self._threads:
+                    return "queued"
+                return self._schedule_locked(source_chat_id, queue_after_active=True)
             return self._schedule_locked(source_chat_id, queue_after_active=scan_status == "pending")
 
     def _schedule_locked(self, source_chat_id: int, *, queue_after_active: bool = False, reset_before_run: bool = False) -> str:
