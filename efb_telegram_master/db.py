@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import tempfile
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
@@ -259,6 +260,12 @@ class DatabaseManager:
             return {"isoformat": isoformat()}
         return {"string": str(value)}
 
+    @staticmethod
+    def _sqlite_dict_row_values(row: object, column_names: tuple[str, ...]) -> tuple[object, ...]:
+        if not isinstance(row, Mapping):
+            raise TypeError("Peewee dictionary query returned a non-mapping row.")
+        return tuple(row[column_name] for column_name in column_names)
+
     @classmethod
     def _sqlite_source_snapshot(cls, source_database, models: tuple[type[Model], ...]) -> _SQLiteImportSnapshot:
         table_names = set(source_database.get_tables())
@@ -272,7 +279,7 @@ class DatabaseManager:
                 source_columns = {column.name for column in source_database.get_columns(model._meta.table_name)}
                 fields = tuple(field for field in model._meta.sorted_fields if field.column_name in source_columns)
                 column_names = tuple(field.column_name for field in fields)
-                rows = tuple(tuple(row[column_name] for column_name in column_names) for row in model.select(*fields).dicts())
+                rows = tuple(DatabaseManager._sqlite_dict_row_values(row, column_names) for row in model.select(*fields).dicts())
             projections.append(_SQLiteSourceProjection(model, column_names, rows))
             serialized_projections.append(
                 {
@@ -324,7 +331,10 @@ class DatabaseManager:
                 for field in projection.model._meta.sorted_fields
                 if field.column_name in projection.column_names
             ]
-            target_rows = tuple(tuple(row[column_name] for column_name in projection.column_names) for row in projection.model.select(*fields).dicts())
+            target_rows = tuple(
+                DatabaseManager._sqlite_dict_row_values(row, projection.column_names)
+                for row in projection.model.select(*fields).dicts()
+            )
             if serialized_rows(target_rows) != serialized_rows(projection.rows):
                 return False
         return True
