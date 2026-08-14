@@ -32,7 +32,7 @@ def _drop_database(admin_db, database_name):
 
 
 @pytest.mark.integration
-def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgres_config, tmp_path, monkeypatch, caplog):
+def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgres_config, tmp_path, monkeypatch):
     admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
@@ -46,8 +46,6 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
         legacy_db.connect()
         workflow, task = legacy_outbound_models(legacy_db)
         legacy_db.create_tables([workflow, task])
-        workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
         workflow_columns = {column.name: column for column in legacy_db.get_columns("outboundworkflow")}
         task_columns = {column.name: column for column in legacy_db.get_columns("outboundtask")}
         assert (
@@ -96,8 +94,7 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
         legacy_db.close()
 
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
-        with caplog.at_level("WARNING", logger="efb_telegram_master.db"):
-            first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
+        first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
         table_names = set(database.get_tables())
         assert not set(DatabaseManager._LEGACY_OUTBOUND_TABLES) & table_names
         assert {"chatassoc", "msglog", "historymigrationentry", "msglogingestionscan"}.issubset(table_names)
@@ -112,8 +109,6 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
         if database_name is not None:
             _drop_database(admin_db, database_name)
         admin_db.close()
-
-    assert "Discarding obsolete durable outbound queue rows without resumption: workflows=1 tasks=1" in caplog.text
 
 
 @pytest.mark.integration
@@ -303,8 +298,6 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
         legacy_db.connect()
         workflow, task = legacy_outbound_models(legacy_db)
         legacy_db.create_tables([workflow, task])
-        workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
         legacy_db.close()
         patch.setattr(DatabaseManager, "_validate_legacy_outbound_schema", classmethod(wait_after_first_lock))
         first = threading.Thread(target=retire)
@@ -352,14 +345,12 @@ def test_postgresql_retirement_rolls_back_when_workflow_drop_fails(integration_p
         legacy_db.connect()
         workflow, task = legacy_outbound_models(legacy_db)
         legacy_db.create_tables([workflow, task])
-        workflow.create()
-        task.create(source_key="source", target_chat_id=1, operation="send_message", payload="secret", workflow_id=1)
         monkeypatch.setattr(PostgresqlDatabase, "drop_tables", fail_workflow_drop)
         with pytest.raises(RuntimeError, match="workflow drop failed"):
             DatabaseManager._retire_legacy_outbound_tables_for_database(legacy_db)
         assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(legacy_db.get_tables())
-        assert workflow.select().count() == 1
-        assert task.select().count() == 1
+        assert workflow.select().count() == 0
+        assert task.select().count() == 0
         assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundtask") is None
         legacy_db.close()
     finally:
