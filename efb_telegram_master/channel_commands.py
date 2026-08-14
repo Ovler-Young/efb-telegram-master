@@ -301,16 +301,21 @@ def load_channel_config(channel_id: ModuleID, translate: Callable[[str], str]) -
     if mtproto_config.enabled and not data["token"]:
         raise ValueError(translate("MTProto requires a non-empty Telegram bot token"))
     admins = data.get("admins")
-    if isinstance(admins, int):
+    if type(admins) is int:
         admins = [admins]
     if isinstance(admins, str) and admins.isdigit():
         admins = [int(admins)]
     if not isinstance(admins, list) or not admins:
         raise ValueError(translate("Admins' user IDs must be a list of one number or more."))
     data["admins"] = [int(admin) if isinstance(admin, str) and admin.isdigit() else admin for admin in admins]
-    if not all(isinstance(admin, int) for admin in data["admins"]):
-        invalid = next(admin for admin in data["admins"] if not isinstance(admin, int))
+    if not all(type(admin) is int for admin in data["admins"]):
+        invalid = next(admin for admin in data["admins"] if type(admin) is not int)
         raise ValueError(translate("Admin ID is expected to be an int, but {data} is found.").format(data=invalid))
+    for section in ("database", "flags", "rpc"):
+        if section in data and not isinstance(data[section], Mapping):
+            raise ValueError(translate("{section} must be a mapping.").format(section=section))
+        if section in data:
+            data[section] = dict(data[section])
     auxiliary_bots = data.get("auxiliary_bots", [])
     if not isinstance(auxiliary_bots, list):
         raise ValueError(translate("auxiliary_bots must be a list."))

@@ -935,6 +935,22 @@ def test_metrics_configuration_defaults_and_disables_invalid_endpoint_options() 
     assert logger.warning.call_count == 2
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("top_n", True, (20, ("127.0.0.1", 9101))),
+        ("top_n", False, (20, ("127.0.0.1", 9101))),
+        ("port", True, (20, None)),
+        ("port", False, (20, None)),
+    ],
+)
+def test_metrics_configuration_rejects_boolean_numeric_values(field, value, expected) -> None:
+    logger = Mock()
+
+    assert parse_metrics_config({field: value}, logger) == expected
+    logger.warning.assert_called_once()
+
+
 def test_channel_dispatch_stops_when_the_runtime_stop_signal_is_set() -> None:
     channel = TelegramChannel.__new__(TelegramChannel)
     channel._stop_polling_called = False

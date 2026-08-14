@@ -263,6 +263,26 @@ def test_load_channel_config_rejects_too_many_auxiliary_bots(tmp_path, monkeypat
         load_channel_config("tests.channel", str)
 
 
+def test_load_channel_config_rejects_boolean_admin_id(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text('token: "main"\nadmins: [true]\n')
+    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+
+    with pytest.raises(ValueError, match="Admin ID is expected to be an int"):
+        load_channel_config("tests.channel", str)
+
+
+@pytest.mark.parametrize("section", ["database", "flags", "rpc"])
+@pytest.mark.parametrize("value", ["null", "[]"])
+def test_load_channel_config_rejects_non_mapping_runtime_sections(tmp_path, monkeypatch, section: str, value: str) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f'token: "main"\nadmins: [1]\n{section}: {value}\n')
+    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+
+    with pytest.raises(ValueError, match=f"{section} must be a mapping"):
+        load_channel_config("tests.channel", str)
+
+
 def test_load_channel_config_defaults_outbound_pending_limit(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text('token: "main"\nadmins: [1]\n')

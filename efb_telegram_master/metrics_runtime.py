@@ -23,7 +23,10 @@ def parse_metrics_config(metrics_cfg: object, logger: Any) -> tuple[int, tuple[s
         logger.warning("Invalid metrics config type %s; Prometheus endpoint disabled.", type(metrics_cfg).__name__)
         return top_n, None
     try:
-        parsed_top_n = int(metrics_cfg.get("top_n", top_n))
+        raw_top_n = metrics_cfg.get("top_n", top_n)
+        if isinstance(raw_top_n, bool):
+            raise ValueError
+        parsed_top_n = int(raw_top_n)
         if parsed_top_n < 0:
             raise ValueError
         top_n = parsed_top_n
@@ -34,7 +37,10 @@ def parse_metrics_config(metrics_cfg: object, logger: Any) -> tuple[int, tuple[s
         logger.warning("Invalid metrics host type %s; Prometheus endpoint disabled.", type(host).__name__)
         return top_n, None
     try:
-        port = int(metrics_cfg.get("port", 9101))
+        raw_port = metrics_cfg.get("port", 9101)
+        if isinstance(raw_port, bool):
+            raise ValueError
+        port = int(raw_port)
         if not 0 <= port <= 65535:
             raise ValueError
     except (TypeError, ValueError):
