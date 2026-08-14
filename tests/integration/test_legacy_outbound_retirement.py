@@ -7,7 +7,7 @@ from peewee import PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, TopicAssoc, database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
 from tests.support.legacy_outbound_schema import legacy_outbound_models
 
 
@@ -244,7 +244,7 @@ def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_
     source_path = tmp_path / "tgdata.db"
     migrated_path = source_path.with_suffix(".db.migrated")
     source_db = SqliteDatabase(source_path)
-    models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan)
+    models = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery)
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         source_db.connect()
