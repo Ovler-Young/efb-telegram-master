@@ -163,7 +163,7 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
     assert row.slave_message_id == "mtproto-ingested:100.500"
 
 
-def test_completed_ingestion_scan_reset_rejects_active_leases():
+def test_association_rescan_resets_completed_scans_and_marks_active_leases():
     original_database = database.obj
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
@@ -174,13 +174,14 @@ def test_completed_ingestion_scan_reset_rejects_active_leases():
         scan = manager.get_or_create_scan(100, 500)
         MsgLogIngestionScan.update(cursor=0, existing_streak=500, scanned_count=500, status="complete").where(MsgLogIngestionScan.id == scan.id).execute()
 
-        assert manager.reset_completed_scan(100) is True
+        assert manager.request_association_rescan(100) == "pending"
         reset = MsgLogIngestionScan.get_by_id(scan.id)
         assert (reset.status, reset.cursor, reset.existing_streak, reset.scanned_count) == ("pending", 500, 0, 0)
 
         assert manager.claim_scan(100, "worker-a", 60) is not None
-        assert manager.reset_completed_scan(100) is False
-        assert MsgLogIngestionScan.get_by_id(scan.id).status == "running"
+        assert manager.request_association_rescan(100) == "running"
+        running = MsgLogIngestionScan.get_by_id(scan.id)
+        assert (running.status, running.rescan_requested) == ("running", True)
     finally:
         test_db.close()
         database.initialize(original_database)

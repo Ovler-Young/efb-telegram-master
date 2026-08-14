@@ -38,16 +38,6 @@ class FakeDatabase:
         self.claims.append((source_chat_id, lease_owner, lease_seconds))
         return self.scan if self.scan.status != "complete" else None
 
-    def reset_completed_scan(self, source_chat_id):
-        assert source_chat_id == 100
-        if self.scan.status != "complete":
-            return False
-        self.scan.cursor = self.scan.scan_boundary
-        self.scan.existing_streak = 0
-        self.scan.status = "pending"
-        self.scan.error = None
-        return True
-
     def persist_item(self, scan, *, source_message_id, classification, slave_uid=None, message=None, lease_owner):
         self.persisted.append((source_message_id, classification, slave_uid, message))
         scan.cursor = source_message_id - 1
@@ -160,7 +150,10 @@ def test_completed_unbound_topic_is_ingested_once_after_association_rescan():
     assert db.persisted == [(1, "unbound-topic", None, None)]
 
     db.chat_associations.associations[10] = "tests.linked-slave"
-    assert db.reset_completed_scan(100) is True
+    db.scan.cursor = db.scan.scan_boundary
+    db.scan.existing_streak = 0
+    db.scan.status = "pending"
+    db.scan.error = None
     asyncio.run(service.run(100, lease_owner="worker-b"))
 
     eligible = [entry for entry in db.persisted if entry[1] == "eligible"]
