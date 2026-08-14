@@ -34,7 +34,7 @@ class SlaveMessageDeliveryRepository(ObservedRepository):
                     (SlaveMessageDelivery.slave_origin_uid == slave_origin_uid)
                     & (SlaveMessageDelivery.slave_message_id == slave_message_id)
                     & (SlaveMessageDelivery.state == "pending")
-                    & (SlaveMessageDelivery.lease_expires_at <= now)
+                    & (SlaveMessageDelivery.lease_expires_at.is_null(True) | (SlaveMessageDelivery.lease_expires_at <= now))
                 )
                 .execute()
                 == 1
