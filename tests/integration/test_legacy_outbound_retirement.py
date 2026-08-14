@@ -112,6 +112,49 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
 
 
 @pytest.mark.integration
+def test_postgresql_startup_preserves_non_empty_legacy_outbound_tables(integration_postgres_config, tmp_path, monkeypatch):
+    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
+    admin_db.connect()
+    admin_db.connection().autocommit = True
+    original_database = database.obj
+    database_name = None
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
+        legacy_db.connect()
+        workflow, task = legacy_outbound_models(legacy_db)
+        legacy_db.create_tables([workflow, task])
+        workflow.create()
+        task.create(
+            source_key="source",
+            target_chat_id=1,
+            operation="send_message",
+            payload="durable payload",
+            workflow_id=1,
+        )
+        legacy_db.close()
+
+        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
+        with pytest.raises(RuntimeError, match="Legacy durable outbound data detected: automatic replay is disabled"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-non-empty-legacy", config=config))
+        assert database.is_closed()
+
+        preserved_db = PostgresqlDatabase(database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"})
+        preserved_db.connect()
+        try:
+            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(preserved_db.get_tables())
+            assert preserved_db.execute_sql("SELECT state FROM outboundworkflow").fetchone() == ("active",)
+            assert preserved_db.execute_sql("SELECT payload FROM outboundtask").fetchone() == ("durable payload",)
+        finally:
+            preserved_db.close()
+    finally:
+        database.initialize(original_database)
+        if database_name is not None:
+            _drop_database(admin_db, database_name)
+        admin_db.close()
+
+
+@pytest.mark.integration
 def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_archive(integration_postgres_config, tmp_path, monkeypatch):
     admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
     admin_db.connect()
