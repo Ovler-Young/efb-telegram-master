@@ -86,17 +86,18 @@ class SlaveMessageService:
         if key is None or owner_token is None:
             yield
             return
-        stopped = threading.Event()
+        stopped, ownership_lost = threading.Event(), threading.Event()
 
         def renew() -> None:
             while not stopped.wait(self.CLAIM_RENEW_INTERVAL):
                 if not self.delivery_claims.renew(*key, owner_token):
+                    ownership_lost.set()
                     return
 
         worker = threading.Thread(target=renew, daemon=True, name="SlaveMessageClaimRenewal")
         worker.start()
         try:
-            yield
+            yield ownership_lost
         finally:
             stopped.set()
             worker.join(timeout=1)
@@ -191,8 +192,18 @@ class SlaveMessageService:
                 msg.vendor_specific = msg.vendor_specific or {}
                 msg.vendor_specific["_sender_bot_id"] = _edit_sender_bot_id
 
-            with self._renew_delivery_claim(dedupe_key, claim_token):
-                self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent, dedupe_key=dedupe_key, claim_token=claim_token)
+            with self._renew_delivery_claim(dedupe_key, claim_token) as ownership_lost:
+                self.dispatch_message(
+                    msg,
+                    msg_template,
+                    old_msg_id,
+                    tg_dest,
+                    thread_id,
+                    silent,
+                    dedupe_key=dedupe_key,
+                    claim_token=claim_token,
+                    ownership_lost=ownership_lost,
+                )
         except Exception as e:
             if pending_claimed:
                 self._release_pending_slave_message(dedupe_key, claim_token)
@@ -222,6 +233,7 @@ class SlaveMessageService:
         silent: bool = False,
         dedupe_key: Optional[Tuple[str, str]] = None,
         claim_token: Optional[str] = None,
+        ownership_lost: Optional[threading.Event] = None,
         database_old_msg_id: Optional[OldMsgID] = None,
         target_msg_id_override: Optional[TelegramMessageID] = None,
     ):
@@ -292,6 +304,10 @@ class SlaveMessageService:
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. This may happen during shutdown or when Telegram API is unavailable.", xid)
             self._release_pending_slave_message(dedupe_key, claim_token)
+            return
+
+        if ownership_lost is not None and ownership_lost.is_set():
+            self.logger.warning("[%s] Delivery claim ownership was lost before post-send processing.", xid)
             return
 
         self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.", xid, tg_msg.chat.id, tg_msg.message_id)
