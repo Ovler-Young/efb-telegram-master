@@ -93,7 +93,7 @@ def _dedupe_processor() -> SlaveMessageService:
     processor.is_silent = Mock(return_value=False)
     processor.dispatch_message = Mock()
     processor.delivery_claims = Mock()
-    processor.delivery_claims.claim.return_value = "claim-token"
+    processor.delivery_claims.claim.return_value = True
     return processor
 
 
@@ -253,19 +253,19 @@ def test_new_slave_message_claims_durable_dedupe_without_msglog_lookup() -> None
     assert processor.send_message(message) is message
     processor.delivery_claims.claim.assert_called_once_with("tests.slave chat", "message")
     processor.msglogs.get_msg_log.assert_not_called()
-    processor.dispatch_message.assert_called_once_with(message, "template", None, 123, None, False, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token")
+    processor.dispatch_message.assert_called_once_with(message, "template", None, 123, None, False, dedupe_key=("tests.slave chat", "message"))
 
 
 def test_pending_duplicate_and_muted_message_do_not_dispatch() -> None:
     processor = _dedupe_processor()
-    processor.delivery_claims.claim.return_value = None
+    processor.delivery_claims.claim.return_value = False
     assert processor.send_message(_message()) is not None
     processor.dispatch_message.assert_not_called()
 
     processor = _dedupe_processor()
     processor.is_silent.return_value = None
     assert processor.send_message(_message()) is not None
-    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message")
     processor.dispatch_message.assert_not_called()
 
 
@@ -274,7 +274,7 @@ def test_destination_mapping_failure_releases_the_pending_dedupe_claim() -> None
     processor.router.route.side_effect = RuntimeError("database unavailable")
 
     assert processor.send_message(_message()) is not None
-    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message")
     processor.dispatch_message.assert_not_called()
 
 
@@ -298,10 +298,10 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
         author=SimpleNamespace(module_id="tests.slave"),
     )
     with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()), patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"):
-        processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token")
+        processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"))
 
     processor.msglogs.add_or_update_message_log.assert_called_once()
-    processor.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message")
     processor.logger.warning.assert_called_once_with(
         "DB write failed for Telegram message %s; dropping mapping (%s).",
         7,
