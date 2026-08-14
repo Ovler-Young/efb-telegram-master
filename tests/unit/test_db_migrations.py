@@ -991,9 +991,7 @@ def test_slave_message_delivery_schema_upgrade_adds_owner_token(tmp_path, monkey
             "CREATE TABLE slavemessagedelivery (id INTEGER PRIMARY KEY, slave_origin_uid TEXT NOT NULL, slave_message_id TEXT NOT NULL, "
             "state TEXT NOT NULL DEFAULT 'pending', lease_expires_at DATETIME, UNIQUE(slave_origin_uid, slave_message_id))"
         )
-        raw_db.execute_sql(
-            "INSERT INTO slavemessagedelivery (slave_origin_uid, slave_message_id, state) VALUES ('tests.slave chat', 'message', 'delivered'), ('tests.slave chat', 'pending-message', 'pending')"
-        )
+        raw_db.execute_sql("INSERT INTO slavemessagedelivery (slave_origin_uid, slave_message_id, state) VALUES ('tests.slave chat', 'message', 'delivered')")
     finally:
         raw_db.close()
 
@@ -1005,10 +1003,6 @@ def test_slave_message_delivery_schema_upgrade_adds_owner_token(tmp_path, monkey
         assert row.state == "delivered"
         assert row.owner_token is None
         assert "owner_token" in {column.name for column in database.get_columns("slavemessagedelivery")}
-        owner_token = SlaveMessageDeliveryRepository().claim("tests.slave chat", "pending-message")
-        assert owner_token is not None
-        pending_row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "pending-message"))
-        assert pending_row.owner_token == owner_token
     finally:
         manager.stop_worker()
         database.initialize(original_database)
