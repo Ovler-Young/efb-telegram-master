@@ -7,9 +7,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
-from pathlib import Path
-from socket import socket
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from typing import Coroutine, Literal, Optional, ParamSpec, TypedDict, TypeVar, cast
 
 import telegram
@@ -39,90 +37,6 @@ class _BotArguments(TypedDict):
     get_updates_request: HTTPXRequest
     base_url: NotRequired[str]
     base_file_url: NotRequired[str]
-
-
-class _WebhookStartArguments(TypedDict, total=False):
-    listen: str
-    port: int
-    url_path: str
-    cert: str | Path
-    key: str | Path
-    bootstrap_retries: int
-    webhook_url: str | None
-    allowed_updates: Sequence[str] | None
-    ip_address: str | None
-    max_connections: int
-    secret_token: str | None
-    unix: str | Path | socket | None
-
-
-def _webhook_start_arguments(config: Mapping[str, object]) -> _WebhookStartArguments:
-    arguments: _WebhookStartArguments = {}
-    if unexpected := set(config).difference(
-        ("listen", "port", "url_path", "cert", "key", "bootstrap_retries", "webhook_url", "allowed_updates", "ip_address", "max_connections", "secret_token", "unix")
-    ):
-        raise ValueError(f"webhook.start_webhook contains unsupported option(s): {', '.join(sorted(unexpected))}")
-
-    for name in ("listen", "url_path"):
-        value = config.get(name)
-        if value is not None:
-            if not isinstance(value, str):
-                raise ValueError(f"webhook.start_webhook.{name} must be a string")
-            if name == "listen":
-                arguments["listen"] = value
-            else:
-                arguments["url_path"] = value
-    for name in ("port", "bootstrap_retries", "max_connections"):
-        value = config.get(name)
-        if value is not None:
-            if not isinstance(value, int):
-                raise ValueError(f"webhook.start_webhook.{name} must be an integer")
-            if name == "port":
-                arguments["port"] = value
-            elif name == "bootstrap_retries":
-                arguments["bootstrap_retries"] = value
-            else:
-                arguments["max_connections"] = value
-    for name in ("cert", "key"):
-        value = config.get(name)
-        if value is not None:
-            if not isinstance(value, (str, Path)):
-                raise ValueError(f"webhook.start_webhook.{name} must be a string or path")
-            if name == "cert":
-                arguments["cert"] = value
-            else:
-                arguments["key"] = value
-    for name in ("webhook_url", "ip_address", "secret_token"):
-        value = config.get(name)
-        if value is not None:
-            if not isinstance(value, str):
-                raise ValueError(f"webhook.start_webhook.{name} must be a string or null")
-            if name == "webhook_url":
-                arguments["webhook_url"] = value
-            elif name == "ip_address":
-                arguments["ip_address"] = value
-            else:
-                arguments["secret_token"] = value
-    if "allowed_updates" in config:
-        allowed_updates = config["allowed_updates"]
-        if allowed_updates is None:
-            arguments["allowed_updates"] = None
-        elif isinstance(allowed_updates, Sequence) and not isinstance(allowed_updates, str):
-            values: list[str] = []
-            for value in allowed_updates:
-                if not isinstance(value, str):
-                    raise ValueError("webhook.start_webhook.allowed_updates must contain strings")
-                values.append(value)
-            arguments["allowed_updates"] = values
-        else:
-            raise ValueError("webhook.start_webhook.allowed_updates must be a sequence or null")
-    if "unix" in config:
-        unix = config["unix"]
-        if unix is None or isinstance(unix, (str, Path, socket)):
-            arguments["unix"] = unix
-        else:
-            raise ValueError("webhook.start_webhook.unix must be a string, path, socket, or null")
-    return arguments
 
 
 def build_request(request_kwargs: Mapping[str, object]) -> HTTPXRequest:
@@ -284,12 +198,12 @@ class TelegramPollingRuntime:
             self.logger.exception("Telegram post-shutdown hook failed", extra={"event": "telegram_runtime.post_shutdown_failed", "error_type": type(error).__name__})
 
     def poll(self, drop_pending_updates: bool = False, timeout: int = 10) -> None:
-        start_webhook: _WebhookStartArguments | None = None
+        start_webhook: Mapping[str, object] | None = None
         if self._webhook is not None:
             configured_webhook = self._webhook.get("start_webhook")
             if not isinstance(configured_webhook, Mapping):
                 raise ValueError("webhook.start_webhook must be a mapping")
-            start_webhook = _webhook_start_arguments(configured_webhook)
+            start_webhook = configured_webhook
         with self._stop_lock:
             self._shutdown_complete.clear()
             self._lifecycle_active = True
@@ -297,7 +211,7 @@ class TelegramPollingRuntime:
             self.logger.info("Telegram webhook runtime starting", extra={"event": "telegram_runtime.webhook_start"})
             try:
                 self.application.run_webhook(
-                    **start_webhook,
+                    **dict(start_webhook),
                     drop_pending_updates=drop_pending_updates,
                     close_loop=True,
                     stop_signals=None,
@@ -386,7 +300,7 @@ def build_telegram_polling_runtime(
         async_runtime,
         on_started,
         on_stopped,
-        webhook if isinstance(webhook, Mapping) else None,
+        cast(Mapping[str, object], webhook) if isinstance(webhook, Mapping) else None,
     )
 
     async def post_init(application: Application) -> None:
