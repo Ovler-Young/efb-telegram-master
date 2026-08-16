@@ -370,11 +370,18 @@ def test_association_rescan_resets_completed_scans_and_marks_active_leases():
     try:
         test_db.create_tables([MsgLogIngestionScan])
         scan = manager.get_or_create_scan(100, 500)
-        MsgLogIngestionScan.update(cursor=0, existing_streak=500, scanned_count=500, status="complete").where(MsgLogIngestionScan.id == scan.id).execute()
+        MsgLogIngestionScan.update(
+            cursor=0,
+            existing_streak=500,
+            scanned_count=500,
+            status="complete",
+            lease_owner="stale-worker",
+            lease_expires_at=datetime.now() - timedelta(seconds=1),
+        ).where(MsgLogIngestionScan.id == scan.id).execute()
 
         assert manager.request_association_rescan(100) == "pending"
         reset = MsgLogIngestionScan.get_by_id(scan.id)
-        assert (reset.status, reset.cursor, reset.existing_streak, reset.scanned_count) == ("pending", 500, 0, 0)
+        assert (reset.status, reset.cursor, reset.existing_streak, reset.scanned_count, reset.lease_owner, reset.lease_expires_at) == ("pending", 500, 0, 0, None, None)
 
         assert manager.claim_scan(100, "worker-a", 60) is not None
         assert manager.request_association_rescan(100) == "running"

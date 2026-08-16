@@ -1,6 +1,6 @@
 import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from ehforwarderbot.types import ChatID
 from peewee import IntegrityError
@@ -8,6 +8,9 @@ from peewee import IntegrityError
 from .database_observability import ObservedRepository, observe_database_method
 from .models import UTC_LEASE_CLOCK, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database, utc_now_naive
 from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
+
+if TYPE_CHECKING:
+    from .msglog_ingestion import IngestedMsgLog
 
 
 class MsgLogIngestionCompletion(str, Enum):
@@ -90,7 +93,7 @@ class MsgLogIngestionRepository(ObservedRepository):
             scan = query.for_update().get_or_none() if supports_for_update else query.get_or_none()
             if scan is None:
                 return None
-            if scan.status == "complete" and scan.lease_owner is None and scan.lease_expires_at is None:
+            if scan.status == "complete":
                 self._reset_for_association_rescan(scan)
             elif scan.status == "running":
                 if scan.lease_owner is not None and not self._lease_expired(scan, utc_now, now):
@@ -102,7 +105,7 @@ class MsgLogIngestionRepository(ObservedRepository):
             return scan.status
 
     def persist_item(
-        self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional[object] = None, lease_owner: str
+        self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional["IngestedMsgLog"] = None, lease_owner: str
     ) -> str:
         now = datetime.datetime.now()
         utc_now = utc_now_naive()
@@ -130,16 +133,16 @@ class MsgLogIngestionRepository(ObservedRepository):
                     outcome = "existing"
                 else:
                     slave_channel_id, _, _ = chat_id_str_to_id(slave_uid)
-                    source_time = getattr(message, "time", None)
+                    source_time = message.time
                     MsgLog.create(
                         master_msg_id=master_msg_id,
                         slave_message_id=f"mtproto-ingested:{master_msg_id}",
-                        text=str(getattr(message, "text")),
+                        text=str(message.text),
                         slave_origin_uid=str(slave_uid),
                         slave_member_uid=str(chat_id_to_str(slave_channel_id, ChatID("__self__"))),
-                        media_type=str(getattr(message, "media_type")),
-                        mime=getattr(message, "mime"),
-                        msg_type=str(getattr(message, "msg_type")),
+                        media_type=str(message.media_type),
+                        mime=message.mime,
+                        msg_type=str(message.msg_type),
                         sent_to=self.channel_id,
                         provenance="mtproto_ingested",
                         time=source_time if isinstance(source_time, datetime.datetime) else utc_now_naive(),

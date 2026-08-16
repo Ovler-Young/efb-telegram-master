@@ -515,7 +515,7 @@ class DatabaseManager:
         placeholder = database.obj.param
         return (
             database.execute_sql(
-                f' SELECT 1 FROM "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" WHERE snapshot_identity = {placeholder}',
+                f'SELECT 1 FROM "{cls._SQLITE_IMPORT_PROVENANCE_TABLE}" WHERE snapshot_identity = {placeholder}',
                 (snapshot.identity,),
             ).fetchone()
             is not None
@@ -685,8 +685,6 @@ class DatabaseManager:
             return "none"
         if normalized_default == "current_timestamp":
             return "current_timestamp"
-        if expected_category != "auto_pk" or column_name != "id" or not primary_key or data_type != "integer":
-            return f"invalid:{normalized_default}"
         return f"invalid:{normalized_default}"
 
     @classmethod

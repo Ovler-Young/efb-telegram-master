@@ -271,6 +271,35 @@ def test_association_reschedule_uses_persisted_request_when_another_worker_is_ru
         assert scheduler.stop(1) == ()
 
 
+@pytest.mark.parametrize(
+    ("enabled", "stop_during_request", "expected"),
+    [(False, False, "unavailable"), (True, True, "stopping")],
+    ids=["unavailable", "stopping"],
+)
+def test_association_reschedule_preserves_running_admission_result(enabled, stop_during_request, expected):
+    class Runtime:
+        def call(self, coroutine, timeout=None):
+            coroutine.close()
+
+    ingestion = SimpleNamespace(
+        request_association_rescan=Mock(return_value="running"),
+        release_scan=Mock(),
+    )
+    scheduler = MsgLogScanScheduler(
+        SimpleNamespace(async_runtime=Runtime()),
+        SimpleNamespace(enabled=enabled, config=SimpleNamespace(scan_ceiling=10)),
+        ingestion,
+        Mock(),
+        Mock(),
+    )
+    if stop_during_request:
+        ingestion.request_association_rescan.side_effect = lambda _source_chat_id: (setattr(scheduler, "_stopping", True), "running")[1]
+    try:
+        assert scheduler.schedule_for_association(100) == expected
+    finally:
+        assert scheduler.stop(1) == ()
+
+
 def test_association_reschedule_queues_a_successor_after_active_lease_expires(tmp_path):
     first_fetch_started = threading.Event()
     allow_expired_worker_to_exit = threading.Event()
