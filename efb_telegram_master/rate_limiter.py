@@ -89,7 +89,12 @@ class SlidingWindowRateLimiter:
             return bool(limiter.try_acquire(str(chat_id), blocking=False))
 
     def try_acquire(self, chat_id: int) -> bool:
-        """Acquire global capacity before bot-chat capacity without rollback."""
+        """Acquire global capacity before bot-chat capacity without rollback.
+
+        A rejected chat admission consumes one global slot. That loss is capped
+        at 28 slots per one-second global window; each chat remains capped at
+        18 admissions per 60 seconds.
+        """
         if not self.try_acquire_global():
             return False
         return self.try_acquire_chat(chat_id)

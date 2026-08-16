@@ -73,15 +73,18 @@ def test_acquisition_uses_monotonic_clock_not_wall_clock(monkeypatch) -> None:
     assert limiter.global_delay() == 0.0
 
 
-def test_global_acquisition_precedes_chat_and_is_not_returned_after_chat_failure() -> None:
+def test_global_acquisition_precedes_chat_and_loses_at_most_one_slot_per_chat_failure() -> None:
     clock = MonotonicClock()
     limiter = _make_limiter(clock)
 
     for _ in range(18):
         assert limiter.try_acquire_chat(100)
 
+    for _ in range(28):
+        assert not limiter.try_acquire(100)
+
+    assert limiter.get_counts(100) == (18, 28)
     assert not limiter.try_acquire(100)
-    assert limiter.get_counts(100) == (18, 1)
 
 
 def test_limiter_state_resets_on_process_restart() -> None:
