@@ -312,11 +312,10 @@ class TelegramBotManager:
                 scan_errors.append(error)
         errors = list(self.api.begin_delivery_shutdown(deadline))
         errors.extend(scan_errors)
-        if not scan_errors:
-            try:
-                self.telegram_runtime.stop(deadline)
-            except BaseException as error:
-                errors.append(error)
+        try:
+            self.telegram_runtime.stop(deadline)
+        except BaseException as error:
+            errors.append(error)
         final_membership_errors = self.api.finish_delivery_shutdown(deadline)
         if final_membership_errors:
             errors.extend(final_membership_errors)

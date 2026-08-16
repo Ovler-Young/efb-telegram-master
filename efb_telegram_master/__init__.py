@@ -191,6 +191,7 @@ class TelegramChannel(MasterChannel):
         errors.extend(self._stop_resource("bot_manager", "stop_channel_resources", deadline))
         final_history_errors = self._stop_resource("history_replay", "stop", deadline) if initial_history_errors else ()
         if final_history_errors:
+            errors.extend(initial_history_errors)
             errors.extend(final_history_errors)
         if errors:
             return tuple(errors)
@@ -271,11 +272,11 @@ class TelegramChannel(MasterChannel):
                 self.logger.warning("Master message worker did not stop before the deadline", extra={"event": "telegram_channel.master_message_shutdown_timeout"})
                 raise TelegramResourceShutdownError(master_errors)
             errors = self._stop_non_master_resources(deadline)
-            if not errors:
-                self._shutdown_complete = True
-            self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
             if errors:
+                self.logger.warning("Telegram channel stopped with resource errors", extra={"event": "telegram_channel.stop_incomplete"})
                 raise TelegramResourceShutdownError(tuple(errors))
+            self._shutdown_complete = True
+            self.logger.info("Stopped Telegram channel", extra={"event": "telegram_channel.stop_completed"})
 
     def get_chats(self) -> List[Chat]:
         raise EFBOperationNotSupported()
