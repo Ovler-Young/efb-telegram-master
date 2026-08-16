@@ -1,7 +1,8 @@
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,7 @@ from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
-from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
+from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from efb_telegram_master.msglog_repository import MsgLogRepository
 
 _OLD_MSGLOG_SCHEMA = """
@@ -182,6 +183,30 @@ def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, m
     assert any("msglog_slave_origin_uid_time_master_msg_id" in detail for *_ignored, detail in query_plan)
 
 
+def test_msglog_migration_preserves_legacy_naive_and_null_times():
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    try:
+        _create_old_msglog_schema(test_db)
+        test_db.execute_sql(
+            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to, time) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("100.2", "legacy-naive", "text", "tests.slave chat", "Text", "tests.master", "2020-01-02 03:04:05"),
+        )
+        test_db.execute_sql(
+            "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to, time) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("100.3", "legacy-null", "text", "tests.slave chat", "Text", "tests.master", None),
+        )
+        DatabaseManager._ensure_historic_schema_columns(test_db)
+        rows = test_db.execute_sql("SELECT master_msg_id, time FROM msglog ORDER BY master_msg_id").fetchall()
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+    assert rows == [("100.1", None), ("100.2", "2020-01-02 03:04:05"), ("100.3", None)]
+
+
 def test_concurrent_sqlite_msglog_provenance_upgrade_is_idempotent(tmp_path):
     original_database = database.obj
     test_db = SqliteDatabase(tmp_path / "tgdata.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
@@ -299,6 +324,41 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
     assert row.slave_message_id == "mtproto-ingested:100.500"
 
 
+def test_live_and_ingestion_fallback_times_are_utc_naive_and_sort_together():
+    original_timezone = os.environ.get("TZ")
+    os.environ["TZ"] = "Pacific/Kiritimati"
+    time.tzset()
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    manager = MsgLogIngestionRepository("tests")
+    before = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        MsgLog.create(**_msglog_values("live"))
+        scan = manager.get_or_create_scan(100, 2)
+        assert manager.claim_scan(100, "worker-a", 60) is not None
+        for message_id, source_time in ((2, None), (1, "invalid")):
+            content = SimpleNamespace(text="ingested", media_type="Text", mime=None, msg_type="Text", time=source_time)
+            assert manager.persist_item(scan, source_message_id=message_id, classification="eligible", slave_uid="tests.slave target", message=content, lease_owner="worker-a") == "inserted"
+        rows = list(MsgLog.select().order_by(MsgLog.time, MsgLog.master_msg_id))
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+        if original_timezone is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = original_timezone
+        time.tzset()
+
+    after = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    assert [row.master_msg_id for row in rows] == ["live", "100.2", "100.1"]
+    assert all(row.time.tzinfo is None for row in rows)
+    assert all(before <= row.time <= after for row in rows)
+
+
 def test_association_rescan_resets_completed_scans_and_marks_active_leases():
     original_database = database.obj
     test_db = SqliteDatabase(":memory:")
@@ -383,10 +443,10 @@ def test_active_association_request_restarts_scan_without_releasing_its_lease():
 
         assert scan is not None
         assert manager.request_association_rescan(100) == "running"
-        assert manager.complete_scan(scan, lease_owner="remote-worker") is True
+        assert manager.complete_scan(scan, lease_owner="remote-worker") is MsgLogIngestionCompletion.RESCAN
         restarted = MsgLogIngestionScan.get_by_id(scan.id)
         assert (restarted.status, restarted.cursor, restarted.rescan_requested, restarted.lease_owner) == ("running", 500, False, "remote-worker")
-        assert manager.complete_scan(scan, lease_owner="remote-worker") is False
+        assert manager.complete_scan(scan, lease_owner="remote-worker") is MsgLogIngestionCompletion.COMPLETE
         assert MsgLogIngestionScan.get_by_id(scan.id).status == "complete"
     finally:
         test_db.close()

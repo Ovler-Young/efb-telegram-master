@@ -12,6 +12,12 @@ from .utils import EFBChannelChatIDStr, TgChatMsgIDStr
 
 database = DatabaseProxy()
 
+
+def utc_now_naive() -> datetime.datetime:
+    """Return the current UTC time in the MsgLog storage representation."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 PickledDict = TypedDict(
     "PickledDict",
     {
@@ -99,7 +105,7 @@ class MsgLog(BaseModel):
     """Telegram bot user ID that sent this message. NULL means the main bot."""
     provenance = TextField(default="live", constraints=[SQL("DEFAULT 'live'")])
     """Origin of this record: ``live`` or ``mtproto_ingested``."""
-    time = DateTimeField(default=datetime.datetime.now, null=True)
+    time = DateTimeField(default=utc_now_naive, null=True)
     """Time of the message sent."""
 
     class Meta:

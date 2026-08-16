@@ -1,12 +1,19 @@
 import datetime
+from enum import Enum
 from typing import List, Optional
 
 from ehforwarderbot.types import ChatID
 from peewee import IntegrityError
 
 from .database_observability import ObservedRepository, observe_database_method
-from .models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database
+from .models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database, utc_now_naive
 from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
+
+
+class MsgLogIngestionCompletion(str, Enum):
+    RESCAN = "rescan"
+    COMPLETE = "complete"
+    LEASE_LOST = "lease_lost"
 
 
 class MsgLogIngestionRepository(ObservedRepository):
@@ -119,7 +126,7 @@ class MsgLogIngestionRepository(ObservedRepository):
                         msg_type=str(getattr(message, "msg_type")),
                         sent_to=self.channel_id,
                         provenance="mtproto_ingested",
-                        time=source_time if isinstance(source_time, datetime.datetime) else now,
+                        time=source_time if isinstance(source_time, datetime.datetime) else utc_now_naive(),
                     )
                     current.inserted_count += 1
                     current.existing_streak = 0
@@ -147,7 +154,7 @@ class MsgLogIngestionRepository(ObservedRepository):
                 scan.__data__.update(current.__data__)
             return updated == 1
 
-    def complete_scan(self, scan: MsgLogIngestionScan, *, lease_owner: str) -> bool:
+    def complete_scan(self, scan: MsgLogIngestionScan, *, lease_owner: str) -> MsgLogIngestionCompletion:
         """Complete the current pass and retain its lease for a requested rescan."""
         now = datetime.datetime.now()
         supports_for_update = bool(getattr(database.obj, "for_update", False))
@@ -156,7 +163,7 @@ class MsgLogIngestionRepository(ObservedRepository):
             query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
             current = query.for_update().get() if supports_for_update else query.get()
             if current.lease_owner != lease_owner or current.lease_expires_at is None or current.lease_expires_at <= now:
-                return False
+                return MsgLogIngestionCompletion.LEASE_LOST
             if current.rescan_requested:
                 current.cursor = current.scan_boundary
                 current.existing_streak = 0
@@ -169,14 +176,14 @@ class MsgLogIngestionRepository(ObservedRepository):
                 current.updated_at = now
                 current.save()
                 scan.__data__.update(current.__data__)
-                return True
+                return MsgLogIngestionCompletion.RESCAN
             current.status = "complete"
             current.lease_owner = None
             current.lease_expires_at = None
             current.updated_at = now
             current.save()
             scan.__data__.update(current.__data__)
-            return False
+            return MsgLogIngestionCompletion.COMPLETE
 
     def release_scan(self, source_chat_id: int, lease_owner: str) -> bool:
         """Make a shutdown-interrupted scan resumable without changing its cursor."""

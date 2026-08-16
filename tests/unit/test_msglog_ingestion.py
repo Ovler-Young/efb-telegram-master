@@ -12,7 +12,7 @@ from peewee import PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master.models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
-from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
+from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from efb_telegram_master.mtproto import MTProtoRetryableError
 
 
@@ -61,7 +61,7 @@ class FakeDatabase:
 
     def complete_scan(self, scan, *, lease_owner):
         scan.status = "complete"
-        return False
+        return MsgLogIngestionCompletion.COMPLETE
 
     def release_scan(self, source_chat_id, lease_owner):
         assert source_chat_id == 100
@@ -397,6 +397,34 @@ def test_ingestion_logs_lease_loss_with_a_stable_event(caplog):
         ("msglog_ingestion.start", None),
         ("msglog_ingestion.lease_lost", None),
     ]
+
+
+def test_ingestion_does_not_log_complete_when_lease_is_lost_at_completion(caplog):
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    ingestion = MsgLogIngestionRepository("tests.master")
+    service = MsgLogIngestionService(ingestion, FakeChatAssociations({10: "tests.slave target"}), FakeMTProto({1: topic_message(1)}, scan_ceiling=1))
+    original_persist_item = ingestion.persist_item
+
+    def persist_then_transfer_lease(scan, **kwargs):
+        outcome = original_persist_item(scan, **kwargs)
+        MsgLogIngestionScan.update(lease_owner="worker-b", lease_expires_at=datetime.now() + timedelta(seconds=60)).where(MsgLogIngestionScan.id == scan.id).execute()
+        return outcome
+
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        ingestion.persist_item = persist_then_transfer_lease
+        with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+            asyncio.run(service.run(100, lease_owner="worker-a"))
+        scan = MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == "100")
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+    assert (scan.status, scan.lease_owner) == ("running", "worker-b")
+    assert [record.event for record in caplog.records] == ["msglog_ingestion.start", "msglog_ingestion.lease_lost"]
 
 
 def test_ingestion_logs_unexpected_failure_with_error_type(caplog):

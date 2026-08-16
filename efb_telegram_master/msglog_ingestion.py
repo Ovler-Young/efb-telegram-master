@@ -10,7 +10,7 @@ from typing import Optional
 
 from .chat_association_repository import ChatAssociationRepository
 from .models import MsgLogIngestionLeaseLostError
-from .msglog_ingestion_repository import MsgLogIngestionRepository
+from .msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from .mtproto import MTProtoClient, MTProtoRetryableError
 from .utils import EFBChannelChatIDStr
 
@@ -108,11 +108,18 @@ class MsgLogIngestionService:
                 if stop_requested():
                     self._release_for_shutdown(source_chat_id, lease_owner)
                     return True
-                if not self.ingestion.complete_scan(scan, lease_owner=lease_owner):
+                completion = self.ingestion.complete_scan(scan, lease_owner=lease_owner)
+                if completion is MsgLogIngestionCompletion.RESCAN:
+                    continue
+                if completion is MsgLogIngestionCompletion.COMPLETE:
                     self._log_event("complete", source_chat_id)
                     return True
+                if completion is MsgLogIngestionCompletion.LEASE_LOST:
+                    self._log_lease_lost(source_chat_id)
+                    return True
+                raise RuntimeError(f"unknown MsgLog ingestion completion outcome: {completion!r}")
         except MsgLogIngestionLeaseLostError:
-            self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id, extra={"event": "msglog_ingestion.lease_lost"})
+            self._log_lease_lost(source_chat_id)
         except MTProtoRetryableError as error:
             self.ingestion.finish_scan(
                 scan,
@@ -133,6 +140,9 @@ class MsgLogIngestionService:
 
     def _release_for_shutdown(self, source_chat_id: int, lease_owner: str) -> None:
         self.ingestion.release_scan(source_chat_id, lease_owner)
+
+    def _log_lease_lost(self, source_chat_id: int) -> None:
+        self.logger.info("MsgLog ingestion lease lost for source chat %d", source_chat_id, extra={"event": "msglog_ingestion.lease_lost"})
 
     def _classify(
         self,
