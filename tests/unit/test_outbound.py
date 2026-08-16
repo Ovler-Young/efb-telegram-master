@@ -437,9 +437,42 @@ def test_attachment_migration_preserves_order_for_old_and_new_destinations() -> 
         assert old_destination.result(1).message.message_id == 2
         assert new_destination.result(1).message.message_id == 2
         assert events.index("message:3:other") < events.index("message:2:old") < events.index("message:2:new")
+        assert queue._chat_redirects == {}
     finally:
         release_attachment.set()
         queue.stop()
+
+
+def test_completed_attachment_migrations_do_not_retain_redirects() -> None:
+    full_text = "x" * int(MessageLimit.MAX_TEXT_LENGTH)
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            return SimpleNamespace(message_id=chat_id)
+
+        def send_document(self, chat_id, _attachment, **_kwargs):
+            if chat_id < 1000:
+                raise ChatMigrated(chat_id + 1000)
+            return SimpleNamespace(message_id=chat_id)
+
+    queue = _queue(Sender(), worker_count=1)
+    try:
+        for chat_id in range(1, 26):
+            receipt = queue.enqueue(QueueRequest("send_message", (), {"chat_id": chat_id, "text": full_text}, chat_id)).result(1)
+            assert receipt.message.message_id == chat_id
+        assert queue._chat_redirects == {}
+    finally:
+        queue.stop()
+
+
+def test_chat_redirect_resolution_follows_chains_and_stops_at_cycles() -> None:
+    queue = OutboundQueue(Mock(), None, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
+    with queue._lock:
+        queue._chat_redirects.update({1: 2, 2: 3, 4: 5, 5: 4})
+
+        assert queue._resolve_chat_id_locked(1) == 3
+        assert queue._resolve_chat_id_locked(4) == 4
+        assert queue._resolve_chat_id_locked(5) == 5
 
 
 def test_repeated_attachment_migration_fails_without_resending_primary() -> None:
@@ -465,6 +498,7 @@ def test_repeated_attachment_migration_fails_without_resending_primary() -> None
             waiter.result(1)
         assert primary_calls == 1
         assert attachment_calls == 2
+        assert queue._chat_redirects == {}
     finally:
         queue.stop()
 

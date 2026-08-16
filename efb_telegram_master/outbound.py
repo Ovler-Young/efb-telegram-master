@@ -63,6 +63,7 @@ class _PendingCall:
     primary_result: Optional[SendReceipt] = None
     attachment: Optional[QueuedCall] = None
     attachment_migrated: bool = False
+    redirect_source: Optional[int] = None
     transport_retries: int = 0
     enqueued_at: float = field(default_factory=time.monotonic)
 
@@ -245,6 +246,7 @@ class OutboundQueue:
                 pending = self._pending.popleft()
                 if pending.waiter.cancelled():
                     cleanup_upload_paths(pending.call.cleanup)
+                    self._clear_chat_redirect_locked(pending)
                     self._record_outcome(pending, "cancelled")
                     self._capacity.release()
                     continue
@@ -298,6 +300,7 @@ class OutboundQueue:
             raise QueueError("Attachment chat migration did not change the destination.")
         rewind_uploads(pending.active_call().args, pending.active_call().kwargs)
         self._chat_redirects[old_chat_id] = new_chat_id
+        pending.redirect_source = old_chat_id
         for queued in self._pending:
             resolved_chat_id = self._resolve_chat_id_locked(queued.call.telegram_chat_id)
             if resolved_chat_id != queued.call.telegram_chat_id:
@@ -309,6 +312,11 @@ class OutboundQueue:
         pending.attachment = _call_with_chat_id(pending.attachment, new_chat_id)
         pending.attachment_migrated, pending.retry_at = True, 0.0
 
+    def _clear_chat_redirect_locked(self, pending: _PendingCall) -> None:
+        if pending.redirect_source is not None:
+            self._chat_redirects.pop(pending.redirect_source, None)
+            pending.redirect_source = None
+
     def _harvest_completed(self) -> None:
         with self._lock:
             completed = [future for future in self._in_flight if future.done()]
@@ -319,6 +327,7 @@ class OutboundQueue:
                 self._capacity.release()
                 if pending.waiter.cancelled():
                     cleanup_upload_paths(pending.call.cleanup)
+                    self._clear_chat_redirect_locked(pending)
                     self._record_outcome(pending, "cancelled")
                     continue
                 try:
@@ -418,6 +427,7 @@ class OutboundQueue:
 
     def _complete_pending_locked(self, pending: _PendingCall, *, result: Optional[SendReceipt] = None, error: Optional[BaseException] = None) -> None:
         cleanup_upload_paths(pending.call.cleanup)
+        self._clear_chat_redirect_locked(pending)
         if pending.waiter.done():
             return
         if error is not None:
@@ -435,6 +445,7 @@ class OutboundQueue:
                 pending = self._pending.popleft()
                 if pending.waiter is waiter:
                     cleanup_upload_paths(pending.call.cleanup)
+                    self._clear_chat_redirect_locked(pending)
                     self._record_outcome(pending, "cancelled")
                 else:
                     retained.append(pending)
