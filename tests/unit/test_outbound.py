@@ -534,13 +534,36 @@ def test_oversize_attachment_terminal_failure_does_not_resend_primary() -> None:
         with pytest.raises(ValueError, match="attachment failed"):
             waiter.result(1)
         assert primary_calls == 1
-        expected_metric = 'etm_outbound_outcomes_total{operation="send_document",outcome="attachment_failure"} 1.0'
-        deadline = time.monotonic() + 1
-        while expected_metric not in generate_latest(metrics.registry).decode() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert expected_metric in generate_latest(metrics.registry).decode()
+        rendered = generate_latest(metrics.registry).decode()
+        assert 'etm_outbound_outcomes_total{operation="send_message",outcome="enqueued"} 1.0' in rendered
+        assert 'etm_outbound_outcomes_total{operation="send_message",outcome="attachment_failure"} 1.0' in rendered
+        assert 'operation="send_document"' not in rendered
     finally:
         release_attachment.set()
+        queue.stop()
+
+
+def test_oversize_attachment_success_records_one_terminal_outcome_for_original_operation() -> None:
+    full_text = "x" * int(MessageLimit.MAX_TEXT_LENGTH)
+
+    class Sender:
+        def send_message(self, *, chat_id, text):
+            return SimpleNamespace(message_id=7)
+
+        def send_document(self, _chat_id, _attachment, **_kwargs):
+            return SimpleNamespace(message_id=8)
+
+    metrics = Metrics()
+    queue = _queue(Sender(), worker_count=1)
+    queue.bind_metrics(metrics)
+    try:
+        receipt = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1)).result(1)
+        assert receipt.message.message_id == 7
+        rendered = generate_latest(metrics.registry).decode()
+        assert 'etm_outbound_outcomes_total{operation="send_message",outcome="enqueued"} 1.0' in rendered
+        assert 'etm_outbound_outcomes_total{operation="send_message",outcome="success"} 1.0' in rendered
+        assert 'operation="send_document"' not in rendered
+    finally:
         queue.stop()
 
 

@@ -400,6 +400,7 @@ class OutboundQueue:
             self._complete_pending_locked(pending, result=receipt)
             return
         assert pending.primary_result is not None
+        self._record_outcome(pending, "success")
         self._complete_pending_locked(pending, result=pending.primary_result)
 
     def _finish_terminal_error_locked(self, pending: _PendingCall, selection: SenderSelection, error: BaseException) -> None:
@@ -454,7 +455,7 @@ class OutboundQueue:
 
     def _record_outcome(self, pending: _PendingCall, outcome: str) -> None:
         if self._metrics is not None:
-            self._metrics.record_outbound_outcome(pending.active_call().operation, outcome, time.monotonic() - pending.enqueued_at)
+            self._metrics.record_outbound_outcome(pending.call.operation, outcome, time.monotonic() - pending.enqueued_at)
 
     def _record_retry(self, call: QueuedCall, reason: str) -> None:
         if self._metrics is not None:
