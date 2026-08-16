@@ -415,7 +415,36 @@ def test_membership_shutdown_joins_completed_probe_workers() -> None:
     aux_bot.begin_membership_shutdown()
 
     assert aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
-    assert not any(thread.is_alive() for thread in aux_bot._membership_probe_executor._threads)
+    assert not any(thread.is_alive() for thread in aux_bot._membership_probe_workers)
+
+
+def test_membership_shutdown_returns_at_deadline_then_joins_after_release() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
+        started.set()
+        assert release.wait(1)
+        return SimpleNamespace(status="member")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+    aux_bot.bot_id = 123
+    aux_bot.async_bot.get_chat_member.side_effect = get_chat_member
+
+    try:
+        assert aux_bot.check_membership_tri(4000) is None
+        assert started.wait(1)
+        aux_bot.begin_membership_shutdown()
+
+        assert not aux_bot.wait_for_membership_shutdown(time.monotonic() + 0.05)
+
+        release.set()
+        assert aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
+        assert not any(thread.is_alive() for thread in aux_bot._membership_probe_workers)
+    finally:
+        release.set()
+        aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
 
 
 def test_membership_shutdown_retries_join_after_runtime_cancellation() -> None:
@@ -450,7 +479,7 @@ def test_membership_shutdown_retries_join_after_runtime_cancellation() -> None:
 
         aux_bot._runtime.stop()
         assert aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
-        assert not any(thread.is_alive() for thread in aux_bot._membership_probe_executor._threads)
+        assert not any(thread.is_alive() for thread in aux_bot._membership_probe_workers)
     finally:
         released.set()
         aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)

@@ -1,11 +1,11 @@
 # coding=utf-8
 
 import logging
+import queue
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Coroutine
-from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, TypeVar, overload
 
@@ -94,7 +94,9 @@ class AuxiliaryBot:
         self._pending_probes: set[int] = set()
         self._max_membership_cache_entries = self.MAX_MEMBERSHIP_CACHE_ENTRIES
         self._membership_probe_slots = threading.BoundedSemaphore(self.MAX_PENDING_MEMBERSHIP_PROBES)
-        self._membership_probe_executor = ThreadPoolExecutor(max_workers=self.MEMBERSHIP_PROBE_WORKERS, thread_name_prefix="ETM-membership")
+        self._membership_probe_queue: queue.Queue[tuple[int, int] | None] = queue.Queue()
+        self._membership_probe_workers: set[threading.Thread] = set()
+        self._membership_probe_workers_started = False
         self._membership_stopping = False
         self._metrics: MembershipProbeMetrics | None = None
         self._membership_changed_callback: Optional[Callable[["AuxiliaryBot", int, bool], None]] = None
@@ -256,12 +258,31 @@ class AuxiliaryBot:
                 return
             self._pending_probes.add(chat_id)
             revision = self._membership_revisions.get(chat_id, 0)
-        try:
-            future = self._membership_probe_executor.submit(self._probe_membership, chat_id, revision)
-        except RuntimeError:
-            self._finish_membership_probe(chat_id)
+            self._start_membership_probe_workers_locked()
+            self._membership_probe_queue.put((chat_id, revision))
+
+    def _start_membership_probe_workers_locked(self) -> None:
+        if self._membership_probe_workers_started:
             return
-        future.add_done_callback(lambda _future: self._finish_membership_probe(chat_id))
+        self._membership_probe_workers_started = True
+        for worker_index in range(self.MEMBERSHIP_PROBE_WORKERS):
+            worker = threading.Thread(
+                target=self._run_membership_probe_worker,
+                name=f"ETM-membership-{worker_index}",
+            )
+            self._membership_probe_workers.add(worker)
+            worker.start()
+
+    def _run_membership_probe_worker(self) -> None:
+        while True:
+            probe = self._membership_probe_queue.get()
+            if probe is None:
+                return
+            chat_id, revision = probe
+            try:
+                self._probe_membership(chat_id, revision)
+            finally:
+                self._finish_membership_probe(chat_id)
 
     def _probe_membership(self, chat_id: int, revision: int | None = None) -> None:
         """Background probe: call get_chat_member and update cache."""
@@ -336,24 +357,37 @@ class AuxiliaryBot:
                 return
             self._membership_stopping = True
             self._membership_changed_callback = None
-        self._membership_probe_executor.shutdown(wait=False, cancel_futures=True)
+            self._cancel_queued_membership_probes_locked()
+            for _worker in self._membership_probe_workers:
+                self._membership_probe_queue.put(None)
+
+    def _cancel_queued_membership_probes_locked(self) -> None:
+        while True:
+            try:
+                probe = self._membership_probe_queue.get_nowait()
+            except queue.Empty:
+                return
+            if probe is not None:
+                chat_id, _revision = probe
+                if chat_id in self._pending_probes:
+                    self._pending_probes.remove(chat_id)
+                    self._membership_probe_slots.release()
+                    self._discard_unused_revision_locked(chat_id)
 
     def wait_for_membership_shutdown(self, deadline: float) -> bool:
         """Join probe workers before the caller-owned absolute shutdown deadline."""
+        self.begin_membership_shutdown()
         while self.has_pending_probes():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
             time.sleep(min(0.01, remaining))
-        self._membership_probe_executor.shutdown(wait=False, cancel_futures=True)
-        # ThreadPoolExecutor has no timeout-aware shutdown. Join the workers
-        # directly so a stalled probe is reported instead of blocking process exit.
-        for worker in tuple(self._membership_probe_executor._threads):
+        for worker in tuple(self._membership_probe_workers):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
             worker.join(remaining)
-        return not any(worker.is_alive() for worker in self._membership_probe_executor._threads)
+        return not any(worker.is_alive() for worker in self._membership_probe_workers)
 
     def has_pending_probes(self) -> bool:
         """Check if there are any pending membership probes."""

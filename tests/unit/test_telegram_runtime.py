@@ -1028,7 +1028,7 @@ def test_manager_runtime_stop_releases_a_real_membership_worker() -> None:
         started_at = time.monotonic()
         manager.stop_channel_resources()
         assert time.monotonic() - started_at < 1.0
-        assert not any(thread.is_alive() for thread in auxiliary._membership_probe_executor._threads)
+        assert not any(thread.is_alive() for thread in auxiliary._membership_probe_workers)
     finally:
         released.set()
         auxiliary.wait_for_membership_shutdown(time.monotonic() + 1)
