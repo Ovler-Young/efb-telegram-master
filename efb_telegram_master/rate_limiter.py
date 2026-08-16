@@ -31,7 +31,7 @@ class _CallableMonotonicClock(AbstractClock):
 class _ClockedInMemoryBucket(InMemoryBucket):
     """In-memory bucket with a caller-supplied public clock implementation."""
 
-    def __init__(self, rates: list[Rate], clock: AbstractClock) -> None:
+    def __init__(self, rates: list[Rate], clock: _CallableMonotonicClock) -> None:
         super().__init__(rates)
         self.clock = clock
 
