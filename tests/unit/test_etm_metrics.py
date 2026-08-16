@@ -1,11 +1,34 @@
+import ast
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import urlopen
 
 from prometheus_client import generate_latest
 
-from efb_telegram_master.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
+from efb_telegram_master.etm_metrics import _DATABASE_METHODS, DestinationQueueSnapshot, Metrics, WorkerSnapshot
 from efb_telegram_master.metrics_runtime import start_metrics_server
+
+
+def _decorated_database_method_labels() -> set[str]:
+    package_root = Path(__file__).parents[2] / "efb_telegram_master"
+    labels: set[str] = set()
+    for source_path in package_root.rglob("*.py"):
+        syntax_tree = ast.parse(source_path.read_text())
+        for node in ast.walk(syntax_tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for decorator in node.decorator_list:
+                if (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Name)
+                    and decorator.func.id == "observe_database_method"
+                    and len(decorator.args) == 1
+                    and isinstance(decorator.args[0], ast.Constant)
+                    and isinstance(decorator.args[0].value, str)
+                ):
+                    labels.add(decorator.args[0].value)
+    return labels
 
 
 class BrokenCpuProcess:
@@ -42,6 +65,17 @@ class NoIoProcess(SupportedProcess):
     @staticmethod
     def io_counters():
         raise OSError("I/O unavailable")
+
+
+def test_database_method_allowlist_matches_all_literal_observation_decorators():
+    assert _DATABASE_METHODS == _decorated_database_method_labels()
+
+
+def test_every_database_method_allowlist_label_is_recordable():
+    metrics = Metrics()
+
+    for method in _DATABASE_METHODS:
+        metrics.record_database_method_call(method, 0.0, "success")
 
 
 def test_process_collector_logs_a_repeated_failure_once_and_keeps_other_metrics(caplog):

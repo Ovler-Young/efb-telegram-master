@@ -55,6 +55,11 @@ _DATABASE_METHODS = frozenset(
         "get_history_migration_entry_page",
         "delete_history_migration_entry",
         "get_recent_msglog_page",
+        "claim_slave_message_delivery",
+        "complete_slave_message_delivery",
+        "renew_slave_message_delivery",
+        "release_slave_message_delivery",
+        "get_resumable_msglog_ingestion_scans",
     }
 )
 _DATABASE_OUTCOMES = frozenset({"success", "failure"})
