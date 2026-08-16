@@ -39,6 +39,26 @@ CREATE TABLE "msglog" (
 )
 """
 
+_LEGACY_INGESTION_SCAN_SCHEMA = """
+CREATE TABLE "msglogingestionscan" (
+    "id" INTEGER NOT NULL PRIMARY KEY,
+    "source_chat_id" TEXT NOT NULL UNIQUE,
+    "scan_boundary" INTEGER NOT NULL,
+    "cursor" INTEGER NOT NULL,
+    "existing_streak" INTEGER NOT NULL DEFAULT 0,
+    "scanned_count" INTEGER NOT NULL DEFAULT 0,
+    "inserted_count" INTEGER NOT NULL DEFAULT 0,
+    "existing_count" INTEGER NOT NULL DEFAULT 0,
+    "skipped_count" INTEGER NOT NULL DEFAULT 0,
+    "lease_owner" TEXT,
+    "lease_expires_at" {timestamp_type},
+    "status" TEXT NOT NULL DEFAULT 'pending',
+    "error" TEXT,
+    "created_at" {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updated_at" {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
 
 def _create_old_msglog_schema(test_db, *, blob_type="BLOB", time_type="DATETIME"):
     test_db.execute_sql(_OLD_MSGLOG_SCHEMA.format(blob_type=blob_type, time_type=time_type))
@@ -47,6 +67,47 @@ def _create_old_msglog_schema(test_db, *, blob_type="BLOB", time_type="DATETIME"
         f"INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to) VALUES ({placeholders})",
         ("100.1", "old-message", "old text", "tests.slave chat", "Text", "tests.master"),
     )
+
+
+def _create_legacy_ingestion_scan_schema(test_db, *, timestamp_type="DATETIME"):
+    test_db.execute_sql(_LEGACY_INGESTION_SCAN_SCHEMA.format(timestamp_type=timestamp_type))
+
+
+def _insert_legacy_ingestion_scan_rows(test_db):
+    columns = (
+        "source_chat_id",
+        "scan_boundary",
+        "cursor",
+        "existing_streak",
+        "scanned_count",
+        "inserted_count",
+        "existing_count",
+        "skipped_count",
+        "lease_owner",
+        "status",
+        "error",
+    )
+    placeholders = ", ".join([test_db.param] * len(columns))
+    test_db.execute_sql(
+        f"INSERT INTO msglogingestionscan ({', '.join(columns)}) VALUES ({placeholders})",
+        ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None),
+    )
+    test_db.execute_sql(
+        f"INSERT INTO msglogingestionscan ({', '.join(columns)}) VALUES ({placeholders})",
+        ("200", 900, 900, 0, 0, 0, 0, 0, None, "pending", None),
+    )
+    test_db.execute_sql(
+        f"INSERT INTO msglogingestionscan ({', '.join(columns)}) VALUES ({placeholders})",
+        ("300", 1000, 875, 125, 125, 20, 90, 15, "worker-a", "running", "temporary failure"),
+    )
+
+
+def _legacy_ingestion_scan_rows(test_db):
+    return test_db.execute_sql(
+        "SELECT source_chat_id, scan_boundary, cursor, existing_streak, scanned_count, inserted_count, "
+        "existing_count, skipped_count, lease_owner, status, error, rescan_requested "
+        "FROM msglogingestionscan ORDER BY source_chat_id"
+    ).fetchall()
 
 
 def _msglog_values(master_msg_id, **values):
@@ -138,6 +199,81 @@ def test_concurrent_sqlite_msglog_provenance_upgrade_is_idempotent(tmp_path):
 
     assert provenance_columns == ["provenance"]
     assert row.provenance == "live"
+
+
+def test_legacy_ingestion_scan_schema_adds_rescan_requested_without_losing_states(tmp_path):
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "tgdata.db")
+    database.initialize(test_db)
+    test_db.connect()
+    try:
+        _create_legacy_ingestion_scan_schema(test_db)
+        _insert_legacy_ingestion_scan_rows(test_db)
+        legacy_columns = {column.name for column in test_db.get_columns("msglogingestionscan")}
+
+        DatabaseManager._ensure_historic_schema_columns(test_db)
+
+        scan_columns = {column.name for column in test_db.get_columns("msglogingestionscan")}
+        rows = _legacy_ingestion_scan_rows(test_db)
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+    expected_columns = {field.column_name for field in MsgLogIngestionScan._meta.sorted_fields}
+    assert legacy_columns == expected_columns - {"rescan_requested"}
+    assert scan_columns == expected_columns
+    assert rows == [
+        ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None, 0),
+        ("200", 900, 900, 0, 0, 0, 0, 0, None, "pending", None, 0),
+        ("300", 1000, 875, 125, 125, 20, 90, 15, "worker-a", "running", "temporary failure", 0),
+    ]
+
+
+def test_sqlite_ingestion_scan_migration_failure_rolls_back_schema_and_data(tmp_path, monkeypatch):
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "tgdata.db")
+    database.initialize(test_db)
+    test_db.connect()
+    original_migrate = db_module.migrate
+    migration_calls = 0
+
+    def fail_after_scan_migration(*operations):
+        nonlocal migration_calls
+        migration_calls += 1
+        if migration_calls == 2:
+            raise RuntimeError("forced migration failure")
+        return original_migrate(*operations)
+
+    try:
+        _create_legacy_ingestion_scan_schema(test_db)
+        _insert_legacy_ingestion_scan_rows(test_db)
+        test_db.execute_sql("CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY)")
+        test_db.execute_sql("INSERT INTO msglog VALUES ('100.1')")
+        monkeypatch.setattr(db_module, "migrate", fail_after_scan_migration)
+
+        with pytest.raises(RuntimeError, match="forced migration failure"):
+            DatabaseManager._ensure_historic_schema_columns(test_db)
+
+        scan_columns = {column.name for column in test_db.get_columns("msglogingestionscan")}
+        msglog_columns = {column.name for column in test_db.get_columns("msglog")}
+        scan_rows = test_db.execute_sql(
+            "SELECT source_chat_id, scan_boundary, cursor, existing_streak, scanned_count, inserted_count, "
+            "existing_count, skipped_count, lease_owner, status, error FROM msglogingestionscan ORDER BY source_chat_id"
+        ).fetchall()
+        msglog_rows = test_db.execute_sql("SELECT master_msg_id FROM msglog").fetchall()
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+    assert migration_calls == 2
+    assert "rescan_requested" not in scan_columns
+    assert msglog_columns == {"master_msg_id"}
+    assert scan_rows == [
+        ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None),
+        ("200", 900, 900, 0, 0, 0, 0, 0, None, "pending", None),
+        ("300", 1000, 875, 125, 125, 20, 90, 15, "worker-a", "running", "temporary failure"),
+    ]
+    assert msglog_rows == [("100.1",)]
 
 
 def test_ingestion_claim_persist_and_idempotence_are_atomic():
@@ -359,6 +495,50 @@ def test_live_message_upsert_wins_when_ingestion_inserts_after_lookup(monkeypatc
         row = MsgLog.get_by_id("100.1")
 
     assert (row.provenance, row.slave_message_id, row.text) == ("live", "live-message", "live text")
+
+
+@pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
+def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false(tmp_path, monkeypatch):
+    connection_kwargs = {
+        "database": os.environ["TEST_POSTGRES_DB"],
+        "host": os.environ["TEST_POSTGRES_HOST"],
+        "port": int(os.environ["TEST_POSTGRES_PORT"]),
+        "user": os.environ["TEST_POSTGRES_USER"],
+        "password": os.environ["TEST_POSTGRES_PASSWORD"],
+    }
+    database_name = f"etm_scan_{uuid.uuid4().hex}"
+    admin_db = PostgresqlDatabase(**connection_kwargs)
+    admin_db.connect()
+    admin_db.connection().autocommit = True
+    original_database = database.obj
+    manager = None
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
+        test_db = PostgresqlDatabase(database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"})
+        test_db.connect()
+        _create_legacy_ingestion_scan_schema(test_db, timestamp_type="TIMESTAMP")
+        _insert_legacy_ingestion_scan_rows(test_db)
+        test_db.close()
+
+        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"}}}
+        manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-scan-upgrade", config=config))
+        scan_columns = {column.name for column in database.get_columns("msglogingestionscan")}
+        rows = _legacy_ingestion_scan_rows(database)
+    finally:
+        if manager is not None:
+            manager.stop_worker()
+        database.initialize(original_database)
+        admin_db.execute_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
+        admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
+        admin_db.close()
+
+    assert "rescan_requested" in scan_columns
+    assert rows == [
+        ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None, False),
+        ("200", 900, 900, 0, 0, 0, 0, 0, None, "pending", None, False),
+        ("300", 1000, 875, 125, 125, 20, 90, 15, "worker-a", "running", "temporary failure", False),
+    ]
 
 
 @pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")

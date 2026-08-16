@@ -17,7 +17,7 @@ from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.outbound_types import SendReceipt
@@ -201,6 +201,49 @@ def test_sqlite_import_snapshot_canonicalizes_legacy_historic_identities_without
         assert source_db.execute_sql("SELECT COUNT(*) FROM historymigrationentry").fetchone() == (4,)
     finally:
         source_db.close()
+
+
+def test_sqlite_import_snapshot_omits_missing_ingestion_rescan_requested_column(tmp_path):
+    source_db = SqliteDatabase(tmp_path / "tgdata.db")
+    source_db.connect()
+    try:
+        source_db.execute_sql(
+            "CREATE TABLE msglogingestionscan ("
+            "id INTEGER PRIMARY KEY, source_chat_id TEXT NOT NULL UNIQUE, scan_boundary INTEGER NOT NULL, cursor INTEGER NOT NULL, "
+            "existing_streak INTEGER NOT NULL DEFAULT 0, scanned_count INTEGER NOT NULL DEFAULT 0, inserted_count INTEGER NOT NULL DEFAULT 0, "
+            "existing_count INTEGER NOT NULL DEFAULT 0, skipped_count INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_expires_at DATETIME, "
+            "status TEXT NOT NULL DEFAULT 'pending', error TEXT, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        source_db.execute_sql(
+            "INSERT INTO msglogingestionscan (source_chat_id, scan_boundary, cursor, existing_streak, scanned_count, inserted_count, "
+            "existing_count, skipped_count, lease_owner, status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None),
+        )
+        with source_db.bind_ctx([MsgLogIngestionScan]):
+            snapshot = DatabaseManager._sqlite_source_snapshot(source_db, (MsgLogIngestionScan,))
+    finally:
+        source_db.close()
+
+    projection = snapshot.projections[0]
+    row = dict(zip(projection.column_names, projection.rows[0]))
+    assert projection.model is MsgLogIngestionScan
+    assert set(projection.column_names) == {field.column_name for field in MsgLogIngestionScan._meta.sorted_fields} - {"rescan_requested"}
+    assert {key: row[key] for key in row if key not in {"created_at", "updated_at"}} == {
+        "id": 1,
+        "source_chat_id": "100",
+        "scan_boundary": 500,
+        "cursor": 0,
+        "existing_streak": 500,
+        "scanned_count": 500,
+        "inserted_count": 5,
+        "existing_count": 495,
+        "skipped_count": 0,
+        "lease_owner": None,
+        "lease_expires_at": None,
+        "status": "complete",
+        "error": None,
+    }
 
 
 def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):
