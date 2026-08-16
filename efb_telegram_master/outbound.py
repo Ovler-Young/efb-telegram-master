@@ -358,6 +358,7 @@ class OutboundQueue:
                 except telegram.error.ChatMigrated as error:
                     if pending.phase is _CallPhase.PRIMARY:
                         self._record_retry(pending.active_call(), "migration")
+                        self._record_outcome(pending, "failure")
                         pending.waiter.set_exception(error)
                     elif pending.attachment_migrated:
                         self._finish_terminal_error_locked(pending, submitted.selection, QueueError("Attachment chat migrated repeatedly."))

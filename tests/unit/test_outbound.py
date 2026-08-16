@@ -880,7 +880,10 @@ def test_queue_records_primary_migration_retry_and_preserves_owned_upload(tmp_pa
         with pytest.raises(ChatMigrated):
             waiter.result(1)
         assert upload.exists()
-        assert 'etm_outbound_retries_total{operation="send_document",reason="migration"} 1.0' in generate_latest(metrics.registry).decode()
+        rendered = generate_latest(metrics.registry).decode()
+        assert 'etm_outbound_retries_total{operation="send_document",reason="migration"} 1.0' in rendered
+        assert 'etm_outbound_outcomes_total{operation="send_document",outcome="failure"} 1.0' in rendered
+        assert 'etm_outbound_latency_seconds_count{operation="send_document",outcome="failure"} 1.0' in rendered
     finally:
         queue.stop()
 
