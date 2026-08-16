@@ -18,7 +18,7 @@ from efb_telegram_master.channel_commands import LocaleState, TelegramCommandSer
 from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
-from efb_telegram_master.msglog_scan import MsgLogScanScheduler, MsgLogScanShutdownTimeout
+from efb_telegram_master.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.mtproto import MTProtoRetryableError
 from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
@@ -545,43 +545,63 @@ def test_association_reschedule_queues_a_successor_after_retryable_error(tmp_pat
     assert fetches == 3
 
 
-def test_msglog_scan_stop_releases_lease_and_rejects_new_workers():
-    started, release = threading.Event(), threading.Event()
-
-    class Runtime:
-        def __init__(self):
-            self.calls = 0
-            self.reject_new_calls = False
-
-        def call(self, coroutine, timeout=None):
-            self.calls += 1
-            coroutine.close()
-            if self.reject_new_calls:
-                raise RuntimeError("Telegram runtime is stopping.")
-            if self.calls == 1:
-                started.set()
-                release.wait()
-
+def test_msglog_scan_stop_does_not_double_release_a_gracefully_stopped_lease(monkeypatch):
+    started = threading.Event()
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
-    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=Runtime()), SimpleNamespace(enabled=True, connected=True, config=SimpleNamespace(scan_ceiling=10)), ingestion, Mock(), Mock())
+    runtime = SharedAsyncRuntime()
+
+    async def connect():
+        return None
+
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10), connect=connect), ingestion, Mock(), Mock())
+
+    async def run(_service, source_chat_id, *, lease_owner, stop_requested):
+        started.set()
+        await asyncio.to_thread(scheduler._stop_event.wait)
+        assert stop_requested()
+        ingestion.release_scan(source_chat_id, lease_owner)
+        return True
+
+    monkeypatch.setattr(MsgLogIngestionService, "run", run)
     try:
         assert scheduler.schedule(100) == "started"
         assert started.wait(1)
         assert scheduler.schedule(100) == "already running"
-        scheduler.runtime.async_runtime.reject_new_calls = True
-        errors = scheduler.stop(0.01)
-        assert len(errors) == 1
-        assert isinstance(errors[0], MsgLogScanShutdownTimeout)
-        assert scheduler.runtime.async_runtime.calls == 2
+        assert scheduler.stop(1) == ()
         ingestion.get_or_create_scan.assert_called_once_with(100, 10)
         assert scheduler.schedule(200) == "stopping"
-        release.set()
-        assert scheduler.stop(1) == ()
         ingestion.release_scan.assert_called_once()
         assert not any(thread.name == "MsgLogIngestion-100" and thread.is_alive() for thread in threading.enumerate())
     finally:
-        release.set()
         scheduler.stop(1)
+        runtime.close()
+
+
+def test_msglog_scan_stop_releases_a_lease_after_an_interrupted_service(monkeypatch):
+    started = threading.Event()
+    ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
+    runtime = SharedAsyncRuntime()
+
+    async def connect():
+        return None
+
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10), connect=connect), ingestion, Mock(), Mock())
+
+    async def run(_service, _source_chat_id, *, lease_owner, stop_requested):
+        started.set()
+        await asyncio.to_thread(scheduler._stop_event.wait)
+        raise RuntimeError(f"interrupted {lease_owner}")
+
+    monkeypatch.setattr(MsgLogIngestionService, "run", run)
+    try:
+        assert scheduler.schedule(100) == "started"
+        assert started.wait(1)
+        assert scheduler.stop(1) == ()
+        ingestion.release_scan.assert_called_once()
+        assert ingestion.release_scan.call_args.args[0] == 100
+    finally:
+        scheduler.stop(1)
+        runtime.close()
 
 
 def test_msglog_scan_closes_runtime_coroutines_when_runtime_call_raises(recwarn):

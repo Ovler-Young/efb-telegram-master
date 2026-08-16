@@ -29,7 +29,6 @@ class MsgLogScanScheduler:
     def __init__(self, runtime, mtproto, ingestion, chat_associations, logger: logging.Logger) -> None:
         self.runtime, self.mtproto, self.ingestion, self.chat_associations, self.logger = runtime, mtproto, ingestion, chat_associations, logger
         self._lock = threading.Lock()
-        self._pending_available = threading.Condition(self._lock)
         self._connect_lock: asyncio.Lock | None = None
         self._stopping = False
         self._stop_event = threading.Event()
@@ -84,7 +83,6 @@ class MsgLogScanScheduler:
         self._pending_source_chat_ids.add(source_chat_id)
         if not_before:
             self._schedule_wakeup_locked(not_before)
-        self._pending_available.notify()
         self._admit_workers_locked()
 
     def _schedule_wakeup_locked(self, not_before: float) -> None:
@@ -93,13 +91,12 @@ class MsgLogScanScheduler:
             return
 
         def wake() -> None:
-            with self._pending_available:
+            with self._lock:
                 self._wake_timers.discard(threading.current_thread())
                 if self._stopping:
                     return
                 self._reap_threads_locked()
                 self._admit_workers_locked()
-                self._pending_available.notify_all()
 
         timer = threading.Timer(delay, wake)
         timer.daemon = True
@@ -117,7 +114,6 @@ class MsgLogScanScheduler:
             for timer in self._wake_timers:
                 timer.cancel()
             self._wake_timers.clear()
-            self._pending_available.notify_all()
             workers = tuple(self._retiring_threads)
         if admission_fence_needed:
             try:
@@ -135,25 +131,25 @@ class MsgLogScanScheduler:
         return ()
 
     def _run(self, source_chat_id: int, lease_owner: str) -> None:
-        claimed: bool | None = None
+        interrupted = False
+        result: object = None
         try:
             result = self._call_runtime(self._run_ingestion(source_chat_id, lease_owner))
-            claimed = result if isinstance(result, bool) else None
         except BaseException as error:
+            interrupted = True
             self.logger.exception("MsgLog ingestion worker failed for group %s", source_chat_id, exc_info=error)
         finally:
-            if self._stopping:
+            if interrupted and self._stopping:
                 try:
                     self.ingestion.release_scan(source_chat_id, lease_owner)
                 except Exception:
                     self.logger.exception("Failed to release MsgLog ingestion lease for group %s", source_chat_id)
             with self._lock:
-                if claimed is False and not self._stopping:
+                if result is False and not self._stopping:
                     self._defer_unclaimed_scan_locked(source_chat_id)
                 if self._owners.get(source_chat_id) == lease_owner:
                     self._threads.pop(source_chat_id, None)
                     self._owners.pop(source_chat_id, None)
-                self._pending_available.notify_all()
 
     def _defer_unclaimed_scan_locked(self, source_chat_id: int) -> None:
         scan = self.ingestion.get_or_create_scan(source_chat_id, self.mtproto.config.scan_ceiling)
@@ -177,7 +173,7 @@ class MsgLogScanScheduler:
 
     def _worker(self) -> None:
         while True:
-            with self._pending_available:
+            with self._lock:
                 pending = self._next_runnable_pending_locked()
                 if self._stopping:
                     return
