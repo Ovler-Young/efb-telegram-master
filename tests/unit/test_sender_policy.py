@@ -216,6 +216,68 @@ def test_retry_after_keeps_the_latest_deadline_for_one_sender_chat(monkeypatch: 
     sender_policy.record_retry_after(call(chat_id=100), RetryAfter(1_000), sender)
 
     assert sender_policy.select(call(required_sender_bot_id="10", chat_id=100), now=1_000.0).retry_at == 2_000.0
+    assert len(sender_policy._cooldown_expiry_heap) == 1
+    assert len(sender_policy._cooldown_max_heaps["auxiliary"]) == 1
+
+
+def test_expired_cooldowns_are_reclaimed_before_new_retry_after_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    auxiliary_bot = auxiliary(10)
+    sender_policy, _pool, _main_bot, _limiter = policy(auxiliary_bot)
+    sender = SenderSelection(auxiliary_bot.bot, "10")
+    clock = [1_000.0]
+    monkeypatch.setattr(sender_policy_module.time, "monotonic", lambda: clock[0])
+
+    for chat_id in range(2_000):
+        sender_policy.record_retry_after(call(chat_id=chat_id), RetryAfter(1), sender)
+
+    clock[0] = 1_002.0
+    sender_policy.record_retry_after(call(chat_id=2_000), RetryAfter(5), sender)
+
+    assert len(sender_policy._cooldowns) == 1
+    assert len(sender_policy._cooldown_expiry_heap) == 1
+    assert len(sender_policy._cooldown_max_heaps["auxiliary"]) == 1
+    assert sender_policy.cooldown_snapshot() == {"main": 0.0, "auxiliary": 5.0}
+
+
+def test_cooldown_snapshot_reports_exact_remaining_maximum_after_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    auxiliary_bot = auxiliary(10)
+    sender_policy, _pool, main_bot, _limiter = policy(auxiliary_bot)
+    auxiliary_sender = SenderSelection(auxiliary_bot.bot, "10")
+    main_sender = SenderSelection(main_bot, None)
+    clock = [1_000.0]
+    monkeypatch.setattr(sender_policy_module.time, "monotonic", lambda: clock[0])
+
+    sender_policy.record_retry_after(call(chat_id=100), RetryAfter(5), auxiliary_sender)
+    sender_policy.record_retry_after(call(chat_id=101), RetryAfter(12), auxiliary_sender)
+    sender_policy.record_retry_after(call(chat_id=100), RetryAfter(20), main_sender)
+
+    assert sender_policy.cooldown_snapshot() == {"main": 20.0, "auxiliary": 12.0}
+
+    clock[0] = 1_006.0
+
+    assert sender_policy.cooldown_snapshot() == {"main": 14.0, "auxiliary": 6.0}
+
+
+def test_cooldown_snapshot_does_not_copy_the_cooldown_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoCopyCooldowns(dict[tuple[str | None, int], float]):
+        def __iter__(self):
+            raise AssertionError("cooldown snapshots must use the indexed maximum")
+
+        def items(self):
+            raise AssertionError("cooldown snapshots must use the indexed maximum")
+
+        def copy(self):
+            raise AssertionError("cooldown snapshots must use the indexed maximum")
+
+    auxiliary_bot = auxiliary(10)
+    sender_policy, _pool, _main_bot, _limiter = policy(auxiliary_bot)
+    sender_policy._cooldowns = NoCopyCooldowns()
+    sender = SenderSelection(auxiliary_bot.bot, "10")
+    monkeypatch.setattr(sender_policy_module.time, "monotonic", lambda: 1_000.0)
+
+    sender_policy.record_retry_after(call(chat_id=100), RetryAfter(5), sender)
+
+    assert sender_policy.cooldown_snapshot() == {"main": 0.0, "auxiliary": 5.0}
 
 
 def test_cooldown_snapshot_is_safe_while_retry_after_updates_arrive(monkeypatch: pytest.MonkeyPatch) -> None:
