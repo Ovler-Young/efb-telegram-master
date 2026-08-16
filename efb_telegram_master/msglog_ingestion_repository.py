@@ -31,9 +31,8 @@ class MsgLogIngestionRepository(ObservedRepository):
 
     @staticmethod
     def _expired_lease_condition(utc_now: datetime.datetime, local_now: datetime.datetime):
-        return (
-            ((MsgLogIngestionScan.lease_clock == UTC_LEASE_CLOCK) & (MsgLogIngestionScan.lease_expires_at <= utc_now))
-            | ((MsgLogIngestionScan.lease_clock.is_null(True) | (MsgLogIngestionScan.lease_clock != UTC_LEASE_CLOCK)) & (MsgLogIngestionScan.lease_expires_at <= local_now))
+        return ((MsgLogIngestionScan.lease_clock == UTC_LEASE_CLOCK) & (MsgLogIngestionScan.lease_expires_at <= utc_now)) | (
+            (MsgLogIngestionScan.lease_clock.is_null(True) | (MsgLogIngestionScan.lease_clock != UTC_LEASE_CLOCK)) & (MsgLogIngestionScan.lease_expires_at <= local_now)
         )
 
     def get_or_create_scan(self, source_chat_id: int, scan_boundary: int) -> MsgLogIngestionScan:

@@ -16,9 +16,8 @@ class SlaveMessageDeliveryRepository(ObservedRepository):
 
     @staticmethod
     def _expired_lease_condition(utc_now: datetime, local_now: datetime):
-        return (
-            ((SlaveMessageDelivery.lease_clock == UTC_LEASE_CLOCK) & (SlaveMessageDelivery.lease_expires_at <= utc_now))
-            | ((SlaveMessageDelivery.lease_clock.is_null(True) | (SlaveMessageDelivery.lease_clock != UTC_LEASE_CLOCK)) & (SlaveMessageDelivery.lease_expires_at <= local_now))
+        return ((SlaveMessageDelivery.lease_clock == UTC_LEASE_CLOCK) & (SlaveMessageDelivery.lease_expires_at <= utc_now)) | (
+            (SlaveMessageDelivery.lease_clock.is_null(True) | (SlaveMessageDelivery.lease_clock != UTC_LEASE_CLOCK)) & (SlaveMessageDelivery.lease_expires_at <= local_now)
         )
 
     @observe_database_method("claim_slave_message_delivery")
