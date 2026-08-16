@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Coroutine
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
+from .models import UTC_LEASE_CLOCK, utc_now_naive
 from .msglog_ingestion import MsgLogIngestionService
 from .utils import TelegramChatID
 
@@ -161,7 +162,8 @@ class MsgLogScanScheduler:
         lease_expires_at = getattr(scan, "lease_expires_at", None)
         delay = 0.0
         if isinstance(lease_expires_at, datetime.datetime):
-            delay = max(0.0, (lease_expires_at - datetime.datetime.now()).total_seconds())
+            now = utc_now_naive() if getattr(scan, "lease_clock", None) == UTC_LEASE_CLOCK else datetime.datetime.now()
+            delay = max(0.0, (lease_expires_at - now).total_seconds())
         not_before = time.monotonic() + delay
         if source_chat_id in self._pending_source_chat_ids:
             self._pending = deque(

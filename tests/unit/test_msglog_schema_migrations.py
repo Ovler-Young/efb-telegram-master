@@ -240,13 +240,15 @@ def test_legacy_ingestion_scan_schema_adds_rescan_requested_without_losing_state
 
         scan_columns = {column.name for column in test_db.get_columns("msglogingestionscan")}
         rows = _legacy_ingestion_scan_rows(test_db)
+        lease_clocks = test_db.execute_sql("SELECT lease_clock FROM msglogingestionscan ORDER BY source_chat_id").fetchall()
     finally:
         test_db.close()
         database.initialize(original_database)
 
     expected_columns = {field.column_name for field in MsgLogIngestionScan._meta.sorted_fields}
-    assert legacy_columns == expected_columns - {"rescan_requested"}
+    assert legacy_columns == expected_columns - {"rescan_requested", "lease_clock"}
     assert scan_columns == expected_columns
+    assert lease_clocks == [(None,), (None,), (None,)]
     assert rows == [
         ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None, 0),
         ("200", 900, 900, 0, 0, 0, 0, 0, None, "pending", None, 0),

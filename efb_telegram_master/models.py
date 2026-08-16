@@ -11,6 +11,7 @@ from typing_extensions import TypedDict
 from .utils import EFBChannelChatIDStr, TgChatMsgIDStr
 
 database = DatabaseProxy()
+UTC_LEASE_CLOCK = "utc"
 
 
 def utc_now_naive() -> datetime.datetime:
@@ -127,6 +128,7 @@ class MsgLogIngestionScan(BaseModel):
     rescan_requested = BooleanField(default=False)
     lease_owner = TextField(null=True)
     lease_expires_at = DateTimeField(null=True)
+    lease_clock = TextField(null=True, default=UTC_LEASE_CLOCK, constraints=[SQL("DEFAULT 'utc'")])
     status = TextField(default="pending")
     error = TextField(null=True)
     created_at = DateTimeField(default=datetime.datetime.now)
@@ -192,6 +194,7 @@ class SlaveMessageDelivery(BaseModel):
     slave_message_id = TextField()
     state = TextField(default="pending", constraints=[SQL("DEFAULT 'pending'")])
     lease_expires_at = DateTimeField(null=True)
+    lease_clock = TextField(null=True, default=UTC_LEASE_CLOCK, constraints=[SQL("DEFAULT 'utc'")])
     owner_token = TextField(null=True)
 
     class Meta:

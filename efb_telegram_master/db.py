@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from ehforwarderbot import utils
-from peewee import AutoField, Model, PostgresqlDatabase, SqliteDatabase
+from peewee import AutoField, Model, PostgresqlDatabase, SqliteDatabase, TextField
 from playhouse.migrate import Operation, PostgresqlMigrator, SqliteMigrator, migrate
 
 from .chat_association_repository import ChatAssociationRepository
@@ -221,7 +221,7 @@ class DatabaseManager:
                 scan_columns = {column.name for column in current_database.get_columns("msglogingestionscan")}
                 scan_migrations = tuple(
                     migrator.add_column("msglogingestionscan", column_name, field)
-                    for column_name, field in (("rescan_requested", MsgLogIngestionScan.rescan_requested),)
+                    for column_name, field in (("rescan_requested", MsgLogIngestionScan.rescan_requested), ("lease_clock", TextField(null=True)))
                     if column_name not in scan_columns
                 )
                 if scan_migrations:
@@ -252,7 +252,12 @@ class DatabaseManager:
                 delivery_columns = {column.name for column in current_database.get_columns("slavemessagedelivery")}
                 delivery_migrations = tuple(
                     migrator.add_column("slavemessagedelivery", column_name, field)
-                    for column_name, field in (("state", SlaveMessageDelivery.state), ("lease_expires_at", SlaveMessageDelivery.lease_expires_at), ("owner_token", SlaveMessageDelivery.owner_token))
+                    for column_name, field in (
+                        ("state", SlaveMessageDelivery.state),
+                        ("lease_expires_at", SlaveMessageDelivery.lease_expires_at),
+                        ("owner_token", SlaveMessageDelivery.owner_token),
+                        ("lease_clock", TextField(null=True)),
+                    )
                     if column_name not in delivery_columns
                 )
                 if delivery_migrations:
@@ -426,6 +431,9 @@ class DatabaseManager:
                         raise ValueError(f"{model.__name__} has no primary key")
                     query = query.where(primary_key.in_(canonical_primary_keys))
                 rows = tuple(DatabaseManager._sqlite_dict_row_values(row, column_names) for row in query.dicts())
+                if model in (MsgLogIngestionScan, SlaveMessageDelivery) and "lease_clock" not in source_columns:
+                    column_names += ("lease_clock",)
+                    rows = tuple((*row, None) for row in rows)
             projections.append(_SQLiteSourceProjection(model, column_names, rows))
             serialized_projections.append(
                 {

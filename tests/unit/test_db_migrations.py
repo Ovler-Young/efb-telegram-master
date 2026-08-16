@@ -241,6 +241,7 @@ def test_sqlite_import_snapshot_omits_missing_ingestion_rescan_requested_column(
         "skipped_count": 0,
         "lease_owner": None,
         "lease_expires_at": None,
+        "lease_clock": None,
         "status": "complete",
         "error": None,
     }
@@ -1055,7 +1056,8 @@ def test_slave_message_delivery_schema_upgrade_adds_owner_token(tmp_path, monkey
         row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "message"))
         assert row.state == "delivered"
         assert row.owner_token is None
-        assert "owner_token" in {column.name for column in database.get_columns("slavemessagedelivery")}
+        assert row.lease_clock is None
+        assert {"owner_token", "lease_clock"}.issubset({column.name for column in database.get_columns("slavemessagedelivery")})
         owner_token = SlaveMessageDeliveryRepository().claim("tests.slave chat", "pending-message")
         assert owner_token is not None
         pending_row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "pending-message"))
