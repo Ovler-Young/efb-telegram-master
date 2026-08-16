@@ -1,11 +1,14 @@
 import asyncio
 import logging
+import os
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from peewee import SqliteDatabase
+import pytest
+from peewee import PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master.models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
@@ -223,7 +226,89 @@ def test_ingestion_collapses_media_to_generic_copyable_content():
     assert stored.media_type == "Document"
     assert stored.msg_type == "File"
     assert stored.mime == "video/mp4"
-    assert stored.time == source_time
+    assert stored.time == datetime(2026, 8, 4, 12, 30)
+
+
+def test_ingestion_persists_mtproto_times_as_utc_naive_datetimes(tmp_path):
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "msglog.db")
+    database.initialize(test_db)
+    test_db.connect()
+    ingestion = MsgLogIngestionRepository("tests.master")
+    mtproto = FakeMTProto(
+        {
+            3: topic_message(3, date=datetime(2026, 8, 4, 12, 30, tzinfo=timezone.utc)),
+            2: topic_message(2, date=datetime(2026, 8, 4, 18, tzinfo=timezone(timedelta(hours=5, minutes=30)))),
+            1: topic_message(1, date=datetime(2026, 8, 4, 8, 15)),
+        },
+        scan_ceiling=3,
+    )
+    service = MsgLogIngestionService(ingestion, FakeChatAssociations({10: "tests.slave target"}), mtproto)
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        asyncio.run(service.run(100, lease_owner="worker-a"))
+        test_db.close()
+        test_db.connect()
+        rows = list(MsgLog.select().order_by(MsgLog.time, MsgLog.master_msg_id))
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+    assert [(row.master_msg_id, row.time, row.time.tzinfo) for row in rows] == [
+        ("100.1", datetime(2026, 8, 4, 8, 15), None),
+        ("100.2", datetime(2026, 8, 4, 12, 30), None),
+        ("100.3", datetime(2026, 8, 4, 12, 30), None),
+    ]
+
+
+@pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
+def test_postgresql_ingestion_persists_mtproto_times_as_utc_naive_datetimes():
+    connection_kwargs = {
+        "database": os.environ["TEST_POSTGRES_DB"],
+        "host": os.environ["TEST_POSTGRES_HOST"],
+        "port": int(os.environ["TEST_POSTGRES_PORT"]),
+        "user": os.environ["TEST_POSTGRES_USER"],
+        "password": os.environ["TEST_POSTGRES_PASSWORD"],
+    }
+    database_name = f"etm_msglog_time_{uuid.uuid4().hex}"
+    admin_db = PostgresqlDatabase(**connection_kwargs)
+    admin_db.connect()
+    admin_db.connection().autocommit = True
+    original_database = database.obj
+    test_db = None
+    try:
+        admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
+        test_db = PostgresqlDatabase(database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"})
+        database.initialize(test_db)
+        test_db.connect()
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        ingestion = MsgLogIngestionRepository("tests.master")
+        service = MsgLogIngestionService(ingestion, FakeChatAssociations({10: "tests.slave target"}), SimpleNamespace())
+        scan = ingestion.get_or_create_scan(100, 3)
+        assert ingestion.claim_scan(100, "worker-a", 60) is not None
+        for message_id, source_time in (
+            (3, datetime(2026, 8, 4, 12, 30, tzinfo=timezone.utc)),
+            (2, datetime(2026, 8, 4, 18, tzinfo=timezone(timedelta(hours=5, minutes=30)))),
+            (1, datetime(2026, 8, 4, 8, 15)),
+        ):
+            classification, slave_uid, content = service._classify(topic_message(message_id, date=source_time), 100)
+            assert ingestion.persist_item(scan, source_message_id=message_id, classification=classification, slave_uid=slave_uid, message=content, lease_owner="worker-a") == "inserted"
+        test_db.close()
+        test_db.connect()
+        rows = list(MsgLog.select().order_by(MsgLog.time, MsgLog.master_msg_id))
+    finally:
+        if test_db is not None and not test_db.is_closed():
+            test_db.close()
+        database.initialize(original_database)
+        admin_db.execute_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
+        admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
+        admin_db.close()
+
+    assert [(row.master_msg_id, row.time, row.time.tzinfo) for row in rows] == [
+        ("100.1", datetime(2026, 8, 4, 8, 15), None),
+        ("100.2", datetime(2026, 8, 4, 12, 30), None),
+        ("100.3", datetime(2026, 8, 4, 12, 30), None),
+    ]
 
 
 def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_cursor(caplog):

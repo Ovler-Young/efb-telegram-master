@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from .chat_association_repository import ChatAssociationRepository
@@ -157,8 +157,15 @@ class MsgLogIngestionService:
         content = self._content(message)
         source_time = getattr(message, "date", None)
         if isinstance(source_time, datetime):
-            content = replace(content, time=source_time)
+            content = replace(content, time=self._normalize_msglog_time(source_time))
         return "eligible", slave_uid, content
+
+    @staticmethod
+    def _normalize_msglog_time(source_time: datetime) -> datetime:
+        """Use UTC-naive values for aware MTProto dates and retain legacy naive dates."""
+        if source_time.tzinfo is None or source_time.utcoffset() is None:
+            return source_time
+        return source_time.astimezone(timezone.utc).replace(tzinfo=None)
 
     @staticmethod
     def _message_id(message: object) -> Optional[int]:
