@@ -243,9 +243,8 @@ class TelegramChannel(MasterChannel):
         msg_log = self.msglogs.get_msg_log(slave_origin_uid=origin_uid, slave_msg_id=msg_id)
         if msg_log is not None and msg_log.provenance != "mtproto_ingested":
             return self.message_reconstructor.build(msg_log)
-        else:
-            # Message is not found.
-            return None
+        # MTProto-ingested records have no reconstructable EFB message.
+        return None
 
     def void_callback_handler(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)

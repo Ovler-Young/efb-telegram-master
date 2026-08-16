@@ -388,8 +388,8 @@ class OutboundQueue:
             assert isinstance(result, PrimaryExecution)
             if result.attachment is not None:
                 pending.primary_result, pending.attachment, pending.phase, pending.retry_at = result.receipt, result.attachment, _CallPhase.ATTACHMENT, 0.0
-                self._call_adapter.record_successful_send(pending.call, selection)
                 if self._lifecycle is OutboundLifecycle.RUNNING:
+                    self._call_adapter.record_successful_send(pending.call, selection)
                     self._pending.appendleft(pending)
                 else:
                     self._record_outcome(pending, "cancelled")

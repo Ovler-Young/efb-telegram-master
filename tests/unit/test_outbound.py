@@ -24,11 +24,12 @@ from efb_telegram_master.outbound_types import (
     QueueRequest,
     SchedulerStoppedError,
     SenderSelection,
+    SendReceipt,
     UploadCleanup,
     rewind_uploads,
 )
 from efb_telegram_master.sender_policy import retry_after_seconds
-from efb_telegram_master.telegram_calls import TelegramCallAdapter
+from efb_telegram_master.telegram_calls import PrimaryExecution, TelegramCallAdapter
 
 
 class _Limiter:
@@ -196,6 +197,26 @@ def test_queue_records_cancelled_outcomes_once_for_shutdown_and_stop_during_retr
     rendered = generate_latest(metrics.registry).decode()
     assert 'etm_outbound_outcomes_total{operation="send_message",outcome="cancelled"} 2.0' in rendered
     assert "987654" not in rendered
+
+
+def test_cancelled_attachment_delivery_does_not_record_auxiliary_affinity() -> None:
+    auxiliary = Mock()
+    auxiliary.bot_id = 10
+    auxiliary.disabled = False
+    pool = BotPool([auxiliary])
+    queue = OutboundQueue(Mock(), pool, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
+    waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "body"}, 1, slave_id="slave-a", required_sender_bot_id="10"))
+    attachment = QueuedCall("send_document", (1, io.BytesIO(b"body")), {}, 1, "slave-a", "10", None)
+
+    with queue._lock:
+        pending = queue._pending.popleft()
+        queue._lifecycle = OutboundLifecycle.STOPPING
+        queue._complete_success_locked(pending, PrimaryExecution(SendReceipt(SimpleNamespace(message_id=1), 10), attachment), SenderSelection(Mock(), 10))
+
+    with pytest.raises(SchedulerStoppedError):
+        waiter.result()
+    assert pool.preferred_sender("slave-a") is None
+    queue.stop()
 
 
 def test_queue_collector_emits_oldest_age_for_a_live_pending_call() -> None:

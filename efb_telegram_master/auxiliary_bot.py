@@ -231,7 +231,7 @@ class AuxiliaryBot:
             callback(self, chat_id, is_member)
 
     def recheck_membership(self, chat_id: int) -> None:
-        """Discard cached membership and asynchronously probe its current value."""
+        """Refresh cached membership unless a confirmed non-member entry remains within its TTL."""
         with self._membership_lock:
             cached_membership = self._membership_cache.get(chat_id)
             if cached_membership is not None and not cached_membership[0]:

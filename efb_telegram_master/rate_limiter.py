@@ -109,7 +109,7 @@ class SlidingWindowRateLimiter:
         return self.try_acquire_chat(chat_id)
 
     def get_counts(self, chat_id: int) -> tuple[int, int]:
-        """Return active bot-chat and global acquisition counts for diagnostics."""
+        """Expire stale entries, then return active bot-chat and global counts."""
         with self._lock:
             chat_bucket, _limiter = self._chat_limiter(chat_id)
             self._leak(self._global_bucket)
@@ -117,7 +117,7 @@ class SlidingWindowRateLimiter:
             return chat_bucket.count(), self._global_bucket.count()
 
     def occupancy_snapshot(self) -> dict[str, float]:
-        """Return aggregate limiter occupancy without exposing chat identities."""
+        """Expire stale entries, then return aggregate occupancy without chat identities."""
         with self._lock:
             self._leak(self._global_bucket)
             global_occupancy = self._global_bucket.count() / GLOBAL_LIMIT
