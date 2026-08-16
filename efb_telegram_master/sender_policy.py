@@ -144,16 +144,12 @@ class SenderPolicy:
         self._remove_cooldown_heap(self._cooldown_max_heaps[kind], self._cooldown_max_indices[kind], key, reverse=True)
         del self._cooldowns[key]
 
-    def _push_cooldown_heap(
-        self, heap: CooldownHeap, indices: CooldownHeapIndices, key: CooldownKey, *, reverse: bool
-    ) -> None:
+    def _push_cooldown_heap(self, heap: CooldownHeap, indices: CooldownHeapIndices, key: CooldownKey, *, reverse: bool) -> None:
         indices[key] = len(heap)
         heap.append(key)
         self._sift_cooldown_up(heap, indices, len(heap) - 1, reverse=reverse)
 
-    def _remove_cooldown_heap(
-        self, heap: CooldownHeap, indices: CooldownHeapIndices, key: CooldownKey, *, reverse: bool
-    ) -> None:
+    def _remove_cooldown_heap(self, heap: CooldownHeap, indices: CooldownHeapIndices, key: CooldownKey, *, reverse: bool) -> None:
         index = indices.pop(key)
         replacement = heap.pop()
         if index == len(heap):
@@ -162,15 +158,11 @@ class SenderPolicy:
         indices[replacement] = index
         self._fix_cooldown_heap(heap, indices, index, reverse=reverse)
 
-    def _fix_cooldown_heap(
-        self, heap: CooldownHeap, indices: CooldownHeapIndices, index: int, *, reverse: bool
-    ) -> None:
+    def _fix_cooldown_heap(self, heap: CooldownHeap, indices: CooldownHeapIndices, index: int, *, reverse: bool) -> None:
         index = self._sift_cooldown_up(heap, indices, index, reverse=reverse)
         self._sift_cooldown_down(heap, indices, index, reverse=reverse)
 
-    def _sift_cooldown_up(
-        self, heap: CooldownHeap, indices: CooldownHeapIndices, index: int, *, reverse: bool
-    ) -> int:
+    def _sift_cooldown_up(self, heap: CooldownHeap, indices: CooldownHeapIndices, index: int, *, reverse: bool) -> int:
         while index:
             parent = (index - 1) // 2
             if not self._cooldown_precedes(heap[index], heap[parent], reverse=reverse):
@@ -179,9 +171,7 @@ class SenderPolicy:
             index = parent
         return index
 
-    def _sift_cooldown_down(
-        self, heap: CooldownHeap, indices: CooldownHeapIndices, index: int, *, reverse: bool
-    ) -> None:
+    def _sift_cooldown_down(self, heap: CooldownHeap, indices: CooldownHeapIndices, index: int, *, reverse: bool) -> None:
         while (child := index * 2 + 1) < len(heap):
             right = child + 1
             if right < len(heap) and self._cooldown_precedes(heap[right], heap[child], reverse=reverse):
@@ -199,9 +189,7 @@ class SenderPolicy:
         return first_deadline > second_deadline if reverse else first_deadline < second_deadline
 
     @staticmethod
-    def _swap_cooldown_heap_entries(
-        heap: CooldownHeap, indices: CooldownHeapIndices, first: int, second: int
-    ) -> None:
+    def _swap_cooldown_heap_entries(heap: CooldownHeap, indices: CooldownHeapIndices, first: int, second: int) -> None:
         heap[first], heap[second] = heap[second], heap[first]
         indices[heap[first]] = first
         indices[heap[second]] = second
