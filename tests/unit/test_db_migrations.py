@@ -1,6 +1,7 @@
 import pickle
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -217,8 +218,8 @@ def test_sqlite_import_snapshot_omits_missing_ingestion_rescan_requested_column(
         )
         source_db.execute_sql(
             "INSERT INTO msglogingestionscan (source_chat_id, scan_boundary, cursor, existing_streak, scanned_count, inserted_count, "
-            "existing_count, skipped_count, lease_owner, status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None),
+            "existing_count, skipped_count, lease_owner, status, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None, "2020-01-02 03:04:05", "2021-02-03 04:05:06"),
         )
         with source_db.bind_ctx([MsgLogIngestionScan]):
             snapshot = DatabaseManager._sqlite_source_snapshot(source_db, (MsgLogIngestionScan,))
@@ -245,6 +246,8 @@ def test_sqlite_import_snapshot_omits_missing_ingestion_rescan_requested_column(
         "status": "complete",
         "error": None,
     }
+    assert row["created_at"] == datetime(2020, 1, 2, 3, 4, 5)
+    assert row["updated_at"] == datetime(2021, 2, 3, 4, 5, 6)
 
 
 def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):

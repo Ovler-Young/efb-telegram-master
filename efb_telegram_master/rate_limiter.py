@@ -28,6 +28,17 @@ class _CallableMonotonicClock(AbstractClock):
         return int(self._now() * 1000)
 
 
+class _ClockedInMemoryBucket(InMemoryBucket):
+    """In-memory bucket with a caller-supplied public clock implementation."""
+
+    def __init__(self, rates: list[Rate], clock: AbstractClock) -> None:
+        super().__init__(rates)
+        self.clock = clock
+
+    def now(self) -> int:
+        return self.clock.now()
+
+
 class SlidingWindowRateLimiter:
     """Per-bot global and bot-chat limits consumed by non-blocking acquisition."""
 
@@ -36,19 +47,17 @@ class SlidingWindowRateLimiter:
         self._lock = threading.Lock()
         self._global_bucket = self._new_bucket(GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS)
         self._global_limiter = self._new_limiter(self._global_bucket)
-        self._chat_buckets: dict[int, InMemoryBucket] = {}
+        self._chat_buckets: dict[int, _ClockedInMemoryBucket] = {}
         self._chat_limiters: dict[int, Limiter] = {}
 
-    def _new_bucket(self, limit: int, seconds: float) -> InMemoryBucket:
-        bucket = InMemoryBucket([Rate(limit, int(seconds * Duration.SECOND))])
-        bucket._clock = self._clock
-        return bucket
+    def _new_bucket(self, limit: int, seconds: float) -> _ClockedInMemoryBucket:
+        return _ClockedInMemoryBucket([Rate(limit, int(seconds * Duration.SECOND))], self._clock)
 
     @staticmethod
     def _new_limiter(bucket: InMemoryBucket) -> Limiter:
         return Limiter(SingleBucketFactory(bucket, schedule_leak=False), buffer_ms=0)
 
-    def _chat_limiter(self, chat_id: int) -> tuple[InMemoryBucket, Limiter]:
+    def _chat_limiter(self, chat_id: int) -> tuple[_ClockedInMemoryBucket, Limiter]:
         limiter = self._chat_limiters.get(chat_id)
         if limiter is None:
             bucket = self._new_bucket(CHAT_LIMIT, CHAT_WINDOW_SECONDS)

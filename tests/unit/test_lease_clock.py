@@ -101,3 +101,28 @@ def test_new_utc_scan_lease_and_scheduler_deferral_ignore_host_timezone():
 
     assert captured["source_chat_id"] == 100
     assert 210.0 <= captured["not_before"] <= 225.0
+
+
+def test_new_scan_ordering_timestamps_use_utc_naive_clock():
+    original_timezone = _with_timezone("Pacific/Kiritimati")
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    scans = MsgLogIngestionRepository("tests")
+    before = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        test_db.create_tables([MsgLogIngestionScan])
+        scan = scans.get_or_create_scan(100, 500)
+        assert scans.claim_scan(100, "worker", 60) is not None
+        stored = MsgLogIngestionScan.get_by_id(scan.id)
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+        _restore_timezone(original_timezone)
+
+    after = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert stored.created_at.tzinfo is None
+    assert stored.updated_at.tzinfo is None
+    assert before <= stored.created_at <= after
+    assert before <= stored.updated_at <= after

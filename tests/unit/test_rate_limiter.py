@@ -73,6 +73,17 @@ def test_acquisition_uses_monotonic_clock_not_wall_clock(monkeypatch) -> None:
     assert limiter.global_delay() == 0.0
 
 
+def test_clock_is_injected_without_mutating_pyrate_limiter_private_clock() -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+
+    assert "_clock" not in limiter._global_bucket.__dict__
+    assert limiter._global_bucket.now() == 0
+
+    clock.value = 42.5
+    assert limiter._global_bucket.now() == 42500
+
+
 def test_global_acquisition_precedes_chat_and_loses_at_most_one_slot_per_chat_failure() -> None:
     clock = MonotonicClock()
     limiter = _make_limiter(clock)

@@ -56,7 +56,7 @@ class MsgLogIngestionRepository(ObservedRepository):
         lease_expires_at = utc_now + datetime.timedelta(seconds=lease_seconds)
         with database.atomic():
             updated = (
-                MsgLogIngestionScan.update(lease_owner=lease_owner, lease_expires_at=lease_expires_at, lease_clock=UTC_LEASE_CLOCK, status="running", error=None, updated_at=local_now)
+                MsgLogIngestionScan.update(lease_owner=lease_owner, lease_expires_at=lease_expires_at, lease_clock=UTC_LEASE_CLOCK, status="running", error=None, updated_at=utc_now)
                 .where(
                     (MsgLogIngestionScan.source_chat_id == str(source_chat_id))
                     & (MsgLogIngestionScan.status != "complete")
@@ -84,7 +84,7 @@ class MsgLogIngestionRepository(ObservedRepository):
 
     def request_association_rescan(self, source_chat_id: int) -> Optional[str]:
         """Durably request a follow-up after a topic becomes eligible."""
-        now = datetime.datetime.now()
+        local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
         supports_for_update = bool(getattr(database.obj, "for_update", False))
         transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
@@ -96,25 +96,25 @@ class MsgLogIngestionRepository(ObservedRepository):
             if scan.status == "complete":
                 self._reset_for_association_rescan(scan)
             elif scan.status == "running":
-                if scan.lease_owner is not None and not self._lease_expired(scan, utc_now, now):
+                if scan.lease_owner is not None and not self._lease_expired(scan, utc_now, local_now):
                     scan.rescan_requested = True
                 else:
                     self._reset_for_association_rescan(scan)
-            scan.updated_at = now
+            scan.updated_at = utc_now
             scan.save()
             return scan.status
 
     def persist_item(
         self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional["IngestedMsgLog"] = None, lease_owner: str
     ) -> str:
-        now = datetime.datetime.now()
+        local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
         supports_for_update = bool(getattr(database.obj, "for_update", False))
         transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
         with transaction:
             query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
             current = query.for_update().get() if supports_for_update else query.get()
-            if current.lease_owner != lease_owner or self._lease_expired(current, utc_now, now):
+            if current.lease_owner != lease_owner or self._lease_expired(current, utc_now, local_now):
                 raise MsgLogIngestionLeaseLostError("MsgLog ingestion lease is no longer owned by this worker")
             if current.status == "complete":
                 return "complete"
@@ -150,22 +150,22 @@ class MsgLogIngestionRepository(ObservedRepository):
                     current.inserted_count += 1
                     current.existing_streak = 0
                     outcome = "inserted"
-            current.updated_at = now
+            current.updated_at = utc_now
             current.save()
             scan.__data__.update(current.__data__)
             return outcome
 
     def finish_scan(self, scan: MsgLogIngestionScan, *, status: str, error: Optional[str] = None, lease_owner: str) -> bool:
-        now = datetime.datetime.now()
+        local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
         with database.atomic():
             updated = (
-                MsgLogIngestionScan.update(status=status, error=error, lease_owner=None, lease_expires_at=None, updated_at=now)
+                MsgLogIngestionScan.update(status=status, error=error, lease_owner=None, lease_expires_at=None, updated_at=utc_now)
                 .where(
                     (MsgLogIngestionScan.id == scan.id)
                     & (MsgLogIngestionScan.lease_owner == lease_owner)
                     & MsgLogIngestionScan.lease_expires_at.is_null(False)
-                    & ~self._expired_lease_condition(utc_now, now)
+                    & ~self._expired_lease_condition(utc_now, local_now)
                 )
                 .execute()
             )
@@ -176,14 +176,14 @@ class MsgLogIngestionRepository(ObservedRepository):
 
     def complete_scan(self, scan: MsgLogIngestionScan, *, lease_owner: str) -> MsgLogIngestionCompletion:
         """Complete the current pass and retain its lease for a requested rescan."""
-        now = datetime.datetime.now()
+        local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
         supports_for_update = bool(getattr(database.obj, "for_update", False))
         transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
         with transaction:
             query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
             current = query.for_update().get() if supports_for_update else query.get()
-            if current.lease_owner != lease_owner or self._lease_expired(current, utc_now, now):
+            if current.lease_owner != lease_owner or self._lease_expired(current, utc_now, local_now):
                 return MsgLogIngestionCompletion.LEASE_LOST
             if current.rescan_requested:
                 current.cursor = current.scan_boundary
@@ -194,24 +194,24 @@ class MsgLogIngestionRepository(ObservedRepository):
                 current.skipped_count = 0
                 current.rescan_requested = False
                 current.error = None
-                current.updated_at = now
+                current.updated_at = utc_now
                 current.save()
                 scan.__data__.update(current.__data__)
                 return MsgLogIngestionCompletion.RESCAN
             current.status = "complete"
             current.lease_owner = None
             current.lease_expires_at = None
-            current.updated_at = now
+            current.updated_at = utc_now
             current.save()
             scan.__data__.update(current.__data__)
             return MsgLogIngestionCompletion.COMPLETE
 
     def release_scan(self, source_chat_id: int, lease_owner: str) -> bool:
         """Make a shutdown-interrupted scan resumable without changing its cursor."""
-        now = datetime.datetime.now()
+        utc_now = utc_now_naive()
         with database.atomic():
             return (
-                MsgLogIngestionScan.update(status="pending", error="shutdown", lease_owner=None, lease_expires_at=None, updated_at=now)
+                MsgLogIngestionScan.update(status="pending", error="shutdown", lease_owner=None, lease_expires_at=None, updated_at=utc_now)
                 .where((MsgLogIngestionScan.source_chat_id == str(source_chat_id)) & (MsgLogIngestionScan.status != "complete") & (MsgLogIngestionScan.lease_owner == lease_owner))
                 .execute()
                 == 1

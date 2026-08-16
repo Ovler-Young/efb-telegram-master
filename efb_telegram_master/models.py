@@ -131,8 +131,8 @@ class MsgLogIngestionScan(BaseModel):
     lease_clock = TextField(null=True, default=UTC_LEASE_CLOCK, constraints=[SQL("DEFAULT 'utc'")])
     status = TextField(default="pending")
     error = TextField(null=True)
-    created_at = DateTimeField(default=datetime.datetime.now)
-    updated_at = DateTimeField(default=datetime.datetime.now)
+    created_at = DateTimeField(default=utc_now_naive)
+    updated_at = DateTimeField(default=utc_now_naive)
 
 
 class MsgLogIngestionLeaseLostError(RuntimeError):
