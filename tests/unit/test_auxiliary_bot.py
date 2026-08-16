@@ -94,6 +94,31 @@ def test_check_membership_tri_starts_probe_for_unknown():
     start_probe.assert_called_once_with(1000)
 
 
+def test_check_membership_tri_does_not_start_duplicate_probe_for_unknown_chat():
+    started = threading.Event()
+    release = threading.Event()
+
+    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
+        started.set()
+        assert release.wait(1)
+        return SimpleNamespace(status="member")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+        aux_bot = AuxiliaryBot("123:token")
+    aux_bot.bot_id = 123
+    aux_bot.async_bot.get_chat_member.side_effect = get_chat_member
+
+    try:
+        assert aux_bot.check_membership_tri(1000) is None
+        assert started.wait(1)
+        assert aux_bot.check_membership_tri(1000) is None
+        assert aux_bot.async_bot.get_chat_member.call_count == 1
+    finally:
+        release.set()
+        aux_bot.begin_membership_shutdown()
+        aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
+
+
 def test_check_membership_tri_returns_unknown_while_refreshing_stale_entry():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
         aux_bot = AuxiliaryBot("123:token")

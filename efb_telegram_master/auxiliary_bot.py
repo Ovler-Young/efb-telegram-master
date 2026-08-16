@@ -208,7 +208,6 @@ class AuxiliaryBot:
         """Tri-state membership check: True (member), False (confirmed not member),
         None (unknown / probe in progress).
         """
-        need_probe = False
         with self._membership_lock:
             entry = self._membership_cache.get(chat_id)
             if entry is not None:
@@ -219,11 +218,6 @@ class AuxiliaryBot:
                     self._membership_cache.move_to_end(chat_id)
                     return is_member
                 del self._membership_cache[chat_id]
-                need_probe = True
-
-        if need_probe:
-            self._start_membership_probe(chat_id)
-            return None
 
         self._start_membership_probe(chat_id)
         return None
