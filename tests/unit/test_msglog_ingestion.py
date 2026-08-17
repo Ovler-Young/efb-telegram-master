@@ -217,8 +217,7 @@ def _five_hundred_rule(db, scan, *, source_message_id, classification, **_kwargs
 def test_ingestion_collapses_media_to_generic_copyable_content():
     db = FakeDatabase(scan_boundary=1)
     media = SimpleNamespace(document=SimpleNamespace(mime_type="video/mp4", attributes=[]))
-    source_time = datetime(2026, 8, 4, 12, 30, tzinfo=timezone.utc)
-    mtproto = FakeMTProto({1: topic_message(1, media=media, date=source_time)}, scan_ceiling=1)
+    mtproto = FakeMTProto({1: topic_message(1, media=media)}, scan_ceiling=1)
 
     asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
@@ -226,7 +225,6 @@ def test_ingestion_collapses_media_to_generic_copyable_content():
     assert stored.media_type == "Document"
     assert stored.msg_type == "File"
     assert stored.mime == "video/mp4"
-    assert stored.time == datetime(2026, 8, 4, 12, 30)
 
 
 def test_ingestion_persists_mtproto_times_as_utc_naive_datetimes(tmp_path):
