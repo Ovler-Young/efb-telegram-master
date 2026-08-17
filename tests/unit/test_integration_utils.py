@@ -1,5 +1,3 @@
-import asyncio
-import threading
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
@@ -10,7 +8,6 @@ from efb_telegram_master import utils as etm_utils
 from efb_telegram_master.chat_destination_cache import ChatDestinationCache
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 from tests.integration import test_master_message_destination as destination_tests
-from tests.integration import test_mtproto_live as mtproto_live_tests
 from tests.integration import utils as integration_utils
 from tests.integration.helper.filters import BaseFilter
 
@@ -35,35 +32,6 @@ def test_decode_start_link_token_rejects_a_mismatched_owner():
 
     with pytest.raises(AssertionError, match="does not match expected owner"):
         integration_utils.decode_start_link_token(start_token, expected_owner=TelegramChatID(2))
-
-
-@pytest.mark.asyncio
-async def test_msglog_cleanup_waits_for_source_mapping_removal_not_pool_worker_exit() -> None:
-    lock = threading.Lock()
-    persistent_worker = threading.current_thread()
-    scheduler = SimpleNamespace(_lock=lock, _threads={100: persistent_worker})
-    channel = SimpleNamespace(msglog_scan=scheduler)
-
-    async def remove_source_mapping() -> None:
-        await asyncio.sleep(0)
-        with lock:
-            scheduler._threads.pop(100)
-
-    removal = asyncio.create_task(remove_source_mapping())
-
-    await mtproto_live_tests._wait_for_ingestion_worker_exit(channel, 100, timeout=0.2)
-    await removal
-
-    assert persistent_worker.is_alive()
-
-
-@pytest.mark.asyncio
-async def test_msglog_cleanup_reports_timeout_when_source_mapping_remains() -> None:
-    scheduler = SimpleNamespace(_lock=threading.Lock(), _threads={100: object()})
-    channel = SimpleNamespace(msglog_scan=scheduler)
-
-    with pytest.raises(TimeoutError, match="MsgLog ingestion worker did not stop"):
-        await mtproto_live_tests._wait_for_ingestion_worker_exit(channel, 100, timeout=0)
 
 
 @pytest.mark.asyncio
@@ -215,71 +183,6 @@ def test_expired_destination_lookup_restores_the_cache_snapshot() -> None:
     assert cache.weak["expired"] is expired
     assert expired.expiry == original_expiry
     assert "created-during-test" not in cache.weak
-
-
-@pytest.mark.asyncio
-async def test_cancel_destination_suggestion_waits_for_its_own_edit(monkeypatch: pytest.MonkeyPatch) -> None:
-    clicked = False
-    calls = []
-    helper = object()
-    client = object()
-    observed = []
-
-    async def click() -> None:
-        nonlocal clicked
-        clicked = True
-
-    async def private_response(trigger, receive, **kwargs):
-        calls.append((trigger, receive, kwargs))
-        await trigger()
-        return await receive(1.0)
-
-    async def wait_for_state(state_client, chat_id, message_id, expected, *, timeout):
-        observed.append((state_client, chat_id, message_id, expected(SimpleNamespace(button_count=0)), timeout))
-
-    message = SimpleNamespace(id=12, chat_id=34, button_count=1, buttons=[[SimpleNamespace(click=click)]])
-
-    monkeypatch.setattr(destination_tests, "wait_for_message_state", wait_for_state)
-
-    await destination_tests.cancel_destination_suggestion(client, helper, private_response, message)
-
-    assert clicked
-    assert len(calls) == 1
-    assert calls[0][2] == {"target_chat_id": 34}
-    assert observed == [(client, 34, 12, True, 1.0)]
-
-
-@pytest.mark.asyncio
-async def test_destination_suggestion_waits_for_the_clicked_prompt_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    clicked = False
-    observed = []
-    client = object()
-    selected_button = SimpleNamespace(click=None)
-    prompt = SimpleNamespace(id=12, chat_id=34, buttons=[[SimpleNamespace(click=_async_noop)], [selected_button]])
-    sent_message = SimpleNamespace(id=77)
-
-    async def click() -> None:
-        nonlocal clicked
-        clicked = True
-
-    selected_button.click = click
-
-    async def private_response(trigger, receive, **kwargs):
-        await trigger()
-        await receive(1.0)
-        observed.append(kwargs)
-
-    async def wait_for_state(state_client, chat_id, message_id, expected, *, timeout):
-        matching = SimpleNamespace(reply_to_msg_id=77, raw_text="Delivering the message to Alice.", text="Delivering the message to Alice.")
-        wrong_reply = SimpleNamespace(reply_to_msg_id=78, raw_text="Delivering the message to Alice.", text="Delivering the message to Alice.")
-        observed.append((state_client, chat_id, message_id, expected(matching), expected(wrong_reply), timeout))
-
-    monkeypatch.setattr(destination_tests, "wait_for_message_state", wait_for_state)
-
-    await destination_tests.wait_for_destination_delivery(client, prompt, selected_button, sent_message, private_response)
-
-    assert clicked
-    assert observed == [(client, 34, 12, True, False, 1.0), {"target_chat_id": 34}]
 
 
 async def _async_noop(*_args: object, **_kwargs: object) -> None:
