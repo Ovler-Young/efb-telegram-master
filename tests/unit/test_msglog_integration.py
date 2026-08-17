@@ -482,6 +482,7 @@ def test_msglog_scan_stop_does_not_double_release_a_gracefully_stopped_lease(mon
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
 
     with msglog_scan_scheduler(ingestion) as scheduler:
+
         async def run(_service, source_chat_id, *, lease_owner, stop_requested):
             started.set()
             await asyncio.to_thread(scheduler._stop_event.wait)
@@ -505,6 +506,7 @@ def test_msglog_scan_stop_releases_a_lease_after_an_interrupted_service(monkeypa
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
 
     with msglog_scan_scheduler(ingestion) as scheduler:
+
         async def run(_service, _source_chat_id, *, lease_owner, stop_requested):
             started.set()
             await asyncio.to_thread(scheduler._stop_event.wait)
