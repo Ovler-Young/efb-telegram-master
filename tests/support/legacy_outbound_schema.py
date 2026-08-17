@@ -1,7 +1,7 @@
 from peewee import SQL, AutoField, BigIntegerField, BooleanField, DateTimeField, IntegerField, Model, TextField
 
 
-def legacy_outbound_models(test_database):
+def create_legacy_outbound_schema(test_database, tables=("outboundworkflow", "outboundtask")):
     class BaseModel(Model):
         class Meta:
             database = test_database
@@ -49,4 +49,28 @@ def legacy_outbound_models(test_database):
                 (("workflow_id", "step_index"), True),
             )
 
+    models = {
+        "outboundworkflow": OutboundWorkflow,
+        "outboundtask": OutboundTask,
+    }
+    test_database.create_tables([models[table] for table in tables])
     return OutboundWorkflow, OutboundTask
+
+
+def create_legacy_historic_identity_source(test_database):
+    test_database.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
+    test_database.execute_sql("CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)")
+    test_database.execute_sql(
+        "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
+        "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
+        "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
+    )
+    test_database.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
+    test_database.execute_sql("INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')")
+    test_database.execute_sql(
+        "INSERT INTO historymigrationentry VALUES "
+        "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+        "(2, 'slave-a', '100', NULL, '10.2', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+        "(3, 'slave-a', '100', '200', '10.3', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
+        "(4, 'slave-a', '100', '200', '10.4', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP)"
+    )

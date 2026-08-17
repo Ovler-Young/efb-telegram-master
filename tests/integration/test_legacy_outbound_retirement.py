@@ -1,5 +1,6 @@
 import threading
 import uuid
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +9,7 @@ from peewee import PostgresqlDatabase, SqliteDatabase
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
-from tests.support.legacy_outbound_schema import legacy_outbound_models
+from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source, create_legacy_outbound_schema
 
 
 @pytest.fixture
@@ -31,6 +32,21 @@ def _drop_database(admin_db, database_name):
     admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
 
 
+@contextmanager
+def _temporary_postgresql_database(config):
+    admin_db = PostgresqlDatabase(**_database_kwargs(config))
+    admin_db.connect()
+    admin_db.connection().autocommit = True
+    database_name, test_db = _new_database(admin_db, config)
+    try:
+        yield database_name, test_db
+    finally:
+        if not test_db.is_closed():
+            test_db.close()
+        _drop_database(admin_db, database_name)
+        admin_db.close()
+
+
 @pytest.mark.integration
 def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgres_config, tmp_path, monkeypatch):
     admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
@@ -44,8 +60,7 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
     try:
         database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
         legacy_db.connect()
-        workflow, task = legacy_outbound_models(legacy_db)
-        legacy_db.create_tables([workflow, task])
+        workflow, task = create_legacy_outbound_schema(legacy_db)
         workflow_columns = {column.name: column for column in legacy_db.get_columns("outboundworkflow")}
         task_columns = {column.name: column for column in legacy_db.get_columns("outboundtask")}
         assert (
@@ -122,8 +137,7 @@ def test_postgresql_startup_preserves_non_empty_legacy_outbound_tables(integrati
     try:
         database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
         legacy_db.connect()
-        workflow, task = legacy_outbound_models(legacy_db)
-        legacy_db.create_tables([workflow, task])
+        workflow, task = create_legacy_outbound_schema(legacy_db)
         workflow.create()
         task.create(
             source_key="source",
@@ -268,22 +282,7 @@ def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         source_db.connect()
-        source_db.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
-        source_db.execute_sql("CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)")
-        source_db.execute_sql(
-            "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
-            "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
-            "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
-        )
-        source_db.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
-        source_db.execute_sql("INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')")
-        source_db.execute_sql(
-            "INSERT INTO historymigrationentry VALUES "
-            "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(2, 'slave-a', '100', NULL, '10.2', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(3, 'slave-a', '100', '200', '10.3', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(4, 'slave-a', '100', '200', '10.4', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP)"
-        )
+        create_legacy_historic_identity_source(source_db)
         database_name, _target = _new_database(admin_db, integration_postgres_config)
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
 
@@ -359,8 +358,7 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
     try:
         database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
         legacy_db.connect()
-        workflow, task = legacy_outbound_models(legacy_db)
-        legacy_db.create_tables([workflow, task])
+        workflow, task = create_legacy_outbound_schema(legacy_db)
         legacy_db.close()
         patch.setattr(DatabaseManager, "_validate_legacy_outbound_schema", classmethod(wait_after_first_lock))
         first = threading.Thread(target=retire)
@@ -389,10 +387,6 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
 
 @pytest.mark.integration
 def test_postgresql_retirement_rolls_back_when_workflow_drop_fails(integration_postgres_config, monkeypatch):
-    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
-    admin_db.connect()
-    admin_db.connection().autocommit = True
-    database_name = None
     drop_calls = 0
     original_drop_tables = PostgresqlDatabase.drop_tables
 
@@ -403,11 +397,9 @@ def test_postgresql_retirement_rolls_back_when_workflow_drop_fails(integration_p
             raise RuntimeError("workflow drop failed")
         return original_drop_tables(instance, models, **kwargs)
 
-    try:
-        database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
+    with _temporary_postgresql_database(integration_postgres_config) as (_database_name, legacy_db):
         legacy_db.connect()
-        workflow, task = legacy_outbound_models(legacy_db)
-        legacy_db.create_tables([workflow, task])
+        workflow, task = create_legacy_outbound_schema(legacy_db)
         monkeypatch.setattr(PostgresqlDatabase, "drop_tables", fail_workflow_drop)
         with pytest.raises(RuntimeError, match="workflow drop failed"):
             DatabaseManager._retire_legacy_outbound_tables_for_database(legacy_db)
@@ -416,7 +408,3 @@ def test_postgresql_retirement_rolls_back_when_workflow_drop_fails(integration_p
         assert task.select().count() == 0
         assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundtask") is None
         legacy_db.close()
-    finally:
-        if database_name is not None:
-            _drop_database(admin_db, database_name)
-        admin_db.close()

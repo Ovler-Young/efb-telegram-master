@@ -27,7 +27,7 @@ from efb_telegram_master.slave_message import SlaveMessageService
 from efb_telegram_master.slave_message_delivery_repository import SlaveMessageDeliveryRepository
 from efb_telegram_master.topic_sync import TopicGroupService
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
-from tests.support.legacy_outbound_schema import legacy_outbound_models
+from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source, create_legacy_outbound_schema
 
 
 def test_msglog_schema_has_sender_bot_id(channel):
@@ -121,22 +121,7 @@ def test_association_schema_upgrade_deduplicates_rows_and_enforces_canonical_ide
     raw_db = SqliteDatabase(database_path)
     raw_db.connect()
     try:
-        raw_db.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
-        raw_db.execute_sql("CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)")
-        raw_db.execute_sql(
-            "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
-            "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
-            "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
-        )
-        raw_db.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
-        raw_db.execute_sql("INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')")
-        raw_db.execute_sql(
-            "INSERT INTO historymigrationentry VALUES "
-            "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(2, 'slave-a', '100', NULL, '10.2', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(3, 'slave-a', '100', '200', '10.3', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(4, 'slave-a', '100', '200', '10.4', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP)"
-        )
+        create_legacy_historic_identity_source(raw_db)
     finally:
         raw_db.close()
 
@@ -174,22 +159,7 @@ def test_sqlite_import_snapshot_canonicalizes_legacy_historic_identities_without
     models = (ChatAssoc, TopicAssoc, HistoryMigrationEntry)
     source_db.connect()
     try:
-        source_db.execute_sql("CREATE TABLE chatassoc (id INTEGER PRIMARY KEY, master_uid TEXT NOT NULL, slave_uid TEXT NOT NULL)")
-        source_db.execute_sql("CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT NOT NULL, message_thread_id TEXT NOT NULL, slave_uid TEXT NOT NULL)")
-        source_db.execute_sql(
-            "CREATE TABLE historymigrationentry (id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, "
-            "message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, media_type TEXT, source_time DATETIME, "
-            "position INTEGER NOT NULL, created_at DATETIME NOT NULL)"
-        )
-        source_db.execute_sql("INSERT INTO chatassoc VALUES (1, 'master-old', 'slave-a'), (2, 'master-new', 'slave-a')")
-        source_db.execute_sql("INSERT INTO topicassoc VALUES (1, '100', '200', 'slave-a'), (2, '101', '201', 'slave-a'), (3, '101', '201', 'slave-b')")
-        source_db.execute_sql(
-            "INSERT INTO historymigrationentry VALUES "
-            "(1, 'slave-a', '100', NULL, '10.1', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(2, 'slave-a', '100', NULL, '10.2', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(3, 'slave-a', '100', '200', '10.3', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP), "
-            "(4, 'slave-a', '100', '200', '10.4', NULL, NULL, NULL, 0, CURRENT_TIMESTAMP)"
-        )
+        create_legacy_historic_identity_source(source_db)
         with source_db.bind_ctx(models):
             snapshot = DatabaseManager._sqlite_source_snapshot(source_db, models)
 
@@ -663,8 +633,7 @@ def test_startup_preserves_non_empty_legacy_outbound_tables_and_retires_empty_on
     raw_db = SqliteDatabase(database_path)
     raw_db.connect()
     try:
-        workflow, task = legacy_outbound_models(raw_db)
-        raw_db.create_tables([workflow, task])
+        workflow, task = create_legacy_outbound_schema(raw_db)
         workflow.create()
         task.create(
             source_key="source",
@@ -754,14 +723,12 @@ def test_postgresql_legacy_outbound_index_fixture_excludes_only_the_primary_key_
     assert set(DatabaseManager._legacy_outbound_task_indexes(backend)) != set(DatabaseManager._LEGACY_OUTBOUND_TASK_INDEXES)
 
 
-@pytest.mark.parametrize("failure", ("drop",))
-def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, monkeypatch, failure):
+def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, monkeypatch):
     database_path = tmp_path / "tgdata.db"
     raw_db = SqliteDatabase(database_path)
     raw_db.connect()
     try:
-        workflow, task = legacy_outbound_models(raw_db)
-        raw_db.create_tables([workflow, task])
+        create_legacy_outbound_schema(raw_db)
     finally:
         raw_db.close()
 
@@ -777,8 +744,8 @@ def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, mo
     monkeypatch.setattr(SqliteDatabase, "drop_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("drop failed")))
 
     try:
-        with pytest.raises(RuntimeError, match=f"{failure} failed"):
-            DatabaseManager(SimpleNamespace(channel_id=f"tests.legacy-{failure}", config={}))
+        with pytest.raises(RuntimeError, match="drop failed"):
+            DatabaseManager(SimpleNamespace(channel_id="tests.legacy-drop", config={}))
     finally:
         if not database.is_closed():
             database.close()
@@ -790,8 +757,7 @@ def test_startup_aborts_without_dropping_partial_historical_schema(tmp_path, mon
     raw_db = SqliteDatabase(tmp_path / "tgdata.db")
     raw_db.connect()
     try:
-        workflow, task = legacy_outbound_models(raw_db)
-        raw_db.create_tables([workflow if legacy_table == "outboundworkflow" else task])
+        create_legacy_outbound_schema(raw_db, tables=(legacy_table,))
     finally:
         raw_db.close()
 
@@ -817,8 +783,7 @@ def test_startup_aborts_without_dropping_same_named_schema_collision(tmp_path, m
     raw_db.connect()
     try:
         raw_db.execute_sql("CREATE TABLE outboundworkflow (id INTEGER PRIMARY KEY, unrelated TEXT)")
-        _workflow, task = legacy_outbound_models(raw_db)
-        raw_db.create_tables([task])
+        create_legacy_outbound_schema(raw_db, tables=("outboundtask",))
     finally:
         raw_db.close()
 
@@ -850,8 +815,7 @@ def test_startup_refuses_legacy_tables_with_default_collisions(tmp_path, monkeyp
     raw_db = SqliteDatabase(tmp_path / "tgdata.db")
     raw_db.connect()
     try:
-        workflow, task = legacy_outbound_models(raw_db)
-        raw_db.create_tables([workflow, task])
+        workflow, task = create_legacy_outbound_schema(raw_db)
         table_sql = raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)).fetchone()[0]
         index_sql = [row[0] for row in raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL", (table_name,)).fetchall()]
         raw_db.execute_sql(f'DROP TABLE "{table_name}"')
@@ -889,8 +853,7 @@ def test_startup_refuses_altered_accepted_at_default_without_dropping_legacy_sch
     raw_db = SqliteDatabase(database_path)
     raw_db.connect()
     try:
-        workflow, task = legacy_outbound_models(raw_db)
-        raw_db.create_tables([workflow, task])
+        workflow, task = create_legacy_outbound_schema(raw_db)
         task_sql = raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", ("outboundtask",)).fetchone()[0]
         index_sql = [row[0] for row in raw_db.execute_sql("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL", ("outboundtask",)).fetchall()]
         raw_db.execute_sql("DROP TABLE outboundtask")
@@ -931,8 +894,7 @@ def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, 
     raw_db = SqliteDatabase(database_path)
     raw_db.connect()
     try:
-        workflow, task = legacy_outbound_models(raw_db)
-        raw_db.create_tables([workflow, task])
+        workflow, task = create_legacy_outbound_schema(raw_db)
     finally:
         raw_db.close()
 
