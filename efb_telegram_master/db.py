@@ -219,6 +219,7 @@ class DatabaseManager:
                 )
             if "msglogingestionscan" in table_names:
                 scan_columns = {column.name for column in current_database.get_columns("msglogingestionscan")}
+                # Existing expiry timestamps were written against local time, so their clock remains NULL until a new claim stamps UTC.
                 scan_migrations = tuple(
                     migrator.add_column("msglogingestionscan", column_name, field)
                     for column_name, field in (("rescan_requested", MsgLogIngestionScan.rescan_requested), ("lease_clock", TextField(null=True)))
@@ -250,6 +251,7 @@ class DatabaseManager:
                 )
             if "slavemessagedelivery" in table_names:
                 delivery_columns = {column.name for column in current_database.get_columns("slavemessagedelivery")}
+                # Existing expiry timestamps were written against local time, so their clock remains NULL until a new claim stamps UTC.
                 delivery_migrations = tuple(
                     migrator.add_column("slavemessagedelivery", column_name, field)
                     for column_name, field in (

@@ -594,6 +594,7 @@ def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false
         manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-scan-upgrade", config=config))
         scan_columns = {column.name for column in database.get_columns("msglogingestionscan")}
         rows = _legacy_ingestion_scan_rows(database)
+        lease_clocks = database.execute_sql("SELECT lease_clock FROM msglogingestionscan ORDER BY source_chat_id").fetchall()
     finally:
         if manager is not None:
             manager.stop_worker()
@@ -603,6 +604,7 @@ def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false
         admin_db.close()
 
     assert {"lease_clock", "rescan_requested"}.issubset(scan_columns)
+    assert lease_clocks == [(None,), (None,), (None,)]
     assert rows == [
         ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None, False),
         ("200", 900, 900, 0, 0, 0, 0, 0, None, "pending", None, False),
