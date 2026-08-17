@@ -18,7 +18,7 @@ pytestmark = mark.asyncio
         (StatusAttribute.Types.UPLOADING_FILE, SendMessageUploadDocumentAction),
     ],
 )
-async def test_slave_message_statuses(helper, client, bot_id, slave, channel, efb_status, tg_status):
+async def test_slave_message_statuses(helper, bot_id, slave, efb_status, tg_status):
     chat = slave.chat_with_alias
     slave.send_status_message(StatusAttribute(efb_status), chat)
     event = await helper.wait_for_event(in_chats(bot_id) & typing)

@@ -364,7 +364,7 @@ class VoiceMessageFactory(MessageFactory):
     ],
     ids=str,
 )
-async def test_slave_message(helper, client, bot_group, slave, channel, factory: MessageFactory):
+async def test_slave_message(helper, bot_group, slave, channel, factory: MessageFactory):
     chat = slave.group
 
     with link_chats(channel, (chat,), bot_group):
