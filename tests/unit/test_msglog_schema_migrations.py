@@ -481,24 +481,6 @@ def test_expired_scan_is_resumable_after_restart():
         database.initialize(original_database)
 
 
-def test_retryable_scan_is_resumable_for_its_source_group():
-    original_database = database.obj
-    test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
-    test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
-    try:
-        test_db.create_tables([MsgLogIngestionScan])
-        scan = manager.get_or_create_scan(100, 500)
-        MsgLogIngestionScan.update(status="retryable-error").where(MsgLogIngestionScan.id == scan.id).execute()
-
-        assert manager.get_resumable_scan(100).id == scan.id
-        assert manager.get_resumable_scan(200) is None
-    finally:
-        test_db.close()
-        database.initialize(original_database)
-
-
 def test_live_message_overwrites_synthetic_provenance():
     test_db = SqliteDatabase(":memory:")
     manager = MsgLogRepository()

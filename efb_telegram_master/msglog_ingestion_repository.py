@@ -1,6 +1,6 @@
 import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional, Protocol
 
 from ehforwarderbot.types import ChatID
 from peewee import IntegrityError
@@ -9,8 +9,22 @@ from .database_observability import ObservedRepository, observe_database_method
 from .models import UTC_LEASE_CLOCK, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database, utc_now_naive
 from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 
-if TYPE_CHECKING:
-    from .msglog_ingestion import IngestedMsgLog
+
+class IngestedMsgLogData(Protocol):
+    @property
+    def text(self) -> str: ...
+
+    @property
+    def media_type(self) -> str: ...
+
+    @property
+    def msg_type(self) -> str: ...
+
+    @property
+    def mime(self) -> Optional[str]: ...
+
+    @property
+    def time(self) -> Optional[datetime.datetime]: ...
 
 
 class MsgLogIngestionCompletion(str, Enum):
@@ -104,7 +118,7 @@ class MsgLogIngestionRepository(ObservedRepository):
             return scan.status
 
     def persist_item(
-        self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional["IngestedMsgLog"] = None, lease_owner: str
+        self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional[IngestedMsgLogData] = None, lease_owner: str
     ) -> str:
         local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
@@ -215,17 +229,6 @@ class MsgLogIngestionRepository(ObservedRepository):
                 .execute()
                 == 1
             )
-
-    def get_resumable_scan(self, source_chat_id: int) -> Optional[MsgLogIngestionScan]:
-        now = datetime.datetime.now()
-        utc_now = utc_now_naive()
-        return MsgLogIngestionScan.get_or_none(
-            (MsgLogIngestionScan.source_chat_id == str(source_chat_id))
-            & (
-                MsgLogIngestionScan.status.in_(("pending", "retryable-error"))
-                | ((MsgLogIngestionScan.status == "running") & (MsgLogIngestionScan.lease_expires_at.is_null(True) | self._expired_lease_condition(utc_now, now)))
-            )
-        )
 
     @observe_database_method("get_resumable_msglog_ingestion_scans")
     def get_resumable_scans(self) -> List[MsgLogIngestionScan]:
