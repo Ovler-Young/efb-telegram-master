@@ -83,11 +83,6 @@ async def _wait_for_msg_log(channel, master_msg_id, timeout=10):
     raise TimeoutError(f"MsgLog row {master_msg_id} was not persisted")
 
 
-def _delete_msg_logs_by_master_ids(channel, master_msg_ids):
-    for master_msg_id in master_msg_ids:
-        channel.msglogs.delete_msg_log(master_msg_id=master_msg_id)
-
-
 async def _wait_for_ingestion_worker_exit(channel, source_chat_id, timeout=30):
     scheduler = channel.msglog_scan
     deadline = time.monotonic() + timeout
@@ -152,7 +147,8 @@ async def test_sync_msglog_ingests_unlogged_topic_messages_live(
             (source_log_ids[0], marker, expected_slave_uid, "live"),
         ]
 
-        _delete_msg_logs_by_master_ids(channel, source_log_ids)
+        for master_msg_id in source_log_ids:
+            channel.msglogs.delete_msg_log(master_msg_id=master_msg_id)
         assert all(channel.msglogs.get_msg_log(master_msg_id=master_msg_id) is None for master_msg_id in source_log_ids)
 
         scan_boundary = max(source_ids)

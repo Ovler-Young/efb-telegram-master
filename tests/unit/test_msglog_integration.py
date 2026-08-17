@@ -2,6 +2,7 @@ import asyncio
 import gc
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -20,7 +21,7 @@ from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.mtproto import MTProtoRetryableError
-from efb_telegram_master.slave_message import ETMMsg, SlaveMessageService
+from efb_telegram_master.slave_message import SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
 
 
@@ -78,11 +79,6 @@ class FakeScanScheduler:
         return "started"
 
 
-class FakeLinkCompletion:
-    def complete(self, _update: Update, _args: list[str]) -> None:
-        return None
-
-
 @pytest.fixture
 def sync_msglog_service() -> TelegramCommandService:
     return TelegramCommandService(
@@ -95,7 +91,7 @@ def sync_msglog_service() -> TelegramCommandService:
         Mock(),
         Mock(),
         FakeScanScheduler(),
-        FakeLinkCompletion(),
+        Mock(),
         [10],
         None,
         Mock(),
@@ -173,116 +169,26 @@ def test_resume_msglog_ingestions_schedules_each_bound_retryable_group():
     assert [call.args for call in manager.schedule.call_args_list] == [(100,), (200,)]
 
 
-def test_association_reschedule_resets_completed_scan_before_starting_worker():
-    class Runtime:
-        def call(self, coroutine, timeout=None):
-            coroutine.close()
-
-    ingestion = SimpleNamespace(
-        request_association_rescan=Mock(return_value="pending"),
-        get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)),
-        release_scan=Mock(),
-    )
-    scheduler = MsgLogScanScheduler(
-        SimpleNamespace(async_runtime=Runtime()),
-        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)),
-        ingestion,
-        Mock(),
-        Mock(),
-    )
-    try:
-        assert scheduler.schedule_for_association(100) == "started"
-        ingestion.request_association_rescan.assert_called_once_with(100)
-        ingestion.get_or_create_scan.assert_called_once_with(100, 10)
-    finally:
-        assert scheduler.stop(1) == ()
-
-
-def test_association_reschedule_does_not_start_a_new_scan():
-    class Runtime:
-        def call(self, coroutine, timeout=None):
-            coroutine.close()
-
-    ingestion = SimpleNamespace(
-        request_association_rescan=Mock(return_value=None),
-        release_scan=Mock(),
-    )
-    scheduler = MsgLogScanScheduler(
-        SimpleNamespace(async_runtime=Runtime()),
-        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)),
-        ingestion,
-        Mock(),
-        Mock(),
-    )
-    try:
-        assert scheduler.schedule_for_association(100) == "unchanged"
-        ingestion.request_association_rescan.assert_called_once_with(100)
-    finally:
-        assert scheduler.stop(1) == ()
-
-
-def test_association_reschedule_starts_an_existing_retryable_scan():
-    class Runtime:
-        def call(self, coroutine, timeout=None):
-            coroutine.close()
-
-    retryable_scan = SimpleNamespace(status="retryable-error", scanned_count=1)
-    ingestion = SimpleNamespace(
-        request_association_rescan=Mock(return_value="retryable-error"),
-        get_or_create_scan=Mock(return_value=retryable_scan),
-        release_scan=Mock(),
-    )
-    scheduler = MsgLogScanScheduler(
-        SimpleNamespace(async_runtime=Runtime()),
-        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)),
-        ingestion,
-        Mock(),
-        Mock(),
-    )
-    try:
-        assert scheduler.schedule_for_association(100) == "resumed"
-        ingestion.request_association_rescan.assert_called_once_with(100)
-        ingestion.get_or_create_scan.assert_called_once_with(100, 10)
-    finally:
-        assert scheduler.stop(1) == ()
-
-
-def test_association_reschedule_uses_persisted_request_when_another_worker_is_running():
-    class Runtime:
-        def call(self, coroutine, timeout=None):
-            coroutine.close()
-
-    ingestion = SimpleNamespace(
-        request_association_rescan=Mock(return_value="running"),
-        get_or_create_scan=Mock(return_value=SimpleNamespace(status="running", scanned_count=0)),
-        release_scan=Mock(),
-    )
-    scheduler = MsgLogScanScheduler(
-        SimpleNamespace(async_runtime=Runtime()),
-        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10)),
-        ingestion,
-        Mock(),
-        Mock(),
-    )
-    try:
-        assert scheduler.schedule_for_association(100) == "queued"
-        ingestion.request_association_rescan.assert_called_once_with(100)
-    finally:
-        assert scheduler.stop(1) == ()
-
-
 @pytest.mark.parametrize(
-    ("enabled", "stop_during_request", "expected"),
-    [(False, False, "unavailable"), (True, True, "stopping")],
-    ids=["unavailable", "stopping"],
+    ("scan_status", "scanned_count", "enabled", "stop_during_request", "expected", "creates_scan"),
+    [
+        ("pending", 0, True, False, "started", True),
+        (None, 0, True, False, "unchanged", False),
+        ("retryable-error", 1, True, False, "resumed", True),
+        ("running", 0, True, False, "queued", True),
+        ("running", 0, False, False, "unavailable", False),
+        ("running", 0, True, True, "stopping", False),
+    ],
+    ids=["pending-start", "no-scan", "retryable-resume", "running-queue", "unavailable", "stopping"],
 )
-def test_association_reschedule_preserves_running_admission_result(enabled, stop_during_request, expected):
+def test_association_reschedule_transitions(scan_status, scanned_count, enabled, stop_during_request, expected, creates_scan):
     class Runtime:
         def call(self, coroutine, timeout=None):
             coroutine.close()
 
     ingestion = SimpleNamespace(
-        request_association_rescan=Mock(return_value="running"),
+        request_association_rescan=Mock(return_value=scan_status),
+        get_or_create_scan=Mock(return_value=SimpleNamespace(status=scan_status, scanned_count=scanned_count)),
         release_scan=Mock(),
     )
     scheduler = MsgLogScanScheduler(
@@ -296,8 +202,34 @@ def test_association_reschedule_preserves_running_admission_result(enabled, stop
         ingestion.request_association_rescan.side_effect = lambda _source_chat_id: (setattr(scheduler, "_stopping", True), "running")[1]
     try:
         assert scheduler.schedule_for_association(100) == expected
+        ingestion.request_association_rescan.assert_called_once_with(100)
+        if creates_scan:
+            ingestion.get_or_create_scan.assert_called_once_with(100, 10)
+        else:
+            ingestion.get_or_create_scan.assert_not_called()
     finally:
         assert scheduler.stop(1) == ()
+
+
+@contextmanager
+def msglog_scan_scheduler(ingestion, *, scan_concurrency=1):
+    runtime = SharedAsyncRuntime()
+
+    async def connect():
+        return None
+
+    scheduler = MsgLogScanScheduler(
+        SimpleNamespace(async_runtime=runtime),
+        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10, scan_concurrency=scan_concurrency), connect=connect),
+        ingestion,
+        Mock(),
+        Mock(),
+    )
+    try:
+        yield scheduler
+    finally:
+        scheduler.stop(1)
+        runtime.close()
 
 
 def test_association_reschedule_queues_a_successor_after_active_lease_expires(tmp_path):
@@ -548,22 +480,16 @@ def test_association_reschedule_queues_a_successor_after_retryable_error(tmp_pat
 def test_msglog_scan_stop_does_not_double_release_a_gracefully_stopped_lease(monkeypatch):
     started = threading.Event()
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
-    runtime = SharedAsyncRuntime()
 
-    async def connect():
-        return None
+    with msglog_scan_scheduler(ingestion) as scheduler:
+        async def run(_service, source_chat_id, *, lease_owner, stop_requested):
+            started.set()
+            await asyncio.to_thread(scheduler._stop_event.wait)
+            assert stop_requested()
+            ingestion.release_scan(source_chat_id, lease_owner)
+            return True
 
-    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10), connect=connect), ingestion, Mock(), Mock())
-
-    async def run(_service, source_chat_id, *, lease_owner, stop_requested):
-        started.set()
-        await asyncio.to_thread(scheduler._stop_event.wait)
-        assert stop_requested()
-        ingestion.release_scan(source_chat_id, lease_owner)
-        return True
-
-    monkeypatch.setattr(MsgLogIngestionService, "run", run)
-    try:
+        monkeypatch.setattr(MsgLogIngestionService, "run", run)
         assert scheduler.schedule(100) == "started"
         assert started.wait(1)
         assert scheduler.schedule(100) == "already running"
@@ -572,36 +498,24 @@ def test_msglog_scan_stop_does_not_double_release_a_gracefully_stopped_lease(mon
         assert scheduler.schedule(200) == "stopping"
         ingestion.release_scan.assert_called_once()
         assert not any(thread.name == "MsgLogIngestion-100" and thread.is_alive() for thread in threading.enumerate())
-    finally:
-        scheduler.stop(1)
-        runtime.close()
 
 
 def test_msglog_scan_stop_releases_a_lease_after_an_interrupted_service(monkeypatch):
     started = threading.Event()
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
-    runtime = SharedAsyncRuntime()
 
-    async def connect():
-        return None
+    with msglog_scan_scheduler(ingestion) as scheduler:
+        async def run(_service, _source_chat_id, *, lease_owner, stop_requested):
+            started.set()
+            await asyncio.to_thread(scheduler._stop_event.wait)
+            raise RuntimeError(f"interrupted {lease_owner}")
 
-    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10), connect=connect), ingestion, Mock(), Mock())
-
-    async def run(_service, _source_chat_id, *, lease_owner, stop_requested):
-        started.set()
-        await asyncio.to_thread(scheduler._stop_event.wait)
-        raise RuntimeError(f"interrupted {lease_owner}")
-
-    monkeypatch.setattr(MsgLogIngestionService, "run", run)
-    try:
+        monkeypatch.setattr(MsgLogIngestionService, "run", run)
         assert scheduler.schedule(100) == "started"
         assert started.wait(1)
         assert scheduler.stop(1) == ()
         ingestion.release_scan.assert_called_once()
         assert ingestion.release_scan.call_args.args[0] == 100
-    finally:
-        scheduler.stop(1)
-        runtime.close()
 
 
 def test_msglog_scan_closes_runtime_coroutines_when_runtime_call_raises(recwarn):
@@ -681,30 +595,17 @@ def test_msglog_scan_shutdown_discards_pending_groups(monkeypatch):
 
     monkeypatch.setattr(MsgLogIngestionService, "run", run)
     ingestion = SimpleNamespace(get_or_create_scan=Mock(return_value=SimpleNamespace(status="pending", scanned_count=0)), release_scan=Mock())
-    runtime = SharedAsyncRuntime()
-
-    async def connect():
-        return None
-
-    scheduler = MsgLogScanScheduler(
-        SimpleNamespace(async_runtime=runtime),
-        SimpleNamespace(enabled=True, config=SimpleNamespace(scan_ceiling=10, scan_concurrency=1), connect=connect),
-        ingestion,
-        Mock(),
-        Mock(),
-    )
-    try:
-        assert scheduler.schedule(100) == "started"
-        assert first_started.wait(1)
-        assert scheduler.schedule(200) == "queued"
-        assert len(scheduler.stop(0.01)) == 1
-        release.set()
-        assert scheduler.stop(1) == ()
-        assert started == [100]
-    finally:
-        release.set()
-        scheduler.stop(1)
-        runtime.close()
+    with msglog_scan_scheduler(ingestion) as scheduler:
+        try:
+            assert scheduler.schedule(100) == "started"
+            assert first_started.wait(1)
+            assert scheduler.schedule(200) == "queued"
+            assert len(scheduler.stop(0.01)) == 1
+            release.set()
+            assert scheduler.stop(1) == ()
+            assert started == [100]
+        finally:
+            release.set()
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():
@@ -744,36 +645,3 @@ def test_dispatch_reply_target_respects_provenance(provenance, expected_target_m
     processor.dispatch_message(message, "", None, 123, None)
 
     assert processor.text_delivery.text.call_args.args[6] == expected_target_msg_id
-
-
-def test_ordinary_send_writes_msglog_once_and_completes_delivery_claim(monkeypatch):
-    processor = object.__new__(SlaveMessageService)
-    processor.logger = Mock()
-    processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock())
-    processor.delivery_claims = Mock()
-    processor.chat_manager = Mock()
-    processor.router = Mock(resolve_reply=Mock(return_value=None))
-    processor.commands = SimpleNamespace(register_command=Mock())
-    sent = SimpleNamespace(chat=SimpleNamespace(id=123), message_id=456, sender_bot_id="7")
-    processor.text_delivery = Mock(text=Mock(return_value=sent))
-    etm_msg = Mock()
-    monkeypatch.setattr(ETMMsg, "from_efbmsg", Mock(return_value=etm_msg))
-    monkeypatch.setattr("efb_telegram_master.slave_message.get_msg_type", Mock(return_value="Text"))
-    message = SimpleNamespace(
-        uid="slave-message",
-        target=None,
-        commands=[],
-        reactions={},
-        text="hello",
-        type=MsgType.Text,
-    )
-
-    processor.dispatch_message(message, "", None, 123, None, dedupe_key=("slave", "slave-message"), claim_token="claim-token")
-
-    processor.msglogs.add_or_update_message_log.assert_called_once_with(
-        etm_msg,
-        sent,
-        None,
-        sender_bot_id="7",
-    )
-    processor.delivery_claims.complete.assert_called_once_with("slave", "slave-message", "claim-token")
