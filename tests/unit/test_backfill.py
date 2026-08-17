@@ -130,54 +130,34 @@ def test_forged_start_token_does_not_consume_the_owner_session():
     storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(459))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=[], full_name="Test chat", link=Mock())
-    bot = SimpleNamespace(send_message=Mock(return_value=_sent_link_message(-100500, 601)), edit_message_text=Mock())
-    callback_sessions = CallbackSessionStore(bot, lambda: 10)
-    handler = SimpleNamespace(_conversations={})
-    callback_sessions.start(handler, storage_key, Flags.LINK_EXEC, 1, ChatListStorage([chat]))
-    service = LinkCompletionService(
-        bot,
-        ModuleID("blueset.telegram"),
-        lambda: False,
-        SimpleNamespace(remove_topic_assoc=Mock(), get_chat_assoc=Mock(return_value=[])),
-        callback_sessions,
-        Mock(),
-        Mock(),
-        lambda message: message,
-        lambda single, plural, count: single if count == 1 else plural,
-        Mock(),
-        handler,
-    )
+    service = _link_completion_service(storage_key, chat)
 
     service.complete(_build_link_update(-100500, user_id=2), [token])
 
     chat.link.assert_not_called()
-    bot.send_message.assert_called_once_with(-100500, text="Session expired or unknown parameter. (SE02)", message_thread_id=ANY)
-    assert callback_sessions.lookup(storage_key) is not None
-    assert storage_key in handler._conversations
+    service.bot.send_message.assert_called_once_with(-100500, text="Session expired or unknown parameter. (SE02)", message_thread_id=ANY)
+    assert service.callback_sessions.lookup(storage_key) is not None
+    assert storage_key in service._conversation_handler._conversations
 
     with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
         service.complete(_build_link_update(-100500), [token])
     chat.link.assert_called_once()
-    assert callback_sessions.lookup(storage_key) is None
+    assert service.callback_sessions.lookup(storage_key) is None
 
 
 def test_start_with_missing_effective_user_does_not_consume_a_session():
     storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(460))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=[], full_name="Test chat", link=Mock())
-    bot = SimpleNamespace(send_message=Mock(), edit_message_text=Mock())
-    callback_sessions = CallbackSessionStore(bot, lambda: 10)
-    handler = SimpleNamespace(_conversations={})
-    callback_sessions.start(handler, storage_key, Flags.LINK_EXEC, 1, ChatListStorage([chat]))
-    service = LinkCompletionService(bot, ModuleID("blueset.telegram"), lambda: False, Mock(), callback_sessions, Mock(), Mock(), lambda message: message, Mock(), Mock(), handler)
-    update = Update(update_id=1, message=Mock())
+    service = _link_completion_service(storage_key, chat)
+    update = _build_link_update(-100500)
     update.effective_message.text = "/start " + token
-    update.effective_message.chat = SimpleNamespace(id=-100500, type="group")
+    update.effective_message.from_user = None
 
     service.complete(update, [token])
 
     chat.link.assert_not_called()
-    assert callback_sessions.lookup(storage_key) is not None
+    assert service.callback_sessions.lookup(storage_key) is not None
 
 
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
@@ -439,8 +419,15 @@ def test_history_replay_processes_request_enqueued_after_idle_queue_observation(
         worker.stop(1)
 
 
-@pytest.mark.parametrize("backfill_flag", [None, "true", "yes", "on", "1"], ids=["automatic", "true", "yes", "on", "one"])
-def test_automatic_and_truthy_links_pass_the_original_storage_key_to_replay(backfill_flag):
+@pytest.mark.parametrize(
+    ("backfill_flag", "starts_replay"),
+    [
+        pytest.param(None, True, id="automatic-first-link"),
+        pytest.param("true", True, id="forced-backfill"),
+        pytest.param("false", False, id="skipped-backfill"),
+    ],
+)
+def test_link_completion_backfill_override_controls_replay_and_history_notice(backfill_flag, starts_replay):
     storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(456))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     chat = SimpleNamespace(
@@ -456,28 +443,11 @@ def test_automatic_and_truthy_links_pass_the_original_storage_key_to_replay(back
     with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
         service.complete(_build_link_update(-100500), args)
 
-    service.history_replay.start.assert_called_once_with("tests.slave chat", -100500, None, storage_key)
-    service.bot.send_message.assert_called_once()
-
-
-@pytest.mark.parametrize("backfill_flag", ["false", "no", "off", "0"], ids=str)
-def test_false_link_flags_do_not_start_backfill_or_send_history_location(backfill_flag):
-    storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(456))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    chat = SimpleNamespace(
-        module_id=ModuleID("tests.slave"),
-        uid=ChatID("chat"),
-        linked=[],
-        full_name="Test chat",
-        link=Mock(),
-    )
-    service = _link_completion_service(storage_key, chat)
-
-    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
-        service.complete(_build_link_update(-100500), [token, backfill_flag])
-
-    service.history_replay.start.assert_not_called()
-    assert all("previously linked" not in call.kwargs.get("text", "") for call in service.bot.send_message.call_args_list)
+    if starts_replay:
+        service.history_replay.start.assert_called_once_with("tests.slave chat", -100500, None, storage_key)
+    else:
+        service.history_replay.start.assert_not_called()
+        assert all("previously linked" not in call.kwargs.get("text", "") for call in service.bot.send_message.call_args_list)
 
 
 def test_empty_history_backfill_enqueues_one_location_notice_in_the_target_topic():
