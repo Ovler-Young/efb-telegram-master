@@ -602,7 +602,7 @@ def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false
         admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
         admin_db.close()
 
-    assert "rescan_requested" in scan_columns
+    assert {"lease_clock", "rescan_requested"}.issubset(scan_columns)
     assert rows == [
         ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None, False),
         ("200", 900, 900, 0, 0, 0, 0, 0, None, "pending", None, False),
