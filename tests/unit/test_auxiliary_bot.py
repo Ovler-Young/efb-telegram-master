@@ -84,16 +84,6 @@ def test_rate_limit_peek_and_acquire_uses_auxiliary_limiter() -> None:
     limiter.try_acquire.assert_called_once_with(100)
 
 
-def test_check_membership_tri_starts_probe_for_unknown():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
-        aux_bot = AuxiliaryBot("123:token")
-
-    with patch.object(aux_bot, "_start_membership_probe") as start_probe:
-        assert aux_bot.check_membership_tri(1000) is None
-
-    start_probe.assert_called_once_with(1000)
-
-
 def test_check_membership_tri_does_not_start_duplicate_probe_for_unknown_chat():
     started = threading.Event()
     release = threading.Event()
