@@ -9,7 +9,6 @@ from .database_observability import ObservedRepository, observe_database_method
 from .models import UTC_LEASE_CLOCK, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database, utc_now_naive
 from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 
-
 if TYPE_CHECKING:
     from .msglog_ingestion import IngestedMsgLog
 
