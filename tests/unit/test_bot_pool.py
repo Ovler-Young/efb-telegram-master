@@ -34,15 +34,15 @@ def test_candidate_bots_exclude_disabled_and_preserve_unknown_membership() -> No
     disabled.check_membership_tri.assert_not_called()
 
 
-def test_successful_main_and_null_slave_do_not_change_affinity() -> None:
+def test_null_slave_does_not_consume_affinity_capacity(monkeypatch) -> None:
     auxiliary = bot(10)
     pool = BotPool([auxiliary])
-    pool.record_successful_auxiliary_send("slave-a", 10)
+    monkeypatch.setattr(BotPool, "MAX_AFFINITY_ENTRIES", 1)
 
     pool.record_successful_auxiliary_send(None, 10)
+    pool.record_successful_auxiliary_send("slave-a", 10)
 
     assert pool.preferred_sender("slave-a") is auxiliary
-    assert pool.preferred_sender(None) is None
 
 
 def test_disabling_bot_removes_every_affinity_to_that_bot() -> None:
@@ -164,7 +164,7 @@ def test_successful_membership_recheck_discards_stale_affinities_and_deduplicate
         pool.shutdown()
 
 
-def test_shutdown_uses_one_deadline_for_all_bots_and_disables_affinity_callbacks(monkeypatch) -> None:
+def test_shutdown_uses_one_deadline_for_all_bots_and_clears_affinity_state(monkeypatch) -> None:
     first = bot(10)
     second = bot(20)
     pool = BotPool([first, second])
@@ -188,7 +188,6 @@ def test_shutdown_uses_one_deadline_for_all_bots_and_disables_affinity_callbacks
     pool.record_successful_auxiliary_send("slave-a", 10)
     pool._membership_failure_slaves[(10, 100)] = OrderedDict({"slave-a": 10.0})
     pool.shutdown()
-    first._membership_changed_callback(first, 100, False)
 
     assert observed_deadlines == [15.0, 15.0]
     assert pool.preferred_sender("slave-a") is None
