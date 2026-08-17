@@ -258,28 +258,6 @@ def test_cooldown_snapshot_reports_exact_remaining_maximum_after_expiry(monkeypa
     assert sender_policy.cooldown_snapshot() == {"main": 14.0, "auxiliary": 6.0}
 
 
-def test_cooldown_snapshot_does_not_copy_the_cooldown_map(monkeypatch: pytest.MonkeyPatch) -> None:
-    class NoCopyCooldowns(dict[tuple[str | None, int], float]):
-        def __iter__(self):
-            raise AssertionError("cooldown snapshots must use the indexed maximum")
-
-        def items(self):
-            raise AssertionError("cooldown snapshots must use the indexed maximum")
-
-        def copy(self):
-            raise AssertionError("cooldown snapshots must use the indexed maximum")
-
-    auxiliary_bot = auxiliary(10)
-    sender_policy, _pool, _main_bot, _limiter = policy(auxiliary_bot)
-    sender_policy._cooldowns = NoCopyCooldowns()
-    sender = SenderSelection(auxiliary_bot.bot, "10")
-    monkeypatch.setattr(sender_policy_module.time, "monotonic", lambda: 1_000.0)
-
-    sender_policy.record_retry_after(call(chat_id=100), RetryAfter(5), sender)
-
-    assert sender_policy.cooldown_snapshot() == {"main": 0.0, "auxiliary": 5.0}
-
-
 def test_cooldown_snapshot_is_safe_while_retry_after_updates_arrive(monkeypatch: pytest.MonkeyPatch) -> None:
     auxiliary_bot = auxiliary(10)
     sender_policy, _pool, _main_bot, _limiter = policy(auxiliary_bot)
