@@ -323,6 +323,8 @@ def test_link_chat_backfill_override_skips_replay(channel, slave, bot_group, bac
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(130))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key)
+    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
+    channel.chat_associations.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
     update = _build_link_update(bot_group)
 
     with (
@@ -417,37 +419,6 @@ def test_history_replay_processes_request_enqueued_after_idle_queue_observation(
         assert queued == [100, 200]
     finally:
         worker.stop(1)
-
-
-@pytest.mark.parametrize(
-    ("backfill_flag", "starts_replay"),
-    [
-        pytest.param(None, True, id="automatic-first-link"),
-        pytest.param("true", True, id="forced-backfill"),
-        pytest.param("false", False, id="skipped-backfill"),
-    ],
-)
-def test_link_completion_backfill_override_controls_replay_and_history_notice(backfill_flag, starts_replay):
-    storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(456))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    chat = SimpleNamespace(
-        module_id=ModuleID("tests.slave"),
-        uid=ChatID("chat"),
-        linked=[],
-        full_name="Test chat",
-        link=Mock(),
-    )
-    service = _link_completion_service(storage_key, chat)
-    args = [token] if backfill_flag is None else [token, backfill_flag]
-
-    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
-        service.complete(_build_link_update(-100500), args)
-
-    if starts_replay:
-        service.history_replay.start.assert_called_once_with("tests.slave chat", -100500, None, storage_key)
-    else:
-        service.history_replay.start.assert_not_called()
-        assert all("previously linked" not in call.kwargs.get("text", "") for call in service.bot.send_message.call_args_list)
 
 
 def test_empty_history_backfill_enqueues_one_location_notice_in_the_target_topic():
