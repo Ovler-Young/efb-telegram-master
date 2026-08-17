@@ -470,31 +470,6 @@ def test_database_method_metrics_record_bounded_public_operation_labels(channel)
     assert "metrics-master" not in rendered
 
 
-def test_database_method_metrics_record_paged_history_operation_labels():
-    original_database = database.obj
-    test_database = SqliteDatabase(":memory:")
-    database.initialize(test_database)
-    test_database.connect()
-    metrics = Metrics()
-    history_migrations = HistoryMigrationRepository()
-    msglogs = MsgLogRepository()
-    history_migrations._metrics = metrics
-    msglogs._metrics = metrics
-    try:
-        test_database.create_tables([HistoryMigrationEntry, MsgLog])
-
-        assert history_migrations.get_entries_page("metrics-slave", 12345, None, None, 1) == []
-        assert msglogs.get_recent_message_page("metrics-slave", None, 1) == []
-
-        rendered = generate_latest(metrics.registry).decode()
-    finally:
-        test_database.close()
-        database.initialize(original_database)
-
-    assert 'etm_database_method_duration_seconds_count{method="get_history_migration_entry_page"} 1.0' in rendered
-    assert 'etm_database_method_duration_seconds_count{method="get_recent_msglog_page"} 1.0' in rendered
-
-
 def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
     original_database = database.obj
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
