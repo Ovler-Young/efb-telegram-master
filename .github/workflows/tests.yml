@@ -5,6 +5,7 @@ on:
     paths:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
+      - 'setup.py'
       - 'README.rst'
       - 'readme_translations/**.rst'
       - 'dodo.py'
@@ -17,6 +18,7 @@ on:
     paths:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
+      - 'setup.py'
       - 'README.rst'
       - 'readme_translations/**.rst'
       - 'dodo.py'

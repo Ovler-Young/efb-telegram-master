@@ -2,10 +2,44 @@ import logging
 from types import SimpleNamespace
 from urllib.request import urlopen
 
+import pytest
 from prometheus_client import generate_latest
 
 from efb_telegram_master.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
 from efb_telegram_master.metrics_runtime import start_metrics_server
+
+_DATABASE_METHOD_OPERATIONS = (
+    "stop_worker",
+    "add_chat_assoc",
+    "remove_chat_assoc",
+    "get_master_msg_id",
+    "get_chat_assoc",
+    "add_topic_assoc",
+    "get_topic_thread_id",
+    "get_topic_slave",
+    "get_topic_slaves",
+    "remove_topic_assoc",
+    "add_or_update_message_log",
+    "get_msg_log",
+    "delete_msg_log",
+    "get_slave_chat_info",
+    "set_slave_chat_info",
+    "delete_slave_chat_info",
+    "get_recent_slave_chats",
+    "get_last_message",
+    "get_recent_messages",
+    "replace_history_migration_entries",
+    "has_pending_history_migrations",
+    "get_next_history_migration_target",
+    "get_history_migration_entry_page",
+    "delete_history_migration_entry",
+    "get_recent_msglog_page",
+    "claim_slave_message_delivery",
+    "complete_slave_message_delivery",
+    "renew_slave_message_delivery",
+    "release_slave_message_delivery",
+    "get_resumable_msglog_ingestion_scans",
+)
 
 
 class BrokenCpuProcess:
@@ -42,6 +76,20 @@ class NoIoProcess(SupportedProcess):
     @staticmethod
     def io_counters():
         raise OSError("I/O unavailable")
+
+
+def test_database_metric_operations_are_recordable_and_reject_unknown_labels():
+    metrics = Metrics()
+
+    for method in _DATABASE_METHOD_OPERATIONS:
+        metrics.record_database_method_call(method, 0.0, "success")
+
+    with pytest.raises(ValueError, match="database method is invalid"):
+        metrics.record_database_method_call("unknown_database_method", 0.0, "success")
+
+    rendered = generate_latest(metrics.registry).decode()
+    for method in _DATABASE_METHOD_OPERATIONS:
+        assert f'etm_database_method_duration_seconds_count{{method="{method}"}} 1.0' in rendered
 
 
 def test_process_collector_logs_a_repeated_failure_once_and_keeps_other_metrics(caplog):
