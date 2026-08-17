@@ -92,7 +92,7 @@ def test_callback_keyboard_forces_main_sender() -> None:
         ("create_forum_topic", (1, "topic"), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
         ("edit_forum_topic", (1, 2), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
         ("reopen_forum_topic", (1, 2), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
-        ("set_chat_title", (1, "title"), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("set_chat_title", (), {"chat_id": 1, "title": "title"}, _MAIN_ROUTING_KWARGS, "__main__", None),
         ("set_chat_photo", (1, object()), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
         ("pin_chat_message", (1, 2), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
         ("set_chat_description", (1, "description"), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
@@ -105,9 +105,11 @@ def test_public_queued_operations_preserve_routing_metadata_semantics(operation,
 
     request = queue.requests[0]
     assert request.operation == operation
+    assert request.args == args
+    expected_kwargs = {"caption": ""} if operation in {"send_audio", "send_document", "send_video", "send_animation", "send_voice"} else kwargs
+    assert request.kwargs == expected_kwargs
     assert request.required_sender_bot_id == required_sender_bot_id
     assert request.slave_id == slave_id
-    assert not {"_sender_bot_id", "_slave_id", "_force_main_bot"} & request.kwargs.keys()
 
 
 def test_edit_requires_explicit_sender_and_delete_routes_to_requested_sender() -> None:
@@ -140,24 +142,6 @@ def test_edit_operations_affix_positional_and_keyword_content(operation, args, k
     assert request.required_sender_bot_id == "__main__"
     assert "prefix" not in request.kwargs
     assert "suffix" not in request.kwargs
-
-
-def test_keyword_only_set_chat_title_strips_queue_metadata() -> None:
-    api, _bot, queue, _chat_binding = _api()
-
-    api.set_chat_title(
-        chat_id=1,
-        title="title",
-        _sender_bot_id="aux-7",
-        _slave_id="slave.chat",
-        _force_main_bot=True,
-    )
-
-    request = queue.requests[0]
-    assert request.args == ()
-    assert request.kwargs == {"chat_id": 1, "title": "title"}
-    assert request.required_sender_bot_id == "__main__"
-    assert request.slave_id is None
 
 
 def test_direct_calls_strip_queue_metadata_and_preserve_chat_action_thread_arguments() -> None:
