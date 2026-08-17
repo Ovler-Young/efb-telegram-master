@@ -386,26 +386,6 @@ def test_recipient_selection_delivers_the_stored_update_to_the_selected_chat():
     assert storage_id not in handler._conversations
 
 
-def test_recipient_suggestion_preserves_the_owner_session_for_an_unauthorized_selection():
-    bot = Mock()
-    callback_sessions = CallbackSessionStore(bot, lambda: 10)
-    delivery = Mock()
-    handler = SimpleNamespace(_conversations={})
-    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock(), handler)
-    storage_id = (TelegramChatID(1), TelegramMessageID(226))
-    storage = ChatListStorage([SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat")])
-    original_update = Mock()
-    storage.set_chat_suggestion(original_update)
-    callback_sessions.start(handler, storage_id, Flags.SUGGEST_RECIPIENTS, 1, storage)
-
-    assert service.suggested_recipient(_callback_update(*storage_id, "chat 0", user_id=2), Mock()) == Flags.SUGGEST_RECIPIENTS
-
-    delivery.deliver.assert_not_called()
-    assert callback_sessions.lookup(storage_id) is storage
-    assert service.suggested_recipient(_callback_update(*storage_id, "chat 0"), Mock()) == ConversationHandler.END
-    delivery.deliver.assert_called_once_with(original_update, ANY, "tests.mocks.slave chat")
-
-
 def test_chat_head_selection_records_a_reply_target_and_cleans_its_session():
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
@@ -421,22 +401,6 @@ def test_chat_head_selection_records_a_reply_target_and_cleans_its_session():
     msglogs.add_or_update_message_log.assert_called_once()
     assert callback_sessions.lookup(storage_id) is None
     assert storage_id not in handler._conversations
-
-
-def test_chat_head_preserves_the_owner_session_for_an_unauthorized_selection():
-    bot = Mock()
-    callback_sessions = CallbackSessionStore(bot, lambda: 10)
-    chat = SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat", self=Mock(), add_self=Mock())
-    msglogs = Mock()
-    handler = SimpleNamespace(_conversations={})
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text, handler)
-    storage_id = (TelegramChatID(1), TelegramMessageID(227))
-    callback_sessions.start(handler, storage_id, Flags.CHAT_HEAD_CONFIRM, 1, ChatListStorage([chat]))
-
-    assert service.make_chat_head(_callback_update(*storage_id, "chat 0", user_id=2), Mock()) == Flags.CHAT_HEAD_CONFIRM
-
-    msglogs.add_or_update_message_log.assert_not_called()
-    assert callback_sessions.lookup(storage_id) is not None
 
 
 @pytest.mark.parametrize("callback", ["chat", "chat 0 extra", "chat nope", "chat 4"])

@@ -75,13 +75,16 @@ async def test_event_queue_discards_oldest_events_and_returns_only_the_newer_cur
     monkeypatch.setattr(helper_module, "PENDING_EVENT_MAX_COUNT", 3)
     for index in range(5):
         await test_helper._queue_event(SimpleNamespace(kind=index))
+    pre_cursor_response = SimpleNamespace(kind="response")
+    await test_helper._queue_event(pre_cursor_response)
     cursor = test_helper.event_cursor()
     response = SimpleNamespace(kind="response")
     await test_helper._queue_event(response)
 
     assert test_helper.queue.qsize() == 3
     assert await test_helper.wait_for_event(lambda event: event.kind == "response", after_cursor=cursor) is response
-    assert [event.kind for event in test_helper.pending_events] == [3, 4]
+    assert [event.kind for event in test_helper.pending_events] == [4, "response"]
+    assert test_helper.pending_events[1] is pre_cursor_response
 
 
 def test_temporary_chat_watch_remains_until_the_final_consumer_unwatches():
