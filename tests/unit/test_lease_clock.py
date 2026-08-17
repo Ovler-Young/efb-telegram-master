@@ -122,7 +122,6 @@ def test_new_scan_ordering_timestamps_use_utc_naive_clock():
         _restore_timezone(original_timezone)
 
     after = datetime.now(timezone.utc).replace(tzinfo=None)
-    assert stored.created_at.tzinfo is None
-    assert stored.updated_at.tzinfo is None
-    assert before <= stored.created_at <= after
-    assert before <= stored.updated_at <= after
+    for timestamp in (stored.created_at, stored.updated_at):
+        assert timestamp.tzinfo is None
+        assert before <= timestamp <= after

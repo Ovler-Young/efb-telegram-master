@@ -11,6 +11,7 @@ import pytest
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.channel_commands import MAX_AUXILIARY_BOTS, load_channel_config
+from efb_telegram_master.outbound import DEFAULT_MAX_PENDING
 
 
 def bot(bot_id: int, *, disabled: bool = False, membership: bool | None = True) -> Mock:
@@ -283,24 +284,19 @@ def test_load_channel_config_rejects_non_mapping_runtime_sections(tmp_path, monk
         load_channel_config("tests.channel", str)
 
 
-def test_load_channel_config_defaults_outbound_pending_limit(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("outbound_config", "expected_max_pending"),
+    [("", DEFAULT_MAX_PENDING), ("outbound:\n  max_pending: 17\n", 17)],
+    ids=["default", "configured"],
+)
+def test_load_channel_config_sets_outbound_pending_limit(tmp_path, monkeypatch, outbound_config: str, expected_max_pending: int) -> None:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text('token: "main"\nadmins: [1]\n')
+    config_path.write_text(f'token: "main"\nadmins: [1]\n{outbound_config}')
     monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
 
     config, _mtproto_config = load_channel_config("tests.channel", str)
 
-    assert config["outbound"]["max_pending"] == 1000
-
-
-def test_load_channel_config_reads_outbound_pending_limit(tmp_path, monkeypatch) -> None:
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text('token: "main"\nadmins: [1]\noutbound:\n  max_pending: 17\n')
-    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
-
-    config, _mtproto_config = load_channel_config("tests.channel", str)
-
-    assert config["outbound"]["max_pending"] == 17
+    assert config["outbound"]["max_pending"] == expected_max_pending
 
 
 @pytest.mark.parametrize(
