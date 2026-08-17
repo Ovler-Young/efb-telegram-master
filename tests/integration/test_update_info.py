@@ -42,16 +42,17 @@ async def test_update_info_group_multi(helper, client, bot_group, channel, slave
         assert "This only works in a group linked with one chat." in content
 
 
-async def test_update_info_no_permission(helper, client, bot_group, bot_id, channel, private_response):
-    if not await is_bot_admin(client, bot_id, bot_group):
-        await client.edit_admin(bot_group, bot_id, change_info=False, is_admin=False, edit_messages=False)
-    content = await private_response(
-        lambda: client.send_message(bot_group, "/update_info"),
-        lambda timeout: helper.wait_for_message_text(text & in_chats(bot_group), timeout),
-        source_channel=channel,
-        target_chat_id=bot_group,
-    )
-    assert "Error occurred while update chat details." in content
+async def test_update_info_no_permission(helper, client, bot_group, bot_id, channel, slave, private_response):
+    with link_chats(channel, (slave.chat_with_alias,), bot_group):
+        if await is_bot_admin(client, bot_id, bot_group):
+            await client.edit_admin(bot_group, bot_id, change_info=False, is_admin=False, edit_messages=False)
+        content = await private_response(
+            lambda: client.send_message(bot_group, "/update_info"),
+            lambda timeout: helper.wait_for_message_text(text & in_chats(bot_group), timeout),
+            source_channel=channel,
+            target_chat_id=bot_group,
+        )
+        assert "Error occurred while update chat details." in content
 
 
 @mark.parametrize("chat_type", ["PrivateChat", "GroupChat"])
