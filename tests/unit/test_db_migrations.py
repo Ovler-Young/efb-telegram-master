@@ -18,7 +18,7 @@ from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
+from efb_telegram_master.models import UTC_LEASE_CLOCK, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_repository import MsgLogRepository
 from efb_telegram_master.outbound_types import SendReceipt
@@ -248,6 +248,40 @@ def test_sqlite_import_snapshot_omits_missing_ingestion_rescan_requested_column(
     }
     assert row["created_at"] == datetime(2020, 1, 2, 3, 4, 5)
     assert row["updated_at"] == datetime(2021, 2, 3, 4, 5, 6)
+
+
+def test_sqlite_import_snapshot_injects_missing_delivery_lease_clock(tmp_path):
+    source_db = SqliteDatabase(tmp_path / "tgdata.db")
+    source_db.connect()
+    try:
+        source_db.execute_sql(
+            "CREATE TABLE slavemessagedelivery ("
+            "id INTEGER PRIMARY KEY, slave_origin_uid TEXT NOT NULL, slave_message_id TEXT NOT NULL, "
+            "state TEXT NOT NULL DEFAULT 'pending', lease_expires_at DATETIME, owner_token TEXT, "
+            "UNIQUE(slave_origin_uid, slave_message_id))"
+        )
+        source_db.execute_sql(
+            "INSERT INTO slavemessagedelivery (slave_origin_uid, slave_message_id, state, lease_expires_at, owner_token) VALUES (?, ?, ?, ?, ?)",
+            ("tests.slave chat", "message", "pending", "2020-01-02 03:04:05", "owner"),
+        )
+        with source_db.bind_ctx([SlaveMessageDelivery]):
+            snapshot = DatabaseManager._sqlite_source_snapshot(source_db, (SlaveMessageDelivery,))
+    finally:
+        source_db.close()
+
+    projection = snapshot.projections[0]
+    row = dict(zip(projection.column_names, projection.rows[0]))
+    assert projection.model is SlaveMessageDelivery
+    assert set(projection.column_names) == {field.column_name for field in SlaveMessageDelivery._meta.sorted_fields}
+    assert row == {
+        "id": 1,
+        "slave_origin_uid": "tests.slave chat",
+        "slave_message_id": "message",
+        "state": "pending",
+        "lease_expires_at": datetime(2020, 1, 2, 3, 4, 5),
+        "owner_token": "owner",
+        "lease_clock": None,
+    }
 
 
 def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):
@@ -1065,6 +1099,7 @@ def test_slave_message_delivery_schema_upgrade_adds_owner_token(tmp_path, monkey
         assert owner_token is not None
         pending_row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "pending-message"))
         assert pending_row.owner_token == owner_token
+        assert pending_row.lease_clock == UTC_LEASE_CLOCK
     finally:
         manager.stop_worker()
         database.initialize(original_database)
