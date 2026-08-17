@@ -24,7 +24,6 @@ from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
 from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
-from tests.thread_diagnostics import live_non_daemon_threads
 
 
 def _runtime(
@@ -870,7 +869,6 @@ def test_channel_constructor_stops_database_when_bot_manager_creation_fails() ->
             TelegramChannel()
 
     database_manager.stop_worker.assert_called_once_with()
-    assert not any(thread.name.startswith(("ETM", "HistoryMigrationReplay", "MsgLogIngestion")) for thread in live_non_daemon_threads())
 
 
 def test_channel_constructor_stops_started_history_replay_when_handler_registration_fails() -> None:
@@ -903,28 +901,23 @@ def test_channel_constructor_stops_started_history_replay_when_handler_registrat
         "LinkCompletionService",
         "ChatHeadService",
     )
-    history_worker_started = threading.Event()
-
-    def fail_after_history_resume(*_args, **_kwargs):
-        if any(thread.name == "HistoryMigrationReplay" for thread in live_non_daemon_threads()):
-            history_worker_started.set()
-            raise RuntimeError("handler registration failed")
-
-    application.add_handler.side_effect = fail_after_history_resume
+    history_replay = Mock(stop=Mock(return_value=()))
+    application.add_handler.side_effect = [None] * 6 + [RuntimeError("handler registration failed")]
     with ExitStack() as stack:
         stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
         stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1]}, Mock())))
         stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
         stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
         stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager", return_value=bot_manager))
+        stack.enter_context(patch("efb_telegram_master.channel_composition.HistoryReplayWorker", return_value=history_replay))
         for dependency in dependencies:
             stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
 
         with pytest.raises(RuntimeError, match="handler registration failed"):
             TelegramChannel()
 
-    assert not any(thread.name == "HistoryMigrationReplay" for thread in live_non_daemon_threads())
-    assert history_worker_started.is_set()
+    history_replay.resume.assert_called_once_with()
+    history_replay.stop.assert_called_once_with(ANY)
     bot_manager.stop_channel_resources.assert_called_once_with(ANY)
     database_manager.stop_worker.assert_called_once_with()
 

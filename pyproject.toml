@@ -51,12 +51,9 @@ dependencies = [
 [project.optional-dependencies]
 tests = [
     "pytest",
-    "cryptg",
-    "pytest-dotenv",
     "flaky",
     "pytest-asyncio",
     "mypy>=0.910",
-    "pytest-html",
     "doit",
     "PySocks",
     "coverage",

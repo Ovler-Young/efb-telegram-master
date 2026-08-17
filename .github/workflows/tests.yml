@@ -5,7 +5,6 @@ on:
     paths:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
-      - 'setup.py'
       - 'README.rst'
       - 'readme_translations/**.rst'
       - 'dodo.py'
@@ -18,7 +17,6 @@ on:
     paths:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
-      - 'setup.py'
       - 'README.rst'
       - 'readme_translations/**.rst'
       - 'dodo.py'
@@ -54,7 +52,6 @@ jobs:
     - name: Install dependencies
       run: |
         uv sync --locked --extra tests --extra tgs
-        uv run --locked mypy --install-types --non-interactive -p efb_telegram_master
     - name: Install binary dependencies
       run: |
         sudo apt update

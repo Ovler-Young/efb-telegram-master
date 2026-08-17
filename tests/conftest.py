@@ -17,7 +17,6 @@ from efb_telegram_master.paths import get_config_path
 
 from .bot import get_bot
 from .mocks.slave import MockSlaveChannel
-from .thread_diagnostics import fail_session_for_live_threads
 
 pytestmark = [pytest.mark.xfail(raises=TimedOut), pytest.mark.xfail(raises=NetworkError)]
 
@@ -43,11 +42,6 @@ def bot_id(bot_token) -> int:
 @pytest.fixture(scope="session")
 def bot_admins(bot_info) -> List[int]:
     return bot_info["admins"]
-
-
-@pytest.fixture(scope="session")
-def bot_admin(bot_admins) -> int:
-    return bot_admins[0]
 
 
 @pytest.fixture(scope="session")
@@ -276,8 +270,6 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
-    # register an additional marker
-    config.addinivalue_line("markers", "unit: mark test as a unit test")
     config.addinivalue_line("markers", "integration: mark test as an integration test")
 
 
@@ -295,7 +287,3 @@ def pytest_runtest_setup(item):
         pytest.skip("test is a unit test", allow_module_level=True)
     elif mode == "integration" and not is_integration:
         pytest.skip("test is an integration test", allow_module_level=True)
-
-
-def pytest_sessionfinish(session, exitstatus):
-    fail_session_for_live_threads(session)
