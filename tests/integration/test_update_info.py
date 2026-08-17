@@ -44,15 +44,21 @@ async def test_update_info_group_multi(helper, client, bot_group, channel, slave
 
 async def test_update_info_no_permission(helper, client, bot_group, bot_id, channel, slave, private_response):
     with link_chats(channel, (slave.chat_with_alias,), bot_group):
+        revoked_admin_rights = False
         if await is_bot_admin(client, bot_id, bot_group):
             await client.edit_admin(bot_group, bot_id, change_info=False, is_admin=False, edit_messages=False)
-        content = await private_response(
-            lambda: client.send_message(bot_group, "/update_info"),
-            lambda timeout: helper.wait_for_message_text(text & in_chats(bot_group), timeout),
-            source_channel=channel,
-            target_chat_id=bot_group,
-        )
-        assert "Error occurred while update chat details." in content
+            revoked_admin_rights = True
+        try:
+            content = await private_response(
+                lambda: client.send_message(bot_group, "/update_info"),
+                lambda timeout: helper.wait_for_message_text(text & in_chats(bot_group), timeout),
+                source_channel=channel,
+                target_chat_id=bot_group,
+            )
+            assert "Error occurred while update chat details." in content
+        finally:
+            if revoked_admin_rights:
+                await client.edit_admin(bot_group, bot_id, change_info=True, is_admin=True, edit_messages=False)
 
 
 @mark.parametrize("chat_type", ["PrivateChat", "GroupChat"])
