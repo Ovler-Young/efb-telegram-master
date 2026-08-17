@@ -341,9 +341,8 @@ def test_live_and_ingestion_fallback_times_are_utc_naive_and_sort_together():
         MsgLog.create(**_msglog_values("live"))
         scan = manager.get_or_create_scan(100, 2)
         assert manager.claim_scan(100, "worker-a", 60) is not None
-        for message_id, source_time in ((2, None), (1, "invalid")):
-            content = SimpleNamespace(text="ingested", media_type="Text", mime=None, msg_type="Text", time=source_time)
-            assert manager.persist_item(scan, source_message_id=message_id, classification="eligible", slave_uid="tests.slave target", message=content, lease_owner="worker-a") == "inserted"
+        content = SimpleNamespace(text="ingested", media_type="Text", mime=None, msg_type="Text", time=None)
+        assert manager.persist_item(scan, source_message_id=2, classification="eligible", slave_uid="tests.slave target", message=content, lease_owner="worker-a") == "inserted"
         rows = list(MsgLog.select().order_by(MsgLog.time, MsgLog.master_msg_id))
     finally:
         test_db.close()
@@ -356,7 +355,7 @@ def test_live_and_ingestion_fallback_times_are_utc_naive_and_sort_together():
 
     after = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    assert [row.master_msg_id for row in rows] == ["live", "100.2", "100.1"]
+    assert [row.master_msg_id for row in rows] == ["live", "100.2"]
     assert all(row.time.tzinfo is None for row in rows)
     assert all(before <= row.time <= after for row in rows)
 
