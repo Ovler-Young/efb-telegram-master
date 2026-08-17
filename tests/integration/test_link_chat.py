@@ -255,7 +255,6 @@ async def simulate_link_chat(client, chat: Chat, command_chat: int, dest_chat: i
         target_chat_id=command_chat,
     )
     url = None
-    # print("STIMULATE_LINK_CHAT_MESSAGE_DICT", message.to_dict())
     for i in chain.from_iterable(message.buttons):
         if i.url:
             url = i.url

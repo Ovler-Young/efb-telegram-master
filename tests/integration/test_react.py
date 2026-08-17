@@ -56,8 +56,8 @@ async def test_react_errors(helper, client, bot_group, slave, channel):
         # Entire slave channel doesn’t support reactions
         with patch.multiple(slave, suggested_reactions=None):
             await tg_msg.reply("/react FullChannelFail")
-            await helper.wait_for_message_text(in_chats(bot_group))
-            # Arbitrary error message
+            text = await helper.wait_for_message_text(in_chats(bot_group))
+            assert "does not accept reactions" in text
 
         # Reaction value is invalid
         with slave.set_react_to_message("reject_one"):
@@ -70,5 +70,5 @@ async def test_react_errors(helper, client, bot_group, slave, channel):
         # Reaction target (chat/message) is invalid
         with slave.set_react_to_message("reject_all"):
             await tg_msg.reply("/react ReactionTargetFail")
-            await helper.wait_for_message_text(in_chats(bot_group))
-            # Arbitrary error message
+            text = await helper.wait_for_message_text(in_chats(bot_group))
+            assert "You cannot react anything to this message." in text

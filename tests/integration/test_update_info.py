@@ -22,39 +22,36 @@ async def test_update_info_private_guidance(helper, client, bot_id, private_resp
 
 
 async def test_update_info_group_empty(helper, client, bot_group, channel, private_response):
-    await private_response(
+    content = await private_response(
         lambda: client.send_message(bot_group, "/update_info"),
-        lambda timeout: helper.wait_for_event(text & in_chats(bot_group), timeout),
+        lambda timeout: helper.wait_for_message_text(text & in_chats(bot_group), timeout),
         source_channel=channel,
         target_chat_id=bot_group,
     )
-    # Should receive a text with error messages.
-    # No assertions needed.
+    assert "This only works in a group linked with one chat. Currently 0 chats linked to this group." in content
 
 
 async def test_update_info_group_multi(helper, client, bot_group, channel, slave, private_response):
     with link_chats(channel, slave.get_chats_by_criteria(alias=True), bot_group):
-        await private_response(
+        content = await private_response(
             lambda: client.send_message(bot_group, "/update_info"),
-            lambda timeout: helper.wait_for_event(text & in_chats(bot_group), timeout),
+            lambda timeout: helper.wait_for_message_text(text & in_chats(bot_group), timeout),
             source_channel=channel,
             target_chat_id=bot_group,
         )
-        # Should receive a text with error messages.
-        # No assertions needed.
+        assert "This only works in a group linked with one chat." in content
 
 
 async def test_update_info_no_permission(helper, client, bot_group, bot_id, channel, private_response):
     if not await is_bot_admin(client, bot_id, bot_group):
         await client.edit_admin(bot_group, bot_id, change_info=False, is_admin=False, edit_messages=False)
-    await private_response(
+    content = await private_response(
         lambda: client.send_message(bot_group, "/update_info"),
-        lambda timeout: helper.wait_for_event(text & in_chats(bot_group), timeout),
+        lambda timeout: helper.wait_for_message_text(text & in_chats(bot_group), timeout),
         source_channel=channel,
         target_chat_id=bot_group,
     )
-    # Should receive a text with error messages.
-    # No assertions needed.
+    assert "Error occurred while update chat details." in content
 
 
 @mark.parametrize("chat_type", ["PrivateChat", "GroupChat"])
