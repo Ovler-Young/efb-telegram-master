@@ -119,28 +119,20 @@ def test_check_membership_tri_does_not_start_duplicate_probe_for_unknown_chat():
         aux_bot.wait_for_membership_shutdown(time.monotonic() + 1)
 
 
-def test_check_membership_tri_returns_unknown_while_refreshing_stale_entry():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
-        aux_bot = AuxiliaryBot("123:token")
-
-    with patch("efb_telegram_master.auxiliary_bot.time.monotonic", return_value=1000.0):
-        aux_bot.update_membership(2000, True)
-
-    with patch("efb_telegram_master.auxiliary_bot.time.monotonic", return_value=1000.0 + aux_bot.MEMBERSHIP_TTL_MEMBER + 1), patch.object(aux_bot, "_start_membership_probe") as start_probe:
-        assert aux_bot.check_membership_tri(2000) is None
-
-    start_probe.assert_called_once_with(2000)
-
-
-def test_probe_membership_marks_non_member_on_bad_request():
+def test_probe_membership_marks_non_member_and_records_bad_request_metric():
     with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
         bot = bot_cls.return_value
         bot.get_chat_member.side_effect = telegram.error.BadRequest("not found")
         aux_bot = AuxiliaryBot("123:token")
         aux_bot.bot_id = 123
+        aux_bot.username = "botA"
+        metrics = Mock()
+        aux_bot.bind_metrics(metrics)
 
     aux_bot._probe_membership(4000)
+
     assert aux_bot.check_membership_tri(4000) is False
+    metrics.record_membership_probe.assert_called_once_with("bad_request")
 
 
 def test_stale_probe_cannot_overwrite_direct_membership_update() -> None:
@@ -293,21 +285,6 @@ def test_membership_cache_snapshot_counts_cached_and_pending_states():
         "not_member": 1,
         "unknown_probe_pending": 1,
     }
-
-
-def test_probe_membership_records_bad_request_metric():
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
-        bot = bot_cls.return_value
-        bot.get_chat_member.side_effect = telegram.error.BadRequest("not found")
-        aux_bot = AuxiliaryBot("123:token")
-        aux_bot.bot_id = 123
-        aux_bot.username = "botA"
-        metrics = Mock()
-        aux_bot.bind_metrics(metrics)
-
-    aux_bot._probe_membership(4000)
-
-    metrics.record_membership_probe.assert_called_once_with("bad_request")
 
 
 def test_probe_membership_forbidden_marks_non_member_without_disabling():

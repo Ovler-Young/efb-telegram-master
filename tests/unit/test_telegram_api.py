@@ -10,6 +10,8 @@ from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.outbound_types import QueueEnqueueError, SendReceipt
 from efb_telegram_master.telegram_api import TelegramAPI
 
+_MAIN_ROUTING_KWARGS = {"_sender_bot_id": "aux-7", "_slave_id": "slave.chat", "_force_main_bot": True}
+
 
 class _RecordingQueue:
     def __init__(self) -> None:
@@ -71,55 +73,40 @@ def test_callback_keyboard_forces_main_sender() -> None:
 
 
 @pytest.mark.parametrize(
-    ("operation", "args", "required_sender_bot_id"),
+    ("operation", "args", "kwargs", "routing_kwargs", "required_sender_bot_id", "slave_id"),
     [
-        ("send_audio", (1, "audio"), None),
-        ("send_document", (1, "document"), None),
-        ("send_video", (1, "video"), None),
-        ("send_animation", (1, "animation"), None),
-        ("send_voice", (1, "voice"), None),
-        ("send_sticker", (1, "sticker"), None),
-        ("send_media_group", (1, ["media"]), None),
-        ("forward_message", (1, 2, 3), None),
-        ("copy_message", (1, 2, 3), None),
-        ("edit_message_caption", (1, 2, "inline-id", "caption"), "__main__"),
-        ("edit_message_media", (1, 2, "media"), "__main__"),
+        ("send_audio", (1, "audio"), {}, {}, None, None),
+        ("send_document", (1, "document"), {}, {}, None, None),
+        ("send_video", (1, "video"), {}, {}, None, None),
+        ("send_animation", (1, "animation"), {}, {}, None, None),
+        ("send_voice", (1, "voice"), {}, {}, None, None),
+        ("send_sticker", (1, "sticker"), {}, {}, None, None),
+        ("send_media_group", (1, ["media"]), {}, {}, None, None),
+        ("forward_message", (1, 2, 3), {}, {}, None, None),
+        ("copy_message", (1, 2, 3), {}, {}, None, None),
+        ("edit_message_caption", (1, 2, "inline-id", "caption"), {}, {}, "__main__", None),
+        ("edit_message_media", (1, 2, "media"), {}, {}, "__main__", None),
+        ("edit_message_reply_markup", (), {"chat_id": 1, "message_id": 2}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("send_location", (1, 1.0, 2.0), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("send_venue", (1, 1.0, 2.0, "title", "address"), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("create_forum_topic", (1, "topic"), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("edit_forum_topic", (1, 2), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("reopen_forum_topic", (1, 2), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("set_chat_title", (1, "title"), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("set_chat_photo", (1, object()), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("pin_chat_message", (1, 2), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
+        ("set_chat_description", (1, "description"), {}, _MAIN_ROUTING_KWARGS, "__main__", None),
     ],
 )
-def test_remaining_public_queued_operations_route_to_the_outbound_queue(operation, args, required_sender_bot_id) -> None:
+def test_public_queued_operations_preserve_routing_metadata_semantics(operation, args, kwargs, routing_kwargs, required_sender_bot_id, slave_id) -> None:
     api, _bot, queue, _chat_binding = _api()
 
-    getattr(api, operation)(*args)
+    getattr(api, operation)(*args, **kwargs, **routing_kwargs)
 
     request = queue.requests[0]
     assert request.operation == operation
     assert request.required_sender_bot_id == required_sender_bot_id
-
-
-@pytest.mark.parametrize(
-    ("operation", "args", "kwargs"),
-    [
-        ("edit_message_reply_markup", (), {"chat_id": 1, "message_id": 2}),
-        ("send_location", (1, 1.0, 2.0), {}),
-        ("send_venue", (1, 1.0, 2.0, "title", "address"), {}),
-        ("create_forum_topic", (1, "topic"), {}),
-        ("edit_forum_topic", (1, 2), {}),
-        ("reopen_forum_topic", (1, 2), {}),
-        ("set_chat_title", (1, "title"), {}),
-        ("set_chat_photo", (1, object()), {}),
-        ("pin_chat_message", (1, 2), {}),
-        ("set_chat_description", (1, "description"), {}),
-    ],
-)
-def test_edits_and_chat_mutations_queue_through_main_sender(operation, args, kwargs) -> None:
-    api, _bot, queue, _chat_binding = _api()
-
-    getattr(api, operation)(*args, **kwargs, _sender_bot_id="aux-7", _slave_id="slave.chat", _force_main_bot=True)
-
-    request = queue.requests[0]
-    assert request.operation == operation
-    assert request.required_sender_bot_id == "__main__"
-    assert request.slave_id is None
+    assert request.slave_id == slave_id
     assert not {"_sender_bot_id", "_slave_id", "_force_main_bot"} & request.kwargs.keys()
 
 

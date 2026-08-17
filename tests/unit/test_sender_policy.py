@@ -338,16 +338,15 @@ def test_retry_after_cooldown_leaves_another_sender_for_the_same_chat_selectable
     assert decision.selection.sender_bot_id == "20"
 
 
-def test_main_bot_remains_selectable_when_no_auxiliary_is_available() -> None:
-    sender_policy, _pool, main_bot, _limiter = policy(auxiliary(10, disabled=True))
-
-    decision = sender_policy.select(call(), now=1_000.0)
-
-    assert decision.selection == SenderSelection(main_bot, None)
-
-
-def test_main_bot_falls_back_when_all_confirmed_auxiliaries_are_unavailable() -> None:
-    sender_policy, _pool, main_bot, _limiter = policy(auxiliary(10, membership=False), auxiliary(20, membership=False))
+@pytest.mark.parametrize(
+    "auxiliaries",
+    [
+        (auxiliary(10, disabled=True),),
+        (auxiliary(10, membership=False), auxiliary(20, membership=False)),
+    ],
+)
+def test_main_bot_falls_back_when_auxiliaries_are_unavailable(auxiliaries: tuple[Mock, ...]) -> None:
+    sender_policy, _pool, main_bot, _limiter = policy(*auxiliaries)
 
     decision = sender_policy.select(call(), now=1_000.0)
 
