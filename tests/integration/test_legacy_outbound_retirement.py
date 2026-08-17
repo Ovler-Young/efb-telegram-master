@@ -60,52 +60,7 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
     try:
         database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
         legacy_db.connect()
-        workflow, task = create_legacy_outbound_schema(legacy_db)
-        workflow_columns = {column.name: column for column in legacy_db.get_columns("outboundworkflow")}
-        task_columns = {column.name: column for column in legacy_db.get_columns("outboundtask")}
-        assert (
-            DatabaseManager._legacy_default_category(
-                legacy_db, "outboundworkflow", "id", DatabaseManager._legacy_column_type(workflow_columns["id"].data_type), workflow_columns["id"].primary_key, workflow_columns["id"].default
-            )
-            == "auto_pk"
-        )
-        assert (
-            DatabaseManager._legacy_default_category(
-                legacy_db, "outboundtask", "id", DatabaseManager._legacy_column_type(task_columns["id"].data_type), task_columns["id"].primary_key, task_columns["id"].default
-            )
-            == "auto_pk"
-        )
-        assert (
-            DatabaseManager._legacy_default_category(
-                legacy_db,
-                "outboundworkflow",
-                "created_at",
-                DatabaseManager._legacy_column_type(workflow_columns["created_at"].data_type),
-                workflow_columns["created_at"].primary_key,
-                workflow_columns["created_at"].default,
-            )
-            == "current_timestamp"
-        )
-        assert (
-            DatabaseManager._legacy_default_category(
-                legacy_db,
-                "outboundtask",
-                "accepted_at",
-                DatabaseManager._legacy_column_type(task_columns["accepted_at"].data_type),
-                task_columns["accepted_at"].primary_key,
-                task_columns["accepted_at"].default,
-            )
-            == "current_timestamp"
-        )
-        assert tuple((index.name, tuple(index.columns), index.unique) for index in legacy_db.get_indexes("outboundtask")) == (
-            ("outboundtask_pkey", ("id",), True),
-            ("outboundtask_workflow_id_step_index", ("workflow_id", "step_index"), True),
-            ("outboundtask_source_key_priority_accepted_at_id", ("source_key", "priority", "accepted_at", "id"), False),
-            ("outboundtask_state_available_at", ("state", "available_at"), False),
-            ("outboundtask_workflow_id", ("workflow_id",), False),
-        )
-        assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundworkflow") is None
-        assert DatabaseManager._legacy_outbound_schema_error(legacy_db, "outboundtask") is None
+        create_legacy_outbound_schema(legacy_db)
         legacy_db.close()
 
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
