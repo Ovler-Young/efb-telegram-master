@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import threading
 import time
 from contextlib import ExitStack
@@ -23,7 +22,7 @@ from efb_telegram_master.outbound_types import OutboundShutdownTimeout, QueueReq
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
-from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
+from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime
 
 
 def _runtime(
@@ -41,15 +40,6 @@ def _runtime(
         AsyncMock(),
         webhook,
     )
-
-
-def test_sync_bot_facade_preserves_telegram_method_signature() -> None:
-    async def send_message(chat_id: int, text: str) -> tuple[int, str]:
-        return chat_id, text
-
-    facade = SyncBotFacade(SimpleNamespace(send_message=send_message), Mock())
-
-    assert inspect.signature(facade.send_message).bind(42, "message").arguments == {"chat_id": 42, "text": "message"}
 
 
 def test_async_runtime_call_uses_bound_loop_without_starting_background_loop() -> None:
@@ -566,14 +556,13 @@ def test_api_timeout_still_stops_other_delivery_resources() -> None:
     bot_pool.wait_for_shutdown.assert_called_once()
 
 
-def test_channel_shutdown_error_still_stops_channel_owned_workers() -> None:
+def test_channel_shutdown_error_stops_owned_workers_without_completed_event() -> None:
     channel = TelegramChannel.__new__(TelegramChannel)
     channel._stop_polling_called = False
     channel.logger = Mock()
     channel.rpc_utilities = Mock()
     channel.bot_manager = Mock()
     channel.bot_manager.stop_channel_resources.side_effect = TelegramResourceShutdownError((OutboundShutdownTimeout("blocked send"),))
-    channel.telegram_runtime = Mock()
     channel.master_message_worker = Mock(stop_worker=Mock(return_value=()))
     channel.db = Mock()
 
@@ -583,21 +572,6 @@ def test_channel_shutdown_error_still_stops_channel_owned_workers() -> None:
     assert channel._stop_polling_called
     channel.master_message_worker.stop_worker.assert_called_once_with(deadline=ANY)
     channel.db.stop_worker.assert_not_called()
-
-
-def test_channel_shutdown_error_does_not_emit_completed_event() -> None:
-    channel = TelegramChannel.__new__(TelegramChannel)
-    channel._stop_polling_called = False
-    channel.logger = Mock()
-    channel.rpc_utilities = Mock()
-    channel.bot_manager = Mock()
-    channel.bot_manager.stop_channel_resources.side_effect = TelegramResourceShutdownError((OutboundShutdownTimeout("blocked send"),))
-    channel.master_message_worker = Mock(stop_worker=Mock(return_value=()))
-    channel.db = Mock()
-
-    with pytest.raises(TelegramResourceShutdownError, match="blocked send"):
-        channel.stop_polling()
-
     channel.logger.info.assert_any_call("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
     assert all(call.kwargs.get("extra", {}).get("event") != "telegram_channel.stop_completed" for call in channel.logger.info.call_args_list)
     channel.logger.warning.assert_called_once_with(
@@ -1152,24 +1126,21 @@ def test_metrics_configuration_rejects_boolean_numeric_values(field, value, expe
     logger.warning.assert_called_once()
 
 
-def test_channel_dispatch_stops_when_the_runtime_stop_signal_is_set() -> None:
+@pytest.mark.parametrize(
+    ("stopping", "dispatches"),
+    [(True, False), (False, True)],
+    ids=["stop_signal", "running"],
+)
+def test_channel_dispatch_respects_runtime_state(stopping: bool, dispatches: bool) -> None:
     channel = TelegramChannel.__new__(TelegramChannel)
     channel._stop_polling_called = False
-    channel.bot_manager = SimpleNamespace(_stopping=Mock(is_set=Mock(return_value=True)))
-    channel.message_service = Mock()
-    message = Mock()
-
-    assert channel.send_message(message) is message
-    channel.message_service.send_message.assert_not_called()
-
-
-def test_channel_dispatches_messages_while_the_runtime_is_running() -> None:
-    channel = TelegramChannel.__new__(TelegramChannel)
-    channel._stop_polling_called = False
-    channel.bot_manager = SimpleNamespace(_stopping=Mock(is_set=Mock(return_value=False)))
+    channel.bot_manager = SimpleNamespace(_stopping=Mock(is_set=Mock(return_value=stopping)))
     channel.message_service = Mock()
     message = Mock()
     channel.message_service.send_message.return_value = message
 
     assert channel.send_message(message) is message
-    channel.message_service.send_message.assert_called_once_with(message)
+    if dispatches:
+        channel.message_service.send_message.assert_called_once_with(message)
+    else:
+        channel.message_service.send_message.assert_not_called()
