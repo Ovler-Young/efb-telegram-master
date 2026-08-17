@@ -68,24 +68,14 @@ def test_channel_injects_conversation_handlers_into_binding_services(channel):
     assert channel.recipient_suggestions._conversation_handler is channel.suggestion_handler
 
 
-@pytest.mark.parametrize(
-    ("handler_name", "state", "callback"),
-    [
-        ("_conversation_handler", Flags.LINK_EXEC, "manual_link 0"),
-    ],
-)
-def test_callback_handlers_expire_missing_sessions(callback_manager, handler_name, state, callback):
+def test_link_execute_expires_missing_callback_session(callback_manager):
     manager = callback_manager
     storage_id = (TelegramChatID(1), TelegramMessageID(201))
-    handler = getattr(manager, handler_name)
-    manager.callback_sessions.set_state(handler, storage_id, state)
-    update = _callback_update(*storage_id, callback)
-    method = {
-        "_conversation_handler": manager.execute,
-    }[handler_name]
+    handler = manager._conversation_handler
+    manager.callback_sessions.set_state(handler, storage_id, Flags.LINK_EXEC)
 
     with patch.object(manager.bot, "edit_message_text"), patch.object(manager.bot, "answer_callback_query") as answer_callback_query:
-        assert method(update, None) == ConversationHandler.END
+        assert manager.execute(_callback_update(*storage_id, "manual_link 0"), None) == ConversationHandler.END
 
     assert storage_id not in handler._conversations
     answer_callback_query.assert_called_once_with("callback-id")
