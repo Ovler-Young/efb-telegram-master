@@ -3,10 +3,16 @@ from types import SimpleNamespace
 from urllib.request import urlopen
 
 import pytest
+from peewee import SqliteDatabase
 from prometheus_client import generate_latest
 
+from efb_telegram_master.chat_association_repository import ChatAssociationRepository
 from efb_telegram_master.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
+from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.metrics_runtime import start_metrics_server
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
+from efb_telegram_master.msglog_repository import MsgLogRepository
+from efb_telegram_master.slave_chat_info_repository import SlaveChatInfoRepository
 
 _DATABASE_METHOD_OPERATIONS = (
     "stop_worker",
@@ -89,6 +95,43 @@ def test_database_metric_operations_are_recordable_and_reject_unknown_labels():
 
     rendered = generate_latest(metrics.registry).decode()
     for method in _DATABASE_METHOD_OPERATIONS:
+        assert f'etm_database_method_duration_seconds_count{{method="{method}"}} 1.0' in rendered
+
+
+def test_database_metric_decorators_record_real_repository_operations():
+    original_database = database.obj
+    test_database = SqliteDatabase(":memory:")
+    database.initialize(test_database)
+    test_database.connect()
+    metrics = Metrics()
+    chat_associations = ChatAssociationRepository()
+    history_migrations = HistoryMigrationRepository()
+    msglogs = MsgLogRepository()
+    slave_chat_info = SlaveChatInfoRepository()
+    for repository in (chat_associations, history_migrations, msglogs, slave_chat_info):
+        repository._metrics = metrics
+
+    try:
+        test_database.create_tables([ChatAssoc, TopicAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo])
+
+        chat_associations.add_chat_assoc("metrics-master", "metrics-slave")
+        assert chat_associations.get_chat_assoc(master_uid="metrics-master") == ["metrics-slave"]
+        assert history_migrations.get_entries_page("metrics-slave", 12345, None, None, 1) == []
+        assert msglogs.get_recent_message_page("metrics-slave", None, 1) == []
+        assert slave_chat_info.get_slave_chat_info("metrics", "slave") is None
+
+        rendered = generate_latest(metrics.registry).decode()
+    finally:
+        test_database.close()
+        database.initialize(original_database)
+
+    for method in (
+        "add_chat_assoc",
+        "get_chat_assoc",
+        "get_history_migration_entry_page",
+        "get_recent_msglog_page",
+        "get_slave_chat_info",
+    ):
         assert f'etm_database_method_duration_seconds_count{{method="{method}"}} 1.0' in rendered
 
 
