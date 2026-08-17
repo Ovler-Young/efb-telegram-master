@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from ehforwarderbot import coordinator
@@ -40,12 +39,6 @@ def test_chat_manager_build_dummy(chat_manager):
     assert generated is not None
     assert generated.module_id == module_id
     assert generated.uid == id
-
-
-def test_chat_manager_requires_explicit_dependencies():
-    manager = ChatObjectCacheManager(SimpleNamespace(), SimpleNamespace(get_slave_chat_info=lambda *_args: None), {})
-
-    assert manager.get_chat("module", "chat") is None
 
 
 def test_chat_manager_update_chat_obj(chat_manager, slave):

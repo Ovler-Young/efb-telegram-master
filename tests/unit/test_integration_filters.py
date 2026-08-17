@@ -1,3 +1,4 @@
+import pytest
 from telethon.events import MessageEdited, NewMessage
 
 from tests.integration.helper import filters
@@ -11,14 +12,9 @@ class DummyEditedMessageEvent(MessageEdited.Event):
     pass
 
 
-def test_message_filter_accepts_new_message_events():
-    event = object.__new__(DummyNewMessageEvent)
-
-    assert filters.message(event)
-
-
-def test_message_filter_accepts_edited_message_events():
-    event = object.__new__(DummyEditedMessageEvent)
+@pytest.mark.parametrize("event_type", [DummyNewMessageEvent, DummyEditedMessageEvent])
+def test_message_filter_accepts_new_and_edited_message_events(event_type):
+    event = object.__new__(event_type)
 
     assert filters.message(event)
 
