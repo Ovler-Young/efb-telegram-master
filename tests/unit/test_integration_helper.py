@@ -121,3 +121,129 @@ async def test_client_disconnect_times_out_when_telethon_never_finishes(monkeypa
 
     with pytest.raises(asyncio.TimeoutError):
         await test_helper._disconnect_client()
+
+
+class StateMessage:
+    def __init__(self, button_count: int) -> None:
+        self.button_count = button_count
+
+    def to_dict(self) -> dict[str, int]:
+        return {"buttons": self.button_count}
+
+
+class StateClient:
+    def __init__(self, messages: list[object | None]) -> None:
+        self.messages = iter(messages)
+
+    async def get_messages(self, _chat_id: int, *, ids: int) -> object | None:
+        return next(self.messages)
+
+
+class RecentMessage(StateMessage):
+    def __init__(self, message_id: int, button_count: int) -> None:
+        super().__init__(button_count)
+        self.id = message_id
+
+
+class RecentMessageClient:
+    def __init__(self, messages: list[list[object]]) -> None:
+        self.messages = iter(messages)
+        self.calls: list[tuple[int, int, int, int, bool]] = []
+
+    async def get_messages(self, chat_id: int, *, min_id: int, offset_id: int, limit: int, reverse: bool) -> list[object]:
+        self.calls.append((chat_id, min_id, offset_id, limit, reverse))
+        return next(self.messages)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_new_message_after_advances_after_a_capped_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    pages = [[RecentMessage(message_id, button_count=0) for message_id in range(first, first + helper_module.NEW_MESSAGE_PAGE_SIZE)] for first in (13, 33, 53)]
+    response = RecentMessage(73, button_count=1)
+    client = RecentMessageClient([*pages, [response]])
+    waits: list[float] = []
+
+    async def yield_control(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr(helper_module, "Message", RecentMessage)
+    monkeypatch.setattr(helper_module.asyncio, "sleep", yield_control)
+
+    assert await helper_module.wait_for_new_message_after(client, 100, 12, lambda current: current.button_count == 1) is response
+    assert client.calls == [
+        (100, 12, 12, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 32, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 52, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 72, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+    ]
+    assert waits == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_private_responses_keep_independent_cursors() -> None:
+    test_helper = build_event_helper()
+    before_a = SimpleNamespace(kind="before-a")
+    between_a_and_b = SimpleNamespace(kind="between-a-and-b")
+    a_response = SimpleNamespace(kind="a")
+    b_response = SimpleNamespace(kind="b")
+    a_trigger_started = asyncio.Event()
+    release_a_trigger = asyncio.Event()
+    await test_helper._queue_event(before_a)
+
+    async def a_trigger() -> None:
+        a_trigger_started.set()
+        await release_a_trigger.wait()
+        await test_helper._queue_event(a_response)
+
+    async def b_trigger() -> None:
+        await test_helper._queue_event(b_response)
+
+    async def receive_a(_: float):
+        return await test_helper.wait_for_event(lambda event: event.kind == "a")
+
+    async def receive_b(_: float):
+        return await test_helper.wait_for_event(lambda event: event.kind == "b")
+
+    a_wait = asyncio.create_task(helper_module.wait_for_private_response(lambda: 0.0, a_trigger, receive_a, response_cursor=test_helper.event_cursor))
+    await a_trigger_started.wait()
+    await test_helper._queue_event(between_a_and_b)
+    b_wait = asyncio.create_task(helper_module.wait_for_private_response(lambda: 0.0, b_trigger, receive_b, response_cursor=test_helper.event_cursor))
+    await asyncio.sleep(0)
+    release_a_trigger.set()
+
+    assert await a_wait is a_response
+    assert await b_wait is b_response
+    assert await test_helper.wait_for_event(lambda event: event.kind == "before-a") is before_a
+    assert await test_helper.wait_for_event(lambda event: event.kind == "between-a-and-b") is between_a_and_b
+
+
+@pytest.mark.asyncio
+async def test_private_response_passes_its_remaining_deadline_to_exact_message_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = StateMessage(button_count=0)
+    client = StateClient([expected])
+    received_timeouts: list[float] = []
+
+    async def wait_for_slot(_, *, cap: float) -> None:
+        assert cap == 65.0
+
+    async def trigger() -> None:
+        return None
+
+    async def receive(timeout: float) -> StateMessage:
+        received_timeouts.append(timeout)
+        return await helper_module.wait_for_message_state(client, 34, 12, lambda current: current.button_count == 0, timeout=timeout)
+
+    monotonic = iter((100.0, 100.0, 110.0, 110.0)).__next__
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+    monkeypatch.setattr(helper_module, "time", SimpleNamespace(monotonic=monotonic))
+    monkeypatch.setattr(helper_module, "wait_for_limiter_slot", wait_for_slot)
+
+    assert await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive) is expected
+    assert received_timeouts == [55.0]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_state_rejects_unexpected_list_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(helper_module, "Message", StateMessage)
+
+    with pytest.raises(TypeError, match="list"):
+        await helper_module.wait_for_message_state(StateClient([[StateMessage(button_count=0)]]), 100, 42, lambda _current: True)
