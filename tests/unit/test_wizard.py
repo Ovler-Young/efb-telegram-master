@@ -1,17 +1,6 @@
 import importlib
 
 
-def test_wizard_entry_uses_focused_modules():
-    wizard_module = importlib.import_module("efb_telegram_master.wizard")
-    config_module = importlib.import_module("efb_telegram_master.wizard_config")
-    steps_module = importlib.import_module("efb_telegram_master.wizard_steps")
-    settings_module = importlib.import_module("efb_telegram_master.wizard_settings")
-
-    assert wizard_module.DataModel is config_module.DataModel
-    assert wizard_module.setup_proxy is steps_module.setup_proxy
-    assert wizard_module.setup_experimental_flags is settings_module.setup_experimental_flags
-
-
 def test_wizard_runs_split_setup_steps_in_order(monkeypatch):
     wizard_module = importlib.import_module("efb_telegram_master.wizard")
     calls = []

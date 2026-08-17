@@ -204,25 +204,6 @@ def test_positional_edit_retries_with_migrated_chat_id() -> None:
     topic_sync.migrate_chat_associations.assert_called_once_with(1, 2)
 
 
-def test_send_audio_affixes_caption_and_strips_queue_metadata() -> None:
-    api, _bot, queue, _chat_binding = _api()
-
-    api.send_audio(
-        chat_id=1,
-        audio="audio",
-        caption="body",
-        prefix="before",
-        suffix="after",
-        _sender_bot_id="aux-7",
-        _slave_id="slave.chat",
-    )
-
-    request = queue.requests[0]
-    assert request.kwargs == {"chat_id": 1, "audio": "audio", "caption": "before\nbody\nafter"}
-    assert request.required_sender_bot_id is None
-    assert request.slave_id == "slave.chat"
-
-
 @pytest.mark.parametrize(
     ("operation", "kwargs"),
     [

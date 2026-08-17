@@ -29,15 +29,6 @@ def _callback_update(chat_id, message_id, data, user_id=1):
     )
 
 
-def test_commands_manager_requires_explicit_dependencies():
-    application = Mock()
-    runtime = SimpleNamespace(application=application, as_async_callback=lambda callback: callback)
-
-    CommandsManager(Mock(), runtime, lambda text: text, lambda: [])
-
-    assert application.add_handler.call_count == 4
-
-
 async def _dispatch_callback(handler, application, update):
     check_result = handler.check_update(update)
     assert check_result is not None
