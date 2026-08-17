@@ -411,19 +411,5 @@ class TelegramIntegrationTestHelper:
 
         return self
 
-    def __enter__(self) -> "TelegramIntegrationTestHelper":
-        """
-        Start the client and return the helper
-
-        Returns:
-            self
-        """
-        self.client.loop.run_until_complete(self.__aenter__())
-        return self
-
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self._disconnect_client()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Trigger the event to end the main async task."""
-        self.client.loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))
