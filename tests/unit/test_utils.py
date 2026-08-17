@@ -4,7 +4,7 @@ from io import BytesIO
 import pytest
 from pytest import raises
 
-from efb_telegram_master.media import convert_tgs_to_gif
+from efb_telegram_master.media import _maybe_scale_wechat_gif, convert_tgs_to_gif
 from efb_telegram_master.utils import b64de, b64en, bounded_error_message, chat_id_str_to_id, chat_id_to_str, message_id_str_to_id, message_id_to_str, normalize_request_kwargs
 
 
@@ -80,3 +80,24 @@ def test_convert_tgs_to_gif():
     with open("tests/mocks/AnimatedSticker.tgs", "rb") as f:
         assert convert_tgs_to_gif(f, out), "conversion outcome"
     assert out.seek(0, 2), "converted TGS file should not be empty"
+
+
+@pytest.mark.parametrize(
+    ("channel_id", "width", "expected_filter"),
+    [
+        ("blueset.wechat", 601, ("scale", 600, -2)),
+        ("blueset.wechat", 600, None),
+        ("example.channel", 601, None),
+    ],
+)
+def test_wechat_gif_scaling_depends_on_channel_and_width(channel_id, width, expected_filter):
+    class GifStream:
+        def __init__(self, applied_filter=None):
+            self.applied_filter = applied_filter
+
+        def filter(self, *filter_args):
+            return GifStream(filter_args)
+
+    result = _maybe_scale_wechat_gif(GifStream(), channel_id, {"width": width})
+
+    assert result.applied_filter == expected_filter
