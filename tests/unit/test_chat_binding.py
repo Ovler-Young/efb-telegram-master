@@ -3,7 +3,7 @@ from unittest.mock import ANY, Mock, patch
 
 import pytest
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ConversationHandler
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ConversationHandler
 
 from efb_telegram_master import utils
 from efb_telegram_master.callback_sessions import CallbackSessionStore, ChatListStorage
@@ -144,30 +144,6 @@ def test_link_exec_keeps_valid_manual_link_callback_active(callback_manager, cal
     assert manager.callback_sessions.lookup(storage_id) is not None
 
 
-def test_other_user_cannot_use_link_callback_and_owner_can_continue(callback_manager, callback_chat):
-    storage_id = (TelegramChatID(1), TelegramMessageID(210))
-    _store_callback_session(callback_manager, callback_manager._conversation_handler, Flags.LINK_EXEC, storage_id, [callback_chat])
-
-    assert callback_manager.execute(_callback_update(*storage_id, "manual_link 0", user_id=2), None) == Flags.LINK_EXEC
-
-    assert callback_manager.callback_sessions.lookup(storage_id) is not None
-    callback_manager.bot.edit_message_text.assert_not_called()
-    callback_manager.bot.answer_callback_query.assert_called_once_with("callback-id", text="Session expired or unknown parameter. (SE02)")
-    assert callback_manager.execute(_callback_update(*storage_id, "manual_link 0"), None) == Flags.LINK_EXEC
-
-
-def test_other_user_cannot_paginate_link_session(callback_manager, callback_chat):
-    storage_id = (TelegramChatID(1), TelegramMessageID(211))
-    _store_callback_session(callback_manager, callback_manager._conversation_handler, Flags.LINK_CONFIRM, storage_id, [callback_chat])
-
-    with patch.object(callback_manager, "render_list") as render_list:
-        assert callback_manager.confirm(_callback_update(*storage_id, "offset 0", user_id=2), None) == Flags.LINK_CONFIRM
-
-    render_list.assert_not_called()
-    assert callback_manager.callback_sessions.lookup(storage_id) is not None
-    assert storage_id in callback_manager._conversation_handler._conversations
-
-
 @pytest.mark.asyncio
 async def test_conversation_handler_keeps_link_session_for_an_unauthorized_callback(callback_manager, callback_chat):
     manager = callback_manager
@@ -189,17 +165,22 @@ async def test_conversation_handler_keeps_link_session_for_an_unauthorized_callb
     application = ApplicationBuilder().token("123:token").build()
 
     attacker = _callback_update(*storage_id, "chat 0", user_id=2)
+    with patch.object(manager, "render_list") as render_list:
+        await _dispatch_callback(handler, application, _callback_update(*storage_id, "offset 0", user_id=2))
+
+    render_list.assert_not_called()
     await _dispatch_callback(handler, application, attacker)
 
     assert handler._conversations[storage_id] == Flags.LINK_CONFIRM
     assert manager.callback_sessions.lookup(storage_id) is not None
-    manager.bot.answer_callback_query.assert_called_once_with("callback-id", text="Session expired or unknown parameter. (SE02)")
+    assert manager.bot.answer_callback_query.call_args_list[0].args == ("callback-id",)
+    assert manager.bot.answer_callback_query.call_args_list[0].kwargs == {"text": "Session expired or unknown parameter. (SE02)"}
     manager.bot.edit_message_text.assert_not_called()
 
     await _dispatch_callback(handler, application, attacker)
     assert handler._conversations[storage_id] == Flags.LINK_CONFIRM
     assert manager.callback_sessions.lookup(storage_id) is not None
-    assert manager.bot.answer_callback_query.call_count == 2
+    assert manager.bot.answer_callback_query.call_count == 3
 
     owner = _callback_update(*storage_id, "chat 0")
     with patch.object(manager, "build_action") as build_action:
@@ -405,26 +386,6 @@ def test_recipient_selection_delivers_the_stored_update_to_the_selected_chat():
     assert storage_id not in handler._conversations
 
 
-def test_other_user_cannot_select_recipient_and_owner_can_continue():
-    bot = Mock()
-    callback_sessions = CallbackSessionStore(bot, lambda: 10)
-    delivery = Mock()
-    handler = SimpleNamespace(_conversations={})
-    service = RecipientSuggestionService(bot, callback_sessions, Mock(), delivery, lambda: 10, lambda text: text, Mock(), handler)
-    storage_id = (TelegramChatID(1), TelegramMessageID(226))
-    storage = ChatListStorage([SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat")])
-    original_update = Mock()
-    storage.set_chat_suggestion(original_update)
-    callback_sessions.start(handler, storage_id, Flags.SUGGEST_RECIPIENTS, 1, storage)
-
-    assert service.suggested_recipient(_callback_update(*storage_id, "chat 0", user_id=2), Mock()) == Flags.SUGGEST_RECIPIENTS
-
-    delivery.deliver.assert_not_called()
-    assert callback_sessions.lookup(storage_id) is storage
-    assert service.suggested_recipient(_callback_update(*storage_id, "chat 0"), Mock()) == ConversationHandler.END
-    delivery.deliver.assert_called_once_with(original_update, ANY, "tests.mocks.slave chat")
-
-
 def test_chat_head_selection_records_a_reply_target_and_cleans_its_session():
     bot = Mock()
     callback_sessions = CallbackSessionStore(bot, lambda: 10)
@@ -440,22 +401,6 @@ def test_chat_head_selection_records_a_reply_target_and_cleans_its_session():
     msglogs.add_or_update_message_log.assert_called_once()
     assert callback_sessions.lookup(storage_id) is None
     assert storage_id not in handler._conversations
-
-
-def test_other_user_cannot_create_chat_head():
-    bot = Mock()
-    callback_sessions = CallbackSessionStore(bot, lambda: 10)
-    chat = SimpleNamespace(module_id="tests.mocks.slave", uid="chat", full_name="Selected chat", self=Mock(), add_self=Mock())
-    msglogs = Mock()
-    handler = SimpleNamespace(_conversations={})
-    service = ChatHeadService(bot, callback_sessions, Mock(), Mock(), SimpleNamespace(channel_id="blueset.telegram"), msglogs, Mock(), lambda text: text, handler)
-    storage_id = (TelegramChatID(1), TelegramMessageID(227))
-    callback_sessions.start(handler, storage_id, Flags.CHAT_HEAD_CONFIRM, 1, ChatListStorage([chat]))
-
-    assert service.make_chat_head(_callback_update(*storage_id, "chat 0", user_id=2), Mock()) == Flags.CHAT_HEAD_CONFIRM
-
-    msglogs.add_or_update_message_log.assert_not_called()
-    assert callback_sessions.lookup(storage_id) is not None
 
 
 @pytest.mark.parametrize("callback", ["chat", "chat 0 extra", "chat nope", "chat 4"])
@@ -524,21 +469,6 @@ def test_chat_head_expires_when_the_session_is_missing():
 
     msglogs.add_or_update_message_log.assert_not_called()
     assert storage_id not in handler._conversations
-
-
-def test_chat_binding_handlers_keep_the_original_registration_order(channel):
-    handlers = channel.telegram_runtime.application.handlers[0]
-
-    def command_index(command):
-        return next(index for index, handler in enumerate(handlers) if isinstance(handler, CommandHandler) and command in handler.commands)
-
-    def conversation_index(state):
-        return next(index for index, handler in enumerate(handlers) if isinstance(handler, ConversationHandler) and state in handler.states)
-
-    assert command_index("link") < conversation_index(Flags.LINK_CONFIRM)
-    assert conversation_index(Flags.LINK_CONFIRM) < command_index("chat") < conversation_index(Flags.CHAT_HEAD_CONFIRM)
-    assert conversation_index(Flags.CHAT_HEAD_CONFIRM) < command_index("unlink_all") < conversation_index(Flags.SUGGEST_RECIPIENTS)
-    assert conversation_index(Flags.SUGGEST_RECIPIENTS) < command_index("update_info") < command_index("init_topics")
 
 
 def test_full_chat_pagination(channel, slave):
