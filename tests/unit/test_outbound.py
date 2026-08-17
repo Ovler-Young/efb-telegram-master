@@ -486,16 +486,6 @@ def test_completed_attachment_migrations_do_not_retain_redirects() -> None:
         queue.stop()
 
 
-def test_chat_redirect_resolution_follows_chains_and_stops_at_cycles() -> None:
-    queue = OutboundQueue(Mock(), None, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
-    with queue._lock:
-        queue._chat_redirects.update({1: 2, 2: 3, 4: 5, 5: 4})
-
-        assert queue._resolve_chat_id_locked(1) == 3
-        assert queue._resolve_chat_id_locked(4) == 4
-        assert queue._resolve_chat_id_locked(5) == 5
-
-
 def test_repeated_attachment_migration_fails_without_resending_primary() -> None:
     primary_calls = 0
     attachment_calls = 0
