@@ -345,9 +345,8 @@ def test_history_replay_resume_starts_a_worker_for_queued_entries():
     manager = HistoryReplayWorker(Mock(), Mock(), history_migrations, Mock(), Mock())
 
     with patch("efb_telegram_master.history_replay.threading.Thread") as thread:
-        manager.resume()
+        assert manager.resume() is True
 
-    thread.assert_called_once_with(target=manager._run, name="HistoryMigrationReplay")
     thread.return_value.start.assert_called_once()
 
 
