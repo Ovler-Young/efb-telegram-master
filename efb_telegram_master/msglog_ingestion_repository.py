@@ -1,6 +1,6 @@
 import datetime
 from enum import Enum
-from typing import List, Optional, Protocol
+from typing import TYPE_CHECKING, List, Optional
 
 from ehforwarderbot.types import ChatID
 from peewee import IntegrityError
@@ -10,21 +10,8 @@ from .models import UTC_LEASE_CLOCK, MsgLog, MsgLogIngestionLeaseLostError, MsgL
 from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 
 
-class IngestedMsgLogData(Protocol):
-    @property
-    def text(self) -> str: ...
-
-    @property
-    def media_type(self) -> str: ...
-
-    @property
-    def msg_type(self) -> str: ...
-
-    @property
-    def mime(self) -> Optional[str]: ...
-
-    @property
-    def time(self) -> Optional[datetime.datetime]: ...
+if TYPE_CHECKING:
+    from .msglog_ingestion import IngestedMsgLog
 
 
 class MsgLogIngestionCompletion(str, Enum):
@@ -118,7 +105,7 @@ class MsgLogIngestionRepository(ObservedRepository):
             return scan.status
 
     def persist_item(
-        self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional[IngestedMsgLogData] = None, lease_owner: str
+        self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional["IngestedMsgLog"] = None, lease_owner: str
     ) -> str:
         local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
