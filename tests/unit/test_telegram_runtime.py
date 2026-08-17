@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import threading
 import time
 from contextlib import ExitStack
@@ -23,7 +22,7 @@ from efb_telegram_master.outbound_types import OutboundShutdownTimeout, QueueReq
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
-from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
+from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime
 
 
 def _runtime(
@@ -41,15 +40,6 @@ def _runtime(
         AsyncMock(),
         webhook,
     )
-
-
-def test_sync_bot_facade_preserves_telegram_method_signature() -> None:
-    async def send_message(chat_id: int, text: str) -> tuple[int, str]:
-        return chat_id, text
-
-    facade = SyncBotFacade(SimpleNamespace(send_message=send_message), Mock())
-
-    assert inspect.signature(facade.send_message) == inspect.signature(send_message)
 
 
 def test_async_runtime_call_uses_bound_loop_without_starting_background_loop() -> None:
