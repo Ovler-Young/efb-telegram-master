@@ -63,7 +63,7 @@ class MsgLogScanScheduler:
         if not self.mtproto.enabled:
             return "unavailable"
         if source_chat_id in self._pending_source_chat_ids:
-            return "already running"
+            return "queued" if queue_after_active else "already running"
         if source_chat_id in self._threads:
             if not queue_after_active:
                 return "already running"

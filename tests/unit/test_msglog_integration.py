@@ -405,6 +405,94 @@ def test_association_reschedule_recovers_untracked_active_lease(tmp_path, termin
     assert fetches == 2
 
 
+def test_association_reschedule_reports_queued_for_resumed_expired_lease(tmp_path):
+    admission_started = threading.Event()
+    allow_admission = threading.Event()
+    fetched = threading.Event()
+    completed = threading.Event()
+    fetches = 0
+
+    class Associations:
+        def get_topic_assoc_slave_uid(self, source_chat_id, topic_id):
+            assert (source_chat_id, topic_id) == (100, 10)
+            return "tests.slave target"
+
+        def get_topic_slaves(self, source_chat_id):
+            return [("tests.slave", 10)] if source_chat_id == 100 else []
+
+    class MTProto:
+        enabled = True
+        config = SimpleNamespace(scan_ceiling=1, scan_concurrency=1)
+
+        async def connect(self):
+            if not admission_started.is_set():
+                admission_started.set()
+                await asyncio.to_thread(allow_admission.wait)
+
+        async def get_input_channel(self, source_chat_id):
+            return source_chat_id
+
+        async def get_channel_messages(self, channel, message_ids):
+            nonlocal fetches
+            assert message_ids == [1]
+            if channel == 200:
+                return []
+            fetches += 1
+            fetched.set()
+            return [
+                SimpleNamespace(
+                    id=1,
+                    message="message 1",
+                    date=None,
+                    reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
+                    action=None,
+                    media=None,
+                )
+            ]
+
+    class TrackingRepository(MsgLogIngestionRepository):
+        def complete_scan(self, scan, *, lease_owner):
+            result = super().complete_scan(scan, lease_owner=lease_owner)
+            if scan.source_chat_id == "100":
+                completed.set()
+            return result
+
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "msglog.db")
+    database.initialize(test_db)
+    test_db.connect()
+    ingestion = TrackingRepository("tests.master")
+    runtime = SharedAsyncRuntime()
+    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        ingestion.get_or_create_scan(200, 1)
+        assert scheduler.schedule(200) == "started"
+        assert admission_started.wait(1)
+
+        scan = ingestion.get_or_create_scan(100, 1)
+        assert ingestion.claim_scan(100, "other-process", 60) is not None
+        MsgLogIngestionScan.update(lease_expires_at=datetime.now() - timedelta(seconds=1)).where(MsgLogIngestionScan.id == scan.id).execute()
+
+        scheduler.resume()
+        assert scheduler.schedule_for_association(100) == "queued"
+
+        allow_admission.set()
+        assert fetched.wait(1)
+        assert completed.wait(1)
+        assert scheduler.stop(1) == ()
+        recovered = MsgLogIngestionScan.get_by_id(scan.id)
+    finally:
+        allow_admission.set()
+        assert scheduler.stop(1) == ()
+        runtime.close()
+        test_db.close()
+        database.initialize(original_database)
+
+    assert recovered.status == "complete"
+    assert fetches == 1
+
+
 def test_association_reschedule_queues_a_successor_after_retryable_error(tmp_path):
     first_fetch_started = threading.Event()
     allow_retryable_error = threading.Event()
