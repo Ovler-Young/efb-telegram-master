@@ -40,6 +40,7 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
         "MasterMessageDelivery",
         "CallbackSessionStore",
         "RecipientSuggestionService",
+        "LinkActionService",
         "LinkService",
         "LinkCompletionService",
         "ChatHeadService",

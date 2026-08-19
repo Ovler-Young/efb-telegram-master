@@ -14,6 +14,7 @@ from .chat_object_cache import ChatObjectCacheManager
 from .commands import CommandsManager
 from .constants import Flags
 from .history_replay import HistoryReplayWorker
+from .link_actions import LinkActionService
 from .link_completion import LinkCompletionService
 from .link_service import LinkService
 from .master_delivery import MasterMessageDelivery
@@ -186,19 +187,18 @@ def _build_chat_binding_services_and_handlers(channel) -> None:
         per_chat=True,
         per_user=False,
     )
+    link_actions = LinkActionService(channel.bot_manager.api, channel.telegram_runtime, channel._, channel.logger)
     link_service = LinkService(
         channel.bot_manager.api,
         channel.telegram_runtime,
         channel.channel_id,
-        channel.flag("multiple_slave_chats"),
         channel.msglogs,
         channel.chat_associations,
         channel.chat_manager,
         channel.callback_sessions,
         recipient_suggestions.render_chat_list,
         channel._,
-        channel.ngettext,
-        channel.logger,
+        link_actions,
         link_handler,
     )
     link_completion = LinkCompletionService(
@@ -241,6 +241,7 @@ def _build_chat_binding_services_and_handlers(channel) -> None:
     channel.recipient_suggestions = recipient_suggestions
     channel.suggestion_handler = suggestion_handler
     channel.link_service = link_service
+    channel.link_actions = link_actions
     channel.link_completion = link_completion
     channel.link_handler = link_handler
     channel.chat_head = chat_head

@@ -7,7 +7,7 @@ from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ConversationH
 from efb_telegram_master.callback_sessions import ChatListStorage
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
-from tests.unit.chat_binding_support import callback_chat, callback_update, create_link_manager, dispatch_callback, store_callback_session
+from tests.unit.chat_binding_support import callback_chat, callback_update, create_link_action_service, create_link_manager, dispatch_callback, store_callback_session
 
 
 @pytest.fixture
@@ -63,7 +63,7 @@ def test_link_confirmation_answers_before_building_the_action_menu(callback_mana
     calls = []
     callback_manager.bot.answer_callback_query.side_effect = lambda *_args: calls.append("answer")
 
-    with patch.object(callback_manager, "build_action", side_effect=lambda *_args: calls.append("build")):
+    with patch.object(callback_manager.action_service, "render", side_effect=lambda *_args: calls.append("build")):
         assert callback_manager.confirm(callback_update(*storage_id, "chat 0"), None) == Flags.LINK_EXEC
 
     assert calls == ["answer", "build"]
@@ -73,10 +73,10 @@ def test_link_exec_keeps_valid_manual_link_callback_active(callback_manager, lin
     storage_id = (TelegramChatID(1), TelegramMessageID(205))
     store_callback_session(callback_manager, callback_manager._conversation_handler, Flags.LINK_EXEC, storage_id, [link_chat])
 
-    with patch.object(callback_manager, "build_action") as build_link_action_message, patch.object(callback_manager.bot, "answer_callback_query") as answer_callback_query:
+    with patch.object(callback_manager.action_service, "execute", return_value=Flags.LINK_EXEC) as execute_action, patch.object(callback_manager.bot, "answer_callback_query") as answer_callback_query:
         assert callback_manager.execute(callback_update(*storage_id, "manual_link 0"), None) == Flags.LINK_EXEC
 
-    build_link_action_message.assert_not_called()
+    execute_action.assert_called_once_with("manual_link", link_chat, *storage_id)
     answer_callback_query.assert_not_called()
     assert callback_manager.callback_sessions.lookup(storage_id) is not None
 
@@ -105,11 +105,35 @@ async def test_conversation_handler_keeps_link_session_for_an_unauthorized_callb
     assert callback_manager.bot.answer_callback_query.call_args_list[0].kwargs == {"text": "Session expired or unknown parameter. (SE02)"}
     callback_manager.bot.edit_message_text.assert_not_called()
 
-    with patch.object(callback_manager, "build_action") as build_action:
+    with patch.object(callback_manager.action_service, "render") as render_action:
         await dispatch_callback(handler, application, callback_update(*storage_id, "chat 0"))
 
     assert handler._conversations[storage_id] == Flags.LINK_EXEC
-    build_action.assert_called_once_with(link_chat, *storage_id)
+    render_action.assert_called_once_with(link_chat, *storage_id)
+
+
+def test_link_action_service_renders_relink_and_manual_action_menu():
+    service = create_link_action_service()
+    chat = SimpleNamespace(full_name="Selected chat", linked=True)
+    storage_id = (TelegramChatID(1), TelegramMessageID(214))
+
+    service.render(chat, *storage_id)
+
+    kwargs = service.bot.edit_message_text.call_args.kwargs
+    assert "This chat has already linked to Telegram." in kwargs["text"]
+    assert [button.text for button in kwargs["reply_markup"].inline_keyboard[0]] == ["Relink", "Restore", "Manual Relink"]
+
+
+def test_link_action_service_keeps_manual_link_session_active():
+    service = create_link_action_service()
+    chat = SimpleNamespace(full_name="Selected chat", linked=False)
+    storage_id = (TelegramChatID(1), TelegramMessageID(215))
+
+    assert service.execute("manual_link", chat, *storage_id) == Flags.LINK_EXEC
+
+    kwargs = service.bot.edit_message_text.call_args.kwargs
+    assert "<code>/start" in kwargs["text"]
+    assert kwargs["reply_markup"].inline_keyboard[0][0].text == "Cancel"
 
 
 @pytest.mark.asyncio

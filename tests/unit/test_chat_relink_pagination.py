@@ -27,7 +27,7 @@ def test_link_actions_accept_zero_index_after_second_page_selection(linked, call
     manager.callback_sessions.lookup(storage_id).offset = manager.channel.flag("chats_per_page")
     manager.logger = Mock()
 
-    with patch.object(manager, "_get_bot_user", return_value=SimpleNamespace(username="test_bot")):
+    with patch("efb_telegram_master.link_actions.get_bot_user", return_value=SimpleNamespace(username="test_bot")):
         assert manager.confirm(callback_update(*storage_id, "chat 10"), None) == Flags.LINK_EXEC
 
     assert manager.callback_sessions.lookup(storage_id).chats == [selected_chat]

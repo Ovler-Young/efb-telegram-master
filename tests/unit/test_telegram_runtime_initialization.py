@@ -115,6 +115,7 @@ def test_channel_constructor_stops_started_history_replay_when_handler_registrat
         "MasterMessageDelivery",
         "CallbackSessionStore",
         "RecipientSuggestionService",
+        "LinkActionService",
         "LinkService",
         "LinkCompletionService",
         "ChatHeadService",

@@ -4,6 +4,7 @@ from unittest.mock import Mock
 from telegram import Update
 
 from efb_telegram_master.callback_sessions import CallbackSessionStore, ChatListStorage
+from efb_telegram_master.link_actions import LinkActionService
 from efb_telegram_master.link_service import LinkService
 
 
@@ -38,7 +39,18 @@ def create_link_manager():
     manager._ = lambda text: text
     manager.callback_sessions = CallbackSessionStore(manager.bot, lambda: manager.channel.flag("chats_per_page"))
     manager._conversation_handler = SimpleNamespace(_conversations={})
+    manager.action_service = create_link_action_service()
+    manager.action_service.bot = manager.bot
     return manager
+
+
+def create_link_action_service():
+    service = LinkActionService.__new__(LinkActionService)
+    service.bot = Mock()
+    service._ = lambda text: text
+    service.runtime = SimpleNamespace(me=SimpleNamespace(username="test_bot"))
+    service.logger = Mock()
+    return service
 
 
 def store_callback_session(manager, handler, state, storage_id, chats):
