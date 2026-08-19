@@ -4,7 +4,7 @@ from unittest.mock import Mock
 from peewee import SqliteDatabase
 
 from efb_telegram_master.history_replay import HistoryReplayWorker, history_location_text
-from efb_telegram_master.models import HistoryMigrationEntry, database
+from efb_telegram_master.models import DATABASE_MODELS, HistoryMigrationEntry
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
@@ -30,12 +30,10 @@ def test_history_location_text_keeps_supergroup_history_urls():
 
 
 def test_history_migration_dispatches_persisted_entries_through_telegram_api():
-    original_database = database.obj
     test_database = SqliteDatabase(":memory:")
-    database.initialize(test_database)
-    test_database.connect()
-    manager = HistoryReplayWorker(SimpleNamespace(send_message=Mock(), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock())
-    try:
+    with test_database.bind_ctx(DATABASE_MODELS):
+        test_database.connect()
+        manager = HistoryReplayWorker(SimpleNamespace(send_message=Mock(), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock())
         test_database.create_tables([HistoryMigrationEntry])
         HistoryMigrationEntry.create(
             slave_chat_id="tests.mocks.slave.chat",
@@ -74,20 +72,16 @@ def test_history_migration_dispatches_persisted_entries_through_telegram_api():
 
         assert manager.process_target(failed_entry) is True
         assert not HistoryMigrationEntry.select().where(HistoryMigrationEntry.id == failed_entry.id).exists()
-    finally:
         test_database.close()
-        database.initialize(original_database)
 
 
 def test_pending_history_migrations_keep_the_failed_entry_and_remaining_boundary():
-    original_database = database.obj
     test_database = SqliteDatabase(":memory:")
-    database.initialize(test_database)
-    test_database.connect()
-    manager = HistoryReplayWorker(
-        SimpleNamespace(send_message=Mock(side_effect=[None, RuntimeError("Telegram failed")]), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock()
-    )
-    try:
+    with test_database.bind_ctx(DATABASE_MODELS):
+        test_database.connect()
+        manager = HistoryReplayWorker(
+            SimpleNamespace(send_message=Mock(side_effect=[None, RuntimeError("Telegram failed")]), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock()
+        )
         test_database.create_tables([HistoryMigrationEntry])
         HistoryMigrationEntry.insert_many(
             [
@@ -101,9 +95,7 @@ def test_pending_history_migrations_keep_the_failed_entry_and_remaining_boundary
 
         assert [entry.source_master_msg_id for entry in HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.position)] == ["10.21", "10.22"]
         manager.bot.copy_message.assert_not_called()
-    finally:
         test_database.close()
-        database.initialize(original_database)
 
 
 def test_history_migration_deletes_zero_call_entry_without_queueing():

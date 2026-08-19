@@ -6,50 +6,48 @@ from peewee import SqliteDatabase
 
 from efb_telegram_master import utils
 from efb_telegram_master.history_replay import HistoryReplayWorker
-from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, database
+from efb_telegram_master.models import DATABASE_MODELS, HistoryMigrationEntry, MsgLog
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
 
 
 def test_pending_history_migrations_send_entries_in_position_order_and_delete_each_success():
-    original_database = database.obj
     test_database = SqliteDatabase(":memory:")
-    database.initialize(test_database)
-    test_database.connect()
-    manager = HistoryReplayWorker(SimpleNamespace(send_message=Mock(), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock())
-    manager.REPLAY_PAGE_SIZE = 2
-    try:
-        test_database.create_tables([HistoryMigrationEntry])
-        HistoryMigrationEntry.insert_many(
-            [
-                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.20", "formatted_text": "first\n", "position": 0},
-                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.21", "formatted_text": "second\n", "position": 1},
-                {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.22", "formatted_text": None, "position": 2},
+    with test_database.bind_ctx(DATABASE_MODELS):
+        test_database.connect()
+        manager = HistoryReplayWorker(SimpleNamespace(send_message=Mock(), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock())
+        manager.REPLAY_PAGE_SIZE = 2
+        try:
+            test_database.create_tables([HistoryMigrationEntry])
+            HistoryMigrationEntry.insert_many(
+                [
+                    {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.20", "formatted_text": "first\n", "position": 0},
+                    {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.21", "formatted_text": "second\n", "position": 1},
+                    {"slave_chat_id": "tests.mocks.slave.chat", "target_chat_id": "12345", "source_master_msg_id": "10.22", "formatted_text": None, "position": 2},
+                ]
+            ).execute()
+
+            pages = []
+            original_get_entries_page = manager.history_migrations.get_entries_page
+
+            def get_entries_page(*args):
+                page = original_get_entries_page(*args)
+                pages.append(page)
+                return page
+
+            with patch.object(manager.history_migrations, "get_entries_page", side_effect=get_entries_page) as get_entries_page_mock:
+                manager.process_pending()
+
+            assert [call.kwargs["text"] for call in manager.bot.send_message.call_args_list] == ["first\n", "second\n"]
+            manager.bot.copy_message.assert_called_once_with(chat_id=12345, from_chat_id=10, message_id=22, disable_notification=True)
+            assert HistoryMigrationEntry.select().count() == 0
+            assert [len(page) for page in pages] == [2, 1, 0]
+            assert get_entries_page_mock.call_args_list == [
+                (("tests.mocks.slave.chat", 12345, None, None, 2), {}),
+                (("tests.mocks.slave.chat", 12345, None, (1, 2), 2), {}),
+                (("tests.mocks.slave.chat", 12345, None, (2, 3), 2), {}),
             ]
-        ).execute()
-
-        pages = []
-        original_get_entries_page = manager.history_migrations.get_entries_page
-
-        def get_entries_page(*args):
-            page = original_get_entries_page(*args)
-            pages.append(page)
-            return page
-
-        with patch.object(manager.history_migrations, "get_entries_page", side_effect=get_entries_page) as get_entries_page_mock:
-            manager.process_pending()
-
-        assert [call.kwargs["text"] for call in manager.bot.send_message.call_args_list] == ["first\n", "second\n"]
-        manager.bot.copy_message.assert_called_once_with(chat_id=12345, from_chat_id=10, message_id=22, disable_notification=True)
-        assert HistoryMigrationEntry.select().count() == 0
-        assert [len(page) for page in pages] == [2, 1, 0]
-        assert get_entries_page_mock.call_args_list == [
-            (("tests.mocks.slave.chat", 12345, None, None, 2), {}),
-            (("tests.mocks.slave.chat", 12345, None, (1, 2), 2), {}),
-            (("tests.mocks.slave.chat", 12345, None, (2, 3), 2), {}),
-        ]
-    finally:
-        test_database.close()
-        database.initialize(original_database)
+        finally:
+            test_database.close()
 
 
 def test_queue_history_migration_entries_persists_pending_rows():

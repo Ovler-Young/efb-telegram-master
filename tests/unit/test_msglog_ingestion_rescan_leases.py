@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 from peewee import SqliteDatabase
 
-from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
+from efb_telegram_master.models import DATABASE_MODELS, MsgLog, MsgLogIngestionScan
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.runtime.mtproto import MTProtoRetryableError
@@ -50,16 +50,14 @@ def ingested_topic_message():
 
 @contextmanager
 def msglog_scan_database(tmp_path):
-    original_database = database.obj
     test_db = SqliteDatabase(tmp_path / "msglog.db")
-    database.initialize(test_db)
-    test_db.connect()
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        yield test_db
-    finally:
-        test_db.close()
-        database.initialize(original_database)
+    with test_db.bind_ctx(DATABASE_MODELS):
+        test_db.connect()
+        try:
+            test_db.create_tables([MsgLog, MsgLogIngestionScan])
+            yield test_db
+        finally:
+            test_db.close()
 
 
 def test_association_reschedule_queues_a_successor_after_active_lease_expires(tmp_path):

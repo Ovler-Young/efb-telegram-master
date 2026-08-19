@@ -10,11 +10,11 @@ from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
 from peewee import IntegrityError, PostgresqlDatabase, SqliteDatabase
 
-from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
+from efb_telegram_master.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc
 from efb_telegram_master.msg_type import TGMsgType
+from efb_telegram_master.persistence import database_initializer
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.persistence.msglog_repository import MsgLogRepository
 from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
@@ -30,21 +30,25 @@ def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, m
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.upgrade", config={}))
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
+    config = SimpleNamespace(database={})
+    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.upgrade", config=config))
     second_manager = None
+    model_binding = None
     try:
         first_manager.stop_worker()
-        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.upgrade", config={}))
+        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.upgrade", config=config))
+        model_binding = second_manager.current_database.bind_ctx(DATABASE_MODELS)
+        model_binding.__enter__()
         old_row = MsgLog.get_by_id("100.1")
         live_row = MsgLog.create(**msglog_values("100.2"))
         ingested_row = MsgLog.create(**msglog_values("100.3", provenance="mtproto_ingested"))
-        provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
+        provenance_columns = [column.name for column in second_manager.current_database.get_columns("msglog") if column.name == "provenance"]
     finally:
         if second_manager is not None:
             second_manager.stop_worker()
-        database.initialize(original_database)
+        if model_binding is not None:
+            model_binding.__exit__(None, None, None)
 
     assert provenance_columns == ["provenance"]
     assert old_row.provenance == "live"
@@ -53,9 +57,9 @@ def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, m
 
 
 def test_concurrent_sqlite_msglog_provenance_upgrade_is_idempotent(tmp_path):
-    original_database = database.obj
     test_db = SqliteDatabase(tmp_path / "tgdata.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     try:
         create_old_msglog_schema(test_db)
@@ -65,16 +69,16 @@ def test_concurrent_sqlite_msglog_provenance_upgrade_is_idempotent(tmp_path):
         provenance_columns = [column.name for column in test_db.get_columns("msglog") if column.name == "provenance"]
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
     assert provenance_columns == ["provenance"]
     assert row.provenance == "live"
 
 
 def test_ingestion_claim_persist_and_idempotence_are_atomic():
-    original_database = database.obj
     test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     manager = MsgLogIngestionRepository("tests", test_db)
     try:
@@ -88,7 +92,7 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
         row = MsgLog.get_by_id("100.500")
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
     assert row.provenance == "mtproto_ingested"
     assert row.slave_message_id == "mtproto-ingested:100.500"
@@ -98,9 +102,9 @@ def test_live_and_ingestion_fallback_times_are_utc_naive_and_sort_together():
     original_timezone = os.environ.get("TZ")
     os.environ["TZ"] = "Pacific/Kiritimati"
     time.tzset()
-    original_database = database.obj
     test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     manager = MsgLogIngestionRepository("tests", test_db)
     before = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -114,7 +118,7 @@ def test_live_and_ingestion_fallback_times_are_utc_naive_and_sort_together():
         rows = list(MsgLog.select().order_by(MsgLog.time, MsgLog.master_msg_id))
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
         if original_timezone is None:
             del os.environ["TZ"]
         else:
@@ -191,22 +195,24 @@ def test_postgresql_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path,
     admin_db = PostgresqlDatabase(**connection_kwargs)
     admin_db.connect()
     admin_db.connection().autocommit = True
-    original_database = database.obj
     first_manager = None
     second_manager = None
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    model_binding = None
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
         test_db = PostgresqlDatabase(database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"})
         test_db.connect()
         create_old_msglog_schema(test_db, blob_type="BYTEA", time_type="TIMESTAMP")
         test_db.close()
-        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"}}}
+        config = SimpleNamespace(database={"type": "postgresql", "database": database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"}})
         first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-upgrade", config=config))
         first_manager.stop_worker()
         second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-upgrade", config=config))
+        model_binding = second_manager.current_database.bind_ctx(DATABASE_MODELS)
+        model_binding.__enter__()
         row = MsgLog.get_by_id("100.1")
-        provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
+        provenance_columns = [column.name for column in second_manager.current_database.get_columns("msglog") if column.name == "provenance"]
         ChatAssoc.create(master_uid="master", slave_uid="slave")
         TopicAssoc.create(topic_chat_id="100", message_thread_id="200", slave_uid="slave")
         HistoryMigrationEntry.create(slave_chat_id="slave", target_chat_id="100", source_master_msg_id="100.1", position=0)
@@ -221,7 +227,8 @@ def test_postgresql_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path,
             second_manager.stop_worker()
         elif first_manager is not None:
             first_manager.stop_worker()
-        database.initialize(original_database)
+        if model_binding is not None:
+            model_binding.__exit__(None, None, None)
         admin_db.execute_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
         admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
         admin_db.close()

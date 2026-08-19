@@ -1,16 +1,16 @@
 import pytest
 from peewee import SqliteDatabase
 
-from efb_telegram_master.models import MsgLogIngestionScan, database
+from efb_telegram_master.models import DATABASE_MODELS, MsgLogIngestionScan
 from efb_telegram_master.persistence import schema_migration
 from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from tests.unit.msglog_schema_support import create_legacy_ingestion_scan_schema, create_old_msglog_schema, insert_legacy_ingestion_scan_rows, legacy_ingestion_scan_rows
 
 
 def test_msglog_migration_preserves_legacy_naive_and_null_times():
-    original_database = database.obj
     test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     try:
         create_old_msglog_schema(test_db)
@@ -26,15 +26,15 @@ def test_msglog_migration_preserves_legacy_naive_and_null_times():
         rows = test_db.execute_sql("SELECT master_msg_id, time FROM msglog ORDER BY master_msg_id").fetchall()
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
     assert rows == [("100.1", None), ("100.2", "2020-01-02 03:04:05"), ("100.3", None)]
 
 
 def test_legacy_ingestion_scan_schema_adds_rescan_requested_without_losing_states(tmp_path):
-    original_database = database.obj
     test_db = SqliteDatabase(tmp_path / "tgdata.db")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     try:
         create_legacy_ingestion_scan_schema(test_db)
@@ -46,7 +46,7 @@ def test_legacy_ingestion_scan_schema_adds_rescan_requested_without_losing_state
         lease_clocks = test_db.execute_sql("SELECT lease_clock FROM msglogingestionscan ORDER BY source_chat_id").fetchall()
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
     expected_columns = {field.column_name for field in MsgLogIngestionScan._meta.sorted_fields}
     assert legacy_columns == expected_columns - {"rescan_requested", "lease_clock"}
@@ -60,9 +60,9 @@ def test_legacy_ingestion_scan_schema_adds_rescan_requested_without_losing_state
 
 
 def test_sqlite_ingestion_scan_migration_failure_rolls_back_schema_and_data(tmp_path, monkeypatch):
-    original_database = database.obj
     test_db = SqliteDatabase(tmp_path / "tgdata.db")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     original_migrate = schema_migration.migrate
     migration_calls = 0
@@ -91,7 +91,7 @@ def test_sqlite_ingestion_scan_migration_failure_rolls_back_schema_and_data(tmp_
         msglog_rows = test_db.execute_sql("SELECT master_msg_id FROM msglog").fetchall()
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
     assert migration_calls == 2
     assert "rescan_requested" not in scan_columns

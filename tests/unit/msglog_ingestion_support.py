@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from peewee import SqliteDatabase
 
-from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
+from efb_telegram_master.models import DATABASE_MODELS, MsgLog, MsgLogIngestionScan
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 
 
@@ -99,14 +99,12 @@ def topic_message(message_id, *, topic_id=10, media=None, date=None, topic_root=
 
 @contextmanager
 def sqlite_ingestion_database(path=":memory:"):
-    original_database = database.obj
     test_db = SqliteDatabase(path)
-    database.initialize(test_db)
-    test_db.connect()
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        yield test_db, MsgLogIngestionRepository("tests.master", test_db)
-    finally:
-        if not test_db.is_closed():
-            test_db.close()
-        database.initialize(original_database)
+    with test_db.bind_ctx(DATABASE_MODELS):
+        test_db.connect()
+        try:
+            test_db.create_tables([MsgLog, MsgLogIngestionScan])
+            yield test_db, MsgLogIngestionRepository("tests.master", test_db)
+        finally:
+            if not test_db.is_closed():
+                test_db.close()

@@ -6,17 +6,17 @@ from types import SimpleNamespace
 import pytest
 from peewee import PostgresqlDatabase, SqliteDatabase
 
-from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import MsgLogIngestionScan, database
+from efb_telegram_master.models import DATABASE_MODELS, MsgLogIngestionScan
+from efb_telegram_master.persistence import database_initializer
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from tests.unit.msglog_schema_support import create_legacy_ingestion_scan_schema, insert_legacy_ingestion_scan_rows, legacy_ingestion_scan_rows, postgres_connection_kwargs
 
 
 def test_association_rescan_resets_completed_scans_and_marks_active_leases():
-    original_database = database.obj
     test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     manager = MsgLogIngestionRepository("tests", test_db)
     try:
@@ -34,7 +34,7 @@ def test_association_rescan_resets_completed_scans_and_marks_active_leases():
         assert (running.status, running.rescan_requested) == ("running", True)
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
 
 @pytest.mark.parametrize(
@@ -43,9 +43,9 @@ def test_association_rescan_resets_completed_scans_and_marks_active_leases():
     ids=["expired", "missing"],
 )
 def test_association_rescan_recovers_stale_running_leases(lease_owner, lease_expires_at):
-    original_database = database.obj
     test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     manager = MsgLogIngestionRepository("tests", test_db)
     try:
@@ -67,7 +67,7 @@ def test_association_rescan_recovers_stale_running_leases(lease_owner, lease_exp
         recovered = MsgLogIngestionScan.get_by_id(scan.id)
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
     assert (
         recovered.status,
@@ -84,9 +84,9 @@ def test_association_rescan_recovers_stale_running_leases(lease_owner, lease_exp
 
 
 def test_active_association_request_restarts_scan_without_releasing_its_lease():
-    original_database = database.obj
     test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     manager = MsgLogIngestionRepository("tests", test_db)
     try:
@@ -102,13 +102,13 @@ def test_active_association_request_restarts_scan_without_releasing_its_lease():
         assert MsgLogIngestionScan.get_by_id(scan.id).status == "complete"
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
 
 def test_expired_scan_is_resumable_after_restart():
-    original_database = database.obj
     test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
+    model_binding = test_db.bind_ctx(DATABASE_MODELS)
+    model_binding.__enter__()
     test_db.connect()
     manager = MsgLogIngestionRepository("tests", test_db)
     try:
@@ -121,7 +121,7 @@ def test_expired_scan_is_resumable_after_restart():
         assert manager.claim_scan(100, "worker-b", 60) is not None
     finally:
         test_db.close()
-        database.initialize(original_database)
+        model_binding.__exit__(None, None, None)
 
 
 @pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
@@ -131,9 +131,9 @@ def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false
     admin_db = PostgresqlDatabase(**connection_kwargs)
     admin_db.connect()
     admin_db.connection().autocommit = True
-    original_database = database.obj
     manager = None
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    model_binding = None
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
         test_db = PostgresqlDatabase(database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"})
@@ -141,15 +141,18 @@ def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false
         create_legacy_ingestion_scan_schema(test_db, timestamp_type="TIMESTAMP")
         insert_legacy_ingestion_scan_rows(test_db)
         test_db.close()
-        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"}}}
+        config = SimpleNamespace(database={"type": "postgresql", "database": database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"}})
         manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-scan-upgrade", config=config))
-        scan_columns = {column.name for column in database.get_columns("msglogingestionscan")}
-        rows = legacy_ingestion_scan_rows(database)
-        lease_clocks = database.execute_sql("SELECT lease_clock FROM msglogingestionscan ORDER BY source_chat_id").fetchall()
+        model_binding = manager.current_database.bind_ctx(DATABASE_MODELS)
+        model_binding.__enter__()
+        scan_columns = {column.name for column in manager.current_database.get_columns("msglogingestionscan")}
+        rows = legacy_ingestion_scan_rows(manager.current_database)
+        lease_clocks = manager.current_database.execute_sql("SELECT lease_clock FROM msglogingestionscan ORDER BY source_chat_id").fetchall()
     finally:
         if manager is not None:
             manager.stop_worker()
-        database.initialize(original_database)
+        if model_binding is not None:
+            model_binding.__exit__(None, None, None)
         admin_db.execute_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
         admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
         admin_db.close()

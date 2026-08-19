@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from peewee import PostgresqlDatabase
 
-from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
+from efb_telegram_master.models import DATABASE_MODELS, MsgLog, MsgLogIngestionScan
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from tests.unit.msglog_ingestion_support import FakeChatAssociations, FakeDatabase, FakeMTProto, sqlite_ingestion_database, topic_message
@@ -123,12 +123,13 @@ def test_postgresql_ingestion_persists_mtproto_times_as_utc_naive_datetimes():
     admin_db = PostgresqlDatabase(**connection_kwargs)
     admin_db.connect()
     admin_db.connection().autocommit = True
-    original_database = database.obj
     test_db = None
+    model_binding = None
     try:
         admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
         test_db = PostgresqlDatabase(database_name, **{key: value for key, value in connection_kwargs.items() if key != "database"})
-        database.initialize(test_db)
+        model_binding = test_db.bind_ctx(DATABASE_MODELS)
+        model_binding.__enter__()
         test_db.connect()
         test_db.create_tables([MsgLog, MsgLogIngestionScan])
         service = MsgLogIngestionService(
@@ -150,7 +151,8 @@ def test_postgresql_ingestion_persists_mtproto_times_as_utc_naive_datetimes():
     finally:
         if test_db is not None and not test_db.is_closed():
             test_db.close()
-        database.initialize(original_database)
+        if model_binding is not None:
+            model_binding.__exit__(None, None, None)
         admin_db.execute_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
         admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
         admin_db.close()
