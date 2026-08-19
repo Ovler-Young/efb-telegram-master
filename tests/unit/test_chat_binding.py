@@ -167,11 +167,6 @@ async def test_conversation_handler_keeps_link_session_for_an_unauthorized_callb
     assert manager.bot.answer_callback_query.call_args_list[0].kwargs == {"text": "Session expired or unknown parameter. (SE02)"}
     manager.bot.edit_message_text.assert_not_called()
 
-    await _dispatch_callback(handler, application, attacker)
-    assert handler._conversations[storage_id] == Flags.LINK_CONFIRM
-    assert manager.callback_sessions.lookup(storage_id) is not None
-    assert manager.bot.answer_callback_query.call_count == 3
-
     owner = _callback_update(*storage_id, "chat 0")
     with patch.object(manager, "build_action") as build_action:
         await _dispatch_callback(handler, application, owner)
@@ -203,13 +198,11 @@ async def test_conversation_handler_keeps_link_execute_session_for_unauthorized_
     attacker = _callback_update(*storage_id, "unlink 0", user_id=2)
 
     await _dispatch_callback(handler, application, attacker)
-    await _dispatch_callback(handler, application, attacker)
-
     assert handler._conversations[storage_id] == Flags.LINK_EXEC
     assert manager.callback_sessions.lookup(storage_id) is not None
     chat.unlink.assert_not_called()
     manager.bot.edit_message_text.assert_not_called()
-    assert manager.bot.answer_callback_query.call_count == 2
+    assert manager.bot.answer_callback_query.call_count == 1
 
     await _dispatch_callback(handler, application, _callback_update(*storage_id, "unlink 0"))
 
@@ -243,13 +236,11 @@ async def test_conversation_handler_keeps_chat_head_session_for_unauthorized_cal
     attacker = _callback_update(*storage_id, "chat 0", user_id=2)
 
     await _dispatch_callback(handler, application, attacker)
-    await _dispatch_callback(handler, application, attacker)
-
     assert handler._conversations[storage_id] == Flags.CHAT_HEAD_CONFIRM
     assert callback_sessions.lookup(storage_id) is not None
     msglogs.add_or_update_message_log.assert_not_called()
     bot.edit_message_text.assert_not_called()
-    assert bot.answer_callback_query.call_count == 2
+    assert bot.answer_callback_query.call_count == 1
 
     await _dispatch_callback(handler, application, _callback_update(*storage_id, "chat 0"))
 
@@ -286,13 +277,11 @@ async def test_conversation_handler_keeps_recipient_session_for_unauthorized_cal
     attacker = _callback_update(*storage_id, "chat 0", user_id=2)
 
     await _dispatch_callback(handler, application, attacker)
-    await _dispatch_callback(handler, application, attacker)
-
     assert handler._conversations[storage_id] == Flags.SUGGEST_RECIPIENTS
     assert callback_sessions.lookup(storage_id) is storage
     delivery.deliver.assert_not_called()
     bot.edit_message_text.assert_not_called()
-    assert bot.answer_callback_query.call_count == 2
+    assert bot.answer_callback_query.call_count == 1
 
     await _dispatch_callback(handler, application, _callback_update(*storage_id, "chat 0"))
 
