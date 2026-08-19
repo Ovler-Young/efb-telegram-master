@@ -7,24 +7,23 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from socket import socket
 from typing import Coroutine, Optional, ParamSpec, TypedDict, TypeVar, cast
 
 import telegram
-import telegram.error
 from telegram import Update
 from telegram.ext import Application, CallbackContext
 from telegram.request import HTTPXRequest
 from typing_extensions import NotRequired
 
 from .request_configuration import RequestConfiguration, parse_request_configuration
+from .telegram_application_lifecycle import LifecycleCallback, TelegramApplicationLifecycle
 from .telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
 
 P = ParamSpec("P")
 T = TypeVar("T")
-LifecycleCallback = Callable[["TelegramPollingRuntime"], Awaitable[None]]
 LocaleUpdateCallback = Callable[[Update, CallbackContext], None]
 
 
@@ -154,7 +153,6 @@ class TelegramPollingRuntime:
         webhook: Mapping[str, object] | None = None,
     ) -> None:
         self.logger, self._on_started, self._on_stopped = logger, on_started, on_stopped
-        self._stop_event: Optional[asyncio.Event] = None
         self._shutdown_complete = threading.Event()
         self._stop_lock = threading.Lock()
         self._stop_requested = False
@@ -166,12 +164,21 @@ class TelegramPollingRuntime:
         self._application = application
         self.me: telegram.User | None = None
         self._webhook = webhook
+        self._application_lifecycle = TelegramApplicationLifecycle(self, logger, async_runtime, on_started, on_stopped)
 
     @property
     def application(self) -> Application:
         if self._application is None:
             raise RuntimeError("Telegram application has not been built.")
         return self._application
+
+    @property
+    def _stop_event(self) -> Optional[asyncio.Event]:
+        return self._application_lifecycle.stop_event
+
+    @_stop_event.setter
+    def _stop_event(self, value: Optional[asyncio.Event]) -> None:
+        self._application_lifecycle.stop_event = value
 
     def as_async_callback(self, callback: Callable[P, T]) -> Callable[P, Coroutine[object, object, T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -197,96 +204,9 @@ class TelegramPollingRuntime:
             pass
         return max(1, int(round(8 * multiplier)))
 
-    async def _post_init(self, _application: Application) -> None:
-        self.async_runtime.bind_loop(asyncio.get_running_loop())
-        self._shutdown_complete.clear()
-        self.me = await self.async_bot.get_me()
-        assert self.me, "Invalid bot credential provided."
-        try:
-            await self._on_started(self)
-        except Exception as error:
-            self.logger.exception(
-                "Telegram runtime start callback failed",
-                extra={"event": "telegram_runtime.start_callback_failed", "error_type": type(error).__name__},
-            )
-            raise
-        self.logger.info("Telegram polling runtime started", extra={"event": "telegram_runtime.start"})
-
-    async def _post_shutdown(self, _application: Application) -> None:
-        try:
-            await self._on_stopped(self)
-        except Exception as error:
-            self.logger.exception(
-                "Telegram runtime stop callback failed",
-                extra={"event": "telegram_runtime.stop_callback_failed", "error_type": type(error).__name__},
-            )
-            raise
-        finally:
-            self.async_runtime.clear_loop()
-            self._shutdown_complete.set()
-            self.logger.info("Telegram polling runtime stopped", extra={"event": "telegram_runtime.stop"})
-
-    async def _run_application_lifecycle(self, *, drop_pending_updates: bool, timeout: int) -> None:
-        stop_event = asyncio.Event()
-        try:
-            with self._stop_lock:
-                self._stop_event = stop_event
-                stop_requested = self._stop_requested
-            if stop_requested:
-                return
-            await self.application.initialize()
-            if self.application.post_init:
-                await self.application.post_init(self.application)
-            with self._stop_lock:
-                stop_requested = self._stop_requested
-            if stop_requested:
-                return
-            updater = self.application.updater
-            if updater is None:
-                raise RuntimeError("Application.run_polling requires an Updater.")
-            await updater.start_polling(
-                poll_interval=0.0,
-                timeout=timeout,
-                bootstrap_retries=0,
-                allowed_updates=None,
-                drop_pending_updates=drop_pending_updates,
-                error_callback=self._handle_polling_error,
-            )
-            await self.application.start()
-            await stop_event.wait()
-        finally:
-            self._stop_event = None
-            await self._shutdown_application()
-
-    def _handle_polling_error(self, error: telegram.error.TelegramError) -> None:
-        self.application.create_task(self.application.process_error(error=error, update=None))
-
-    async def _shutdown_application(self) -> None:
-        try:
-            updater = self.application.updater
-            if updater is not None and updater.running:
-                await updater.stop()
-        except Exception as error:
-            self.logger.exception("Telegram updater stop failed", extra={"event": "telegram_runtime.updater_stop_failed", "error_type": type(error).__name__})
-        try:
-            if self.application.running:
-                await self.application.stop()
-        except Exception as error:
-            self.logger.exception("Telegram application stop failed", extra={"event": "telegram_runtime.application_stop_failed", "error_type": type(error).__name__})
-        try:
-            if self.application.post_stop:
-                await self.application.post_stop(self.application)
-        except Exception as error:
-            self.logger.exception("Telegram post-stop hook failed", extra={"event": "telegram_runtime.post_stop_failed", "error_type": type(error).__name__})
-        try:
-            await self.application.shutdown()
-        except Exception as error:
-            self.logger.exception("Telegram application shutdown failed", extra={"event": "telegram_runtime.shutdown_failed", "error_type": type(error).__name__})
-        try:
-            if self.application.post_shutdown:
-                await self.application.post_shutdown(self.application)
-        except Exception as error:
-            self.logger.exception("Telegram post-shutdown hook failed", extra={"event": "telegram_runtime.post_shutdown_failed", "error_type": type(error).__name__})
+    def _stop_requested_for_lifecycle(self) -> bool:
+        with self._stop_lock:
+            return self._stop_requested
 
     def poll(self, drop_pending_updates: bool = False, timeout: int = 10) -> None:
         start_webhook: _WebhookStartArguments | None = None
@@ -324,7 +244,13 @@ class TelegramPollingRuntime:
                 self.logger.info("Telegram webhook runtime stopped", extra={"event": "telegram_runtime.webhook_stop"})
             return
         try:
-            asyncio.run(self._run_application_lifecycle(drop_pending_updates=drop_pending_updates, timeout=timeout))
+            asyncio.run(
+                self._application_lifecycle.run(
+                    drop_pending_updates=drop_pending_updates,
+                    timeout=timeout,
+                    stop_requested=self._stop_requested_for_lifecycle,
+                )
+            )
         except BaseException as error:
             self.logger.exception(
                 "Telegram polling lifecycle failed",
@@ -332,7 +258,6 @@ class TelegramPollingRuntime:
             )
             raise
         finally:
-            self._stop_event = None
             self._shutdown_complete.set()
             with self._stop_lock:
                 self._lifecycle_active = False
@@ -401,12 +326,6 @@ def build_telegram_polling_runtime(
         webhook,
     )
 
-    async def post_init(application: Application) -> None:
-        await runtime._post_init(application)
-
-    async def post_shutdown(application: Application) -> None:
-        await runtime._post_shutdown(application)
-
-    application = Application.builder().bot(async_bot).job_queue(None).post_init(post_init).post_shutdown(post_shutdown).build()
+    application = Application.builder().bot(async_bot).job_queue(None).post_init(runtime._application_lifecycle.post_init).post_shutdown(runtime._application_lifecycle.post_shutdown).build()
     runtime._application = application
     return runtime

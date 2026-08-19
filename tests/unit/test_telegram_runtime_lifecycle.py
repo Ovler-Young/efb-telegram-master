@@ -37,8 +37,8 @@ async def test_post_lifecycle_callbacks_bind_and_clear_the_runtime_loop() -> Non
     on_stopped = AsyncMock()
     runtime = TelegramPollingRuntime(Mock(), application, async_bot, async_runtime, on_started, on_stopped)
 
-    await runtime._post_init(application)
-    await runtime._post_shutdown(application)
+    await runtime._application_lifecycle.post_init(application)
+    await runtime._application_lifecycle.post_shutdown(application)
 
     async_runtime.bind_loop.assert_called_once_with(asyncio.get_running_loop())
     on_started.assert_awaited_once_with(runtime)
@@ -85,7 +85,7 @@ async def test_polling_lifecycle_starts_polling_then_stops_every_ptb_component()
     )
     runtime = _runtime(application=application)
 
-    await runtime._run_application_lifecycle(drop_pending_updates=False, timeout=1)
+    await runtime._application_lifecycle.run(drop_pending_updates=False, timeout=1, stop_requested=lambda: False)
 
     assert observed == ["initialize", "post_init", "start_polling", "start", "updater_stop", "stop", "post_stop", "shutdown", "post_shutdown"]
     assert runtime._stop_event is None
@@ -95,10 +95,10 @@ def test_poll_forwards_custom_timeout_to_manual_lifecycle(monkeypatch: pytest.Mo
     runtime = _runtime(application=Mock())
     observed: dict[str, object] = {}
 
-    async def lifecycle(*, drop_pending_updates: bool, timeout: int) -> None:
+    async def lifecycle(*, drop_pending_updates: bool, timeout: int, stop_requested: object) -> None:
         observed.update(drop_pending_updates=drop_pending_updates, timeout=timeout)
 
-    monkeypatch.setattr(runtime, "_run_application_lifecycle", lifecycle)
+    monkeypatch.setattr(runtime._application_lifecycle, "run", lifecycle)
 
     runtime.poll(drop_pending_updates=True, timeout=1)
 
