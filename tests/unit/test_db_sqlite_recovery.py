@@ -3,9 +3,8 @@ from types import SimpleNamespace
 
 from peewee import SqliteDatabase
 
-from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery, TopicAssoc, database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery, TopicAssoc
 from efb_telegram_master.persistence.sqlite_postgresql_import import SQLitePostgresqlImportCoordinator
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source
 
@@ -111,12 +110,10 @@ def test_sqlite_import_snapshot_injects_missing_delivery_lease_clock(tmp_path):
 
 
 def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    manager = DatabaseManager(SimpleNamespace(channel_id="tests.sqlite", config={}))
+    monkeypatch.setattr("efb_telegram_master.persistence.database_initializer.utils.get_data_path", lambda _channel_id: tmp_path)
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.sqlite", config=SimpleNamespace(database={})))
     try:
-        assert isinstance(database.obj, SqliteDatabase)
-        assert database.obj.pragma("journal_mode").lower() == "wal"
+        assert isinstance(manager.current_database, SqliteDatabase)
+        assert manager.current_database.pragma("journal_mode").lower() == "wal"
     finally:
         manager.stop_worker()
-        database.initialize(original_database)

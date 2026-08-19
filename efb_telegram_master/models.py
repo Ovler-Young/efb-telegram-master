@@ -5,12 +5,11 @@ from typing import Collection, Dict, Tuple
 
 from ehforwarderbot.message import MessageAttribute, MessageCommands
 from ehforwarderbot.types import ReactionName
-from peewee import SQL, AutoField, BlobField, BooleanField, CharField, DatabaseProxy, DateTimeField, IntegerField, Model, TextField
+from peewee import SQL, AutoField, BlobField, BooleanField, CharField, DateTimeField, IntegerField, Model, TextField
 from typing_extensions import TypedDict
 
 from .utils import EFBChannelChatIDStr, TgChatMsgIDStr
 
-database = DatabaseProxy()
 UTC_LEASE_CLOCK = "utc"
 
 
@@ -45,7 +44,7 @@ Dict entries for ``pickle`` field of ``msglog`` log.
 
 class BaseModel(Model):
     class Meta:
-        database = database
+        database = None
 
 
 class TopicAssoc(BaseModel):
@@ -221,11 +220,6 @@ DATABASE_MODELS = (
     MsgLogIngestionScan,
     SlaveMessageDelivery,
 )
-
-
-def bind_models_to_proxy() -> None:
-    for model in DATABASE_MODELS:
-        model._meta.set_database(database)
 
 
 SlaveChatInfo.add_index(

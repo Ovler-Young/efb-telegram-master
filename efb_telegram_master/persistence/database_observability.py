@@ -23,7 +23,7 @@ class ObservedRepository:
 
     @property
     def database(self):
-        return getattr(self._database, "obj", self._database)
+        return self._database
 
     @contextmanager
     def _bound_models(self):
@@ -36,13 +36,8 @@ class ObservedRepository:
         if current_database is None:
             raise RuntimeError("Repository database has not been initialized")
         with self._model_binding_lock:
-            previous_databases = tuple(model._meta.database for model in DATABASE_MODELS)
-            try:
-                with current_database.bind_ctx(DATABASE_MODELS):
-                    yield
-            finally:
-                for model, previous_database in zip(DATABASE_MODELS, previous_databases):
-                    model._meta.set_database(previous_database)
+            with current_database.bind_ctx(DATABASE_MODELS):
+                yield
 
 
 def observe_database_method(method: str):
