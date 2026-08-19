@@ -1,114 +1,13 @@
-import asyncio
-from abc import ABC, abstractmethod
 from typing import Optional
 from uuid import uuid4
 
 from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot import MsgType
-from ehforwarderbot.message import LocationAttribute
-from pytest import approx
 from telethon import TelegramClient
 from telethon.tl.custom import Message
-from telethon.tl.types import InputGeoPoint, InputMediaContact, InputMediaDice, InputMediaGeoPoint, InputMediaVenue, MessageMediaDice, MessageMediaVenue
 
-TELEGRAM_OPERATION_TIMEOUT = 90
-
-# region Message factory classes
-
-
-class MessageFactory(ABC):
-    """Interface of factory to generate messages."""
-
-    test_quote = True
-
-    @abstractmethod
-    async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        """Build an initial message to send with."""
-
-    @abstractmethod
-    def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
-        """Compare if the Telegram message matches with what is processed by ETM.
-
-        This method should raises ``AssertionError`` if a mismatch is found.
-        Otherwise this shall return nothing (i.e. ``None``).
-        """
-
-    async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        """Issue an edit of the message if applicable.
-
-        Returns the edited message, or none if no edit is needed."""
-        return None
-
-    async def edit_message_media(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        """Issue a media edit of the message if applicable.
-
-        Returns the edited message, or none if no edit is needed."""
-        return None
-
-    async def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
-        """Finalize the message before discarding if needed."""
-        pass
-
-    def __str__(self):
-        return self.__class__.__name__
-
-
-async def run_telegram_operation(factory: MessageFactory, phase: str, operation):
-    try:
-        return await asyncio.wait_for(operation, timeout=TELEGRAM_OPERATION_TIMEOUT)
-    except asyncio.TimeoutError as exc:
-        raise TimeoutError(f"{factory} timed out during {phase} after {TELEGRAM_OPERATION_TIMEOUT} seconds") from exc
-
-
-class TextMessageFactory(MessageFactory):
-    async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(chat_id, f"守ったものは、明るい未来幻想を見せながら消えてゆくヒカリ。\nnew message {uuid4()}, target: {target and target.id}", reply_to=target)
-
-    def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
-        assert efb_msg.type == MsgType.Text
-        assert tg_msg.text == efb_msg.text
-
-    async def edit_message(self, client: TelegramClient, message: Message) -> Optional[Message]:
-        return await message.edit(
-            text=f"信じたものは、都合のいい妄想を繰り返し映し出す鏡。\nedited message {uuid4()}",
-        )
-
-
-class LocationMessageFactory(MessageFactory):
-    async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(chat_id, file=InputMediaGeoPoint(InputGeoPoint(0.0, 0.0)), reply_to=target)
-
-    def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
-        assert efb_msg.type == MsgType.Location
-        assert isinstance(efb_msg.attributes, LocationAttribute)
-        assert tg_msg.geo.lat == approx(efb_msg.attributes.latitude, abs=1e-3)
-        assert tg_msg.geo.long == approx(efb_msg.attributes.longitude, abs=1e-3)
-
-
-class VenueMessageFactory(MessageFactory):
-    async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(chat_id, file=InputMediaVenue(InputGeoPoint(0.0, 0.0), "Location name", f"Address {uuid4()}", "", "", ""), reply_to=target)
-
-    def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
-        assert efb_msg.type == MsgType.Location
-        assert isinstance(efb_msg.attributes, LocationAttribute)
-        assert tg_msg.geo.lat == approx(efb_msg.attributes.latitude, abs=1e-3)
-        assert tg_msg.geo.long == approx(efb_msg.attributes.longitude, abs=1e-3)
-        assert isinstance(tg_msg.media, MessageMediaVenue)
-        assert tg_msg.media.title in efb_msg.text
-        assert tg_msg.media.address in efb_msg.text
-
-
-class ContactMessageFactory(MessageFactory):
-    async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(chat_id, file=InputMediaContact("+424 3 14159", "Bot", "Support", ""), reply_to=target)
-
-    def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
-        assert efb_msg.type == MsgType.Text
-        assert tg_msg.contact
-        assert tg_msg.contact.phone_number in efb_msg.text
-        assert tg_msg.contact.first_name in efb_msg.text
-        assert tg_msg.contact.last_name in efb_msg.text
+from .master_message_factory_base import MessageFactory
+from .master_message_text_factories import ContactMessageFactory, DiceMessageFactory, LocationMessageFactory, TextMessageFactory
 
 
 class StickerMessageFactory(MessageFactory):
@@ -281,24 +180,6 @@ class AnimationMessageFactory(MessageFactory):
     async def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
             efb_msg.file.close()
-
-
-class DiceMessageFactory(MessageFactory):
-    def __init__(self, emoji: str):
-        self.emoji = emoji
-
-    async def send_message(self, client: TelegramClient, chat_id: int, target: Message = None) -> Message:
-        return await client.send_message(chat_id, f"Dice caption {uuid4()}", file=InputMediaDice(self.emoji), reply_to=target)
-
-    def compare_message(self, tg_msg: Message, efb_msg: EFBMessage) -> None:
-        assert efb_msg.type == MsgType.Text
-        media = tg_msg.media
-        assert isinstance(media, MessageMediaDice)
-        assert str(media.emoticon) in efb_msg.text
-        assert str(media.value) in efb_msg.text
-
-    def __str__(self):
-        return f"DiceMessageFactory({self.emoji})"
 
 
 def all_message_factories():

@@ -1,7 +1,8 @@
 from ehforwarderbot.chat import SelfChatMember
 from pytest import mark
 
-from .master_message_factories import MessageFactory, all_message_factories, run_telegram_operation
+from .master_message_factory_base import MessageFactory, run_telegram_operation
+from .master_message_media_factories import all_message_factories
 from .utils import link_chats
 
 pytestmark = mark.asyncio
