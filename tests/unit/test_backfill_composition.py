@@ -84,7 +84,7 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
             return f"translated:{message}"
 
     locale_update = Update(update_id=2, message=Mock(chat=Mock(id=100), from_user=Mock(id=1, language_code="fr")))
-    with patch("efb_telegram_master.channel_commands.translation", return_value=PrefixTranslations()):
+    with patch("efb_telegram_master.channel_locale.translation", return_value=PrefixTranslations()):
         channel.locale_state.update(locale_update, channel.logger)
 
     assert channel.locale == "fr"

@@ -4,7 +4,8 @@ from unittest.mock import Mock
 import pytest
 from telegram import Update
 
-from efb_telegram_master.channel_commands import LocaleState, TelegramCommandService
+from efb_telegram_master.channel_commands import TelegramCommandService
+from efb_telegram_master.channel_locale import LocaleState
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
 
 

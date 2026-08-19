@@ -1,12 +1,10 @@
-"""Telegram command, information, locale, and configuration handling."""
+"""Telegram command, information, and configuration handling."""
 
 from __future__ import annotations
 
 import logging
-import os
 import shlex
 from collections.abc import Callable, Mapping
-from gettext import NullTranslations, translation
 from typing import List, Optional
 
 import ehforwarderbot
@@ -15,19 +13,19 @@ from ehforwarderbot import Channel, coordinator
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBMessageReactionNotPossible, EFBOperationNotSupported
 from ehforwarderbot.status import ReactToMessage
 from ehforwarderbot.types import ChatID, InstanceID, ModuleID, ReactionName
-from language_tags import tags
 from ruamel.yaml import YAML
 from telegram import Message, Update
 from telegram.constants import ChatType
 from telegram.ext import CallbackContext
 
 from . import utils as etm_utils
+from .channel_locale import LocaleState
 from .chat_object_cache import ChatObjectCacheManager
 from .link_completion import LinkCompletionService
 from .msglog_scan import MsgLogScanScheduler
 from .mtproto import MTProtoConfig
 from .outbound import DEFAULT_MAX_PENDING
-from .paths import LOCALE_DIR, get_config_path
+from .paths import get_config_path
 from .persistence.chat_association_repository import ChatAssociationRepository
 from .persistence.msglog_repository import MsgLogRepository
 from .ptb_compat import SupportsSendMessage, get_forwarded_chat, sync_reply_html, sync_reply_text
@@ -255,34 +253,6 @@ class TelegramCommandService:
             if channel.suggested_reactions:
                 prompt += "\n" + self._("You may want to try: {}").format(", ".join(channel.suggested_reactions[:10]))
             sync_reply_text(self.api, message, prompt)
-
-
-class LocaleState:
-    """Late-bound translations shared by the channel and its collaborators."""
-
-    def __init__(self) -> None:
-        self.locale: str | None = None
-        self.translator: NullTranslations = translation("efb_telegram_master", os.fspath(LOCALE_DIR), fallback=True)
-
-    def gettext(self, message: str) -> str:
-        return self.translator.gettext(message)
-
-    def ngettext(self, singular: str, plural: str, count: int) -> str:
-        return self.translator.ngettext(singular, plural, count)
-
-    def update(self, update: Update, logger: logging.Logger) -> None:
-        if not update.effective_user or not update.effective_user.language_code:
-            return
-        language_code = update.effective_user.language_code
-        if language_code == self.locale:
-            return
-        tag = tags.tag(language_code)
-        locale = tag.language.format if tag.language else language_code.replace("-", "_")
-        if tag.language and tag.region:
-            locale += "_" + tag.region.format
-        logger.info("Telegram locale updated", extra={"event": "telegram_channel.locale_updated", "locale": locale})
-        self.locale = language_code
-        self.translator = translation("efb_telegram_master", os.fspath(LOCALE_DIR), languages=[locale, "C"], fallback=True)
 
 
 def load_channel_config(channel_id: ModuleID, translate: Callable[[str], str]) -> tuple[dict, MTProtoConfig]:

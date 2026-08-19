@@ -24,8 +24,9 @@ from telegram.ext import CallbackContext
 from . import utils as etm_utils
 from .__version__ import __version__
 from .bot_manager import TelegramBotManager, TelegramResourceShutdownError
-from .channel_commands import LocaleState, load_channel_config
+from .channel_commands import load_channel_config
 from .channel_composition import initialize_channel_components
+from .channel_locale import LocaleState
 from .db import DatabaseManager
 from .message import ETMMsg
 from .rpc_utils import RPCUtilities
