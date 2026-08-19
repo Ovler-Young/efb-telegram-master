@@ -68,8 +68,14 @@ class DatabaseManager:
             from playhouse.postgres_ext import PooledPostgresqlExtDatabase
 
             return PooledPostgresqlExtDatabase(
-                db_config.get("database", "efb_telegram"), host=db_config.get("host", "localhost"), port=db_config.get("port", 5432), user=db_config.get("user", "postgres"),
-                password=db_config.get("password", ""), max_connections=db_config.get("max_connections", 8), stale_timeout=db_config.get("stale_timeout", 300), options=db_config.get("options", "-c timezone=UTC"),
+                db_config.get("database", "efb_telegram"),
+                host=db_config.get("host", "localhost"),
+                port=db_config.get("port", 5432),
+                user=db_config.get("user", "postgres"),
+                password=db_config.get("password", ""),
+                max_connections=db_config.get("max_connections", 8),
+                stale_timeout=db_config.get("stale_timeout", 300),
+                options=db_config.get("options", "-c timezone=UTC"),
             )
         return SqliteDatabase(str(base_path / "tgdata.db"), pragmas={"journal_mode": "wal", "foreign_keys": 1, "busy_timeout": 5000}, check_same_thread=False)
 

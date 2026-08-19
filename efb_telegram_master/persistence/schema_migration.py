@@ -48,7 +48,23 @@ class DatabaseSchemaMigrator:
             tables = set(self.database.get_tables())
             migrator = SqliteMigrator(self.database) if isinstance(self.database, SqliteDatabase) else PostgresqlMigrator(self.database)
             steps: list[Operation] = []
-            self._append_columns(steps, migrator, tables, "msglog", (("file_id", MsgLog.file_id), ("media_type", MsgLog.media_type), ("mime", MsgLog.mime), ("master_msg_id_alt", MsgLog.master_msg_id_alt), ("pickle", MsgLog.pickle), ("file_unique_id", MsgLog.file_unique_id), ("sender_bot_id", MsgLog.sender_bot_id), ("provenance", MsgLog.provenance), ("time", MsgLog.time)))
+            self._append_columns(
+                steps,
+                migrator,
+                tables,
+                "msglog",
+                (
+                    ("file_id", MsgLog.file_id),
+                    ("media_type", MsgLog.media_type),
+                    ("mime", MsgLog.mime),
+                    ("master_msg_id_alt", MsgLog.master_msg_id_alt),
+                    ("pickle", MsgLog.pickle),
+                    ("file_unique_id", MsgLog.file_unique_id),
+                    ("sender_bot_id", MsgLog.sender_bot_id),
+                    ("provenance", MsgLog.provenance),
+                    ("time", MsgLog.time),
+                ),
+            )
             scan_steps: list[Operation] = []
             self._append_columns(scan_steps, migrator, tables, "msglogingestionscan", (("rescan_requested", MsgLogIngestionScan.rescan_requested), ("lease_clock", TextField(null=True))))
             if scan_steps:
@@ -57,7 +73,18 @@ class DatabaseSchemaMigrator:
             if steps:
                 migrate(*steps)
             delivery_steps: list[Operation] = []
-            self._append_columns(delivery_steps, migrator, tables, "slavemessagedelivery", (("state", SlaveMessageDelivery.state), ("lease_expires_at", SlaveMessageDelivery.lease_expires_at), ("owner_token", SlaveMessageDelivery.owner_token), ("lease_clock", TextField(null=True))))
+            self._append_columns(
+                delivery_steps,
+                migrator,
+                tables,
+                "slavemessagedelivery",
+                (
+                    ("state", SlaveMessageDelivery.state),
+                    ("lease_expires_at", SlaveMessageDelivery.lease_expires_at),
+                    ("owner_token", SlaveMessageDelivery.owner_token),
+                    ("lease_clock", TextField(null=True)),
+                ),
+            )
             if delivery_steps:
                 migrate(*delivery_steps)
             self._create_historic_indexes(tables)
@@ -71,8 +98,12 @@ class DatabaseSchemaMigrator:
     def _create_historic_indexes(self, tables: set[str]) -> None:
         if "slavechatinfo" in tables:
             self._deduplicate_by_key(SlaveChatInfo, (SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id))
-            self.database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {self.SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX} ON slavechatinfo (slave_channel_id, slave_chat_uid) WHERE slave_chat_group_id IS NULL")
-            self.database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {self.SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX} ON slavechatinfo (slave_channel_id, slave_chat_uid, slave_chat_group_id) WHERE slave_chat_group_id IS NOT NULL")
+            self.database.execute_sql(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {self.SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX} ON slavechatinfo (slave_channel_id, slave_chat_uid) WHERE slave_chat_group_id IS NULL"
+            )
+            self.database.execute_sql(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {self.SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX} ON slavechatinfo (slave_channel_id, slave_chat_uid, slave_chat_group_id) WHERE slave_chat_group_id IS NOT NULL"
+            )
         if "msglog" in tables:
             self.database.execute_sql(f"CREATE INDEX IF NOT EXISTS {self.MSGLOG_REPLAY_SOURCE_INDEX} ON msglog (slave_origin_uid, time, master_msg_id)")
         if "chatassoc" in tables:
@@ -84,9 +115,15 @@ class DatabaseSchemaMigrator:
             self.database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {self.TOPIC_ASSOC_SLAVE_INDEX} ON topicassoc (slave_uid)")
             self.database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {self.TOPIC_ASSOC_TOPIC_THREAD_INDEX} ON topicassoc (topic_chat_id, message_thread_id)")
         if "historymigrationentry" in tables:
-            self._deduplicate_by_key(HistoryMigrationEntry, (HistoryMigrationEntry.slave_chat_id, HistoryMigrationEntry.target_chat_id, HistoryMigrationEntry.message_thread_id, HistoryMigrationEntry.position))
-            self.database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {self.HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX} ON historymigrationentry (slave_chat_id, target_chat_id, position) WHERE message_thread_id IS NULL")
-            self.database.execute_sql(f"CREATE UNIQUE INDEX IF NOT EXISTS {self.HISTORY_TARGET_POSITION_WITH_THREAD_INDEX} ON historymigrationentry (slave_chat_id, target_chat_id, message_thread_id, position) WHERE message_thread_id IS NOT NULL")
+            self._deduplicate_by_key(
+                HistoryMigrationEntry, (HistoryMigrationEntry.slave_chat_id, HistoryMigrationEntry.target_chat_id, HistoryMigrationEntry.message_thread_id, HistoryMigrationEntry.position)
+            )
+            self.database.execute_sql(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {self.HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX} ON historymigrationentry (slave_chat_id, target_chat_id, position) WHERE message_thread_id IS NULL"
+            )
+            self.database.execute_sql(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {self.HISTORY_TARGET_POSITION_WITH_THREAD_INDEX} ON historymigrationentry (slave_chat_id, target_chat_id, message_thread_id, position) WHERE message_thread_id IS NOT NULL"
+            )
 
     @staticmethod
     def _deduplicate_by_key(model: type[Model], fields: tuple[Any, ...]) -> None:

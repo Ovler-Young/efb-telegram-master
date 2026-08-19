@@ -54,7 +54,9 @@ class SQLitePostgresqlImportCoordinator:
             sqlite_path = base_path / "tgdata.db"
             migrated_path = sqlite_path.with_suffix(".db.migrated")
             if sqlite_path.exists() and migrated_path.exists() and not os.path.samefile(sqlite_path, migrated_path):
-                raise RuntimeError("SQLite-to-PostgreSQL migration finalization collision: both tgdata.db and tgdata.db.migrated exist with different contents; preserving both files. Resolve the conflict before restarting.")
+                raise RuntimeError(
+                    "SQLite-to-PostgreSQL migration finalization collision: both tgdata.db and tgdata.db.migrated exist with different contents; preserving both files. Resolve the conflict before restarting."
+                )
             target_initialized = ChatAssoc.table_exists()
             if sqlite_path.exists() or migrated_path.exists():
                 LegacyOutboundRetirement(self.database).reject_target_data()
@@ -108,7 +110,13 @@ class SQLitePostgresqlImportCoordinator:
                     column_names += ("lease_clock",)
                     rows = tuple((*row, None) for row in rows)
             projections.append(SQLiteSourceProjection(model, column_names, rows))
-            serialized_projections.append({"table": model._meta.table_name, "columns": column_names, "rows": sorted((tuple(cls._snapshot_value(value) for value in row) for row in rows), key=lambda row: json.dumps(row, ensure_ascii=True, separators=(",", ":"), sort_keys=True))})
+            serialized_projections.append(
+                {
+                    "table": model._meta.table_name,
+                    "columns": column_names,
+                    "rows": sorted((tuple(cls._snapshot_value(value) for value in row) for row in rows), key=lambda row: json.dumps(row, ensure_ascii=True, separators=(",", ":"), sort_keys=True)),
+                }
+            )
         serialized_snapshot = json.dumps(serialized_projections, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         return SQLiteImportSnapshot(tuple(projections), sha256(serialized_snapshot.encode()).hexdigest())
 
@@ -145,14 +153,20 @@ class SQLitePostgresqlImportCoordinator:
         for model in self.MODELS:
             primary_key = model._meta.primary_key
             if isinstance(primary_key, AutoField):
-                self.database.execute_sql(f"SELECT setval(pg_get_serial_sequence({self.database.param}, {self.database.param}), COALESCE(MAX(\"{primary_key.column_name}\"), 1), MAX(\"{primary_key.column_name}\") IS NOT NULL) FROM \"{model._meta.table_name}\"", (model._meta.table_name, primary_key.column_name))
+                self.database.execute_sql(
+                    f'SELECT setval(pg_get_serial_sequence({self.database.param}, {self.database.param}), COALESCE(MAX("{primary_key.column_name}"), 1), MAX("{primary_key.column_name}") IS NOT NULL) FROM "{model._meta.table_name}"',
+                    (model._meta.table_name, primary_key.column_name),
+                )
 
     def _record_provenance(self, snapshot: SQLiteImportSnapshot) -> None:
         self.database.execute_sql(f'CREATE TABLE IF NOT EXISTS "{self.SQLITE_IMPORT_PROVENANCE_TABLE}" (snapshot_identity TEXT PRIMARY KEY)')
         self.database.execute_sql(f'INSERT INTO "{self.SQLITE_IMPORT_PROVENANCE_TABLE}" (snapshot_identity) VALUES ({self.database.param})', (snapshot.identity,))
 
     def _has_provenance(self, snapshot: SQLiteImportSnapshot) -> bool:
-        return self.SQLITE_IMPORT_PROVENANCE_TABLE in self.database.get_tables() and self.database.execute_sql(f'SELECT 1 FROM "{self.SQLITE_IMPORT_PROVENANCE_TABLE}" WHERE snapshot_identity = {self.database.param}', (snapshot.identity,)).fetchone() is not None
+        return (
+            self.SQLITE_IMPORT_PROVENANCE_TABLE in self.database.get_tables()
+            and self.database.execute_sql(f'SELECT 1 FROM "{self.SQLITE_IMPORT_PROVENANCE_TABLE}" WHERE snapshot_identity = {self.database.param}', (snapshot.identity,)).fetchone() is not None
+        )
 
     @staticmethod
     def _create_archive(source_database: Any, archive_path: Path) -> None:
@@ -179,7 +193,9 @@ class SQLitePostgresqlImportCoordinator:
                 cls._create_archive(source_database, archive_path)
                 os.link(archive_path, migrated_path)
             except FileExistsError as error:
-                raise RuntimeError("SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; preserving both files. Resolve the conflict before restarting.") from error
+                raise RuntimeError(
+                    "SQLite-to-PostgreSQL migration finalization collision: tgdata.db.migrated already exists; preserving both files. Resolve the conflict before restarting."
+                ) from error
             except (OSError, RuntimeError, sqlite3.Error) as error:
                 raise RuntimeError(f"SQLite-to-PostgreSQL migration finalization failed; source remains at {sqlite_path}") from error
         finally:
@@ -191,9 +207,13 @@ class SQLitePostgresqlImportCoordinator:
         with self._source_fence(sqlite_path) as (snapshot, source_database):
             with self.database.bind_ctx(self.MODELS):
                 if not self._has_provenance(snapshot):
-                    raise RuntimeError("SQLite-to-PostgreSQL migration restart conflict: target import provenance does not match tgdata.db; preserving the source. Resolve the target/source conflict before restarting.")
+                    raise RuntimeError(
+                        "SQLite-to-PostgreSQL migration restart conflict: target import provenance does not match tgdata.db; preserving the source. Resolve the target/source conflict before restarting."
+                    )
                 if not self._target_matches_snapshot(snapshot):
-                    raise RuntimeError("SQLite-to-PostgreSQL migration restart conflict: target data does not exactly match tgdata.db; preserving the source. Resolve the target/source conflict before restarting.")
+                    raise RuntimeError(
+                        "SQLite-to-PostgreSQL migration restart conflict: target data does not exactly match tgdata.db; preserving the source. Resolve the target/source conflict before restarting."
+                    )
                 self._finalize_source(source_database, sqlite_path)
         self.logger.info("SQLite-to-PostgreSQL migration source finalization completed; source renamed to %s", sqlite_path.with_suffix(".db.migrated"))
 

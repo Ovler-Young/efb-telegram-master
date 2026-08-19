@@ -84,7 +84,9 @@ def test_pending_history_migrations_keep_the_failed_entry_and_remaining_boundary
     test_database = SqliteDatabase(":memory:")
     database.initialize(test_database)
     test_database.connect()
-    manager = HistoryReplayWorker(SimpleNamespace(send_message=Mock(side_effect=[None, RuntimeError("Telegram failed")]), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock())
+    manager = HistoryReplayWorker(
+        SimpleNamespace(send_message=Mock(side_effect=[None, RuntimeError("Telegram failed")]), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock()
+    )
     try:
         test_database.create_tables([HistoryMigrationEntry])
         HistoryMigrationEntry.insert_many(
