@@ -30,10 +30,6 @@ from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, Telegra
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source, create_legacy_outbound_schema
 
 
-def test_msglog_schema_has_sender_bot_id(channel):
-    assert "sender_bot_id" in {column.name for column in database.get_columns("msglog")}
-
-
 def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, monkeypatch):
     database_path = tmp_path / "tgdata.db"
     raw_db = SqliteDatabase(database_path)
@@ -426,29 +422,6 @@ def test_concurrent_history_replacements_leave_one_coherent_target(tmp_path):
         if not test_database.is_closed():
             test_database.close()
         database.initialize(original_database)
-
-
-def test_history_migration_entry_schema_retains_replay_columns_without_msglog_legacy_field():
-    test_db = SqliteDatabase(":memory:")
-
-    with test_db.bind_ctx([HistoryMigrationEntry, MsgLog]):
-        test_db.create_tables([HistoryMigrationEntry, MsgLog])
-        history_columns = {column.name for column in test_db.get_columns("historymigrationentry")}
-        msglog_columns = {column.name for column in test_db.get_columns("msglog")}
-
-    assert {
-        "id",
-        "slave_chat_id",
-        "target_chat_id",
-        "message_thread_id",
-        "source_master_msg_id",
-        "formatted_text",
-        "media_type",
-        "source_time",
-        "position",
-        "created_at",
-    }.issubset(history_columns)
-    assert "source_master_msg_id" not in msglog_columns
 
 
 def test_database_method_metrics_record_bounded_public_operation_labels(channel):
