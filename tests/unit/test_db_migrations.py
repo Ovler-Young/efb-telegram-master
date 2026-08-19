@@ -17,6 +17,7 @@ from efb_telegram_master.chat_association_repository import ChatAssociationRepos
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
+from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.models import UTC_LEASE_CLOCK, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
@@ -584,7 +585,7 @@ def test_database_manager_stops_and_closes_postgresql_pool_when_retirement_fails
     pool.connect.return_value = True
     pool.is_closed.return_value = False
     monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: None))
-    monkeypatch.setattr(DatabaseManager, "_retire_legacy_outbound_tables", lambda _self: (_ for _ in ()).throw(RuntimeError("retirement failed")))
+    monkeypatch.setattr(LegacyOutboundRetirement, "retire_tables", lambda _self: (_ for _ in ()).throw(RuntimeError("retirement failed")))
     try:
         with pytest.raises(RuntimeError, match="retirement failed"):
             DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-failure", config={"database": {"type": "postgresql"}}))
@@ -622,7 +623,7 @@ def test_startup_preserves_non_empty_legacy_outbound_tables_and_retires_empty_on
     preserved_db = SqliteDatabase(database_path)
     preserved_db.connect()
     try:
-        assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(preserved_db.get_tables())
+        assert set(LegacyOutboundRetirement.TABLES).issubset(preserved_db.get_tables())
         assert preserved_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 1
         assert preserved_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
         preserved_db.execute_sql("DELETE FROM outboundtask")
@@ -634,12 +635,25 @@ def test_startup_preserves_non_empty_legacy_outbound_tables_and_retires_empty_on
     try:
         manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
         table_names = set(database.get_tables())
-        assert not set(DatabaseManager._LEGACY_OUTBOUND_TABLES) & table_names
+        assert not set(LegacyOutboundRetirement.TABLES) & table_names
         assert {"chatassoc", "msglog", "historymigrationentry", "msglogingestionscan"}.issubset(table_names)
     finally:
         if manager is not None:
             manager.stop_worker()
         database.initialize(original_database)
+
+
+def test_legacy_outbound_retirement_directly_retires_empty_schema(tmp_path):
+    raw_db = SqliteDatabase(tmp_path / "tgdata.db")
+    raw_db.connect()
+    try:
+        create_legacy_outbound_schema(raw_db)
+
+        LegacyOutboundRetirement(raw_db).retire_tables()
+
+        assert not set(LegacyOutboundRetirement.TABLES) & set(raw_db.get_tables())
+    finally:
+        raw_db.close()
 
 
 @pytest.mark.parametrize(
@@ -659,7 +673,7 @@ def test_startup_preserves_non_empty_legacy_outbound_tables_and_retires_empty_on
 )
 def test_legacy_auto_primary_key_default_categories(table_name, column_name, data_type, primary_key, default, expected):
     backend = SqliteDatabase(":memory:") if default is None else db_module.PostgresqlDatabase("tests")
-    assert DatabaseManager._legacy_default_category(backend, table_name, column_name, data_type, primary_key, default) == expected
+    assert LegacyOutboundRetirement._default_category(backend, table_name, column_name, data_type, primary_key, default) == expected
 
 
 def test_postgresql_legacy_outbound_index_fixture_excludes_only_the_primary_key_index(monkeypatch):
@@ -685,11 +699,11 @@ def test_postgresql_legacy_outbound_index_fixture_excludes_only_the_primary_key_
     )
     monkeypatch.setattr(backend, "get_indexes", lambda _table_name: introspected_indexes)
 
-    assert set(DatabaseManager._legacy_outbound_task_indexes(backend)) == set(DatabaseManager._LEGACY_OUTBOUND_TASK_INDEXES)
+    assert set(LegacyOutboundRetirement.task_indexes(backend)) == set(LegacyOutboundRetirement._TASK_INDEXES)
 
     monkeypatch.setattr(backend, "get_indexes", lambda _table_name: (*introspected_indexes, IndexMetadata("outboundtask_unexpected", "", ["state"], False, "outboundtask")))
 
-    assert set(DatabaseManager._legacy_outbound_task_indexes(backend)) != set(DatabaseManager._LEGACY_OUTBOUND_TASK_INDEXES)
+    assert set(LegacyOutboundRetirement.task_indexes(backend)) != set(LegacyOutboundRetirement._TASK_INDEXES)
 
 
 def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, monkeypatch):
@@ -709,7 +723,7 @@ def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, mo
             database = database
             table_name = "outboundworkflow"
 
-    monkeypatch.setattr(DatabaseManager, "_legacy_table_model", staticmethod(lambda _table_name, _database: LegacyOutboundTable))
+    monkeypatch.setattr(LegacyOutboundRetirement, "_table_model", staticmethod(lambda _table_name, _database: LegacyOutboundTable))
     monkeypatch.setattr(SqliteDatabase, "drop_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("drop failed")))
 
     try:
@@ -721,7 +735,7 @@ def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, mo
         database.initialize(original_database)
 
 
-@pytest.mark.parametrize("legacy_table", DatabaseManager._LEGACY_OUTBOUND_TABLES)
+@pytest.mark.parametrize("legacy_table", LegacyOutboundRetirement.TABLES)
 def test_startup_aborts_without_dropping_partial_historical_schema(tmp_path, monkeypatch, legacy_table):
     raw_db = SqliteDatabase(tmp_path / "tgdata.db")
     raw_db.connect()
@@ -808,7 +822,7 @@ def test_startup_refuses_legacy_tables_with_default_collisions(tmp_path, monkeyp
         collision_db = SqliteDatabase(tmp_path / "tgdata.db")
         collision_db.connect()
         try:
-            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(collision_db.get_tables())
+            assert set(LegacyOutboundRetirement.TABLES).issubset(collision_db.get_tables())
         finally:
             collision_db.close()
     finally:
@@ -841,7 +855,7 @@ def test_startup_refuses_altered_accepted_at_default_without_dropping_legacy_sch
         collision_db = SqliteDatabase(database_path)
         collision_db.connect()
         try:
-            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(collision_db.get_tables())
+            assert set(LegacyOutboundRetirement.TABLES).issubset(collision_db.get_tables())
             assert collision_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 0
             assert collision_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 1
             assert {index.name for index in collision_db.get_indexes("outboundtask")} == {
@@ -886,10 +900,10 @@ def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, 
         restored_db = SqliteDatabase(database_path)
         restored_db.connect()
         try:
-            assert set(DatabaseManager._LEGACY_OUTBOUND_TABLES).issubset(restored_db.get_tables())
+            assert set(LegacyOutboundRetirement.TABLES).issubset(restored_db.get_tables())
             assert restored_db.execute_sql("SELECT COUNT(*) FROM outboundworkflow").fetchone()[0] == 0
             assert restored_db.execute_sql("SELECT COUNT(*) FROM outboundtask").fetchone()[0] == 0
-            assert DatabaseManager._legacy_outbound_schema_error(restored_db, "outboundtask") is None
+            assert LegacyOutboundRetirement.schema_error(restored_db, "outboundtask") is None
         finally:
             restored_db.close()
     finally:
