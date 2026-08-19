@@ -8,6 +8,7 @@ from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
 from efb_telegram_master.models import database
+from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from tests.support.legacy_outbound_schema import create_legacy_outbound_schema
 
 
@@ -18,7 +19,7 @@ def test_database_manager_stops_and_closes_postgresql_pool_when_retirement_fails
     pooled_database.start()
     pool.connect.return_value = True
     pool.is_closed.return_value = False
-    monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: None))
+    monkeypatch.setattr(DatabaseSchemaMigrator, "create", lambda _self: None)
     monkeypatch.setattr(LegacyOutboundRetirement, "retire_tables", lambda _self: (_ for _ in ()).throw(RuntimeError("retirement failed")))
     try:
         with pytest.raises(RuntimeError, match="retirement failed"):
