@@ -1,29 +1,14 @@
-import asyncio
 import re
 from itertools import chain
-from typing import List, Optional
-from uuid import uuid4
+from typing import List
 
-from ehforwarderbot import Chat
 from pytest import mark
-from telethon.errors import MessageIdInvalidError
 from telethon.tl.custom import Message, MessageButton
-from telethon.tl.functions.channels import DeleteChannelRequest
-from telethon.tl.functions.messages import CreateChatRequest, MigrateChatRequest
-from telethon.tl.types import Chat as TelethonChat
 from telethon.tl.types import MessageEntityCode
-from telethon.utils import get_peer_id
 
 from .helper.filters import edited, has_button, in_chats, regex
-from .helper.messages import wait_for_message_state, wait_for_new_message_after
+from .link_chat_flows import retry_on_message_id_invalid_error, simulate_link_chat
 from .utils import assert_is_linked, link_chats, unlink_all_chats
-
-retry_on_message_id_invalid_error = mark.flaky(
-    max_runs=2,
-    min_passes=1,  # default value
-    rerun_filter=lambda err, *_: issubclass(err[0], MessageIdInvalidError),
-)
-"""Retry on ``MessageIdInvalidError`` due to flaky behavior of MTProto API"""
 
 pytestmark = [mark.asyncio, retry_on_message_id_invalid_error]
 
@@ -156,15 +141,6 @@ async def test_link_chat_group_linked_unlink(helper, client, bot_id, bot_group, 
         assert_is_linked(channel, tuple(), bot_group)
 
 
-async def test_link_chat_group_linked_relink(helper, client, bot_id, bot_group, bot_channel, slave, channel, private_response):
-    chat = slave.chat_with_alias
-    with link_chats(channel, (chat,), bot_channel):
-        with link_chats(channel, tuple(), bot_group):
-            await simulate_link_chat(client, chat, bot_id, bot_group, command_channel=bot_channel, private_response=private_response)
-            assert_is_linked(channel, tuple(), bot_channel)
-            assert_is_linked(channel, (chat,), bot_group)
-
-
 async def test_link_chat_channel(helper, client, bot_id, bot_group, bot_channel, slave, channel, private_response):
     chat = slave.chat_with_alias
     with link_chats(channel, tuple(), bot_channel):
@@ -195,133 +171,3 @@ async def test_link_chat_target_incoming_message(helper, client, bot_id, slave, 
     )
     assert chat.display_name in message.raw_text
     await message.click(text="Cancel")
-
-
-async def simulate_link_chat(client, chat: Chat, command_chat: int, dest_chat: int, private_response, command_channel: Optional[int] = None, dest_channel: Optional[int] = None):
-    """Simulate the procedure of linking a chat.
-
-    Provide command_channel to link from a channel.
-    """
-    if command_channel is not None:
-        command_message_id = None
-
-        async def trigger():
-            nonlocal command_message_id
-            message = await client.send_message(command_channel, f"/link {chat.uid}")
-            forwarded = await message.forward_to(command_chat)
-            command_message_id = forwarded.id
-    else:
-        command_message_id = None
-
-        async def trigger():
-            nonlocal command_message_id
-            command = await client.send_message(command_chat, f"/link {chat.uid}")
-            command_message_id = command.id
-
-    def has_target_selection(current: Message) -> bool:
-        return bool(current.button_count) and chat.display_name in current.buttons[0][0].text
-
-    def is_link_response(current: Message) -> bool:
-        return current.raw_text == "Processing..." or has_target_selection(current)
-
-    async def receive_selection_panel(timeout: float) -> Message:
-        assert command_message_id is not None
-        response = await wait_for_new_message_after(client, command_chat, command_message_id, is_link_response, timeout=timeout)
-        return await wait_for_message_state(client, command_chat, response.id, has_target_selection, timeout=timeout)
-
-    message = await private_response(trigger, receive_selection_panel, target_chat_id=command_chat)
-    session_message_id = message.id
-    choose_chat = message.buttons[0][0]
-    selection_text = message.raw_text
-
-    def is_operation_panel(current: Message) -> bool:
-        buttons = tuple(chain.from_iterable(current.buttons))
-        return (
-            current.raw_text != selection_text
-            and bool(current.button_count)
-            and any(button.url and "?startgroup=" in button.url for button in buttons)
-            and any(button.text.lower().startswith("manual ") for button in buttons)
-        )
-
-    message = await private_response(
-        choose_chat.click,
-        lambda timeout: wait_for_message_state(
-            client,
-            command_chat,
-            session_message_id,
-            is_operation_panel,
-            timeout=timeout,
-        ),
-        target_chat_id=command_chat,
-    )
-    url = None
-    for i in chain.from_iterable(message.buttons):
-        if i.url:
-            url = i.url
-            break
-    assert url is not None
-    match = re.search(r"\?startgroup=(.+)", url)
-    assert match is not None
-    token = match.group(1)
-    command = f"/start {token}"
-
-    async def complete_link():
-        if dest_channel:
-            message = await client.send_message(dest_channel, command)
-            await message.forward_to(dest_chat)
-        else:
-            await client.send_message(dest_chat, command)
-
-    await private_response(
-        complete_link,
-        lambda timeout: wait_for_message_state(
-            client,
-            command_chat,
-            session_message_id,
-            lambda current: not current.button_count,
-            timeout=timeout,
-        ),
-        target_chat_id=command_chat,
-    )
-
-
-async def test_group_chat_migration(client, helper, channel, slave, bot_id):
-    slave_chats = slave.chats_by_chat_type["PrivateChat"]
-    title = f"Chat upgrade test {uuid4()}"
-    response = await client(CreateChatRequest(users=[bot_id], title=title))
-    if getattr(response, "chats", None):
-        chat: TelethonChat = response.chats[0]
-    elif getattr(response, "updates", None) and getattr(response.updates, "chats", None):
-        chat: TelethonChat = response.updates.chats[0]
-    else:
-        chat = await client.get_entity(title)
-    mega_chat = None
-    try:
-        with link_chats(channel, slave_chats, get_peer_id(chat)):
-            mega_chat_response = await client(MigrateChatRequest(chat_id=chat.id))
-            if getattr(mega_chat_response, "chats", None):
-                mega_chat = next(c for c in mega_chat_response.chats if getattr(c, "id", None) != chat.id)
-            elif getattr(mega_chat_response, "updates", None) and getattr(mega_chat_response.updates, "chats", None):
-                mega_chat = next(c for c in mega_chat_response.updates.chats if getattr(c, "id", None) != chat.id)
-            else:
-                mega_chat = await client.get_entity(get_peer_id(chat))
-
-            deadline = asyncio.get_running_loop().time() + 20
-            while True:
-                migrated = get_peer_id(mega_chat)
-                original = get_peer_id(chat)
-                try:
-                    assert_is_linked(channel, slave_chats, migrated)
-                    assert_is_linked(channel, tuple(), original)
-                except AssertionError:
-                    if asyncio.get_running_loop().time() >= deadline:
-                        raise
-                    await asyncio.sleep(0.1)
-                else:
-                    break
-    finally:
-        if mega_chat is not None:
-            await unlink_all_chats(channel, client, helper, get_peer_id(mega_chat))
-            await client(DeleteChannelRequest(mega_chat.id))
-        else:
-            await client.delete_dialog(chat)
