@@ -32,6 +32,7 @@ def test_queue_serializes_same_chat_calls():
 
     queue = _queue(Sender())
     try:
+        assert queue.worker_snapshot() == (True, 0)
         first = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "first"}, 1))
         second = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "second"}, 1))
         assert started.wait(1)
