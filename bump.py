@@ -8,9 +8,9 @@ Custom version bumper partially implements PEP 440.
 import argparse
 import re
 import subprocess
+from typing import List, Optional
 
 from packaging import version
-from typing import Optional, List
 
 PACKAGE = "efb_telegram_master"
 

@@ -112,6 +112,7 @@ def test_queue_records_rate_limit_and_transport_retry_metrics_before_transport_e
     assert 'etm_outbound_outcomes_total{operation="send_message",outcome="failure"} 1.0' in rendered
     assert "987654" not in rendered
 
+
 def test_queue_collector_emits_oldest_age_for_a_live_pending_call() -> None:
     metrics = Metrics()
     queue = OutboundQueue(Mock(), None, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)

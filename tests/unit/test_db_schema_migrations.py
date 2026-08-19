@@ -31,6 +31,7 @@ def test_database_manager_repositories_remain_bound_to_their_own_database(tmp_pa
         first_manager.stop_worker()
         database.initialize(original_database)
 
+
 def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, monkeypatch):
     database_path = tmp_path / "tgdata.db"
     raw_db = SqliteDatabase(database_path)

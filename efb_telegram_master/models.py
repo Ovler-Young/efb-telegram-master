@@ -226,6 +226,8 @@ DATABASE_MODELS = (
 def bind_models_to_proxy() -> None:
     for model in DATABASE_MODELS:
         model._meta.set_database(database)
+
+
 SlaveChatInfo.add_index(
     SlaveChatInfo.index(
         SlaveChatInfo.slave_channel_id,

@@ -143,6 +143,7 @@ def test_stop_timeout_keeps_blocked_send_and_upload_owned_until_later_stop(tmp_p
     assert not any(thread.name.startswith("ETM-send") and thread.is_alive() for thread in threading.enumerate())
     assert not upload.exists()
 
+
 def test_queue_cleans_owned_upload_when_shutdown_cancels_pending_call(tmp_path) -> None:
     upload = tmp_path / "upload.bin"
     upload.write_bytes(b"upload")

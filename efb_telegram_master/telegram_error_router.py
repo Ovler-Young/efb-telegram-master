@@ -87,7 +87,9 @@ class TelegramErrorRouter:
             else:
                 self.logger.exception("Telegram message request failed (%s).", type(error).__name__, extra={"event": "telegram_channel.request_failed", "error_type": type(error).__name__})
                 self.api.send_message(
-                    self.admins[0], self._translate("Message request is invalid.\n{error}\n<code>{update}</code>").format(error=html.escape(str(error)), update=html.escape(str(update))), parse_mode="HTML"
+                    self.admins[0],
+                    self._translate("Message request is invalid.\n{error}\n<code>{update}</code>").format(error=html.escape(str(error)), update=html.escape(str(update))),
+                    parse_mode="HTML",
                 )
         except (telegram.error.TimedOut, telegram.error.NetworkError):
             self._handle_network_error(update, error)
@@ -106,7 +108,10 @@ class TelegramErrorRouter:
         )
         if isinstance(update, Update) and isinstance(update.message, Message):
             sync_reply_html(
-                self.api, update.message, self._translate("This message is not processed due to poor internet environment of the server.\n<code>{code}</code>").format(code=html.escape(str(error))), quote=True
+                self.api,
+                update.message,
+                self._translate("This message is not processed due to poor internet environment of the server.\n<code>{code}</code>").format(code=html.escape(str(error))),
+                quote=True,
             )
         interval = self.network_error_prompt_interval()
         if interval > 0 and self.timeout_count % interval == 0:

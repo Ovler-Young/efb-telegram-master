@@ -150,7 +150,12 @@ def test_requested_empty_backfill_sends_one_history_location_to_the_linked_topic
 
     history_calls = [call for call in channel.bot_manager.api.send_message.call_args_list if "previously linked" in call.kwargs.get("text", "")]
     assert len(history_calls) == 1
-    assert history_calls[0].kwargs == {"chat_id": bot_group, "text": "This chat was previously linked. History messages are not migrated. You can view previous messages here: https://t.me/c/1234567890/456", "disable_notification": True, "message_thread_id": topic_id}
+    assert history_calls[0].kwargs == {
+        "chat_id": bot_group,
+        "text": "This chat was previously linked. History messages are not migrated. You can view previous messages here: https://t.me/c/1234567890/456",
+        "disable_notification": True,
+        "message_thread_id": topic_id,
+    }
     _cleanup_link_state(channel, chat, bot_group)
 
 
