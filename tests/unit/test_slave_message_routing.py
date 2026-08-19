@@ -11,6 +11,7 @@ from efb_telegram_master import TelegramChannel
 from efb_telegram_master.slave_delivery_helpers import send_identity
 from efb_telegram_master.slave_delivery_types import DeliveryPlan
 from efb_telegram_master.slave_message import SlaveMessageService
+from efb_telegram_master.slave_message_claims import SlaveMessageClaimLifecycle
 from efb_telegram_master.slave_routing import SlaveMessageRouter
 
 
@@ -30,8 +31,9 @@ def _dedupe_processor() -> SlaveMessageService:
     processor.router = Mock(route=Mock(return_value=DeliveryPlan("template", 123, None)))
     processor.is_silent = Mock(return_value=False)
     processor.dispatch_message = Mock()
-    processor.delivery_claims = Mock()
-    processor.delivery_claims.claim.return_value = "claim-token"
+    delivery_claims = Mock()
+    delivery_claims.claim.return_value = "claim-token"
+    processor.claim_lifecycle = SlaveMessageClaimLifecycle(delivery_claims, processor.logger)
     return processor
 
 
@@ -97,7 +99,7 @@ def test_new_slave_message_claims_durable_dedupe_without_msglog_lookup() -> None
     message = _message()
 
     assert processor.send_message(message) is message
-    processor.delivery_claims.claim.assert_called_once_with("tests.slave chat", "message")
+    processor.claim_lifecycle.delivery_claims.claim.assert_called_once_with("tests.slave chat", "message")
     processor.msglogs.get_msg_log.assert_not_called()
     processor.dispatch_message.assert_called_once()
     assert processor.dispatch_message.call_args.args == (message, "template", None, 123, None, False)
@@ -108,14 +110,14 @@ def test_new_slave_message_claims_durable_dedupe_without_msglog_lookup() -> None
 
 def test_pending_duplicate_and_muted_message_do_not_dispatch() -> None:
     processor = _dedupe_processor()
-    processor.delivery_claims.claim.return_value = None
+    processor.claim_lifecycle.delivery_claims.claim.return_value = None
     assert processor.send_message(_message()) is not None
     processor.dispatch_message.assert_not_called()
 
     processor = _dedupe_processor()
     processor.is_silent.return_value = None
     assert processor.send_message(_message()) is not None
-    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.claim_lifecycle.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
     processor.dispatch_message.assert_not_called()
 
 
@@ -124,7 +126,7 @@ def test_destination_mapping_failure_releases_the_pending_dedupe_claim() -> None
     processor.router.route.side_effect = RuntimeError("database unavailable")
 
     assert processor.send_message(_message()) is not None
-    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.claim_lifecycle.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
     processor.dispatch_message.assert_not_called()
 
 
@@ -133,13 +135,13 @@ def test_terminal_delivery_failure_releases_the_dedupe_claim_without_completing_
     processor.dispatch_message.side_effect = ValueError("attachment failed")
 
     assert processor.send_message(_message()) is not None
-    processor.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
-    processor.delivery_claims.complete.assert_not_called()
+    processor.claim_lifecycle.delivery_claims.release.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.claim_lifecycle.delivery_claims.complete.assert_not_called()
 
 
 def test_active_delivery_renews_the_owned_claim() -> None:
     processor = _dedupe_processor()
-    processor.CLAIM_RENEW_INTERVAL = 0.01
+    processor.claim_lifecycle.RENEW_INTERVAL = 0.01
     started, release = threading.Event(), threading.Event()
 
     def dispatch(*_args, **_kwargs):
@@ -152,9 +154,9 @@ def test_active_delivery_renews_the_owned_claim() -> None:
     try:
         assert started.wait(1)
         deadline = time.monotonic() + 1
-        while not processor.delivery_claims.renew.called and time.monotonic() < deadline:
+        while not processor.claim_lifecycle.delivery_claims.renew.called and time.monotonic() < deadline:
             time.sleep(0.01)
-        processor.delivery_claims.renew.assert_called_with("tests.slave chat", "message", "claim-token")
+        processor.claim_lifecycle.delivery_claims.renew.assert_called_with("tests.slave chat", "message", "claim-token")
     finally:
         release.set()
         worker.join(1)
@@ -162,8 +164,8 @@ def test_active_delivery_renews_the_owned_claim() -> None:
 
 def test_renewal_exception_fences_post_send_side_effects() -> None:
     processor = _dedupe_processor()
-    processor.CLAIM_RENEW_INTERVAL = 0.01
-    processor.delivery_claims.renew.side_effect = RuntimeError("database unavailable")
+    processor.claim_lifecycle.RENEW_INTERVAL = 0.01
+    processor.claim_lifecycle.delivery_claims.renew.side_effect = RuntimeError("database unavailable")
     started, release = threading.Event(), threading.Event()
 
     def dispatch(*_args, **_kwargs):
@@ -192,7 +194,7 @@ def test_lost_renewal_fences_post_send_side_effects() -> None:
     processor.commands = SimpleNamespace(register_command=Mock())
     processor.chat_manager = Mock()
     processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock())
-    processor.delivery_claims = Mock()
+    processor.claim_lifecycle = SlaveMessageClaimLifecycle(Mock(), processor.logger)
     processor.router = Mock(resolve_reply=Mock(return_value=None))
     processor.text_delivery = Mock(text=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100, type=ChatType.PRIVATE), message_id=7)))
     ownership_lost = threading.Event()
@@ -202,7 +204,7 @@ def test_lost_renewal_fences_post_send_side_effects() -> None:
     with patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()):
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token", ownership_lost=ownership_lost)
 
-    processor.delivery_claims.complete.assert_not_called()
+    processor.claim_lifecycle.delivery_claims.complete.assert_not_called()
     processor.commands.register_command.assert_not_called()
     processor.msglogs.add_or_update_message_log.assert_not_called()
     processor.logger.warning.assert_called_once_with("[%s] Delivery claim ownership was lost before post-send processing.", "message")
@@ -214,7 +216,7 @@ def test_failed_completion_fences_command_registration_and_message_logging() -> 
     processor.commands = SimpleNamespace(register_command=Mock())
     processor.chat_manager = Mock()
     processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock())
-    processor.delivery_claims = Mock(complete=Mock(return_value=False))
+    processor.claim_lifecycle = SlaveMessageClaimLifecycle(Mock(complete=Mock(return_value=False)), processor.logger)
     processor.router = SimpleNamespace(resolve_reply=Mock(return_value=None), admins=[100])
     processor.text_delivery = Mock(text=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100, type=ChatType.PRIVATE), message_id=7)))
     message = SimpleNamespace(
@@ -230,7 +232,7 @@ def test_failed_completion_fences_command_registration_and_message_logging() -> 
     with patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()):
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token")
 
-    processor.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.claim_lifecycle.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message", "claim-token")
     processor.commands.register_command.assert_not_called()
     processor.msglogs.add_or_update_message_log.assert_not_called()
     processor.logger.warning.assert_called_once_with("[%s] Delivery claim ownership was lost before completion.", "message")
@@ -242,9 +244,8 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
     processor.commands = SimpleNamespace(register_command=Mock())
     processor.chat_manager = Mock()
     processor.msglogs = SimpleNamespace(add_or_update_message_log=Mock(side_effect=RuntimeError("database unavailable")))
-    processor.delivery_claims = Mock()
+    processor.claim_lifecycle = SlaveMessageClaimLifecycle(Mock(), processor.logger)
     processor.router = Mock(resolve_reply=Mock(return_value=None))
-    processor._release_pending_slave_message = Mock()
     processor.text_delivery = Mock(text=Mock(return_value=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=7)))
     message = SimpleNamespace(
         uid="message",
@@ -259,13 +260,12 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token")
 
     processor.msglogs.add_or_update_message_log.assert_called_once()
-    processor.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message", "claim-token")
+    processor.claim_lifecycle.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message", "claim-token")
     processor.logger.warning.assert_called_once_with(
         "DB write failed for Telegram message %s; dropping mapping (%s).",
         7,
         "RuntimeError",
     )
-    processor._release_pending_slave_message.assert_not_called()
 
 
 def test_command_session_uses_the_telegram_message_owner() -> None:
@@ -275,7 +275,6 @@ def test_command_session_uses_the_telegram_message_owner() -> None:
     processor.chat_manager = Mock()
     processor.msglogs = Mock()
     processor.router = SimpleNamespace(resolve_reply=Mock(return_value=None), admins=[100])
-    processor._release_pending_slave_message = Mock()
     telegram_message = SimpleNamespace(chat=SimpleNamespace(id=100, type=ChatType.PRIVATE), message_id=7)
     processor.text_delivery = Mock(text=Mock(return_value=telegram_message))
     command = MessageCommand("Run", "run")
@@ -307,7 +306,6 @@ def test_command_session_in_group_allows_configured_admins() -> None:
     processor.chat_manager = Mock()
     processor.msglogs = Mock()
     processor.router = SimpleNamespace(resolve_reply=Mock(return_value=None), admins=[100])
-    processor._release_pending_slave_message = Mock()
     telegram_message = SimpleNamespace(chat=SimpleNamespace(id=-100500, type=ChatType.SUPERGROUP), message_id=7)
     processor.text_delivery = Mock(text=Mock(return_value=telegram_message))
     command = MessageCommand("Run", "run")
