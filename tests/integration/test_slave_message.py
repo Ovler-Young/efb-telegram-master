@@ -31,7 +31,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityMentionName
 
 from tests.integration.helper.filters import edited, in_chats, reply_to
 from tests.integration.utils import link_chats
-from tests.mocks.slave import MockSlaveChannel
+from tests.mocks.slave.channel import MockSlaveChannel
 
 pytestmark = mark.asyncio
 

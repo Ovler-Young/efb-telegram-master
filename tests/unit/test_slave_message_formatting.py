@@ -7,7 +7,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_delivery_helpers import chat_info_keyboard, reactions_footer
-from tests.mocks.slave import MockSlaveChannel
+from tests.mocks.slave.channel import MockSlaveChannel
 
 
 def test_reaction_footer_omits_empty_reactions() -> None:

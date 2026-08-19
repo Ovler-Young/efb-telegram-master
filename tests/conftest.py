@@ -16,7 +16,7 @@ from efb_telegram_master import TelegramChannel
 from efb_telegram_master.paths import get_config_path
 
 from .bot import get_bot
-from .mocks.slave import MockSlaveChannel
+from .mocks.slave.channel import MockSlaveChannel
 
 pytestmark = [pytest.mark.xfail(raises=TimedOut), pytest.mark.xfail(raises=NetworkError)]
 
