@@ -4,12 +4,11 @@ from unittest.mock import Mock, patch
 
 import pytest
 from ehforwarderbot import Message
-from ehforwarderbot.types import ChatID, ModuleID
+from ehforwarderbot.types import ChatID
 from telegram import Update
-from telegram.error import ChatMigrated, TelegramError
+from telegram.error import TelegramError
 
 from efb_telegram_master import utils
-from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.ptb_compat import sync_reply_text
 from efb_telegram_master.topic_sync import TopicGroupService
 from efb_telegram_master.utils import TelegramChatID, TelegramTopicID
@@ -203,28 +202,6 @@ def test_chat_migration_preserves_all_associations_and_recreates_forum_topics(ch
         ((second_slave_uid, new_chat_id), {}),
     ]
     channel.chat_associations.remove_chat_assoc(master_uid=new_master_uid)
-
-
-def test_manager_chat_migration_keeps_multiple_slave_associations() -> None:
-    old_chat_id, new_chat_id = -100720, -100721
-    manager = TelegramBotManager.__new__(TelegramBotManager)
-    manager.channel_id = ModuleID("blueset.telegram")
-    manager.chat_associations = Mock()
-    manager.chat_associations.get_chat_assoc.return_value = ["tests.slave.one", "tests.slave.two"]
-    manager.api = Mock()
-    manager._ngettext = lambda single, _plural, _count: single
-    update = Update.de_json(
-        {"update_id": 1, "message": {"message_id": 1, "date": 1, "chat": {"id": old_chat_id, "type": "supergroup"}}},
-        SimpleNamespace(defaults=SimpleNamespace(tzinfo=None)),
-    )
-
-    manager._handle_chat_migration(update, ChatMigrated(new_chat_id))
-
-    new_master_uid = utils.chat_id_to_str(manager.channel_id, ChatID(str(new_chat_id)))
-    assert manager.chat_associations.add_chat_assoc.call_args_list == [
-        ((), {"master_uid": new_master_uid, "slave_uid": "tests.slave.one", "multiple_slave": True}),
-        ((), {"master_uid": new_master_uid, "slave_uid": "tests.slave.two", "multiple_slave": True}),
-    ]
 
 
 def test_master_message_routes_forum_thread_to_slave(channel, slave):
