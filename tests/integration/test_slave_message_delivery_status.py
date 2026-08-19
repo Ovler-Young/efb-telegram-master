@@ -6,7 +6,8 @@ from telethon.tl.types import SendMessageRecordAudioAction, SendMessageTypingAct
 from tests.integration.helper.filter_chats import in_chats
 from tests.integration.helper.filter_messages import reply_to
 from tests.integration.helper.filter_updates import typing
-from tests.integration.slave_message_factories import MessageFactory, all_message_factories
+from tests.integration.slave_message_factory_base import MessageFactory
+from tests.integration.slave_message_media_factories import all_message_factories
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio

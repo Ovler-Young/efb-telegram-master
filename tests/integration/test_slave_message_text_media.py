@@ -1,7 +1,8 @@
 from pytest import mark
 
 from tests.integration.helper.filter_chats import in_chats
-from tests.integration.slave_message_factories import MessageFactory, all_message_factories
+from tests.integration.slave_message_factory_base import MessageFactory
+from tests.integration.slave_message_media_factories import all_message_factories
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio
