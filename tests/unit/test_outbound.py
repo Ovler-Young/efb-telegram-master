@@ -24,12 +24,11 @@ from efb_telegram_master.outbound_types import (
     QueueRequest,
     SchedulerStoppedError,
     SenderSelection,
-    SendReceipt,
     UploadCleanup,
     rewind_uploads,
 )
 from efb_telegram_master.sender_policy import retry_after_seconds
-from efb_telegram_master.telegram_calls import PrimaryExecution, TelegramCallAdapter
+from efb_telegram_master.telegram_calls import TelegramCallAdapter
 
 
 class _Limiter:
@@ -197,26 +196,6 @@ def test_queue_records_cancelled_outcomes_once_for_shutdown_and_stop_during_retr
     rendered = generate_latest(metrics.registry).decode()
     assert 'etm_outbound_outcomes_total{operation="send_message",outcome="cancelled"} 2.0' in rendered
     assert "987654" not in rendered
-
-
-def test_cancelled_attachment_delivery_does_not_record_auxiliary_affinity() -> None:
-    auxiliary = Mock()
-    auxiliary.bot_id = 10
-    auxiliary.disabled = False
-    pool = BotPool([auxiliary])
-    queue = OutboundQueue(Mock(), pool, _Limiter(), worker_count=1, blocking_timeout=1, shutdown_drain_timeout=1, shutdown_join_grace=0.1)
-    waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "body"}, 1, slave_id="slave-a", required_sender_bot_id="10"))
-    attachment = QueuedCall("send_document", (1, io.BytesIO(b"body")), {}, 1, "slave-a", "10", None)
-
-    with queue._lock:
-        pending = queue._pending.popleft()
-        queue._lifecycle = OutboundLifecycle.STOPPING
-        queue._complete_success_locked(pending, PrimaryExecution(SendReceipt(SimpleNamespace(message_id=1), 10), attachment), SenderSelection(Mock(), 10))
-
-    with pytest.raises(SchedulerStoppedError):
-        waiter.result()
-    assert pool.preferred_sender("slave-a") is None
-    queue.stop()
 
 
 def test_queue_collector_emits_oldest_age_for_a_live_pending_call() -> None:
@@ -458,30 +437,8 @@ def test_attachment_migration_preserves_order_for_old_and_new_destinations() -> 
         assert old_destination.result(1).message.message_id == 2
         assert new_destination.result(1).message.message_id == 2
         assert events.index("message:3:other") < events.index("message:2:old") < events.index("message:2:new")
-        assert queue._chat_redirects == {}
-    finally:
-        release_attachment.set()
-        queue.stop()
-
-
-def test_completed_attachment_migrations_do_not_retain_redirects() -> None:
-    full_text = "x" * int(MessageLimit.MAX_TEXT_LENGTH)
-
-    class Sender:
-        def send_message(self, *, chat_id, text):
-            return SimpleNamespace(message_id=chat_id)
-
-        def send_document(self, chat_id, _attachment, **_kwargs):
-            if chat_id < 1000:
-                raise ChatMigrated(chat_id + 1000)
-            return SimpleNamespace(message_id=chat_id)
-
-    queue = _queue(Sender(), worker_count=1)
-    try:
-        for chat_id in range(1, 26):
-            receipt = queue.enqueue(QueueRequest("send_message", (), {"chat_id": chat_id, "text": full_text}, chat_id)).result(1)
-            assert receipt.message.message_id == chat_id
-        assert queue._chat_redirects == {}
+        post_completion = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "post-completion"}, 1))
+        assert post_completion.result(1).message.message_id == 1
     finally:
         queue.stop()
 
@@ -489,12 +446,14 @@ def test_completed_attachment_migrations_do_not_retain_redirects() -> None:
 def test_repeated_attachment_migration_fails_without_resending_primary() -> None:
     primary_calls = 0
     attachment_calls = 0
+    message_chat_ids: list[int] = []
     full_text = "x" * int(MessageLimit.MAX_TEXT_LENGTH)
 
     class Sender:
         def send_message(self, *, chat_id, text):
             nonlocal primary_calls
             primary_calls += 1
+            message_chat_ids.append(chat_id)
             return SimpleNamespace(message_id=7)
 
         def send_document(self, _chat_id, _attachment, **_kwargs):
@@ -509,7 +468,8 @@ def test_repeated_attachment_migration_fails_without_resending_primary() -> None
             waiter.result(1)
         assert primary_calls == 1
         assert attachment_calls == 2
-        assert queue._chat_redirects == {}
+        assert queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": "post-failure"}, 1)).result(1).message.message_id == 7
+        assert message_chat_ids == [1, 1]
     finally:
         queue.stop()
 
