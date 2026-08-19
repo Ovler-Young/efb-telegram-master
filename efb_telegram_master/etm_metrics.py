@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from prometheus_client import CollectorRegistry, Counter, Histogram
-from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
+from prometheus_client.core import Metric
 
+from .metrics_process import register_bounded_gauge_collector, register_destination_queue_collector, register_process_collector, register_worker_collector
 from .outbound import OutboundQueue
 from .telegram_calls import QUEUED_OPERATIONS
 
@@ -223,124 +224,10 @@ class Metrics:
         process_factory: Callable[[], Any] | None = None,
         network_io_counters: Callable[[], Any] | None = None,
     ) -> None:
-        """Register scrape-time process and host resource observations.
-
-        ``cpu_percent(None)`` is sampled once during registration to establish
-        psutil's baseline. Each scrape then reports utilization since the prior
-        sample as a Prometheus ratio. Unsupported process I/O sources are
-        omitted, and a failure from one source leaves the other observations
-        available for that scrape.
-        """
-        if process_factory is None or network_io_counters is None:
-            try:
-                import psutil
-            except ImportError:
-                if process_factory is None:
-                    return
-            else:
-                if process_factory is None:
-                    process_factory = psutil.Process
-                if network_io_counters is None:
-                    network_io_counters = psutil.net_io_counters
-
-        try:
-            process = process_factory()
-        except Exception as error:
-            self._record_collector_failure("process_factory", error)
-            return
-        try:
-            process.cpu_percent(interval=None)
-        except Exception as error:
-            self._record_collector_failure("process_cpu_baseline", error)
-
-        def collect() -> Iterable[Metric]:
-            metrics: list[Metric] = []
-
-            try:
-                cpu_percent = self._non_negative(process.cpu_percent(interval=None), "process CPU percent")
-                cpu = GaugeMetricFamily(
-                    f"{self.namespace}_process_cpu_utilization_ratio",
-                    "Process CPU utilization since the previous psutil sample, as a ratio.",
-                )
-                cpu.add_metric([], cpu_percent / 100)
-                metrics.append(cpu)
-            except Exception as error:
-                self._record_collector_failure("process_cpu", error)
-
-            try:
-                memory = process.memory_info()
-                resident_memory = self._non_negative(memory.rss, "process resident memory")
-                resident = GaugeMetricFamily(
-                    f"{self.namespace}_process_resident_memory_bytes",
-                    "Resident memory currently used by this process in bytes.",
-                )
-                resident.add_metric([], resident_memory)
-                metrics.append(resident)
-            except Exception as error:
-                self._record_collector_failure("process_memory", error)
-
-            try:
-                disk = process.io_counters()
-                disk_read = CounterMetricFamily(
-                    f"{self.namespace}_process_disk_read_bytes_total",
-                    "Cumulative bytes read by this process from disk.",
-                )
-                disk_read.add_metric([], self._non_negative(disk.read_bytes, "process disk read bytes"))
-                disk_write = CounterMetricFamily(
-                    f"{self.namespace}_process_disk_write_bytes_total",
-                    "Cumulative bytes written by this process to disk.",
-                )
-                disk_write.add_metric([], self._non_negative(disk.write_bytes, "process disk write bytes"))
-                metrics.extend((disk_read, disk_write))
-            except Exception as error:
-                self._record_collector_failure("process_disk", error)
-
-            if network_io_counters is not None:
-                try:
-                    network_counters = network_io_counters()
-                    network_receive = CounterMetricFamily(
-                        f"{self.namespace}_host_network_receive_bytes_total",
-                        "Cumulative network bytes received by the host.",
-                    )
-                    network_receive.add_metric([], self._non_negative(network_counters.bytes_recv, "host network received bytes"))
-                    network_transmit = CounterMetricFamily(
-                        f"{self.namespace}_host_network_transmit_bytes_total",
-                        "Cumulative network bytes transmitted by the host.",
-                    )
-                    network_transmit.add_metric([], self._non_negative(network_counters.bytes_sent, "host network transmitted bytes"))
-                    metrics.extend((network_receive, network_transmit))
-                except Exception as error:
-                    self._record_collector_failure("host_network", error)
-
-            return tuple(metrics)
-
-        self._register_collector(collect)
+        register_process_collector(self, process_factory, network_io_counters)
 
     def register_destination_queue_collector(self, snapshot: Callable[[], Iterable[DestinationQueueSnapshot]], top_n: int) -> None:
-        """Register a scrape-time top-N destination snapshot with no retained destination state."""
-        cap = self._count(top_n, "destination top_n")
-
-        def collect() -> Iterable[GaugeMetricFamily]:
-            depth = GaugeMetricFamily(
-                f"{self.namespace}_outbound_destination_queue_depth",
-                "Current queued rows for the deepest destinations in this scrape.",
-                labels=["destination"],
-            )
-            oldest = GaugeMetricFamily(
-                f"{self.namespace}_outbound_destination_oldest_age_seconds",
-                "Oldest queued-row age for the deepest destinations in this scrape.",
-                labels=["destination"],
-            )
-            samples = list(snapshot())
-            for item in sorted(samples, key=lambda value: value.depth, reverse=True)[:cap]:
-                if not isinstance(item.destination, str) or not item.destination:
-                    raise ValueError("destination must be a non-empty string")
-                depth.add_metric([item.destination], self._count(item.depth, "destination depth"))
-                if item.oldest_age_seconds is not None:
-                    oldest.add_metric([item.destination], self._non_negative(item.oldest_age_seconds, "destination oldest age"))
-            return (depth, oldest)
-
-        self._register_collector(collect)
+        register_destination_queue_collector(self, snapshot, top_n)
 
     def register_outbound_queue_collectors(self, queue: OutboundQueue, top_n: int) -> None:
         """Register the outbound queue's bounded scrape snapshots."""
@@ -358,17 +245,7 @@ class Metrics:
         self.register_cooldown_collector(queue.cooldown_snapshot)
 
     def register_worker_collector(self, snapshot: Callable[[], WorkerSnapshot]) -> None:
-        """Register aggregate worker liveness and in-flight state."""
-
-        def collect() -> Iterable[GaugeMetricFamily]:
-            health = GaugeMetricFamily(f"{self.namespace}_outbound_worker_healthy", "Whether the outbound worker is alive.")
-            in_flight = GaugeMetricFamily(f"{self.namespace}_outbound_worker_in_flight", "Calls currently owned by the outbound worker.")
-            value = snapshot()
-            health.add_metric([], int(value.healthy))
-            in_flight.add_metric([], self._count(value.in_flight, "worker in-flight"))
-            return (health, in_flight)
-
-        self._register_collector(collect)
+        register_worker_collector(self, snapshot)
 
     def register_cooldown_collector(self, snapshot: Callable[[], Mapping[str, float]]) -> None:
         self._register_bounded_gauge_collector(
@@ -425,10 +302,4 @@ class Metrics:
         snapshot: Callable[[], Mapping[str, Any]],
         normalize: Callable[[Any], float | int],
     ) -> None:
-        def collect() -> Iterable[GaugeMetricFamily]:
-            metric = GaugeMetricFamily(name, documentation, labels=[label])
-            for key, value in snapshot().items():
-                metric.add_metric([self._bounded(key, allowed, label)], normalize(value))
-            return (metric,)
-
-        self._register_collector(collect)
+        register_bounded_gauge_collector(self, name, documentation, label, allowed, snapshot, normalize)
