@@ -8,15 +8,14 @@ Custom version bumper partially implements PEP 440.
 import argparse
 import re
 import subprocess
+from typing import List, Optional
 
 from packaging import version
-from typing import Optional, List
 
 PACKAGE = "efb_telegram_master"
 
 parser = argparse.ArgumentParser(description="Custom version bumper partially implements PEP 440.")
-parser.add_argument("level", action="store",
-                    choices=("major", "minor", "patch", "alpha", "beta", "post", "dev"))
+parser.add_argument("level", action="store", choices=("major", "minor", "patch", "alpha", "beta", "post", "dev"))
 parser.add_argument("--dry-run", "-d", help="Dry run.", action="store_true")
 parser.add_argument("--allow-dirty", "-a", help="Allow dirty git working directory.", action="store_true")
 parser.add_argument("--no-commit", "-n", help="Do not make a new commit.", action="store_true")
@@ -121,7 +120,7 @@ def main():
     with open(version_file_path) as f:
         content = f.read()
         span = next(re.finditer(r'(?<=__version__ = ")[^"]+(?=")', content)).span()
-        source = (content[:span[0]], content[span[0]:span[1]], content[span[1]:])
+        source = (content[: span[0]], content[span[0] : span[1]], content[span[1] :])
     v = version.parse(source[1])
 
     new_ver = bump_version(v, args.level)
@@ -131,12 +130,7 @@ def main():
     print(bump_message)
 
     if not args.allow_dirty:
-        lines = [
-            line.strip() for line in
-            subprocess.check_output(
-                ["git", "status", "--porcelain"]).splitlines()
-            if not line.strip().startswith(b"??")
-        ]
+        lines = [line.strip() for line in subprocess.check_output(["git", "status", "--porcelain"]).splitlines() if not line.strip().startswith(b"??")]
 
         if lines:
             print("Git working directory is dirty, stopped.")
@@ -145,7 +139,7 @@ def main():
     if args.dry_run:
         print("Dry run, not writing to the file")
     else:
-        with open(version_file_path, 'w') as f:
+        with open(version_file_path, "w") as f:
             f.write(source[0])
             f.write(new_ver)
             f.write(source[2])

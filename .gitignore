@@ -47,6 +47,8 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+.pytest_cache/
+.ruff_cache/
 
 # Translations
 *.mo
@@ -121,6 +123,7 @@ fabric.properties
 
 # doit
 .doit.db
+.doit.db.db
 
 # Readme translations
 readme_translations/locale

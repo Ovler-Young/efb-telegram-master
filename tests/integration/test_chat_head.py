@@ -1,8 +1,11 @@
 import re
+
 from pytest import mark
 from telethon.tl.custom import Message
 
-from .helper.filters import in_chats, has_button, edited, regex
+from .helper.filter_chats import in_chats
+from .helper.filter_content import has_button, regex
+from .helper.filter_messages import edited
 from .utils import link_chats
 
 pytestmark = mark.asyncio
@@ -66,7 +69,7 @@ async def test_chat_head_private(helper, client, bot_id, slave, private_response
 
 async def test_chat_head_singly_linked(helper, client, bot_group, slave, channel):
     chat = slave.chat_with_alias
-    with link_chats(channel, (chat, ), bot_group):
+    with link_chats(channel, (chat,), bot_group):
         await client.send_message(bot_group, "/chat")
         content: str = await helper.wait_for_message_text(in_chats(bot_group) & regex(chat.name))
 

@@ -21,7 +21,7 @@ EFB Telegram 主端（ETM）
 .. image:: https://github.com/ehForwarderBot/efb-telegram-master/raw/master/banner.png
    :alt: Banner
 
-`其他语言的 README <./readme_translations>`_。
+`其他语言的 README <../README.rst>`_。
 
 **信道 ID**: ``blueset.telegram``
 
@@ -32,7 +32,7 @@ API，``python-telegram-bot`` 建立。
 依赖
 ====
 
-* Python >= 3.6
+* Python >= 3.10
 
 * EH Forwarder Bot >= 2.0.0
 
@@ -188,7 +188,7 @@ API，``python-telegram-bot`` 建立。
 ~~~~~~~~~~~~~~
 
 如果你的会话太多，不想在一次次点击 ``下一页
->`` 按钮，亦或是你想要一个更直接的方式筛选你的会话，ETM 为 ``/chat`` 和 ``/list`` 指令搭载了筛选功能。在指令后面追加关联词即可获得筛选后的会话列表。
+>`` 按钮，亦或是你想要一个更直接的方式筛选你的会话，ETM 为 ``/chat`` 指令搭载了筛选功能。在指令后面追加关联词即可获得筛选后的会话列表。
 
 例如：``/chat Eana`` 指令能够筛选出所有包含「Eana」的会话。
 
@@ -319,7 +319,7 @@ ETM 可以协助您依照远端会话来更新 Telegram 群组的名称和
 
 * Bot 是该群组的管理员。
 
-* 该群组\ **仅绑定到了一个**远端会话
+* 该群组\ **仅绑定到了一个**\ 远端会话
 
 * 远端会话当前可用
 
@@ -393,7 +393,7 @@ ETM 不能：
 
 由于 Telegram Bot API 和 EH Forwarder Bot 的技术局限，ETM 存在一些限制：
 
-* **不支持**部分 Telegram 消息类型：
+* **不支持**\ 部分 Telegram 消息类型：
      * 游戏消息
 
      * 发票（invoice，又译「账单」、「订单」）消息

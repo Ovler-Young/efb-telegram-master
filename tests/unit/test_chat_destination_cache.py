@@ -3,8 +3,8 @@ import time
 
 from pytest import fixture, mark
 
-from efb_telegram_master import chat_destination_cache
-from efb_telegram_master.utils import EFBChannelChatIDStr
+from efb_telegram_master.chat import chat_destination_cache
+from efb_telegram_master.core.utils import EFBChannelChatIDStr
 
 
 @fixture(scope="function")

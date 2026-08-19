@@ -1,17 +1,17 @@
 from unittest.mock import patch
 
+from ehforwarderbot import coordinator
+from ehforwarderbot.chat import PrivateChat
 from pytest import fixture
 
-from efb_telegram_master.chat_object_cache import ChatObjectCacheManager
-from ehforwarderbot import Chat
-from ehforwarderbot.chat import PrivateChat
+from efb_telegram_master.chat.chat_object_cache import ChatObjectCacheManager
 
 
 @fixture(scope="function")
 def chat_manager(channel):
     # Prevent the manager to get a list of available chats in the list
-    with patch.dict('ehforwarderbot.coordinator.slaves', {}, clear=True):
-        yield ChatObjectCacheManager(channel)
+    with patch.dict("ehforwarderbot.coordinator.slaves", {}, clear=True):
+        yield ChatObjectCacheManager(channel.db, channel.slave_chat_info, coordinator.slaves)
 
 
 def test_chat_manager_enrol_single(chat_manager, slave):

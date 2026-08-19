@@ -4,8 +4,37 @@ from io import BytesIO
 import pytest
 from pytest import raises
 
-from efb_telegram_master.utils import b64de, b64en, message_id_to_str, \
-    message_id_str_to_id, chat_id_str_to_id, chat_id_to_str, convert_tgs_to_gif
+from efb_telegram_master.core.media import _maybe_scale_wechat_gif, convert_tgs_to_gif
+from efb_telegram_master.core.utils import b64de, b64en, bounded_error_message, chat_id_str_to_id, chat_id_to_str, message_id_str_to_id, message_id_to_str, normalize_request_kwargs
+
+
+def test_normalize_request_kwargs_filters_legacy_fields_and_embeds_proxy_auth() -> None:
+    assert normalize_request_kwargs(
+        {
+            "read_timeout": 15.0,
+            "proxy_url": "socks5://proxy.example:1080",
+            "urllib3_proxy_kwargs": {"username": "user@example", "password": "p@ss"},
+            "retries": 3,
+        }
+    ) == {
+        "read_timeout": 15.0,
+        "proxy": "socks5://user%40example:p%40ss@proxy.example:1080",
+    }
+    assert normalize_request_kwargs(
+        {
+            "proxy": "http://embedded:auth@proxy.example:8080",
+            "proxy_url": "http://ignored.example:8080",
+            "username": "ignored",
+            "connection_pool_size": 8,
+        }
+    ) == {
+        "connection_pool_size": 8,
+        "proxy": "http://embedded:auth@proxy.example:8080",
+    }
+
+
+def test_bounded_error_message_limits_log_value_to_200_characters() -> None:
+    assert bounded_error_message(RuntimeError("x" * 201)) == "x" * 200
 
 
 def test_flag(channel):
@@ -28,8 +57,7 @@ def test_url_safe_base64():
 def test_message_id_str_conversion():
     chat_id = 1
     message_id = 2
-    assert (chat_id, message_id) == message_id_str_to_id(
-        message_id_to_str(chat_id=chat_id, message_id=message_id))
+    assert (chat_id, message_id) == message_id_str_to_id(message_id_to_str(chat_id=chat_id, message_id=message_id))
 
 
 def test_chat_id_str_conversion():
@@ -37,13 +65,9 @@ def test_chat_id_str_conversion():
     chat_id = "__chat_id__"
     group_id = "__group_id__"
 
-    assert (channel_id, chat_id, None) == chat_id_str_to_id(
-        chat_id_to_str(channel_id=channel_id, chat_uid=chat_id)
-    ), "Converting channel-chat ID without group ID"
+    assert (channel_id, chat_id, None) == chat_id_str_to_id(chat_id_to_str(channel_id=channel_id, chat_uid=chat_id)), "Converting channel-chat ID without group ID"
 
-    assert (channel_id, chat_id, group_id) == chat_id_str_to_id(
-        chat_id_to_str(channel_id=channel_id, chat_uid=chat_id, group_id=group_id)
-    ), "Converting channel-chat ID with group ID"
+    assert (channel_id, chat_id, group_id) == chat_id_str_to_id(chat_id_to_str(channel_id=channel_id, chat_uid=chat_id, group_id=group_id)), "Converting channel-chat ID with group ID"
 
 
 def test_convert_tgs_to_gif():
@@ -53,6 +77,27 @@ def test_convert_tgs_to_gif():
         pytest.skip(f"TGS raster backend is unavailable in this environment: {exc}")
 
     out = BytesIO()
-    with open('tests/mocks/AnimatedSticker.tgs', 'rb') as f:
+    with open("tests/mocks/AnimatedSticker.tgs", "rb") as f:
         assert convert_tgs_to_gif(f, out), "conversion outcome"
     assert out.seek(0, 2), "converted TGS file should not be empty"
+
+
+@pytest.mark.parametrize(
+    ("channel_id", "width", "expected_filter"),
+    [
+        ("blueset.wechat", 601, ("scale", 600, -2)),
+        ("blueset.wechat", 600, None),
+        ("example.channel", 601, None),
+    ],
+)
+def test_wechat_gif_scaling_depends_on_channel_and_width(channel_id, width, expected_filter):
+    class GifStream:
+        def __init__(self, applied_filter=None):
+            self.applied_filter = applied_filter
+
+        def filter(self, *filter_args):
+            return GifStream(filter_args)
+
+    result = _maybe_scale_wechat_gif(GifStream(), channel_id, {"width": width})
+
+    assert result.applied_filter == expected_filter

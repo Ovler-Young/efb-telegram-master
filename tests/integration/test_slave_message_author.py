@@ -1,6 +1,7 @@
 from pytest import mark
 
-from tests.integration.helper.filters import in_chats, regex
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_content import regex
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio
@@ -10,8 +11,7 @@ pytestmark = mark.asyncio
 
 async def test_slave_message_author_external(helper, client, bot_group, slave, channel):
     chat = slave.chat_with_alias
-    author = chat.make_system_member(uid="member_from_middleware",
-                                     name="Middleware Member")
+    author = chat.make_system_member(uid="member_from_middleware", name="Middleware Member")
     author.module_id = "unknown.middleware"
     author.module_name = "Unknown middleware"
     author.channel_emoji = ""

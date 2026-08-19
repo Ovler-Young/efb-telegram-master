@@ -9,26 +9,58 @@ Only testing with text messages, as everything else shall follow suit.
 import asyncio
 import re
 import time
-from contextlib import suppress
+from contextlib import contextmanager
 from typing import List
 from unittest.mock import patch
 
 from pytest import mark, raises
 from telethon.tl.custom import Message, MessageButton
 
-from .helper.filters import in_chats, has_button, edited, regex, text
-
-retry_on_integration_timeout = mark.flaky(
-    max_runs=2,
-    min_passes=1,
-    rerun_filter=lambda err, *_: bool(err and err[0] and issubclass(err[0], TimeoutError)),
-)
+from .helper.filter_chats import in_chats
+from .helper.filter_content import has_button, regex, text
+from .helper.filter_messages import edited, reply_to
+from .helper.messages import wait_for_message_state
 
 pytestmark = mark.asyncio
 
 
-async def test_master_master_quick_reply_no_cache(helper, client, bot_id, slave, channel,
-                                                  private_response):
+def _is_delivery_confirmation(message: Message, replied_to_message_id: int) -> bool:
+    return message.reply_to_msg_id == replied_to_message_id and re.fullmatch(r"Delivering the message to .+\.", message.raw_text or message.text or "") is not None
+
+
+async def wait_for_destination_delivery(client, prompt: Message, button: MessageButton, sent_message: Message, private_response) -> None:
+    await private_response(
+        lambda: button.click(),
+        lambda timeout: wait_for_message_state(
+            client,
+            prompt.chat_id,
+            prompt.id,
+            lambda current: _is_delivery_confirmation(current, sent_message.id),
+            timeout=timeout,
+        ),
+        target_chat_id=prompt.chat_id,
+    )
+
+
+@contextmanager
+def preserve_destination_cache(cache):
+    weak_items = tuple(cache.weak.items())
+    strong_entries = tuple(cache.strong)
+    entries = tuple(dict.fromkeys((*strong_entries, *(entry for _, entry in weak_items))))
+    entry_state = tuple((entry, entry.expiry, entry.warned) for entry in entries)
+    try:
+        yield
+    finally:
+        cache.weak.clear()
+        cache.strong.clear()
+        cache.strong.extend(strong_entries)
+        cache.weak.update(weak_items)
+        for entry, expiry, warned in entry_state:
+            entry.expiry = expiry
+            entry.warned = warned
+
+
+async def test_master_master_quick_reply_no_cache(helper, client, bot_id, slave, channel, private_response):
     assert channel.chat_dest_cache.enabled
     channel.chat_dest_cache.weak.clear()
     channel.chat_dest_cache.strong.clear()
@@ -44,8 +76,7 @@ async def test_master_master_quick_reply_no_cache(helper, client, bot_id, slave,
     assert slave.messages.empty()
 
 
-async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
-                                         private_response):
+async def test_master_master_quick_reply(helper, client, bot_id, slave, channel, private_response):
     """Tests if the quick reply cache exists, and changes afterwards by
     incoming message from slave channel.
     """
@@ -67,21 +98,18 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
     assert message.chat == chat
 
     content = "test_master_master_quick_reply send new message with quick reply"
-    text = await private_response(
+    warning_text = await private_response(
         lambda: client.send_message(bot_id, content),
-        lambda timeout: helper.wait_for_message_text(
-            in_chats(bot_id) & regex(re.escape(chat.display_name)), timeout
-        ),
+        lambda timeout: helper.wait_for_message_text(in_chats(bot_id) & regex(re.escape(chat.display_name)), timeout),
     )
-    assert chat.display_name in text, f"{text!r} is not a warning message for {chat}"
+    assert chat.display_name in warning_text, f"{warning_text!r} is not a warning message for {chat}"
     message = await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
 
     assert message.text == content
     assert message.chat == chat
 
-    content = "test_master_master_quick_reply send another new message " \
-              "with quick reply, should give no warning"
+    content = "test_master_master_quick_reply send another new message with quick reply, should give no warning"
     await client.send_message(bot_id, content)
     message = await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
@@ -97,26 +125,23 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
         nonlocal message
         message = slave.send_text_message(chat_alt, author=chat_alt.other)
 
-    text = await private_response(
+    incoming_text = await private_response(
         send_incoming_message,
-        lambda timeout: helper.wait_for_message_text(
-            in_chats(bot_id) & regex(re.escape(message.text if message else "")), timeout
-        ),
+        lambda timeout: helper.wait_for_message_text(in_chats(bot_id) & regex(re.escape(message.text if message else "")), timeout),
     )
     assert message is not None
-    assert message.text in text  # there might be message header in ``text``
+    assert message.text in incoming_text  # there might be message header in ``incoming_text``
 
     content = "test_master_master_quick_reply this shall not be sent due to cleared cache"
     message = await private_response(
         lambda: client.send_message(bot_id, content),
-        lambda timeout: helper.wait_for_message(in_chats(bot_id), timeout),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & text & regex("Error: No recipient specified"), timeout),
     )  # Error message
     assert slave.messages.empty()
-    await cancel_destination_suggestion(helper, message)
+    await cancel_destination_suggestion(client, helper, private_response, message)
 
 
-async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, slave, channel,
-                                                       private_response):
+async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, slave, channel, private_response):
     assert channel.chat_dest_cache.enabled
     slave.clear_messages()
 
@@ -129,30 +154,28 @@ async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, sl
     await message.click(0)
     message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & ~has_button)
     await message.reply(content)
-    await asyncio.to_thread(slave.messages.get, timeout=5)
+    delivered = await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
+    assert delivered.text == content
 
     # Mutate only the cache entry. Patching ``time.time`` changes the shared
     # module object Telethon also uses for its transport deadlines.
     human_chat_cache_key = str((await client.get_me()).id)
     assert human_chat_cache_key in channel.chat_dest_cache.weak
-    channel.chat_dest_cache.weak[human_chat_cache_key].expiry = time.time() - 1
-    content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
-    message = await private_response(
-        lambda: client.send_message(bot_id, content),
-        lambda timeout: helper.wait_for_message(
-            in_chats(bot_id) & text & regex("Error: No recipient specified"), timeout
-        ),
-    )
-    assert slave.messages.empty()
-    await cancel_destination_suggestion(helper, message)
+    cache_entry = channel.chat_dest_cache.weak[human_chat_cache_key]
+    with preserve_destination_cache(channel.chat_dest_cache):
+        cache_entry.expiry = time.time() - 1
+        content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
+        message = await private_response(
+            lambda: client.send_message(bot_id, content),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & text & regex("Error: No recipient specified"), timeout),
+        )
+        assert slave.messages.empty()
+        await cancel_destination_suggestion(client, helper, private_response, message)
 
 
-@retry_on_integration_timeout
-async def test_master_master_destination_suggestion(helper, client, bot_id, slave, channel,
-                                                    private_response):
-    with patch.dict(channel.flag.config, send_to_last_chat="disabled"), \
-         patch.multiple(channel.chat_dest_cache, enabled=False):
+async def test_master_master_destination_suggestion(helper, client, bot_id, slave, channel, private_response):
+    with patch.dict(channel.flag.config, send_to_last_chat="disabled"), patch.multiple(channel.chat_dest_cache, enabled=False):
         assert not channel.chat_dest_cache.enabled
         slave.clear_messages()
         chat = slave.chat_with_alias
@@ -168,24 +191,15 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
 
         message: Message = await private_response(
             send_message,
-            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button & reply_to(sent_message.id if sent_message else None), timeout),
         )
         assert sent_message is not None
         buttons: List[List[MessageButton]] = message.buttons
-        chat_buttons = [
-            button
-            for row in buttons
-            for button in row
-            if chat.display_name in button.text
-        ]
+        chat_buttons = [button for row in buttons for button in row if chat.display_name in button.text]
         assert chat_buttons
         # await buttons[-1][0].click()  # Cancel the error message.
 
-        await chat_buttons[0].click()  # deliver the message
-        await helper.wait_for_message(
-            in_chats(bot_id) & edited(message.id) & text
-            & regex(r"^Delivering the message to .+\.$")
-        )
+        await wait_for_destination_delivery(client, message, chat_buttons[0], sent_message, private_response)
         slave_message = await asyncio.to_thread(slave.messages.get, timeout=15)
         slave.messages.task_done()
         assert slave_message.text == content
@@ -201,11 +215,12 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         assert slave_message.edit
 
 
-
-async def cancel_destination_suggestion(helper, message: Message):
+async def cancel_destination_suggestion(client, helper, private_response, message: Message):
     """Cancel chat destination suggestions if available."""
-    with suppress(asyncio.TimeoutError):
-        while not message.button_count:
-            message = await helper.wait_for_message(in_chats(message.chat_id))
-    if message.button_count:
-        await message.buttons[-1][-1].click()
+    if not message.button_count:
+        return
+    await private_response(
+        lambda: message.buttons[-1][-1].click(),
+        lambda timeout: wait_for_message_state(client, message.chat_id, message.id, lambda current: not current.button_count, timeout=timeout),
+        target_chat_id=message.chat_id,
+    )

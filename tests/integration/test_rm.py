@@ -1,8 +1,11 @@
-from pytest import mark
 from unittest.mock import patch
 
 from ehforwarderbot.status import MessageRemoval
-from tests.integration.helper.filters import in_chats, regex, deleted, has_button
+from pytest import mark
+
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_content import has_button, regex
+from tests.integration.helper.filter_updates import deleted
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio
@@ -47,11 +50,9 @@ async def test_rm_edit(helper, client, bot_group, slave, channel):
         assert removal_status.message.uid == message.uid
 
 
-async def test_rm_command_delete(helper, client, bot_id, bot_group, slave, channel,
-                                 private_response):
+async def test_rm_command_delete(helper, client, bot_id, bot_group, slave, channel, private_response):
     chat = slave.chat_with_alias
     with patch.dict(channel.flag.config, prevent_message_removal=False):
-
         tg_msg = await private_response(
             lambda: client.send_message(bot_id, f"/chat {chat.uid}"),
             lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),

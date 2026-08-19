@@ -1,38 +1,32 @@
-from abc import abstractmethod, ABC
-from itertools import chain
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Optional, List, Tuple
 
-from pytest import mark, approx
+from ehforwarderbot.message import MsgType
+from pytest import mark
 from telegram.constants import FileSizeLimit
-from telethon.tl.custom import Message
-from telethon.tl.types import MessageEntityMentionName, MessageEntityCode
 
-from ehforwarderbot import Chat
-from ehforwarderbot import Message as EFBMessage
-from ehforwarderbot.chat import SelfChatMember
-from ehforwarderbot.message import LinkAttribute, LocationAttribute, MsgType
-from tests.integration.helper.filters import in_chats, edited, reply_to, regex
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_content import regex
+from tests.integration.helper.filter_messages import reply_to
 from tests.integration.utils import link_chats
-from tests.mocks.slave import MockSlaveChannel
 
 pytestmark = mark.asyncio
 
 
-async def test_slave_message_file_oversize(helper, client, bot_group, slave, channel):
+async def test_slave_message_file_oversize_reports_bot_api_limit(helper, client, bot_group, slave, channel):
     chat = slave.chat_with_alias
-    with link_chats(channel, (chat,), bot_group),\
-            NamedTemporaryFile(suffix=".bin") as f:
-        # Write a large enough file
-        f.truncate(FileSizeLimit.FILESIZE_UPLOAD + 1024 * 10)
-        f.seek(0)
+    with link_chats(channel, (chat,), bot_group), NamedTemporaryFile(suffix=".bin") as file:
+        file.truncate(FileSizeLimit.FILESIZE_UPLOAD + 1024 * 10)
+        file.seek(0)
+        efb_message = slave.send_file_like_message(
+            MsgType.File,
+            Path(file.name),
+            mime="application/octet-stream",
+            chat=chat,
+            author=chat.other,
+            commands=True,
+        )
 
-        # Send it
-        efb_msg = slave.send_file_like_message(MsgType.File, Path(f.name), mime="application/octet-stream",
-                                               chat=chat, author=chat.other, commands=True)
-
-        # Expect a text message and an error message
-        tg_msg = await helper.wait_for_message(in_chats(bot_group) & regex(efb_msg.text))
-        assert not tg_msg.file
-        await helper.wait_for_message(in_chats(bot_group) & reply_to(tg_msg.id))
+        notice_target = await helper.wait_for_message(in_chats(bot_group) & regex(efb_message.text))
+        assert not notice_target.file
+        await helper.wait_for_message(in_chats(bot_group) & reply_to(notice_target.id))

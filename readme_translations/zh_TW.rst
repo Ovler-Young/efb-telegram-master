@@ -21,7 +21,7 @@ EFB Telegram 主端（ETM）
 .. image:: https://github.com/ehForwarderBot/efb-telegram-master/raw/master/banner.png
    :alt: Banner
 
-`其他語言的 README <./readme_translations>`_。
+`其他語言的 README <../README.rst>`_。
 
 **頻道 ID**: ``blueset.telegram``
 
@@ -32,7 +32,7 @@ API，``python-telegram-bot`` 建立。
 依賴
 ====
 
-* Python >= 3.6
+* Python >= 3.10
 
 * EH Forwarder Bot >= 2.0.0
 
@@ -188,7 +188,7 @@ API，``python-telegram-bot`` 建立。
 ~~~~~~~~~~~~~~
 
 如果你的對話太多，不想在一次次點擊 ``下一頁
->`` 按鈕，亦或是你想要一個更直接的方式篩選你的對話，ETM 為 ``/chat`` 和 ``/list`` 指令搭載了篩選功能。在指令後面追加關聯詞即可獲得篩選後的對話列表。
+>`` 按鈕，亦或是你想要一個更直接的方式篩選你的對話，ETM 為 ``/chat`` 指令搭載了篩選功能。在指令後面追加關聯詞即可獲得篩選後的對話列表。
 
 例如：``/chat Eana`` 指令能夠篩選出所有包含「Eana」的對話。
 
@@ -393,7 +393,7 @@ ETM 不能：
 
 由於 Telegram Bot API 和 EH Forwarder Bot 的技術局限，ETM 存在一些限制：
 
-* **不支援**部分 Telegram 消息類型：
+* **不支援**\ 部分 Telegram 消息類型：
      * 遊戲消息
 
      * 發票（invoice，又譯「帳單」、「訂單」）消息

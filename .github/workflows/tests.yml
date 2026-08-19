@@ -6,20 +6,32 @@ on:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
+      - 'README.rst'
+      - 'readme_translations/**.rst'
+      - 'dodo.py'
+      - '.pre-commit-config.yaml'
       - '.github/workflows/tests.yml'
       - 'pytest.ini'
-  pull_request_target:
+      - 'pyproject.toml'
+      - 'uv.lock'
+  pull_request:
     paths:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
+      - 'README.rst'
+      - 'readme_translations/**.rst'
+      - 'dodo.py'
+      - '.pre-commit-config.yaml'
       - '.github/workflows/tests.yml'
       - 'pytest.ini'
+      - 'pyproject.toml'
+      - 'uv.lock'
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit:
@@ -27,7 +39,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    environment: ${{ github.event_name == 'pull_request_target' && 'telegram-integration' || 'ci' }}
     strategy:
       fail-fast: true
       max-parallel: 1
@@ -35,41 +46,32 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
     - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.pull_request.head.sha || github.sha }}
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
+    - uses: astral-sh/setup-uv@v6
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install '.[tests,tgs]'
-        mypy --install-types --non-interactive -p efb_telegram_master
+        uv sync --locked --extra tests --extra tgs
     - name: Install binary dependencies
       run: |
-        sudo apt update
-        sudo apt install -y ffmpeg libmagic-dev libwebp-dev
-    - name: Check with mypy
+        printf '%s\n' 'https://archive.ubuntu.com/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+        timeout --kill-after=30s 15m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+        timeout --kill-after=30s 15m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmagic-dev libwebp-dev
+    - name: Run quality checks
       run: |
-        mypy -p efb_telegram_master --ignore-missing-imports
+        uv run --locked doit quality
     - name: Test unit suite
-      env:
-        TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
-        GROUPS: ${{ secrets.TELEGRAM_GROUPS }}
-        CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
-        TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
-        AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
-        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
-        USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
-        API_ID: ${{ secrets.TELEGRAM_API_ID }}
-        API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       run: |
-        pytest -vv -r a -l --color=yes --mode=unit
+        uv run --locked pytest -vv -r a -l --color=yes --mode=unit
 
   integration:
-    if: github.event_name == 'pull_request_target'
+    if: >-
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'push' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     needs: unit
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -92,20 +94,19 @@ jobs:
           --health-retries 5
     steps:
     - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
     - name: Set up Python 3.12
       uses: actions/setup-python@v6
       with:
         python-version: "3.12"
+    - uses: astral-sh/setup-uv@v6
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install '.[tests,tgs,postgresql]'
+        uv sync --locked --extra tests --extra tgs --extra postgresql
     - name: Install binary dependencies
       run: |
-        sudo apt update
-        sudo apt install -y ffmpeg libmagic-dev libwebp-dev
+        printf '%s\n' 'https://archive.ubuntu.com/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+        timeout --kill-after=30s 15m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+        timeout --kill-after=30s 15m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmagic-dev libwebp-dev
     - name: Test integration suite
       env:
         TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -124,4 +125,4 @@ jobs:
         TEST_POSTGRES_USER: postgres
         TEST_POSTGRES_PASSWORD: postgres
       run: |
-        pytest -vv -r a -l --color=yes --mode=integration
+        uv run --locked pytest -vv -r a -l --color=yes --mode=integration

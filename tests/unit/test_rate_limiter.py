@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
+from efb_telegram_master.runtime.rate_limiter import SlidingWindowRateLimiter
 
 
 @dataclass
@@ -66,22 +66,36 @@ def test_acquisition_uses_monotonic_clock_not_wall_clock(monkeypatch) -> None:
     limiter = _make_limiter(clock)
 
     monkeypatch.setattr(
-        "efb_telegram_master.rate_limiter.time.time",
+        "efb_telegram_master.runtime.rate_limiter.time.time",
         lambda: (_ for _ in ()).throw(AssertionError("wall clock used")),
     )
     assert limiter.try_acquire_global()
     assert limiter.global_delay() == 0.0
 
 
-def test_global_acquisition_precedes_chat_and_is_not_returned_after_chat_failure() -> None:
+def test_clock_is_injected_without_mutating_pyrate_limiter_private_clock() -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+
+    assert "_clock" not in limiter._global_bucket.__dict__
+    assert limiter._global_bucket.now() == 0
+
+    clock.value = 42.5
+    assert limiter._global_bucket.now() == 42500
+
+
+def test_global_acquisition_precedes_chat_and_loses_at_most_one_slot_per_chat_failure() -> None:
     clock = MonotonicClock()
     limiter = _make_limiter(clock)
 
     for _ in range(18):
         assert limiter.try_acquire_chat(100)
 
+    for _ in range(28):
+        assert not limiter.try_acquire(100)
+
+    assert limiter.get_counts(100) == (18, 28)
     assert not limiter.try_acquire(100)
-    assert limiter.get_counts(100) == (18, 1)
 
 
 def test_limiter_state_resets_on_process_restart() -> None:

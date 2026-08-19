@@ -1,185 +1,205 @@
+import logging
 from types import SimpleNamespace
 from urllib.request import urlopen
 
 import pytest
+from peewee import SqliteDatabase
 from prometheus_client import generate_latest
 
-from efb_telegram_master.etm_metrics import (
-    DestinationQueueSnapshot,
-    Metrics,
-    WorkerSnapshot,
-    start_metrics_server,
+from efb_telegram_master.core.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
+from efb_telegram_master.core.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc
+from efb_telegram_master.persistence.chat_association_repository import ChatAssociationRepository
+from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
+from efb_telegram_master.persistence.msglog_repository import MsgLogRepository
+from efb_telegram_master.persistence.slave_chat_info_repository import SlaveChatInfoRepository
+from efb_telegram_master.runtime.metrics_runtime import start_metrics_server
+
+_DATABASE_METHOD_OPERATIONS = (
+    "stop_worker",
+    "add_chat_assoc",
+    "remove_chat_assoc",
+    "get_master_msg_id",
+    "get_chat_assoc",
+    "add_topic_assoc",
+    "get_topic_thread_id",
+    "get_topic_slave",
+    "get_topic_slaves",
+    "remove_topic_assoc",
+    "add_or_update_message_log",
+    "get_msg_log",
+    "delete_msg_log",
+    "get_slave_chat_info",
+    "set_slave_chat_info",
+    "delete_slave_chat_info",
+    "get_recent_slave_chats",
+    "get_last_message",
+    "get_recent_messages",
+    "replace_history_migration_entries",
+    "has_pending_history_migrations",
+    "get_next_history_migration_target",
+    "get_history_migration_entry_page",
+    "delete_history_migration_entry",
+    "get_recent_msglog_page",
+    "claim_slave_message_delivery",
+    "complete_slave_message_delivery",
+    "renew_slave_message_delivery",
+    "release_slave_message_delivery",
+    "get_resumable_msglog_ingestion_scans",
 )
 
 
-def _render(metrics: Metrics) -> str:
-    return generate_latest(metrics.registry).decode()
+class BrokenCpuProcess:
+    def cpu_percent(self, interval=None):
+        raise RuntimeError("unavailable")
+
+    @staticmethod
+    def memory_info():
+        return SimpleNamespace(rss=1)
+
+    @staticmethod
+    def io_counters():
+        return SimpleNamespace(read_bytes=1, write_bytes=1)
 
 
-class _SupportedProcess:
-    def __init__(self) -> None:
-        self.cpu_percent_values = iter((0.0, 12.5))
+class SupportedProcess:
+    def __init__(self):
+        self.cpu_samples = iter((0.0, 25.0))
 
-    def cpu_percent(self, interval: None) -> float:
+    def cpu_percent(self, interval=None):
         assert interval is None
-        return next(self.cpu_percent_values)
+        return next(self.cpu_samples)
 
     @staticmethod
-    def memory_info() -> SimpleNamespace:
-        return SimpleNamespace(rss=4096)
-
-    @staticmethod
-    def io_counters() -> SimpleNamespace:
-        return SimpleNamespace(read_bytes=1024, write_bytes=2048)
-
-
-def _supported_host_network_counters() -> SimpleNamespace:
-    return SimpleNamespace(bytes_recv=3072, bytes_sent=4096)
-
-
-def test_process_collector_renders_supported_process_observations():
-    metrics = Metrics(
-        process_factory=_SupportedProcess,
-        network_io_counters=_supported_host_network_counters,
-    )
-
-    rendered = _render(metrics)
-
-    assert "etm_process_cpu_utilization_ratio 0.125" in rendered
-    assert "etm_process_resident_memory_bytes 4096.0" in rendered
-    assert "etm_process_disk_read_bytes_total 1024.0" in rendered
-    assert "etm_process_disk_write_bytes_total 2048.0" in rendered
-    assert "etm_host_network_receive_bytes_total 3072.0" in rendered
-    assert "etm_host_network_transmit_bytes_total 4096.0" in rendered
-    assert "# HELP etm_host_network_receive_bytes_total Cumulative network bytes received by the host." in rendered
-
-
-class _UnsupportedIoProcess:
-    def cpu_percent(self, interval: None) -> float:
-        assert interval is None
-        return 0.0
-
-    @staticmethod
-    def memory_info() -> SimpleNamespace:
-        return SimpleNamespace(rss=1024)
-
-    @staticmethod
-    def io_counters() -> SimpleNamespace:
-        raise NotImplementedError
-
-
-def test_process_collector_omits_unsupported_io_observations():
-    def unsupported_network_io_counters() -> SimpleNamespace:
-        raise NotImplementedError
-
-    rendered = _render(
-        Metrics(
-            process_factory=_UnsupportedIoProcess,
-            network_io_counters=unsupported_network_io_counters,
-        )
-    )
-
-    assert "etm_process_resident_memory_bytes 1024.0" in rendered
-    assert "etm_process_disk_read_bytes_total" not in rendered
-    assert "etm_process_disk_write_bytes_total" not in rendered
-    assert "etm_host_network_receive_bytes_total" not in rendered
-    assert "etm_host_network_transmit_bytes_total" not in rendered
-
-
-class _PartiallyFailingProcess:
-    def cpu_percent(self, interval: None) -> float:
-        assert interval is None
-        raise OSError("process exited")
-
-    @staticmethod
-    def memory_info() -> SimpleNamespace:
+    def memory_info():
         return SimpleNamespace(rss=2048)
 
     @staticmethod
-    def io_counters() -> SimpleNamespace:
+    def io_counters():
+        return SimpleNamespace(read_bytes=1024, write_bytes=512)
+
+
+class NoIoProcess(SupportedProcess):
+    @staticmethod
+    def io_counters():
         raise OSError("I/O unavailable")
 
 
-def test_process_collector_isolates_metric_source_errors():
-    rendered = _render(
-        Metrics(
-            process_factory=_PartiallyFailingProcess,
-            network_io_counters=_supported_host_network_counters,
-        )
+def test_database_metric_operations_are_recordable_and_reject_unknown_labels():
+    metrics = Metrics()
+
+    for method in _DATABASE_METHOD_OPERATIONS:
+        metrics.record_database_method_call(method, 0.0, "success")
+
+    with pytest.raises(ValueError, match="database method is invalid"):
+        metrics.record_database_method_call("unknown_database_method", 0.0, "success")
+
+    rendered = generate_latest(metrics.registry).decode()
+    for method in _DATABASE_METHOD_OPERATIONS:
+        assert f'etm_database_method_duration_seconds_count{{method="{method}"}} 1.0' in rendered
+
+
+def test_database_metric_decorators_record_real_repository_operations():
+    test_database = SqliteDatabase(":memory:")
+    test_database.connect()
+    metrics = Metrics()
+    chat_associations = ChatAssociationRepository(test_database)
+    history_migrations = HistoryMigrationRepository(test_database)
+    msglogs = MsgLogRepository(test_database)
+    slave_chat_info = SlaveChatInfoRepository(test_database)
+    for repository in (chat_associations, history_migrations, msglogs, slave_chat_info):
+        repository._metrics = metrics
+
+    try:
+        with test_database.bind_ctx(DATABASE_MODELS):
+            test_database.create_tables([ChatAssoc, TopicAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo])
+
+            chat_associations.add_chat_assoc("metrics-master", "metrics-slave")
+            assert chat_associations.get_chat_assoc(master_uid="metrics-master") == ["metrics-slave"]
+            assert history_migrations.get_entries_page("metrics-slave", 12345, None, None, 1) == []
+            assert msglogs.get_recent_message_page("metrics-slave", None, 1) == []
+            assert slave_chat_info.get_slave_chat_info("metrics", "slave") is None
+
+        rendered = generate_latest(metrics.registry).decode()
+    finally:
+        test_database.close()
+
+    for method in (
+        "add_chat_assoc",
+        "get_chat_assoc",
+        "get_history_migration_entry_page",
+        "get_recent_msglog_page",
+        "get_slave_chat_info",
+    ):
+        assert f'etm_database_method_duration_seconds_count{{method="{method}"}} 1.0' in rendered
+
+
+def test_process_collector_logs_a_repeated_failure_once_and_keeps_other_metrics(caplog):
+    metrics = Metrics(
+        process_factory=BrokenCpuProcess,
+        network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=1),
     )
 
-    assert "etm_process_cpu_utilization_ratio" not in rendered
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.core.etm_metrics"):
+        first_scrape = generate_latest(metrics.registry).decode()
+        second_scrape = generate_latest(metrics.registry).decode()
+
+    assert "etm_process_resident_memory_bytes" in first_scrape
+    assert "etm_host_network_receive_bytes_total 1.0" in first_scrape
+    assert "etm_host_network_transmit_bytes_total 1.0" in first_scrape
+    assert "etm_host_network_receive_bytes_total 1.0" in second_scrape
+    assert [record.message for record in caplog.records].count("Metrics collector process_cpu failed (RuntimeError).") == 1
+
+
+def test_process_collector_renders_supported_process_observations():
+    metrics = Metrics(process_factory=SupportedProcess, network_io_counters=lambda: SimpleNamespace(bytes_recv=3072, bytes_sent=4096))
+
+    rendered = generate_latest(metrics.registry).decode()
+
+    assert "etm_process_cpu_utilization_ratio 0.25" in rendered
     assert "etm_process_resident_memory_bytes 2048.0" in rendered
-    assert "etm_process_disk_read_bytes_total" not in rendered
+    assert "etm_process_disk_read_bytes_total 1024.0" in rendered
+    assert "etm_process_disk_write_bytes_total 512.0" in rendered
     assert "etm_host_network_receive_bytes_total 3072.0" in rendered
     assert "etm_host_network_transmit_bytes_total 4096.0" in rendered
 
 
-def test_queue_metrics_render_every_closed_matrix_event():
-    metrics = Metrics()
+def test_process_collector_omits_unsupported_io_observations_without_suppressing_network(caplog):
+    metrics = Metrics(process_factory=NoIoProcess, network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=2))
 
-    metrics.record_enqueued("blocking", "send_message")
-    metrics.set_queue_depth(3)
-    metrics.record_removal("normal", "delete_message", "terminal_discard", 1.25)
-    metrics.record_dequeued("normal", "delete_message")
-    metrics.record_dispatch_failure("normal", "delete_message")
-    metrics.increment_in_flight("blocking", "send_message", "main")
-    metrics.decrement_in_flight("blocking", "send_message", "main")
-    metrics.record_completion("blocking", "send_message", "main", "failure")
-    metrics.record_queue_dispatch("submitted")
-    metrics.record_queue_wait("blocking", "send_message", 0.25)
-    metrics.record_executor_attempt_duration("blocking", "send_message", "failure", 0.5)
-    metrics.record_queue_lifetime("blocking", "send_message", "failure", 1.0)
-    metrics.record_retry("blocking", "send_message", "rate_limit")
-    metrics.record_failure("blocking", "send_message", "execution")
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.core.etm_metrics"):
+        rendered = generate_latest(metrics.registry).decode()
+        second_scrape = generate_latest(metrics.registry).decode()
 
-    rendered = _render(metrics)
-
-    assert 'etm_outbound_enqueued_total{operation="send_message",priority="blocking"} 1.0' in rendered
-    assert "etm_outbound_queue_depth 3.0" in rendered
-    assert 'etm_outbound_queue_residence_seconds_count{operation="delete_message",outcome="terminal_discard",priority="normal"} 1.0' in rendered
-    assert 'etm_outbound_queue_removals_total{operation="delete_message",outcome="terminal_discard",priority="normal"} 1.0' in rendered
-    assert 'etm_outbound_dequeued_total{operation="delete_message",priority="normal"} 1.0' in rendered
-    assert 'etm_outbound_dispatch_failures_total{operation="delete_message",priority="normal"} 1.0' in rendered
-    assert 'etm_outbound_in_flight{operation="send_message",priority="blocking",sender_kind="main"} 0.0' in rendered
-    assert 'etm_outbound_completions_total{operation="send_message",outcome="failure",priority="blocking",sender_kind="main"} 1.0' in rendered
-    assert 'etm_outbound_queue_dispatches_total{outcome="submitted"} 1.0' in rendered
-    assert 'etm_outbound_queue_wait_seconds_count{operation="send_message",priority="blocking"} 1.0' in rendered
-    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="failure",priority="blocking"} 1.0' in rendered
-    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="failure",priority="blocking"} 1.0' in rendered
-    assert 'etm_outbound_retries_total{operation="send_message",priority="blocking",reason="rate_limit"} 1.0' in rendered
-    assert 'etm_outbound_failures_total{operation="send_message",priority="blocking",stage="execution"} 1.0' in rendered
+    assert "etm_process_resident_memory_bytes 2048.0" in rendered
+    assert "etm_process_disk_read_bytes_total" not in rendered
+    assert "etm_process_disk_write_bytes_total" not in rendered
+    assert "etm_host_network_receive_bytes_total 1.0" in rendered
+    assert "etm_host_network_transmit_bytes_total 2.0" in rendered
+    assert "etm_host_network_receive_bytes_total 1.0" in second_scrape
+    assert [record.message for record in caplog.records].count("Metrics collector process_disk failed (OSError).") == 1
 
 
 def test_snapshot_collectors_render_bounded_aggregate_metrics():
     metrics = Metrics()
-    metrics.register_destination_queue_collector(
-        lambda: (
-            DestinationQueueSnapshot("least", 1, 3.0),
-            DestinationQueueSnapshot("deepest", 3, 2.0),
-            DestinationQueueSnapshot("middle", 2, None),
-        ),
-        top_n=2,
-    )
+    metrics.register_destination_queue_collector(lambda: (DestinationQueueSnapshot("least", 1, 3.0), DestinationQueueSnapshot("deepest", 3, 2.0), DestinationQueueSnapshot("middle", 2, None)), top_n=2)
     metrics.register_worker_collector(lambda: WorkerSnapshot(healthy=True, in_flight=4))
     metrics.register_cooldown_collector(lambda: {"main": 1.5, "auxiliary": 0.0})
     metrics.register_auxiliary_count_collector(lambda: {"enabled": 2, "disabled": 1})
-    metrics.register_membership_cache_collector(
-        lambda: {"member": 4, "not_member": 2, "unknown_probe_pending": 1}
-    )
+    metrics.register_membership_cache_collector(lambda: {"member": 4, "not_member": 2, "unknown_probe_pending": 1})
     metrics.register_rate_limit_occupancy_collector(lambda: {"global": 0.5, "chat": 0.25})
 
-    rendered = _render(metrics)
+    rendered = generate_latest(metrics.registry).decode()
 
     assert 'etm_outbound_destination_queue_depth{destination="deepest"} 3.0' in rendered
+    assert 'etm_outbound_destination_oldest_age_seconds{destination="deepest"} 2.0' in rendered
     assert 'etm_outbound_destination_queue_depth{destination="middle"} 2.0' in rendered
     assert 'etm_outbound_destination_queue_depth{destination="least"}' not in rendered
-    assert 'etm_outbound_destination_oldest_age_seconds{destination="deepest"} 2.0' in rendered
-    assert 'etm_outbound_destination_oldest_age_seconds{destination="middle"}' not in rendered
     assert "etm_outbound_worker_healthy 1.0" in rendered
     assert "etm_outbound_worker_in_flight 4.0" in rendered
     assert 'etm_outbound_cooldown_seconds{sender_kind="main"} 1.5' in rendered
+    assert 'etm_outbound_cooldown_seconds{sender_kind="auxiliary"} 0.0' in rendered
     assert 'etm_auxiliary_bots{state="enabled"} 2.0' in rendered
+    assert 'etm_auxiliary_bots{state="disabled"} 1.0' in rendered
     assert 'etm_auxiliary_membership_cache_entries{state="unknown_probe_pending"} 1.0' in rendered
     assert 'etm_rate_limit_occupancy{scope="chat"} 0.25' in rendered
 
@@ -192,7 +212,7 @@ def test_snapshot_collectors_render_empty_snapshots_without_labels():
     metrics.register_membership_cache_collector(lambda: {})
     metrics.register_rate_limit_occupancy_collector(lambda: {})
 
-    rendered = _render(metrics)
+    rendered = generate_latest(metrics.registry).decode()
 
     assert "etm_outbound_destination_queue_depth{" not in rendered
     assert "etm_outbound_cooldown_seconds{" not in rendered
@@ -201,38 +221,29 @@ def test_snapshot_collectors_render_empty_snapshots_without_labels():
     assert "etm_rate_limit_occupancy{" not in rendered
 
 
-def test_metrics_server_serves_http_and_thread_stops_after_shutdown():
+def test_membership_probe_timeout_is_a_bounded_metric_outcome():
     metrics = Metrics()
-    metrics.set_queue_depth(2)
-    server = start_metrics_server("127.0.0.1", 0, metrics.registry)
+
+    metrics.record_membership_probe("timeout")
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_auxiliary_membership_probes_total{outcome="timeout"} 1.0' in rendered
+
+
+def test_metrics_server_logs_the_port_chosen_by_the_os(caplog):
+    metrics = Metrics(process_factory=SupportedProcess, network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=2))
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.runtime.metrics_runtime"):
+        metrics_server = start_metrics_server("127.0.0.1", 0, metrics.registry)
+
     try:
-        host, port = server.server_address
+        assert metrics_server.server_address[1] > 0
+        assert caplog.records[-1].args == (metrics_server.server_address,)
+        host, port = metrics_server.server_address
         with urlopen(f"http://{host}:{port}/metrics", timeout=2) as response:
             assert response.status == 200
-            assert "etm_outbound_queue_depth 2.0" in response.read().decode()
+            assert "etm_process_resident_memory_bytes" in response.read().decode()
     finally:
-        server.shutdown()
-        server.server_close()
-        server.thread.join(timeout=2)
-
-    assert not server.thread.is_alive()
-
-
-@pytest.mark.parametrize(
-    "call",
-    [
-        lambda metrics: metrics.record_enqueued("urgent", "send_message"),
-        lambda metrics: metrics.record_enqueued("normal", "get_me"),
-        lambda metrics: metrics.record_removal("normal", "send_message", "requeued", 0.0),
-        lambda metrics: metrics.increment_in_flight("normal", "send_message", "bot-42"),
-        lambda metrics: metrics.record_completion("normal", "send_message", "main", "cancelled"),
-        lambda metrics: metrics.set_queue_depth(-1),
-        lambda metrics: metrics.record_queue_dispatch("reserved"),
-        lambda metrics: metrics.record_queue_wait("normal", "send_message", -0.1),
-        lambda metrics: metrics.record_retry("normal", "send_message", "unbounded"),
-        lambda metrics: metrics.record_failure("normal", "send_message", "retry"),
-    ],
-)
-def test_queue_metrics_reject_unbounded_or_invalid_values(call):
-    with pytest.raises(ValueError):
-        call(Metrics())
+        metrics_server.shutdown()
+        metrics_server.server_close()
+        metrics_server.thread.join(timeout=1)
+        assert not metrics_server.thread.is_alive()

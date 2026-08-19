@@ -21,7 +21,7 @@ EFB Telegram Master Channel (ETM)
 .. image:: https://github.com/ehForwarderBot/efb-telegram-master/raw/master/banner.png
    :alt: Banner
 
-`README in other languages <./readme_translations>`_.
+`README in other languages <../README.rst>`_.
 
 **Channel ID**: ``blueset.telegram``
 
@@ -32,7 +32,7 @@ Telegram Bot API, ``python-telegram-bot``.
 Requirements
 ============
 
-* Python >= 3.6
+* Python >= 3.10
 
 * EH Forwarder Bot >= 2.0.0
 
@@ -176,8 +176,8 @@ Not: In case of multiple admins are assigned, they may all send
 2. Send ``/link`` directly to the bot, then select your preferred
     slave chat.
 
-3. Tap “Link” and select your new group. *You can also choose to
-    unlink or relink a linked chat from this menu.*
+3. Tap “Link” and select your new group.
+   *You can also choose to unlink or relink a linked chat from this menu.*
 
 4. Tap “Start” at the bottom of your screen, and you should see a
     success message: “Chat linked.”
@@ -212,7 +212,7 @@ Advanced feature: Filtering
 
 If you have just too many chats, and being too tired for keep tapping
 \ ``Next >``, or maybe you just want to find a way to filter out what
-you’re looking for, now ETM has equipped ``/chat`` and ``/list`` with
+you’re looking for, now ETM has equipped ``/chat`` with
 filtering feature. Attach your keyword behind, and you can get a
 filtered result.
 

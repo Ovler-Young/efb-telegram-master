@@ -1,7 +1,6 @@
-from pytest import raises
-
 from ehforwarderbot import Chat
 from ehforwarderbot.chat import BaseChat, ChatMember
+from pytest import raises
 
 
 def compare_base_chat(self: BaseChat, other: BaseChat):
@@ -27,7 +26,7 @@ def compare_members(self: ChatMember, other: ChatMember):
     assert self.chat == other.chat
 
 
-def test_slave_chat_update_chat(bot_group, slave, channel):
+def test_slave_chat_update_chat(slave, channel):
     added, edited, removed = slave.send_chat_update_status()
     chat_manager = channel.chat_manager
 
@@ -43,7 +42,7 @@ def test_slave_chat_update_chat(bot_group, slave, channel):
     compare_chats(edited, edited_cache)
 
 
-def test_slave_chat_update_member(bot_group, slave, channel):
+def test_slave_chat_update_member(slave, channel):
     added, edited, removed = slave.send_member_update_status()
     group = added.chat
     chat_manager = channel.chat_manager

@@ -1,11 +1,14 @@
 import asyncio
 import inspect
 import logging
+import os
+import sys
 import threading
 import time
+import traceback
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Set
+from typing import Dict, Set
 
 import pytest
 import pytest_asyncio
@@ -13,10 +16,13 @@ from telethon import TelegramClient
 
 from efb_telegram_master import TelegramChannel
 
-from .helper.helper import TelegramIntegrationTestHelper, wait_for_private_response
 from ..bot import get_user_session
+from .helper.client import TelegramIntegrationTestHelper
+from .helper.requests import wait_for_private_response
 
 pytest.register_assert_rewrite("tests.integration.utils")
+
+POLLING_START_TIMEOUT = 30.0
 
 
 def pytest_collection_modifyitems(items):
@@ -26,6 +32,7 @@ def pytest_collection_modifyitems(items):
         if integration_directory in item.path.parents and inspect.iscoroutinefunction(item.obj):
             item.add_marker(pytest.mark.asyncio(loop_scope="session"), append=False)
 
+
 @pytest.fixture(scope="session")
 def user_session_info():
     return get_user_session()
@@ -33,17 +40,38 @@ def user_session_info():
 
 @pytest.fixture(scope="session")
 def user_session(user_session_info) -> str:
-    return user_session_info['user_session']
+    return user_session_info["user_session"]
 
 
 @pytest.fixture(scope="session")
 def api_id(user_session_info) -> int:
-    return user_session_info['api_id']
+    return user_session_info["api_id"]
 
 
 @pytest.fixture(scope="session")
 def api_hash(user_session_info) -> str:
-    return user_session_info['api_hash']
+    return user_session_info["api_hash"]
+
+
+@pytest.fixture(scope="session")
+def integration_postgres_config() -> Dict[str, object]:
+    required = (
+        "TEST_POSTGRES_HOST",
+        "TEST_POSTGRES_PORT",
+        "TEST_POSTGRES_DB",
+        "TEST_POSTGRES_USER",
+        "TEST_POSTGRES_PASSWORD",
+    )
+    if any(not os.environ.get(name) for name in required):
+        pytest.skip("PostgreSQL integration environment is not configured")
+    return {
+        "type": "postgresql",
+        "host": os.environ["TEST_POSTGRES_HOST"],
+        "port": int(os.environ["TEST_POSTGRES_PORT"]),
+        "database": os.environ["TEST_POSTGRES_DB"],
+        "user": os.environ["TEST_POSTGRES_USER"],
+        "password": os.environ["TEST_POSTGRES_PASSWORD"],
+    }
 
 
 @pytest.fixture(scope="session")
@@ -59,13 +87,9 @@ def filter_chats(bot_id, bot_groups, bot_channels, bot_topic_group) -> Set[int]:
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
-async def helper_wrap(user_session, api_id, api_hash, bot_id,
-                      filter_chats, aux_bot_ids) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
+async def helper_wrap(user_session, api_id, api_hash, bot_id, filter_chats, aux_bot_ids) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
     loop = asyncio.get_running_loop()
-    async with TelegramIntegrationTestHelper(
-            user_session, api_id, api_hash, loop, [bot_id, *aux_bot_ids],
-            chats=filter_chats
-    ) as helper:
+    async with TelegramIntegrationTestHelper(user_session, api_id, api_hash, loop, [bot_id, *aux_bot_ids], chats=filter_chats) as helper:
         yield helper
 
 
@@ -103,21 +127,24 @@ def poll_bot_factory():
         if expected_channel is not None and channel is not expected_channel:
             return
 
-        still_alive = False
+        shutdown_error = None
         try:
-            channel.bot_manager.graceful_stop()
-            polling_thread.join(timeout=30)
-            still_alive = polling_thread.is_alive()
+            channel.stop_polling()
+        except BaseException as error:
+            shutdown_error = error
         finally:
-            state["channel"] = None
-            state["thread"] = None
-            state["errors"] = None
+            polling_thread.join(timeout=30)
 
-        if still_alive:
-            raise RuntimeError("Telegram bot polling thread did not stop in time.")
-
-        # Telegram may take a moment to release the previous long-poll slot.
-        time.sleep(2)
+        if polling_thread.is_alive():
+            frame = sys._current_frames().get(polling_thread.ident)
+            stack = "".join(traceback.format_stack(frame)) if frame is not None else "stack unavailable"
+            print(f"Telegram bot polling thread did not stop: name={polling_thread.name!r} ident={polling_thread.ident!r}\n{stack}")
+            raise RuntimeError("Telegram bot polling thread did not stop in time.") from shutdown_error
+        state["channel"] = None
+        state["thread"] = None
+        state["errors"] = None
+        if shutdown_error is not None:
+            raise shutdown_error
 
         if polling_errors:
             raise polling_errors[0]
@@ -134,38 +161,39 @@ def poll_bot_factory():
             def runner():
                 try:
                     # Keep long polling short in tests so teardown can release the slot quickly.
-                    channel.bot_manager.polling(drop_pending_updates=True, timeout=1)
+                    channel.telegram_runtime.poll(drop_pending_updates=True, timeout=1)
                 except BaseException as exc:  # pragma: no cover - test bootstrap path
                     polling_errors.append(exc)
 
             polling_thread = threading.Thread(
                 target=runner,
                 name=f"pytest-poll-bot-{channel.channel_id}",
-                daemon=True,
             )
             polling_thread.start()
+            state["channel"] = channel
+            state["thread"] = polling_thread
+            state["errors"] = polling_errors
 
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                if polling_errors:
-                    raise polling_errors[0]
-                runtime_ready = channel.bot_manager._runtime._ready.wait(timeout=0.1)
-                application = channel.bot_manager.application
-                updater = application.updater
-                if (
-                    runtime_ready
-                    and updater is not None
-                    and updater.running
-                    and application.running
-                ):
+            try:
+                deadline = time.monotonic() + POLLING_START_TIMEOUT
+                while time.monotonic() < deadline:
                     if polling_errors:
                         raise polling_errors[0]
-                    state["channel"] = channel
-                    state["thread"] = polling_thread
-                    state["errors"] = polling_errors
-                    return
-
-            raise RuntimeError("Telegram bot polling did not become ready in time.")
+                    remaining = deadline - time.monotonic()
+                    runtime_ready = channel.telegram_runtime.async_runtime._ready.wait(timeout=min(0.1, remaining))
+                    application = channel.telegram_runtime.application
+                    updater = application.updater
+                    if runtime_ready and updater is not None and updater.running and application.running:
+                        if polling_errors:
+                            raise polling_errors[0]
+                        return
+                raise RuntimeError("Telegram bot polling did not become ready in time.")
+            except BaseException as startup_error:
+                try:
+                    stop(channel)
+                except BaseException as cleanup_error:
+                    print(f"Telegram bot polling startup cleanup failed: {cleanup_error!r}")
+                raise startup_error
 
     class PollBotFactory:
         def start(self, channel):
@@ -192,16 +220,20 @@ async def client(helper_wrap) -> AsyncGenerator[TelegramClient, None]:
 
 
 def _primary_bot_limiter_delay(channel: TelegramChannel, target_chat_id: int) -> float:
-    """Local integration seam for observing the primary bot's outbound limiter."""
-    return channel.bot_manager._rate_limiter.peek_delay(target_chat_id)
+    """Expose the production queue's main-bot limiter to response tests."""
+    return channel.bot_manager.api._outbound_queue._sender_policy._main_rate_limiter.peek_delay(target_chat_id)
 
 
 @pytest.fixture
-def private_response(channel: TelegramChannel, bot_id: int):
-    """Wait for a private response within one deadline."""
-    async def wait(trigger, receive, *, source_channel: TelegramChannel = channel,
-                   target_chat_id: int = bot_id):
-        limiter_delay = lambda: _primary_bot_limiter_delay(source_channel, target_chat_id)
-        return await wait_for_private_response(limiter_delay, trigger, receive)
+def private_response(channel: TelegramChannel, bot_id: int, helper_wrap: TelegramIntegrationTestHelper):
+    """Use the response deadline that includes the primary-bot rate-limit wait."""
+
+    async def wait(trigger, receive, *, source_channel: TelegramChannel = channel, target_chat_id: int = bot_id):
+        return await wait_for_private_response(
+            lambda: _primary_bot_limiter_delay(source_channel, target_chat_id),
+            trigger,
+            receive,
+            response_cursor=helper_wrap.event_cursor,
+        )
 
     return wait

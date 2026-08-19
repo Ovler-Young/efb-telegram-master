@@ -3,7 +3,9 @@ from unittest.mock import patch
 from pytest import mark
 from telethon.tl.custom import Message
 
-from tests.integration.helper.filters import in_chats, regex, reply_to, edited
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_content import regex
+from tests.integration.helper.filter_messages import edited, reply_to
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio
@@ -28,7 +30,7 @@ async def test_react_send_and_retract_reaction(helper, client, bot_group, slave,
         assert reaction in edited_tg_msg.text
 
         # Retract reaction
-        await tg_msg.reply(f"/react -")
+        await tg_msg.reply("/react -")
         edited_tg_msg = await helper.wait_for_message(in_chats(bot_group) & edited(edited_tg_msg.id))
         assert reaction not in edited_tg_msg.text
 
@@ -56,8 +58,8 @@ async def test_react_errors(helper, client, bot_group, slave, channel):
         # Entire slave channel doesn’t support reactions
         with patch.multiple(slave, suggested_reactions=None):
             await tg_msg.reply("/react FullChannelFail")
-            await helper.wait_for_message_text(in_chats(bot_group))
-            # Arbitrary error message
+            text = await helper.wait_for_message_text(in_chats(bot_group))
+            assert "does not accept reactions" in text
 
         # Reaction value is invalid
         with slave.set_react_to_message("reject_one"):
@@ -70,5 +72,5 @@ async def test_react_errors(helper, client, bot_group, slave, channel):
         # Reaction target (chat/message) is invalid
         with slave.set_react_to_message("reject_all"):
             await tg_msg.reply("/react ReactionTargetFail")
-            await helper.wait_for_message_text(in_chats(bot_group))
-            # Arbitrary error message
+            text = await helper.wait_for_message_text(in_chats(bot_group))
+            assert "You cannot react anything to this message." in text
