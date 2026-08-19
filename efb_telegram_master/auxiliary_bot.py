@@ -1,6 +1,7 @@
 # coding=utf-8
 
 import logging
+import threading
 from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Callable, Optional, TypeVar, overload
 
@@ -85,12 +86,13 @@ class AuxiliaryBot:
         get_updates_request = build_request(self._request_kwargs) if self._request_kwargs else None
         base_url = self._base_kwargs.get("base_url")
         base_file_url = self._base_kwargs.get("base_file_url")
-        kwargs: dict[str, object] = {"token": self._token, "local_mode": self._local_mode, "request": request, "get_updates_request": get_updates_request}
+        if base_url is not None and base_file_url is not None:
+            return telegram.Bot(self._token, base_url=base_url, base_file_url=base_file_url, request=request, get_updates_request=get_updates_request, local_mode=self._local_mode)
         if base_url is not None:
-            kwargs["base_url"] = base_url
+            return telegram.Bot(self._token, base_url=base_url, request=request, get_updates_request=get_updates_request, local_mode=self._local_mode)
         if base_file_url is not None:
-            kwargs["base_file_url"] = base_file_url
-        return telegram.Bot(**kwargs)
+            return telegram.Bot(self._token, base_file_url=base_file_url, request=request, get_updates_request=get_updates_request, local_mode=self._local_mode)
+        return telegram.Bot(self._token, request=request, get_updates_request=get_updates_request, local_mode=self._local_mode)
 
     def initialize(self) -> bool:
         try:
@@ -165,7 +167,7 @@ class AuxiliaryBot:
             self._membership_lifecycle.set_membership_changed_callback(lambda chat_id, is_member: callback(self, chat_id, is_member))
 
     @property
-    def _membership_probe_workers(self) -> set[object]:
+    def _membership_probe_workers(self) -> set[threading.Thread]:
         return self._membership_lifecycle._membership_probe_workers
 
     def bind_runtime(self, runtime: "AsyncTelegramRuntime") -> None:
