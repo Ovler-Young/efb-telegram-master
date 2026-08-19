@@ -26,8 +26,8 @@ jobs:
       run: |
         wget https://artifacts.crowdin.com/repo/deb/crowdin.deb -O crowdin.deb
         sudo dpkg -i crowdin.deb
-        sudo apt-get update
-        sudo apt-get install -y gettext
+        timeout --kill-after=30s 5m sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+        timeout --kill-after=30s 5m sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y gettext
     - name: Setup directories
       shell: bash
       run: |
