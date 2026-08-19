@@ -1,6 +1,4 @@
 import threading
-import uuid
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -11,47 +9,16 @@ from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
 from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
 from efb_telegram_master.persistence.sqlite_postgresql_import import SQLitePostgresqlImportCoordinator
+from tests.integration import legacy_outbound_retirement_helpers
+from tests.integration.legacy_outbound_retirement_helpers import database_kwargs, drop_database, new_database
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source, create_legacy_outbound_schema
 
-
-@pytest.fixture
-def poll_bot():
-    """Keep database-retirement tests independent of Telegram polling."""
-
-
-def _database_kwargs(config):
-    return {key: value for key, value in config.items() if key != "type"}
-
-
-def _new_database(admin_db, config):
-    database_name = f"etm_legacy_{uuid.uuid4().hex}"
-    admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
-    return database_name, PostgresqlDatabase(database_name, **{key: value for key, value in _database_kwargs(config).items() if key != "database"})
-
-
-def _drop_database(admin_db, database_name):
-    admin_db.execute_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
-    admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
-
-
-@contextmanager
-def _temporary_postgresql_database(config):
-    admin_db = PostgresqlDatabase(**_database_kwargs(config))
-    admin_db.connect()
-    admin_db.connection().autocommit = True
-    database_name, test_db = _new_database(admin_db, config)
-    try:
-        yield database_name, test_db
-    finally:
-        if not test_db.is_closed():
-            test_db.close()
-        _drop_database(admin_db, database_name)
-        admin_db.close()
+poll_bot = legacy_outbound_retirement_helpers.poll_bot
 
 
 @pytest.mark.integration
 def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgres_config, tmp_path, monkeypatch):
-    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
+    admin_db = PostgresqlDatabase(**database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
     original_database = database.obj
@@ -60,12 +27,12 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
     database_name = None
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
-        database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
+        database_name, legacy_db = new_database(admin_db, integration_postgres_config)
         legacy_db.connect()
         create_legacy_outbound_schema(legacy_db)
         legacy_db.close()
 
-        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
+        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in database_kwargs(integration_postgres_config).items() if key != "database"}}}
         first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql", config=config))
         table_names = set(database.get_tables())
         assert not set(LegacyOutboundRetirement.TABLES) & table_names
@@ -79,55 +46,13 @@ def test_postgresql_retirement_drops_frozen_historical_schema(integration_postgr
             first_manager.stop_worker()
         database.initialize(original_database)
         if database_name is not None:
-            _drop_database(admin_db, database_name)
-        admin_db.close()
-
-
-@pytest.mark.integration
-def test_postgresql_startup_preserves_non_empty_legacy_outbound_tables(integration_postgres_config, tmp_path, monkeypatch):
-    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
-    admin_db.connect()
-    admin_db.connection().autocommit = True
-    original_database = database.obj
-    database_name = None
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    try:
-        database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
-        legacy_db.connect()
-        workflow, task = create_legacy_outbound_schema(legacy_db)
-        workflow.create()
-        task.create(
-            source_key="source",
-            target_chat_id=1,
-            operation="send_message",
-            payload="durable payload",
-            workflow_id=1,
-        )
-        legacy_db.close()
-
-        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
-        with pytest.raises(RuntimeError, match="Legacy durable outbound data detected: automatic replay is disabled"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-non-empty-legacy", config=config))
-        assert database.is_closed()
-
-        preserved_db = PostgresqlDatabase(database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"})
-        preserved_db.connect()
-        try:
-            assert set(LegacyOutboundRetirement.TABLES).issubset(preserved_db.get_tables())
-            assert preserved_db.execute_sql("SELECT state FROM outboundworkflow").fetchone() == ("active",)
-            assert preserved_db.execute_sql("SELECT payload FROM outboundtask").fetchone() == ("durable payload",)
-        finally:
-            preserved_db.close()
-    finally:
-        database.initialize(original_database)
-        if database_name is not None:
-            _drop_database(admin_db, database_name)
+            drop_database(admin_db, database_name)
         admin_db.close()
 
 
 @pytest.mark.integration
 def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_archive(integration_postgres_config, tmp_path, monkeypatch):
-    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
+    admin_db = PostgresqlDatabase(**database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
     database_name = None
@@ -164,8 +89,8 @@ def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_arc
             HistoryMigrationEntry.create(id=104, slave_chat_id="slave", target_chat_id="10", source_master_msg_id="10.1", position=0)
             MsgLogIngestionScan.create(id=105, source_chat_id="10", scan_boundary=100, cursor=100)
             SlaveMessageDelivery.create(id=106, slave_origin_uid="slave", slave_message_id="source-message")
-        database_name, _target = _new_database(admin_db, integration_postgres_config)
-        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
+        database_name, _target = new_database(admin_db, integration_postgres_config)
+        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in database_kwargs(integration_postgres_config).items() if key != "database"}}}
         assert source_path.with_name("tgdata.db-wal").exists()
         migrated_path.write_bytes(b"operator archive")
         with pytest.raises(RuntimeError, match="both tgdata.db and tgdata.db.migrated exist"):
@@ -218,7 +143,7 @@ def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_arc
             manager.stop_worker()
         database.initialize(original_database)
         if database_name is not None:
-            _drop_database(admin_db, database_name)
+            drop_database(admin_db, database_name)
         admin_db.close()
 
     assert not source_path.with_name("tgdata.db-wal").exists()
@@ -226,7 +151,7 @@ def test_postgresql_startup_preserves_sqlite_snapshot_content_provenance_and_arc
 
 @pytest.mark.integration
 def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_postgres_config, tmp_path, monkeypatch):
-    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
+    admin_db = PostgresqlDatabase(**database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
     database_name = None
@@ -240,8 +165,8 @@ def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_
     try:
         source_db.connect()
         create_legacy_historic_identity_source(source_db)
-        database_name, _target = _new_database(admin_db, integration_postgres_config)
-        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"}}}
+        database_name, _target = new_database(admin_db, integration_postgres_config)
+        config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in database_kwargs(integration_postgres_config).items() if key != "database"}}}
 
         manager = DatabaseManager(SimpleNamespace(channel_id="tests.sqlite-import-canonical", config=config))
 
@@ -280,13 +205,13 @@ def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_
             manager.stop_worker()
         database.initialize(original_database)
         if database_name is not None:
-            _drop_database(admin_db, database_name)
+            drop_database(admin_db, database_name)
         admin_db.close()
 
 
 @pytest.mark.integration
 def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(integration_postgres_config):
-    admin_db = PostgresqlDatabase(**_database_kwargs(integration_postgres_config))
+    admin_db = PostgresqlDatabase(**database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
     database_name = None
@@ -303,7 +228,7 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
         return original_validate(current_database, table_names)
 
     def retire():
-        connection = PostgresqlDatabase(database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"})
+        connection = PostgresqlDatabase(database_name, **{key: value for key, value in database_kwargs(integration_postgres_config).items() if key != "database"})
         connection.connect()
         try:
             LegacyOutboundRetirement(connection).retire_tables()
@@ -313,7 +238,7 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
             connection.close()
 
     try:
-        database_name, legacy_db = _new_database(admin_db, integration_postgres_config)
+        database_name, legacy_db = new_database(admin_db, integration_postgres_config)
         legacy_db.connect()
         workflow, task = create_legacy_outbound_schema(legacy_db)
         legacy_db.close()
@@ -329,7 +254,7 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
         second.join(10)
         assert not first.is_alive() and not second.is_alive()
         assert not errors
-        check_db = PostgresqlDatabase(database_name, **{key: value for key, value in _database_kwargs(integration_postgres_config).items() if key != "database"})
+        check_db = PostgresqlDatabase(database_name, **{key: value for key, value in database_kwargs(integration_postgres_config).items() if key != "database"})
         check_db.connect()
         try:
             assert not set(LegacyOutboundRetirement.TABLES) & set(check_db.get_tables())
@@ -338,30 +263,5 @@ def test_postgresql_retirement_advisory_lock_serializes_concurrent_startups(inte
     finally:
         patch.undo()
         if database_name is not None:
-            _drop_database(admin_db, database_name)
+            drop_database(admin_db, database_name)
         admin_db.close()
-
-
-@pytest.mark.integration
-def test_postgresql_retirement_rolls_back_when_workflow_drop_fails(integration_postgres_config, monkeypatch):
-    drop_calls = 0
-    original_drop_tables = PostgresqlDatabase.drop_tables
-
-    def fail_workflow_drop(instance, models, **kwargs):
-        nonlocal drop_calls
-        drop_calls += 1
-        if drop_calls == 2:
-            raise RuntimeError("workflow drop failed")
-        return original_drop_tables(instance, models, **kwargs)
-
-    with _temporary_postgresql_database(integration_postgres_config) as (_database_name, legacy_db):
-        legacy_db.connect()
-        workflow, task = create_legacy_outbound_schema(legacy_db)
-        monkeypatch.setattr(PostgresqlDatabase, "drop_tables", fail_workflow_drop)
-        with pytest.raises(RuntimeError, match="workflow drop failed"):
-            LegacyOutboundRetirement(legacy_db).retire_tables()
-        assert set(LegacyOutboundRetirement.TABLES).issubset(legacy_db.get_tables())
-        assert workflow.select().count() == 0
-        assert task.select().count() == 0
-        assert LegacyOutboundRetirement.schema_error(legacy_db, "outboundtask") is None
-        legacy_db.close()
