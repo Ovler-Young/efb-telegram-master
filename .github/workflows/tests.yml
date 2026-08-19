@@ -56,8 +56,8 @@ jobs:
         uv sync --locked --extra tests --extra tgs
     - name: Install binary dependencies
       run: |
-        sudo apt update
-        sudo apt install -y ffmpeg libmagic-dev libwebp-dev
+        timeout 5m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+        timeout 5m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmagic-dev libwebp-dev
     - name: Run quality checks
       run: |
         uv run --locked doit quality
@@ -103,8 +103,8 @@ jobs:
         uv sync --locked --extra tests --extra tgs --extra postgresql
     - name: Install binary dependencies
       run: |
-        sudo apt update
-        sudo apt install -y ffmpeg libmagic-dev libwebp-dev
+        timeout 5m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+        timeout 5m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmagic-dev libwebp-dev
     - name: Test integration suite
       env:
         TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
