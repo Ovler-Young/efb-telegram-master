@@ -57,7 +57,7 @@ jobs:
     - name: Install binary dependencies
       run: |
         timeout --kill-after=30s 5m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-        timeout --kill-after=30s 5m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmagic-dev libwebp-dev
+        timeout --kill-after=30s 15m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmagic-dev libwebp-dev
     - name: Run quality checks
       run: |
         uv run --locked doit quality
@@ -104,7 +104,7 @@ jobs:
     - name: Install binary dependencies
       run: |
         timeout --kill-after=30s 5m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-        timeout --kill-after=30s 5m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmagic-dev libwebp-dev
+        timeout --kill-after=30s 15m sudo apt -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmagic-dev libwebp-dev
     - name: Test integration suite
       env:
         TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
