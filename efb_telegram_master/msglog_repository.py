@@ -11,13 +11,16 @@ from telegram import Message
 
 from .database_observability import ObservedRepository, observe_database_method
 from .message import ETMMsg
-from .models import MsgLog, PickledDict, database
+from .models import MsgLog, PickledDict
 from .utils import EFBChannelChatIDStr, OldMsgID, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, chat_id_to_str, message_id_to_str
 
 
 class MsgLogRepository(ObservedRepository):
     FAIL_FLAG = "__fail__"
     logger = logging.getLogger(__name__)
+
+    def __init__(self, database=None) -> None:
+        super().__init__(database)
 
     @observe_database_method("get_master_msg_id")
     def get_master_msg_id(self, message: EFBMessage) -> Optional[TgChatMsgIDStr]:
@@ -162,7 +165,7 @@ class MsgLogRepository(ObservedRepository):
         query = MsgLog.select().where(MsgLog.slave_origin_uid == slave_chat_id)
         if after is not None:
             after_time, after_message_id = after
-            nulls_first = not isinstance(database.obj, PostgresqlDatabase)
+            nulls_first = not isinstance(self.database, PostgresqlDatabase)
             if after_time is None and nulls_first:
                 query = query.where(((MsgLog.time.is_null(True)) & (MsgLog.master_msg_id > after_message_id)) | MsgLog.time.is_null(False))
             elif after_time is None:

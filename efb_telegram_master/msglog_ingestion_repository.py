@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, List, Optional
 from ehforwarderbot.types import ChatID
 from peewee import IntegrityError
 
-from .database_observability import ObservedRepository, observe_database_method
-from .models import UTC_LEASE_CLOCK, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database, utc_now_naive
+from .database_observability import ObservedRepository, bind_database, observe_database_method
+from .models import UTC_LEASE_CLOCK, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, utc_now_naive
 from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 
 if TYPE_CHECKING:
@@ -20,7 +20,8 @@ class MsgLogIngestionCompletion(str, Enum):
 
 
 class MsgLogIngestionRepository(ObservedRepository):
-    def __init__(self, channel_id: str) -> None:
+    def __init__(self, channel_id: str, database=None) -> None:
+        super().__init__(database)
         self.channel_id = channel_id
 
     @staticmethod
@@ -35,6 +36,7 @@ class MsgLogIngestionRepository(ObservedRepository):
             (MsgLogIngestionScan.lease_clock.is_null(True) | (MsgLogIngestionScan.lease_clock != UTC_LEASE_CLOCK)) & (MsgLogIngestionScan.lease_expires_at <= local_now)
         )
 
+    @bind_database
     def get_or_create_scan(self, source_chat_id: int, scan_boundary: int) -> MsgLogIngestionScan:
         if scan_boundary <= 0:
             raise ValueError("scan boundary must be positive")
@@ -47,13 +49,14 @@ class MsgLogIngestionRepository(ObservedRepository):
         except IntegrityError:
             return MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == source_id)
 
+    @bind_database
     def claim_scan(self, source_chat_id: int, lease_owner: str, lease_seconds: int) -> Optional[MsgLogIngestionScan]:
         if lease_seconds <= 0:
             raise ValueError("lease seconds must be positive")
         utc_now = utc_now_naive()
         local_now = datetime.datetime.now()
         lease_expires_at = utc_now + datetime.timedelta(seconds=lease_seconds)
-        with database.atomic():
+        with self.database.atomic():
             updated = (
                 MsgLogIngestionScan.update(lease_owner=lease_owner, lease_expires_at=lease_expires_at, lease_clock=UTC_LEASE_CLOCK, status="running", error=None, updated_at=utc_now)
                 .where(
@@ -81,12 +84,13 @@ class MsgLogIngestionRepository(ObservedRepository):
         scan.status = "pending"
         scan.error = None
 
+    @bind_database
     def request_association_rescan(self, source_chat_id: int) -> Optional[str]:
         """Durably request a follow-up after a topic becomes eligible."""
         local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
-        supports_for_update = bool(getattr(database.obj, "for_update", False))
-        transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
+        supports_for_update = bool(getattr(self.database, "for_update", False))
+        transaction = self.database.atomic() if supports_for_update else self.database.atomic("IMMEDIATE")
         with transaction:
             query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.source_chat_id == str(source_chat_id))
             scan = query.for_update().get_or_none() if supports_for_update else query.get_or_none()
@@ -103,13 +107,14 @@ class MsgLogIngestionRepository(ObservedRepository):
             scan.save()
             return scan.status
 
+    @bind_database
     def persist_item(
         self, scan: MsgLogIngestionScan, *, source_message_id: int, classification: str, slave_uid: Optional[EFBChannelChatIDStr] = None, message: Optional["IngestedMsgLog"] = None, lease_owner: str
     ) -> str:
         local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
-        supports_for_update = bool(getattr(database.obj, "for_update", False))
-        transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
+        supports_for_update = bool(getattr(self.database, "for_update", False))
+        transaction = self.database.atomic() if supports_for_update else self.database.atomic("IMMEDIATE")
         with transaction:
             query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
             current = query.for_update().get() if supports_for_update else query.get()
@@ -154,10 +159,11 @@ class MsgLogIngestionRepository(ObservedRepository):
             scan.__data__.update(current.__data__)
             return outcome
 
+    @bind_database
     def finish_scan(self, scan: MsgLogIngestionScan, *, status: str, error: Optional[str] = None, lease_owner: str) -> bool:
         local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
-        with database.atomic():
+        with self.database.atomic():
             updated = (
                 MsgLogIngestionScan.update(status=status, error=error, lease_owner=None, lease_expires_at=None, updated_at=utc_now)
                 .where(
@@ -173,12 +179,13 @@ class MsgLogIngestionRepository(ObservedRepository):
                 scan.__data__.update(current.__data__)
             return updated == 1
 
+    @bind_database
     def complete_scan(self, scan: MsgLogIngestionScan, *, lease_owner: str) -> MsgLogIngestionCompletion:
         """Complete the current pass and retain its lease for a requested rescan."""
         local_now = datetime.datetime.now()
         utc_now = utc_now_naive()
-        supports_for_update = bool(getattr(database.obj, "for_update", False))
-        transaction = database.atomic() if supports_for_update else database.atomic("IMMEDIATE")
+        supports_for_update = bool(getattr(self.database, "for_update", False))
+        transaction = self.database.atomic() if supports_for_update else self.database.atomic("IMMEDIATE")
         with transaction:
             query = MsgLogIngestionScan.select().where(MsgLogIngestionScan.id == scan.id)
             current = query.for_update().get() if supports_for_update else query.get()
@@ -205,10 +212,11 @@ class MsgLogIngestionRepository(ObservedRepository):
             scan.__data__.update(current.__data__)
             return MsgLogIngestionCompletion.COMPLETE
 
+    @bind_database
     def release_scan(self, source_chat_id: int, lease_owner: str) -> bool:
         """Make a shutdown-interrupted scan resumable without changing its cursor."""
         utc_now = utc_now_naive()
-        with database.atomic():
+        with self.database.atomic():
             return (
                 MsgLogIngestionScan.update(status="pending", error="shutdown", lease_owner=None, lease_expires_at=None, updated_at=utc_now)
                 .where((MsgLogIngestionScan.source_chat_id == str(source_chat_id)) & (MsgLogIngestionScan.status != "complete") & (MsgLogIngestionScan.lease_owner == lease_owner))

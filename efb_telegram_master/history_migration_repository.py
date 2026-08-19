@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from peewee import PostgresqlDatabase, SqliteDatabase
 
 from .database_observability import ObservedRepository, observe_database_method
-from .models import HistoryMigrationEntry, database
+from .models import HistoryMigrationEntry
 from .utils import EFBChannelChatIDStr, TelegramTopicID
 
 
@@ -16,14 +16,16 @@ class HistoryMigrationRepository(ObservedRepository):
     INSERT_BATCH_SIZE = 100
     _LOCK_KEY = 681_774_240_616_480_005
 
-    @classmethod
+    def __init__(self, database=None) -> None:
+        super().__init__(database)
+
     @contextmanager
-    def _replacement_transaction(cls):
-        current_database = database.obj
-        transaction = database.atomic("IMMEDIATE") if isinstance(current_database, SqliteDatabase) else database.atomic()
+    def _replacement_transaction(self):
+        current_database = self.database
+        transaction = current_database.atomic("IMMEDIATE") if isinstance(current_database, SqliteDatabase) else current_database.atomic()
         with transaction:
             if isinstance(current_database, PostgresqlDatabase):
-                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (cls._LOCK_KEY,))
+                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (self._LOCK_KEY,))
             yield
 
     @contextmanager

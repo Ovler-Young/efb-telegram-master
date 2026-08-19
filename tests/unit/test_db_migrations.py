@@ -30,6 +30,27 @@ from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, Telegra
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source, create_legacy_outbound_schema
 
 
+def test_database_manager_repositories_remain_bound_to_their_own_database(tmp_path, monkeypatch):
+    original_database = database.obj
+    (tmp_path / "tests.first").mkdir()
+    (tmp_path / "tests.second").mkdir()
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda channel_id: tmp_path / channel_id)
+    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.first", config={}))
+    second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.second", config={}))
+    try:
+        first_manager.chat_associations.add_chat_assoc("master-one", "slave-one")
+        second_manager.chat_associations.add_chat_assoc("master-two", "slave-two")
+
+        assert first_manager.chat_associations.get_chat_assoc(master_uid="master-one") == ["slave-one"]
+        assert first_manager.chat_associations.get_chat_assoc(master_uid="master-two") == []
+        assert second_manager.chat_associations.get_chat_assoc(master_uid="master-one") == []
+        assert second_manager.chat_associations.get_chat_assoc(master_uid="master-two") == ["slave-two"]
+    finally:
+        second_manager.stop_worker()
+        first_manager.stop_worker()
+        database.initialize(original_database)
+
+
 def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, monkeypatch):
     database_path = tmp_path / "tgdata.db"
     raw_db = SqliteDatabase(database_path)

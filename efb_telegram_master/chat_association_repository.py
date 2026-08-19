@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 from peewee import DoesNotExist, PostgresqlDatabase, SqliteDatabase
 
 from .database_observability import ObservedRepository, observe_database_method
-from .models import ChatAssoc, HistoryMigrationEntry, TopicAssoc, database
+from .models import ChatAssoc, HistoryMigrationEntry, TopicAssoc
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramTopicID
 
 
@@ -13,22 +13,24 @@ class ChatAssociationRepository(ObservedRepository):
     logger = logging.getLogger(__name__)
     _LOCK_KEY = 681_774_240_616_480_004
 
-    @classmethod
+    def __init__(self, database=None) -> None:
+        super().__init__(database)
+
     @contextmanager
-    def _mutation_transaction(cls):
-        current_database = database.obj
-        transaction = database.atomic("IMMEDIATE") if isinstance(current_database, SqliteDatabase) else database.atomic()
+    def _mutation_transaction(self):
+        current_database = self.database
+        transaction = current_database.atomic("IMMEDIATE") if isinstance(current_database, SqliteDatabase) else current_database.atomic()
         with transaction:
             if isinstance(current_database, PostgresqlDatabase):
-                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (cls._LOCK_KEY,))
+                current_database.execute_sql("SELECT pg_advisory_xact_lock(%s)", (self._LOCK_KEY,))
             yield
 
-    @classmethod
     @contextmanager
-    def topic_provisioning_transaction(cls):
+    def topic_provisioning_transaction(self):
         """Serialize association lookup, remote topic creation, and persistence."""
-        with cls._mutation_transaction():
-            yield
+        with self._bound_models():
+            with self._mutation_transaction():
+                yield
 
     @staticmethod
     def _invalidate_history_entries(slave_uids: list[str]) -> None:

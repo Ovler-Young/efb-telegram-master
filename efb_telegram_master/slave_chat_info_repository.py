@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 class SlaveChatInfoRepository(ObservedRepository):
     logger = logging.getLogger(__name__)
 
+    def __init__(self, database=None) -> None:
+        super().__init__(database)
+
     @observe_database_method("get_slave_chat_info")
     def get_slave_chat_info(self, slave_channel_id: Optional[ModuleID] = None, slave_chat_uid: Optional[ChatID] = None, slave_chat_group_id: Optional[ChatID] = None) -> Optional[SlaveChatInfo]:
         if slave_channel_id is None or slave_chat_uid is None:

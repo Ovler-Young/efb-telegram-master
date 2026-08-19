@@ -17,14 +17,9 @@ from ehforwarderbot import utils
 from peewee import AutoField, Model, PostgresqlDatabase, SqliteDatabase, TextField
 from playhouse.migrate import Operation, PostgresqlMigrator, SqliteMigrator, migrate
 
-from .chat_association_repository import ChatAssociationRepository
 from .database_observability import DatabaseMetrics, observe_database_method
-from .history_migration_repository import HistoryMigrationRepository
-from .models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
-from .msglog_ingestion_repository import MsgLogIngestionRepository
-from .msglog_repository import MsgLogRepository
-from .slave_chat_info_repository import SlaveChatInfoRepository
-from .slave_message_delivery_repository import SlaveMessageDeliveryRepository
+from .models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, bind_models_to_proxy, database
+from .repository_registry import Repositories
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -110,12 +105,6 @@ class DatabaseManager:
     def __init__(self, channel: "TelegramChannel"):
         self.channel: "TelegramChannel" = channel
         self._metrics: Optional[DatabaseMetrics] = None
-        self.chat_associations = ChatAssociationRepository()
-        self.slave_chat_info = SlaveChatInfoRepository()
-        self.slave_message_deliveries = SlaveMessageDeliveryRepository()
-        self.msglogs = MsgLogRepository()
-        self.history_migrations = HistoryMigrationRepository()
-        self.msglog_ingestion = MsgLogIngestionRepository(channel.channel_id)
         base_path = utils.get_data_path(channel.channel_id)
         self._base_path = base_path
 
@@ -143,6 +132,15 @@ class DatabaseManager:
             )
 
         database.initialize(actual_db)
+        bind_models_to_proxy()
+        self.current_database = actual_db
+        repositories = Repositories(actual_db, channel.channel_id)
+        self.chat_associations = repositories.chat_associations
+        self.slave_chat_info = repositories.slave_chat_info
+        self.slave_message_deliveries = repositories.slave_message_deliveries
+        self.msglogs = repositories.msglogs
+        self.history_migrations = repositories.history_migrations
+        self.msglog_ingestion = repositories.msglog_ingestion
         connected = False
         try:
             database.connect()
@@ -173,10 +171,10 @@ class DatabaseManager:
 
     @observe_database_method("stop_worker")
     def stop_worker(self) -> None:
-        stop = getattr(database.obj, "stop", None)
+        stop = getattr(self.current_database, "stop", None)
         if callable(stop):
             stop()
-        database.close()
+        self.current_database.close()
 
     @staticmethod
     def _create() -> None:
@@ -188,6 +186,11 @@ class DatabaseManager:
 
     @staticmethod
     def _ensure_historic_schema_columns(current_database) -> None:
+        with current_database.bind_ctx(DATABASE_MODELS):
+            DatabaseManager._ensure_historic_schema_columns_bound(current_database)
+
+    @staticmethod
+    def _ensure_historic_schema_columns_bound(current_database) -> None:
         transaction_arguments: Tuple[str, ...] = ()
         if isinstance(current_database, SqliteDatabase):
             transaction_arguments = ("IMMEDIATE",)

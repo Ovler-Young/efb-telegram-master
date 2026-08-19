@@ -14,6 +14,9 @@ class SlaveMessageDeliveryRepository(ObservedRepository):
     logger = logging.getLogger(__name__)
     LEASE_SECONDS = 300
 
+    def __init__(self, database=None) -> None:
+        super().__init__(database)
+
     @staticmethod
     def _expired_lease_condition(utc_now: datetime, local_now: datetime):
         return ((SlaveMessageDelivery.lease_clock == UTC_LEASE_CLOCK) & (SlaveMessageDelivery.lease_expires_at <= utc_now)) | (
