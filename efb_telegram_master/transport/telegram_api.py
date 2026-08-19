@@ -6,8 +6,8 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-from ..auxiliary_bot import MembershipProbeShutdownTimeout
-from ..outbound import OutboundQueue
+from ..outbound.auxiliary_bot import MembershipProbeShutdownTimeout
+from ..outbound.outbound import OutboundQueue
 from ..runtime.bot_pool import BotPool
 from .telegram_api_operations import SyncBotProtocol, TelegramAPIOperations
 

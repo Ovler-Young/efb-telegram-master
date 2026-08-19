@@ -6,15 +6,15 @@ from unittest.mock import Mock
 import pytest
 from peewee import SqliteDatabase
 
-from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
+from efb_telegram_master.chat.topic_sync import TopicGroupService
+from efb_telegram_master.core.db import DatabaseManager
+from efb_telegram_master.core.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
+from efb_telegram_master.core.utils import TelegramChatID, TelegramTopicID
 from efb_telegram_master.persistence.chat_association_repository import ChatAssociationRepository
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from efb_telegram_master.persistence.slave_chat_info_repository import SlaveChatInfoRepository
 from efb_telegram_master.persistence.slave_message_delivery_repository import SlaveMessageDeliveryRepository
-from efb_telegram_master.topic_sync import TopicGroupService
-from efb_telegram_master.utils import TelegramChatID, TelegramTopicID
 
 
 def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):

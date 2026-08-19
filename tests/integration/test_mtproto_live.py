@@ -9,9 +9,9 @@ from uuid import uuid4
 
 import pytest
 
-from efb_telegram_master import utils
-from efb_telegram_master.models import MsgLog, MsgLogIngestionScan
-from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
+from efb_telegram_master.core import utils
+from efb_telegram_master.core.models import MsgLog, MsgLogIngestionScan
+from efb_telegram_master.history.msglog_ingestion import MsgLogIngestionService
 
 from ..bot import get_user_session
 from .helper.filter_chats import in_chats

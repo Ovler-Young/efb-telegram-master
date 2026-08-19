@@ -5,8 +5,8 @@ from unittest.mock import ANY, Mock
 import pytest
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.history_replay import HistoryReplayShutdownTimeout
-from efb_telegram_master.outbound_types import OutboundShutdownTimeout
+from efb_telegram_master.history.history_replay import HistoryReplayShutdownTimeout
+from efb_telegram_master.outbound.outbound_types import OutboundShutdownTimeout
 from efb_telegram_master.runtime.bot_manager import TelegramResourceShutdownError
 from efb_telegram_master.transport.telegram_api import TelegramAPI
 

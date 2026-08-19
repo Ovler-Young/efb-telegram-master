@@ -8,12 +8,12 @@ import pytest
 from prometheus_client import generate_latest
 from telegram.error import NetworkError, RetryAfter
 
-from efb_telegram_master.auxiliary_bot import AuxiliaryBot
-from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.outbound import OutboundQueue
-from efb_telegram_master.outbound_types import QueueEnqueueError, QueueRequest
+from efb_telegram_master.core.etm_metrics import Metrics
+from efb_telegram_master.outbound.auxiliary_bot import AuxiliaryBot
+from efb_telegram_master.outbound.outbound import OutboundQueue
+from efb_telegram_master.outbound.outbound_types import QueueEnqueueError, QueueRequest
+from efb_telegram_master.outbound.sender_policy import retry_after_seconds
 from efb_telegram_master.runtime.bot_pool import BotPool
-from efb_telegram_master.sender_policy import retry_after_seconds
 from tests.support.outbound_queue import _Limiter, _queue
 
 
@@ -220,7 +220,7 @@ def test_queue_failure_rechecks_cached_member_and_clears_only_the_triggering_aff
         assert release_probe.wait(1)
         return SimpleNamespace(status="left")
 
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot"):
         auxiliary = AuxiliaryBot("123:token")
     auxiliary.bot_id = 10
     auxiliary.async_bot.get_chat_member.side_effect = get_chat_member

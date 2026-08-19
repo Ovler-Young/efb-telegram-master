@@ -7,8 +7,8 @@ from ehforwarderbot.constants import MsgType
 from ehforwarderbot.types import MessageID
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.slave_message import SlaveMessageService
-from efb_telegram_master.slave_status import SlaveStatusService
+from efb_telegram_master.delivery.slave_message import SlaveMessageService
+from efb_telegram_master.delivery.slave_status import SlaveStatusService
 
 
 def test_ingested_rows_are_not_remote_get_or_reaction_targets():

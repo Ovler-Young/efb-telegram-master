@@ -5,9 +5,9 @@ from unittest.mock import ANY, Mock
 import pytest
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.master_message import MasterMessageWorker, MasterMessageWorkerShutdownTimeout
-from efb_telegram_master.outbound import OutboundQueue
-from efb_telegram_master.outbound_types import QueueRequest
+from efb_telegram_master.delivery.master_message import MasterMessageWorker, MasterMessageWorkerShutdownTimeout
+from efb_telegram_master.outbound.outbound import OutboundQueue
+from efb_telegram_master.outbound.outbound_types import QueueRequest
 from efb_telegram_master.runtime.bot_manager import TelegramBotManager, TelegramResourceShutdownError
 from efb_telegram_master.runtime.rate_limiter import SlidingWindowRateLimiter
 from efb_telegram_master.transport.telegram_api import TelegramAPI

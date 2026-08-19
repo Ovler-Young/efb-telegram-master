@@ -4,11 +4,11 @@ from typing import TYPE_CHECKING, Optional
 from ehforwarderbot.types import ChatID, ModuleID
 from peewee import IntegrityError
 
-from ..models import SlaveChatInfo
+from ..core.models import SlaveChatInfo
 from .database_observability import ObservedRepository, observe_database_method
 
 if TYPE_CHECKING:
-    from ..chat import ETMChatMixin
+    from ..chat.chat import ETMChatMixin
 
 
 class SlaveChatInfoRepository(ObservedRepository):

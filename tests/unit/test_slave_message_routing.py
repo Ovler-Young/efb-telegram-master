@@ -3,8 +3,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from efb_telegram_master.slave_delivery_helpers import send_identity
-from efb_telegram_master.slave_routing import SlaveMessageRouter
+from efb_telegram_master.delivery.slave_delivery_helpers import send_identity
+from efb_telegram_master.delivery.slave_routing import SlaveMessageRouter
 
 
 def test_forum_destination_uses_cached_chat_info_until_ttl() -> None:

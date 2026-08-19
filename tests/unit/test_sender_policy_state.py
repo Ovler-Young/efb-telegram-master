@@ -5,8 +5,8 @@ import threading
 import pytest
 from telegram.error import RetryAfter
 
-import efb_telegram_master.sender_policy as sender_policy_module
-from efb_telegram_master.outbound_types import SenderSelection
+import efb_telegram_master.outbound.sender_policy as sender_policy_module
+from efb_telegram_master.outbound.outbound_types import SenderSelection
 from tests.unit.sender_policy_support import auxiliary, call, policy
 
 

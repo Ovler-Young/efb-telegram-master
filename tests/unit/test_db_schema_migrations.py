@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 from peewee import IntegrityError, SqliteDatabase
 
-from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import DATABASE_MODELS, UTC_LEASE_CLOCK, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
+from efb_telegram_master.core.db import DatabaseManager
+from efb_telegram_master.core.models import DATABASE_MODELS, UTC_LEASE_CLOCK, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
 from efb_telegram_master.persistence import database_initializer
 from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from efb_telegram_master.persistence.slave_message_delivery_repository import SlaveMessageDeliveryRepository

@@ -10,8 +10,8 @@ from typing import Any
 from prometheus_client import CollectorRegistry
 
 from ..config.runtime import RuntimeConfiguration
-from ..etm_metrics import Metrics
-from ..outbound import OutboundQueue
+from ..core.etm_metrics import Metrics
+from ..outbound.outbound import OutboundQueue
 from .bot_pool import BotPool
 
 

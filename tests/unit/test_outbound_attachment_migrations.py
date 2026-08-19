@@ -7,8 +7,8 @@ from prometheus_client import generate_latest
 from telegram.constants import MessageLimit
 from telegram.error import ChatMigrated
 
-from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.outbound_types import QueueError, QueueRequest, UploadCleanup
+from efb_telegram_master.core.etm_metrics import Metrics
+from efb_telegram_master.outbound.outbound_types import QueueError, QueueRequest, UploadCleanup
 from tests.support.outbound_queue import _queue
 
 

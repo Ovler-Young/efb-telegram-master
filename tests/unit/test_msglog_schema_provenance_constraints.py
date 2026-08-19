@@ -10,10 +10,10 @@ from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
 from peewee import IntegrityError, PostgresqlDatabase, SqliteDatabase
 
-from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc
-from efb_telegram_master.msg_type import TGMsgType
+from efb_telegram_master.core.db import DatabaseManager
+from efb_telegram_master.core.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc
+from efb_telegram_master.delivery.message import ETMMsg
+from efb_telegram_master.delivery.msg_type import TGMsgType
 from efb_telegram_master.persistence import database_initializer
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.persistence.msglog_repository import MsgLogRepository

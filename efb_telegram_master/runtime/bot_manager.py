@@ -12,8 +12,8 @@ from ehforwarderbot.types import ModuleID
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from ..msglog_scan import MsgLogScanScheduler
-from ..outbound import OutboundQueue
+from ..history.msglog_scan import MsgLogScanScheduler
+from ..outbound.outbound import OutboundQueue
 from ..persistence.chat_association_repository import ChatAssociationRepository
 from ..persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from ..transport.telegram_api import TelegramAPI

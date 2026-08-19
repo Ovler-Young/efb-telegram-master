@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from efb_telegram_master.outbound_types import SenderSelection
+from efb_telegram_master.outbound.outbound_types import SenderSelection
 from efb_telegram_master.transport.telegram_calls import TelegramCallAdapter
 from tests.unit.sender_policy_support import auxiliary, call, policy
 

@@ -4,8 +4,8 @@ from io import BytesIO
 import pytest
 from pytest import raises
 
-from efb_telegram_master.media import _maybe_scale_wechat_gif, convert_tgs_to_gif
-from efb_telegram_master.utils import b64de, b64en, bounded_error_message, chat_id_str_to_id, chat_id_to_str, message_id_str_to_id, message_id_to_str, normalize_request_kwargs
+from efb_telegram_master.core.media import _maybe_scale_wechat_gif, convert_tgs_to_gif
+from efb_telegram_master.core.utils import b64de, b64en, bounded_error_message, chat_id_str_to_id, chat_id_to_str, message_id_str_to_id, message_id_to_str, normalize_request_kwargs
 
 
 def test_normalize_request_kwargs_filters_legacy_fields_and_embeds_proxy_auth() -> None:

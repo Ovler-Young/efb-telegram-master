@@ -6,9 +6,9 @@ from unittest.mock import Mock
 import pytest
 from ehforwarderbot.constants import MsgType
 
-from efb_telegram_master.slave_delivery_types import DeliveryPlan
-from efb_telegram_master.slave_message import SlaveMessageService
-from efb_telegram_master.slave_message_claims import SlaveMessageClaimLifecycle
+from efb_telegram_master.delivery.slave_delivery_types import DeliveryPlan
+from efb_telegram_master.delivery.slave_message import SlaveMessageService
+from efb_telegram_master.delivery.slave_message_claims import SlaveMessageClaimLifecycle
 
 
 def _message(uid="message"):

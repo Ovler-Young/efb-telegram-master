@@ -8,10 +8,10 @@ from ehforwarderbot.types import ChatID
 from telegram import Update
 from telegram.error import TelegramError
 
-from efb_telegram_master import utils
-from efb_telegram_master.ptb_compat import sync_reply_text
-from efb_telegram_master.topic_sync import TopicGroupService
-from efb_telegram_master.utils import TelegramChatID, TelegramTopicID
+from efb_telegram_master.chat.topic_sync import TopicGroupService
+from efb_telegram_master.core import utils
+from efb_telegram_master.core.ptb_compat import sync_reply_text
+from efb_telegram_master.core.utils import TelegramChatID, TelegramTopicID
 
 
 @pytest.mark.parametrize(
@@ -51,7 +51,7 @@ def test_update_info_error_replies_are_bounded_and_log_context(monkeypatch, meth
         service._update_forum_group_info = Mock(side_effect=error)
         service._update_forum_reply(update, TelegramChatID(1))
     else:
-        monkeypatch.setattr("efb_telegram_master.topic_sync.coordinator.slaves", {"slave": channel})
+        monkeypatch.setattr("efb_telegram_master.chat.topic_sync.coordinator.slaves", {"slave": channel})
         service._update_single_group(update, SimpleNamespace(id=1), "slave chat")
 
     reply = bot.reply_error.call_args.args[1]

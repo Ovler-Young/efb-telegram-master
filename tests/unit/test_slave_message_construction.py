@@ -6,8 +6,8 @@ from ehforwarderbot.constants import MsgType
 from ehforwarderbot.message import MessageCommand
 from telegram.constants import ChatType
 
-from efb_telegram_master.slave_message import SlaveMessageService
-from efb_telegram_master.slave_message_claims import SlaveMessageClaimLifecycle
+from efb_telegram_master.delivery.slave_message import SlaveMessageService
+from efb_telegram_master.delivery.slave_message_claims import SlaveMessageClaimLifecycle
 
 
 def test_lost_renewal_fences_post_send_side_effects() -> None:
@@ -23,7 +23,7 @@ def test_lost_renewal_fences_post_send_side_effects() -> None:
     ownership_lost.set()
     message = SimpleNamespace(uid="message", target=None, commands=[MessageCommand("Run", "run")], reactions={}, text="body", type=MsgType.Text, author=SimpleNamespace(module_id="tests.slave"))
 
-    with patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()):
+    with patch("efb_telegram_master.delivery.slave_message.coordinator.get_module_by_id", return_value=Mock()):
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token", ownership_lost=ownership_lost)
 
     processor.claim_lifecycle.delivery_claims.complete.assert_not_called()
@@ -51,7 +51,7 @@ def test_failed_completion_fences_command_registration_and_message_logging() -> 
         author=SimpleNamespace(module_id="tests.slave"),
     )
 
-    with patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()):
+    with patch("efb_telegram_master.delivery.slave_message.coordinator.get_module_by_id", return_value=Mock()):
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token")
 
     processor.claim_lifecycle.delivery_claims.complete.assert_called_once_with("tests.slave chat", "message", "claim-token")
@@ -78,7 +78,7 @@ def test_database_mapping_failure_still_runs_dispatch_completion() -> None:
         type=MsgType.Text,
         author=SimpleNamespace(module_id="tests.slave"),
     )
-    with patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()), patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"):
+    with patch("efb_telegram_master.delivery.slave_message.ETMMsg.from_efbmsg", return_value=Mock()), patch("efb_telegram_master.delivery.slave_message.get_msg_type", return_value="text"):
         processor.dispatch_message(message, "template", None, 100, None, dedupe_key=("tests.slave chat", "message"), claim_token="claim-token")
 
     processor.msglogs.add_or_update_message_log.assert_called_once()
@@ -111,9 +111,9 @@ def test_command_session_uses_the_telegram_message_owner() -> None:
     )
 
     with (
-        patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()),
-        patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"),
-        patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()),
+        patch("efb_telegram_master.delivery.slave_message.ETMMsg.from_efbmsg", return_value=Mock()),
+        patch("efb_telegram_master.delivery.slave_message.get_msg_type", return_value="text"),
+        patch("efb_telegram_master.delivery.slave_message.coordinator.get_module_by_id", return_value=Mock()),
     ):
         processor.dispatch_message(message, "template", None, 100, None)
 
@@ -142,9 +142,9 @@ def test_command_session_in_group_allows_configured_admins() -> None:
     )
 
     with (
-        patch("efb_telegram_master.slave_message.ETMMsg.from_efbmsg", return_value=Mock()),
-        patch("efb_telegram_master.slave_message.get_msg_type", return_value="text"),
-        patch("efb_telegram_master.slave_message.coordinator.get_module_by_id", return_value=Mock()),
+        patch("efb_telegram_master.delivery.slave_message.ETMMsg.from_efbmsg", return_value=Mock()),
+        patch("efb_telegram_master.delivery.slave_message.get_msg_type", return_value="text"),
+        patch("efb_telegram_master.delivery.slave_message.coordinator.get_module_by_id", return_value=Mock()),
     ):
         processor.dispatch_message(message, "template", None, -100500, None)
 

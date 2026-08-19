@@ -8,7 +8,7 @@ from xmlrpc.server import SimpleXMLRPCRequestHandler, SimpleXMLRPCServer
 from ehforwarderbot.types import ModuleID
 
 if TYPE_CHECKING:
-    from ..db import DatabaseManager
+    from ..core.db import DatabaseManager
 
 
 class RPCConfig(Protocol):

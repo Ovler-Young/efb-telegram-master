@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import pytest
 from peewee import PostgresqlDatabase, SqliteDatabase
 
-from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
-from efb_telegram_master.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
+from efb_telegram_master.core.db import DatabaseManager
+from efb_telegram_master.core.legacy_outbound_retirement import LegacyOutboundRetirement
+from efb_telegram_master.core.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
 from efb_telegram_master.persistence import database_initializer
 from efb_telegram_master.persistence import sqlite_postgresql_import as sqlite_import_module
 from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator

@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 from peewee import SqliteDatabase
 
-from efb_telegram_master.db import DatabaseManager
+from efb_telegram_master.core.db import DatabaseManager
 from efb_telegram_master.persistence.database_initializer import DatabaseInitializer
 
 
@@ -13,7 +13,7 @@ def test_database_manager_exposes_repositories_after_initializer_prepares_databa
     prepared_database = SqliteDatabase(tmp_path / "tgdata.db")
     initializer = Mock()
     initializer.initialize.return_value = (prepared_database, Path(tmp_path))
-    monkeypatch.setattr("efb_telegram_master.db.DatabaseInitializer", lambda *_args: initializer)
+    monkeypatch.setattr("efb_telegram_master.core.db.DatabaseInitializer", lambda *_args: initializer)
 
     manager = DatabaseManager(SimpleNamespace(channel_id="tests.database", config={}))
 

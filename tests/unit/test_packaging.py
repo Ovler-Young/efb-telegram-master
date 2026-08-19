@@ -36,6 +36,32 @@ RUNTIME_MODULES = (
     "rpc_utils",
 )
 CONFIG_MODULES = ("request", "runtime", "wizard", "wizard_configuration", "wizard_settings", "wizard_state", "wizard_steps")
+CHAT_MODULES = ("chat", "chat_codec", "chat_destination_cache", "chat_head", "chat_member", "chat_object_cache", "chat_types", "topic_sync")
+LINK_MODULES = ("callback_sessions", "link_actions", "link_completion", "link_service", "recipient_suggestions")
+HISTORY_MODULES = ("history_replay", "msglog_ingestion", "msglog_reconstruction", "msglog_scan")
+DELIVERY_MODULES = (
+    "commands",
+    "master_delivery",
+    "master_inbound",
+    "master_message",
+    "master_mutations",
+    "message",
+    "msg_type",
+    "oversized_notice",
+    "slave_delivery_helpers",
+    "slave_delivery_types",
+    "slave_file_delivery",
+    "slave_file_transfer",
+    "slave_image_delivery",
+    "slave_media_delivery",
+    "slave_message",
+    "slave_message_claims",
+    "slave_routing",
+    "slave_status",
+    "slave_text_delivery",
+)
+OUTBOUND_MODULES = ("auxiliary_bot", "membership_lifecycle", "outbound", "outbound_execution", "outbound_types", "sender_policy")
+CORE_MODULES = ("constants", "db", "etm_metrics", "legacy_outbound_retirement", "locale_mixin", "media", "models", "paths", "ptb_compat", "utils")
 
 
 def test_setuptools_configuration_discovers_only_project_packages():
@@ -77,6 +103,17 @@ def test_runtime_and_configuration_packages_are_discoverable_without_root_aliase
     packages = configuration["tool"]["setuptools"]["packages"]
 
     for package, modules in (("runtime", RUNTIME_MODULES), ("config", CONFIG_MODULES)):
+        assert f"efb_telegram_master.{package}" in packages
+        for module in modules:
+            assert import_module(f"efb_telegram_master.{package}.{module}")
+            assert not (ROOT / "efb_telegram_master" / f"{module}.py").exists()
+
+
+def test_capability_packages_are_discoverable_without_root_aliases():
+    configuration = read_configuration(str(ROOT / "pyproject.toml"), expand=True)
+    packages = configuration["tool"]["setuptools"]["packages"]
+
+    for package, modules in (("chat", CHAT_MODULES), ("link", LINK_MODULES), ("history", HISTORY_MODULES), ("delivery", DELIVERY_MODULES), ("outbound", OUTBOUND_MODULES), ("core", CORE_MODULES)):
         assert f"efb_telegram_master.{package}" in packages
         for module in modules:
             assert import_module(f"efb_telegram_master.{package}.{module}")

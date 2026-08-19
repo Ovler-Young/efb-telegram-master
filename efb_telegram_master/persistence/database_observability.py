@@ -27,7 +27,7 @@ class ObservedRepository:
 
     @contextmanager
     def _bound_models(self):
-        from ..models import DATABASE_MODELS
+        from ..core.models import DATABASE_MODELS
 
         if not self._bind_models:
             yield

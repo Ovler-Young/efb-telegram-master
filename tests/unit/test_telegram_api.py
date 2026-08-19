@@ -6,8 +6,8 @@ import pytest
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import ChatMigrated
 
-from efb_telegram_master.outbound import OutboundQueue
-from efb_telegram_master.outbound_types import QueueEnqueueError, SendReceipt
+from efb_telegram_master.outbound.outbound import OutboundQueue
+from efb_telegram_master.outbound.outbound_types import QueueEnqueueError, SendReceipt
 from efb_telegram_master.transport.telegram_api import TelegramAPI
 
 _MAIN_ROUTING_KWARGS = {"_sender_bot_id": "aux-7", "_slave_id": "slave.chat", "_force_main_bot": True}

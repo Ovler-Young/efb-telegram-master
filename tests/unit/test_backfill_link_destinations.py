@@ -4,8 +4,8 @@ from unittest.mock import Mock, patch
 import pytest
 from ehforwarderbot.types import ChatID, ModuleID
 
-from efb_telegram_master import utils
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.core import utils
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
 from tests.unit.backfill_support import _add_chat_association, _build_link_update, _cleanup_link_state, _link_chat_update, _link_completion_service, _sent_link_message, _store_link_session
 
 
@@ -196,7 +196,7 @@ def test_private_callback_relink_uses_the_previous_supergroup_history_location()
     )
     service = _link_completion_service(storage_key, chat)
 
-    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
+    with patch("efb_telegram_master.link.link_completion.coordinator.get_module_by_id"):
         service.complete(_build_link_update(-100500), [token])
 
     history_calls = [call for call in service.bot.send_message.call_args_list if "previously linked" in call.kwargs.get("text", "")]

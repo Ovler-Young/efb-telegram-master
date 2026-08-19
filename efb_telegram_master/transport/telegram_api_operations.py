@@ -13,8 +13,8 @@ import telegram.error
 from telegram import File, ForumTopic, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext
 
-from ..outbound import OutboundQueue
-from ..outbound_types import QueueEnqueueError, QueueRequest, SchedulerStoppedError, SendReceipt, UploadCleanup, cleanup_upload_paths, rewind_uploads
+from ..outbound.outbound import OutboundQueue
+from ..outbound.outbound_types import QueueEnqueueError, QueueRequest, SchedulerStoppedError, SendReceipt, UploadCleanup, cleanup_upload_paths, rewind_uploads
 from .telegram_calls import QUEUED_OPERATIONS, stripped_telegram_kwargs
 
 if TYPE_CHECKING:

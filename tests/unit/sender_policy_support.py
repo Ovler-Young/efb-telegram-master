@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from efb_telegram_master.outbound_types import QueuedCall
+from efb_telegram_master.outbound.outbound_types import QueuedCall
+from efb_telegram_master.outbound.sender_policy import SenderPolicy
 from efb_telegram_master.runtime.bot_pool import BotPool
-from efb_telegram_master.sender_policy import SenderPolicy
 
 
 class Limiter:

@@ -3,8 +3,8 @@ from uuid import uuid4
 
 import pytest
 
-from efb_telegram_master import utils as etm_utils
-from efb_telegram_master.utils import TelegramChatID
+from efb_telegram_master.core import utils as etm_utils
+from efb_telegram_master.core.utils import TelegramChatID
 
 from .test_backfill_history_ingestion import STREAM_MESSAGE_COUNT, STREAM_SETTLE_TIMEOUT, expected_stream_indices, extract_stream_indices, messages_since_id, start_mock_stream, wait_for_stream_stable
 from .test_backfill_history_lifecycle import target_migration_entry_count, wait_for_migrated_stream_terminal

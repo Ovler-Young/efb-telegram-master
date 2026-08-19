@@ -4,9 +4,9 @@ from unittest.mock import Mock, patch
 import pytest
 from telegram.ext import ConversationHandler
 
-from efb_telegram_master import utils
-from efb_telegram_master.constants import Flags
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.core import utils
+from efb_telegram_master.core.constants import Flags
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
 from tests.unit.chat_binding_support import callback_update, create_link_manager, store_callback_session
 
 
@@ -27,7 +27,7 @@ def test_link_actions_accept_zero_index_after_second_page_selection(linked, call
     manager.callback_sessions.lookup(storage_id).offset = manager.channel.flag("chats_per_page")
     manager.logger = Mock()
 
-    with patch("efb_telegram_master.link_actions.get_bot_user", return_value=SimpleNamespace(username="test_bot")):
+    with patch("efb_telegram_master.link.link_actions.get_bot_user", return_value=SimpleNamespace(username="test_bot")):
         assert manager.confirm(callback_update(*storage_id, "chat 10"), None) == Flags.LINK_EXEC
 
     assert manager.callback_sessions.lookup(storage_id).chats == [selected_chat]

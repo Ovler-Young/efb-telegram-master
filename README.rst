@@ -40,25 +40,28 @@ Architecture and Development Navigation
 ---------------------------------------
 
 - ``efb_telegram_master.TelegramChannel`` is the EFB entry point.
-  ``channel_composition.py`` constructs its collaborators after database
-  initialization.
+  ``runtime/channel_composition.py`` constructs its collaborators after
+  database initialization.
 - ``transport/`` owns the python-telegram-bot application, polling lifecycle,
   synchronous Bot API facade, call adaptation, and error routing.
-  ``bot_manager.py`` coordinates Telegram resources for the channel.
-- ``db.py`` owns database connection setup and schema migration.
-  ``persistence/`` owns the database-backed repositories, their registry, and
-  shared repository observability.
-- ``master_inbound.py`` resolves Telegram updates for delivery to slave
-  channels. ``master_delivery.py`` performs that delivery.
-  ``slave_message.py`` accepts slave messages for Telegram delivery, and
-  ``outbound.py`` owns the queued Telegram-call execution path.
+  ``runtime/bot_manager.py`` coordinates Telegram resources for the channel.
+- ``core/`` owns shared models, database construction, compatibility helpers,
+  metrics, paths, media conversion, and common utilities. ``persistence/``
+  owns database-backed repositories and migrations.
+- ``chat/`` owns chat and topic state. ``link/`` owns linking callbacks and
+  recipient selection. ``history/`` owns replay and MsgLog ingestion.
+- ``delivery/`` owns inbound update handling and message delivery.
+  ``outbound/`` owns queued calls, sender policy, and auxiliary bot behavior.
+- Consumers import concrete modules from these capability packages. The
+  package root exposes only the channel entry point and version.
 
 Directional ownership flow::
 
-    entry/composition [TelegramChannel, channel_composition]
+    entry/composition [TelegramChannel, runtime/channel_composition]
         -> runtime/transport [transport/telegram_runtime.py, transport/telegram_api.py]
-        -> inbound/outbound [master_inbound.py, outbound.py]
-        -> persistence/MsgLog [persistence/, MsgLogRepository]
+        -> delivery/outbound [delivery/master_inbound.py, outbound/outbound.py]
+        -> chat/link/history [chat/, link/, history/]
+        -> core/persistence [core/, persistence/]
 
 Validate a checkout with:
 

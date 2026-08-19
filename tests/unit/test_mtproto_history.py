@@ -6,8 +6,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
-from efb_telegram_master.msglog_scan import MsgLogScanScheduler
+from efb_telegram_master.history.msglog_ingestion import MsgLogIngestionService
+from efb_telegram_master.history.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.runtime.mtproto import MTProtoClient, MTProtoConfig
 from tests.unit.mtproto_support import FakeClient
 

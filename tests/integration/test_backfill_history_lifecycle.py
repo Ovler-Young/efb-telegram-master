@@ -2,8 +2,8 @@ import asyncio
 import time
 from typing import List, Set
 
-from efb_telegram_master import utils as etm_utils
-from efb_telegram_master.models import HistoryMigrationEntry
+from efb_telegram_master.core import utils as etm_utils
+from efb_telegram_master.core.models import HistoryMigrationEntry
 
 from .test_backfill_history_ingestion import POLL_INTERVAL_SECONDS, expected_stream_indices, extract_stream_indices, logs_with_prefix, messages_since_id
 

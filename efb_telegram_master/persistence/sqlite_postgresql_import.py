@@ -11,8 +11,8 @@ from typing import Any
 
 from peewee import AutoField, Model, chunked
 
-from ..legacy_outbound_retirement import LegacyOutboundRetirement
-from ..models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
+from ..core.legacy_outbound_retirement import LegacyOutboundRetirement
+from ..core.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
 from .schema_migration import DatabaseSchemaMigrator
 
 

@@ -1,16 +1,17 @@
 import pickle
 import re
+import sys
 from datetime import datetime
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ehforwarderbot.chat import GroupChat, PrivateChat, SystemChat
 from pytest import fixture
 
-from efb_telegram_master import chat as chat_module
-from efb_telegram_master.chat_codec import convert_chat, unpickle
-from efb_telegram_master.chat_member import ETMChatMember, ETMSelfChatMember, ETMSystemChatMember
-from efb_telegram_master.chat_types import ETMGroupChat, ETMPrivateChat, ETMSystemChat
+from efb_telegram_master.chat import chat as chat_module
+from efb_telegram_master.chat.chat_codec import convert_chat, unpickle
+from efb_telegram_master.chat.chat_member import ETMChatMember, ETMSelfChatMember, ETMSystemChatMember
+from efb_telegram_master.chat.chat_types import ETMGroupChat, ETMPrivateChat, ETMSystemChat
 
 
 @fixture(scope="module")
@@ -102,18 +103,18 @@ def test_last_message_time_uses_ttl_cache():
         name="Chat",
     )
 
-    with patch("efb_telegram_master.chat.time.time", return_value=100.0):
+    with patch("efb_telegram_master.chat.chat.time.time", return_value=100.0):
         assert chat.last_message_time == first_time
         assert chat.last_message_time == first_time
 
     assert db.msglogs.get_last_message.call_count == 1
 
-    with patch("efb_telegram_master.chat.time.time", return_value=160.0):
+    with patch("efb_telegram_master.chat.chat.time.time", return_value=160.0):
         assert chat.last_message_time == first_time
 
     assert db.msglogs.get_last_message.call_count == 1
 
-    with patch("efb_telegram_master.chat.time.time", return_value=161.0):
+    with patch("efb_telegram_master.chat.chat.time.time", return_value=161.0):
         assert chat.last_message_time == second_time
 
     assert db.msglogs.get_last_message.call_count == 2
@@ -170,6 +171,28 @@ def test_etm_chat_unpickles_legacy_concrete_class_path(db, slave, monkeypatch):
 
     assert type(recovered) is ETMPrivateChat
     assert not hasattr(chat_module, "ETMPrivateChat")
+
+
+def test_etm_chat_unpickles_legacy_chat_type_and_member_paths(db, slave, monkeypatch):
+    chat = convert_chat(db, chat=slave.chat_with_alias)
+    legacy_types = ModuleType("efb_telegram_master.chat_types")
+    legacy_members = ModuleType("efb_telegram_master.chat_member")
+    legacy_types.ETMPrivateChat = ETMPrivateChat
+    legacy_members.ETMChatMember = ETMChatMember
+    legacy_members.ETMSelfChatMember = ETMSelfChatMember
+    monkeypatch.setitem(sys.modules, legacy_types.__name__, legacy_types)
+    monkeypatch.setitem(sys.modules, legacy_members.__name__, legacy_members)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(ETMPrivateChat, "__module__", legacy_types.__name__)
+        patcher.setattr(ETMChatMember, "__module__", legacy_members.__name__)
+        patcher.setattr(ETMSelfChatMember, "__module__", legacy_members.__name__)
+        legacy_pickle = pickle.dumps(chat)
+
+    recovered = unpickle(legacy_pickle, db)
+
+    assert type(recovered) is ETMPrivateChat
+    assert type(recovered.other) is ETMChatMember
+    assert type(recovered.self) is ETMSelfChatMember
 
 
 def test_etm_chat_copy(db, slave):

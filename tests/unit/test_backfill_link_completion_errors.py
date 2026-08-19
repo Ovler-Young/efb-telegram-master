@@ -4,11 +4,11 @@ from unittest.mock import Mock, patch
 from ehforwarderbot.types import ChatID, ModuleID
 from telegram import Update
 
-from efb_telegram_master import utils
-from efb_telegram_master.history_replay import HistoryReplayWorker
-from efb_telegram_master.models import HistoryMigrationEntry
+from efb_telegram_master.core import utils
+from efb_telegram_master.core.models import HistoryMigrationEntry
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.history.history_replay import HistoryReplayWorker
 from efb_telegram_master.runtime.channel_commands import TelegramCommandService
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 from tests.unit.backfill_support import _build_link_update, _cleanup_link_state, _link_completion_service
 
 
@@ -32,7 +32,7 @@ def test_private_callback_automatic_empty_backfill_omits_an_invalid_history_url(
     chat = SimpleNamespace(module_id=ModuleID("tests.slave"), uid=ChatID("chat"), linked=[], full_name="Test chat", link=Mock())
     service = _link_completion_service(storage_key, chat)
 
-    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
+    with patch("efb_telegram_master.link.link_completion.coordinator.get_module_by_id"):
         service.complete(_build_link_update(-100500), [token])
 
     service.history_replay.start.assert_called_once_with("tests.slave chat", -100500, None, storage_key)

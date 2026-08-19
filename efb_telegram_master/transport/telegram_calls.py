@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import telegram.constants
 import telegram.error
 
-from ..outbound_types import QueuedCall, SenderSelection, SendReceipt, TelegramArgs, TelegramKwargs, rewind_uploads
+from ..outbound.outbound_types import QueuedCall, SenderSelection, SendReceipt, TelegramArgs, TelegramKwargs, rewind_uploads
 
 if TYPE_CHECKING:
     from ..runtime.bot_pool import BotPool

@@ -8,15 +8,15 @@ from ehforwarderbot.types import MessageID
 from peewee import SqliteDatabase
 from prometheus_client import generate_latest
 
-from efb_telegram_master import utils
-from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import MsgLog, TopicAssoc
-from efb_telegram_master.msg_type import TGMsgType
-from efb_telegram_master.outbound_types import SendReceipt
+from efb_telegram_master.core import utils
+from efb_telegram_master.core.etm_metrics import Metrics
+from efb_telegram_master.core.models import MsgLog, TopicAssoc
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
+from efb_telegram_master.delivery.message import ETMMsg
+from efb_telegram_master.delivery.msg_type import TGMsgType
+from efb_telegram_master.delivery.slave_message import SlaveMessageService
+from efb_telegram_master.outbound.outbound_types import SendReceipt
 from efb_telegram_master.persistence.msglog_repository import MsgLogRepository
-from efb_telegram_master.slave_message import SlaveMessageService
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 
 
 def test_database_method_metrics_record_bounded_public_operation_labels(channel):

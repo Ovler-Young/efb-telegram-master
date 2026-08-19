@@ -5,8 +5,8 @@ import pytest
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ConversationHandler
 
-from efb_telegram_master.commands import CommandsManager, ETMCommandMsgStorage
-from efb_telegram_master.constants import Flags
+from efb_telegram_master.core.constants import Flags
+from efb_telegram_master.delivery.commands import CommandsManager, ETMCommandMsgStorage
 
 
 def _callback_update(chat_id, message_id, data, user_id=1):

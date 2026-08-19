@@ -2,7 +2,7 @@ import re
 
 import pytest
 
-from efb_telegram_master import utils
+from efb_telegram_master.core import utils
 
 from .helper.filter_chats import in_chats
 from .helper.filter_content import regex

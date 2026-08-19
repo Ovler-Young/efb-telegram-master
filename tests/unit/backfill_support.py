@@ -10,11 +10,11 @@ from unittest.mock import Mock
 from ehforwarderbot.types import ChatID, ModuleID
 from telegram import Update
 
-from efb_telegram_master import utils
-from efb_telegram_master.callback_sessions import CallbackSessionStore, ChatListStorage
-from efb_telegram_master.constants import Flags
-from efb_telegram_master.link_completion import LinkCompletionService
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.core import utils
+from efb_telegram_master.core.constants import Flags
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.link.callback_sessions import CallbackSessionStore, ChatListStorage
+from efb_telegram_master.link.link_completion import LinkCompletionService
 
 
 def _build_link_update(chat_id, *, is_forum=False, user_id=1):

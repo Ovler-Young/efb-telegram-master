@@ -4,7 +4,7 @@ from typing import Any
 from peewee import Model, PostgresqlDatabase, SqliteDatabase, TextField
 from playhouse.migrate import Operation, PostgresqlMigrator, SqliteMigrator, migrate
 
-from ..models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
+from ..core.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
 
 
 class DatabaseSchemaMigrator:

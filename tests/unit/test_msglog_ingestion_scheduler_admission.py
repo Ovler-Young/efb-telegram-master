@@ -2,7 +2,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from efb_telegram_master.msglog_scan import MsgLogScanScheduler
+from efb_telegram_master.history.msglog_scan import MsgLogScanScheduler
 
 
 def test_association_reschedule_reports_queued_when_resume_has_pending_source():

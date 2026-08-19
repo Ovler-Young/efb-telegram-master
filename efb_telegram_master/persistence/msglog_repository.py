@@ -9,9 +9,9 @@ from ehforwarderbot.types import MessageID
 from peewee import DoesNotExist, PostgresqlDatabase, fn
 from telegram import Message
 
-from ..message import ETMMsg
-from ..models import MsgLog, PickledDict
-from ..utils import EFBChannelChatIDStr, OldMsgID, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, chat_id_to_str, message_id_to_str
+from ..core.models import MsgLog, PickledDict
+from ..core.utils import EFBChannelChatIDStr, OldMsgID, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, chat_id_to_str, message_id_to_str
+from ..delivery.message import ETMMsg
 from .database_observability import ObservedRepository, observe_database_method
 
 

@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 from peewee import PostgresqlDatabase
 
-from efb_telegram_master.models import DATABASE_MODELS, MsgLog, MsgLogIngestionScan
-from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
+from efb_telegram_master.core.models import DATABASE_MODELS, MsgLog, MsgLogIngestionScan
+from efb_telegram_master.history.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from tests.unit.msglog_ingestion_support import FakeChatAssociations, FakeDatabase, FakeMTProto, sqlite_ingestion_database, topic_message
 

@@ -2,14 +2,14 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from efb_telegram_master.history_replay import HistoryReplayShutdownTimeout, HistoryReplayWorker
+from efb_telegram_master.history.history_replay import HistoryReplayShutdownTimeout, HistoryReplayWorker
 
 
 def test_history_replay_resume_starts_a_worker_for_queued_entries():
     history_migrations = Mock(has_pending_entries=Mock(return_value=True))
     manager = HistoryReplayWorker(Mock(), Mock(), history_migrations, Mock(), Mock())
 
-    with patch("efb_telegram_master.history_replay.threading.Thread") as thread:
+    with patch("efb_telegram_master.history.history_replay.threading.Thread") as thread:
         assert manager.resume() is True
 
     thread.return_value.start.assert_called_once()

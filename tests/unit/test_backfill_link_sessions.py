@@ -4,9 +4,9 @@ from unittest.mock import ANY, Mock, patch
 import pytest
 from ehforwarderbot.types import ChatID, ModuleID
 
-from efb_telegram_master import utils
-from efb_telegram_master.constants import Flags
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.core import utils
+from efb_telegram_master.core.constants import Flags
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
 from tests.unit.backfill_support import _build_link_update, _cleanup_link_state, _link_chat_update, _link_completion_service, _sent_link_message
 
 
@@ -17,7 +17,7 @@ def test_link_completion_reads_multiple_slave_setting_at_completion_time():
     multiple_slave_chats = Mock(return_value=False)
     service = _link_completion_service(storage_key, chat, multiple_slave_chats)
 
-    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
+    with patch("efb_telegram_master.link.link_completion.coordinator.get_module_by_id"):
         service.complete(_build_link_update(-100500), [token])
 
     multiple_slave_chats.assert_called_once_with()
@@ -30,7 +30,7 @@ def test_link_completion_rejects_an_inactive_slave_without_consuming_its_session
     chat = SimpleNamespace(module_id=ModuleID("tests.inactive_slave"), uid=ChatID("chat"), linked=[], full_name="Inactive chat", link=Mock())
     service = _link_completion_service(storage_key, chat)
 
-    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id", side_effect=NameError):
+    with patch("efb_telegram_master.link.link_completion.coordinator.get_module_by_id", side_effect=NameError):
         service.complete(_build_link_update(-100500), [token])
 
     service.bot.edit_message_text.assert_called_once_with(
@@ -60,7 +60,7 @@ def test_forged_start_token_does_not_consume_the_owner_session():
     assert service.callback_sessions.lookup(storage_key) is not None
     assert storage_key in service._conversation_handler._conversations
 
-    with patch("efb_telegram_master.link_completion.coordinator.get_module_by_id"):
+    with patch("efb_telegram_master.link.link_completion.coordinator.get_module_by_id"):
         service.complete(_build_link_update(-100500), [token])
     chat.link.assert_called_once()
     assert service.callback_sessions.lookup(storage_key) is None

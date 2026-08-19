@@ -6,8 +6,8 @@ from ehforwarderbot.types import ChatID, ModuleID
 from telegram import Update
 from telegram.error import ChatMigrated
 
-from efb_telegram_master import utils
-from efb_telegram_master.outbound_types import SchedulerStoppedError
+from efb_telegram_master.core import utils
+from efb_telegram_master.outbound.outbound_types import SchedulerStoppedError
 from efb_telegram_master.transport.telegram_error_router import TelegramErrorRouter
 
 

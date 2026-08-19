@@ -11,7 +11,7 @@ from telethon import TelegramClient
 from telethon.tl.types import ChannelParticipantsAdmins
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TgChatMsgIDStr, b64de, chat_id_to_str, message_id_str_to_id
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID, TgChatMsgIDStr, b64de, chat_id_to_str, message_id_str_to_id
 
 from .helper.filter_chats import in_chats
 from .helper.filter_content import has_button, text

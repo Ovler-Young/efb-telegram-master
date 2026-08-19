@@ -4,7 +4,7 @@ import threading
 import time
 from typing import List, Set
 
-from efb_telegram_master import utils as etm_utils
+from efb_telegram_master.core import utils as etm_utils
 
 STREAM_INTERVAL_SECONDS = 0.5
 STREAM_DURATION_SECONDS = 60.0

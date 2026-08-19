@@ -8,7 +8,7 @@ from ruamel.yaml import YAML
 from telegram import Bot
 
 from .. import TelegramChannel
-from ..paths import LOCALE_DIR, get_config_path
+from ..core.paths import LOCALE_DIR, get_config_path
 from .wizard_configuration import WizardConfiguration
 
 translator = translation("efb_telegram_master", str(LOCALE_DIR), fallback=True)

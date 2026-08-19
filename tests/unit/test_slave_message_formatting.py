@@ -5,8 +5,8 @@ from ehforwarderbot import Chat, Message
 from ehforwarderbot.chat import ChatMember
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from efb_telegram_master.constants import Emoji
-from efb_telegram_master.slave_delivery_helpers import chat_info_keyboard, reactions_footer
+from efb_telegram_master.core.constants import Emoji
+from efb_telegram_master.delivery.slave_delivery_helpers import chat_info_keyboard, reactions_footer
 from tests.mocks.slave.channel import MockSlaveChannel
 
 

@@ -5,9 +5,9 @@ from unittest.mock import ANY, Mock, patch
 
 import pytest
 
-from efb_telegram_master.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
-from efb_telegram_master.msglog_scan import MsgLogScanShutdownTimeout
-from efb_telegram_master.outbound_types import OutboundShutdownTimeout
+from efb_telegram_master.history.msglog_scan import MsgLogScanShutdownTimeout
+from efb_telegram_master.outbound.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
+from efb_telegram_master.outbound.outbound_types import OutboundShutdownTimeout
 from efb_telegram_master.runtime.bot_manager import TelegramBotManager, TelegramResourceShutdownError
 from efb_telegram_master.runtime.bot_pool import BotPool
 from efb_telegram_master.transport.telegram_api import TelegramAPI
@@ -54,7 +54,7 @@ def test_manager_runtime_stop_releases_a_real_membership_worker() -> None:
     async def get_chat_member(*_args):
         return SimpleNamespace(status="member")
 
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot"):
         auxiliary = AuxiliaryBot("123:token")
     auxiliary.bot_id = 10
     auxiliary._runtime = Runtime()

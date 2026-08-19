@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 from ehforwarderbot import utils
 from peewee import PostgresqlDatabase, SqliteDatabase
 
-from ..legacy_outbound_retirement import LegacyOutboundRetirement
+from ..core.legacy_outbound_retirement import LegacyOutboundRetirement
 from .schema_migration import DatabaseSchemaMigrator
 from .sqlite_postgresql_import import SQLitePostgresqlImportCoordinator
 

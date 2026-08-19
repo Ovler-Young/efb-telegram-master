@@ -4,9 +4,9 @@ from unittest.mock import Mock, patch
 import pytest
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ConversationHandler
 
-from efb_telegram_master.callback_sessions import ChatListStorage
-from efb_telegram_master.constants import Flags
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.core.constants import Flags
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.link.callback_sessions import ChatListStorage
 from tests.unit.chat_binding_support import callback_chat, callback_update, create_link_action_service, create_link_manager, dispatch_callback, store_callback_session
 
 

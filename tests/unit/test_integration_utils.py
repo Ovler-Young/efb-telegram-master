@@ -3,9 +3,9 @@ from typing import cast
 
 import pytest
 
-from efb_telegram_master import utils as etm_utils
-from efb_telegram_master.chat_destination_cache import ChatDestinationCache
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.chat.chat_destination_cache import ChatDestinationCache
+from efb_telegram_master.core import utils as etm_utils
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
 from tests.integration import test_master_message_destination as destination_tests
 from tests.integration import utils as integration_utils
 

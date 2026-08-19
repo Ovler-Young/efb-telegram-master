@@ -8,9 +8,9 @@ from prometheus_client import generate_latest
 from telegram.constants import MessageLimit
 from telegram.error import RetryAfter
 
-from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.outbound import OutboundQueue
-from efb_telegram_master.outbound_types import (
+from efb_telegram_master.core.etm_metrics import Metrics
+from efb_telegram_master.outbound.outbound import OutboundQueue
+from efb_telegram_master.outbound.outbound_types import (
     OutboundLifecycle,
     OutboundShutdownTimeout,
     QueueRequest,

@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import pytest
 from peewee import IndexMetadata, PostgresqlDatabase, SqliteDatabase
 
-from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
+from efb_telegram_master.core.db import DatabaseManager
+from efb_telegram_master.core.legacy_outbound_retirement import LegacyOutboundRetirement
 from efb_telegram_master.persistence import database_initializer
 from tests.support.legacy_outbound_schema import create_legacy_outbound_schema
 

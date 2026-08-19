@@ -6,8 +6,8 @@ import pytest
 from peewee import SqliteDatabase
 from prometheus_client import generate_latest
 
-from efb_telegram_master.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
-from efb_telegram_master.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc
+from efb_telegram_master.core.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
+from efb_telegram_master.core.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc
 from efb_telegram_master.persistence.chat_association_repository import ChatAssociationRepository
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.persistence.msglog_repository import MsgLogRepository
@@ -139,7 +139,7 @@ def test_process_collector_logs_a_repeated_failure_once_and_keeps_other_metrics(
         network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=1),
     )
 
-    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.etm_metrics"):
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.core.etm_metrics"):
         first_scrape = generate_latest(metrics.registry).decode()
         second_scrape = generate_latest(metrics.registry).decode()
 
@@ -166,7 +166,7 @@ def test_process_collector_renders_supported_process_observations():
 def test_process_collector_omits_unsupported_io_observations_without_suppressing_network(caplog):
     metrics = Metrics(process_factory=NoIoProcess, network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=2))
 
-    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.etm_metrics"):
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.core.etm_metrics"):
         rendered = generate_latest(metrics.registry).decode()
         second_scrape = generate_latest(metrics.registry).decode()
 

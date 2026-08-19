@@ -1,7 +1,7 @@
 import pytest
 from peewee import SqliteDatabase
 
-from efb_telegram_master.models import DATABASE_MODELS, MsgLogIngestionScan
+from efb_telegram_master.core.models import DATABASE_MODELS, MsgLogIngestionScan
 from efb_telegram_master.persistence import schema_migration
 from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from tests.unit.msglog_schema_support import create_legacy_ingestion_scan_schema, create_old_msglog_schema, insert_legacy_ingestion_scan_rows, legacy_ingestion_scan_rows

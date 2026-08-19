@@ -3,7 +3,7 @@ from datetime import datetime
 
 from peewee import SqliteDatabase
 
-from efb_telegram_master.models import DATABASE_MODELS, HistoryMigrationEntry
+from efb_telegram_master.core.models import DATABASE_MODELS, HistoryMigrationEntry
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
 
 

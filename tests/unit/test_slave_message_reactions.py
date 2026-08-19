@@ -5,8 +5,8 @@ import pytest
 from ehforwarderbot.constants import MsgType
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 
-from efb_telegram_master.slave_delivery_types import DeliveryPlan
-from efb_telegram_master.slave_status import SlaveStatusService
+from efb_telegram_master.delivery.slave_delivery_types import DeliveryPlan
+from efb_telegram_master.delivery.slave_status import SlaveStatusService
 
 
 @pytest.mark.parametrize(

@@ -13,10 +13,10 @@ from ehforwarderbot.types import ChatID, ModuleID
 from telegram import Message, Update
 from telegram.ext import CallbackContext
 
-from .. import utils as etm_utils
-from ..outbound_types import SchedulerStoppedError
+from ..core import utils as etm_utils
+from ..core.ptb_compat import sync_reply_html
+from ..outbound.outbound_types import SchedulerStoppedError
 from ..persistence.chat_association_repository import ChatAssociationRepository
-from ..ptb_compat import sync_reply_html
 from .telegram_api import TelegramAPI
 
 

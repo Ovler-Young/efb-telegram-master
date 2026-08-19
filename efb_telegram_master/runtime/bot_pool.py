@@ -10,9 +10,9 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from typing import Optional, Protocol, cast
 
-from ..auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
 from ..config.request import RequestConfiguration, request_kwargs
 from ..config.runtime import AuxiliaryBotConfiguration
+from ..outbound.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
 from ..transport.telegram_sync_bridge import AsyncTelegramRuntime
 
 logger = logging.getLogger(__name__)

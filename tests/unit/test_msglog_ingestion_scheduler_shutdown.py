@@ -5,8 +5,8 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
-from efb_telegram_master.msglog_scan import MsgLogScanScheduler
+from efb_telegram_master.history.msglog_ingestion import MsgLogIngestionService
+from efb_telegram_master.history.msglog_scan import MsgLogScanScheduler
 
 
 class SharedAsyncRuntime:

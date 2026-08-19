@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 from peewee import SqliteDatabase
 
-from efb_telegram_master.models import DATABASE_MODELS, UTC_LEASE_CLOCK, MsgLogIngestionScan, SlaveMessageDelivery
-from efb_telegram_master.msglog_scan import MsgLogScanScheduler
+from efb_telegram_master.core.models import DATABASE_MODELS, UTC_LEASE_CLOCK, MsgLogIngestionScan, SlaveMessageDelivery
+from efb_telegram_master.history.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.persistence.slave_message_delivery_repository import SlaveMessageDeliveryRepository
 
@@ -91,7 +91,7 @@ def test_new_utc_scan_lease_and_scheduler_deferral_ignore_host_timezone():
         scheduler._pending_source_chat_ids = set()
         captured = {}
         scheduler._enqueue_locked = lambda source_chat_id, **kwargs: captured.update(source_chat_id=source_chat_id, **kwargs)
-        with patch("efb_telegram_master.msglog_scan.time.monotonic", return_value=100.0):
+        with patch("efb_telegram_master.history.msglog_scan.time.monotonic", return_value=100.0):
             scheduler._defer_unclaimed_scan_locked(100)
     finally:
         test_db.close()

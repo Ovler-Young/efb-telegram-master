@@ -21,26 +21,26 @@ from PIL import Image, WebPImagePlugin
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from . import utils as etm_utils
-from .__version__ import __version__
-from .config.runtime import RuntimeConfiguration, load_channel_config
-from .db import DatabaseManager
-from .message import ETMMsg
-from .runtime.bot_manager import TelegramBotManager, TelegramResourceShutdownError
-from .runtime.channel_composition import initialize_channel_components
-from .runtime.channel_locale import LocaleState
-from .runtime.rpc_utils import RPCUtilities
-from .utils import ExperimentalFlagsManager
+from efb_telegram_master.__version__ import __version__
+from efb_telegram_master.config.runtime import RuntimeConfiguration, load_channel_config
+from efb_telegram_master.core import utils as etm_utils
+from efb_telegram_master.core.db import DatabaseManager
+from efb_telegram_master.core.utils import ExperimentalFlagsManager
+from efb_telegram_master.delivery.message import ETMMsg
+from efb_telegram_master.runtime.bot_manager import TelegramBotManager, TelegramResourceShutdownError
+from efb_telegram_master.runtime.channel_composition import initialize_channel_components
+from efb_telegram_master.runtime.channel_locale import LocaleState
+from efb_telegram_master.runtime.rpc_utils import RPCUtilities
 
 if TYPE_CHECKING:
-    from .chat_object_cache import ChatObjectCacheManager
-    from .master_message import MasterMessageWorker
-    from .msglog_reconstruction import MsgLogReconstructor
-    from .runtime.bot_manager import TelegramBotManager
-    from .slave_message import SlaveMessageService
-    from .slave_status import SlaveStatusService
-    from .topic_sync import TopicGroupService
-    from .transport.telegram_runtime import TelegramPollingRuntime
+    from efb_telegram_master.chat.chat_object_cache import ChatObjectCacheManager
+    from efb_telegram_master.chat.topic_sync import TopicGroupService
+    from efb_telegram_master.delivery.master_message import MasterMessageWorker
+    from efb_telegram_master.delivery.slave_message import SlaveMessageService
+    from efb_telegram_master.delivery.slave_status import SlaveStatusService
+    from efb_telegram_master.history.msglog_reconstruction import MsgLogReconstructor
+    from efb_telegram_master.runtime.bot_manager import TelegramBotManager
+    from efb_telegram_master.transport.telegram_runtime import TelegramPollingRuntime
 
 
 class TelegramChannelInitializationCleanup:

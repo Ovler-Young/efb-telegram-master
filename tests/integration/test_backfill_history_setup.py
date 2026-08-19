@@ -7,10 +7,10 @@ from uuid import uuid4
 import pytest
 from ehforwarderbot.types import ChatID
 
-from efb_telegram_master import utils as etm_utils
-from efb_telegram_master.callback_sessions import ChatListStorage
-from efb_telegram_master.constants import Flags
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.core import utils as etm_utils
+from efb_telegram_master.core.constants import Flags
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.link.callback_sessions import ChatListStorage
 
 from .helper.messages import wait_for_new_message_after
 from .utils import get_start_link

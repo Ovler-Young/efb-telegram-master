@@ -17,14 +17,14 @@ from telegram import Message, Update
 from telegram.constants import ChatType
 from telegram.ext import CallbackContext
 
-from .. import utils as etm_utils
-from ..chat_object_cache import ChatObjectCacheManager
-from ..link_completion import LinkCompletionService
-from ..msglog_scan import MsgLogScanScheduler
+from ..chat.chat_object_cache import ChatObjectCacheManager
+from ..core import utils as etm_utils
+from ..core.ptb_compat import SupportsSendMessage, get_forwarded_chat, sync_reply_html, sync_reply_text
+from ..core.utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
+from ..history.msglog_scan import MsgLogScanScheduler
+from ..link.link_completion import LinkCompletionService
 from ..persistence.chat_association_repository import ChatAssociationRepository
 from ..persistence.msglog_repository import MsgLogRepository
-from ..ptb_compat import SupportsSendMessage, get_forwarded_chat, sync_reply_html, sync_reply_text
-from ..utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 from .channel_locale import LocaleState
 
 

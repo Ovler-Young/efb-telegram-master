@@ -13,7 +13,7 @@ import ehforwarderbot.coordinator
 from telegram.error import NetworkError, TimedOut
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.paths import get_config_path
+from efb_telegram_master.core.paths import get_config_path
 
 from .bot import get_bot
 from .mocks.slave.channel import MockSlaveChannel

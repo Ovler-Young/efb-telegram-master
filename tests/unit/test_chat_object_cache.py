@@ -4,7 +4,7 @@ from ehforwarderbot import coordinator
 from ehforwarderbot.chat import PrivateChat
 from pytest import fixture
 
-from efb_telegram_master.chat_object_cache import ChatObjectCacheManager
+from efb_telegram_master.chat.chat_object_cache import ChatObjectCacheManager
 
 
 @fixture(scope="function")

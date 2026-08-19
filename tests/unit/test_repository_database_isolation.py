@@ -1,7 +1,7 @@
 import pytest
 from peewee import SqliteDatabase
 
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, TopicAssoc
+from efb_telegram_master.core.models import ChatAssoc, HistoryMigrationEntry, TopicAssoc
 from efb_telegram_master.persistence.chat_association_repository import ChatAssociationRepository
 
 

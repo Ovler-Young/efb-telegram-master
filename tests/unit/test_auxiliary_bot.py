@@ -6,8 +6,8 @@ from unittest.mock import Mock, patch
 
 import telegram.error
 
-from efb_telegram_master.auxiliary_bot import AuxiliaryBot
-from efb_telegram_master.membership_lifecycle import MembershipLifecycle
+from efb_telegram_master.outbound.auxiliary_bot import AuxiliaryBot
+from efb_telegram_master.outbound.membership_lifecycle import MembershipLifecycle
 
 
 def _wait_for_probe(auxiliary: AuxiliaryBot) -> None:
@@ -18,7 +18,7 @@ def _wait_for_probe(auxiliary: AuxiliaryBot) -> None:
 
 
 def test_initialize_sets_identity() -> None:
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_class:
+    with patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot") as bot_class:
         bot_class.return_value.get_me = Mock(return_value=SimpleNamespace(id=123, username="auxbot"))
         auxiliary = AuxiliaryBot("123:token")
 
@@ -28,7 +28,7 @@ def test_initialize_sets_identity() -> None:
 
 
 def test_initialize_disables_forbidden_bot() -> None:
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_class:
+    with patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot") as bot_class:
         bot_class.return_value.get_me = Mock(side_effect=telegram.error.Forbidden("bad token"))
         auxiliary = AuxiliaryBot("123:token")
 
@@ -38,7 +38,7 @@ def test_initialize_disables_forbidden_bot() -> None:
 
 
 def test_rate_limit_delegation_uses_auxiliary_limiter() -> None:
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot"):
         auxiliary = AuxiliaryBot("123:token")
     limiter = Mock(peek_delay=Mock(return_value=1.5), try_acquire=Mock(return_value=False))
     auxiliary._rate_limiter = limiter
@@ -50,7 +50,7 @@ def test_rate_limit_delegation_uses_auxiliary_limiter() -> None:
 
 
 def test_auxiliary_delegates_membership_lifecycle_to_collaborator() -> None:
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot"):
         auxiliary = AuxiliaryBot("123:token")
 
     assert isinstance(auxiliary._membership_lifecycle, MembershipLifecycle)
@@ -69,7 +69,7 @@ def test_unknown_membership_admits_one_probe_and_records_result() -> None:
         assert release.wait(1)
         return SimpleNamespace(status="member")
 
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot"):
         auxiliary = AuxiliaryBot("123:token")
     auxiliary.bot_id = 123
     auxiliary.async_bot.get_chat_member.side_effect = get_chat_member
@@ -96,7 +96,7 @@ def test_membership_probe_timeout_keeps_membership_unknown() -> None:
     async def get_chat_member(*_args: object) -> SimpleNamespace:
         return SimpleNamespace(status="member")
 
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
+    with patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot"):
         auxiliary = AuxiliaryBot("123:token")
     auxiliary.bot_id = 123
     auxiliary._runtime = Runtime()
@@ -117,7 +117,11 @@ def test_shutdown_cancels_queued_work_and_waits_for_running_worker() -> None:
         assert release.wait(1)
         return SimpleNamespace(status="member")
 
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"), patch.object(AuxiliaryBot, "MEMBERSHIP_PROBE_WORKERS", 1), patch.object(AuxiliaryBot, "MAX_PENDING_MEMBERSHIP_PROBES", 2):
+    with (
+        patch("efb_telegram_master.outbound.auxiliary_bot.telegram.Bot"),
+        patch.object(AuxiliaryBot, "MEMBERSHIP_PROBE_WORKERS", 1),
+        patch.object(AuxiliaryBot, "MAX_PENDING_MEMBERSHIP_PROBES", 2),
+    ):
         auxiliary = AuxiliaryBot("123:token")
     auxiliary.bot_id = 123
     auxiliary.async_bot.get_chat_member.side_effect = get_chat_member

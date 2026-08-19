@@ -4,11 +4,11 @@ from unittest.mock import ANY, Mock
 import pytest
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ConversationHandler
 
-from efb_telegram_master.callback_sessions import CallbackSessionStore, ChatListStorage
-from efb_telegram_master.chat_head import ChatHeadService
-from efb_telegram_master.constants import Flags
-from efb_telegram_master.recipient_suggestions import RecipientSuggestionService
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.chat.chat_head import ChatHeadService
+from efb_telegram_master.core.constants import Flags
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.link.callback_sessions import CallbackSessionStore, ChatListStorage
+from efb_telegram_master.link.recipient_suggestions import RecipientSuggestionService
 from tests.unit.chat_binding_support import callback_chat, callback_update, create_link_manager, dispatch_callback
 
 

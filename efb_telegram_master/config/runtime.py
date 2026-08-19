@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from ehforwarderbot.types import ModuleID
 from ruamel.yaml import YAML
 
-from ..paths import get_config_path
+from ..core.paths import get_config_path
 from ..runtime.mtproto import MTProtoConfig
 from .request import RequestConfiguration, parse_request_configuration
 

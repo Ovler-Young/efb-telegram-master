@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 from peewee import SqliteDatabase
 
-from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery, TopicAssoc
+from efb_telegram_master.core.db import DatabaseManager
+from efb_telegram_master.core.models import ChatAssoc, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery, TopicAssoc
 from efb_telegram_master.persistence.sqlite_postgresql_import import SQLitePostgresqlImportCoordinator
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source
 

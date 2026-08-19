@@ -3,9 +3,9 @@ from unittest.mock import Mock
 
 from telegram import Update
 
-from efb_telegram_master.callback_sessions import CallbackSessionStore, ChatListStorage
-from efb_telegram_master.link_actions import LinkActionService
-from efb_telegram_master.link_service import LinkService
+from efb_telegram_master.link.callback_sessions import CallbackSessionStore, ChatListStorage
+from efb_telegram_master.link.link_actions import LinkActionService
+from efb_telegram_master.link.link_service import LinkService
 
 
 def callback_update(chat_id, message_id, data, user_id=1):

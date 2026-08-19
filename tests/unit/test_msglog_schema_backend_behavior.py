@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 from peewee import PostgresqlDatabase, SqliteDatabase
 
-from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import DATABASE_MODELS, MsgLogIngestionScan
+from efb_telegram_master.core.db import DatabaseManager
+from efb_telegram_master.core.models import DATABASE_MODELS, MsgLogIngestionScan
 from efb_telegram_master.persistence import database_initializer
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from tests.unit.msglog_schema_support import create_legacy_ingestion_scan_schema, insert_legacy_ingestion_scan_rows, legacy_ingestion_scan_rows, postgres_connection_kwargs

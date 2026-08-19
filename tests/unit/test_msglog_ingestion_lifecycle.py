@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from efb_telegram_master.models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan
-from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
+from efb_telegram_master.core.models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan
+from efb_telegram_master.history.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.runtime.mtproto import MTProtoRetryableError
 from tests.unit.msglog_ingestion_support import FakeChatAssociations, FakeDatabase, FakeMTProto, sqlite_ingestion_database, topic_message
 
@@ -50,7 +50,7 @@ def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_c
     db = FakeDatabase(scan_boundary=5)
     mtproto = FakeMTProto({}, error=MTProtoRetryableError("temporary"), scan_ceiling=5)
 
-    with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.history.msglog_ingestion"):
         asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     assert db.scan.status == "retryable-error"
@@ -125,7 +125,7 @@ def test_ingestion_logs_lease_loss_with_a_stable_event(caplog):
         raise MsgLogIngestionLeaseLostError()
 
     mtproto.get_input_channel = lose_lease
-    with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.history.msglog_ingestion"):
         asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     assert [(record.event, getattr(record, "error_type", None)) for record in caplog.records] == [
@@ -145,7 +145,7 @@ def test_ingestion_does_not_log_complete_when_lease_is_lost_at_completion(caplog
             return outcome
 
         ingestion.persist_item = persist_then_transfer_lease
-        with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+        with caplog.at_level(logging.INFO, logger="efb_telegram_master.history.msglog_ingestion"):
             asyncio.run(service.run(100, lease_owner="worker-a"))
         scan = MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == "100")
 
@@ -161,7 +161,7 @@ def test_ingestion_logs_unexpected_failure_with_error_type(caplog):
         raise ValueError("failed")
 
     mtproto.get_input_channel = fail
-    with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.history.msglog_ingestion"):
         asyncio.run(MsgLogIngestionService(db.msglog_ingestion, db.chat_associations, mtproto).run(100, lease_owner="worker-a"))
 
     assert db.scan.status == "error"

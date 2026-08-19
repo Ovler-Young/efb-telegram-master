@@ -7,8 +7,8 @@ from ehforwarderbot.exceptions import EFBChatNotFound, EFBException, EFBMessageT
 from telegram import Update
 from telegram.constants import FileSizeLimit
 
-from efb_telegram_master.master_delivery import MasterMessageDelivery
-from efb_telegram_master.utils import EFBChannelChatIDStr
+from efb_telegram_master.core.utils import EFBChannelChatIDStr
+from efb_telegram_master.delivery.master_delivery import MasterMessageDelivery
 
 
 def _delivery_for_error_reply() -> tuple[MasterMessageDelivery, Mock, Mock]:
@@ -41,8 +41,8 @@ def test_master_delivery_keeps_exception_text_out_of_replies_and_logs_context(mo
     message = SimpleNamespace(message_id=2, chat_id=1, chat=SimpleNamespace(id=1))
     update = Update(update_id=1, message=message)
     delivery, bot, logger = _delivery_for_error_reply()
-    monkeypatch.setattr("efb_telegram_master.master_delivery.coordinator.slaves", {"slave": Mock()})
-    monkeypatch.setattr("efb_telegram_master.master_delivery.get_msg_type", Mock(side_effect=error))
+    monkeypatch.setattr("efb_telegram_master.delivery.master_delivery.coordinator.slaves", {"slave": Mock()})
+    monkeypatch.setattr("efb_telegram_master.delivery.master_delivery.get_msg_type", Mock(side_effect=error))
 
     delivery.deliver(update, None, EFBChannelChatIDStr("slave chat"))
 
@@ -99,7 +99,7 @@ def test_edited_oversized_attachment_removal_skips_download_eligibility(monkeypa
         lambda destination, etm_message: removals.append((destination, etm_message)),
         Mock(),
     )
-    monkeypatch.setattr("efb_telegram_master.master_delivery.coordinator.slaves", {"slave": slave})
+    monkeypatch.setattr("efb_telegram_master.delivery.master_delivery.coordinator.slaves", {"slave": slave})
 
     delivery.deliver(update, None, EFBChannelChatIDStr("slave chat"), edited=SimpleNamespace(slave_message_id="old-message", file_unique_id="old-file"))
 

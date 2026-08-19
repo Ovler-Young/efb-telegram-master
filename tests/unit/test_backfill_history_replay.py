@@ -3,10 +3,10 @@ from unittest.mock import Mock
 
 from peewee import SqliteDatabase
 
-from efb_telegram_master.history_replay import HistoryReplayWorker, history_location_text
-from efb_telegram_master.models import DATABASE_MODELS, HistoryMigrationEntry
+from efb_telegram_master.core.models import DATABASE_MODELS, HistoryMigrationEntry
+from efb_telegram_master.core.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.history.history_replay import HistoryReplayWorker, history_location_text
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
 
 def test_empty_history_backfill_enqueues_one_location_notice_in_the_target_topic():

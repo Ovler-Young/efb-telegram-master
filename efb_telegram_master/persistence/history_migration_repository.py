@@ -7,8 +7,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from peewee import PostgresqlDatabase, SqliteDatabase
 
-from ..models import HistoryMigrationEntry
-from ..utils import EFBChannelChatIDStr, TelegramTopicID
+from ..core.models import HistoryMigrationEntry
+from ..core.utils import EFBChannelChatIDStr, TelegramTopicID
 from .database_observability import ObservedRepository, observe_database_method
 
 

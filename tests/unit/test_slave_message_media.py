@@ -10,13 +10,13 @@ from ehforwarderbot.types import MessageID
 from telegram import InputMediaPhoto
 from telegram.error import BadRequest
 
-from efb_telegram_master.oversized_notice import OversizedNoticeSender
-from efb_telegram_master.slave_delivery_helpers import REMOTE_IMAGE_URL_VENDOR_KEY
-from efb_telegram_master.slave_file_delivery import SlaveFileDelivery
-from efb_telegram_master.slave_file_transfer import SlaveFileTransfer
-from efb_telegram_master.slave_image_delivery import ImageDelivery
-from efb_telegram_master.slave_media_delivery import SlaveMediaDelivery
-from efb_telegram_master.slave_text_delivery import TextDelivery
+from efb_telegram_master.delivery.oversized_notice import OversizedNoticeSender
+from efb_telegram_master.delivery.slave_delivery_helpers import REMOTE_IMAGE_URL_VENDOR_KEY
+from efb_telegram_master.delivery.slave_file_delivery import SlaveFileDelivery
+from efb_telegram_master.delivery.slave_file_transfer import SlaveFileTransfer
+from efb_telegram_master.delivery.slave_image_delivery import ImageDelivery
+from efb_telegram_master.delivery.slave_media_delivery import SlaveMediaDelivery
+from efb_telegram_master.delivery.slave_text_delivery import TextDelivery
 
 
 def _processor():
@@ -97,7 +97,7 @@ def test_oversized_file_sends_current_bot_api_notice_for_new_message() -> None:
     processor = _processor()
     processor.bot.send_message.return_value = "sent"
     message = SimpleNamespace(edit_media=True, chat=SimpleNamespace(module_id="tests.slave", uid="chat"))
-    with patch("efb_telegram_master.oversized_notice.sync_reply_text") as reply:
+    with patch("efb_telegram_master.delivery.oversized_notice.sync_reply_text") as reply:
         sent, edit_media = processor.oversized_notice_sender.send(message, "Attachment exceeds the limit.", 100, 7, "header", "footer", "caption", None, 9, None, True)
     assert (sent, edit_media) == ("sent", True)
     assert processor.bot.send_message.call_args.kwargs["text"] == "caption"

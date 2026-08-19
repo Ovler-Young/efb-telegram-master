@@ -1,4 +1,4 @@
-from efb_telegram_master.outbound import OutboundQueue
+from efb_telegram_master.outbound.outbound import OutboundQueue
 
 
 class _Limiter:

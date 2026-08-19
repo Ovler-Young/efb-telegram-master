@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from peewee import SqliteDatabase
 
-from efb_telegram_master.models import DATABASE_MODELS, MsgLog, MsgLogIngestionScan
+from efb_telegram_master.core.models import DATABASE_MODELS, MsgLog, MsgLogIngestionScan
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 
 

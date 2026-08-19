@@ -6,9 +6,9 @@ from unittest.mock import Mock
 
 import pytest
 
-from efb_telegram_master.auxiliary_bot import MembershipProbeShutdownTimeout
 from efb_telegram_master.config.runtime import MAX_AUXILIARY_BOTS, load_channel_config
-from efb_telegram_master.outbound import DEFAULT_MAX_PENDING
+from efb_telegram_master.outbound.auxiliary_bot import MembershipProbeShutdownTimeout
+from efb_telegram_master.outbound.outbound import DEFAULT_MAX_PENDING
 from efb_telegram_master.runtime.bot_pool import BotPool
 
 
