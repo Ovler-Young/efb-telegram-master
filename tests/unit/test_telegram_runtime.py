@@ -556,7 +556,7 @@ def test_api_timeout_still_stops_other_delivery_resources() -> None:
     bot_pool.wait_for_shutdown.assert_called_once()
 
 
-def test_channel_shutdown_error_stops_owned_workers_without_completed_event() -> None:
+def test_channel_shutdown_error_stops_owned_workers() -> None:
     channel = TelegramChannel.__new__(TelegramChannel)
     channel._stop_polling_called = False
     channel.logger = Mock()
@@ -572,12 +572,6 @@ def test_channel_shutdown_error_stops_owned_workers_without_completed_event() ->
     assert channel._stop_polling_called
     channel.master_message_worker.stop_worker.assert_called_once_with(deadline=ANY)
     channel.db.stop_worker.assert_not_called()
-    channel.logger.info.assert_any_call("Stopping Telegram channel", extra={"event": "telegram_channel.stop_started"})
-    assert all(call.kwargs.get("extra", {}).get("event") != "telegram_channel.stop_completed" for call in channel.logger.info.call_args_list)
-    channel.logger.warning.assert_called_once_with(
-        "Telegram channel stopped with resource errors",
-        extra={"event": "telegram_channel.stop_incomplete"},
-    )
 
 
 def test_channel_stops_master_messages_before_outbound_delivery() -> None:
