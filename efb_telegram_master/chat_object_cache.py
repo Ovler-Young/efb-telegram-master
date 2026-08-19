@@ -7,9 +7,10 @@ from ehforwarderbot.exceptions import EFBChatNotFound
 from ehforwarderbot.types import ChatID, ModuleID
 from typing_extensions import Literal
 
-from .chat import ETMChatMixin, ETMSystemChat
+from .chat import ETMChatMixin
 from .chat_codec import convert_chat, unpickle
 from .chat_member import ETMChatMember
+from .chat_types import ETMSystemChat
 
 CacheKey = Tuple[ModuleID, ChatID]
 """Cache storage key: module_id, chat_id"""

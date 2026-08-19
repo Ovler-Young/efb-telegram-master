@@ -1,10 +1,12 @@
+import io
 import pickle
 from typing import TYPE_CHECKING, Union, overload
 
 from ehforwarderbot.chat import Chat, ChatMember, GroupChat, PrivateChat, SelfChatMember, SystemChat, SystemChatMember
 
-from .chat import ETMChatMixin, ETMGroupChat, ETMPrivateChat, ETMSystemChat
+from .chat import ETMChatMixin
 from .chat_member import ETMChatMember, ETMSelfChatMember
+from .chat_types import ETMGroupChat, ETMPrivateChat, ETMSystemChat
 
 if TYPE_CHECKING:
     from .db import DatabaseManager
@@ -120,8 +122,21 @@ def pickle_chat(chat: ETMChatMixin) -> bytes:
 def unpickle(data: bytes, db: "DatabaseManager") -> ETMChatMixin:
     if isinstance(data, memoryview):
         data = bytes(data)
-    obj = pickle.loads(data)
+    obj = _ChatUnpickler(io.BytesIO(data)).load()
     obj.db = db
     obj.chat_associations = db.chat_associations
     obj.slave_chat_info = db.slave_chat_info
     return obj
+
+
+class _ChatUnpickler(pickle.Unpickler):
+    _legacy_chat_types = {
+        "ETMPrivateChat": ETMPrivateChat,
+        "ETMSystemChat": ETMSystemChat,
+        "ETMGroupChat": ETMGroupChat,
+    }
+
+    def find_class(self, module: str, name: str):
+        if module == "efb_telegram_master.chat" and name in self._legacy_chat_types:
+            return self._legacy_chat_types[name]
+        return super().find_class(module, name)

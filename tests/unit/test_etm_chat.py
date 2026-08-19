@@ -1,3 +1,4 @@
+import pickle
 import re
 from datetime import datetime
 from types import SimpleNamespace
@@ -6,9 +7,10 @@ from unittest.mock import Mock, patch
 from ehforwarderbot.chat import GroupChat, PrivateChat, SystemChat
 from pytest import fixture
 
-from efb_telegram_master.chat import ETMGroupChat, ETMPrivateChat, ETMSystemChat
+from efb_telegram_master import chat as chat_module
 from efb_telegram_master.chat_codec import convert_chat, unpickle
 from efb_telegram_master.chat_member import ETMChatMember, ETMSelfChatMember, ETMSystemChatMember
+from efb_telegram_master.chat_types import ETMGroupChat, ETMPrivateChat, ETMSystemChat
 
 
 @fixture(scope="module")
@@ -155,6 +157,19 @@ def test_etm_chat_pickle(db, slave):
     for i in attributes:
         assert getattr(chat, i) == getattr(recovered, i)
     assert chat.db is recovered.db
+
+
+def test_etm_chat_unpickles_legacy_concrete_class_path(db, slave, monkeypatch):
+    chat = convert_chat(db, chat=slave.chat_with_alias)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(ETMPrivateChat, "__module__", "efb_telegram_master.chat")
+        patcher.setattr(chat_module, "ETMPrivateChat", ETMPrivateChat, raising=False)
+        legacy_pickle = pickle.dumps(chat)
+
+    recovered = unpickle(legacy_pickle, db)
+
+    assert type(recovered) is ETMPrivateChat
+    assert not hasattr(chat_module, "ETMPrivateChat")
 
 
 def test_etm_chat_copy(db, slave):

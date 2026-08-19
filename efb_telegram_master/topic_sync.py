@@ -20,7 +20,8 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import CallbackContext, CommandHandler, MessageHandler
 
 from . import utils
-from .chat import ETMChatMixin, ETMGroupChat
+from .chat import ETMChatMixin
+from .chat_types import ETMGroupChat
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramTopicID
 
