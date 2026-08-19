@@ -8,7 +8,7 @@ from telegram.error import RetryAfter
 
 from .outbound_types import ExecutorSubmitError, OutboundLifecycle, QueueError, SchedulerStoppedError, SenderSelection, cleanup_upload_paths, rewind_uploads
 from .sender_policy import retry_after_seconds
-from .telegram_calls import PrimaryExecution
+from .transport.telegram_calls import PrimaryExecution
 
 if TYPE_CHECKING:
     from .outbound import OutboundQueue, _PendingCall

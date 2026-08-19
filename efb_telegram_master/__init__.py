@@ -39,8 +39,8 @@ if TYPE_CHECKING:
     from .msglog_reconstruction import MsgLogReconstructor
     from .slave_message import SlaveMessageService
     from .slave_status import SlaveStatusService
-    from .telegram_runtime import TelegramPollingRuntime
     from .topic_sync import TopicGroupService
+    from .transport.telegram_runtime import TelegramPollingRuntime
 
 
 class TelegramChannelInitializationCleanup:

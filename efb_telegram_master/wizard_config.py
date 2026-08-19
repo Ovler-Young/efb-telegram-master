@@ -143,6 +143,6 @@ def build_bot(configuration: WizardConfiguration, token: Optional[str] = None) -
     bot_token = token or configuration.token
     if configuration.request is None:
         return Bot(token=bot_token)
-    from .telegram_runtime import build_request
+    from .transport.telegram_runtime import build_request
 
     return Bot(token=bot_token, request=build_request(configuration.request))

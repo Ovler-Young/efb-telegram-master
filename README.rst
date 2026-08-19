@@ -42,8 +42,9 @@ Architecture and Development Navigation
 - ``efb_telegram_master.TelegramChannel`` is the EFB entry point.
   ``channel_composition.py`` constructs its collaborators after database
   initialization.
-- ``telegram_runtime.py`` owns the python-telegram-bot application and polling
-  lifecycle. ``bot_manager.py`` coordinates Telegram resources for the channel.
+- ``transport/`` owns the python-telegram-bot application, polling lifecycle,
+  synchronous Bot API facade, call adaptation, and error routing.
+  ``bot_manager.py`` coordinates Telegram resources for the channel.
 - ``db.py`` owns database connection setup and schema migration.
   ``persistence/`` owns the database-backed repositories, their registry, and
   shared repository observability.
@@ -52,12 +53,20 @@ Architecture and Development Navigation
   ``slave_message.py`` accepts slave messages for Telegram delivery, and
   ``outbound.py`` owns the queued Telegram-call execution path.
 
+Directional ownership flow::
+
+    entry/composition [TelegramChannel, channel_composition]
+        -> runtime/transport [transport/telegram_runtime.py, transport/telegram_api.py]
+        -> inbound/outbound [master_inbound.py, outbound.py]
+        -> persistence/MsgLog [persistence/, MsgLogRepository]
+
 Validate a checkout with:
 
 .. code:: shell
 
     uv run --locked doit quality
     uv run --locked pytest tests/unit/test_packaging.py
+    uv run --locked pytest tests/unit/test_telegram_runtime_initialization.py tests/unit/test_telegram_runtime_lifecycle.py tests/unit/test_telegram_sync_bridge.py
     uv run --locked python -m compileall -q efb_telegram_master
 
 Getting Started

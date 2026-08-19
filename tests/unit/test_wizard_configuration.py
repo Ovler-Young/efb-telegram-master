@@ -60,7 +60,7 @@ def test_data_model_rejects_invalid_request_configuration_before_bot_constructio
 
 def test_build_bot_receives_typed_request_configuration(monkeypatch, tmp_path) -> None:
     wizard_config = importlib.import_module("efb_telegram_master.wizard_config")
-    telegram_runtime = importlib.import_module("efb_telegram_master.telegram_runtime")
+    telegram_runtime = importlib.import_module("efb_telegram_master.transport.telegram_runtime")
     config_path = tmp_path / "config.yaml"
     config_path.write_text("token: token\nrequest_kwargs:\n  read_timeout: 3\n")
     monkeypatch.setattr(wizard_config, "get_config_path", lambda channel_id: config_path)

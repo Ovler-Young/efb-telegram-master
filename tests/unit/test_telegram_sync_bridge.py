@@ -2,7 +2,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime
+from efb_telegram_master.transport.telegram_sync_bridge import AsyncTelegramRuntime
 
 
 def test_async_runtime_call_uses_bound_loop_without_starting_background_loop() -> None:
@@ -21,7 +21,7 @@ def test_async_runtime_call_uses_bound_loop_without_starting_background_loop() -
     coroutine = coroutine_function()
 
     try:
-        with patch("efb_telegram_master.telegram_sync_bridge.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
+        with patch("efb_telegram_master.transport.telegram_sync_bridge.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
             assert runtime.call(coroutine, timeout=7) == "ok"
     finally:
         coroutine.close()
@@ -54,7 +54,7 @@ def test_async_runtime_call_starts_background_loop_when_no_loop_is_ready() -> No
     coroutine = coroutine_function()
 
     try:
-        with patch("efb_telegram_master.telegram_sync_bridge.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
+        with patch("efb_telegram_master.transport.telegram_sync_bridge.asyncio.run_coroutine_threadsafe", return_value=future) as runner:
             assert runtime.call(coroutine) == "ok"
     finally:
         coroutine.close()

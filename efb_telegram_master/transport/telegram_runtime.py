@@ -18,7 +18,7 @@ from telegram.ext import Application, CallbackContext
 from telegram.request import HTTPXRequest
 from typing_extensions import NotRequired
 
-from .request_configuration import RequestConfiguration, parse_request_configuration
+from ..request_configuration import RequestConfiguration, parse_request_configuration
 from .telegram_application_lifecycle import LifecycleCallback, TelegramApplicationLifecycle
 from .telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
 

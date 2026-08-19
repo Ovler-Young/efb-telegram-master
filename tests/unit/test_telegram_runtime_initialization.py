@@ -11,7 +11,7 @@ from telegram import Update
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.master_message import MasterMessageWorker
-from efb_telegram_master.telegram_api import TelegramAPI
+from efb_telegram_master.transport.telegram_api import TelegramAPI
 
 
 def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_cleanup_errors(caplog) -> None:

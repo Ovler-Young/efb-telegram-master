@@ -8,7 +8,7 @@ from efb_telegram_master import TelegramChannel
 from efb_telegram_master.bot_manager import TelegramResourceShutdownError
 from efb_telegram_master.history_replay import HistoryReplayShutdownTimeout
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout
-from efb_telegram_master.telegram_api import TelegramAPI
+from efb_telegram_master.transport.telegram_api import TelegramAPI
 
 
 def test_api_resource_shutdown_stops_metrics_server_under_its_current_owner() -> None:

@@ -8,7 +8,7 @@ from telegram.error import ChatMigrated
 
 from efb_telegram_master import utils
 from efb_telegram_master.outbound_types import SchedulerStoppedError
-from efb_telegram_master.telegram_error_router import TelegramErrorRouter
+from efb_telegram_master.transport.telegram_error_router import TelegramErrorRouter
 
 
 def _router(*, stopping: threading.Event | None = None) -> TelegramErrorRouter:

@@ -6,8 +6,8 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import pytest
 
-from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout
-from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime
+from efb_telegram_master.transport.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout
+from efb_telegram_master.transport.telegram_sync_bridge import AsyncTelegramRuntime
 
 
 def _runtime(
@@ -140,7 +140,7 @@ def test_stop_during_poll_startup_prevents_application_initialization() -> None:
         except BaseException as error:
             errors.append(error)
 
-    with patch("efb_telegram_master.telegram_runtime.asyncio.run", side_effect=delayed_run):
+    with patch("efb_telegram_master.transport.telegram_runtime.asyncio.run", side_effect=delayed_run):
         poll_thread = threading.Thread(target=poll)
         poll_thread.start()
         assert poll_entered.wait(1)

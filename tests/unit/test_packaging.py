@@ -14,6 +14,15 @@ PERSISTENCE_MODULES = (
     "slave_message_delivery_repository",
     "repository_registry",
 )
+TRANSPORT_MODULES = (
+    "telegram_api",
+    "telegram_api_operations",
+    "telegram_application_lifecycle",
+    "telegram_calls",
+    "telegram_error_router",
+    "telegram_runtime",
+    "telegram_sync_bridge",
+)
 
 
 def test_setuptools_configuration_discovers_only_project_packages():
@@ -38,4 +47,13 @@ def test_persistence_package_is_discoverable_and_importable():
     assert "efb_telegram_master.persistence" in configuration["tool"]["setuptools"]["packages"]
     for module in PERSISTENCE_MODULES:
         assert import_module(f"efb_telegram_master.persistence.{module}")
+        assert not (ROOT / "efb_telegram_master" / f"{module}.py").exists()
+
+
+def test_transport_package_is_discoverable_and_importable():
+    configuration = read_configuration(str(ROOT / "pyproject.toml"), expand=True)
+
+    assert "efb_telegram_master.transport" in configuration["tool"]["setuptools"]["packages"]
+    for module in TRANSPORT_MODULES:
+        assert import_module(f"efb_telegram_master.transport.{module}")
         assert not (ROOT / "efb_telegram_master" / f"{module}.py").exists()

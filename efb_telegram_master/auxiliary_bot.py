@@ -11,7 +11,7 @@ import telegram.error
 from .membership_lifecycle import MembershipLifecycle, MembershipProbeMetrics
 
 if TYPE_CHECKING:
-    from .telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
+    from .transport.telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ class AuxiliaryBot:
         self._membership_callback: Callable[["AuxiliaryBot", int, bool], None] | None = None
 
     def _create_bot(self) -> telegram.Bot:
-        from .telegram_runtime import build_request
+        from .transport.telegram_runtime import build_request
 
         request = build_request(self._request_kwargs) if self._request_kwargs else None
         get_updates_request = build_request(self._request_kwargs) if self._request_kwargs else None
@@ -171,7 +171,7 @@ class AuxiliaryBot:
         return self._membership_lifecycle._membership_probe_workers
 
     def bind_runtime(self, runtime: "AsyncTelegramRuntime") -> None:
-        from .telegram_sync_bridge import SyncBotFacade
+        from .transport.telegram_sync_bridge import SyncBotFacade
 
         self._runtime = runtime
         self.bot = SyncBotFacade(self.async_bot, runtime)

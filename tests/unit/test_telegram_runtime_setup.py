@@ -5,8 +5,8 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 import pytest
 
 from efb_telegram_master.request_configuration import RequestConfiguration
-from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
-from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime
+from efb_telegram_master.transport.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
+from efb_telegram_master.transport.telegram_sync_bridge import AsyncTelegramRuntime
 
 
 def _runtime(
@@ -51,9 +51,9 @@ def test_build_runtime_passes_local_mode_and_independent_requests(monkeypatch: p
     channel = Mock()
     channel.flag.side_effect = {"local_tdlib_api": True, "api_base_url": "http://localhost:8081/bot", "api_base_file_url": "file:///var/lib/telegram-bot-api"}.get
 
-    with patch("efb_telegram_master.telegram_runtime.build_request", side_effect=requests) as build_request:
-        with patch("efb_telegram_master.telegram_runtime.telegram.Bot") as bot_cls:
-            with patch("efb_telegram_master.telegram_runtime.Application.builder", return_value=builder):
+    with patch("efb_telegram_master.transport.telegram_runtime.build_request", side_effect=requests) as build_request:
+        with patch("efb_telegram_master.transport.telegram_runtime.telegram.Bot") as bot_cls:
+            with patch("efb_telegram_master.transport.telegram_runtime.Application.builder", return_value=builder):
                 runtime = build_telegram_polling_runtime({"token": "123:token"}, channel, Mock(), AsyncMock(), AsyncMock())
 
     bot_cls.assert_called_once_with(

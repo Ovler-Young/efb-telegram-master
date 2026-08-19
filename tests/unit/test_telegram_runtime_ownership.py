@@ -10,7 +10,7 @@ from efb_telegram_master.master_message import MasterMessageWorker, MasterMessag
 from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.outbound_types import QueueRequest
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
-from efb_telegram_master.telegram_api import TelegramAPI
+from efb_telegram_master.transport.telegram_api import TelegramAPI
 
 
 def test_channel_owner_stops_the_real_master_message_worker() -> None:

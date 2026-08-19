@@ -26,7 +26,7 @@ from .slave_status import deliver_message_status
 from .utils import OldMsgID, TelegramChatID, TelegramMessageID, TelegramTopicID
 
 if TYPE_CHECKING:
-    from .telegram_api import TelegramAPI
+    from .transport.telegram_api import TelegramAPI
 
 
 class SlaveMessageService:

@@ -20,9 +20,9 @@ from .outbound import OutboundQueue
 from .persistence.chat_association_repository import ChatAssociationRepository
 from .persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from .rate_limiter import SlidingWindowRateLimiter
-from .telegram_api import TelegramAPI
-from .telegram_error_router import TelegramErrorRouter
-from .telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
+from .transport.telegram_api import TelegramAPI
+from .transport.telegram_error_router import TelegramErrorRouter
+from .transport.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 
 if TYPE_CHECKING:
     from . import TelegramChannel

@@ -13,7 +13,7 @@ from prometheus_client.core import Metric
 
 from .metrics_process import register_bounded_gauge_collector, register_destination_queue_collector, register_process_collector, register_worker_collector
 from .outbound import OutboundQueue
-from .telegram_calls import QUEUED_OPERATIONS
+from .transport.telegram_calls import QUEUED_OPERATIONS
 
 _PRIORITIES = frozenset({"blocking", "normal"})
 _SENDER_KINDS = frozenset({"main", "auxiliary"})

@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Optional
 import telegram.constants
 import telegram.error
 
-from .outbound_types import QueuedCall, SenderSelection, SendReceipt, TelegramArgs, TelegramKwargs, rewind_uploads
+from ..outbound_types import QueuedCall, SenderSelection, SendReceipt, TelegramArgs, TelegramKwargs, rewind_uploads
 
 if TYPE_CHECKING:
-    from .bot_pool import BotPool
+    from ..bot_pool import BotPool
 
 
 QUEUED_OPERATIONS = frozenset(

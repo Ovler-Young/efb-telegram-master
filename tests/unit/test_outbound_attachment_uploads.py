@@ -10,7 +10,7 @@ from telegram.error import BadRequest, RetryAfter
 
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.outbound_types import QueuedCall, QueueRequest, SenderSelection, UploadCleanup, rewind_uploads
-from efb_telegram_master.telegram_calls import TelegramCallAdapter
+from efb_telegram_master.transport.telegram_calls import TelegramCallAdapter
 from tests.support.outbound_queue import _queue
 
 

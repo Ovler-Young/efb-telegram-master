@@ -1,7 +1,7 @@
 import pytest
 
 from efb_telegram_master.request_configuration import parse_request_configuration
-from efb_telegram_master.telegram_runtime import build_request
+from efb_telegram_master.transport.telegram_runtime import build_request
 
 
 def test_request_configuration_coerces_number_and_uses_defaults() -> None:

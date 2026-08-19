@@ -10,7 +10,7 @@ from efb_telegram_master.bot_manager import TelegramBotManager, TelegramResource
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.msglog_scan import MsgLogScanShutdownTimeout
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout
-from efb_telegram_master.telegram_api import TelegramAPI
+from efb_telegram_master.transport.telegram_api import TelegramAPI
 
 
 def _manager(api: Mock, runtime: Mock) -> TelegramBotManager:

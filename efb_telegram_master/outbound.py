@@ -25,7 +25,7 @@ from .outbound_types import (
     rewind_uploads,
 )
 from .sender_policy import SenderPolicy
-from .telegram_calls import QUEUED_OPERATIONS, TelegramCallAdapter
+from .transport.telegram_calls import QUEUED_OPERATIONS, TelegramCallAdapter
 
 if TYPE_CHECKING:
     from .bot_pool import BotPool
