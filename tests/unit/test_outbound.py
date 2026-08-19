@@ -554,9 +554,12 @@ def test_shutdown_after_oversize_primary_cleans_owned_upload_without_queuing_att
         def send_document(self, *_args, **_kwargs):
             pytest.fail("attachment must not start after shutdown begins")
 
-    queue = _queue(Sender(), worker_count=1)
+    auxiliary = Mock(bot_id=10, disabled=False, check_membership_tri=Mock(return_value=True), peek_delay=Mock(return_value=0.0), try_acquire_limits=Mock(return_value=True))
+    auxiliary.bot = Sender()
+    pool = BotPool([auxiliary])
+    queue = _queue(Mock(), worker_count=1, bot_pool=pool)
     try:
-        waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1, cleanup=UploadCleanup((str(upload),))))
+        waiter = queue.enqueue(QueueRequest("send_message", (), {"chat_id": 1, "text": full_text}, 1, slave_id="slave-a", required_sender_bot_id="10", cleanup=UploadCleanup((str(upload),))))
         assert primary_started.wait(1)
         stopper = threading.Thread(target=queue.stop)
         stopper.start()
@@ -571,6 +574,7 @@ def test_shutdown_after_oversize_primary_cleans_owned_upload_without_queuing_att
             waiter.result()
         assert queue.destination_snapshot() == []
         assert not upload.exists()
+        assert pool.preferred_sender("slave-a") is None
     finally:
         release_primary.set()
         queue.stop()
