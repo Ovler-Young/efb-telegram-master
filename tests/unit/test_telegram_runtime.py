@@ -20,6 +20,7 @@ from efb_telegram_master.msglog_scan import MsgLogScanShutdownTimeout
 from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout, QueueRequest, SchedulerStoppedError
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
+from efb_telegram_master.request_configuration import RequestConfiguration
 from efb_telegram_master.telegram_api import TelegramAPI
 from efb_telegram_master.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
 from efb_telegram_master.telegram_sync_bridge import AsyncTelegramRuntime
@@ -175,8 +176,8 @@ def test_build_runtime_passes_local_mode_and_independent_requests(monkeypatch: p
     )
     assert build_request.call_count == 2
     assert [call.args[0] for call in build_request.call_args_list] == [
-        {"read_timeout": 15.0, "connection_pool_size": 16},
-        {"read_timeout": 15.0, "connection_pool_size": 16},
+        RequestConfiguration(connection_pool_size=16, read_timeout=15.0),
+        RequestConfiguration(connection_pool_size=16, read_timeout=15.0),
     ]
     assert runtime.application is application
 
@@ -185,6 +186,11 @@ def test_build_runtime_passes_local_mode_and_independent_requests(monkeypatch: p
 def test_build_runtime_rejects_non_mapping_webhook_config(webhook: object) -> None:
     with pytest.raises(ValueError, match="webhook must be a mapping"):
         build_telegram_polling_runtime({"token": "123:token", "webhook": webhook}, Mock(), Mock(), AsyncMock(), AsyncMock())
+
+
+def test_build_runtime_rejects_non_mapping_request_config() -> None:
+    with pytest.raises(ValueError, match="request_kwargs must be a mapping"):
+        build_telegram_polling_runtime({"token": "123:token", "request_kwargs": []}, Mock(), Mock(), AsyncMock(), AsyncMock())
 
 
 @pytest.mark.asyncio

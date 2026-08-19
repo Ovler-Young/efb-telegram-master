@@ -10,7 +10,7 @@ import time
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from socket import socket
-from typing import Coroutine, Literal, Optional, ParamSpec, TypedDict, TypeVar, cast
+from typing import Coroutine, Optional, ParamSpec, TypedDict, TypeVar, cast
 
 import telegram
 import telegram.error
@@ -19,8 +19,8 @@ from telegram.ext import Application, CallbackContext
 from telegram.request import HTTPXRequest
 from typing_extensions import NotRequired
 
+from .request_configuration import RequestConfiguration, parse_request_configuration
 from .telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
-from .utils import normalize_request_kwargs
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -124,21 +124,19 @@ def _webhook_start_arguments(config: Mapping[str, object]) -> _WebhookStartArgum
     return arguments
 
 
-def build_request(request_kwargs: Mapping[str, object]) -> HTTPXRequest:
+def build_request(request_kwargs: Mapping[str, object] | RequestConfiguration) -> HTTPXRequest:
+    configuration = request_kwargs if isinstance(request_kwargs, RequestConfiguration) else parse_request_configuration(request_kwargs)
     return HTTPXRequest(
-        connection_pool_size=cast(int, request_kwargs.get("connection_pool_size", 1)),
-        read_timeout=cast(Optional[float], request_kwargs.get("read_timeout")),
-        write_timeout=cast(Optional[float], request_kwargs.get("write_timeout")),
-        connect_timeout=cast(Optional[float], request_kwargs.get("connect_timeout")),
-        pool_timeout=cast(Optional[float], request_kwargs.get("pool_timeout")),
-        media_write_timeout=cast(Optional[float], request_kwargs.get("media_write_timeout")),
-        http_version=cast(Literal["1.1", "2.0", "2"], request_kwargs.get("http_version") or "1.1"),
-        socket_options=cast(
-            Optional[Collection[tuple[int, int, int] | tuple[int, int, bytes | bytearray] | tuple[int, int, None, int]]],
-            request_kwargs.get("socket_options"),
-        ),
-        proxy=cast(Optional[str], request_kwargs.get("proxy")),
-        httpx_kwargs=cast(Optional[dict[str, object]], request_kwargs.get("httpx_kwargs")),
+        connection_pool_size=configuration.connection_pool_size,
+        read_timeout=configuration.read_timeout,
+        write_timeout=configuration.write_timeout,
+        connect_timeout=configuration.connect_timeout,
+        pool_timeout=configuration.pool_timeout,
+        media_write_timeout=configuration.media_write_timeout,
+        http_version=configuration.http_version,
+        socket_options=configuration.socket_options,
+        proxy=configuration.proxy,
+        httpx_kwargs=configuration.httpx_kwargs,
     )
 
 
@@ -372,9 +370,11 @@ def build_telegram_polling_runtime(
 ) -> TelegramPollingRuntime:
     request_config: dict[str, object] = {"read_timeout": 15.0, "connection_pool_size": TelegramPollingRuntime._default_connection_pool_size(config)}
     configured = config.get("request_kwargs")
+    if configured is not None and not isinstance(configured, Mapping):
+        raise ValueError("request_kwargs must be a mapping")
     if isinstance(configured, Mapping):
         request_config.update(configured)
-    request_kwargs = normalize_request_kwargs(request_config)
+    request_kwargs = parse_request_configuration(request_config)
     identity: _BotArguments = {
         "token": cast(str, config["token"]),
         "local_mode": bool(getattr(channel, "flag")("local_tdlib_api")),

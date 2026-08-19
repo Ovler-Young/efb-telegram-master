@@ -12,6 +12,7 @@ from . import TelegramChannel
 from .paths import LOCALE_DIR, get_config_path
 from .telegram_runtime import build_request
 from .utils import normalize_request_kwargs
+from .wizard_configuration import WizardConfiguration
 
 translator = translation("efb_telegram_master", str(LOCALE_DIR), fallback=True)
 _ = translator.gettext
@@ -39,7 +40,7 @@ class DataModel:
         if not self.config_path.exists():
             self.build_default_config()
         else:
-            self.data = self.yaml.load(self.config_path.open())
+            self.data = WizardConfiguration.from_mapping(self.yaml.load(self.config_path.open())).values
             if self.data.get("request_kwargs"):
                 self.request = build_request(normalize_request_kwargs(self.data["request_kwargs"]))
 
