@@ -8,12 +8,12 @@ from types import SimpleNamespace
 import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import PostgresqlDatabase, SqliteDatabase
+from peewee import IntegrityError, PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
+from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from efb_telegram_master.msglog_repository import MsgLogRepository
@@ -587,6 +587,15 @@ def test_postgresql_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path,
         second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-upgrade", config=config))
         row = MsgLog.get_by_id("100.1")
         provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
+        ChatAssoc.create(master_uid="master", slave_uid="slave")
+        TopicAssoc.create(topic_chat_id="100", message_thread_id="200", slave_uid="slave")
+        HistoryMigrationEntry.create(slave_chat_id="slave", target_chat_id="100", source_master_msg_id="100.1", position=0)
+        with pytest.raises(IntegrityError):
+            ChatAssoc.create(master_uid="master-other", slave_uid="slave")
+        with pytest.raises(IntegrityError):
+            TopicAssoc.create(topic_chat_id="100", message_thread_id="200", slave_uid="slave-other")
+        with pytest.raises(IntegrityError):
+            HistoryMigrationEntry.create(slave_chat_id="slave", target_chat_id="100", source_master_msg_id="100.2", position=0)
     finally:
         if second_manager is not None:
             second_manager.stop_worker()
