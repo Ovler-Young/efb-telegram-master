@@ -2,16 +2,63 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 from ehforwarderbot import Message
 from ehforwarderbot.types import ChatID, ModuleID
 from telegram import Update
-from telegram.error import ChatMigrated
+from telegram.error import ChatMigrated, TelegramError
 
 from efb_telegram_master import utils
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.ptb_compat import sync_reply_text
 from efb_telegram_master.topic_sync import TopicGroupService
 from efb_telegram_master.utils import TelegramChatID, TelegramTopicID
+
+
+@pytest.mark.parametrize(
+    ("method_name", "error", "expected_reply", "log_message"),
+    [
+        (
+            "_update_forum_reply",
+            RuntimeError("SENTINEL-SECRET"),
+            "Error occurred while updating forum group info.",
+            "Error occurred while updating forum group info (%s).",
+        ),
+        (
+            "_update_single_group",
+            TelegramError("SENTINEL-SECRET"),
+            "Error occurred while update chat details.",
+            "Error occurred while update chat details (%s).",
+        ),
+    ],
+)
+def test_update_info_error_replies_are_bounded_and_log_context(monkeypatch, method_name, error, expected_reply, log_message) -> None:
+    logger = Mock()
+    bot = Mock()
+    channel = Mock(get_chat=Mock(side_effect=error))
+    service = TopicGroupService(
+        SimpleNamespace(),
+        bot,
+        Mock(),
+        Mock(),
+        Mock(),
+        "tests.master",
+        lambda text: text,
+        lambda single, _plural, _count: single,
+        logger,
+    )
+    update = SimpleNamespace(effective_message=SimpleNamespace(message_thread_id=None))
+    if method_name == "_update_forum_reply":
+        service._update_forum_group_info = Mock(side_effect=error)
+        service._update_forum_reply(update, TelegramChatID(1))
+    else:
+        monkeypatch.setattr("efb_telegram_master.topic_sync.coordinator.slaves", {"slave": channel})
+        service._update_single_group(update, SimpleNamespace(id=1), "slave chat")
+
+    reply = bot.reply_error.call_args.args[1]
+    assert reply == expected_reply
+    assert "SENTINEL-SECRET" not in reply
+    assert logger.exception.call_args.args == (log_message, type(error).__name__)
 
 
 class _ReadOnlyReplyMessage:

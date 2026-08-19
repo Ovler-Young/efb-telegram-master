@@ -102,8 +102,8 @@ class TopicGroupService:
         try:
             success, result_message, _ = self._update_forum_group_info(chat_id, TelegramTopicID(thread_id) if thread_id else None)
         except Exception as error:
-            self.logger.exception("Error occurred while updating forum group info.")
-            return self.bot.reply_error(update, self._("Error occurred while updating forum group info.\n{0}").format(str(error)))
+            self.logger.exception("Error occurred while updating forum group info (%s).", type(error).__name__)
+            return self.bot.reply_error(update, self._("Error occurred while updating forum group info."))
         if success:
             return sync_reply_text(self.bot, update_message, result_message)
         return self.bot.reply_error(update, result_message)
@@ -137,7 +137,8 @@ class TopicGroupService:
         except EFBOperationNotSupported:
             return self.bot.reply_error(update, self._("No profile picture provided from this chat."))
         except TelegramError as error:
-            return self.bot.reply_error(update, self._("Error occurred while update chat details.\n{0}").format(error.message))
+            self.logger.exception("Error occurred while update chat details (%s).", type(error).__name__)
+            return self.bot.reply_error(update, self._("Error occurred while update chat details."))
         finally:
             for value in (picture, resized):
                 if value and getattr(value, "close", None):

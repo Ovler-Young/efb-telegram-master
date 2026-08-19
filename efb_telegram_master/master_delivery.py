@@ -100,16 +100,19 @@ class MasterMessageDelivery:
             slave_message = coordinator.send_message(etm_message)
             etm_message.uid = slave_message.uid if slave_message and slave_message.uid else None
         except EFBChatNotFound as error:
-            self.bot.reply_error(update, error.args[0] or self.localize("Chat is not found."))
+            self.bot.reply_error(update, self.localize("Chat is not found."))
+            self.logger.exception("Message %s is not sent (%s).", message_id, type(error).__name__)
         except EFBMessageTypeNotSupported as error:
-            self.bot.reply_error(update, error.args[0] or self.localize("Message type is not supported."))
+            self.bot.reply_error(update, self.localize("Message type is not supported."))
+            self.logger.exception("Message %s is not sent (%s).", message_id, type(error).__name__)
         except EFBOperationNotSupported as error:
-            self.bot.reply_error(update, self.localize("Message editing is not supported.\n\n{exception!s}").format(exception=error))
+            self.bot.reply_error(update, self.localize("Message editing is not supported."))
+            self.logger.exception("Message %s is not sent (%s).", message_id, type(error).__name__)
         except EFBException as error:
-            self.bot.reply_error(update, self.localize("Message is not sent.\n\n{exception!s}").format(exception=error))
+            self.bot.reply_error(update, self.localize("Message is not sent."))
             self.logger.exception("Message %s is not sent (%s).", message_id, type(error).__name__)
         except Exception as error:
-            self.bot.reply_error(update, self.localize("Message is not sent.\n\n{exception!r}").format(exception=error))
+            self.bot.reply_error(update, self.localize("Message is not sent."))
             self.logger.exception("Message %s is not sent (%s).", message_id, type(error).__name__)
         finally:
             if log_message:
