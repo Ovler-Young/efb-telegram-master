@@ -107,6 +107,31 @@ def sync_msglog_update(*, user_id=10, is_forum=True):
     return Update(update_id=1, message=message)
 
 
+def ingested_topic_message():
+    return SimpleNamespace(
+        id=1,
+        message="message 1",
+        date=None,
+        reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
+        action=None,
+        media=None,
+    )
+
+
+@contextmanager
+def msglog_scan_database(tmp_path):
+    original_database = database.obj
+    test_db = SqliteDatabase(tmp_path / "msglog.db")
+    database.initialize(test_db)
+    test_db.connect()
+    try:
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        yield
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+
 def test_sync_msglog_schedules_for_admin_in_bound_forum_group(sync_msglog_service):
     service = sync_msglog_service
 
@@ -264,51 +289,36 @@ def test_association_reschedule_queues_a_successor_after_active_lease_expires(tm
                 if fetches == 1:
                     first_fetch_started.set()
                     await asyncio.to_thread(allow_expired_worker_to_exit.wait)
-                return [
-                    SimpleNamespace(
-                        id=1,
-                        message="message 1",
-                        date=None,
-                        reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
-                        action=None,
-                        media=None,
-                    )
-                ]
+                return [ingested_topic_message()]
             finally:
                 active_fetches -= 1
 
-    original_database = database.obj
-    test_db = SqliteDatabase(tmp_path / "msglog.db")
-    database.initialize(test_db)
-    test_db.connect()
-    ingestion = MsgLogIngestionRepository("tests.master")
-    runtime = SharedAsyncRuntime()
-    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        scan = ingestion.get_or_create_scan(100, 1)
-        assert scheduler.schedule(100) == "started"
-        assert first_fetch_started.wait(1)
-        assert scheduler.schedule_for_association(100) == "queued"
-        MsgLogIngestionScan.update(
-            status="running",
-            lease_expires_at=datetime.now() - timedelta(seconds=1),
-        ).where(MsgLogIngestionScan.id == scan.id).execute()
+    with msglog_scan_database(tmp_path):
+        ingestion = MsgLogIngestionRepository("tests.master")
+        runtime = SharedAsyncRuntime()
+        scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
+        try:
+            scan = ingestion.get_or_create_scan(100, 1)
+            assert scheduler.schedule(100) == "started"
+            assert first_fetch_started.wait(1)
+            assert scheduler.schedule_for_association(100) == "queued"
+            MsgLogIngestionScan.update(
+                status="running",
+                lease_expires_at=datetime.now() - timedelta(seconds=1),
+            ).where(MsgLogIngestionScan.id == scan.id).execute()
 
-        allow_expired_worker_to_exit.set()
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
-                break
-            time.sleep(0.01)
-        recovered = MsgLogIngestionScan.get_by_id(scan.id)
-        row = MsgLog.get_by_id("100.1")
-    finally:
-        allow_expired_worker_to_exit.set()
-        assert scheduler.stop(1) == ()
-        runtime.close()
-        test_db.close()
-        database.initialize(original_database)
+            allow_expired_worker_to_exit.set()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
+                    break
+                time.sleep(0.01)
+            recovered = MsgLogIngestionScan.get_by_id(scan.id)
+            row = MsgLog.get_by_id("100.1")
+        finally:
+            allow_expired_worker_to_exit.set()
+            assert scheduler.stop(1) == ()
+            runtime.close()
 
     assert (recovered.status, recovered.rescan_requested, recovered.lease_owner) == ("complete", False, None)
     assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
@@ -348,16 +358,7 @@ def test_association_reschedule_recovers_untracked_active_lease(tmp_path, termin
             nonlocal fetches
             assert message_ids == [1]
             fetches += 1
-            return [
-                SimpleNamespace(
-                    id=1,
-                    message="message 1",
-                    date=None,
-                    reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
-                    action=None,
-                    media=None,
-                )
-            ]
+            return [ingested_topic_message()]
 
     class TrackingRepository(MsgLogIngestionRepository):
         def claim_scan(self, source_chat_id, lease_owner, lease_seconds):
@@ -366,39 +367,33 @@ def test_association_reschedule_recovers_untracked_active_lease(tmp_path, termin
                 rejected_claim.set()
             return claimed
 
-    original_database = database.obj
-    test_db = SqliteDatabase(tmp_path / "msglog.db")
-    database.initialize(test_db)
-    test_db.connect()
-    ingestion = TrackingRepository("tests.master")
-    runtime = SharedAsyncRuntime()
-    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        scan = ingestion.get_or_create_scan(100, 1)
-        assert ingestion.claim_scan(100, "other-process", 1) is not None
-        MsgLogIngestionScan.update(lease_expires_at=datetime.now() + timedelta(milliseconds=100)).where(MsgLogIngestionScan.id == scan.id).execute()
-        if prior_process:
-            scheduler.resume()
-            assert not rejected_claim.is_set()
+    with msglog_scan_database(tmp_path):
+        ingestion = TrackingRepository("tests.master")
+        runtime = SharedAsyncRuntime()
+        scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
+        try:
+            scan = ingestion.get_or_create_scan(100, 1)
+            assert ingestion.claim_scan(100, "other-process", 1) is not None
+            MsgLogIngestionScan.update(lease_expires_at=datetime.now() + timedelta(milliseconds=100)).where(MsgLogIngestionScan.id == scan.id).execute()
+            if prior_process:
+                scheduler.resume()
+                assert not rejected_claim.is_set()
 
-        assert scheduler.schedule_for_association(100) == "queued"
-        assert rejected_claim.wait(1)
-        if terminal_state == "retryable-error":
-            MsgLogIngestionScan.update(status="retryable-error", lease_owner=None, lease_expires_at=None).where(MsgLogIngestionScan.id == scan.id).execute()
+            assert scheduler.schedule_for_association(100) == "queued"
+            assert rejected_claim.wait(1)
+            if terminal_state == "retryable-error":
+                MsgLogIngestionScan.update(status="retryable-error", lease_owner=None, lease_expires_at=None).where(MsgLogIngestionScan.id == scan.id).execute()
 
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
-                break
-            time.sleep(0.01)
-        recovered = MsgLogIngestionScan.get_by_id(scan.id)
-        row = MsgLog.get_by_id("100.1")
-    finally:
-        assert scheduler.stop(1) == ()
-        runtime.close()
-        test_db.close()
-        database.initialize(original_database)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
+                    break
+                time.sleep(0.01)
+            recovered = MsgLogIngestionScan.get_by_id(scan.id)
+            row = MsgLog.get_by_id("100.1")
+        finally:
+            assert scheduler.stop(1) == ()
+            runtime.close()
 
     assert (recovered.status, recovered.rescan_requested, recovered.lease_owner) == ("complete", False, None)
     assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
@@ -476,44 +471,29 @@ def test_association_reschedule_queues_a_successor_after_retryable_error(tmp_pat
                 first_fetch_started.set()
                 await asyncio.to_thread(allow_retryable_error.wait)
                 raise MTProtoRetryableError("temporary")
-            return [
-                SimpleNamespace(
-                    id=1,
-                    message="message 1",
-                    date=None,
-                    reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=10, reply_to_msg_id=None),
-                    action=None,
-                    media=None,
-                )
-            ]
+            return [ingested_topic_message()]
 
-    original_database = database.obj
-    test_db = SqliteDatabase(tmp_path / "msglog.db")
-    database.initialize(test_db)
-    test_db.connect()
-    ingestion = MsgLogIngestionRepository("tests.master")
-    runtime = SharedAsyncRuntime()
-    scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        scan = ingestion.get_or_create_scan(100, 1)
-        assert scheduler.schedule(100) == "started"
-        assert first_fetch_started.wait(1)
-        assert scheduler.schedule_for_association(100) == "queued"
-        allow_retryable_error.set()
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
-                break
-            time.sleep(0.01)
-        recovered = MsgLogIngestionScan.get_by_id(scan.id)
-        row = MsgLog.get_by_id("100.1")
-    finally:
-        allow_retryable_error.set()
-        assert scheduler.stop(1) == ()
-        runtime.close()
-        test_db.close()
-        database.initialize(original_database)
+    with msglog_scan_database(tmp_path):
+        ingestion = MsgLogIngestionRepository("tests.master")
+        runtime = SharedAsyncRuntime()
+        scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
+        try:
+            scan = ingestion.get_or_create_scan(100, 1)
+            assert scheduler.schedule(100) == "started"
+            assert first_fetch_started.wait(1)
+            assert scheduler.schedule_for_association(100) == "queued"
+            allow_retryable_error.set()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                if MsgLogIngestionScan.get_by_id(scan.id).status == "complete":
+                    break
+                time.sleep(0.01)
+            recovered = MsgLogIngestionScan.get_by_id(scan.id)
+            row = MsgLog.get_by_id("100.1")
+        finally:
+            allow_retryable_error.set()
+            assert scheduler.stop(1) == ()
+            runtime.close()
 
     assert (recovered.status, recovered.rescan_requested, recovered.lease_owner) == ("complete", False, None)
     assert (row.provenance, row.slave_origin_uid) == ("mtproto_ingested", "tests.slave target")
