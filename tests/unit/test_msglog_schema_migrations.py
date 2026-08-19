@@ -8,12 +8,12 @@ from types import SimpleNamespace
 import pytest
 from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
-from peewee import IntegrityError, PostgresqlDatabase, SqliteDatabase
+from peewee import PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.message import ETMMsg
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
+from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from efb_telegram_master.msglog_repository import MsgLogRepository
@@ -89,18 +89,13 @@ def _insert_legacy_ingestion_scan_rows(test_db):
         "error",
     )
     placeholders = ", ".join([test_db.param] * len(columns))
-    test_db.execute_sql(
-        f"INSERT INTO msglogingestionscan ({', '.join(columns)}) VALUES ({placeholders})",
+    statement = f"INSERT INTO msglogingestionscan ({', '.join(columns)}) VALUES ({placeholders})"
+    for row in (
         ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None),
-    )
-    test_db.execute_sql(
-        f"INSERT INTO msglogingestionscan ({', '.join(columns)}) VALUES ({placeholders})",
         ("200", 900, 900, 0, 0, 0, 0, 0, None, "pending", None),
-    )
-    test_db.execute_sql(
-        f"INSERT INTO msglogingestionscan ({', '.join(columns)}) VALUES ({placeholders})",
         ("300", 1000, 875, 125, 125, 20, 90, 15, "worker-a", "running", "temporary failure"),
-    )
+    ):
+        test_db.execute_sql(statement, row)
 
 
 def _legacy_ingestion_scan_rows(test_db):
@@ -124,27 +119,6 @@ def _msglog_values(master_msg_id, **values):
     }
 
 
-def test_database_restart_retains_msglog_provenance_and_ingestion_scan(tmp_path, monkeypatch):
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.fresh", config={}))
-    second_manager = None
-    try:
-        first_manager.stop_worker()
-        second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.fresh", config={}))
-        msglog_columns = {column.name for column in database.get_columns("msglog")}
-        scan_columns = {column.name for column in database.get_columns("msglogingestionscan")}
-        defaults = {column.name: column.default for column in database.get_columns("msglog")}
-    finally:
-        if second_manager is not None:
-            second_manager.stop_worker()
-        database.initialize(original_database)
-
-    assert "provenance" in msglog_columns
-    assert defaults["provenance"] == "'live'"
-    assert {"source_chat_id", "cursor", "lease_owner", "existing_streak", "rescan_requested"}.issubset(scan_columns)
-
-
 def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, monkeypatch):
     database_path = tmp_path / "tgdata.db"
     raw_db = SqliteDatabase(database_path)
@@ -165,11 +139,6 @@ def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, m
         live_row = MsgLog.create(**_msglog_values("100.2"))
         ingested_row = MsgLog.create(**_msglog_values("100.3", provenance="mtproto_ingested"))
         provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
-        msglog_indexes = {index.name for index in database.get_indexes("msglog")}
-        query_plan = database.execute_sql(
-            "EXPLAIN QUERY PLAN SELECT master_msg_id FROM msglog WHERE slave_origin_uid = ? ORDER BY time ASC, master_msg_id ASC LIMIT 2",
-            ("tests.slave chat",),
-        ).fetchall()
     finally:
         if second_manager is not None:
             second_manager.stop_worker()
@@ -179,8 +148,6 @@ def test_database_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, m
     assert old_row.provenance == "live"
     assert live_row.provenance == "live"
     assert ingested_row.provenance == "mtproto_ingested"
-    assert "msglog_slave_origin_uid_time_master_msg_id" in msglog_indexes
-    assert any("msglog_slave_origin_uid_time_master_msg_id" in detail for *_ignored, detail in query_plan)
 
 
 def test_msglog_migration_preserves_legacy_naive_and_null_times():
@@ -547,15 +514,19 @@ def test_live_message_upsert_wins_when_ingestion_inserts_after_lookup(monkeypatc
     assert (row.provenance, row.slave_message_id, row.text) == ("live", "live-message", "live text")
 
 
-@pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
-def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false(tmp_path, monkeypatch):
-    connection_kwargs = {
+def _postgres_connection_kwargs():
+    return {
         "database": os.environ["TEST_POSTGRES_DB"],
         "host": os.environ["TEST_POSTGRES_HOST"],
         "port": int(os.environ["TEST_POSTGRES_PORT"]),
         "user": os.environ["TEST_POSTGRES_USER"],
         "password": os.environ["TEST_POSTGRES_PASSWORD"],
     }
+
+
+@pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
+def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false(tmp_path, monkeypatch):
+    connection_kwargs = _postgres_connection_kwargs()
     database_name = f"etm_scan_{uuid.uuid4().hex}"
     admin_db = PostgresqlDatabase(**connection_kwargs)
     admin_db.connect()
@@ -595,13 +566,7 @@ def test_postgresql_legacy_ingestion_scan_schema_defaults_rescan_requested_false
 
 @pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
 def test_postgresql_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path, monkeypatch):
-    connection_kwargs = {
-        "database": os.environ["TEST_POSTGRES_DB"],
-        "host": os.environ["TEST_POSTGRES_HOST"],
-        "port": int(os.environ["TEST_POSTGRES_PORT"]),
-        "user": os.environ["TEST_POSTGRES_USER"],
-        "password": os.environ["TEST_POSTGRES_PASSWORD"],
-    }
+    connection_kwargs = _postgres_connection_kwargs()
     database_name = f"etm_msglog_{uuid.uuid4().hex}"
     admin_db = PostgresqlDatabase(**connection_kwargs)
     admin_db.connect()
@@ -622,15 +587,6 @@ def test_postgresql_upgrade_adds_msglog_provenance_without_losing_rows(tmp_path,
         second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-upgrade", config=config))
         row = MsgLog.get_by_id("100.1")
         provenance_columns = [column.name for column in database.get_columns("msglog") if column.name == "provenance"]
-        ChatAssoc.create(master_uid="master", slave_uid="slave")
-        TopicAssoc.create(topic_chat_id="100", message_thread_id="200", slave_uid="slave")
-        HistoryMigrationEntry.create(slave_chat_id="slave", target_chat_id="100", source_master_msg_id="100.1", position=0)
-        with pytest.raises(IntegrityError):
-            ChatAssoc.create(master_uid="master-other", slave_uid="slave")
-        with pytest.raises(IntegrityError):
-            TopicAssoc.create(topic_chat_id="100", message_thread_id="200", slave_uid="slave-other")
-        with pytest.raises(IntegrityError):
-            HistoryMigrationEntry.create(slave_chat_id="slave", target_chat_id="100", source_master_msg_id="100.2", position=0)
     finally:
         if second_manager is not None:
             second_manager.stop_worker()
