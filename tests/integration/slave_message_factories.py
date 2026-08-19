@@ -1,21 +1,3 @@
-"""
-Planned workflow
-================
-Send a message
-Assert if it is send
-Check if content is correct
-
-Edit the message (if possible)
-    Assert message ID is the same
-    Assert content updated
-Edit the message media (if possible)
-    Assert message ID is the same
-    Assert content updated
-Send another message of same kind, quoting the previous one
-    Assert message is sent
-    Assert message target is correct.
-"""
-
 from abc import ABC, abstractmethod
 from itertools import chain
 from pathlib import Path
@@ -25,15 +7,11 @@ from ehforwarderbot import Chat
 from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot.chat import SelfChatMember
 from ehforwarderbot.message import LinkAttribute, LocationAttribute, MsgType
-from pytest import approx, mark
+from pytest import approx
 from telethon.tl.custom import Message
 from telethon.tl.types import MessageEntityCode, MessageEntityMentionName
 
-from tests.integration.helper.filters import edited, in_chats, reply_to
-from tests.integration.utils import link_chats
 from tests.mocks.slave.channel import MockSlaveChannel
-
-pytestmark = mark.asyncio
 
 
 class MessageFactory(ABC):
@@ -69,7 +47,7 @@ class MessageFactory(ABC):
         Returns the edited message, or none if no edit is needed."""
         return None
 
-    def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
+    def finalize_message(self, efb_msg: EFBMessage):
         """Finalize the message before discarding if needed."""
         pass
 
@@ -212,7 +190,7 @@ class ImageMessageFactory(MessageFactory):
             path = Path("tests/mocks/image_1.png")
         return slave.edit_file_like_message(message, path, mime="image/png", reactions=True, commands=True, substitution=True)
 
-    def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
+    def finalize_message(self, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
             efb_msg.file.close()
 
@@ -238,7 +216,7 @@ class StickerMessageFactory(MessageFactory):
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
         return slave.edit_file_like_message(message, Path("tests/mocks/sticker_1.png"), mime="image/png", reactions=True, commands=True, substitution=True)
 
-    def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
+    def finalize_message(self, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
             efb_msg.file.close()
 
@@ -265,7 +243,7 @@ class FileMessageFactory(MessageFactory):
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
         return slave.edit_file_like_message(message, Path("tests/mocks/document_1.txt.gz"), mime="application/gzip", reactions=True, commands=True, substitution=True)
 
-    def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
+    def finalize_message(self, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
             efb_msg.file.close()
 
@@ -290,7 +268,7 @@ class AnimationMessageFactory(MessageFactory):
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
         return slave.edit_file_like_message(message, Path("tests/mocks/animation_1.gif"), "image/gif", reactions=True, commands=True, substitution=True)
 
-    def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
+    def finalize_message(self, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
             efb_msg.file.close()
 
@@ -315,7 +293,7 @@ class VideoMessageFactory(MessageFactory):
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
         return slave.edit_file_like_message(message, Path("tests/mocks/video_1.mp4"), "video/mp4", reactions=True, commands=True, substitution=True)
 
-    def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
+    def finalize_message(self, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
             efb_msg.file.close()
 
@@ -342,14 +320,13 @@ class VoiceMessageFactory(MessageFactory):
     def edit_message_media(self, slave: MockSlaveChannel, message: Message) -> Optional[Message]:
         return slave.edit_file_like_message(message, Path("tests/mocks/audio_0.mp3"), "audio/mpeg", reactions=True, commands=True, substitution=True)
 
-    def finalize_message(self, tg_msg: Message, efb_msg: EFBMessage):
+    def finalize_message(self, efb_msg: EFBMessage):
         if efb_msg.file and not efb_msg.file.closed:
             efb_msg.file.close()
 
 
-@mark.parametrize(
-    "factory",
-    [
+def all_message_factories():
+    return [
         TextMessageFactory(),
         LinkMessageFactory(),
         LocationMessageFactory(),
@@ -361,47 +338,4 @@ class VoiceMessageFactory(MessageFactory):
         VideoMessageFactory(),
         VoiceMessageFactory(),
         TextMessageFactory(unsupported=True),
-    ],
-    ids=str,
-)
-async def test_slave_message(helper, bot_group, slave, channel, factory: MessageFactory):
-    chat = slave.group
-
-    with link_chats(channel, (chat,), bot_group):
-        message_ids = []
-        efb_msg = factory.send_message(slave, chat)
-        tg_msg = await helper.wait_for_message(in_chats(bot_group))
-        message_ids.append(tg_msg.id)
-        factory.compare_message(tg_msg, efb_msg)
-
-        edited_efb_msg = factory.edit_message(slave, efb_msg)
-        if edited_efb_msg is not None:
-            filters = in_chats(bot_group)
-            if factory.content_editable:
-                filters &= edited(*message_ids)
-            tg_msg = await helper.wait_for_message(filters)
-            if not factory.content_editable:
-                message_ids.append(tg_msg.id)
-            factory.compare_message(tg_msg, edited_efb_msg)
-
-        edited_media_efb_msg = factory.edit_message_media(slave, efb_msg)
-        if edited_media_efb_msg is not None:
-            filters = in_chats(bot_group)
-            if factory.media_editable:
-                filters &= edited(*message_ids)
-            tg_msg = await helper.wait_for_message(filters)
-            if factory.media_editable:
-                try:
-                    factory.compare_message(tg_msg, edited_media_efb_msg)
-                except AssertionError:
-                    # Update coalescing in Telegram/Telethon might result in the first event missing
-                    # the caption update or we are catching the intermediate state.
-                    # Only wait for the second message if the first one was incomplete.
-                    tg_msg = await helper.wait_for_message(filters)
-            if not factory.media_editable:
-                message_ids.append(tg_msg.id)
-            factory.compare_message(tg_msg, edited_media_efb_msg)
-
-        targeted_message = factory.send_message(slave, chat, target=efb_msg)
-        targeted_tg_msg = await helper.wait_for_message(in_chats(bot_group) & reply_to(*message_ids))
-        factory.compare_message(targeted_tg_msg, targeted_message)
+    ]
