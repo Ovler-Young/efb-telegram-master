@@ -3,10 +3,9 @@ from types import SimpleNamespace
 import pytest
 from peewee import IndexMetadata, PostgresqlDatabase, SqliteDatabase
 
-from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
-from efb_telegram_master.models import database
+from efb_telegram_master.persistence import database_initializer
 from tests.support.legacy_outbound_schema import create_legacy_outbound_schema
 
 
@@ -27,12 +26,10 @@ def test_startup_preserves_non_empty_legacy_outbound_tables(tmp_path, monkeypatc
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         with pytest.raises(RuntimeError, match="automatic replay is disabled"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
-        assert database.is_closed()
+            DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config=SimpleNamespace(database={})))
         preserved_db = SqliteDatabase(database_path)
         preserved_db.connect()
         try:
@@ -42,7 +39,7 @@ def test_startup_preserves_non_empty_legacy_outbound_tables(tmp_path, monkeypatc
         finally:
             preserved_db.close()
     finally:
-        database.initialize(original_database)
+        pass
 
 
 @pytest.mark.parametrize(
@@ -61,7 +58,7 @@ def test_startup_preserves_non_empty_legacy_outbound_tables(tmp_path, monkeypatc
     ),
 )
 def test_legacy_auto_primary_key_default_categories(table_name, column_name, data_type, primary_key, default, expected):
-    backend = SqliteDatabase(":memory:") if default is None else db_module.PostgresqlDatabase("tests")
+    backend = SqliteDatabase(":memory:") if default is None else PostgresqlDatabase("tests")
     assert LegacyOutboundRetirement._default_category(backend, table_name, column_name, data_type, primary_key, default) == expected
 
 
@@ -104,11 +101,10 @@ def test_startup_aborts_without_dropping_partial_historical_schema(tmp_path, mon
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         with pytest.raises(RuntimeError, match="partial-schema collision"):
-            DatabaseManager(SimpleNamespace(channel_id=f"tests.partial-{legacy_table}", config={}))
+            DatabaseManager(SimpleNamespace(channel_id=f"tests.partial-{legacy_table}", config=SimpleNamespace(database={})))
         collision_db = SqliteDatabase(tmp_path / "tgdata.db")
         collision_db.connect()
         try:
@@ -116,9 +112,7 @@ def test_startup_aborts_without_dropping_partial_historical_schema(tmp_path, mon
         finally:
             collision_db.close()
     finally:
-        if not database.is_closed():
-            database.close()
-        database.initialize(original_database)
+        pass
 
 
 def test_startup_aborts_without_dropping_same_named_schema_collision(tmp_path, monkeypatch):
@@ -130,11 +124,10 @@ def test_startup_aborts_without_dropping_same_named_schema_collision(tmp_path, m
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         with pytest.raises(RuntimeError, match="Legacy outbound schema collision"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.collision", config={}))
+            DatabaseManager(SimpleNamespace(channel_id="tests.collision", config=SimpleNamespace(database={})))
         collision_db = SqliteDatabase(tmp_path / "tgdata.db")
         collision_db.connect()
         try:
@@ -142,9 +135,7 @@ def test_startup_aborts_without_dropping_same_named_schema_collision(tmp_path, m
         finally:
             collision_db.close()
     finally:
-        if not database.is_closed():
-            database.close()
-        database.initialize(original_database)
+        pass
 
 
 @pytest.mark.parametrize(
@@ -174,11 +165,10 @@ def test_startup_refuses_legacy_tables_with_default_collisions(tmp_path, monkeyp
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         with pytest.raises(RuntimeError, match="schema collision"):
-            DatabaseManager(SimpleNamespace(channel_id=f"tests.defaults-{table_name}", config={}))
+            DatabaseManager(SimpleNamespace(channel_id=f"tests.defaults-{table_name}", config=SimpleNamespace(database={})))
         collision_db = SqliteDatabase(tmp_path / "tgdata.db")
         collision_db.connect()
         try:
@@ -186,9 +176,7 @@ def test_startup_refuses_legacy_tables_with_default_collisions(tmp_path, monkeyp
         finally:
             collision_db.close()
     finally:
-        if not database.is_closed():
-            database.close()
-        database.initialize(original_database)
+        pass
 
 
 def test_startup_refuses_altered_accepted_at_default_without_dropping_legacy_schema(tmp_path, monkeypatch):
@@ -207,11 +195,10 @@ def test_startup_refuses_altered_accepted_at_default_without_dropping_legacy_sch
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         with pytest.raises(RuntimeError, match="schema collision"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.accepted-at-default", config={}))
+            DatabaseManager(SimpleNamespace(channel_id="tests.accepted-at-default", config=SimpleNamespace(database={})))
         collision_db = SqliteDatabase(database_path)
         collision_db.connect()
         try:
@@ -227,6 +214,4 @@ def test_startup_refuses_altered_accepted_at_default_without_dropping_legacy_sch
         finally:
             collision_db.close()
     finally:
-        if not database.is_closed():
-            database.close()
-        database.initialize(original_database)
+        pass

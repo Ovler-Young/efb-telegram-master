@@ -3,10 +3,9 @@ from types import SimpleNamespace
 import pytest
 from peewee import PostgresqlDatabase
 
-from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
-from efb_telegram_master.models import database
+from efb_telegram_master.persistence import database_initializer
 from tests.integration import legacy_outbound_retirement_helpers
 from tests.integration.legacy_outbound_retirement_helpers import database_kwargs, drop_database, new_database, temporary_postgresql_database
 from tests.support.legacy_outbound_schema import create_legacy_outbound_schema
@@ -19,9 +18,8 @@ def test_postgresql_startup_preserves_non_empty_legacy_outbound_tables(integrati
     admin_db = PostgresqlDatabase(**database_kwargs(integration_postgres_config))
     admin_db.connect()
     admin_db.connection().autocommit = True
-    original_database = database.obj
     database_name = None
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
         database_name, legacy_db = new_database(admin_db, integration_postgres_config)
         legacy_db.connect()
@@ -38,8 +36,7 @@ def test_postgresql_startup_preserves_non_empty_legacy_outbound_tables(integrati
 
         config = {"database": {"type": "postgresql", "database": database_name, **{key: value for key, value in database_kwargs(integration_postgres_config).items() if key != "database"}}}
         with pytest.raises(RuntimeError, match="Legacy durable outbound data detected: automatic replay is disabled"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-non-empty-legacy", config=config))
-        assert database.is_closed()
+            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-non-empty-legacy", config=SimpleNamespace(database=config["database"])))
 
         preserved_db = PostgresqlDatabase(database_name, **{key: value for key, value in database_kwargs(integration_postgres_config).items() if key != "database"})
         preserved_db.connect()
@@ -50,7 +47,6 @@ def test_postgresql_startup_preserves_non_empty_legacy_outbound_tables(integrati
         finally:
             preserved_db.close()
     finally:
-        database.initialize(original_database)
         if database_name is not None:
             drop_database(admin_db, database_name)
         admin_db.close()

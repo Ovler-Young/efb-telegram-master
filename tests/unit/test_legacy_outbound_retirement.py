@@ -4,16 +4,14 @@ from unittest.mock import Mock, patch
 import pytest
 from peewee import Model, SqliteDatabase
 
-from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
-from efb_telegram_master.models import database
+from efb_telegram_master.persistence import database_initializer
 from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from tests.support.legacy_outbound_schema import create_legacy_outbound_schema
 
 
 def test_database_manager_stops_and_closes_postgresql_pool_when_retirement_fails(monkeypatch):
-    original_database = database.obj
     pool = Mock()
     pooled_database = patch("playhouse.postgres_ext.PooledPostgresqlExtDatabase", return_value=pool)
     pooled_database.start()
@@ -23,14 +21,13 @@ def test_database_manager_stops_and_closes_postgresql_pool_when_retirement_fails
     monkeypatch.setattr(LegacyOutboundRetirement, "retire_tables", lambda _self: (_ for _ in ()).throw(RuntimeError("retirement failed")))
     try:
         with pytest.raises(RuntimeError, match="retirement failed"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-failure", config={"database": {"type": "postgresql"}}))
+            DatabaseManager(SimpleNamespace(channel_id="tests.postgresql-failure", config=SimpleNamespace(database={"type": "postgresql"})))
 
         pool.connect.assert_called_once_with()
         pool.stop.assert_called_once_with()
         pool.close.assert_called_once_with()
     finally:
         pooled_database.stop()
-        database.initialize(original_database)
 
 
 def test_startup_retires_empty_legacy_outbound_tables_idempotently(tmp_path, monkeypatch):
@@ -42,19 +39,17 @@ def test_startup_retires_empty_legacy_outbound_tables_idempotently(tmp_path, mon
     finally:
         raw_db.close()
 
-    original_database = database.obj
     manager = None
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     try:
-        manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config={}))
-        table_names = set(database.get_tables())
+        manager = DatabaseManager(SimpleNamespace(channel_id="tests.legacy", config=SimpleNamespace(database={})))
+        table_names = set(manager.current_database.get_tables())
         assert not set(LegacyOutboundRetirement.TABLES) & table_names
         assert {"chatassoc", "msglog", "historymigrationentry", "msglogingestionscan"}.issubset(table_names)
-        LegacyOutboundRetirement(database.obj).retire_tables()
+        LegacyOutboundRetirement(manager.current_database).retire_tables()
     finally:
         if manager is not None:
             manager.stop_worker()
-        database.initialize(original_database)
 
 
 def test_legacy_outbound_retirement_directly_retires_empty_schema_idempotently(tmp_path):
@@ -80,24 +75,24 @@ def test_startup_aborts_when_legacy_outbound_table_retirement_fails(tmp_path, mo
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
 
-    class LegacyOutboundTable(Model):
-        class Meta:
-            database = database
-            table_name = "outboundworkflow"
+    def legacy_table_model(_table_name, current_database):
+        class LegacyOutboundTable(Model):
+            class Meta:
+                database = current_database
+                table_name = "outboundworkflow"
 
-    monkeypatch.setattr(LegacyOutboundRetirement, "_table_model", staticmethod(lambda _table_name, _database: LegacyOutboundTable))
+        return LegacyOutboundTable
+
+    monkeypatch.setattr(LegacyOutboundRetirement, "_table_model", staticmethod(legacy_table_model))
     monkeypatch.setattr(SqliteDatabase, "drop_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("drop failed")))
 
     try:
         with pytest.raises(RuntimeError, match="drop failed"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.legacy-drop", config={}))
+            DatabaseManager(SimpleNamespace(channel_id="tests.legacy-drop", config=SimpleNamespace(database={})))
     finally:
-        if not database.is_closed():
-            database.close()
-        database.initialize(original_database)
+        pass
 
 
 def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, monkeypatch):
@@ -109,7 +104,6 @@ def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, 
     finally:
         raw_db.close()
 
-    original_database = database.obj
     original_drop_tables = SqliteDatabase.drop_tables
     dropped_tables = []
 
@@ -119,11 +113,11 @@ def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, 
             raise RuntimeError("workflow drop failed")
         return original_drop_tables(instance, models, **kwargs)
 
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
     monkeypatch.setattr(SqliteDatabase, "drop_tables", fail_workflow_drop)
     try:
         with pytest.raises(RuntimeError, match="workflow drop failed"):
-            DatabaseManager(SimpleNamespace(channel_id="tests.rollback", config={}))
+            DatabaseManager(SimpleNamespace(channel_id="tests.rollback", config=SimpleNamespace(database={})))
         assert dropped_tables == ["outboundtask", "outboundworkflow"]
         restored_db = SqliteDatabase(database_path)
         restored_db.connect()
@@ -135,6 +129,4 @@ def test_sqlite_legacy_retirement_rolls_back_when_workflow_drop_fails(tmp_path, 
         finally:
             restored_db.close()
     finally:
-        if not database.is_closed():
-            database.close()
-        database.initialize(original_database)
+        pass

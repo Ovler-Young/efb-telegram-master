@@ -4,21 +4,20 @@ from types import SimpleNamespace
 import pytest
 from peewee import IntegrityError, SqliteDatabase
 
-from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
-from efb_telegram_master.models import UTC_LEASE_CLOCK, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
+from efb_telegram_master.models import DATABASE_MODELS, UTC_LEASE_CLOCK, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc
+from efb_telegram_master.persistence import database_initializer
 from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from efb_telegram_master.persistence.slave_message_delivery_repository import SlaveMessageDeliveryRepository
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source
 
 
 def test_database_manager_repositories_remain_bound_to_their_own_database(tmp_path, monkeypatch):
-    original_database = database.obj
     (tmp_path / "tests.first").mkdir()
     (tmp_path / "tests.second").mkdir()
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda channel_id: tmp_path / channel_id)
-    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.first", config={}))
-    second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.second", config={}))
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda channel_id: tmp_path / channel_id)
+    first_manager = DatabaseManager(SimpleNamespace(channel_id="tests.first", config=SimpleNamespace(database={})))
+    second_manager = DatabaseManager(SimpleNamespace(channel_id="tests.second", config=SimpleNamespace(database={})))
     try:
         first_manager.chat_associations.add_chat_assoc("master-one", "slave-one")
         second_manager.chat_associations.add_chat_assoc("master-two", "slave-two")
@@ -30,7 +29,6 @@ def test_database_manager_repositories_remain_bound_to_their_own_database(tmp_pa
     finally:
         second_manager.stop_worker()
         first_manager.stop_worker()
-        database.initialize(original_database)
 
 
 def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, monkeypatch):
@@ -59,17 +57,16 @@ def test_startup_migrates_pre_migration_four_sqlite_rows_without_loss(tmp_path, 
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    manager = DatabaseManager(SimpleNamespace(channel_id="tests.pre-migration-four", config={}))
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.pre-migration-four", config=SimpleNamespace(database={})))
     try:
-        msglog_columns = {column.name for column in database.get_columns("msglog")}
-        slave_info_columns = {column.name for column in database.get_columns("slavechatinfo")}
-        msglog = MsgLog.get_by_id("100.1")
-        slave_info = SlaveChatInfo.get(SlaveChatInfo.slave_chat_uid == "tests.slave chat")
+        with manager.current_database.bind_ctx(DATABASE_MODELS):
+            msglog_columns = {column.name for column in manager.current_database.get_columns("msglog")}
+            slave_info_columns = {column.name for column in manager.current_database.get_columns("slavechatinfo")}
+            msglog = MsgLog.get_by_id("100.1")
+            slave_info = SlaveChatInfo.get(SlaveChatInfo.slave_chat_uid == "tests.slave chat")
     finally:
         manager.stop_worker()
-        database.initialize(original_database)
     assert {"file_id", "media_type", "mime", "master_msg_id_alt", "pickle", "file_unique_id", "sender_bot_id", "provenance"}.issubset(msglog_columns)
     assert {"pickle", "slave_chat_group_id"}.issubset(slave_info_columns)
     assert (msglog.slave_message_id, msglog.text, msglog.provenance) == ("legacy-message", "legacy text", "live")
@@ -123,33 +120,32 @@ def test_association_schema_upgrade_deduplicates_rows_and_enforces_canonical_ide
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    manager = DatabaseManager(SimpleNamespace(channel_id="tests.association-upgrade", config={}))
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.association-upgrade", config=SimpleNamespace(database={})))
     try:
-        assert [(row.master_uid, row.slave_uid) for row in ChatAssoc.select()] == [("master-new", "slave-a")]
-        assert [(row.topic_chat_id, row.message_thread_id, row.slave_uid) for row in TopicAssoc.select()] == [("101", "201", "slave-b")]
-        assert [row.source_master_msg_id for row in HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id)] == ["10.2", "10.4"]
-        assert {
-            DatabaseSchemaMigrator.CHAT_ASSOC_SLAVE_INDEX,
-            DatabaseSchemaMigrator.TOPIC_ASSOC_SLAVE_INDEX,
-            DatabaseSchemaMigrator.TOPIC_ASSOC_TOPIC_THREAD_INDEX,
-        }.issubset({index.name for index in database.get_indexes("topicassoc")} | {index.name for index in database.get_indexes("chatassoc")})
-        assert {
-            DatabaseSchemaMigrator.HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX,
-            DatabaseSchemaMigrator.HISTORY_TARGET_POSITION_WITH_THREAD_INDEX,
-        }.issubset({index.name for index in database.get_indexes("historymigrationentry")})
-        with pytest.raises(IntegrityError):
-            ChatAssoc.create(master_uid="master-other", slave_uid="slave-a")
-        with pytest.raises(IntegrityError):
-            TopicAssoc.create(topic_chat_id="101", message_thread_id="201", slave_uid="slave-c")
-        with pytest.raises(IntegrityError):
-            HistoryMigrationEntry.create(slave_chat_id="slave-a", target_chat_id="100", source_master_msg_id="10.5", position=0)
-        with pytest.raises(IntegrityError):
-            HistoryMigrationEntry.create(slave_chat_id="slave-a", target_chat_id="100", message_thread_id="200", source_master_msg_id="10.6", position=0)
+        with manager.current_database.bind_ctx(DATABASE_MODELS):
+            assert [(row.master_uid, row.slave_uid) for row in ChatAssoc.select()] == [("master-new", "slave-a")]
+            assert [(row.topic_chat_id, row.message_thread_id, row.slave_uid) for row in TopicAssoc.select()] == [("101", "201", "slave-b")]
+            assert [row.source_master_msg_id for row in HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id)] == ["10.2", "10.4"]
+            assert {
+                DatabaseSchemaMigrator.CHAT_ASSOC_SLAVE_INDEX,
+                DatabaseSchemaMigrator.TOPIC_ASSOC_SLAVE_INDEX,
+                DatabaseSchemaMigrator.TOPIC_ASSOC_TOPIC_THREAD_INDEX,
+            }.issubset({index.name for index in manager.current_database.get_indexes("topicassoc")} | {index.name for index in manager.current_database.get_indexes("chatassoc")})
+            assert {
+                DatabaseSchemaMigrator.HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX,
+                DatabaseSchemaMigrator.HISTORY_TARGET_POSITION_WITH_THREAD_INDEX,
+            }.issubset({index.name for index in manager.current_database.get_indexes("historymigrationentry")})
+            with pytest.raises(IntegrityError):
+                ChatAssoc.create(master_uid="master-other", slave_uid="slave-a")
+            with pytest.raises(IntegrityError):
+                TopicAssoc.create(topic_chat_id="101", message_thread_id="201", slave_uid="slave-c")
+            with pytest.raises(IntegrityError):
+                HistoryMigrationEntry.create(slave_chat_id="slave-a", target_chat_id="100", source_master_msg_id="10.5", position=0)
+            with pytest.raises(IntegrityError):
+                HistoryMigrationEntry.create(slave_chat_id="slave-a", target_chat_id="100", message_thread_id="200", source_master_msg_id="10.6", position=0)
     finally:
         manager.stop_worker()
-        database.initialize(original_database)
 
 
 def test_slave_chat_info_schema_upgrade_deduplicates_null_and_group_identities(tmp_path, monkeypatch):
@@ -172,21 +168,20 @@ def test_slave_chat_info_schema_upgrade_deduplicates_null_and_group_identities(t
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    manager = DatabaseManager(SimpleNamespace(channel_id="tests.slave-chat-info-upgrade", config={}))
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.slave-chat-info-upgrade", config=SimpleNamespace(database={})))
     try:
-        assert [(row.slave_chat_group_id, row.slave_chat_name) for row in SlaveChatInfo.select().order_by(SlaveChatInfo.id)] == [(None, "new"), ("group", "new group")]
-        indexes = {index.name for index in database.get_indexes("slavechatinfo")}
-        assert {
-            DatabaseSchemaMigrator.SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX,
-            DatabaseSchemaMigrator.SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX,
-        }.issubset(indexes)
-        with pytest.raises(IntegrityError):
-            SlaveChatInfo.create(slave_channel_id="tests.slave", slave_channel_emoji="x", slave_chat_uid="chat", slave_chat_name="duplicate", slave_chat_type="group")
+        with manager.current_database.bind_ctx(DATABASE_MODELS):
+            assert [(row.slave_chat_group_id, row.slave_chat_name) for row in SlaveChatInfo.select().order_by(SlaveChatInfo.id)] == [(None, "new"), ("group", "new group")]
+            indexes = {index.name for index in manager.current_database.get_indexes("slavechatinfo")}
+            assert {
+                DatabaseSchemaMigrator.SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX,
+                DatabaseSchemaMigrator.SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX,
+            }.issubset(indexes)
+            with pytest.raises(IntegrityError):
+                SlaveChatInfo.create(slave_channel_id="tests.slave", slave_channel_emoji="x", slave_chat_uid="chat", slave_chat_name="duplicate", slave_chat_type="group")
     finally:
         manager.stop_worker()
-        database.initialize(original_database)
 
 
 def test_slave_message_delivery_schema_upgrade_adds_owner_token(tmp_path, monkeypatch):
@@ -204,20 +199,19 @@ def test_slave_message_delivery_schema_upgrade_adds_owner_token(tmp_path, monkey
     finally:
         raw_db.close()
 
-    original_database = database.obj
-    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    manager = DatabaseManager(SimpleNamespace(channel_id="tests.delivery-owner-token-upgrade", config={}))
+    monkeypatch.setattr(database_initializer.utils, "get_data_path", lambda _channel_id: tmp_path)
+    manager = DatabaseManager(SimpleNamespace(channel_id="tests.delivery-owner-token-upgrade", config=SimpleNamespace(database={})))
     try:
-        row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "message"))
-        assert row.state == "delivered"
-        assert row.owner_token is None
-        assert row.lease_clock is None
-        assert {"owner_token", "lease_clock"}.issubset({column.name for column in database.get_columns("slavemessagedelivery")})
-        owner_token = SlaveMessageDeliveryRepository(manager.current_database).claim("tests.slave chat", "pending-message")
-        assert owner_token is not None
-        pending_row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "pending-message"))
-        assert pending_row.owner_token == owner_token
-        assert pending_row.lease_clock == UTC_LEASE_CLOCK
+        with manager.current_database.bind_ctx(DATABASE_MODELS):
+            row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "message"))
+            assert row.state == "delivered"
+            assert row.owner_token is None
+            assert row.lease_clock is None
+            assert {"owner_token", "lease_clock"}.issubset({column.name for column in manager.current_database.get_columns("slavemessagedelivery")})
+            owner_token = SlaveMessageDeliveryRepository(manager.current_database).claim("tests.slave chat", "pending-message")
+            assert owner_token is not None
+            pending_row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "pending-message"))
+            assert pending_row.owner_token == owner_token
+            assert pending_row.lease_clock == UTC_LEASE_CLOCK
     finally:
         manager.stop_worker()
-        database.initialize(original_database)

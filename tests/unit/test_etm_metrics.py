@@ -7,7 +7,7 @@ from peewee import SqliteDatabase
 from prometheus_client import generate_latest
 
 from efb_telegram_master.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
-from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
+from efb_telegram_master.models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc
 from efb_telegram_master.persistence.chat_association_repository import ChatAssociationRepository
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.persistence.msglog_repository import MsgLogRepository
@@ -99,9 +99,7 @@ def test_database_metric_operations_are_recordable_and_reject_unknown_labels():
 
 
 def test_database_metric_decorators_record_real_repository_operations():
-    original_database = database.obj
     test_database = SqliteDatabase(":memory:")
-    database.initialize(test_database)
     test_database.connect()
     metrics = Metrics()
     chat_associations = ChatAssociationRepository(test_database)
@@ -112,18 +110,18 @@ def test_database_metric_decorators_record_real_repository_operations():
         repository._metrics = metrics
 
     try:
-        test_database.create_tables([ChatAssoc, TopicAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo])
+        with test_database.bind_ctx(DATABASE_MODELS):
+            test_database.create_tables([ChatAssoc, TopicAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo])
 
-        chat_associations.add_chat_assoc("metrics-master", "metrics-slave")
-        assert chat_associations.get_chat_assoc(master_uid="metrics-master") == ["metrics-slave"]
-        assert history_migrations.get_entries_page("metrics-slave", 12345, None, None, 1) == []
-        assert msglogs.get_recent_message_page("metrics-slave", None, 1) == []
-        assert slave_chat_info.get_slave_chat_info("metrics", "slave") is None
+            chat_associations.add_chat_assoc("metrics-master", "metrics-slave")
+            assert chat_associations.get_chat_assoc(master_uid="metrics-master") == ["metrics-slave"]
+            assert history_migrations.get_entries_page("metrics-slave", 12345, None, None, 1) == []
+            assert msglogs.get_recent_message_page("metrics-slave", None, 1) == []
+            assert slave_chat_info.get_slave_chat_info("metrics", "slave") is None
 
         rendered = generate_latest(metrics.registry).decode()
     finally:
         test_database.close()
-        database.initialize(original_database)
 
     for method in (
         "add_chat_assoc",
