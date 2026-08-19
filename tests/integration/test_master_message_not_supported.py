@@ -9,7 +9,8 @@ from telethon.tl.functions.messages import GetInlineBotResultsRequest, GetSticke
 from telethon.tl.types import Document, InputMediaPoll, InputStickerSetAnimatedEmoji, Poll, PollAnswer, TextWithEntities
 from telethon.tl.types.messages import StickerSet
 
-from .helper.filters import in_chats, regex
+from .helper.filter_chats import in_chats
+from .helper.filter_content import regex
 from .utils import link_chats
 
 pytestmark = mark.asyncio

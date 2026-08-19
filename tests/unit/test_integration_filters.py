@@ -1,7 +1,7 @@
 import pytest
 from telethon.events import MessageEdited, NewMessage
 
-from tests.integration.helper import filters
+from tests.integration.helper.filter_messages import edited, message
 
 
 class DummyNewMessageEvent(NewMessage.Event):
@@ -16,7 +16,7 @@ class DummyEditedMessageEvent(MessageEdited.Event):
 def test_message_filter_accepts_new_and_edited_message_events(event_type):
     event = object.__new__(event_type)
 
-    assert filters.message(event)
+    assert message(event)
 
 
 def test_edited_filter_rejects_a_new_message_event_for_the_same_message_id():
@@ -24,8 +24,8 @@ def test_edited_filter_rejects_a_new_message_event_for_the_same_message_id():
     event.__dict__["_init"] = False
     event.message = type("Message", (), {"id": 42})()
 
-    assert not filters.edited(42)(event)
-    assert not filters.edited(43)(event)
+    assert not edited(42)(event)
+    assert not edited(43)(event)
 
 
 def test_edited_filter_accepts_an_edited_message_event_with_the_expected_message_id():
@@ -33,5 +33,5 @@ def test_edited_filter_accepts_an_edited_message_event_with_the_expected_message
     event.__dict__["_init"] = False
     event.message = type("Message", (), {"id": 42})()
 
-    assert filters.edited(42)(event)
-    assert not filters.edited(43)(event)
+    assert edited(42)(event)
+    assert not edited(43)(event)

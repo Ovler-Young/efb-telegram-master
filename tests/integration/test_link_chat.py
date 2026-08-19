@@ -6,7 +6,9 @@ from pytest import mark
 from telethon.tl.custom import Message, MessageButton
 from telethon.tl.types import MessageEntityCode
 
-from .helper.filters import edited, has_button, in_chats, regex
+from .helper.filter_chats import in_chats
+from .helper.filter_content import has_button, regex
+from .helper.filter_messages import edited
 from .link_chat_flows import retry_on_message_id_invalid_error, simulate_link_chat
 from .utils import assert_is_linked, link_chats, unlink_all_chats
 

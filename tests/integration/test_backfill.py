@@ -3,7 +3,9 @@ from unittest.mock import patch
 
 import pytest
 
-from .helper.filters import edited, in_chats, text
+from .helper.filter_chats import in_chats
+from .helper.filter_content import text
+from .helper.filter_messages import edited
 from .utils import get_start_link, unlink_all_chats
 
 pytestmark = pytest.mark.asyncio

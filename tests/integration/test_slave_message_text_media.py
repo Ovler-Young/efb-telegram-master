@@ -1,6 +1,6 @@
 from pytest import mark
 
-from tests.integration.helper.filters import in_chats
+from tests.integration.helper.filter_chats import in_chats
 from tests.integration.slave_message_factories import MessageFactory, all_message_factories
 from tests.integration.utils import link_chats
 

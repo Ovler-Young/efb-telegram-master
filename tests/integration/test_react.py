@@ -3,7 +3,9 @@ from unittest.mock import patch
 from pytest import mark
 from telethon.tl.custom import Message
 
-from tests.integration.helper.filters import edited, in_chats, regex, reply_to
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_content import regex
+from tests.integration.helper.filter_messages import edited, reply_to
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio

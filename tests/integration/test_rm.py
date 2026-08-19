@@ -3,7 +3,9 @@ from unittest.mock import patch
 from ehforwarderbot.status import MessageRemoval
 from pytest import mark
 
-from tests.integration.helper.filters import deleted, has_button, in_chats, regex
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_content import has_button, regex
+from tests.integration.helper.filter_updates import deleted
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio

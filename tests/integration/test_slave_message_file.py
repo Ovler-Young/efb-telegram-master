@@ -5,7 +5,9 @@ from ehforwarderbot.message import MsgType
 from pytest import mark
 from telegram.constants import FileSizeLimit
 
-from tests.integration.helper.filters import in_chats, regex, reply_to
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_content import regex
+from tests.integration.helper.filter_messages import reply_to
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio

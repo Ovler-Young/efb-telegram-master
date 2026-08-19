@@ -1,7 +1,7 @@
 from pytest import mark
 from telethon.tl.custom import Message
 
-from .helper.filters import in_chats
+from .helper.filter_chats import in_chats
 from .utils import assert_is_linked, link_chats
 
 pytestmark = mark.asyncio

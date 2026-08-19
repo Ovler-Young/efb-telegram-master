@@ -3,7 +3,9 @@ from pytest import mark
 from telethon.events import UserUpdate
 from telethon.tl.types import SendMessageRecordAudioAction, SendMessageTypingAction, SendMessageUploadDocumentAction, SendMessageUploadPhotoAction, SendMessageUploadVideoAction
 
-from tests.integration.helper.filters import in_chats, reply_to, typing
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_messages import reply_to
+from tests.integration.helper.filter_updates import typing
 from tests.integration.slave_message_factories import MessageFactory, all_message_factories
 from tests.integration.utils import link_chats
 

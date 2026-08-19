@@ -15,8 +15,9 @@ from telethon.sessions import StringSession
 from telethon.tl.custom import Message
 from telethon.tl.types import TypeInputPeer
 
-from . import filters
-from .filters import BaseFilter
+from .filter_content import text
+from .filter_messages import message
+from .filters import BaseFilter, everything
 from .requests import PRIVATE_RESPONSE_WAIT_CAP, _private_response_cursor
 from .utils import parse_socks5_link
 
@@ -182,7 +183,7 @@ class TelegramIntegrationTestHelper:
         self.logger.debug("Got deleted message event, %s, %s", time.time(), event.to_dict())
         await self._queue_event(event)
 
-    async def wait_for_event(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> EventCommon:
+    async def wait_for_event(self, event_filter: BaseFilter = everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> EventCommon:
         """Wait for one matching event, preserving unmatched events for later waits."""
         self._prune_pending_events()
         effective_cursor = _private_response_cursor.get() if after_cursor is None else after_cursor
@@ -205,14 +206,14 @@ class TelegramIntegrationTestHelper:
             self.pending_events.append(value)
             self._prune_pending_events()
 
-    async def wait_for_message(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> Message:
+    async def wait_for_message(self, event_filter: BaseFilter = everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> Message:
         """Wait for a message and return its entity."""
-        event = await self.wait_for_event(filters.message & event_filter, timeout=timeout, after_cursor=after_cursor)
+        event = await self.wait_for_event(message & event_filter, timeout=timeout, after_cursor=after_cursor)
         return event.message  # type: ignore
 
-    async def wait_for_message_text(self, event_filter: BaseFilter = filters.everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> str:
+    async def wait_for_message_text(self, event_filter: BaseFilter = everything, timeout: float = 20.0, *, after_cursor: Optional[int] = None) -> str:
         """Wait for a text message and return its text."""
-        event = await self.wait_for_event(filters.text & event_filter, timeout=timeout, after_cursor=after_cursor)
+        event = await self.wait_for_event(text & event_filter, timeout=timeout, after_cursor=after_cursor)
         return event.message.text  # type: ignore
 
     async def _startup_step(self, phase: str, operation):

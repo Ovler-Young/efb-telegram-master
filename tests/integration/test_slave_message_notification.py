@@ -4,7 +4,8 @@ from unittest.mock import patch
 from ehforwarderbot.chat import ChatNotificationState
 from pytest import mark, raises
 
-from tests.integration.helper.filters import in_chats, regex
+from tests.integration.helper.filter_chats import in_chats
+from tests.integration.helper.filter_content import regex
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio

@@ -7,7 +7,9 @@ from telethon.tl.types import PeerChannel
 from telethon.tl.types.messages import ChatFull
 from telethon.utils import resolve_id
 
-from .helper.filters import in_chats, new_photo, new_title, regex, text
+from .helper.filter_chats import in_chats
+from .helper.filter_content import regex, text
+from .helper.filter_updates import new_photo, new_title
 from .utils import is_bot_admin, link_chats
 
 pytestmark = mark.asyncio

@@ -14,7 +14,8 @@ from efb_telegram_master.models import MsgLog, MsgLogIngestionScan
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 
 from ..bot import get_user_session
-from .helper.filters import in_chats, regex
+from .helper.filter_chats import in_chats
+from .helper.filter_content import regex
 
 pytestmark = pytest.mark.asyncio
 

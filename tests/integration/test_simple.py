@@ -4,7 +4,8 @@ from ehforwarderbot.__version__ import __version__ as efb_version
 from pytest import mark
 from telethon.tl.custom import Message
 
-from .helper.filters import in_chats, regex
+from .helper.filter_chats import in_chats
+from .helper.filter_content import regex
 from .utils import link_chats
 
 pytestmark = mark.asyncio

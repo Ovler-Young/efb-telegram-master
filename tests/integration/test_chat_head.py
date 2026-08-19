@@ -3,7 +3,9 @@ import re
 from pytest import mark
 from telethon.tl.custom import Message
 
-from .helper.filters import edited, has_button, in_chats, regex
+from .helper.filter_chats import in_chats
+from .helper.filter_content import has_button, regex
+from .helper.filter_messages import edited
 from .utils import link_chats
 
 pytestmark = mark.asyncio
