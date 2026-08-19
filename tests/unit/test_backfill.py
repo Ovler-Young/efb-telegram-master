@@ -15,11 +15,11 @@ from efb_telegram_master import TelegramChannel, utils
 from efb_telegram_master.callback_sessions import CallbackSessionStore, ChatListStorage
 from efb_telegram_master.channel_commands import TelegramCommandService
 from efb_telegram_master.constants import Flags
-from efb_telegram_master.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.history_replay import HistoryReplayShutdownTimeout, HistoryReplayWorker, history_location_text
 from efb_telegram_master.link_completion import LinkCompletionService
 from efb_telegram_master.models import HistoryMigrationEntry, MsgLog, database
 from efb_telegram_master.mtproto import MTProtoConfig
+from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 
 

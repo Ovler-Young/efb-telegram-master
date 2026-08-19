@@ -22,14 +22,14 @@ from telegram.constants import ChatType
 from telegram.ext import CallbackContext
 
 from . import utils as etm_utils
-from .chat_association_repository import ChatAssociationRepository
 from .chat_object_cache import ChatObjectCacheManager
 from .link_completion import LinkCompletionService
-from .msglog_repository import MsgLogRepository
 from .msglog_scan import MsgLogScanScheduler
 from .mtproto import MTProtoConfig
 from .outbound import DEFAULT_MAX_PENDING
 from .paths import LOCALE_DIR, get_config_path
+from .persistence.chat_association_repository import ChatAssociationRepository
+from .persistence.msglog_repository import MsgLogRepository
 from .ptb_compat import SupportsSendMessage, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 

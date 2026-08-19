@@ -8,10 +8,10 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Optional
 
-from .chat_association_repository import ChatAssociationRepository
 from .models import MsgLogIngestionLeaseLostError
-from .msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from .mtproto import MTProtoClient, MTProtoRetryableError
+from .persistence.chat_association_repository import ChatAssociationRepository
+from .persistence.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from .utils import EFBChannelChatIDStr
 
 _INGESTION_EVENT_IDS = {"start": "msglog_ingestion.start", "complete": "msglog_ingestion.complete"}

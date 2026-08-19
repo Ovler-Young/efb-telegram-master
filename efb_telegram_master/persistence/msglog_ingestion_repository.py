@@ -5,12 +5,12 @@ from typing import TYPE_CHECKING, List, Optional
 from ehforwarderbot.types import ChatID
 from peewee import IntegrityError
 
+from ..models import UTC_LEASE_CLOCK, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, utc_now_naive
+from ..utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 from .database_observability import ObservedRepository, bind_database, observe_database_method
-from .models import UTC_LEASE_CLOCK, MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, utc_now_naive
-from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 
 if TYPE_CHECKING:
-    from .msglog_ingestion import IngestedMsgLog
+    from ..msglog_ingestion import IngestedMsgLog
 
 
 class MsgLogIngestionCompletion(str, Enum):

@@ -15,8 +15,8 @@ from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, TopicAssoc, database
 from efb_telegram_master.msg_type import TGMsgType
-from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
-from efb_telegram_master.msglog_repository import MsgLogRepository
+from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
+from efb_telegram_master.persistence.msglog_repository import MsgLogRepository
 
 _OLD_MSGLOG_SCHEMA = """
 CREATE TABLE "msglog" (

@@ -12,8 +12,8 @@ from peewee import PostgresqlDatabase, SqliteDatabase
 
 from efb_telegram_master.models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
-from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from efb_telegram_master.mtproto import MTProtoRetryableError
+from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 
 EXPECTED_MTPROTO_TIMES = [
     ("100.1", datetime(2026, 8, 4, 8, 15), None),

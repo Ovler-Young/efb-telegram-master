@@ -18,7 +18,7 @@ class ObservedRepository:
     def __init__(self, database=None) -> None:
         self._bind_models = database is not None
         if database is None:
-            from .models import database as configured_database
+            from ..models import database as configured_database
 
             database = configured_database
         self._database = database
@@ -29,7 +29,7 @@ class ObservedRepository:
 
     @contextmanager
     def _bound_models(self):
-        from .models import DATABASE_MODELS
+        from ..models import DATABASE_MODELS
 
         if not self._bind_models:
             yield

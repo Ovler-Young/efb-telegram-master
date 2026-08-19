@@ -4,9 +4,9 @@ from typing import List, Optional, Tuple
 
 from peewee import DoesNotExist, PostgresqlDatabase, SqliteDatabase
 
+from ..models import ChatAssoc, HistoryMigrationEntry, TopicAssoc
+from ..utils import EFBChannelChatIDStr, TelegramChatID, TelegramTopicID
 from .database_observability import ObservedRepository, observe_database_method
-from .models import ChatAssoc, HistoryMigrationEntry, TopicAssoc
-from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramTopicID
 
 
 class ChatAssociationRepository(ObservedRepository):

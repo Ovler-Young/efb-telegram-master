@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from typing import Optional
 
 from . import utils
-from .history_migration_repository import HistoryMigrationRepository
+from .persistence.history_migration_repository import HistoryMigrationRepository
 from .utils import EFBChannelChatIDStr, TelegramTopicID, TgChatMsgIDStr, bounded_error_message
 
 

@@ -17,7 +17,7 @@ from .chat import ETMChatMixin
 from .constants import Flags
 from .message import ETMMsg
 from .msg_type import TGMsgType
-from .msglog_repository import MsgLogRepository
+from .persistence.msglog_repository import MsgLogRepository
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 
 

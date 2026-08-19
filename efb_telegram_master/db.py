@@ -16,10 +16,10 @@ from ehforwarderbot import utils
 from peewee import AutoField, Model, PostgresqlDatabase, SqliteDatabase, TextField
 from playhouse.migrate import Operation, PostgresqlMigrator, SqliteMigrator, migrate
 
-from .database_observability import DatabaseMetrics, observe_database_method
 from .legacy_outbound_retirement import LegacyOutboundRetirement
 from .models import DATABASE_MODELS, ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, bind_models_to_proxy, database
-from .repository_registry import Repositories
+from .persistence.database_observability import DatabaseMetrics, observe_database_method
+from .persistence.repository_registry import Repositories
 
 if TYPE_CHECKING:
     from . import TelegramChannel

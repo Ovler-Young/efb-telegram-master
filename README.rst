@@ -36,6 +36,30 @@ Requirements
 -  libmagic
 -  libwebp
 
+Architecture and Development Navigation
+---------------------------------------
+
+- ``efb_telegram_master.TelegramChannel`` is the EFB entry point.
+  ``channel_composition.py`` constructs its collaborators after database
+  initialization.
+- ``telegram_runtime.py`` owns the python-telegram-bot application and polling
+  lifecycle. ``bot_manager.py`` coordinates Telegram resources for the channel.
+- ``db.py`` owns database connection setup and schema migration.
+  ``persistence/`` owns the database-backed repositories, their registry, and
+  shared repository observability.
+- ``master_inbound.py`` resolves Telegram updates for delivery to slave
+  channels. ``master_delivery.py`` performs that delivery.
+  ``slave_message.py`` accepts slave messages for Telegram delivery, and
+  ``outbound.py`` owns the queued Telegram-call execution path.
+
+Validate a checkout with:
+
+.. code:: shell
+
+    uv run --locked doit quality
+    uv run --locked pytest tests/unit/test_packaging.py
+    uv run --locked python -m compileall -q efb_telegram_master
+
 Getting Started
 ---------------
 

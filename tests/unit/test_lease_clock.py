@@ -7,9 +7,9 @@ from unittest.mock import patch
 from peewee import SqliteDatabase
 
 from efb_telegram_master.models import UTC_LEASE_CLOCK, MsgLogIngestionScan, SlaveMessageDelivery, database
-from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
-from efb_telegram_master.slave_message_delivery_repository import SlaveMessageDeliveryRepository
+from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
+from efb_telegram_master.persistence.slave_message_delivery_repository import SlaveMessageDeliveryRepository
 
 
 def _with_timezone(timezone_name):

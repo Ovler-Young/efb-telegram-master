@@ -18,9 +18,9 @@ from efb_telegram_master import TelegramChannel
 from efb_telegram_master.channel_commands import LocaleState, TelegramCommandService
 from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
-from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
 from efb_telegram_master.mtproto import MTProtoRetryableError
+from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.slave_message import SlaveMessageService
 from efb_telegram_master.slave_status import SlaveStatusService
 

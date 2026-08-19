@@ -16,13 +16,13 @@ from telegram.ext import CallbackContext
 
 from . import utils as etm_utils
 from .bot_pool import build_bot_pool
-from .chat_association_repository import ChatAssociationRepository
 from .metrics_runtime import configure_runtime_metrics
-from .msglog_ingestion_repository import MsgLogIngestionRepository
 from .msglog_scan import MsgLogScanScheduler
 from .mtproto import MTProtoClient, MTProtoRetryableError, MTProtoSessionOwnershipError
 from .outbound import OutboundQueue
 from .outbound_types import SchedulerStoppedError
+from .persistence.chat_association_repository import ChatAssociationRepository
+from .persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from .ptb_compat import sync_reply_html
 from .rate_limiter import SlidingWindowRateLimiter
 from .telegram_api import TelegramAPI

@@ -5,9 +5,9 @@ from uuid import uuid4
 
 from peewee import IntegrityError
 
+from ..models import UTC_LEASE_CLOCK, SlaveMessageDelivery, utc_now_naive
+from ..utils import EFBChannelChatIDStr
 from .database_observability import ObservedRepository, observe_database_method
-from .models import UTC_LEASE_CLOCK, SlaveMessageDelivery, utc_now_naive
-from .utils import EFBChannelChatIDStr
 
 
 class SlaveMessageDeliveryRepository(ObservedRepository):
