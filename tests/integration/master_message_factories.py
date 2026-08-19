@@ -1,23 +1,3 @@
-"""
-Planned workflow
-================
-Send a message
-Assert if it is send
-Check if content is correct
-
-Edit the message (if possible)
-    Assert message ID is the same
-    Assert edit flag and not edit_media flag
-    Assert content updated
-Edit the message media (if possible)
-    Assert message ID is the same
-    Assert edit and edit_media flag
-    Assert content updated
-Send another message of same kind, quoting the previous one
-    Assert message is sent
-    Assert message target is correct.
-"""
-
 import asyncio
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -25,16 +5,11 @@ from uuid import uuid4
 
 from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot import MsgType
-from ehforwarderbot.chat import SelfChatMember
 from ehforwarderbot.message import LocationAttribute
-from pytest import approx, mark
+from pytest import approx
 from telethon import TelegramClient
 from telethon.tl.custom import Message
 from telethon.tl.types import InputGeoPoint, InputMediaContact, InputMediaDice, InputMediaGeoPoint, InputMediaVenue, MessageMediaDice, MessageMediaVenue
-
-from .utils import link_chats
-
-pytestmark = mark.asyncio
 
 TELEGRAM_OPERATION_TIMEOUT = 90
 
@@ -326,12 +301,8 @@ class DiceMessageFactory(MessageFactory):
         return f"DiceMessageFactory({self.emoji})"
 
 
-# endregion Message factory classes
-
-
-@mark.parametrize(
-    "factory",
-    [
+def all_message_factories():
+    return [
         TextMessageFactory(),
         LocationMessageFactory(),
         ContactMessageFactory(),
@@ -346,56 +317,4 @@ class DiceMessageFactory(MessageFactory):
         DiceMessageFactory("🎲"),
         DiceMessageFactory("🎯"),
         DiceMessageFactory("🏀"),
-    ],
-    ids=str,
-)
-async def test_master_message(helper, client, bot_group, slave, channel, factory: MessageFactory):
-    chat = slave.chat_without_alias
-
-    with link_chats(channel, (chat,), bot_group):
-        # Send message
-        tg_msg = await run_telegram_operation(factory, "initial send", factory.send_message(client, bot_group))
-        efb_msg = slave.messages.get(timeout=5)
-        assert efb_msg.chat == chat
-        assert isinstance(efb_msg.author, SelfChatMember)
-        assert efb_msg.deliver_to is slave
-        assert not efb_msg.edit
-        assert not efb_msg.edit_media
-        factory.compare_message(tg_msg, efb_msg)
-        await factory.finalize_message(tg_msg, efb_msg)
-
-        # Edit message
-        edited_msg = await run_telegram_operation(factory, "text edit", factory.edit_message(client, tg_msg))
-        if edited_msg is not None:
-            efb_msg = slave.messages.get(timeout=5)
-            assert efb_msg.chat == chat
-            assert isinstance(efb_msg.author, SelfChatMember)
-            assert efb_msg.deliver_to is slave
-            assert efb_msg.edit
-            assert not efb_msg.edit_media
-            factory.compare_message(edited_msg, efb_msg)
-            await factory.finalize_message(edited_msg, efb_msg)
-
-        # Edit media
-        media_edited = await run_telegram_operation(factory, "media edit", factory.edit_message_media(client, tg_msg))
-        if media_edited is not None:
-            efb_msg = slave.messages.get(timeout=5)
-            assert efb_msg.chat == chat
-            assert isinstance(efb_msg.author, SelfChatMember)
-            assert efb_msg.deliver_to is slave
-            assert efb_msg.edit
-            assert efb_msg.edit_media
-            factory.compare_message(media_edited, efb_msg)
-            await factory.finalize_message(media_edited, efb_msg)
-
-        # Quote reply
-        if factory.test_quote:
-            quoted_message = await run_telegram_operation(factory, "quote reply send", factory.send_message(client, bot_group, target=tg_msg))
-            quoted_efb_msg = slave.messages.get(timeout=5)
-            assert quoted_efb_msg.chat == chat
-            assert isinstance(quoted_efb_msg.author, SelfChatMember)
-            assert quoted_efb_msg.deliver_to is slave
-            assert not quoted_efb_msg.edit
-            assert not quoted_efb_msg.edit_media
-            assert quoted_efb_msg.target.uid == efb_msg.uid
-            await factory.finalize_message(quoted_message, quoted_efb_msg)
+    ]
