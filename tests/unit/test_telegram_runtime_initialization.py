@@ -155,7 +155,9 @@ def test_channel_rpc_bind_failure_stops_before_component_startup() -> None:
     )
     with ExitStack() as stack:
         stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
-        stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=RuntimeConfiguration.from_mapping({"token": "token", "admins": [1], "rpc": {"server": "127.0.0.1", "port": 0}})))
+        stack.enter_context(
+            patch("efb_telegram_master.load_channel_config", return_value=RuntimeConfiguration.from_mapping({"token": "token", "admins": [1], "rpc": {"server": "127.0.0.1", "port": 0}}))
+        )
         stack.enter_context(patch("efb_telegram_master.runtime.rpc_utils._ThreadedXMLRPCServer", side_effect=OSError("bind failed")))
         stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
         bot_manager = stack.enter_context(patch("efb_telegram_master.runtime.channel_composition.TelegramBotManager"))

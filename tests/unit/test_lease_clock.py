@@ -37,7 +37,9 @@ def test_legacy_local_leases_are_not_reclaimed_early_or_blocked_after_expiry():
         with test_db.bind_ctx(DATABASE_MODELS):
             test_db.create_tables([MsgLogIngestionScan, SlaveMessageDelivery])
             scan = scans.get_or_create_scan(100, 500)
-            MsgLogIngestionScan.update(status="running", lease_owner="legacy", lease_expires_at=datetime.now() + timedelta(minutes=1), lease_clock=None).where(MsgLogIngestionScan.id == scan.id).execute()
+            MsgLogIngestionScan.update(status="running", lease_owner="legacy", lease_expires_at=datetime.now() + timedelta(minutes=1), lease_clock=None).where(
+                MsgLogIngestionScan.id == scan.id
+            ).execute()
             SlaveMessageDelivery.create(slave_origin_uid="tests.slave chat", slave_message_id="legacy", lease_expires_at=datetime.now() + timedelta(minutes=1), lease_clock=None, owner_token="legacy")
 
             assert scans.claim_scan(100, "other", 60) is None

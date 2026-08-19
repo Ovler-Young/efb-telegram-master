@@ -4,6 +4,7 @@ import time
 
 from pytest import fixture
 
+from efb_telegram_master.config.runtime import RPCConfiguration
 from efb_telegram_master.runtime.rpc_utils import RPCShutdownTimeout, RPCUtilities
 
 
@@ -28,7 +29,7 @@ def test_rpc_channels_id(rpc, coordinator):
 def test_configured_rpc_server_requires_explicit_start_and_stops_idempotently():
     database = FakeDatabase()
     coordinator_module = FakeCoordinator()
-    utilities = RPCUtilities({"server": "127.0.0.1", "port": 0}, database, coordinator_module)
+    utilities = RPCUtilities(RPCConfiguration(port=0), database, coordinator_module)
 
     assert not hasattr(database, "config")
     assert not hasattr(coordinator_module, "db")
@@ -45,7 +46,7 @@ def test_configured_rpc_server_requires_explicit_start_and_stops_idempotently():
 
 
 def test_rpc_stop_reports_an_active_handler_until_a_retry_joins_it():
-    utilities = RPCUtilities({"server": "127.0.0.1", "port": 0}, FakeDatabase(), FakeCoordinator())
+    utilities = RPCUtilities(RPCConfiguration(port=0), FakeDatabase(), FakeCoordinator())
     utilities.start()
     assert utilities.server is not None
 
