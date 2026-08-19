@@ -17,7 +17,8 @@ from telethon import TelegramClient
 from efb_telegram_master import TelegramChannel
 
 from ..bot import get_user_session
-from .helper.helper import TelegramIntegrationTestHelper, wait_for_private_response
+from .helper.client import TelegramIntegrationTestHelper
+from .helper.requests import wait_for_private_response
 
 pytest.register_assert_rewrite("tests.integration.utils")
 

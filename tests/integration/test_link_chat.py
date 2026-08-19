@@ -15,7 +15,7 @@ from telethon.tl.types import MessageEntityCode
 from telethon.utils import get_peer_id
 
 from .helper.filters import edited, has_button, in_chats, regex
-from .helper.helper import wait_for_message_state, wait_for_new_message_after
+from .helper.messages import wait_for_message_state, wait_for_new_message_after
 from .utils import assert_is_linked, link_chats, unlink_all_chats
 
 retry_on_message_id_invalid_error = mark.flaky(

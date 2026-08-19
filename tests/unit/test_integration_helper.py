@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.integration.helper import helper as helper_module
+from tests.integration.helper import client as client_module
+from tests.integration.helper import messages as message_module
+from tests.integration.helper import requests as request_module
 
 
 class RecordingTelegramClient:
@@ -44,8 +46,8 @@ class HangingDisconnectTelegramClient:
         return None
 
 
-def build_event_helper() -> helper_module.TelegramIntegrationTestHelper:
-    test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
+def build_event_helper() -> client_module.TelegramIntegrationTestHelper:
+    test_helper = object.__new__(client_module.TelegramIntegrationTestHelper)
     test_helper.queue = asyncio.Queue()
     test_helper.pending_events = []
     test_helper._event_sequence = 0
@@ -59,9 +61,9 @@ def build_event_helper() -> helper_module.TelegramIntegrationTestHelper:
 
 
 def test_helper_cleanup_removes_every_registered_event_handler(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(helper_module, "TelegramClient", RecordingTelegramClient)
-    monkeypatch.setattr(helper_module, "StringSession", lambda _session: object())
-    test_helper = helper_module.TelegramIntegrationTestHelper("session", 1, "hash", None, 2, chats={100})
+    monkeypatch.setattr(client_module, "TelegramClient", RecordingTelegramClient)
+    monkeypatch.setattr(client_module, "StringSession", lambda _session: object())
+    test_helper = client_module.TelegramIntegrationTestHelper("session", 1, "hash", None, 2, chats={100})
 
     asyncio.run(test_helper._disconnect_client())
 
@@ -72,7 +74,7 @@ def test_helper_cleanup_removes_every_registered_event_handler(monkeypatch: pyte
 @pytest.mark.asyncio
 async def test_event_queue_discards_oldest_events_and_returns_only_the_newer_cursor_response(monkeypatch: pytest.MonkeyPatch) -> None:
     test_helper = build_event_helper()
-    monkeypatch.setattr(helper_module, "PENDING_EVENT_MAX_COUNT", 3)
+    monkeypatch.setattr(client_module, "PENDING_EVENT_MAX_COUNT", 3)
     for index in range(5):
         await test_helper._queue_event(SimpleNamespace(kind=index))
     pre_cursor_response = SimpleNamespace(kind="response")
@@ -102,10 +104,10 @@ def test_temporary_chat_watch_remains_until_the_final_consumer_unwatches():
 @pytest.mark.asyncio
 async def test_client_startup_timeout_disconnects_the_partially_started_client(monkeypatch: pytest.MonkeyPatch) -> None:
     client = StalledTelegramClient()
-    test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
+    test_helper = object.__new__(client_module.TelegramIntegrationTestHelper)
     test_helper.client = client
     test_helper.logger = logging.getLogger(__name__)
-    monkeypatch.setattr(helper_module, "CLIENT_START_TIMEOUT", 0.01)
+    monkeypatch.setattr(client_module, "CLIENT_START_TIMEOUT", 0.01)
 
     with pytest.raises(TimeoutError, match="client connect"):
         await test_helper.__aenter__()
@@ -115,9 +117,9 @@ async def test_client_startup_timeout_disconnects_the_partially_started_client(m
 
 @pytest.mark.asyncio
 async def test_client_disconnect_times_out_when_telethon_never_finishes(monkeypatch: pytest.MonkeyPatch) -> None:
-    test_helper = object.__new__(helper_module.TelegramIntegrationTestHelper)
+    test_helper = object.__new__(client_module.TelegramIntegrationTestHelper)
     test_helper.client = HangingDisconnectTelegramClient()
-    monkeypatch.setattr(helper_module, "CLIENT_STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr(client_module, "CLIENT_STOP_TIMEOUT", 0.01)
 
     with pytest.raises(asyncio.TimeoutError):
         await test_helper._disconnect_client()
@@ -157,7 +159,7 @@ class RecentMessageClient:
 
 @pytest.mark.asyncio
 async def test_wait_for_new_message_after_advances_after_a_capped_poll(monkeypatch: pytest.MonkeyPatch) -> None:
-    pages = [[RecentMessage(message_id, button_count=0) for message_id in range(first, first + helper_module.NEW_MESSAGE_PAGE_SIZE)] for first in (13, 33, 53)]
+    pages = [[RecentMessage(message_id, button_count=0) for message_id in range(first, first + message_module.NEW_MESSAGE_PAGE_SIZE)] for first in (13, 33, 53)]
     response = RecentMessage(73, button_count=1)
     client = RecentMessageClient([*pages, [response]])
     waits: list[float] = []
@@ -165,15 +167,15 @@ async def test_wait_for_new_message_after_advances_after_a_capped_poll(monkeypat
     async def yield_control(delay: float) -> None:
         waits.append(delay)
 
-    monkeypatch.setattr(helper_module, "Message", RecentMessage)
-    monkeypatch.setattr(helper_module.asyncio, "sleep", yield_control)
+    monkeypatch.setattr(message_module, "Message", RecentMessage)
+    monkeypatch.setattr(message_module.asyncio, "sleep", yield_control)
 
-    assert await helper_module.wait_for_new_message_after(client, 100, 12, lambda current: current.button_count == 1) is response
+    assert await message_module.wait_for_new_message_after(client, 100, 12, lambda current: current.button_count == 1) is response
     assert client.calls == [
-        (100, 12, 12, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
-        (100, 12, 32, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
-        (100, 12, 52, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
-        (100, 12, 72, helper_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 12, message_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 32, message_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 52, message_module.NEW_MESSAGE_PAGE_SIZE, True),
+        (100, 12, 72, message_module.NEW_MESSAGE_PAGE_SIZE, True),
     ]
     assert waits == [1.0]
 
@@ -203,10 +205,10 @@ async def test_concurrent_private_responses_keep_independent_cursors() -> None:
     async def receive_b(_: float):
         return await test_helper.wait_for_event(lambda event: event.kind == "b")
 
-    a_wait = asyncio.create_task(helper_module.wait_for_private_response(lambda: 0.0, a_trigger, receive_a, response_cursor=test_helper.event_cursor))
+    a_wait = asyncio.create_task(request_module.wait_for_private_response(lambda: 0.0, a_trigger, receive_a, response_cursor=test_helper.event_cursor))
     await a_trigger_started.wait()
     await test_helper._queue_event(between_a_and_b)
-    b_wait = asyncio.create_task(helper_module.wait_for_private_response(lambda: 0.0, b_trigger, receive_b, response_cursor=test_helper.event_cursor))
+    b_wait = asyncio.create_task(request_module.wait_for_private_response(lambda: 0.0, b_trigger, receive_b, response_cursor=test_helper.event_cursor))
     await asyncio.sleep(0)
     release_a_trigger.set()
 
@@ -230,20 +232,20 @@ async def test_private_response_passes_its_remaining_deadline_to_exact_message_s
 
     async def receive(timeout: float) -> StateMessage:
         received_timeouts.append(timeout)
-        return await helper_module.wait_for_message_state(client, 34, 12, lambda current: current.button_count == 0, timeout=timeout)
+        return await message_module.wait_for_message_state(client, 34, 12, lambda current: current.button_count == 0, timeout=timeout)
 
     monotonic = iter((100.0, 100.0, 110.0, 110.0)).__next__
-    monkeypatch.setattr(helper_module, "Message", StateMessage)
-    monkeypatch.setattr(helper_module, "time", SimpleNamespace(monotonic=monotonic))
-    monkeypatch.setattr(helper_module, "wait_for_limiter_slot", wait_for_slot)
+    monkeypatch.setattr(message_module, "Message", StateMessage)
+    monkeypatch.setattr(request_module, "time", SimpleNamespace(monotonic=monotonic))
+    monkeypatch.setattr(request_module, "wait_for_limiter_slot", wait_for_slot)
 
-    assert await helper_module.wait_for_private_response(lambda: 0.0, trigger, receive) is expected
+    assert await request_module.wait_for_private_response(lambda: 0.0, trigger, receive) is expected
     assert received_timeouts == [55.0]
 
 
 @pytest.mark.asyncio
 async def test_wait_for_message_state_rejects_unexpected_list_response(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(helper_module, "Message", StateMessage)
+    monkeypatch.setattr(message_module, "Message", StateMessage)
 
     with pytest.raises(TypeError, match="list"):
-        await helper_module.wait_for_message_state(StateClient([[StateMessage(button_count=0)]]), 100, 42, lambda _current: True)
+        await message_module.wait_for_message_state(StateClient([[StateMessage(button_count=0)]]), 100, 42, lambda _current: True)

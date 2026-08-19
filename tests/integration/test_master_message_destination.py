@@ -17,7 +17,7 @@ from pytest import mark, raises
 from telethon.tl.custom import Message, MessageButton
 
 from .helper.filters import edited, has_button, in_chats, regex, reply_to, text
-from .helper.helper import wait_for_message_state
+from .helper.messages import wait_for_message_state
 
 pytestmark = mark.asyncio
 
