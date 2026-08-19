@@ -38,6 +38,18 @@ def _store_link_session(channel, chat, storage_key):
     channel.callback_sessions.store(storage_key, 1, storage)
 
 
+def _link_chat_update(channel, chat, bot_group, message_id):
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(message_id))
+    _store_link_session(channel, chat, storage_key)
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    return storage_key, token, _build_link_update(bot_group)
+
+
+def _add_chat_association(channel, chat, master_chat_id):
+    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(master_chat_id)))
+    channel.chat_associations.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
+
+
 def _cleanup_link_state(channel, chat, master_chat_id):
     master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(master_chat_id)))
     channel.chat_associations.remove_chat_assoc(master_uid=master_uid)
@@ -162,11 +174,8 @@ def test_start_with_missing_effective_user_does_not_consume_a_session():
 
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     chat = slave.chat_with_alias
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key)
+    storage_key, token, update = _link_chat_update(channel, chat, bot_group, 101)
     channel.callback_sessions.set_state(channel.link_handler, storage_key, Flags.LINK_EXEC)
-    update = _build_link_update(bot_group)
 
     sent_message = _sent_link_message(bot_group, 500)
 
@@ -187,10 +196,7 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
 def test_initial_link_backfills_to_the_chat_migrated_during_status_edit(channel, slave, bot_group):
     chat = slave.chat_with_alias
     migrated_chat_id = -100700
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(109))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key)
-    update = _build_link_update(bot_group)
+    storage_key, token, update = _link_chat_update(channel, chat, bot_group, 109)
 
     def migrate_status_edit(**kwargs):
         if kwargs["chat_id"] == bot_group:
@@ -230,11 +236,8 @@ def test_replacing_a_chat_association_discards_its_pending_history(channel, slav
 
 def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
     chat = channel.chat_manager.update_chat_obj(slave.chat_with_alias)
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(106))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key)
+    storage_key, token, update = _link_chat_update(channel, chat, bot_group, 106)
     channel.callback_sessions.set_state(channel.link_handler, storage_key, Flags.LINK_EXEC)
-    update = _build_link_update(bot_group)
 
     with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 506)), patch.object(chat, "link", side_effect=RuntimeError("link failed")):
         with pytest.raises(RuntimeError, match="link failed"):
@@ -246,10 +249,7 @@ def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
 
 def test_link_chat_edits_status_message_with_sender_bot(channel, slave, bot_group):
     chat = slave.chat_with_alias
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(105))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key)
-    update = _build_link_update(bot_group)
+    storage_key, token, update = _link_chat_update(channel, chat, bot_group, 105)
 
     sent_message = _sent_link_message(bot_group, 505, sender_bot_id="8465204282")
 
@@ -270,12 +270,8 @@ def test_link_chat_edits_status_message_with_sender_bot(channel, slave, bot_grou
 
 def test_link_chat_auto_mode_sends_history_link_on_relink(channel, slave, bot_group):
     chat = slave.chat_with_alias
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(102))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key)
-    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
-    channel.chat_associations.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
-    update = _build_link_update(bot_group)
+    storage_key, token, update = _link_chat_update(channel, chat, bot_group, 102)
+    _add_chat_association(channel, chat, bot_group)
 
     sent_message = _sent_link_message(bot_group, 501)
 
@@ -295,12 +291,8 @@ def test_link_chat_auto_mode_sends_history_link_on_relink(channel, slave, bot_gr
 @pytest.mark.parametrize("backfill_flag", ["true", "yes", "on", "1"])
 def test_link_chat_backfill_override_forces_replay(channel, slave, bot_group, backfill_flag):
     chat = slave.chat_with_alias
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(103))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key)
-    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
-    channel.chat_associations.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
-    update = _build_link_update(bot_group)
+    storage_key, token, update = _link_chat_update(channel, chat, bot_group, 103)
+    _add_chat_association(channel, chat, bot_group)
 
     sent_message = _sent_link_message(bot_group, 502)
 
@@ -320,12 +312,8 @@ def test_link_chat_backfill_override_forces_replay(channel, slave, bot_group, ba
 @pytest.mark.parametrize("backfill_flag", ["false", "no", "off", "0"])
 def test_link_chat_backfill_override_skips_replay(channel, slave, bot_group, backfill_flag):
     chat = slave.chat_with_alias
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(130))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key)
-    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
-    channel.chat_associations.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
-    update = _build_link_update(bot_group)
+    storage_key, token, update = _link_chat_update(channel, chat, bot_group, 130)
+    _add_chat_association(channel, chat, bot_group)
 
     with (
         patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 530)),
@@ -469,8 +457,7 @@ def test_requested_empty_backfill_sends_one_history_location_to_the_linked_topic
     storage_key = (TelegramChatID(-1001234567890), TelegramMessageID(456))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key)
-    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
-    channel.chat_associations.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
+    _add_chat_association(channel, chat, bot_group)
     update = _build_link_update(bot_group, is_forum=True)
     topic_id = 789
     channel.topic_sync.create_topic = Mock(return_value=topic_id)
@@ -628,12 +615,8 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
 
 def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(channel, slave, bot_group):
     chat = slave.chat_with_alias
-    storage_key = (TelegramChatID(bot_group), TelegramMessageID(104))
-    token = utils.b64en(utils.message_id_to_str(*storage_key))
-    _store_link_session(channel, chat, storage_key)
-    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
-    channel.chat_associations.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
-    update = _build_link_update(bot_group)
+    storage_key, token, update = _link_chat_update(channel, chat, bot_group, 104)
+    _add_chat_association(channel, chat, bot_group)
     update.effective_message.text = f"/start {token} true"
 
     sent_message = _sent_link_message(bot_group, 503)
