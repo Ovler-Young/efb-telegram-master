@@ -15,6 +15,12 @@ from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
 from efb_telegram_master.mtproto import MTProtoRetryableError
 
+EXPECTED_MTPROTO_TIMES = [
+    ("100.1", datetime(2026, 8, 4, 8, 15), None),
+    ("100.2", datetime(2026, 8, 4, 12, 30), None),
+    ("100.3", datetime(2026, 8, 4, 12, 30), None),
+]
+
 
 @dataclass
 class Scan:
@@ -33,7 +39,6 @@ class FakeDatabase:
         self.chat_associations = FakeChatAssociations({10: "tests.slave"})
         self.msglog_ingestion = self
         self.persisted = []
-        self.claims = []
 
     def get_or_create_scan(self, source_chat_id, scan_boundary):
         assert source_chat_id == 100
@@ -41,16 +46,12 @@ class FakeDatabase:
         return self.scan
 
     def claim_scan(self, source_chat_id, lease_owner, lease_seconds):
-        self.claims.append((source_chat_id, lease_owner, lease_seconds))
         return self.scan if self.scan.status != "complete" else None
 
     def persist_item(self, scan, *, source_message_id, classification, slave_uid=None, message=None, lease_owner):
         self.persisted.append((source_message_id, classification, slave_uid, message))
         scan.cursor = source_message_id - 1
         if classification == "eligible":
-            if source_message_id in {503, 502}:
-                scan.existing_streak += 1
-                return "existing"
             scan.existing_streak = 0
             return "inserted"
         return "skipped"
@@ -110,6 +111,27 @@ def topic_message(message_id, *, topic_id=10, media=None, date=None, topic_root=
     )
 
 
+@pytest.fixture
+def sqlite_ingestion_database():
+    original_database = database.obj
+    test_db = None
+
+    def create(path=":memory:"):
+        nonlocal test_db
+        test_db = SqliteDatabase(path)
+        database.initialize(test_db)
+        test_db.connect()
+        test_db.create_tables([MsgLog, MsgLogIngestionScan])
+        return test_db, MsgLogIngestionRepository("tests.master")
+
+    try:
+        yield create
+    finally:
+        if test_db is not None and not test_db.is_closed():
+            test_db.close()
+        database.initialize(original_database)
+
+
 def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
     db = FakeDatabase()
     ordinary_reply = SimpleNamespace(
@@ -144,7 +166,7 @@ def test_ingestion_descends_in_hundred_id_batches_and_stores_mapped_messages():
     assert db.scan.status == "complete"
 
 
-def test_association_rescan_restarts_completed_scan_and_repeats_active_lease():
+def test_association_rescan_restarts_completed_scan_and_repeats_active_lease(sqlite_ingestion_database):
     class Associations:
         def __init__(self):
             self.slave_uid = None
@@ -157,31 +179,22 @@ def test_association_rescan_restarts_completed_scan_and_repeats_active_lease():
                 assert ingestion.request_association_rescan(100) == "running"
             return self.slave_uid
 
-    original_database = database.obj
-    test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
-    test_db.connect()
-    ingestion = MsgLogIngestionRepository("tests.master")
+    _, ingestion = sqlite_ingestion_database()
     associations = Associations()
     mtproto = FakeMTProto({1: topic_message(1)}, scan_ceiling=1)
     service = MsgLogIngestionService(ingestion, associations, mtproto)
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        asyncio.run(service.run(100, lease_owner="worker-a"))
+    asyncio.run(service.run(100, lease_owner="worker-a"))
 
-        completed = MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == "100")
-        assert completed.status == "complete"
-        assert MsgLog.select().count() == 0
+    completed = MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == "100")
+    assert completed.status == "complete"
+    assert MsgLog.select().count() == 0
 
-        associations.slave_uid = "tests.slave target"
-        assert ingestion.request_association_rescan(100) == "pending"
-        asyncio.run(service.run(100, lease_owner="worker-b"))
+    associations.slave_uid = "tests.slave target"
+    assert ingestion.request_association_rescan(100) == "pending"
+    asyncio.run(service.run(100, lease_owner="worker-b"))
 
-        scan = MsgLogIngestionScan.get_by_id(completed.id)
-        row = MsgLog.get_by_id("100.1")
-    finally:
-        test_db.close()
-        database.initialize(original_database)
+    scan = MsgLogIngestionScan.get_by_id(completed.id)
+    row = MsgLog.get_by_id("100.1")
 
     assert associations.requested_during_active_lease
     assert [ids for _channel, ids in mtproto.calls] == [[1], [1], [1]]
@@ -227,12 +240,8 @@ def test_ingestion_collapses_media_to_generic_copyable_content():
     assert stored.mime == "video/mp4"
 
 
-def test_ingestion_persists_mtproto_times_as_utc_naive_datetimes(tmp_path):
-    original_database = database.obj
-    test_db = SqliteDatabase(tmp_path / "msglog.db")
-    database.initialize(test_db)
-    test_db.connect()
-    ingestion = MsgLogIngestionRepository("tests.master")
+def test_ingestion_persists_mtproto_times_as_utc_naive_datetimes(sqlite_ingestion_database, tmp_path):
+    test_db, ingestion = sqlite_ingestion_database(tmp_path / "msglog.db")
     mtproto = FakeMTProto(
         {
             3: topic_message(3, date=datetime(2026, 8, 4, 12, 30, tzinfo=timezone.utc)),
@@ -242,21 +251,12 @@ def test_ingestion_persists_mtproto_times_as_utc_naive_datetimes(tmp_path):
         scan_ceiling=3,
     )
     service = MsgLogIngestionService(ingestion, FakeChatAssociations({10: "tests.slave target"}), mtproto)
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        asyncio.run(service.run(100, lease_owner="worker-a"))
-        test_db.close()
-        test_db.connect()
-        rows = list(MsgLog.select().order_by(MsgLog.time, MsgLog.master_msg_id))
-    finally:
-        test_db.close()
-        database.initialize(original_database)
+    asyncio.run(service.run(100, lease_owner="worker-a"))
+    test_db.close()
+    test_db.connect()
+    rows = list(MsgLog.select().order_by(MsgLog.time, MsgLog.master_msg_id))
 
-    assert [(row.master_msg_id, row.time, row.time.tzinfo) for row in rows] == [
-        ("100.1", datetime(2026, 8, 4, 8, 15), None),
-        ("100.2", datetime(2026, 8, 4, 12, 30), None),
-        ("100.3", datetime(2026, 8, 4, 12, 30), None),
-    ]
+    assert [(row.master_msg_id, row.time, row.time.tzinfo) for row in rows] == EXPECTED_MTPROTO_TIMES
 
 
 @pytest.mark.skipif(not os.getenv("TEST_POSTGRES_HOST"), reason="PostgreSQL test environment is not configured")
@@ -302,11 +302,7 @@ def test_postgresql_ingestion_persists_mtproto_times_as_utc_naive_datetimes():
         admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
         admin_db.close()
 
-    assert [(row.master_msg_id, row.time, row.time.tzinfo) for row in rows] == [
-        ("100.1", datetime(2026, 8, 4, 8, 15), None),
-        ("100.2", datetime(2026, 8, 4, 12, 30), None),
-        ("100.3", datetime(2026, 8, 4, 12, 30), None),
-    ]
+    assert [(row.master_msg_id, row.time, row.time.tzinfo) for row in rows] == EXPECTED_MTPROTO_TIMES
 
 
 def test_ingestion_marks_transient_mtproto_failure_for_retry_without_advancing_cursor(caplog):
@@ -397,12 +393,8 @@ def test_ingestion_logs_lease_loss_with_a_stable_event(caplog):
     ]
 
 
-def test_ingestion_does_not_log_complete_when_lease_is_lost_at_completion(caplog):
-    original_database = database.obj
-    test_db = SqliteDatabase(":memory:")
-    database.initialize(test_db)
-    test_db.connect()
-    ingestion = MsgLogIngestionRepository("tests.master")
+def test_ingestion_does_not_log_complete_when_lease_is_lost_at_completion(caplog, sqlite_ingestion_database):
+    _, ingestion = sqlite_ingestion_database()
     service = MsgLogIngestionService(ingestion, FakeChatAssociations({10: "tests.slave target"}), FakeMTProto({1: topic_message(1)}, scan_ceiling=1))
     original_persist_item = ingestion.persist_item
 
@@ -411,15 +403,10 @@ def test_ingestion_does_not_log_complete_when_lease_is_lost_at_completion(caplog
         MsgLogIngestionScan.update(lease_owner="worker-b", lease_expires_at=datetime.now() + timedelta(seconds=60)).where(MsgLogIngestionScan.id == scan.id).execute()
         return outcome
 
-    try:
-        test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        ingestion.persist_item = persist_then_transfer_lease
-        with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
-            asyncio.run(service.run(100, lease_owner="worker-a"))
-        scan = MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == "100")
-    finally:
-        test_db.close()
-        database.initialize(original_database)
+    ingestion.persist_item = persist_then_transfer_lease
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.msglog_ingestion"):
+        asyncio.run(service.run(100, lease_owner="worker-a"))
+    scan = MsgLogIngestionScan.get(MsgLogIngestionScan.source_chat_id == "100")
 
     assert (scan.status, scan.lease_owner) == ("running", "worker-b")
     assert [record.event for record in caplog.records] == ["msglog_ingestion.start", "msglog_ingestion.lease_lost"]
