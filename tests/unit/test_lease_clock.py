@@ -33,8 +33,8 @@ def test_legacy_local_leases_are_not_reclaimed_early_or_blocked_after_expiry():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    scans = MsgLogIngestionRepository("tests")
-    deliveries = SlaveMessageDeliveryRepository()
+    scans = MsgLogIngestionRepository("tests", test_db)
+    deliveries = SlaveMessageDeliveryRepository(test_db)
     try:
         test_db.create_tables([MsgLogIngestionScan, SlaveMessageDelivery])
         scan = scans.get_or_create_scan(100, 500)
@@ -65,8 +65,8 @@ def test_new_utc_scan_lease_and_scheduler_deferral_ignore_host_timezone():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    scans = MsgLogIngestionRepository("tests")
-    deliveries = SlaveMessageDeliveryRepository()
+    scans = MsgLogIngestionRepository("tests", test_db)
+    deliveries = SlaveMessageDeliveryRepository(test_db)
     before = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         test_db.create_tables([MsgLogIngestionScan, SlaveMessageDelivery])
@@ -109,7 +109,7 @@ def test_new_scan_ordering_timestamps_use_utc_naive_clock():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    scans = MsgLogIngestionRepository("tests")
+    scans = MsgLogIngestionRepository("tests", test_db)
     before = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         test_db.create_tables([MsgLogIngestionScan])

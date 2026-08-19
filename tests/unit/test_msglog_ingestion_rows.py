@@ -132,7 +132,7 @@ def test_postgresql_ingestion_persists_mtproto_times_as_utc_naive_datetimes():
         test_db.connect()
         test_db.create_tables([MsgLog, MsgLogIngestionScan])
         service = MsgLogIngestionService(
-            MsgLogIngestionRepository("tests.master"),
+            MsgLogIngestionRepository("tests.master", test_db),
             FakeChatAssociations({10: "tests.slave target"}),
             FakeMTProto(
                 {

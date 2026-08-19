@@ -2,6 +2,7 @@ import logging
 import time
 from contextlib import contextmanager
 from functools import wraps
+from threading import RLock
 from typing import Callable, Optional, Protocol
 
 
@@ -14,13 +15,10 @@ class DatabaseMetrics(Protocol):
 class ObservedRepository:
     logger = logging.getLogger(__name__)
     _metrics: Optional[DatabaseMetrics] = None
+    _model_binding_lock = RLock()
 
-    def __init__(self, database=None) -> None:
-        self._bind_models = database is not None
-        if database is None:
-            from ..models import database as configured_database
-
-            database = configured_database
+    def __init__(self, database) -> None:
+        self._bind_models = True
         self._database = database
 
     @property
@@ -37,13 +35,14 @@ class ObservedRepository:
         current_database = self.database
         if current_database is None:
             raise RuntimeError("Repository database has not been initialized")
-        previous_databases = tuple(model._meta.database for model in DATABASE_MODELS)
-        try:
-            with current_database.bind_ctx(DATABASE_MODELS):
-                yield
-        finally:
-            for model, previous_database in zip(DATABASE_MODELS, previous_databases):
-                model._meta.set_database(previous_database)
+        with self._model_binding_lock:
+            previous_databases = tuple(model._meta.database for model in DATABASE_MODELS)
+            try:
+                with current_database.bind_ctx(DATABASE_MODELS):
+                    yield
+            finally:
+                for model, previous_database in zip(DATABASE_MODELS, previous_databases):
+                    model._meta.set_database(previous_database)
 
 
 def observe_database_method(method: str):

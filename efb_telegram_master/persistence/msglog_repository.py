@@ -19,7 +19,7 @@ class MsgLogRepository(ObservedRepository):
     FAIL_FLAG = "__fail__"
     logger = logging.getLogger(__name__)
 
-    def __init__(self, database=None) -> None:
+    def __init__(self, database) -> None:
         super().__init__(database)
 
     @observe_database_method("get_master_msg_id")

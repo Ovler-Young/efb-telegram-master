@@ -18,7 +18,7 @@ def test_association_rescan_resets_completed_scans_and_marks_active_leases():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
+    manager = MsgLogIngestionRepository("tests", test_db)
     try:
         test_db.create_tables([MsgLogIngestionScan])
         scan = manager.get_or_create_scan(100, 500)
@@ -47,7 +47,7 @@ def test_association_rescan_recovers_stale_running_leases(lease_owner, lease_exp
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
+    manager = MsgLogIngestionRepository("tests", test_db)
     try:
         test_db.create_tables([MsgLogIngestionScan])
         scan = manager.get_or_create_scan(100, 500)
@@ -88,7 +88,7 @@ def test_active_association_request_restarts_scan_without_releasing_its_lease():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
+    manager = MsgLogIngestionRepository("tests", test_db)
     try:
         test_db.create_tables([MsgLogIngestionScan])
         manager.get_or_create_scan(100, 500)
@@ -110,7 +110,7 @@ def test_expired_scan_is_resumable_after_restart():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
+    manager = MsgLogIngestionRepository("tests", test_db)
     try:
         test_db.create_tables([MsgLogIngestionScan])
         scan = manager.get_or_create_scan(100, 500)

@@ -104,10 +104,10 @@ def test_database_metric_decorators_record_real_repository_operations():
     database.initialize(test_database)
     test_database.connect()
     metrics = Metrics()
-    chat_associations = ChatAssociationRepository()
-    history_migrations = HistoryMigrationRepository()
-    msglogs = MsgLogRepository()
-    slave_chat_info = SlaveChatInfoRepository()
+    chat_associations = ChatAssociationRepository(test_database)
+    history_migrations = HistoryMigrationRepository(test_database)
+    msglogs = MsgLogRepository(test_database)
+    slave_chat_info = SlaveChatInfoRepository(test_database)
     for repository in (chat_associations, history_migrations, msglogs, slave_chat_info):
         repository._metrics = metrics
 

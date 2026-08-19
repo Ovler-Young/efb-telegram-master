@@ -56,7 +56,7 @@ def msglog_scan_database(tmp_path):
     test_db.connect()
     try:
         test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        yield
+        yield test_db
     finally:
         test_db.close()
         database.initialize(original_database)
@@ -98,8 +98,8 @@ def test_association_reschedule_queues_a_successor_after_active_lease_expires(tm
             finally:
                 active_fetches -= 1
 
-    with msglog_scan_database(tmp_path):
-        ingestion = MsgLogIngestionRepository("tests.master")
+    with msglog_scan_database(tmp_path) as test_db:
+        ingestion = MsgLogIngestionRepository("tests.master", test_db)
         runtime = SharedAsyncRuntime()
         scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
         try:
@@ -172,8 +172,8 @@ def test_association_reschedule_recovers_untracked_active_lease(tmp_path, termin
                 rejected_claim.set()
             return claimed
 
-    with msglog_scan_database(tmp_path):
-        ingestion = TrackingRepository("tests.master")
+    with msglog_scan_database(tmp_path) as test_db:
+        ingestion = TrackingRepository("tests.master", test_db)
         runtime = SharedAsyncRuntime()
         scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
         try:
@@ -278,8 +278,8 @@ def test_association_reschedule_queues_a_successor_after_retryable_error(tmp_pat
                 raise MTProtoRetryableError("temporary")
             return [ingested_topic_message()]
 
-    with msglog_scan_database(tmp_path):
-        ingestion = MsgLogIngestionRepository("tests.master")
+    with msglog_scan_database(tmp_path) as test_db:
+        ingestion = MsgLogIngestionRepository("tests.master", test_db)
         runtime = SharedAsyncRuntime()
         scheduler = MsgLogScanScheduler(SimpleNamespace(async_runtime=runtime), MTProto(), ingestion, Associations(), Mock())
         try:

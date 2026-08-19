@@ -13,7 +13,7 @@ def test_history_migration_replacement_stages_source_before_acquiring_sqlite_wri
     test_database = SqliteDatabase(database_path, pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
     database.initialize(test_database)
     test_database.connect()
-    repository = HistoryMigrationRepository()
+    repository = HistoryMigrationRepository(test_database)
     source_staged = threading.Event()
     continue_source = threading.Event()
     errors = []

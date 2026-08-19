@@ -75,7 +75,7 @@ def test_remove_chat_assoc_removes_topic_assoc(channel):
 
 def test_slave_delivery_receipt_persists_sender_bot_id():
     test_db = SqliteDatabase(":memory:")
-    repository = MsgLogRepository()
+    repository = MsgLogRepository(test_db)
     author = SimpleNamespace(module_id="tests.slave", uid="author")
     chat = SimpleNamespace(module_id="tests.slave", uid="chat", get_member=lambda _uid: author)
     message = SimpleNamespace(
@@ -154,7 +154,7 @@ def _reaction_message(reactor, reactions):
 
 def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
     test_db = SqliteDatabase(":memory:")
-    manager = MsgLogRepository()
+    manager = MsgLogRepository(test_db)
     reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
     message = _reaction_message(reactor, {})
 
@@ -175,7 +175,7 @@ def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
 
 def test_reaction_alternate_db_failures_preserve_then_update_canonical_row():
     test_db = SqliteDatabase(":memory:")
-    manager = MsgLogRepository()
+    manager = MsgLogRepository(test_db)
     reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
     message = _reaction_message(reactor, {"NEW": [reactor]})
 

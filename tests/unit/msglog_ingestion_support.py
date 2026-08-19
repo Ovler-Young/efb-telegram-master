@@ -105,7 +105,7 @@ def sqlite_ingestion_database(path=":memory:"):
     test_db.connect()
     try:
         test_db.create_tables([MsgLog, MsgLogIngestionScan])
-        yield test_db, MsgLogIngestionRepository("tests.master")
+        yield test_db, MsgLogIngestionRepository("tests.master", test_db)
     finally:
         if not test_db.is_closed():
             test_db.close()

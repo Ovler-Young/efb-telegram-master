@@ -14,7 +14,7 @@ class SlaveMessageDeliveryRepository(ObservedRepository):
     logger = logging.getLogger(__name__)
     LEASE_SECONDS = 300
 
-    def __init__(self, database=None) -> None:
+    def __init__(self, database) -> None:
         super().__init__(database)
 
     @staticmethod

@@ -20,7 +20,7 @@ class MsgLogIngestionCompletion(str, Enum):
 
 
 class MsgLogIngestionRepository(ObservedRepository):
-    def __init__(self, channel_id: str, database=None) -> None:
+    def __init__(self, channel_id: str, database) -> None:
         super().__init__(database)
         self.channel_id = channel_id
 

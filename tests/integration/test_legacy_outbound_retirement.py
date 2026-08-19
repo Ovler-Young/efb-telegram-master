@@ -10,6 +10,7 @@ from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.legacy_outbound_retirement import LegacyOutboundRetirement
 from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, MsgLogIngestionScan, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
+from efb_telegram_master.persistence.sqlite_postgresql_import import SQLitePostgresqlImportCoordinator
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source, create_legacy_outbound_schema
 
 
@@ -268,7 +269,7 @@ def test_postgresql_import_canonicalizes_legacy_historic_identities(integration_
             assert archive.execute_sql("SELECT COUNT(*) FROM topicassoc").fetchone() == (3,)
             assert archive.execute_sql("SELECT COUNT(*) FROM historymigrationentry").fetchone() == (4,)
             with archive.bind_ctx(models):
-                snapshot = DatabaseManager._sqlite_source_snapshot(archive, models)
+                snapshot = SQLitePostgresqlImportCoordinator.sqlite_source_snapshot(archive, models)
             assert provenance == (snapshot.identity,)
         finally:
             archive.close()

@@ -7,6 +7,7 @@ from peewee import IntegrityError, SqliteDatabase
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.models import UTC_LEASE_CLOCK, ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
+from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from efb_telegram_master.persistence.slave_message_delivery_repository import SlaveMessageDeliveryRepository
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source
 
@@ -91,7 +92,7 @@ def test_historic_schema_migration_serializes_sqlite_startups(tmp_path):
         connection = SqliteDatabase(database_path, pragmas={"busy_timeout": 5000})
         try:
             connection.connect()
-            DatabaseManager._ensure_historic_schema_columns(connection)
+            DatabaseSchemaMigrator(connection).ensure_historic_schema_columns()
         except BaseException as error:
             errors.append(error)
         finally:
@@ -108,7 +109,7 @@ def test_historic_schema_migration_serializes_sqlite_startups(tmp_path):
     check_db.connect()
     try:
         assert {"provenance", "time"}.issubset({column.name for column in check_db.get_columns("msglog")})
-        assert DatabaseManager._MSGLOG_REPLAY_SOURCE_INDEX in {index.name for index in check_db.get_indexes("msglog")}
+        assert DatabaseSchemaMigrator.MSGLOG_REPLAY_SOURCE_INDEX in {index.name for index in check_db.get_indexes("msglog")}
     finally:
         check_db.close()
 
@@ -130,13 +131,13 @@ def test_association_schema_upgrade_deduplicates_rows_and_enforces_canonical_ide
         assert [(row.topic_chat_id, row.message_thread_id, row.slave_uid) for row in TopicAssoc.select()] == [("101", "201", "slave-b")]
         assert [row.source_master_msg_id for row in HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id)] == ["10.2", "10.4"]
         assert {
-            DatabaseManager._CHAT_ASSOC_SLAVE_INDEX,
-            DatabaseManager._TOPIC_ASSOC_SLAVE_INDEX,
-            DatabaseManager._TOPIC_ASSOC_TOPIC_THREAD_INDEX,
+            DatabaseSchemaMigrator.CHAT_ASSOC_SLAVE_INDEX,
+            DatabaseSchemaMigrator.TOPIC_ASSOC_SLAVE_INDEX,
+            DatabaseSchemaMigrator.TOPIC_ASSOC_TOPIC_THREAD_INDEX,
         }.issubset({index.name for index in database.get_indexes("topicassoc")} | {index.name for index in database.get_indexes("chatassoc")})
         assert {
-            DatabaseManager._HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX,
-            DatabaseManager._HISTORY_TARGET_POSITION_WITH_THREAD_INDEX,
+            DatabaseSchemaMigrator.HISTORY_TARGET_POSITION_WITHOUT_THREAD_INDEX,
+            DatabaseSchemaMigrator.HISTORY_TARGET_POSITION_WITH_THREAD_INDEX,
         }.issubset({index.name for index in database.get_indexes("historymigrationentry")})
         with pytest.raises(IntegrityError):
             ChatAssoc.create(master_uid="master-other", slave_uid="slave-a")
@@ -178,8 +179,8 @@ def test_slave_chat_info_schema_upgrade_deduplicates_null_and_group_identities(t
         assert [(row.slave_chat_group_id, row.slave_chat_name) for row in SlaveChatInfo.select().order_by(SlaveChatInfo.id)] == [(None, "new"), ("group", "new group")]
         indexes = {index.name for index in database.get_indexes("slavechatinfo")}
         assert {
-            DatabaseManager._SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX,
-            DatabaseManager._SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX,
+            DatabaseSchemaMigrator.SLAVE_CHAT_INFO_IDENTITY_WITHOUT_GROUP_INDEX,
+            DatabaseSchemaMigrator.SLAVE_CHAT_INFO_IDENTITY_WITH_GROUP_INDEX,
         }.issubset(indexes)
         with pytest.raises(IntegrityError):
             SlaveChatInfo.create(slave_channel_id="tests.slave", slave_channel_emoji="x", slave_chat_uid="chat", slave_chat_name="duplicate", slave_chat_type="group")
@@ -212,7 +213,7 @@ def test_slave_message_delivery_schema_upgrade_adds_owner_token(tmp_path, monkey
         assert row.owner_token is None
         assert row.lease_clock is None
         assert {"owner_token", "lease_clock"}.issubset({column.name for column in database.get_columns("slavemessagedelivery")})
-        owner_token = SlaveMessageDeliveryRepository().claim("tests.slave chat", "pending-message")
+        owner_token = SlaveMessageDeliveryRepository(manager.current_database).claim("tests.slave chat", "pending-message")
         assert owner_token is not None
         pending_row = SlaveMessageDelivery.get((SlaveMessageDelivery.slave_origin_uid == "tests.slave chat") & (SlaveMessageDelivery.slave_message_id == "pending-message"))
         assert pending_row.owner_token == owner_token

@@ -11,6 +11,7 @@ from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, SlaveChatInfo, SlaveMessageDelivery, TopicAssoc, database
 from efb_telegram_master.persistence.chat_association_repository import ChatAssociationRepository
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
+from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from efb_telegram_master.persistence.slave_chat_info_repository import SlaveChatInfoRepository
 from efb_telegram_master.persistence.slave_message_delivery_repository import SlaveMessageDeliveryRepository
 from efb_telegram_master.topic_sync import TopicGroupService
@@ -22,7 +23,7 @@ def test_concurrent_association_replacements_leave_one_canonical_row(tmp_path):
     test_database = SqliteDatabase(tmp_path / "association.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
     database.initialize(test_database)
     test_database.connect()
-    repository = ChatAssociationRepository()
+    repository = ChatAssociationRepository(test_database)
     try:
         test_database.create_tables([ChatAssoc, TopicAssoc, HistoryMigrationEntry])
         HistoryMigrationEntry.create(slave_chat_id="slave-a", target_chat_id="100", source_master_msg_id="100.1", position=0)
@@ -64,7 +65,7 @@ def test_concurrent_topic_provisioning_creates_one_remote_topic_and_association(
 
     try:
         test_database.create_tables([ChatAssoc, TopicAssoc])
-        repository = ChatAssociationRepository()
+        repository = ChatAssociationRepository(test_database)
         service_kwargs = (
             None,
             SimpleNamespace(create_forum_topic=create_forum_topic),
@@ -97,7 +98,7 @@ def test_concurrent_slave_chat_info_writes_leave_one_canonical_row(tmp_path):
     test_database = SqliteDatabase(tmp_path / "slave-chat-info.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
     database.initialize(test_database)
     test_database.connect()
-    repository = SlaveChatInfoRepository()
+    repository = SlaveChatInfoRepository(test_database)
     try:
         test_database.create_tables([SlaveChatInfo])
 
@@ -124,7 +125,7 @@ def test_concurrent_history_replacements_leave_one_coherent_target(tmp_path):
     test_database = SqliteDatabase(tmp_path / "history.db", pragmas={"journal_mode": "wal", "busy_timeout": 5000}, check_same_thread=False)
     database.initialize(test_database)
     test_database.connect()
-    repository = HistoryMigrationRepository()
+    repository = HistoryMigrationRepository(test_database)
     try:
         test_database.create_tables([HistoryMigrationEntry])
 
@@ -164,7 +165,7 @@ def test_database_manager_closes_sqlite_when_schema_creation_fails(tmp_path, mon
         return original_close(instance, *args, **kwargs)
 
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
-    monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("schema creation failed"))))
+    monkeypatch.setattr(DatabaseSchemaMigrator, "create", lambda _self: (_ for _ in ()).throw(RuntimeError("schema creation failed")))
     monkeypatch.setattr(SqliteDatabase, "close", close)
     try:
         with pytest.raises(RuntimeError, match="schema creation failed"):
@@ -240,7 +241,7 @@ def test_database_manager_preserves_initialization_error_when_cleanup_logging_fa
 
     monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
     monkeypatch.setattr(DatabaseManager, "logger", logger)
-    monkeypatch.setattr(DatabaseManager, "_create", staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("schema creation failed"))))
+    monkeypatch.setattr(DatabaseSchemaMigrator, "create", lambda _self: (_ for _ in ()).throw(RuntimeError("schema creation failed")))
     monkeypatch.setattr(DatabaseManager, "stop_worker", cleanup)
     try:
         with pytest.raises(RuntimeError, match="schema creation failed"):
@@ -256,7 +257,7 @@ def test_database_manager_preserves_initialization_error_when_cleanup_logging_fa
 
 def test_slave_message_delivery_claim_persists_across_repository_instances(tmp_path):
     test_db = SqliteDatabase(tmp_path / "delivery.db")
-    first, restarted = SlaveMessageDeliveryRepository(), SlaveMessageDeliveryRepository()
+    first, restarted = SlaveMessageDeliveryRepository(test_db), SlaveMessageDeliveryRepository(test_db)
     with test_db.bind_ctx([SlaveMessageDelivery]):
         test_db.connect()
         try:

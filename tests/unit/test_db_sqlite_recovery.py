@@ -6,6 +6,7 @@ from peewee import SqliteDatabase
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLogIngestionScan, SlaveMessageDelivery, TopicAssoc, database
+from efb_telegram_master.persistence.sqlite_postgresql_import import SQLitePostgresqlImportCoordinator
 from tests.support.legacy_outbound_schema import create_legacy_historic_identity_source
 
 
@@ -16,7 +17,7 @@ def test_sqlite_import_snapshot_canonicalizes_legacy_historic_identities_without
     try:
         create_legacy_historic_identity_source(source_db)
         with source_db.bind_ctx(models):
-            snapshot = DatabaseManager._sqlite_source_snapshot(source_db, models)
+            snapshot = SQLitePostgresqlImportCoordinator.sqlite_source_snapshot(source_db, models)
 
         rows_by_model = {projection.model: [dict(zip(projection.column_names, row)) for row in projection.rows] for projection in snapshot.projections}
         assert rows_by_model[ChatAssoc] == [{"id": 2, "master_uid": "master-new", "slave_uid": "slave-a"}]
@@ -47,7 +48,7 @@ def test_sqlite_import_snapshot_omits_missing_ingestion_rescan_requested_column(
             ("100", 500, 0, 500, 500, 5, 495, 0, None, "complete", None, "2020-01-02 03:04:05", "2021-02-03 04:05:06"),
         )
         with source_db.bind_ctx([MsgLogIngestionScan]):
-            snapshot = DatabaseManager._sqlite_source_snapshot(source_db, (MsgLogIngestionScan,))
+            snapshot = SQLitePostgresqlImportCoordinator.sqlite_source_snapshot(source_db, (MsgLogIngestionScan,))
     finally:
         source_db.close()
 
@@ -90,7 +91,7 @@ def test_sqlite_import_snapshot_injects_missing_delivery_lease_clock(tmp_path):
             ("tests.slave chat", "message", "pending", "2020-01-02 03:04:05", "owner"),
         )
         with source_db.bind_ctx([SlaveMessageDelivery]):
-            snapshot = DatabaseManager._sqlite_source_snapshot(source_db, (SlaveMessageDelivery,))
+            snapshot = SQLitePostgresqlImportCoordinator.sqlite_source_snapshot(source_db, (SlaveMessageDelivery,))
     finally:
         source_db.close()
 

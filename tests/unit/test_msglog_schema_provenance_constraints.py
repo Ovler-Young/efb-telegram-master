@@ -17,6 +17,7 @@ from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog,
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from efb_telegram_master.persistence.msglog_repository import MsgLogRepository
+from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from tests.unit.msglog_schema_support import create_old_msglog_schema, msglog_values, postgres_connection_kwargs
 
 
@@ -59,7 +60,7 @@ def test_concurrent_sqlite_msglog_provenance_upgrade_is_idempotent(tmp_path):
     try:
         create_old_msglog_schema(test_db)
         with ThreadPoolExecutor(max_workers=2) as executor:
-            list(executor.map(lambda _index: DatabaseManager._create(), range(2)))
+            list(executor.map(lambda _index: DatabaseSchemaMigrator(test_db).create(), range(2)))
         row = MsgLog.get_by_id("100.1")
         provenance_columns = [column.name for column in test_db.get_columns("msglog") if column.name == "provenance"]
     finally:
@@ -75,7 +76,7 @@ def test_ingestion_claim_persist_and_idempotence_are_atomic():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
+    manager = MsgLogIngestionRepository("tests", test_db)
     try:
         test_db.create_tables([MsgLog, MsgLogIngestionScan])
         scan = manager.get_or_create_scan(100, 500)
@@ -101,7 +102,7 @@ def test_live_and_ingestion_fallback_times_are_utc_naive_and_sort_together():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    manager = MsgLogIngestionRepository("tests")
+    manager = MsgLogIngestionRepository("tests", test_db)
     before = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         test_db.create_tables([MsgLog, MsgLogIngestionScan])
@@ -128,7 +129,7 @@ def test_live_and_ingestion_fallback_times_are_utc_naive_and_sort_together():
 
 def test_live_message_overwrites_synthetic_provenance():
     test_db = SqliteDatabase(":memory:")
-    manager = MsgLogRepository()
+    manager = MsgLogRepository(test_db)
     message = ETMMsg(
         uid=MessageID("live-message"),
         chat=SimpleNamespace(module_id="tests.slave", uid="chat"),
@@ -153,7 +154,7 @@ def test_live_message_overwrites_synthetic_provenance():
 
 def test_live_message_upsert_wins_when_ingestion_inserts_after_lookup(monkeypatch):
     test_db = SqliteDatabase(":memory:")
-    manager = MsgLogRepository()
+    manager = MsgLogRepository(test_db)
     message = ETMMsg(
         uid=MessageID("live-message"),
         chat=SimpleNamespace(module_id="tests.slave", uid="chat"),

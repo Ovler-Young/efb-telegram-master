@@ -15,7 +15,7 @@ def test_pending_history_migrations_send_entries_in_position_order_and_delete_ea
     test_database = SqliteDatabase(":memory:")
     database.initialize(test_database)
     test_database.connect()
-    manager = HistoryReplayWorker(SimpleNamespace(send_message=Mock(), copy_message=Mock()), Mock(), HistoryMigrationRepository(), Mock(), Mock())
+    manager = HistoryReplayWorker(SimpleNamespace(send_message=Mock(), copy_message=Mock()), Mock(), HistoryMigrationRepository(test_database), Mock(), Mock())
     manager.REPLAY_PAGE_SIZE = 2
     try:
         test_database.create_tables([HistoryMigrationEntry])

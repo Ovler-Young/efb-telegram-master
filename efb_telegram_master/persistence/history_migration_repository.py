@@ -16,7 +16,7 @@ class HistoryMigrationRepository(ObservedRepository):
     INSERT_BATCH_SIZE = 100
     _LOCK_KEY = 681_774_240_616_480_005
 
-    def __init__(self, database=None) -> None:
+    def __init__(self, database) -> None:
         super().__init__(database)
 
     @contextmanager

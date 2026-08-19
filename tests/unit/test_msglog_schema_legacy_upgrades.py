@@ -1,9 +1,9 @@
 import pytest
 from peewee import SqliteDatabase
 
-from efb_telegram_master import db as db_module
-from efb_telegram_master.db import DatabaseManager
 from efb_telegram_master.models import MsgLogIngestionScan, database
+from efb_telegram_master.persistence import schema_migration
+from efb_telegram_master.persistence.schema_migration import DatabaseSchemaMigrator
 from tests.unit.msglog_schema_support import create_legacy_ingestion_scan_schema, create_old_msglog_schema, insert_legacy_ingestion_scan_rows, legacy_ingestion_scan_rows
 
 
@@ -22,7 +22,7 @@ def test_msglog_migration_preserves_legacy_naive_and_null_times():
             "INSERT INTO msglog (master_msg_id, slave_message_id, text, slave_origin_uid, msg_type, sent_to, time) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("100.3", "legacy-null", "text", "tests.slave chat", "Text", "tests.master", None),
         )
-        DatabaseManager._ensure_historic_schema_columns(test_db)
+        DatabaseSchemaMigrator(test_db).ensure_historic_schema_columns()
         rows = test_db.execute_sql("SELECT master_msg_id, time FROM msglog ORDER BY master_msg_id").fetchall()
     finally:
         test_db.close()
@@ -40,7 +40,7 @@ def test_legacy_ingestion_scan_schema_adds_rescan_requested_without_losing_state
         create_legacy_ingestion_scan_schema(test_db)
         insert_legacy_ingestion_scan_rows(test_db)
         legacy_columns = {column.name for column in test_db.get_columns("msglogingestionscan")}
-        DatabaseManager._ensure_historic_schema_columns(test_db)
+        DatabaseSchemaMigrator(test_db).ensure_historic_schema_columns()
         scan_columns = {column.name for column in test_db.get_columns("msglogingestionscan")}
         rows = legacy_ingestion_scan_rows(test_db)
         lease_clocks = test_db.execute_sql("SELECT lease_clock FROM msglogingestionscan ORDER BY source_chat_id").fetchall()
@@ -64,7 +64,7 @@ def test_sqlite_ingestion_scan_migration_failure_rolls_back_schema_and_data(tmp_
     test_db = SqliteDatabase(tmp_path / "tgdata.db")
     database.initialize(test_db)
     test_db.connect()
-    original_migrate = db_module.migrate
+    original_migrate = schema_migration.migrate
     migration_calls = 0
 
     def fail_after_scan_migration(*operations):
@@ -79,9 +79,9 @@ def test_sqlite_ingestion_scan_migration_failure_rolls_back_schema_and_data(tmp_
         insert_legacy_ingestion_scan_rows(test_db)
         test_db.execute_sql("CREATE TABLE msglog (master_msg_id TEXT PRIMARY KEY)")
         test_db.execute_sql("INSERT INTO msglog VALUES ('100.1')")
-        monkeypatch.setattr(db_module, "migrate", fail_after_scan_migration)
+        monkeypatch.setattr(schema_migration, "migrate", fail_after_scan_migration)
         with pytest.raises(RuntimeError, match="forced migration failure"):
-            DatabaseManager._ensure_historic_schema_columns(test_db)
+            DatabaseSchemaMigrator(test_db).ensure_historic_schema_columns()
         scan_columns = {column.name for column in test_db.get_columns("msglogingestionscan")}
         msglog_columns = {column.name for column in test_db.get_columns("msglog")}
         scan_rows = test_db.execute_sql(

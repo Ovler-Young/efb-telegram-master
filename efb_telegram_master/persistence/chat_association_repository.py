@@ -13,7 +13,7 @@ class ChatAssociationRepository(ObservedRepository):
     logger = logging.getLogger(__name__)
     _LOCK_KEY = 681_774_240_616_480_004
 
-    def __init__(self, database=None) -> None:
+    def __init__(self, database) -> None:
         super().__init__(database)
 
     @contextmanager
