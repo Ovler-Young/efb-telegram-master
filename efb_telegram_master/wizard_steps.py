@@ -1,13 +1,14 @@
 import asyncio
 import threading
+from dataclasses import replace
 from getpass import getpass
+from urllib.parse import quote, urlparse, urlunparse
 
 from bullet import Bullet, YesNo
 from telegram import Bot
 from telegram.error import TelegramError
 
-from .telegram_runtime import build_request
-from .utils import normalize_request_kwargs
+from .request_configuration import RequestConfiguration
 from .wizard_config import DataModel, _, build_bot, print_wrapped
 
 
@@ -28,7 +29,7 @@ def start_id_bot(data: DataModel):
     stop_event = threading.Event()
 
     def runner():
-        asyncio.run(_id_bot_loop(build_bot(data), stop_event))
+        asyncio.run(_id_bot_loop(build_bot(data.configuration), stop_event))
 
     thread = threading.Thread(target=runner, daemon=True, name="ETMWizardIDBot")
     thread.start()
@@ -49,7 +50,7 @@ def input_bot_token(data: DataModel, default=None):
                 continue
         else:
             try:
-                asyncio.run(build_bot(data, ans).get_me())
+                asyncio.run(build_bot(data.configuration, ans).get_me())
             except TelegramError as e:
                 print_wrapped(str(e))
                 print()
@@ -60,8 +61,7 @@ def input_bot_token(data: DataModel, default=None):
 
 def setup_proxy(data):
     if YesNo(prompt=_("Do you want to run ETM behind a proxy? "), prompt_prefix="[yN] ", default="n").launch():
-        if data.data.get("request_kwargs") is None:
-            data.data["request_kwargs"] = {}
+        request = data.configuration.request or RequestConfiguration()
         proxy_type = Bullet(prompt=_("Select proxy type"), choices=["http", "socks5"]).launch()
         host = input(_("Proxy host (domain/IP): "))
         port = input(_("Proxy port: "))
@@ -71,10 +71,7 @@ def setup_proxy(data):
             username = input(_("Username: "))
             password = getpass(_("Password: "))
         if proxy_type == "http":
-            data.data["request_kwargs"]["proxy_url"] = f"http://{host}:{port}/"
-            if username is not None and password is not None:
-                data.data["request_kwargs"]["username"] = username
-                data.data["request_kwargs"]["password"] = password
+            proxy = f"http://{host}:{port}/"
         elif proxy_type == "socks5":
             try:
                 import socks
@@ -87,19 +84,27 @@ def setup_proxy(data):
                 print()
                 raise error
             protocol = input(_("Protocol [socks5]: ")) or "socks5"
-            data.data["request_kwargs"]["proxy_url"] = f"{protocol}://{host}:{port}"
-            if username is not None and password is not None:
-                data.data["request_kwargs"]["urllib3_proxy_kwargs"] = {"username": username, "password": password}
-        data.request = build_request(normalize_request_kwargs(data.data["request_kwargs"]))
+            proxy = f"{protocol}://{host}:{port}"
+        data.configuration.request = replace(request, proxy=_proxy_with_credentials(proxy, username, password))
+
+
+def _proxy_with_credentials(proxy: str, username: str | None, password: str | None) -> str:
+    if username is None or password is None:
+        return proxy
+    parsed = urlparse(proxy)
+    netloc = quote(username, safe="") + ":" + quote(password, safe="") + "@" + (parsed.hostname or "")
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
 
 def setup_telegram_bot(data):
     print_wrapped(_("1. Set up your Telegram Bot\n---------------------------\nETM requires you to have a Telegram bot ready with you to start with."))
     print()
-    if data.data["token"]:
+    if data.configuration.token:
         # Config has token ready.
         # Assuming user doesn't need help creating one
-        data.data["token"] = input_bot_token(data, data.data["token"])
+        data.configuration.token = input_bot_token(data, data.configuration.token)
     else:
         # No config is ready.
         # prompt to guide user to create one.
@@ -147,7 +152,7 @@ def setup_telegram_bot(data):
             print()
             input(_("Press ENTER/RETURN to continue..."))
         print()
-        data.data["token"] = input_bot_token(data)
+        data.configuration.token = input_bot_token(data)
 
 
 def setup_telegram_bot_commands_list(data):
@@ -160,7 +165,7 @@ def setup_telegram_bot_commands_list(data):
     if answer == prompt_yes:
         print(_("Updating commands list..."), end="", flush=True)
         asyncio.run(
-            build_bot(data).set_my_commands(
+            build_bot(data.configuration).set_my_commands(
                 [
                     ("help", _("Show commands list.")),
                     ("link", _("Link a remote chat to a group.")),
@@ -208,8 +213,8 @@ def setup_admins(data):
         _("2. Set up Bot administrators\n----------------------------\nTo protect your data privacy and security, you need to provide a list of users who can interact with this Telegram Bot.")
     )
     print()
-    if data.data["admins"]:
-        data.data["admins"] = input_admin_ids(default=data.data["admins"])
+    if data.configuration.admins:
+        data.configuration.admins = input_admin_ids(default=data.configuration.admins)
     else:
         prompt_yes = _("Yes, I want to know how to get my ID.")
         prompt_no = _("No, I already know my ID.")
@@ -228,11 +233,11 @@ def setup_admins(data):
                 _("Now, send any message to the bot you just created. You should be able to get a numerical ID. That is your Telegram user ID. Enter that below to set yourself as an admin.")
             )
             print()
-            data.data["admins"] = input_admin_ids(default=data.data["admins"])
+            data.configuration.admins = input_admin_ids(default=data.configuration.admins)
             print()
             print(_("Stopping ID bot..."), end="", flush=True)
             stop_event.set()
             id_bot_thread.join(timeout=10.0)
             print(_("OK"))
         else:
-            data.data["admins"] = input_admin_ids(default=data.data["admins"])
+            data.configuration.admins = input_admin_ids(default=data.configuration.admins)

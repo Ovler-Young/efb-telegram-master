@@ -1,4 +1,3 @@
-from collections.abc import Mapping
 from gettext import translation
 from typing import Optional
 
@@ -7,12 +6,9 @@ from ehforwarderbot import coordinator
 from ehforwarderbot.types import ModuleID
 from ruamel.yaml import YAML
 from telegram import Bot
-from telegram.request import HTTPXRequest
 
 from . import TelegramChannel
 from .paths import LOCALE_DIR, get_config_path
-from .telegram_runtime import build_request
-from .utils import normalize_request_kwargs
 from .wizard_configuration import WizardConfiguration
 
 translator = translation("efb_telegram_master", str(LOCALE_DIR), fallback=True)
@@ -25,10 +21,7 @@ def print_wrapped(text):
 
 
 class DataModel:
-    data: dict
-
     def __init__(self, profile: str, instance_id: str):
-        self.request: Optional[HTTPXRequest] = None
         self.building_default = False
         coordinator.profile = profile
         self.profile = profile
@@ -41,14 +34,10 @@ class DataModel:
         if not self.config_path.exists():
             self.build_default_config()
         else:
-            configuration = WizardConfiguration.from_mapping(self.yaml.load(self.config_path.open()))
-            self.data = configuration.values
-            request_kwargs = self.data.get("request_kwargs")
-            if isinstance(request_kwargs, Mapping) and request_kwargs:
-                self.request = build_request(normalize_request_kwargs(request_kwargs))
+            self.configuration = WizardConfiguration.from_mapping(self.yaml.load(self.config_path.open()))
 
     def build_default_config(self):
-        self.data = {"token": "", "admins": [], "flags": {}}
+        self.configuration = WizardConfiguration.defaults()
         self.building_default = True
 
     def save(self):
@@ -73,7 +62,7 @@ class DataModel:
                     )
                 )
                 f.write("\n")
-                self.yaml.dump({"token": self.data["token"]}, f)
+                self.yaml.dump({"token": self.configuration.token}, f)
                 f.write("\n")
                 f.write(
                     _(
@@ -82,7 +71,7 @@ class DataModel:
                     )
                 )
                 f.write("\n")
-                self.yaml.dump({"admins": self.data["admins"]}, f)
+                self.yaml.dump({"admins": self.configuration.admins}, f)
                 f.write("\n")
                 f.write(
                     _(
@@ -99,7 +88,7 @@ class DataModel:
                     )
                 )
                 f.write("\n")
-                self.yaml.dump({"flags": self.data["flags"]}, f)
+                self.yaml.dump({"flags": self.configuration.flags}, f)
                 f.write("\n")
                 f.write(
                     _(
@@ -108,8 +97,8 @@ class DataModel:
                     )
                 )
                 f.write("\n")
-                if self.data.get("request_kwargs"):
-                    self.yaml.dump({"request_kwargs": self.data["request_kwargs"]}, f)
+                if self.configuration.request is not None:
+                    self.yaml.dump({"request_kwargs": self.configuration.to_mapping()["request_kwargs"]}, f)
                 else:
                     f.write(
                         "# request_kwargs:\n"
@@ -137,21 +126,23 @@ class DataModel:
                     )
                 )
                 f.write("\n")
-                if self.data.get("rpc"):
-                    self.yaml.dump({"rpc": self.data["rpc"]}, f)
+                if self.configuration.rpc is not None:
+                    self.yaml.dump({"rpc": self.configuration.rpc.to_mapping()}, f)
                 else:
                     f.write("# rpc:\n#     server: 127.0.0.1\n#     port: 8000\n")
                 f.write("\n")
             with self.config_path.open() as f:
-                self.data = self.yaml.load(f)
+                self.configuration = WizardConfiguration.from_mapping(self.yaml.load(f))
             self.building_default = False
         else:
             with self.config_path.open("w") as f:
-                self.yaml.dump(self.data, f)
+                self.yaml.dump(self.configuration.to_mapping(), f)
 
 
-def build_bot(data: DataModel, token: Optional[str] = None) -> Bot:
-    bot_kwargs: dict = {"token": token or data.data["token"]}
-    if data.request is not None:
-        bot_kwargs["request"] = data.request
-    return Bot(**bot_kwargs)
+def build_bot(configuration: WizardConfiguration, token: Optional[str] = None) -> Bot:
+    bot_token = token or configuration.token
+    if configuration.request is None:
+        return Bot(token=bot_token)
+    from .telegram_runtime import build_request
+
+    return Bot(token=bot_token, request=build_request(configuration.request))

@@ -1,6 +1,10 @@
+from dataclasses import replace
+
 from bullet import Bullet, Numbers, YesNo
 
+from .request_configuration import RequestConfiguration
 from .wizard_config import _, print_wrapped
+from .wizard_configuration import RPCConfiguration
 
 flags_settings = {
     "chats_per_page": (10, "int", None, _("Number of chats shown in when choosing for /chat and /link command. An overly large value may lead to malfunction of such commands.")),
@@ -68,21 +72,21 @@ def setup_experimental_flags(data):
         return
     for key, value in flags_settings.items():
         default, cat, params, desc = value
-        if data.data["flags"].get(key) is not None:
-            default = data.data["flags"].get(key)
+        if data.configuration.flags.get(key) is not None:
+            default = data.configuration.flags.get(key)
         if cat == "bool":
             prompt_prefix = "[Yn] " if default else "[yN] "
             print()
             print(key)
             print_wrapped(desc)
             ans = YesNo(prompt=f"{key}? ", default="y" if default else "n", prompt_prefix=prompt_prefix).launch()
-            data.data["flags"][key] = ans
+            data.configuration.flags[key] = ans
         elif cat == "int":
             print()
             print(key)
             print_wrapped(desc)
             ans = Numbers(prompt=f"{key} [{default}]? ", type=int).launch(default=default)
-            data.data["flags"][key] = ans
+            data.configuration.flags[key] = ans
         elif cat == "choices":
             try:
                 assert isinstance(params, list)
@@ -93,7 +97,7 @@ def setup_experimental_flags(data):
             print(key)
             print_wrapped(desc)
             ans = Bullet(prompt=f"{key}?", choices=params).launch(default=default)
-            data.data["flags"][key] = ans
+            data.configuration.flags[key] = ans
 
 
 def setup_network_configurations(data):
@@ -106,10 +110,12 @@ def setup_network_configurations(data):
     print("https://etm.1a23.studio/")
     print()
     if YesNo(prompt=_("Do you want to change timeout settings? "), prompt_prefix="[yN] ", default="n").launch():
-        if data.data.get("request_kwargs") is None:
-            data.data["request_kwargs"] = {}
-        data.data["request_kwargs"]["read_timeout"] = Numbers(prompt=_("read_timeout (in seconds): ")).launch()
-        data.data["request_kwargs"]["connect_timeout"] = Numbers(prompt=_("connect_timeout (in seconds): ")).launch()
+        request = data.configuration.request or RequestConfiguration()
+        data.configuration.request = replace(
+            request,
+            read_timeout=float(Numbers(prompt=_("read_timeout (in seconds): ")).launch()),
+            connect_timeout=float(Numbers(prompt=_("connect_timeout (in seconds): ")).launch()),
+        )
 
 
 def setup_rpc(data):
@@ -123,9 +129,10 @@ def setup_rpc(data):
         return
     server = "127.0.0.1"
     port = 8000
-    if "rpc" in data.data:
-        server = data.data["rpc"]["server"]
-        port = data.data["rpc"]["port"]
+    existing_rpc = data.configuration.rpc
+    if existing_rpc is not None:
+        server = existing_rpc.server
+        port = existing_rpc.port
     server = input(_("RPC server: ") + f"[{server}] ") or server
     port = int(input(_("Proxy port: ") + f"[{port}] ") or port)
-    data.data["rpc"] = {"server": server, "port": port}
+    data.configuration.rpc = RPCConfiguration(server=server, port=port, additional_options=existing_rpc.additional_options if existing_rpc is not None else {})
