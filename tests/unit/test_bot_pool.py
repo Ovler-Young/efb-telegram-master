@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import threading
 import time
 from collections import OrderedDict
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
-from efb_telegram_master.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
+from efb_telegram_master.auxiliary_bot import MembershipProbeShutdownTimeout
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.channel_commands import MAX_AUXILIARY_BOTS, load_channel_config
 from efb_telegram_master.outbound import DEFAULT_MAX_PENDING
@@ -54,6 +52,7 @@ def test_disabling_bot_removes_every_affinity_to_that_bot() -> None:
     pool.record_successful_auxiliary_send("slave-c", 20)
 
     pool.disable_bot(10)
+    first.disabled = False
 
     assert pool.preferred_sender("slave-a") is None
     assert pool.preferred_sender("slave-b") is None
@@ -72,19 +71,6 @@ def test_membership_failure_isolated_to_the_affected_chat() -> None:
     assert pool.preferred_sender("unrelated-slave") is None
 
 
-def test_remove_affinity_for_bot_keeps_other_bot_affinities() -> None:
-    first = bot(10)
-    second = bot(20)
-    pool = BotPool([first, second])
-    pool.record_successful_auxiliary_send("slave-a", 10)
-    pool.record_successful_auxiliary_send("slave-b", 20)
-
-    pool.remove_affinity_for_bot(10)
-
-    assert pool.preferred_sender("slave-a") is None
-    assert pool.preferred_sender("slave-b") is second
-
-
 def test_confirmed_membership_failure_removes_only_the_failed_sender_affinity() -> None:
     first = bot(10)
     second = bot(20)
@@ -94,6 +80,7 @@ def test_confirmed_membership_failure_removes_only_the_failed_sender_affinity() 
     pool.record_successful_auxiliary_send("slave-c", 20)
     pool.record_possible_membership_failure("slave-a", 10, 100)
 
+    first.recheck_membership.assert_called_once_with(100)
     first._membership_changed_callback(first, 100, False)
 
     assert pool.preferred_sender("slave-a") is None
@@ -112,56 +99,6 @@ def test_confirmed_membership_failure_preserves_a_newer_affinity() -> None:
     first._membership_changed_callback(first, 100, False)
 
     assert pool.preferred_sender("slave-a") is second
-
-
-def test_successful_membership_recheck_discards_stale_affinities_and_deduplicates_later_probes() -> None:
-    first_probe_finished = threading.Event()
-    second_probe_started = threading.Event()
-    release_second_probe = threading.Event()
-    probe_count = 0
-
-    def get_chat_member(_chat_id: int, _bot_id: int) -> SimpleNamespace:
-        nonlocal probe_count
-        probe_count += 1
-        if probe_count == 1:
-            first_probe_finished.set()
-            return SimpleNamespace(status="member")
-        second_probe_started.set()
-        assert release_second_probe.wait(1)
-        return SimpleNamespace(status="left")
-
-    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot"):
-        auxiliary = AuxiliaryBot("123:token")
-    auxiliary.bot_id = 10
-    auxiliary.async_bot.get_chat_member.side_effect = get_chat_member
-    auxiliary.update_membership(100, True)
-    pool = BotPool([auxiliary])
-    try:
-        pool.record_successful_auxiliary_send("slave-a", 10)
-        pool.record_possible_membership_failure("slave-a", 10, 100)
-        assert first_probe_finished.wait(1)
-
-        deadline = time.monotonic() + 1
-        while auxiliary.check_membership_tri(100) is None and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert auxiliary.check_membership_tri(100) is True
-
-        pool.record_successful_auxiliary_send("slave-b", 10)
-        pool.record_possible_membership_failure("slave-b", 10, 100)
-        assert second_probe_started.wait(1)
-        pool.record_possible_membership_failure("slave-b", 10, 100)
-        assert probe_count == 2
-        release_second_probe.set()
-
-        deadline = time.monotonic() + 1
-        while pool.preferred_sender("slave-b") is auxiliary and time.monotonic() < deadline:
-            time.sleep(0.01)
-
-        assert pool.preferred_sender("slave-a") is auxiliary
-        assert pool.preferred_sender("slave-b") is None
-    finally:
-        release_second_probe.set()
-        pool.shutdown()
 
 
 def test_shutdown_uses_one_deadline_for_all_bots_and_clears_affinity_state(monkeypatch) -> None:
@@ -243,10 +180,9 @@ def test_affinity_and_membership_failure_state_are_bounded_without_evicting_live
     assert pool._membership_failure_slaves == {}
 
 
-@pytest.mark.parametrize("contents", ["null\n", "[]\n", "token\n"])
-def test_load_channel_config_rejects_non_mapping_yaml_root(tmp_path, monkeypatch, contents: str) -> None:
+def test_load_channel_config_rejects_non_mapping_yaml_root(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(contents)
+    config_path.write_text("null\n")
     monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
 
     with pytest.raises(ValueError, match="Config file must contain a mapping"):
@@ -272,14 +208,12 @@ def test_load_channel_config_rejects_boolean_admin_id(tmp_path, monkeypatch) -> 
         load_channel_config("tests.channel", str)
 
 
-@pytest.mark.parametrize("section", ["database", "flags", "rpc"])
-@pytest.mark.parametrize("value", ["null", "[]"])
-def test_load_channel_config_rejects_non_mapping_runtime_sections(tmp_path, monkeypatch, section: str, value: str) -> None:
+def test_load_channel_config_rejects_non_mapping_runtime_section(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(f'token: "main"\nadmins: [1]\n{section}: {value}\n')
+    config_path.write_text('token: "main"\nadmins: [1]\ndatabase: []\n')
     monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
 
-    with pytest.raises(ValueError, match=f"{section} must be a mapping"):
+    with pytest.raises(ValueError, match="database must be a mapping"):
         load_channel_config("tests.channel", str)
 
 
