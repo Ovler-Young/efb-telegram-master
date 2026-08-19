@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from efb_telegram_master.models import MsgLog, MsgLogIngestionLeaseLostError, MsgLogIngestionScan
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
-from efb_telegram_master.mtproto import MTProtoRetryableError
+from efb_telegram_master.runtime.mtproto import MTProtoRetryableError
 from tests.unit.msglog_ingestion_support import FakeChatAssociations, FakeDatabase, FakeMTProto, sqlite_ingestion_database, topic_message
 
 

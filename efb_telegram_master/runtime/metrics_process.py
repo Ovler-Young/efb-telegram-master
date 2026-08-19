@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
 if TYPE_CHECKING:
-    from .etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
+    from ..etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
 
 
 def _counter_metric(name: str, documentation: str, value: float) -> CounterMetricFamily:

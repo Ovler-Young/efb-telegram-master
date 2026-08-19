@@ -6,10 +6,10 @@ from unittest.mock import ANY, Mock, patch
 import pytest
 
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
-from efb_telegram_master.bot_manager import TelegramBotManager, TelegramResourceShutdownError
-from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.msglog_scan import MsgLogScanShutdownTimeout
 from efb_telegram_master.outbound_types import OutboundShutdownTimeout
+from efb_telegram_master.runtime.bot_manager import TelegramBotManager, TelegramResourceShutdownError
+from efb_telegram_master.runtime.bot_pool import BotPool
 from efb_telegram_master.transport.telegram_api import TelegramAPI
 
 

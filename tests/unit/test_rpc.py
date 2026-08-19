@@ -4,7 +4,7 @@ import time
 
 from pytest import fixture
 
-from efb_telegram_master.rpc_utils import RPCShutdownTimeout, RPCUtilities
+from efb_telegram_master.runtime.rpc_utils import RPCShutdownTimeout, RPCUtilities
 
 
 class FakeDatabase:

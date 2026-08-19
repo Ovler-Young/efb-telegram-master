@@ -23,20 +23,20 @@ from telegram.ext import CallbackContext
 
 from . import utils as etm_utils
 from .__version__ import __version__
-from .bot_manager import TelegramBotManager, TelegramResourceShutdownError
-from .channel_commands import load_channel_config
-from .channel_composition import initialize_channel_components
-from .channel_locale import LocaleState
+from .config.runtime import RuntimeConfiguration, load_channel_config
 from .db import DatabaseManager
 from .message import ETMMsg
-from .rpc_utils import RPCUtilities
+from .runtime.bot_manager import TelegramBotManager, TelegramResourceShutdownError
+from .runtime.channel_composition import initialize_channel_components
+from .runtime.channel_locale import LocaleState
+from .runtime.rpc_utils import RPCUtilities
 from .utils import ExperimentalFlagsManager
 
 if TYPE_CHECKING:
-    from .bot_manager import TelegramBotManager
     from .chat_object_cache import ChatObjectCacheManager
     from .master_message import MasterMessageWorker
     from .msglog_reconstruction import MsgLogReconstructor
+    from .runtime.bot_manager import TelegramBotManager
     from .slave_message import SlaveMessageService
     from .slave_status import SlaveStatusService
     from .topic_sync import TopicGroupService
@@ -66,7 +66,7 @@ class TelegramChannel(MasterChannel):
 
     _stop_polling = False
     SHUTDOWN_TIMEOUT = TelegramBotManager.SHUTDOWN_DRAIN_TIMEOUT + TelegramBotManager.SHUTDOWN_JOIN_GRACE
-    config: dict
+    config: RuntimeConfiguration
     bot_manager: TelegramBotManager
     telegram_runtime: TelegramPollingRuntime
     chat_manager: ChatObjectCacheManager
@@ -100,7 +100,7 @@ class TelegramChannel(MasterChannel):
             raise EFBException(self._("WebP support of Pillow is required.\nPlease refer to Pillow Documentation for instructions.\nhttps://pillow.readthedocs.io/"))
 
         self.logger: logging.Logger = logging.getLogger(__name__)
-        self.config, self.mtproto_config = load_channel_config(self.channel_id, self._)
+        self.config = load_channel_config(self.channel_id, self._)
         mimetypes.init(files=["mimetypes"])
         self.flag: ExperimentalFlagsManager = ExperimentalFlagsManager(self)
         self.db: DatabaseManager = DatabaseManager(self)
@@ -112,7 +112,7 @@ class TelegramChannel(MasterChannel):
         self.history_migrations = self.db.history_migrations
         self.msglog_ingestion = self.db.msglog_ingestion
         try:
-            self.rpc_utilities = RPCUtilities(self.config.get("rpc"), self.db, coordinator)
+            self.rpc_utilities = RPCUtilities(self.config.rpc, self.db, coordinator)
             self._owned_rpc_utilities = self.rpc_utilities
             self.rpc_utilities.start()
             initialize_channel_components(self)

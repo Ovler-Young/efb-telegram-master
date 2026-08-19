@@ -7,8 +7,8 @@ from ehforwarderbot.types import ModuleID
 from ruamel.yaml import YAML
 from telegram import Bot
 
-from . import TelegramChannel
-from .paths import LOCALE_DIR, get_config_path
+from .. import TelegramChannel
+from ..paths import LOCALE_DIR, get_config_path
 from .wizard_configuration import WizardConfiguration
 
 translator = translation("efb_telegram_master", str(LOCALE_DIR), fallback=True)
@@ -143,6 +143,6 @@ def build_bot(configuration: WizardConfiguration, token: Optional[str] = None) -
     bot_token = token or configuration.token
     if configuration.request is None:
         return Bot(token=bot_token)
-    from .transport.telegram_runtime import build_request
+    from ..transport.telegram_runtime import build_request
 
     return Bot(token=bot_token, request=build_request(configuration.request))

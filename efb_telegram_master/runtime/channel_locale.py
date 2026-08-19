@@ -9,7 +9,7 @@ from gettext import NullTranslations, translation
 from language_tags import tags
 from telegram import Update
 
-from .paths import LOCALE_DIR
+from ..paths import LOCALE_DIR
 
 
 class LocaleState:

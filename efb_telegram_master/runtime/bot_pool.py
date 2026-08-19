@@ -7,13 +7,13 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Optional, Protocol, cast
 
-from .auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
-from .transport.telegram_runtime import TelegramPollingRuntime
-from .transport.telegram_sync_bridge import AsyncTelegramRuntime
-from .utils import normalize_request_kwargs
+from ..auxiliary_bot import AuxiliaryBot, MembershipProbeShutdownTimeout
+from ..config.request import RequestConfiguration, request_kwargs
+from ..config.runtime import AuxiliaryBotConfiguration
+from ..transport.telegram_sync_bridge import AsyncTelegramRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -23,38 +23,19 @@ class ChannelFlags(Protocol):
 
 
 def build_bot_pool(
-    auxiliary_configs: object,
-    config: Mapping[str, object],
+    auxiliary_configs: Sequence[AuxiliaryBotConfiguration],
+    request_configuration: RequestConfiguration,
     channel: ChannelFlags,
     runtime: AsyncTelegramRuntime,
     logger: logging.Logger,
 ) -> "BotPool | None":
     """Construct the valid, available auxiliary bots declared in configuration."""
-    if not isinstance(auxiliary_configs, list):
-        return None
-    request_config: dict[str, object] = {
-        "read_timeout": 15.0,
-        "connection_pool_size": TelegramPollingRuntime._default_connection_pool_size(config),
-    }
-    configured_request_kwargs = config.get("request_kwargs")
-    if isinstance(configured_request_kwargs, Mapping):
-        request_config.update(configured_request_kwargs)
-    request_kwargs = normalize_request_kwargs(request_config)
-    main_token = config["token"]
-    seen_tokens = {main_token}
+    auxiliary_request_kwargs = request_kwargs(request_configuration)
     bots: list[AuxiliaryBot] = []
     for entry in auxiliary_configs:
-        if not isinstance(entry, dict) or not isinstance(entry.get("token"), str):
-            logger.warning("Skipping invalid auxiliary bot configuration", extra={"event": "telegram_bot.auxiliary_configuration_invalid", "entry_type": type(entry).__name__})
-            continue
-        token = entry["token"]
-        if token in seen_tokens:
-            logger.warning("Skipping duplicate auxiliary bot", extra={"event": "telegram_bot.auxiliary_duplicate"})
-            continue
-        seen_tokens.add(token)
         bot = AuxiliaryBot(
-            token=token,
-            request_kwargs=request_kwargs,
+            token=entry.token,
+            request_kwargs=auxiliary_request_kwargs,
             base_url=cast(str | None, channel.flag("api_base_url") or None),
             base_file_url=cast(str | None, channel.flag("api_base_file_url") or None),
             local_mode=bool(channel.flag("local_tdlib_api")),

@@ -9,10 +9,10 @@ from prometheus_client import generate_latest
 from telegram.error import NetworkError, RetryAfter
 
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
-from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.outbound_types import QueueEnqueueError, QueueRequest
+from efb_telegram_master.runtime.bot_pool import BotPool
 from efb_telegram_master.sender_policy import retry_after_seconds
 from tests.support.outbound_queue import _Limiter, _queue
 

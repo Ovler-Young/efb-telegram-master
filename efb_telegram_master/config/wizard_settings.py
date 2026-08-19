@@ -2,9 +2,9 @@ from dataclasses import replace
 
 from bullet import Bullet, Numbers, YesNo
 
-from .request_configuration import RequestConfiguration
-from .wizard_config import _, print_wrapped
+from .request import RequestConfiguration
 from .wizard_configuration import RPCConfiguration
+from .wizard_state import _, print_wrapped
 
 flags_settings = {
     "chats_per_page": (10, "int", None, _("Number of chats shown in when choosing for /chat and /link command. An overly large value may lead to malfunction of such commands.")),

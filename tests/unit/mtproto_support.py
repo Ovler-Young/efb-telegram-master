@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from efb_telegram_master.mtproto import MTProtoConfig
+from efb_telegram_master.runtime.mtproto import MTProtoConfig
 
 
 class FakeClient:

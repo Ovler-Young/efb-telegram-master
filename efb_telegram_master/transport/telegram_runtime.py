@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from socket import socket
-from typing import Coroutine, Optional, ParamSpec, TypedDict, TypeVar, cast
+from typing import Coroutine, Optional, ParamSpec, TypedDict, TypeVar
 
 import telegram
 from telegram import Update
@@ -18,7 +17,8 @@ from telegram.ext import Application, CallbackContext
 from telegram.request import HTTPXRequest
 from typing_extensions import NotRequired
 
-from ..request_configuration import RequestConfiguration, parse_request_configuration
+from ..config.request import RequestConfiguration, parse_request_configuration
+from ..config.runtime import RuntimeConfiguration
 from .telegram_application_lifecycle import LifecycleCallback, TelegramApplicationLifecycle
 from .telegram_sync_bridge import AsyncTelegramRuntime, SyncBotFacade
 
@@ -194,16 +194,6 @@ class TelegramPollingRuntime:
         self.application.add_handler(MessageHandler(~Filters.user(user_id=admins), self.as_async_callback(lambda update, context: None)))
         self.application.add_handler(TypeHandler(Update, self.as_async_callback(update_locale)), group=-1)
 
-    @staticmethod
-    def _default_connection_pool_size(config: Mapping[str, object]) -> int:
-        multiplier = 2.0
-        try:
-            configured = float(os.getenv("ETM_HTTPX_POOL_MULTIPLIER", multiplier))
-            multiplier = configured if configured > 0 else multiplier
-        except ValueError:
-            pass
-        return max(1, int(round(8 * multiplier)))
-
     def _stop_requested_for_lifecycle(self) -> bool:
         with self._stop_lock:
             return self._stop_requested
@@ -248,7 +238,7 @@ class TelegramPollingRuntime:
                 self._application_lifecycle.run(
                     drop_pending_updates=drop_pending_updates,
                     timeout=timeout,
-                    stop_requested=self._stop_requested_for_lifecycle,
+                    stop_requested=lambda: self._stop_requested_for_lifecycle(),
                 )
             )
         except BaseException as error:
@@ -287,24 +277,17 @@ class TelegramPollingRuntime:
 
 
 def build_telegram_polling_runtime(
-    config: Mapping[str, object],
+    config: RuntimeConfiguration,
     channel: object,
     logger: logging.Logger,
     on_started: LifecycleCallback,
     on_stopped: LifecycleCallback,
 ) -> TelegramPollingRuntime:
-    request_config: dict[str, object] = {"read_timeout": 15.0, "connection_pool_size": TelegramPollingRuntime._default_connection_pool_size(config)}
-    configured = config.get("request_kwargs")
-    if configured is not None and not isinstance(configured, Mapping):
-        raise ValueError("request_kwargs must be a mapping")
-    if isinstance(configured, Mapping):
-        request_config.update(configured)
-    request_kwargs = parse_request_configuration(request_config)
     identity: _BotArguments = {
-        "token": cast(str, config["token"]),
+        "token": config.token,
         "local_mode": bool(getattr(channel, "flag")("local_tdlib_api")),
-        "request": build_request(request_kwargs),
-        "get_updates_request": build_request(request_kwargs),
+        "request": build_request(config.request),
+        "get_updates_request": build_request(config.request),
     }
     base_url = getattr(channel, "flag")("api_base_url")
     if base_url:
@@ -314,8 +297,6 @@ def build_telegram_polling_runtime(
         identity["base_file_url"] = base_file_url
     async_bot = telegram.Bot(**identity)
     async_runtime = AsyncTelegramRuntime(logger)
-    if (webhook := config.get("webhook")) is not None and not isinstance(webhook, Mapping):
-        raise ValueError("webhook must be a mapping")
     runtime = TelegramPollingRuntime(
         logger,
         None,
@@ -323,7 +304,7 @@ def build_telegram_polling_runtime(
         async_runtime,
         on_started,
         on_stopped,
-        webhook,
+        config.webhook,
     )
 
     application = Application.builder().bot(async_bot).job_queue(None).post_init(runtime._application_lifecycle.post_init).post_shutdown(runtime._application_lifecycle.post_shutdown).build()

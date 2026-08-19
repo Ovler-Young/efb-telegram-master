@@ -27,6 +27,19 @@ class RequestConfiguration:
     httpx_kwargs: dict[str, object] | None = None
 
 
+def request_kwargs(configuration: RequestConfiguration) -> dict[str, object]:
+    """Build the auxiliary-bot keyword arguments from validated settings."""
+    values: dict[str, object] = {
+        "connection_pool_size": configuration.connection_pool_size,
+        "http_version": configuration.http_version,
+    }
+    for name in ("read_timeout", "write_timeout", "connect_timeout", "pool_timeout", "media_write_timeout", "socket_options", "proxy", "httpx_kwargs"):
+        value = getattr(configuration, name)
+        if value is not None:
+            values[name] = value
+    return values
+
+
 _REQUEST_OPTIONS = frozenset(
     {
         "connection_pool_size",

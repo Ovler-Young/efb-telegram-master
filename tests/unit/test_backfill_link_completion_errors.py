@@ -5,9 +5,9 @@ from ehforwarderbot.types import ChatID, ModuleID
 from telegram import Update
 
 from efb_telegram_master import utils
-from efb_telegram_master.channel_commands import TelegramCommandService
 from efb_telegram_master.history_replay import HistoryReplayWorker
 from efb_telegram_master.models import HistoryMigrationEntry
+from efb_telegram_master.runtime.channel_commands import TelegramCommandService
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
 from tests.unit.backfill_support import _build_link_update, _cleanup_link_state, _link_completion_service
 

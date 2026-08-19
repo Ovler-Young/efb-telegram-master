@@ -11,8 +11,8 @@ from peewee import SqliteDatabase
 
 from efb_telegram_master.models import MsgLog, MsgLogIngestionScan, database
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
-from efb_telegram_master.mtproto import MTProtoRetryableError
 from efb_telegram_master.persistence.msglog_ingestion_repository import MsgLogIngestionRepository
+from efb_telegram_master.runtime.mtproto import MTProtoRetryableError
 
 
 class SharedAsyncRuntime:

@@ -64,7 +64,7 @@ class AuxiliaryBot:
         self.disabled = False
         self._runtime: Optional["AsyncTelegramRuntime"] = None
 
-        from .rate_limiter import SlidingWindowRateLimiter
+        from .runtime.rate_limiter import SlidingWindowRateLimiter
 
         self._rate_limiter = SlidingWindowRateLimiter()
         self._membership_lifecycle = MembershipLifecycle(

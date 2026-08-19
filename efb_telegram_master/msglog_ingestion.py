@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .models import MsgLogIngestionLeaseLostError
-from .mtproto import MTProtoClient, MTProtoRetryableError
 from .persistence.chat_association_repository import ChatAssociationRepository
 from .persistence.msglog_ingestion_repository import MsgLogIngestionCompletion, MsgLogIngestionRepository
+from .runtime.mtproto import MTProtoClient, MTProtoRetryableError
 from .utils import EFBChannelChatIDStr
 
 _INGESTION_EVENT_IDS = {"start": "msglog_ingestion.start", "complete": "msglog_ingestion.complete"}

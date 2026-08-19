@@ -11,8 +11,8 @@ from typing import Any
 from prometheus_client import CollectorRegistry, Counter, Histogram
 from prometheus_client.core import Metric
 
-from .metrics_process import register_bounded_gauge_collector, register_destination_queue_collector, register_process_collector, register_worker_collector
 from .outbound import OutboundQueue
+from .runtime.metrics_process import register_bounded_gauge_collector, register_destination_queue_collector, register_process_collector, register_worker_collector
 from .transport.telegram_calls import QUEUED_OPERATIONS
 
 _PRIORITIES = frozenset({"blocking", "normal"})

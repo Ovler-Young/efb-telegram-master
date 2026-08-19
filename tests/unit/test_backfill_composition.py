@@ -7,7 +7,7 @@ from ehforwarderbot.channel import MasterChannel
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.mtproto import MTProtoConfig
+from efb_telegram_master.config.runtime import RuntimeConfiguration
 
 
 def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
@@ -29,7 +29,7 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
     history_replay = Mock()
 
     def load_config(_channel_id, _translate):
-        return {"token": "token", "admins": [1]}, MTProtoConfig(enabled=False)
+        return RuntimeConfiguration.from_mapping({"token": "token", "admins": [1]})
 
     dependencies = [
         "MTProtoClient",
@@ -62,10 +62,10 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
         stack.enter_context(patch("efb_telegram_master.load_channel_config", new=load_config))
         stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
         stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
-        stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager", return_value=bot_manager))
-        stack.enter_context(patch("efb_telegram_master.channel_composition.HistoryReplayWorker", return_value=history_replay))
+        stack.enter_context(patch("efb_telegram_master.runtime.channel_composition.TelegramBotManager", return_value=bot_manager))
+        stack.enter_context(patch("efb_telegram_master.runtime.channel_composition.HistoryReplayWorker", return_value=history_replay))
         for dependency in dependencies:
-            stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
+            stack.enter_context(patch(f"efb_telegram_master.runtime.channel_composition.{dependency}"))
         channel = TelegramChannel()
 
     assert channel.slave_message_deliveries is database_manager.slave_message_deliveries
@@ -75,7 +75,7 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
     message = Mock(chat=Mock(id=100, is_forum=True), from_user=Mock(id=1), message_thread_id=None)
     channel.command_service.sync_msglog(Update(update_id=1, message=message), Mock())
 
-    assert channel.command_service.admins == [1]
+    assert channel.command_service.admins == (1,)
     channel.chat_associations.get_topic_slaves.assert_called_once_with(100)
     channel.msglog_scan.schedule.assert_called_once_with(100)
     api.send_message.assert_called_once_with(100, text="MsgLog sync started for this group.")
@@ -85,7 +85,7 @@ def test_channel_composition_wires_sync_msglog_and_dynamic_locale():
             return f"translated:{message}"
 
     locale_update = Update(update_id=2, message=Mock(chat=Mock(id=100), from_user=Mock(id=1, language_code="fr")))
-    with patch("efb_telegram_master.channel_locale.translation", return_value=PrefixTranslations()):
+    with patch("efb_telegram_master.runtime.channel_locale.translation", return_value=PrefixTranslations()):
         channel.locale_state.update(locale_update, channel.logger)
 
     assert channel.locale == "fr"

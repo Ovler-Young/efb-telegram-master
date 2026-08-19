@@ -8,8 +8,8 @@ from bullet import Bullet, YesNo
 from telegram import Bot
 from telegram.error import TelegramError
 
-from .request_configuration import RequestConfiguration
-from .wizard_config import DataModel, _, build_bot, print_wrapped
+from .request import RequestConfiguration
+from .wizard_state import DataModel, _, build_bot, print_wrapped
 
 
 async def _id_bot_loop(bot: Bot, stop_event: threading.Event):

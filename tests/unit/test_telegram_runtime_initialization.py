@@ -9,13 +9,14 @@ from ehforwarderbot.channel import MasterChannel
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.bot_manager import TelegramBotManager
+from efb_telegram_master.config.runtime import RuntimeConfiguration
 from efb_telegram_master.master_message import MasterMessageWorker
+from efb_telegram_master.runtime.bot_manager import TelegramBotManager
 from efb_telegram_master.transport.telegram_api import TelegramAPI
 
 
 def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_cleanup_errors(caplog) -> None:
-    channel = SimpleNamespace(config={"admins": [1], "outbound": {"max_pending": 17}}, db=Mock())
+    channel = SimpleNamespace(config=RuntimeConfiguration.from_mapping({"token": "token", "admins": [1], "outbound": {"max_pending": 17}}), db=Mock())
     async_runtime = Mock()
 
     def consume_runtime_call(coroutine, **_kwargs):
@@ -30,10 +31,10 @@ def test_bot_manager_constructor_failure_preserves_dispatcher_error_and_reports_
     runtime.stop.side_effect = runtime_error
 
     with (
-        patch("efb_telegram_master.bot_manager.build_telegram_polling_runtime", return_value=runtime),
-        patch("efb_telegram_master.bot_manager.build_bot_pool", return_value=None),
-        patch("efb_telegram_master.bot_manager.OutboundQueue") as queue_type,
-        patch("efb_telegram_master.bot_manager.configure_runtime_metrics", return_value=(None, None)),
+        patch("efb_telegram_master.runtime.bot_manager.build_telegram_polling_runtime", return_value=runtime),
+        patch("efb_telegram_master.runtime.bot_manager.build_bot_pool", return_value=None),
+        patch("efb_telegram_master.runtime.bot_manager.OutboundQueue") as queue_type,
+        patch("efb_telegram_master.runtime.bot_manager.configure_runtime_metrics", return_value=(None, None)),
         patch.object(TelegramAPI, "begin_delivery_shutdown", return_value=(delivery_error,)) as begin_delivery,
         patch.object(TelegramAPI, "finish_delivery_shutdown", return_value=()) as finish_delivery,
     ):
@@ -74,14 +75,14 @@ def test_channel_constructor_stops_database_when_bot_manager_creation_fails() ->
 
     with (
         patch.object(MasterChannel, "__init__", return_value=None),
-        patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1]}, Mock())),
+        patch("efb_telegram_master.load_channel_config", return_value=RuntimeConfiguration.from_mapping({"token": "token", "admins": [1]})),
         patch("efb_telegram_master.ExperimentalFlagsManager", return_value=Mock()),
         patch("efb_telegram_master.DatabaseManager", return_value=database_manager),
-        patch("efb_telegram_master.channel_composition.TelegramBotManager", side_effect=RuntimeError("bot setup failed")),
-        patch("efb_telegram_master.channel_composition.MTProtoClient", return_value=Mock()),
-        patch("efb_telegram_master.channel_composition.ChatObjectCacheManager", return_value=Mock()),
-        patch("efb_telegram_master.channel_composition.ChatDestinationCache", return_value=Mock()),
-        patch("efb_telegram_master.channel_composition.TelegramChatID", return_value=Mock()),
+        patch("efb_telegram_master.runtime.channel_composition.TelegramBotManager", side_effect=RuntimeError("bot setup failed")),
+        patch("efb_telegram_master.runtime.channel_composition.MTProtoClient", return_value=Mock()),
+        patch("efb_telegram_master.runtime.channel_composition.ChatObjectCacheManager", return_value=Mock()),
+        patch("efb_telegram_master.runtime.channel_composition.ChatDestinationCache", return_value=Mock()),
+        patch("efb_telegram_master.runtime.channel_composition.TelegramChatID", return_value=Mock()),
     ):
         with pytest.raises(RuntimeError, match="bot setup failed"):
             TelegramChannel()
@@ -124,13 +125,13 @@ def test_channel_constructor_stops_started_history_replay_when_handler_registrat
     application.add_handler.side_effect = [None] * 6 + [RuntimeError("handler registration failed")]
     with ExitStack() as stack:
         stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
-        stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1]}, Mock())))
+        stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=RuntimeConfiguration.from_mapping({"token": "token", "admins": [1]})))
         stack.enter_context(patch("efb_telegram_master.ExperimentalFlagsManager", return_value=flag))
         stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
-        stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager", return_value=bot_manager))
-        stack.enter_context(patch("efb_telegram_master.channel_composition.HistoryReplayWorker", return_value=history_replay))
+        stack.enter_context(patch("efb_telegram_master.runtime.channel_composition.TelegramBotManager", return_value=bot_manager))
+        stack.enter_context(patch("efb_telegram_master.runtime.channel_composition.HistoryReplayWorker", return_value=history_replay))
         for dependency in dependencies:
-            stack.enter_context(patch(f"efb_telegram_master.channel_composition.{dependency}"))
+            stack.enter_context(patch(f"efb_telegram_master.runtime.channel_composition.{dependency}"))
 
         with pytest.raises(RuntimeError, match="handler registration failed"):
             TelegramChannel()
@@ -154,10 +155,10 @@ def test_channel_rpc_bind_failure_stops_before_component_startup() -> None:
     )
     with ExitStack() as stack:
         stack.enter_context(patch.object(MasterChannel, "__init__", return_value=None))
-        stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=({"token": "token", "admins": [1], "rpc": {"server": "127.0.0.1", "port": 0}}, Mock())))
-        stack.enter_context(patch("efb_telegram_master.rpc_utils._ThreadedXMLRPCServer", side_effect=OSError("bind failed")))
+        stack.enter_context(patch("efb_telegram_master.load_channel_config", return_value=RuntimeConfiguration.from_mapping({"token": "token", "admins": [1], "rpc": {"server": "127.0.0.1", "port": 0}})))
+        stack.enter_context(patch("efb_telegram_master.runtime.rpc_utils._ThreadedXMLRPCServer", side_effect=OSError("bind failed")))
         stack.enter_context(patch("efb_telegram_master.DatabaseManager", return_value=database_manager))
-        bot_manager = stack.enter_context(patch("efb_telegram_master.channel_composition.TelegramBotManager"))
+        bot_manager = stack.enter_context(patch("efb_telegram_master.runtime.channel_composition.TelegramBotManager"))
 
         with pytest.raises(OSError, match="bind failed"):
             TelegramChannel()

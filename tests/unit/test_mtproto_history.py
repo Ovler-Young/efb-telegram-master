@@ -8,7 +8,7 @@ import pytest
 
 from efb_telegram_master.msglog_ingestion import MsgLogIngestionService
 from efb_telegram_master.msglog_scan import MsgLogScanScheduler
-from efb_telegram_master.mtproto import MTProtoClient, MTProtoConfig
+from efb_telegram_master.runtime.mtproto import MTProtoClient, MTProtoConfig
 from tests.unit.mtproto_support import FakeClient
 
 

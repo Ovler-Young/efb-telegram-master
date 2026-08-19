@@ -5,31 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from .request_configuration import RequestConfiguration, parse_request_configuration
-
-
-@dataclass
-class RPCConfiguration:
-    """Settings for the optional RPC interface."""
-
-    server: str = "127.0.0.1"
-    port: int = 8000
-    additional_options: dict[str, object] = field(default_factory=dict)
-
-    @classmethod
-    def from_mapping(cls, data: object) -> "RPCConfiguration":
-        if not isinstance(data, Mapping):
-            raise ValueError("rpc must be a mapping.")
-        server = data.get("server", "127.0.0.1")
-        port = data.get("port", 8000)
-        if not isinstance(server, str):
-            raise ValueError("rpc.server must be a string.")
-        if type(port) is not int:
-            raise ValueError("rpc.port must be an integer.")
-        return cls(server=server, port=port, additional_options={key: value for key, value in data.items() if key not in {"server", "port"}})
-
-    def to_mapping(self) -> dict[str, object]:
-        return {**self.additional_options, "server": self.server, "port": self.port}
+from .request import RequestConfiguration, parse_request_configuration
+from .runtime import RPCConfiguration
 
 
 @dataclass

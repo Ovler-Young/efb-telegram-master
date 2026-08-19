@@ -2,18 +2,21 @@ import threading
 import time
 from collections.abc import Mapping
 from socketserver import ThreadingMixIn
-from typing import TYPE_CHECKING, List, Optional, Protocol, TypedDict
+from typing import TYPE_CHECKING, List, Optional, Protocol
 from xmlrpc.server import SimpleXMLRPCRequestHandler, SimpleXMLRPCServer
 
 from ehforwarderbot.types import ModuleID
 
 if TYPE_CHECKING:
-    from .db import DatabaseManager
+    from ..db import DatabaseManager
 
 
-class RPCConfig(TypedDict):
-    server: str
-    port: int
+class RPCConfig(Protocol):
+    @property
+    def server(self) -> str: ...
+
+    @property
+    def port(self) -> int: ...
 
 
 class SlaveChannelCoordinator(Protocol):
@@ -118,7 +121,7 @@ class RPCUtilities:
             class RequestHandler(SimpleXMLRPCRequestHandler):
                 rpc_paths = ("/", "/RPC2")
 
-            server = _ThreadedXMLRPCServer((rpc_config["server"], rpc_config["port"]), requestHandler=RequestHandler)
+            server = _ThreadedXMLRPCServer((rpc_config.server, rpc_config.port), requestHandler=RequestHandler)
             try:
                 server.register_introspection_functions()
                 server.register_multicall_functions()

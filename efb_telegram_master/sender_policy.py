@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, Optional
 from telegram.error import RetryAfter
 
 from .outbound_types import QueuedCall, SenderDecision, SenderSelection
-from .rate_limiter import SlidingWindowRateLimiter
+from .runtime.rate_limiter import SlidingWindowRateLimiter
 
 if TYPE_CHECKING:
-    from .bot_pool import BotPool
+    from .runtime.bot_pool import BotPool
 
 
 CooldownKey = tuple[Optional[str], int]

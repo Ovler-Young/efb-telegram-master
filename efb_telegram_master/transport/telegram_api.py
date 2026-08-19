@@ -7,13 +7,13 @@ import time
 from typing import TYPE_CHECKING
 
 from ..auxiliary_bot import MembershipProbeShutdownTimeout
-from ..bot_pool import BotPool
 from ..outbound import OutboundQueue
+from ..runtime.bot_pool import BotPool
 from .telegram_api_operations import SyncBotProtocol, TelegramAPIOperations
 
 if TYPE_CHECKING:
     from .. import TelegramChannel
-    from ..metrics_runtime import MetricsServer
+    from ..runtime.metrics_runtime import MetricsServer
 
 
 class MetricsServerShutdownTimeout(RuntimeError):

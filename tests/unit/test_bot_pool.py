@@ -7,9 +7,9 @@ from unittest.mock import Mock
 import pytest
 
 from efb_telegram_master.auxiliary_bot import MembershipProbeShutdownTimeout
-from efb_telegram_master.bot_pool import BotPool
-from efb_telegram_master.channel_commands import MAX_AUXILIARY_BOTS, load_channel_config
+from efb_telegram_master.config.runtime import MAX_AUXILIARY_BOTS, load_channel_config
 from efb_telegram_master.outbound import DEFAULT_MAX_PENDING
+from efb_telegram_master.runtime.bot_pool import BotPool
 
 
 def bot(bot_id: int, *, disabled: bool = False, membership: bool | None = True) -> Mock:
@@ -120,7 +120,7 @@ def test_shutdown_uses_one_deadline_for_all_bots_and_clears_affinity_state(monke
     second.begin_membership_shutdown.side_effect = begin_shutdown
     first.wait_for_membership_shutdown.side_effect = wait_for_membership_shutdown
     second.wait_for_membership_shutdown.side_effect = wait_for_membership_shutdown
-    monkeypatch.setattr("efb_telegram_master.bot_pool.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("efb_telegram_master.runtime.bot_pool.time.monotonic", lambda: now[0])
 
     pool.record_successful_auxiliary_send("slave-a", 10)
     pool._membership_failure_slaves[(10, 100)] = OrderedDict({"slave-a": 10.0})
@@ -151,7 +151,7 @@ def test_affinity_and_membership_failure_state_are_bounded_without_evicting_live
     first = bot(10)
     pool = BotPool([first])
     now = [100.0]
-    monkeypatch.setattr("efb_telegram_master.bot_pool.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("efb_telegram_master.runtime.bot_pool.time.monotonic", lambda: now[0])
     monkeypatch.setattr(BotPool, "MAX_AFFINITY_ENTRIES", 2)
     monkeypatch.setattr(BotPool, "MAX_MEMBERSHIP_FAILURE_ENTRIES", 1)
     monkeypatch.setattr(BotPool, "MAX_FAILURE_SLAVES_PER_MEMBERSHIP_PROBE", 2)
@@ -183,7 +183,7 @@ def test_affinity_and_membership_failure_state_are_bounded_without_evicting_live
 def test_load_channel_config_rejects_non_mapping_yaml_root(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text("null\n")
-    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+    monkeypatch.setattr("efb_telegram_master.config.runtime.get_config_path", lambda _channel_id: config_path)
 
     with pytest.raises(ValueError, match="Config file must contain a mapping"):
         load_channel_config("tests.channel", str)
@@ -193,7 +193,7 @@ def test_load_channel_config_rejects_too_many_auxiliary_bots(tmp_path, monkeypat
     config_path = tmp_path / "config.yaml"
     auxiliary_bots = "".join(f'  - token: "auxiliary-{index}"\n' for index in range(MAX_AUXILIARY_BOTS + 1))
     config_path.write_text(f'token: "main"\nadmins: [1]\nauxiliary_bots:\n{auxiliary_bots}')
-    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+    monkeypatch.setattr("efb_telegram_master.config.runtime.get_config_path", lambda _channel_id: config_path)
 
     with pytest.raises(ValueError, match=f"at most {MAX_AUXILIARY_BOTS} entries"):
         load_channel_config("tests.channel", str)
@@ -202,7 +202,7 @@ def test_load_channel_config_rejects_too_many_auxiliary_bots(tmp_path, monkeypat
 def test_load_channel_config_rejects_boolean_admin_id(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text('token: "main"\nadmins: [true]\n')
-    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+    monkeypatch.setattr("efb_telegram_master.config.runtime.get_config_path", lambda _channel_id: config_path)
 
     with pytest.raises(ValueError, match="Admin ID is expected to be an int"):
         load_channel_config("tests.channel", str)
@@ -211,7 +211,7 @@ def test_load_channel_config_rejects_boolean_admin_id(tmp_path, monkeypatch) -> 
 def test_load_channel_config_rejects_non_mapping_runtime_section(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text('token: "main"\nadmins: [1]\ndatabase: []\n')
-    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+    monkeypatch.setattr("efb_telegram_master.config.runtime.get_config_path", lambda _channel_id: config_path)
 
     with pytest.raises(ValueError, match="database must be a mapping"):
         load_channel_config("tests.channel", str)
@@ -225,11 +225,11 @@ def test_load_channel_config_rejects_non_mapping_runtime_section(tmp_path, monke
 def test_load_channel_config_sets_outbound_pending_limit(tmp_path, monkeypatch, outbound_config: str, expected_max_pending: int) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(f'token: "main"\nadmins: [1]\n{outbound_config}')
-    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+    monkeypatch.setattr("efb_telegram_master.config.runtime.get_config_path", lambda _channel_id: config_path)
 
-    config, _mtproto_config = load_channel_config("tests.channel", str)
+    config = load_channel_config("tests.channel", str)
 
-    assert config["outbound"]["max_pending"] == expected_max_pending
+    assert config.outbound.max_pending == expected_max_pending
 
 
 @pytest.mark.parametrize(
@@ -243,7 +243,7 @@ def test_load_channel_config_sets_outbound_pending_limit(tmp_path, monkeypatch, 
 def test_load_channel_config_rejects_invalid_outbound_pending_limit(tmp_path, monkeypatch, outbound_config: str, message: str) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(f'token: "main"\nadmins: [1]\n{outbound_config}')
-    monkeypatch.setattr("efb_telegram_master.channel_commands.get_config_path", lambda _channel_id: config_path)
+    monkeypatch.setattr("efb_telegram_master.config.runtime.get_config_path", lambda _channel_id: config_path)
 
     with pytest.raises(ValueError, match=message):
         load_channel_config("tests.channel", str)

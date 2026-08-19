@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import shlex
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import List, Optional
 
 import ehforwarderbot
@@ -13,25 +13,19 @@ from ehforwarderbot import Channel, coordinator
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBMessageReactionNotPossible, EFBOperationNotSupported
 from ehforwarderbot.status import ReactToMessage
 from ehforwarderbot.types import ChatID, InstanceID, ModuleID, ReactionName
-from ruamel.yaml import YAML
 from telegram import Message, Update
 from telegram.constants import ChatType
 from telegram.ext import CallbackContext
 
-from . import utils as etm_utils
+from .. import utils as etm_utils
+from ..chat_object_cache import ChatObjectCacheManager
+from ..link_completion import LinkCompletionService
+from ..msglog_scan import MsgLogScanScheduler
+from ..persistence.chat_association_repository import ChatAssociationRepository
+from ..persistence.msglog_repository import MsgLogRepository
+from ..ptb_compat import SupportsSendMessage, get_forwarded_chat, sync_reply_html, sync_reply_text
+from ..utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 from .channel_locale import LocaleState
-from .chat_object_cache import ChatObjectCacheManager
-from .link_completion import LinkCompletionService
-from .msglog_scan import MsgLogScanScheduler
-from .mtproto import MTProtoConfig
-from .outbound import DEFAULT_MAX_PENDING
-from .paths import get_config_path
-from .persistence.chat_association_repository import ChatAssociationRepository
-from .persistence.msglog_repository import MsgLogRepository
-from .ptb_compat import SupportsSendMessage, get_forwarded_chat, sync_reply_html, sync_reply_text
-from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
-
-MAX_AUXILIARY_BOTS = 16
 
 
 class TelegramCommandService:
@@ -253,57 +247,3 @@ class TelegramCommandService:
             if channel.suggested_reactions:
                 prompt += "\n" + self._("You may want to try: {}").format(", ".join(channel.suggested_reactions[:10]))
             sync_reply_text(self.api, message, prompt)
-
-
-def load_channel_config(channel_id: ModuleID, translate: Callable[[str], str]) -> tuple[dict, MTProtoConfig]:
-    """Parse and validate the configuration required before channel composition."""
-    config_path = get_config_path(channel_id)
-    if not config_path.exists():
-        raise FileNotFoundError(translate("Config File does not exist. ({path})").format(path=config_path))
-    with config_path.open() as config_file:
-        parsed_data = YAML().load(config_file)
-    if not isinstance(parsed_data, Mapping):
-        raise ValueError(translate("Config file must contain a mapping."))
-    data = dict(parsed_data)
-    if not isinstance(data.get("token"), str):
-        raise ValueError(translate("Telegram bot token must be a string"))
-    mtproto_config = MTProtoConfig.from_mapping(data.get("mtproto"))
-    if mtproto_config.enabled and not data["token"]:
-        raise ValueError(translate("MTProto requires a non-empty Telegram bot token"))
-    admins = data.get("admins")
-    if type(admins) is int:
-        admins = [admins]
-    if isinstance(admins, str) and admins.isdigit():
-        admins = [int(admins)]
-    if not isinstance(admins, list) or not admins:
-        raise ValueError(translate("Admins' user IDs must be a list of one number or more."))
-    data["admins"] = [int(admin) if isinstance(admin, str) and admin.isdigit() else admin for admin in admins]
-    if not all(type(admin) is int for admin in data["admins"]):
-        invalid = next(admin for admin in data["admins"] if type(admin) is not int)
-        raise ValueError(translate("Admin ID is expected to be an int, but {data} is found.").format(data=invalid))
-    for section in ("database", "flags", "rpc"):
-        if section in data and not isinstance(data[section], Mapping):
-            raise ValueError(translate("{section} must be a mapping.").format(section=section))
-        if section in data:
-            data[section] = dict(data[section])
-    auxiliary_bots = data.get("auxiliary_bots", [])
-    if not isinstance(auxiliary_bots, list):
-        raise ValueError(translate("auxiliary_bots must be a list."))
-    if len(auxiliary_bots) > MAX_AUXILIARY_BOTS:
-        raise ValueError(translate("auxiliary_bots must contain at most {count} entries.").format(count=MAX_AUXILIARY_BOTS))
-    seen_tokens = {data["token"]}
-    for index, entry in enumerate(auxiliary_bots):
-        if not isinstance(entry, dict) or not isinstance(entry.get("token"), str):
-            raise ValueError(translate('auxiliary_bots[{idx}] must have a "token" string.').format(idx=index))
-        if entry["token"] in seen_tokens:
-            raise ValueError(translate("Duplicate token found in auxiliary_bots[{idx}].").format(idx=index))
-        seen_tokens.add(entry["token"])
-    outbound = data.get("outbound", {})
-    if not isinstance(outbound, Mapping):
-        raise ValueError(translate("outbound must be a mapping."))
-    max_pending = outbound.get("max_pending", DEFAULT_MAX_PENDING)
-    if type(max_pending) is not int or max_pending <= 0:
-        raise ValueError(translate("outbound.max_pending must be a positive integer."))
-    data["outbound"] = dict(outbound)
-    data["outbound"]["max_pending"] = max_pending
-    return data.copy(), mtproto_config

@@ -8,7 +8,6 @@ from prometheus_client import generate_latest
 from telegram.constants import MessageLimit
 from telegram.error import RetryAfter
 
-from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import OutboundQueue
 from efb_telegram_master.outbound_types import (
@@ -18,6 +17,7 @@ from efb_telegram_master.outbound_types import (
     SchedulerStoppedError,
     UploadCleanup,
 )
+from efb_telegram_master.runtime.bot_pool import BotPool
 from tests.support.outbound_queue import _Limiter, _queue
 
 

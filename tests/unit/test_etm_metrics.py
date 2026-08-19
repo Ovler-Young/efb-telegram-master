@@ -7,12 +7,12 @@ from peewee import SqliteDatabase
 from prometheus_client import generate_latest
 
 from efb_telegram_master.etm_metrics import DestinationQueueSnapshot, Metrics, WorkerSnapshot
-from efb_telegram_master.metrics_runtime import start_metrics_server
 from efb_telegram_master.models import ChatAssoc, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database
 from efb_telegram_master.persistence.chat_association_repository import ChatAssociationRepository
 from efb_telegram_master.persistence.history_migration_repository import HistoryMigrationRepository
 from efb_telegram_master.persistence.msglog_repository import MsgLogRepository
 from efb_telegram_master.persistence.slave_chat_info_repository import SlaveChatInfoRepository
+from efb_telegram_master.runtime.metrics_runtime import start_metrics_server
 
 _DATABASE_METHOD_OPERATIONS = (
     "stop_worker",
@@ -234,7 +234,7 @@ def test_membership_probe_timeout_is_a_bounded_metric_outcome():
 
 def test_metrics_server_logs_the_port_chosen_by_the_os(caplog):
     metrics = Metrics(process_factory=SupportedProcess, network_io_counters=lambda: SimpleNamespace(bytes_recv=1, bytes_sent=2))
-    with caplog.at_level(logging.INFO, logger="efb_telegram_master.metrics_runtime"):
+    with caplog.at_level(logging.INFO, logger="efb_telegram_master.runtime.metrics_runtime"):
         metrics_server = start_metrics_server("127.0.0.1", 0, metrics.registry)
 
     try:

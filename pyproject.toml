@@ -68,7 +68,7 @@ postgresql = ["psycopg2-binary"]
 "blueset.telegram" = "efb_telegram_master:TelegramChannel"
 
 [project.entry-points."ehforwarderbot.wizard"]
-"blueset.telegram" = "efb_telegram_master.wizard:wizard"
+"blueset.telegram" = "efb_telegram_master.config.wizard:wizard"
 
 [project.urls]
 Homepage = "https://etm.1a23.studio"

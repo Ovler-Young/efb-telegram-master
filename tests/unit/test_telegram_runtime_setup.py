@@ -4,7 +4,8 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import pytest
 
-from efb_telegram_master.request_configuration import RequestConfiguration
+from efb_telegram_master.config.request import RequestConfiguration
+from efb_telegram_master.config.runtime import RuntimeConfiguration
 from efb_telegram_master.transport.telegram_runtime import TelegramPollingRuntime, TelegramRuntimeShutdownTimeout, build_telegram_polling_runtime
 from efb_telegram_master.transport.telegram_sync_bridge import AsyncTelegramRuntime
 
@@ -36,7 +37,9 @@ def test_default_connection_pool_size_uses_worker_count_multiplier(monkeypatch: 
     else:
         monkeypatch.setenv("ETM_HTTPX_POOL_MULTIPLIER", environment)
 
-    assert TelegramPollingRuntime._default_connection_pool_size({}) == expected
+    configuration = RuntimeConfiguration.from_mapping({"token": "token", "admins": [1]})
+
+    assert configuration.request.connection_pool_size == expected
 
 
 def test_build_runtime_passes_local_mode_and_independent_requests(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -54,7 +57,7 @@ def test_build_runtime_passes_local_mode_and_independent_requests(monkeypatch: p
     with patch("efb_telegram_master.transport.telegram_runtime.build_request", side_effect=requests) as build_request:
         with patch("efb_telegram_master.transport.telegram_runtime.telegram.Bot") as bot_cls:
             with patch("efb_telegram_master.transport.telegram_runtime.Application.builder", return_value=builder):
-                runtime = build_telegram_polling_runtime({"token": "123:token"}, channel, Mock(), AsyncMock(), AsyncMock())
+                runtime = build_telegram_polling_runtime(RuntimeConfiguration.from_mapping({"token": "123:token", "admins": [1]}), channel, Mock(), AsyncMock(), AsyncMock())
 
     bot_cls.assert_called_once_with(
         token="123:token",
@@ -75,12 +78,12 @@ def test_build_runtime_passes_local_mode_and_independent_requests(monkeypatch: p
 @pytest.mark.parametrize("webhook", [False, [], "invalid"])
 def test_build_runtime_rejects_non_mapping_webhook_config(webhook: object) -> None:
     with pytest.raises(ValueError, match="webhook must be a mapping"):
-        build_telegram_polling_runtime({"token": "123:token", "webhook": webhook}, Mock(), Mock(), AsyncMock(), AsyncMock())
+        build_telegram_polling_runtime(RuntimeConfiguration.from_mapping({"token": "123:token", "admins": [1], "webhook": webhook}), Mock(), Mock(), AsyncMock(), AsyncMock())
 
 
 def test_build_runtime_rejects_non_mapping_request_config() -> None:
     with pytest.raises(ValueError, match="request_kwargs must be a mapping"):
-        build_telegram_polling_runtime({"token": "123:token", "request_kwargs": []}, Mock(), Mock(), AsyncMock(), AsyncMock())
+        RuntimeConfiguration.from_mapping({"token": "123:token", "admins": [1], "request_kwargs": []})
 
 
 def test_webhook_stop_waits_for_blocked_ptb_teardown_before_shutting_down_runtime() -> None:

@@ -5,42 +5,42 @@ from __future__ import annotations
 from ehforwarderbot import coordinator
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
 
+from ..callback_sessions import CallbackSessionStore
+from ..chat_destination_cache import ChatDestinationCache
+from ..chat_head import ChatHeadService
+from ..chat_object_cache import ChatObjectCacheManager
+from ..commands import CommandsManager
+from ..constants import Flags
+from ..history_replay import HistoryReplayWorker
+from ..link_actions import LinkActionService
+from ..link_completion import LinkCompletionService
+from ..link_service import LinkService
+from ..master_delivery import MasterMessageDelivery
+from ..master_inbound import MasterMessageInbound
+from ..master_message import MasterMessageWorker
+from ..master_mutations import MasterMessageMutations
+from ..msglog_reconstruction import MsgLogReconstructor
+from ..oversized_notice import OversizedNoticeSender
+from ..ptb_compat import Filters
+from ..recipient_suggestions import RecipientSuggestionService
+from ..slave_file_delivery import SlaveFileDelivery
+from ..slave_file_transfer import SlaveFileTransfer
+from ..slave_image_delivery import ImageDelivery
+from ..slave_media_delivery import SlaveMediaDelivery
+from ..slave_message import SlaveMessageService
+from ..slave_routing import SlaveMessageRouter
+from ..slave_status import SlaveStatusService
+from ..slave_text_delivery import TextDelivery
+from ..topic_sync import TopicGroupService
+from ..utils import ExperimentalFlagsManager, TelegramChatID
 from .bot_manager import TelegramBotManager
-from .callback_sessions import CallbackSessionStore
 from .channel_commands import TelegramCommandService
-from .chat_destination_cache import ChatDestinationCache
-from .chat_head import ChatHeadService
-from .chat_object_cache import ChatObjectCacheManager
-from .commands import CommandsManager
-from .constants import Flags
-from .history_replay import HistoryReplayWorker
-from .link_actions import LinkActionService
-from .link_completion import LinkCompletionService
-from .link_service import LinkService
-from .master_delivery import MasterMessageDelivery
-from .master_inbound import MasterMessageInbound
-from .master_message import MasterMessageWorker
-from .master_mutations import MasterMessageMutations
-from .msglog_reconstruction import MsgLogReconstructor
 from .mtproto import MTProtoClient
-from .oversized_notice import OversizedNoticeSender
-from .ptb_compat import Filters
-from .recipient_suggestions import RecipientSuggestionService
-from .slave_file_delivery import SlaveFileDelivery
-from .slave_file_transfer import SlaveFileTransfer
-from .slave_image_delivery import ImageDelivery
-from .slave_media_delivery import SlaveMediaDelivery
-from .slave_message import SlaveMessageService
-from .slave_routing import SlaveMessageRouter
-from .slave_status import SlaveStatusService
-from .slave_text_delivery import TextDelivery
-from .topic_sync import TopicGroupService
-from .utils import ExperimentalFlagsManager, TelegramChatID
 
 
 def initialize_channel_components(channel) -> None:
     """Build channel-owned collaborators after its database is ready."""
-    channel.mtproto = MTProtoClient(channel.mtproto_config, channel.config["token"], channel.db._base_path)
+    channel.mtproto = MTProtoClient(channel.config.mtproto, channel.config.token, channel.db._base_path)
     channel.chat_manager = ChatObjectCacheManager(channel.db, channel.slave_chat_info, coordinator.slaves)
     channel.chat_dest_cache = ChatDestinationCache(channel.flag("send_to_last_chat"))
     channel.topic_group = TelegramChatID(channel.flag("topic_group"))
@@ -115,7 +115,7 @@ def initialize_channel_components(channel) -> None:
         message_reconstructor,
         channel.msglog_scan,
         channel.link_completion,
-        channel.config["admins"],
+        channel.config.admins,
         channel.topic_group,
         channel.logger,
         channel.locale_state,
@@ -252,9 +252,9 @@ def _build_slave_services(channel) -> None:
     api = channel.bot_manager.api
     temp_dir = lambda: ExperimentalFlagsManager.get_temp_dir(channel)
     router = SlaveMessageRouter(
-        api, channel.msglogs, channel.chat_associations, channel.chat_dest_cache, channel.chat_manager, channel.config["admins"], channel.topic_group, channel.topic_sync, channel.logger
+        api, channel.msglogs, channel.chat_associations, channel.chat_dest_cache, channel.chat_manager, channel.config.admins, channel.topic_group, channel.topic_sync, channel.logger
     )
-    text_delivery = TextDelivery(channel.config["admins"][0], api, channel._, channel.logger)
+    text_delivery = TextDelivery(channel.config.admins[0], api, channel._, channel.logger)
     file_transfer = SlaveFileTransfer(channel.flag, api, channel.logger, channel._, temp_dir)
     oversized_notice_sender = OversizedNoticeSender(api)
     image_delivery = ImageDelivery(api, channel.flag, channel.logger, channel._, text_delivery, file_transfer, oversized_notice_sender, temp_dir)

@@ -2,8 +2,8 @@ import shutil
 
 from PIL import Image, WebPImagePlugin
 
-from .wizard_config import DataModel, _, print_wrapped
 from .wizard_settings import setup_experimental_flags, setup_network_configurations, setup_rpc
+from .wizard_state import DataModel, _, print_wrapped
 from .wizard_steps import setup_admins, setup_proxy, setup_telegram_bot, setup_telegram_bot_commands_list
 
 

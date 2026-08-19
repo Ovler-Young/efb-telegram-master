@@ -4,7 +4,7 @@ from unittest.mock import Mock
 import pytest
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.metrics_runtime import MetricsServer, parse_metrics_config
+from efb_telegram_master.runtime.metrics_runtime import MetricsServer, parse_metrics_config
 
 
 def test_metrics_server_stop_closes_an_unstarted_server_without_shutdown_or_join() -> None:

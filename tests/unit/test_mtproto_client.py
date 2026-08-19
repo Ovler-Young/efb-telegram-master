@@ -7,8 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from efb_telegram_master.bot_manager import TelegramBotManager
-from efb_telegram_master.mtproto import (
+from efb_telegram_master.runtime.bot_manager import TelegramBotManager
+from efb_telegram_master.runtime.mtproto import (
     MAX_SCAN_CONCURRENCY,
     MTProtoClient,
     MTProtoConfig,

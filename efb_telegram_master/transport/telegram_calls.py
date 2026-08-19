@@ -11,7 +11,7 @@ import telegram.error
 from ..outbound_types import QueuedCall, SenderSelection, SendReceipt, TelegramArgs, TelegramKwargs, rewind_uploads
 
 if TYPE_CHECKING:
-    from ..bot_pool import BotPool
+    from ..runtime.bot_pool import BotPool
 
 
 QUEUED_OPERATIONS = frozenset(

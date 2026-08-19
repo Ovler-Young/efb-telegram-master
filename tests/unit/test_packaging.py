@@ -23,6 +23,19 @@ TRANSPORT_MODULES = (
     "telegram_runtime",
     "telegram_sync_bridge",
 )
+RUNTIME_MODULES = (
+    "bot_manager",
+    "bot_pool",
+    "channel_commands",
+    "channel_composition",
+    "channel_locale",
+    "metrics_process",
+    "metrics_runtime",
+    "mtproto",
+    "rate_limiter",
+    "rpc_utils",
+)
+CONFIG_MODULES = ("request", "runtime", "wizard", "wizard_configuration", "wizard_settings", "wizard_state", "wizard_steps")
 
 
 def test_setuptools_configuration_discovers_only_project_packages():
@@ -38,7 +51,7 @@ def test_setuptools_configuration_discovers_only_project_packages():
     assert list((ROOT / "efb_telegram_master" / "locale").glob("**/*.po"))
     assert project["version"] == "2.3.1"
     assert project["entry-points"]["ehforwarderbot.master"] == {"blueset.telegram": "efb_telegram_master:TelegramChannel"}
-    assert project["entry-points"]["ehforwarderbot.wizard"] == {"blueset.telegram": "efb_telegram_master.wizard:wizard"}
+    assert project["entry-points"]["ehforwarderbot.wizard"] == {"blueset.telegram": "efb_telegram_master.config.wizard:wizard"}
 
 
 def test_persistence_package_is_discoverable_and_importable():
@@ -57,3 +70,14 @@ def test_transport_package_is_discoverable_and_importable():
     for module in TRANSPORT_MODULES:
         assert import_module(f"efb_telegram_master.transport.{module}")
         assert not (ROOT / "efb_telegram_master" / f"{module}.py").exists()
+
+
+def test_runtime_and_configuration_packages_are_discoverable_without_root_aliases():
+    configuration = read_configuration(str(ROOT / "pyproject.toml"), expand=True)
+    packages = configuration["tool"]["setuptools"]["packages"]
+
+    for package, modules in (("runtime", RUNTIME_MODULES), ("config", CONFIG_MODULES)):
+        assert f"efb_telegram_master.{package}" in packages
+        for module in modules:
+            assert import_module(f"efb_telegram_master.{package}.{module}")
+            assert not (ROOT / "efb_telegram_master" / f"{module}.py").exists()

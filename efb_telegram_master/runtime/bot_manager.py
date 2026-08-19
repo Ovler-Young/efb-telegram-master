@@ -12,20 +12,20 @@ from ehforwarderbot.types import ModuleID
 from telegram import Update
 from telegram.ext import CallbackContext
 
+from ..msglog_scan import MsgLogScanScheduler
+from ..outbound import OutboundQueue
+from ..persistence.chat_association_repository import ChatAssociationRepository
+from ..persistence.msglog_ingestion_repository import MsgLogIngestionRepository
+from ..transport.telegram_api import TelegramAPI
+from ..transport.telegram_error_router import TelegramErrorRouter
+from ..transport.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 from .bot_pool import build_bot_pool
 from .metrics_runtime import configure_runtime_metrics
-from .msglog_scan import MsgLogScanScheduler
 from .mtproto import MTProtoClient, MTProtoRetryableError, MTProtoSessionOwnershipError
-from .outbound import OutboundQueue
-from .persistence.chat_association_repository import ChatAssociationRepository
-from .persistence.msglog_ingestion_repository import MsgLogIngestionRepository
 from .rate_limiter import SlidingWindowRateLimiter
-from .transport.telegram_api import TelegramAPI
-from .transport.telegram_error_router import TelegramErrorRouter
-from .transport.telegram_runtime import TelegramPollingRuntime, build_telegram_polling_runtime
 
 if TYPE_CHECKING:
-    from . import TelegramChannel
+    from .. import TelegramChannel
 
 
 class TelegramResourceShutdownError(RuntimeError):
@@ -77,7 +77,7 @@ class TelegramBotManager:
         self._translate, self._ngettext = translate, ngettext
         self._locale_update = locale_update
         config = channel.config
-        self.admins: Sequence[int] = config["admins"]
+        self.admins: Sequence[int] = config.admins
         self.telegram_runtime = build_telegram_polling_runtime(
             config,
             channel,
@@ -86,7 +86,7 @@ class TelegramBotManager:
             self.runtime_stopped,
         )
         self.msglog_scan = MsgLogScanScheduler(self.telegram_runtime, mtproto, msglog_ingestion, chat_associations, self.logger)
-        bot_pool = build_bot_pool(config.get("auxiliary_bots", []), config, channel, self.telegram_runtime.async_runtime, self.logger)
+        bot_pool = build_bot_pool(config.auxiliary_bots, config.request, channel, self.telegram_runtime.async_runtime, self.logger)
         outbound_queue = OutboundQueue(
             self.telegram_runtime.bot,
             bot_pool,
@@ -96,7 +96,7 @@ class TelegramBotManager:
             shutdown_drain_timeout=self.SHUTDOWN_DRAIN_TIMEOUT,
             shutdown_join_grace=self.SHUTDOWN_JOIN_GRACE,
             cancel_active_calls=self.telegram_runtime.async_runtime.begin_delivery_shutdown,
-            max_pending=config["outbound"]["max_pending"],
+            max_pending=config.outbound.max_pending,
         )
         self.api = TelegramAPI(channel, self.telegram_runtime.bot, outbound_queue, bot_pool)
         self.error_router = TelegramErrorRouter(
@@ -115,7 +115,7 @@ class TelegramBotManager:
         self.api.bind_metrics_server(metrics_server)
         outbound_queue.start()
         try:
-            self.telegram_runtime.add_base_dispatchers(config["admins"], self.update_locale)
+            self.telegram_runtime.add_base_dispatchers(config.admins, self.update_locale)
         except BaseException as error:
             cleanup = TelegramBotManagerInitializationCleanup(self)
             cleanup_errors = cleanup.retry()

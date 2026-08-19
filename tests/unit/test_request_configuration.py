@@ -1,6 +1,6 @@
 import pytest
 
-from efb_telegram_master.request_configuration import parse_request_configuration
+from efb_telegram_master.config.request import parse_request_configuration
 from efb_telegram_master.transport.telegram_runtime import build_request
 
 

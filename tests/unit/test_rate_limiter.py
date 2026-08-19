@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
+from efb_telegram_master.runtime.rate_limiter import SlidingWindowRateLimiter
 
 
 @dataclass
@@ -66,7 +66,7 @@ def test_acquisition_uses_monotonic_clock_not_wall_clock(monkeypatch) -> None:
     limiter = _make_limiter(clock)
 
     monkeypatch.setattr(
-        "efb_telegram_master.rate_limiter.time.time",
+        "efb_telegram_master.runtime.rate_limiter.time.time",
         lambda: (_ for _ in ()).throw(AssertionError("wall clock used")),
     )
     assert limiter.try_acquire_global()

@@ -28,8 +28,8 @@ from .sender_policy import SenderPolicy
 from .transport.telegram_calls import QUEUED_OPERATIONS, TelegramCallAdapter
 
 if TYPE_CHECKING:
-    from .bot_pool import BotPool
-    from .rate_limiter import SlidingWindowRateLimiter
+    from .runtime.bot_pool import BotPool
+    from .runtime.rate_limiter import SlidingWindowRateLimiter
 
 
 _CHAT_ID_ARGUMENT_INDICES = {"edit_message_text": 1}

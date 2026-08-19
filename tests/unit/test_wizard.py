@@ -2,7 +2,7 @@ import importlib
 
 
 def test_wizard_runs_split_setup_steps_in_order(monkeypatch):
-    wizard_module = importlib.import_module("efb_telegram_master.wizard")
+    wizard_module = importlib.import_module("efb_telegram_master.config.wizard")
     calls = []
 
     class Data:

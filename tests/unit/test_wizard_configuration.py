@@ -2,8 +2,8 @@ import importlib
 
 import pytest
 
-from efb_telegram_master.request_configuration import RequestConfiguration
-from efb_telegram_master.wizard_configuration import WizardConfiguration
+from efb_telegram_master.config.request import RequestConfiguration
+from efb_telegram_master.config.wizard_configuration import WizardConfiguration
 
 
 def test_wizard_configuration_coerces_admin_ids_and_defaults_optional_sections() -> None:
@@ -48,7 +48,7 @@ def test_wizard_configuration_rejects_invalid_schema(data: object, message: str)
 
 
 def test_data_model_rejects_invalid_request_configuration_before_bot_construction(monkeypatch, tmp_path) -> None:
-    wizard_config = importlib.import_module("efb_telegram_master.wizard_config")
+    wizard_config = importlib.import_module("efb_telegram_master.config.wizard_state")
     config_path = tmp_path / "config.yaml"
     config_path.write_text("token: token\nrequest_kwargs:\n  unsupported: true\n")
     monkeypatch.setattr(wizard_config, "get_config_path", lambda channel_id: config_path)
@@ -59,7 +59,7 @@ def test_data_model_rejects_invalid_request_configuration_before_bot_constructio
 
 
 def test_build_bot_receives_typed_request_configuration(monkeypatch, tmp_path) -> None:
-    wizard_config = importlib.import_module("efb_telegram_master.wizard_config")
+    wizard_config = importlib.import_module("efb_telegram_master.config.wizard_state")
     telegram_runtime = importlib.import_module("efb_telegram_master.transport.telegram_runtime")
     config_path = tmp_path / "config.yaml"
     config_path.write_text("token: token\nrequest_kwargs:\n  read_timeout: 3\n")

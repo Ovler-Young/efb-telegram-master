@@ -9,9 +9,10 @@ from typing import Any
 
 from prometheus_client import CollectorRegistry
 
+from ..config.runtime import RuntimeConfiguration
+from ..etm_metrics import Metrics
+from ..outbound import OutboundQueue
 from .bot_pool import BotPool
-from .etm_metrics import Metrics
-from .outbound import OutboundQueue
 
 
 def parse_metrics_config(metrics_cfg: object, logger: Any) -> tuple[int, tuple[str, int] | None]:
@@ -94,14 +95,14 @@ def start_metrics_server(host: str, port: int, registry: CollectorRegistry) -> M
 
 
 def configure_runtime_metrics(
-    config: Mapping[str, object],
+    config: RuntimeConfiguration,
     database: Any,
     bot_pool: BotPool | None,
     outbound_queue: OutboundQueue,
     logger: logging.Logger,
 ) -> tuple[Metrics, MetricsServer | None]:
     """Attach scrape callbacks to the live delivery collaborators."""
-    top_n, endpoint = parse_metrics_config(config.get("metrics"), logger)
+    top_n, endpoint = parse_metrics_config(config.metrics, logger)
     metrics = Metrics(namespace="etm")
     database.set_metrics(metrics)
     if bot_pool:
