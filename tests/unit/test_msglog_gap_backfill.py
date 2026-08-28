@@ -517,10 +517,31 @@ def test_snapshot_keeps_a_gap_after_live_rows_fragment_it(msglog_database):
     assert store.snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 2)]
 
 
-def test_snapshot_advances_legacy_checkpoint_to_the_first_unread_message(msglog_database):
+def test_snapshot_advances_interior_legacy_checkpoint_to_the_first_unread_message(msglog_database):
+    _log(1)
     MsgLogBackfillCheckpoint.create(chat_id=-100, left=1, right=43, cursor=1)
 
     assert MsgLogBackfillStore().snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 2)]
+
+
+@pytest.mark.asyncio
+async def test_legacy_leading_checkpoint_includes_message_id_one(msglog_database):
+    MsgLogBackfillCheckpoint.create(chat_id=-100, left=1, right=43, cursor=1)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    legacy_gap = MsgLogGap(-100, 1, 43)
+    normalized_gap = MsgLogGap(-100, 0, 43)
+    history = _History({normalized_gap: [_message(1, 1000)]})
+    store = MsgLogBackfillStore()
+
+    assert store.snapshot_gaps() == [PendingGap(normalized_gap, 1)]
+    checkpoint = MsgLogBackfillCheckpoint.get()
+    assert (checkpoint.left, checkpoint.cursor) == (0, 1)
+
+    await MsgLogGapBackfiller(store, history, main_bot_id=1000).run()
+
+    assert history.started == [normalized_gap]
+    assert MsgLog.get_by_id("-100.1").text == "content"
+    assert MsgLogBackfillCheckpoint.select().count() == 0
 
 
 @pytest.mark.asyncio

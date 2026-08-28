@@ -154,7 +154,14 @@ class MsgLogBackfillStore:
             checkpoints = self._pending_gaps()
             if checkpoints:
                 for pending_gap in checkpoints:
-                    if pending_gap.cursor <= pending_gap.gap.left:
+                    if self._is_legacy_leading_checkpoint(pending_gap):
+                        MsgLogBackfillCheckpoint.update(left=0, cursor=1).where(
+                            (MsgLogBackfillCheckpoint.chat_id == pending_gap.gap.chat_id)
+                            & (MsgLogBackfillCheckpoint.left == pending_gap.gap.left)
+                            & (MsgLogBackfillCheckpoint.right == pending_gap.gap.right)
+                            & (MsgLogBackfillCheckpoint.cursor == pending_gap.cursor)
+                        ).execute()
+                    elif pending_gap.cursor <= pending_gap.gap.left:
                         MsgLogBackfillCheckpoint.update(cursor=pending_gap.gap.left + 1).where(
                             (MsgLogBackfillCheckpoint.chat_id == pending_gap.gap.chat_id)
                             & (MsgLogBackfillCheckpoint.left == pending_gap.gap.left)
@@ -174,6 +181,13 @@ class MsgLogBackfillStore:
                     for gap in gaps
                 ]).execute()
             return self._pending_gaps()
+
+    @staticmethod
+    def _is_legacy_leading_checkpoint(pending_gap: PendingGap) -> bool:
+        if pending_gap.gap.left != 1 or pending_gap.cursor != 1:
+            return False
+        master_msg_id = f"{pending_gap.gap.chat_id}.1"
+        return not MsgLog.select().where(MsgLog.master_msg_id == master_msg_id).exists()
 
     @staticmethod
     def _pending_gaps() -> list[PendingGap]:
