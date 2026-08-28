@@ -18,7 +18,14 @@ from ehforwarderbot.types import ChatID, ModuleID
 from peewee import chunked
 from ruamel.yaml import YAML
 
-from .db import DatabaseManager, MsgLog, SYNTHETIC_MSGLOG_PREFIX, TopicAssoc, database
+from .db import (
+    DatabaseManager,
+    MsgLog,
+    MsgLogBackfillCheckpoint,
+    SYNTHETIC_MSGLOG_PREFIX,
+    TopicAssoc,
+    database,
+)
 from .paths import get_config_path, get_data_path
 from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 
@@ -61,6 +68,12 @@ class GapResult:
     skipped: Mapping[str, int]
 
 
+@dataclass(frozen=True, order=True)
+class PendingGap:
+    gap: MsgLogGap
+    cursor: int
+
+
 class HistorySource(Protocol):
     def iter_gap(self, gap: MsgLogGap) -> AsyncIterator[object]: ...
 
@@ -95,9 +108,10 @@ class TelethonHistorySource:
 
 
 class MsgLogBackfillStore:
-    """Read MsgLog anchors and atomically insert one completed gap."""
+    """Read MsgLog anchors and persist short, restartable recovery writes."""
 
     INSERT_CHUNK_SIZE = 400
+    CHUNK_MESSAGE_SPAN = 1000
 
     def find_gaps(self) -> list[MsgLogGap]:
         message_ids: dict[int, list[int]] = defaultdict(list)
@@ -135,27 +149,74 @@ class MsgLogBackfillStore:
                 continue
         return associations
 
-    def insert_gap(self, rows: Sequence[BackfillRow]) -> int:
+    def snapshot_gaps(self) -> list[PendingGap]:
+        with database.atomic():
+            checkpoints = self._pending_gaps()
+            if checkpoints:
+                return checkpoints
+            gaps = self.find_gaps()
+            if gaps:
+                MsgLogBackfillCheckpoint.insert_many([
+                    {"chat_id": gap.chat_id, "left": gap.left, "right": gap.right, "cursor": gap.left}
+                    for gap in gaps
+                ]).execute()
+            return self._pending_gaps()
+
+    @staticmethod
+    def _pending_gaps() -> list[PendingGap]:
+        return [
+            PendingGap(MsgLogGap(row.chat_id, row.left, row.right), row.cursor)
+            for row in MsgLogBackfillCheckpoint.select().order_by(
+                MsgLogBackfillCheckpoint.chat_id,
+                MsgLogBackfillCheckpoint.left,
+                MsgLogBackfillCheckpoint.right,
+            )
+        ]
+
+    def insert_chunk_and_advance(
+        self,
+        pending_gap: PendingGap,
+        next_cursor: int,
+        rows: Sequence[BackfillRow],
+    ) -> int:
+        if not pending_gap.cursor < next_cursor <= pending_gap.gap.right:
+            raise ValueError("Backfill checkpoint cursor is outside its gap")
+        with database.atomic():
+            inserted = self._insert_rows(rows)
+            where = (
+                (MsgLogBackfillCheckpoint.chat_id == pending_gap.gap.chat_id)
+                & (MsgLogBackfillCheckpoint.left == pending_gap.gap.left)
+                & (MsgLogBackfillCheckpoint.right == pending_gap.gap.right)
+                & (MsgLogBackfillCheckpoint.cursor == pending_gap.cursor)
+            )
+            if next_cursor == pending_gap.gap.right:
+                changed = MsgLogBackfillCheckpoint.delete().where(where).execute()
+            else:
+                changed = MsgLogBackfillCheckpoint.update(cursor=next_cursor).where(where).execute()
+            if changed != 1:
+                raise RuntimeError("MsgLog backfill checkpoint changed concurrently")
+            return inserted
+
+    def _insert_rows(self, rows: Sequence[BackfillRow]) -> int:
         if not rows:
             return 0
         payloads = [row.__dict__ for row in rows]
         inserted = 0
-        with database.atomic():
-            for batch in chunked(payloads, self.INSERT_CHUNK_SIZE):
-                message_ids = [str(row["master_msg_id"]) for row in batch]
-                query = MsgLog.select(MsgLog.master_msg_id, MsgLog.master_msg_id_alt).where(
-                    (MsgLog.master_msg_id.in_(message_ids)) |
-                    (MsgLog.master_msg_id_alt.in_(message_ids))
-                ).tuples()
-                existing = {
-                    str(message_id)
-                    for row in cast(Iterable[tuple[object, object]], query)
-                    for message_id in row
-                    if message_id is not None
-                }
-                pending = [row for row in batch if row["master_msg_id"] not in existing]
-                if pending:
-                    inserted += self._insert_batch(pending)
+        for batch in chunked(payloads, self.INSERT_CHUNK_SIZE):
+            message_ids = [str(row["master_msg_id"]) for row in batch]
+            query = MsgLog.select(MsgLog.master_msg_id, MsgLog.master_msg_id_alt).where(
+                (MsgLog.master_msg_id.in_(message_ids)) |
+                (MsgLog.master_msg_id_alt.in_(message_ids))
+            ).tuples()
+            existing = {
+                str(message_id)
+                for row in cast(Iterable[tuple[object, object]], query)
+                for message_id in row
+                if message_id is not None
+            }
+            rows_to_insert = [row for row in batch if row["master_msg_id"] not in existing]
+            if rows_to_insert:
+                inserted += self._insert_batch(rows_to_insert)
         return inserted
 
     @staticmethod
@@ -170,19 +231,31 @@ class MsgLogGapBackfiller:
         history: HistorySource | Sequence[HistorySource],
         *,
         main_bot_id: int,
+        auxiliary_bot_ids: Iterable[int] = (),
     ) -> None:
         self.store = store
         self.histories = tuple(history) if isinstance(history, Sequence) else (history,)
         if not self.histories:
             raise ValueError("At least one Telegram history source is required")
         self.main_bot_id = main_bot_id
+        self.auxiliary_bot_ids = frozenset(auxiliary_bot_ids)
 
     async def run(self) -> list[GapResult]:
         results: list[GapResult] = []
-        for gap in self.store.find_gaps():
-            rows, skipped = await self._fetch_gap(gap)
-            inserted = self.store.insert_gap(rows)
-            results.append(GapResult(gap, inserted, dict(skipped)))
+        for pending_gap in self.store.snapshot_gaps():
+            inserted = 0
+            skipped: Counter[str] = Counter()
+            cursor = pending_gap.cursor
+            while cursor < pending_gap.gap.right:
+                next_cursor = min(cursor + self.store.CHUNK_MESSAGE_SPAN, pending_gap.gap.right)
+                chunk_gap = MsgLogGap(pending_gap.gap.chat_id, cursor, next_cursor)
+                rows, chunk_skipped = await self._fetch_gap(chunk_gap)
+                inserted += self.store.insert_chunk_and_advance(
+                    PendingGap(pending_gap.gap, cursor), next_cursor, rows
+                )
+                skipped.update(chunk_skipped)
+                cursor = next_cursor
+            results.append(GapResult(pending_gap.gap, inserted, dict(skipped)))
         return results
 
     async def _fetch_gap(self, gap: MsgLogGap) -> tuple[list[BackfillRow], Counter[str]]:
@@ -254,6 +327,8 @@ class MsgLogGapBackfiller:
         sender_id = getattr(sender, "id", None)
         if isinstance(sender_id, bool) or not isinstance(sender_id, int):
             raise ValueError(f"Telegram message {chat_id}.{getattr(message, 'id', '?')} has no bot identity")
+        if sender_id != self.main_bot_id and sender_id not in self.auxiliary_bot_ids:
+            return "unconfigured_bot", None
         slave_uid = associations[topic_id]
         slave_channel_id, _, _ = chat_id_str_to_id(slave_uid)
         media_type, msg_type, mime = self._content_type(message)
@@ -332,37 +407,36 @@ async def _run_command(args: argparse.Namespace) -> list[GapResult]:
 
         clients = []
         histories = []
-        failures: list[Exception] = []
-        for bot_token in bot_tokens:
-            bot_id = bot_token.partition(":")[0]
-            client = TelegramClient(
-                str(session.with_name(f"{session.name}-{bot_id}")),
-                args.api_id,
-                args.api_hash,
-                receive_updates=False,
-            )
-            try:
-                await client.start(bot_token=bot_token)
-                bot = await client.get_me()
-                if (
-                    not bool(getattr(bot, "bot", False))
-                    or getattr(bot, "id", None) != int(bot_id)
-                ):
-                    raise ValueError(f"Telethon session does not belong to configured bot {bot_id}")
-            except Exception as error:
-                failures.append(error)
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                continue
-            clients.append(client)
-            histories.append(TelethonHistorySource(client))
-        if not histories:
-            raise RuntimeError("No configured Telegram bot could start a history source") from failures[0]
         try:
+            for bot_token in bot_tokens:
+                bot_id = bot_token.partition(":")[0]
+                client = TelegramClient(
+                    str(session.with_name(f"{session.name}-{bot_id}")),
+                    args.api_id,
+                    args.api_hash,
+                    receive_updates=False,
+                )
+                try:
+                    await client.start(bot_token=bot_token)
+                    bot = await client.get_me()
+                    if (
+                        not bool(getattr(bot, "bot", False))
+                        or getattr(bot, "id", None) != int(bot_id)
+                    ):
+                        raise ValueError(f"Telethon session does not belong to configured bot {bot_id}")
+                except Exception as error:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"Could not initialize configured Telegram bot {bot_id} for MsgLog backfill"
+                    ) from error
+                clients.append(client)
+                histories.append(TelethonHistorySource(client))
             return await MsgLogGapBackfiller(
-                MsgLogBackfillStore(), histories, main_bot_id=main_bot_id
+                MsgLogBackfillStore(), histories, main_bot_id=main_bot_id,
+                auxiliary_bot_ids=(int(bot_token.partition(":")[0]) for bot_token in bot_tokens[1:]),
             ).run()
         finally:
             for client in clients:

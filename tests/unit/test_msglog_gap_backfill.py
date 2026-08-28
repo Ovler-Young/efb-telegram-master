@@ -8,12 +8,19 @@ from peewee import SqliteDatabase
 from telegram import Chat, Message, Update
 
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master.db import MsgLog, SYNTHETIC_MSGLOG_PREFIX, TopicAssoc, database
+from efb_telegram_master.db import (
+    MsgLog,
+    MsgLogBackfillCheckpoint,
+    SYNTHETIC_MSGLOG_PREFIX,
+    TopicAssoc,
+    database,
+)
 from efb_telegram_master.msglog_backfill import (
     BackfillRow,
     MsgLogBackfillStore,
     MsgLogGap,
     MsgLogGapBackfiller,
+    PendingGap,
     TelethonHistorySource,
 )
 import efb_telegram_master.msglog_backfill as msglog_backfill
@@ -24,7 +31,7 @@ def msglog_database():
     sqlite = SqliteDatabase(":memory:")
     database.initialize(sqlite)
     sqlite.connect()
-    sqlite.create_tables([MsgLog, TopicAssoc])
+    sqlite.create_tables([MsgLog, MsgLogBackfillCheckpoint, TopicAssoc])
     yield sqlite
     sqlite.close()
 
@@ -173,7 +180,9 @@ async def test_backfill_is_serial_stops_on_failure_and_preserves_sender_identity
     }, fail_at=second)
 
     with pytest.raises(RuntimeError, match="history failed"):
-        await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
+        await MsgLogGapBackfiller(
+            MsgLogBackfillStore(), history, main_bot_id=1000, auxiliary_bot_ids=(2000,)
+        ).run()
 
     assert history.started == [first, second]
     rows = list(MsgLog.select().where(
@@ -213,10 +222,12 @@ async def test_backfill_merges_available_histories_in_message_order(msglog_datab
     TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
     gap = MsgLogGap(-100, 1, 23)
     primary = _History({gap: [_message(2, 1000), _message(4, 1000)]})
-    auxiliary = _History({gap: [_message(2, 1000), _message(3, 2000)]})
+    auxiliary = _History({gap: [
+        _message(2, 1000), _message(3, 2000), _message(5, 3000)
+    ]})
 
     results = await MsgLogGapBackfiller(
-        MsgLogBackfillStore(), [primary, auxiliary], main_bot_id=1000
+        MsgLogBackfillStore(), [primary, auxiliary], main_bot_id=1000, auxiliary_bot_ids=(2000,)
     ).run()
 
     assert results[0].inserted == 3
@@ -228,6 +239,7 @@ async def test_backfill_merges_available_histories_in_message_order(msglog_datab
         ("-100.3", "2000"),
         ("-100.4", None),
     ]
+    assert results[0].skipped == {"unconfigured_bot": 1, "deleted": 17}
 
 
 @pytest.mark.asyncio
@@ -243,7 +255,8 @@ async def test_backfill_aborts_gap_without_writing_when_any_source_fails(msglog_
 
     with pytest.raises(RuntimeError, match="history failed"):
         await MsgLogGapBackfiller(
-            MsgLogBackfillStore(), [primary, failing, auxiliary], main_bot_id=1000
+            MsgLogBackfillStore(), [primary, failing, auxiliary], main_bot_id=1000,
+            auxiliary_bot_ids=(2000,)
         ).run()
 
     assert primary.started == [first_gap]
@@ -251,6 +264,7 @@ async def test_backfill_aborts_gap_without_writing_when_any_source_fails(msglog_
     assert auxiliary.started == []
     assert MsgLog.select().where(MsgLog.master_msg_id.in_(["-100.2", "-100.3"])).count() == 0
     assert MsgLog.get_by_id("-100.50").text == "existing"
+    assert MsgLogBackfillCheckpoint.get(MsgLogBackfillCheckpoint.left == 1).cursor == 1
     assert second_gap not in primary.started
 
 
@@ -297,9 +311,10 @@ async def test_command_starts_main_and_auxiliary_bot_history_sources(tmp_path, m
             self.stopped = True
 
     class Backfiller:
-        def __init__(self, store, histories, *, main_bot_id):
+        def __init__(self, store, histories, *, main_bot_id, auxiliary_bot_ids):
             captured["histories"] = histories
             captured["main_bot_id"] = main_bot_id
+            captured["auxiliary_bot_ids"] = tuple(auxiliary_bot_ids)
 
         async def run(self):
             return []
@@ -315,6 +330,7 @@ async def test_command_starts_main_and_auxiliary_bot_history_sources(tmp_path, m
 
     assert results == []
     assert captured["main_bot_id"] == 1000
+    assert captured["auxiliary_bot_ids"] == (2000, 3000)
     assert [client.started_with for client in clients] == [
         "1000:main", "2000:auxiliary-one", "3000:auxiliary-two"
     ]
@@ -328,7 +344,7 @@ async def test_command_starts_main_and_auxiliary_bot_history_sources(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_command_ignores_nonmatching_bot_session_and_uses_verified_source(tmp_path, monkeypatch):
+async def test_command_aborts_when_a_configured_bot_session_is_not_verified(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         'token: "1000:main"\n'
@@ -336,7 +352,6 @@ async def test_command_ignores_nonmatching_bot_session_and_uses_verified_source(
         '  - token: "2000:auxiliary"\n'
     )
     clients = []
-    captured = {}
 
     class Client:
         def __init__(self, session, api_id, api_hash, *, receive_updates):
@@ -349,8 +364,8 @@ async def test_command_ignores_nonmatching_bot_session_and_uses_verified_source(
 
         async def get_me(self):
             if self.started_with.startswith("1000:"):
-                return SimpleNamespace(id=9999, bot=False)
-            return SimpleNamespace(id=2000, bot=True)
+                return SimpleNamespace(id=1000, bot=True)
+            return SimpleNamespace(id=9999, bot=False)
 
         async def disconnect(self):
             self.disconnected = True
@@ -362,27 +377,16 @@ async def test_command_ignores_nonmatching_bot_session_and_uses_verified_source(
         def stop_worker(self):
             pass
 
-    class Backfiller:
-        def __init__(self, store, histories, *, main_bot_id):
-            captured["histories"] = histories
-            captured["main_bot_id"] = main_bot_id
-
-        async def run(self):
-            return []
-
     monkeypatch.setattr(msglog_backfill, "get_config_path", lambda channel_id: config_path)
     monkeypatch.setattr(msglog_backfill, "DatabaseManager", Manager)
-    monkeypatch.setattr(msglog_backfill, "MsgLogGapBackfiller", Backfiller)
     monkeypatch.setitem(sys.modules, "telethon", SimpleNamespace(TelegramClient=Client))
 
-    results = await msglog_backfill._run_command(SimpleNamespace(
-        profile="default", session=tmp_path / "backfill", api_id=1, api_hash="hash"
-    ))
+    with pytest.raises(RuntimeError, match="configured Telegram bot 2000"):
+        await msglog_backfill._run_command(SimpleNamespace(
+            profile="default", session=tmp_path / "backfill", api_id=1, api_hash="hash"
+        ))
 
-    assert results == []
-    assert captured["main_bot_id"] == 1000
-    assert len(captured["histories"]) == 1
-    assert captured["histories"][0].client is clients[1]
+    assert len(clients) == 2
     assert all(client.disconnected for client in clients)
 
 
@@ -402,7 +406,7 @@ def _row(message_id: int, text: str = "new") -> BackfillRow:
     )
 
 
-def test_gap_insert_rolls_back_all_chunks_and_does_not_overwrite(msglog_database):
+def test_chunk_write_rolls_back_cursor_and_preserves_existing_rows(msglog_database):
     class FailingStore(MsgLogBackfillStore):
         INSERT_CHUNK_SIZE = 1
 
@@ -415,12 +419,18 @@ def test_gap_insert_rolls_back_all_chunks_and_does_not_overwrite(msglog_database
                 raise RuntimeError("write failed")
             return super()._insert_batch(rows)
 
+    _log(1)
+    _log(23)
+    store = FailingStore()
+    pending = store.snapshot_gaps()[0]
     with pytest.raises(RuntimeError, match="write failed"):
-        FailingStore().insert_gap([_row(2), _row(3)])
+        store.insert_chunk_and_advance(pending, 23, [_row(2), _row(3)])
     assert MsgLog.select().where(MsgLog.master_msg_id.in_(["-100.2", "-100.3"])).count() == 0
+    assert MsgLogBackfillCheckpoint.get().cursor == 1
 
     _log(2)
-    assert MsgLogBackfillStore().insert_gap([_row(2, "replacement"), _row(3)]) == 1
+    store = MsgLogBackfillStore()
+    assert store.insert_chunk_and_advance(store.snapshot_gaps()[0], 23, [_row(2, "replacement"), _row(3)]) == 1
     assert MsgLog.get_by_id("-100.2").text == "existing"
     assert MsgLog.get_by_id("-100.3").text == "new"
 
@@ -431,10 +441,25 @@ def test_alternate_id_is_not_a_gap_anchor_or_overwritten(msglog_database):
     MsgLog.update(master_msg_id_alt="-100.23").where(MsgLog.master_msg_id == "-100.50").execute()
 
     assert MsgLogBackfillStore().find_gaps() == [MsgLogGap(-100, 1, 50)]
-    assert MsgLogBackfillStore().insert_gap([_row(23), _row(24)]) == 1
+    store = MsgLogBackfillStore()
+    pending = store.snapshot_gaps()[0]
+    assert store.insert_chunk_and_advance(pending, 50, [_row(23), _row(24)]) == 1
     assert MsgLog.get_by_id("-100.50").master_msg_id_alt == "-100.23"
     assert MsgLog.get_or_none(MsgLog.master_msg_id == "-100.23") is None
     assert MsgLog.get_by_id("-100.24").text == "new"
+
+
+def test_snapshot_keeps_a_gap_after_live_rows_fragment_it(msglog_database):
+    _log(1)
+    _log(43)
+    store = MsgLogBackfillStore()
+
+    assert store.snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 1)]
+    for message_id in range(2, 23):
+        _log(message_id)
+
+    assert store.find_gaps() == []
+    assert store.snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 1)]
 
 
 @pytest.mark.asyncio

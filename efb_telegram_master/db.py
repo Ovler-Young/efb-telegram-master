@@ -13,6 +13,7 @@ from peewee import (
     AutoField,
     BlobField,
     CharField,
+    CompositeKey,
     DatabaseProxy,
     DateTimeField,
     DoesNotExist,
@@ -215,6 +216,18 @@ class MsgLog(BaseModel):
         return msg
 
 
+class MsgLogBackfillCheckpoint(BaseModel):
+    """Durable progress for a single run-once MsgLog recovery interval."""
+
+    chat_id = IntegerField()
+    left = IntegerField()
+    right = IntegerField()
+    cursor = IntegerField()
+
+    class Meta:
+        primary_key = CompositeKey("chat_id", "left", "right")
+
+
 class HistoryMigrationEntry(BaseModel):
     id = AutoField()
     slave_chat_id = TextField()
@@ -340,14 +353,16 @@ class DatabaseManager:
         Initializing tables.
         """
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            ChatAssoc, MsgLog, MsgLogBackfillCheckpoint, SlaveChatInfo, TopicAssoc,
+            HistoryMigrationEntry,
         ])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            ChatAssoc, MsgLog, MsgLogBackfillCheckpoint, SlaveChatInfo, TopicAssoc,
+            HistoryMigrationEntry,
         ], safe=True)
 
     @staticmethod

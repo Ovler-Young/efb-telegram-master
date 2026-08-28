@@ -20,6 +20,7 @@ from efb_telegram_master.db import (
     DatabaseManager,
     HistoryMigrationEntry,
     MsgLog,
+    MsgLogBackfillCheckpoint,
     TopicAssoc,
     database,
 )
@@ -158,11 +159,13 @@ def test_topic_assoc_table_exists_and_round_trips(channel, slave):
 def test_create_missing_tables_preserves_existing_chat_assoc(channel):
     channel.db.add_chat_assoc("master-existing", "slave-existing", multiple_slave=True)
     TopicAssoc.drop_table(safe=True)
+    MsgLogBackfillCheckpoint.drop_table(safe=True)
     HistoryMigrationEntry.drop_table(safe=True)
 
     channel.db._create_missing_tables()
 
     assert TopicAssoc.table_exists()
+    assert MsgLogBackfillCheckpoint.table_exists()
     assert HistoryMigrationEntry.table_exists()
     assert ChatAssoc.get_or_none(ChatAssoc.master_uid == "master-existing") is not None
     channel.db.remove_chat_assoc(master_uid="master-existing")
