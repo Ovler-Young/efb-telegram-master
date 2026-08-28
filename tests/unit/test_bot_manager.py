@@ -2,6 +2,7 @@ import asyncio
 import base64
 import inspect
 import io
+import logging
 import string
 import random
 import threading
@@ -24,6 +25,15 @@ from efb_telegram_master.bot_manager import (
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
+
+
+class DurableMessage:
+    def __init__(self) -> None:
+        self.type_telegram = None
+        self.receipt = None
+
+    def put_telegram_file(self, receipt) -> None:
+        self.receipt = receipt
 
 
 def _bind_blocking_enqueue_helper(manager):
@@ -772,7 +782,7 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
     wake_event.set.side_effect = assert_context_registered
     row_id, _waiter = TelegramBotManager._enqueue_requests(
         manager,
-        [Mock()],
+        [QueueRequest("send_message", (), {"_send_mode": "blocking"})],
         db_log_context=db_context,
     )
 
@@ -784,6 +794,7 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     manager = object.__new__(TelegramBotManager)
     on_complete = Mock()
     manager._queued_db_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
+    manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
     manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
@@ -800,6 +811,59 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     assert decision.kind.name == "TERMINAL_FAILURE"
     on_complete.assert_called_once_with()
     assert manager._queued_db_log_contexts == {}
+
+
+def test_durable_reconciliation_retries_db_write_and_preserves_sender(monkeypatch):
+    manager = object.__new__(TelegramBotManager)
+    etm_msg = DurableMessage()
+    real_tg_msg = SimpleNamespace(chat_id=123, message_id=9)
+    db_write = Mock(side_effect=RuntimeError("database unavailable"))
+    manager.channel = SimpleNamespace(
+        db=SimpleNamespace(add_or_update_message_log=db_write)
+    )
+    manager.logger = Mock()
+    on_complete = Mock()
+    manager._queued_completion_callbacks = {7: on_complete}
+    manager._queued_db_log_context_lock = threading.Lock()
+    monkeypatch.setattr("efb_telegram_master.bot_manager.get_msg_type", lambda _message: "text")
+    row = SimpleNamespace(
+        id=7,
+        log_context=TelegramBotManager._encode_queued_log_context(
+            QueuedDbLogContext(etm_msg, None)
+        ),
+        completion_receipt=TelegramBotManager.encode_queued_completion_receipt(
+            real_tg_msg, SenderSelection(object(), "10")
+        ),
+    )
+
+    assert not TelegramBotManager.reconcile_queued_delivery(manager, row)
+    assert 7 in manager._queued_completion_callbacks
+    on_complete.assert_not_called()
+
+    db_write.side_effect = None
+    assert TelegramBotManager.reconcile_queued_delivery(manager, row)
+    persisted_msg, persisted_receipt, old_msg_id = db_write.call_args.args
+    assert isinstance(persisted_msg, DurableMessage)
+    assert (persisted_receipt.chat_id, persisted_receipt.message_id) == (123, 9)
+    assert old_msg_id is None
+    assert db_write.call_args.kwargs == {"sender_bot_id": "10"}
+    on_complete.assert_called_once_with()
+    assert manager._queued_completion_callbacks == {}
+
+
+def test_durable_reconciliation_logs_corrupt_context_and_keeps_it_pending(caplog):
+    manager = object.__new__(TelegramBotManager)
+    manager.logger = logging.getLogger("tests.durable_reconciliation")
+    row = SimpleNamespace(
+        id=7,
+        log_context=b"corrupt",
+        completion_receipt=b"\x01receipt",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=manager.logger.name):
+        assert not TelegramBotManager.reconcile_queued_delivery(manager, row)
+
+    assert "MsgLog reconciliation failed for durable queue row 7" in caplog.text
 
 
 def test_cooldown_metrics_snapshot_blocks_mutation_until_iteration_is_safe(
