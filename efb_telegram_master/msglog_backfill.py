@@ -70,11 +70,24 @@ class TelethonHistorySource:
         self.client = client
 
     async def iter_gap(self, gap: MsgLogGap) -> AsyncIterator[object]:
+        lower_bound = gap.left
+        cutoff_probe = self.client.iter_messages(  # type: ignore[attr-defined]
+            gap.chat_id,
+            limit=1,
+            offset_date=RECOVERY_SCAN_START,
+        )
+        async for cutoff_anchor in cutoff_probe:
+            cutoff_anchor_id = getattr(cutoff_anchor, "id", None)
+            if isinstance(cutoff_anchor_id, bool) or not isinstance(cutoff_anchor_id, int):
+                raise ValueError(f"Telegram history cutoff probe for {gap.chat_id} has no integer message ID")
+            lower_bound = max(lower_bound, cutoff_anchor_id)
+            break
+        if lower_bound >= gap.right - 1:
+            return
         iterator = self.client.iter_messages(  # type: ignore[attr-defined]
             gap.chat_id,
-            min_id=gap.left,
+            min_id=lower_bound,
             max_id=gap.right,
-            offset_date=RECOVERY_SCAN_START,
             reverse=True,
         )
         async for message in iterator:

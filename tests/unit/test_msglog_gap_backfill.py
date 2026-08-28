@@ -102,7 +102,7 @@ def test_gap_discovery_uses_id_one_as_the_virtual_leading_bound(msglog_database)
 
 
 @pytest.mark.asyncio
-async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration():
+async def test_telethon_history_uses_cutoff_probe_before_ascending_interval():
     calls = []
 
     class Client:
@@ -110,7 +110,8 @@ async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration()
             calls.append((chat_id, kwargs))
 
             async def messages():
-                for message_id in (11, 12):
+                message_ids = (10,) if "offset_date" in kwargs else (11, 12)
+                for message_id in message_ids:
                     yield SimpleNamespace(id=message_id)
 
             return messages()
@@ -121,9 +122,41 @@ async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration()
 
     assert received == [11, 12]
     assert calls == [(-100, {
-        "min_id": 1,
-        "max_id": 13,
+        "limit": 1,
         "offset_date": msglog_backfill.RECOVERY_SCAN_START,
+    }), (-100, {
+        "min_id": 10,
+        "max_id": 13,
+        "reverse": True,
+    })]
+
+
+@pytest.mark.asyncio
+async def test_telethon_history_uses_gap_bound_when_nothing_predates_cutoff():
+    calls = []
+
+    class Client:
+        def iter_messages(self, chat_id, **kwargs):
+            calls.append((chat_id, kwargs))
+
+            async def messages():
+                if "offset_date" not in kwargs:
+                    for message_id in (2, 3):
+                        yield SimpleNamespace(id=message_id)
+
+            return messages()
+
+    gap = MsgLogGap(-100, 1, 4)
+    source = TelethonHistorySource(Client())
+    received = [message.id async for message in source.iter_gap(gap)]
+
+    assert received == [2, 3]
+    assert calls == [(-100, {
+        "limit": 1,
+        "offset_date": msglog_backfill.RECOVERY_SCAN_START,
+    }), (-100, {
+        "min_id": 1,
+        "max_id": 4,
         "reverse": True,
     })]
 
