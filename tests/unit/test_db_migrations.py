@@ -214,6 +214,31 @@ def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):
     stored.delete_instance()
 
 
+def test_repeated_delivery_reconciliation_keeps_one_master_message(channel, slave):
+    chat = slave.chat_with_alias
+    etm_msg = ETMMsg(
+        uid=MessageID("durable-delivery"),
+        chat=channel.chat_manager.update_chat_obj(chat),
+        author=channel.chat_manager.get_or_enrol_member(chat, chat.self),
+        text="durable delivery",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=channel,
+    )
+    master_message = SimpleNamespace(chat_id=123456, message_id=654322)
+
+    channel.db.add_or_update_message_log(etm_msg, master_message, sender_bot_id="777")
+    channel.db.add_or_update_message_log(etm_msg, master_message, sender_bot_id="777")
+
+    master_msg_id = utils.message_id_to_str(
+        TelegramChatID(123456), TelegramMessageID(654322)
+    )
+    rows = list(MsgLog.select().where(MsgLog.master_msg_id == master_msg_id))
+    assert len(rows) == 1
+    assert rows[0].sender_bot_id == "777"
+    rows[0].delete_instance()
+
+
 def test_build_etm_msg_restores_sender_bot_id(channel, slave):
     chat = slave.chat_with_alias
     etm_msg = ETMMsg(
