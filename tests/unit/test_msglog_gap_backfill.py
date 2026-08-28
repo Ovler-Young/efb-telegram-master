@@ -61,20 +61,13 @@ def _message(
 
 
 class _History:
-    def __init__(self, messages_by_gap, *, fail_at=None, anchors_by_gap=None):
+    def __init__(self, messages_by_gap, *, fail_at=None):
         self.messages_by_gap = messages_by_gap
         self.fail_at = fail_at
-        self.anchors_by_gap = anchors_by_gap or {}
         self.started = []
 
-    async def get_anchors(self, gap):
-        self.started.append(("anchors", gap))
-        return self.anchors_by_gap.get(
-            gap, (SimpleNamespace(id=gap.left), SimpleNamespace(id=gap.right))
-        )
-
     async def iter_gap(self, gap):
-        self.started.append(("gap", gap))
+        self.started.append(gap)
         if gap == self.fail_at:
             raise RuntimeError("history failed")
         for message in self.messages_by_gap.get(gap, ()):
@@ -105,12 +98,8 @@ async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration()
     calls = []
 
     class Client:
-        async def get_messages(self, chat_id, **kwargs):
-            calls.append(("anchors", chat_id, kwargs))
-            return [SimpleNamespace(id=message_id) for message_id in kwargs["ids"]]
-
         def iter_messages(self, chat_id, **kwargs):
-            calls.append(("gap", chat_id, kwargs))
+            calls.append((chat_id, kwargs))
 
             async def messages():
                 for message_id in (11, 12):
@@ -120,15 +109,10 @@ async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration()
 
     gap = MsgLogGap(-100, 10, 13)
     source = TelethonHistorySource(Client())
-    anchors = await source.get_anchors(gap)
     received = [message.id async for message in source.iter_gap(gap)]
 
-    assert [message.id for message in anchors] == [10, 13]
     assert received == [11, 12]
-    assert calls == [
-        ("anchors", -100, {"ids": [10, 13]}),
-        ("gap", -100, {"min_id": 10, "max_id": 13, "reverse": True}),
-    ]
+    assert calls == [(-100, {"min_id": 10, "max_id": 13, "reverse": True})]
 
 
 @pytest.mark.asyncio
@@ -145,9 +129,7 @@ async def test_backfill_is_serial_stops_on_failure_and_preserves_sender_identity
     with pytest.raises(RuntimeError, match="history failed"):
         await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
 
-    assert history.started == [
-        ("anchors", first), ("gap", first), ("anchors", second), ("gap", second)
-    ]
+    assert history.started == [first, second]
     rows = list(MsgLog.select().where(
         MsgLog.master_msg_id.in_(["-100.2", "-100.3", "-100.4"])
     ).order_by(MsgLog.master_msg_id))
@@ -223,25 +205,6 @@ async def test_unmapped_and_service_messages_are_skipped_as_one_completed_gap(ms
     assert results[0].inserted == 1
     assert results[0].skipped == {"unmapped": 1, "service": 1, "deleted": 18}
     assert MsgLog.get_by_id("-100.4").slave_origin_uid == "tests.mocks.slave chat"
-
-
-@pytest.mark.asyncio
-async def test_invisible_anchor_stops_before_writes_or_next_gap(msglog_database):
-    for message_id in (1, 23, 50):
-        _log(message_id)
-    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
-    first = MsgLogGap(-100, 1, 23)
-    second = MsgLogGap(-100, 23, 50)
-    history = _History(
-        {first: [_message(2, 1000)], second: [_message(24, 1000)]},
-        anchors_by_gap={first: (SimpleNamespace(id=1),)},
-    )
-
-    with pytest.raises(ValueError, match="not both visible"):
-        await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
-
-    assert history.started == [("anchors", first)]
-    assert MsgLog.get_or_none(MsgLog.master_msg_id == "-100.2") is None
 
 
 def test_react_rejects_synthetic_msglog_identity():

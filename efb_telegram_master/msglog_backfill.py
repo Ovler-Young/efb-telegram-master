@@ -60,19 +60,12 @@ class GapResult:
 
 
 class HistorySource(Protocol):
-    async def get_anchors(self, gap: MsgLogGap) -> Sequence[object]: ...
-
     def iter_gap(self, gap: MsgLogGap) -> AsyncIterator[object]: ...
 
 
 class TelethonHistorySource:
     def __init__(self, client: object) -> None:
         self.client = client
-
-    async def get_anchors(self, gap: MsgLogGap) -> Sequence[object]:
-        return await self.client.get_messages(  # type: ignore[attr-defined,no-any-return]
-            gap.chat_id, ids=[gap.left, gap.right]
-        )
 
     async def iter_gap(self, gap: MsgLogGap) -> AsyncIterator[object]:
         iterator = self.client.iter_messages(  # type: ignore[attr-defined]
@@ -167,16 +160,6 @@ class MsgLogGapBackfiller:
         return results
 
     async def _fetch_gap(self, gap: MsgLogGap) -> tuple[list[BackfillRow], Counter[str]]:
-        anchors = await self.history.get_anchors(gap)
-        anchor_ids = {
-            message_id
-            for message in anchors
-            if type(message).__name__ != "MessageEmpty"
-            and not isinstance((message_id := getattr(message, "id", None)), bool)
-            and isinstance(message_id, int)
-        }
-        if anchor_ids != {gap.left, gap.right}:
-            raise ValueError(f"Telegram history anchors for {gap.chat_id} are not both visible")
         associations = self.store.topic_associations(gap.chat_id)
         rows: list[BackfillRow] = []
         skipped: Counter[str] = Counter()
