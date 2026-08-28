@@ -10,6 +10,7 @@ import io
 import logging
 import numbers
 import os
+import pickle
 import re
 import threading
 import time
@@ -39,6 +40,7 @@ from .outbound import (
     OutboundQueueScheduler,
     QUEUED_OPERATIONS,
     QueueEnqueueError,
+    QueuePersistenceError,
     QueueRequest,
     SchedulerStoppedError,
     SenderSelection,
@@ -486,8 +488,9 @@ class TelegramBotManager(LocaleMixin):
         self._bot_chat_state_lock = threading.Lock()
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
-        self._queued_db_log_contexts: dict[int, QueuedDbLogContext] = {}
-        self._queued_db_log_context_lock = threading.Lock()
+        self._queued_blocking_log_contexts: dict[int, QueuedDbLogContext] = {}
+        self._queued_completion_callbacks: dict[int, Optional[Callable[[], None]]] = {}
+        self._queued_log_context_lock = threading.Lock()
         self._last_metrics_snapshot = 0.0
         from .etm_metrics import Metrics, start_metrics_server
         metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
@@ -1073,10 +1076,31 @@ class TelegramBotManager(LocaleMixin):
                     "Outbound scheduler stopped."
                 )
                 raise error
-            row_id, waiter = self._outbound_queue.enqueue_many(requests, self._queue_operation)
+            durable_requests = requests
             if db_log_context is not None:
-                with self._queued_db_log_context_lock:
-                    self._queued_db_log_contexts[row_id] = db_log_context
+                blocking_context = any(
+                    request.kwargs.get("_send_mode", "eventual") == "blocking"
+                    for request in requests
+                )
+                if not blocking_context:
+                    encoded_context = self._encode_queued_log_context(db_log_context)
+                    durable_requests = [
+                        QueueRequest(
+                            request.operation, request.args, request.kwargs, encoded_context
+                        )
+                        for request in requests
+                    ]
+            else:
+                blocking_context = False
+            row_id, waiter = self._outbound_queue.enqueue_many(
+                durable_requests, self._queue_operation
+            )
+            if db_log_context is not None:
+                with self._queued_log_context_lock:
+                    if blocking_context:
+                        self._queued_blocking_log_contexts[row_id] = db_log_context
+                    else:
+                        self._queued_completion_callbacks[row_id] = db_log_context.on_complete
             self._outbound_scheduler.wake_event.set()
             return str(row_id), waiter
 
@@ -1377,15 +1401,63 @@ class TelegramBotManager(LocaleMixin):
         )
         return result
 
-    def _pop_queued_db_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
+    @staticmethod
+    def _encode_queued_log_context(context: QueuedDbLogContext) -> bytes:
+        try:
+            return b"\x01" + pickle.dumps((context.etm_msg, context.old_msg_id), protocol=5)
+        except Exception as error:
+            raise QueueEnqueueError("Unable to serialize queued database log context.") from error
+
+    @staticmethod
+    def _decode_queued_log_context(payload: object) -> tuple['ETMMsg', Optional['OldMsgID']]:
+        if not isinstance(payload, bytes) or not payload or payload[0] != 1:
+            raise QueuePersistenceError("Queued database log context has an unknown version.")
+        try:
+            value = pickle.loads(payload[1:])
+        except Exception as error:
+            raise QueuePersistenceError("Queued database log context cannot be decoded.") from error
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise QueuePersistenceError("Queued database log context has an invalid shape.")
+        return cast('ETMMsg', value[0]), cast(Optional['OldMsgID'], value[1])
+
+    @staticmethod
+    def encode_queued_completion_receipt(result: object, selection: SenderSelection) -> bytes:
+        try:
+            return b"\x01" + pickle.dumps((result, selection.sender_bot_id), protocol=5)
+        except Exception as error:
+            raise QueuePersistenceError("Unable to serialize queued Telegram completion receipt.") from error
+
+    @staticmethod
+    def _decode_queued_completion_receipt(payload: object) -> tuple[TelegramMessage, Optional[str]]:
+        if not isinstance(payload, bytes) or not payload or payload[0] != 1:
+            raise QueuePersistenceError("Queued Telegram completion receipt has an unknown version.")
+        try:
+            value = pickle.loads(payload[1:])
+        except Exception as error:
+            raise QueuePersistenceError("Queued Telegram completion receipt cannot be decoded.") from error
+        if not isinstance(value, tuple) or len(value) != 2 or not isinstance(value[1], (str, type(None))):
+            raise QueuePersistenceError("Queued Telegram completion receipt has an invalid shape.")
+        return cast(TelegramMessage, value[0]), value[1]
+
+    def _pop_queued_blocking_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
         if not isinstance(row_id, int):
             return None
-        contexts = getattr(self, "_queued_db_log_contexts", None)
-        context_lock = getattr(self, "_queued_db_log_context_lock", None)
+        contexts = getattr(self, "_queued_blocking_log_contexts", None)
+        context_lock = getattr(self, "_queued_log_context_lock", None)
         if contexts is None or context_lock is None:
             return None
         with context_lock:
             return contexts.pop(row_id, None)
+
+    def _pop_queued_completion_callback(self, row_id: object) -> Optional[Callable[[], None]]:
+        if not isinstance(row_id, int):
+            return None
+        callbacks = getattr(self, "_queued_completion_callbacks", None)
+        context_lock = getattr(self, "_queued_log_context_lock", None)
+        if callbacks is None or context_lock is None:
+            return None
+        with context_lock:
+            return callbacks.pop(row_id, None)
 
     def _finish_queued_database_update(
         self,
@@ -1394,7 +1466,7 @@ class TelegramBotManager(LocaleMixin):
         *,
         sender_bot_id: Optional[str] = None,
     ) -> None:
-        db_log_context = self._pop_queued_db_log_context(row_id)
+        db_log_context = self._pop_queued_blocking_log_context(row_id)
         if db_log_context is None:
             return
         if real_tg_msg is None:
@@ -1408,14 +1480,40 @@ class TelegramBotManager(LocaleMixin):
             on_complete=db_log_context.on_complete,
         )
 
+    def reconcile_queued_delivery(self, row) -> bool:
+        """Write a persisted Telegram completion to MsgLog."""
+        if row.log_context is None or row.completion_receipt is None:
+            return False
+        etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
+        real_tg_msg, sender_bot_id = self._decode_queued_completion_receipt(
+            row.completion_receipt
+        )
+        try:
+            etm_msg.type_telegram = get_msg_type(real_tg_msg)
+            etm_msg.put_telegram_file(real_tg_msg)
+            self.channel.db.add_or_update_message_log(
+                etm_msg,
+                real_tg_msg,
+                old_msg_id,
+                sender_bot_id=sender_bot_id,
+            )
+        except Exception as error:
+            self.logger.warning(
+                "DB reconciliation failed for durable queue row %s: %s", row.id, error
+            )
+            return False
+        self._run_database_update_callback(self._pop_queued_completion_callback(row.id))
+        return True
+
     def record_queued_success(
         self, row, result: object, selection: SenderSelection
     ) -> QueuedCompletionDecision:
-        self._finish_queued_database_update(
-            getattr(row, "id", None),
-            cast(TelegramMessage, result),
-            sender_bot_id=selection.sender_bot_id,
-        )
+        if getattr(row, "log_context", None) is None:
+            self._finish_queued_database_update(
+                getattr(row, "id", None),
+                cast(TelegramMessage, result),
+                sender_bot_id=selection.sender_bot_id,
+            )
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
         return QueuedCompletionDecision(QueuedCompletionKind.SUCCESS)
@@ -1443,6 +1541,9 @@ class TelegramBotManager(LocaleMixin):
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
         self._finish_queued_database_update(getattr(row, "id", None))
+        self._run_database_update_callback(
+            self._pop_queued_completion_callback(getattr(row, "id", None))
+        )
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
     def record_queued_retry_after(
