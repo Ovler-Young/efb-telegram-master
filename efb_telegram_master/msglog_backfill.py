@@ -190,22 +190,10 @@ class MsgLogGapBackfiller:
         rows: list[BackfillRow] = []
         skipped: Counter[str] = Counter()
         messages_by_id: dict[int, object] = {}
-        failures: list[Exception] = []
-        successful_sources = 0
         for history in self.histories:
-            try:
-                messages = await self._read_gap(history, gap)
-            except Exception as error:
-                failures.append(error)
-                continue
-            successful_sources += 1
+            messages = await self._read_gap(history, gap)
             for message in messages:
                 messages_by_id.setdefault(int(getattr(message, "id")), message)
-
-        if not successful_sources:
-            if failures:
-                raise failures[0]
-            raise RuntimeError(f"No Telegram history source could fetch {gap.chat_id} ({gap.left}, {gap.right})")
 
         for message_id in sorted(messages_by_id):
             message = messages_by_id[message_id]

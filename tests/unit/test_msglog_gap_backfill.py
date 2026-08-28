@@ -213,15 +213,13 @@ async def test_backfill_merges_available_histories_in_message_order(msglog_datab
     TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
     gap = MsgLogGap(-100, 1, 23)
     primary = _History({gap: [_message(2, 1000), _message(4, 1000)]})
-    unavailable = _History({}, fail_at=gap)
     auxiliary = _History({gap: [_message(2, 1000), _message(3, 2000)]})
 
     results = await MsgLogGapBackfiller(
-        MsgLogBackfillStore(), [primary, unavailable, auxiliary], main_bot_id=1000
+        MsgLogBackfillStore(), [primary, auxiliary], main_bot_id=1000
     ).run()
 
     assert results[0].inserted == 3
-    assert unavailable.started == [gap]
     rows = list(MsgLog.select().where(
         MsgLog.master_msg_id.in_(["-100.2", "-100.3", "-100.4"])
     ).order_by(MsgLog.master_msg_id))
@@ -230,6 +228,30 @@ async def test_backfill_merges_available_histories_in_message_order(msglog_datab
         ("-100.3", "2000"),
         ("-100.4", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_backfill_aborts_gap_without_writing_when_any_source_fails(msglog_database):
+    for message_id in (1, 23, 50):
+        _log(message_id)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    first_gap = MsgLogGap(-100, 1, 23)
+    second_gap = MsgLogGap(-100, 23, 50)
+    primary = _History({first_gap: [_message(2, 1000)]})
+    failing = _History({}, fail_at=first_gap)
+    auxiliary = _History({first_gap: [_message(3, 2000)]})
+
+    with pytest.raises(RuntimeError, match="history failed"):
+        await MsgLogGapBackfiller(
+            MsgLogBackfillStore(), [primary, failing, auxiliary], main_bot_id=1000
+        ).run()
+
+    assert primary.started == [first_gap]
+    assert failing.started == [first_gap]
+    assert auxiliary.started == []
+    assert MsgLog.select().where(MsgLog.master_msg_id.in_(["-100.2", "-100.3"])).count() == 0
+    assert MsgLog.get_by_id("-100.50").text == "existing"
+    assert second_gap not in primary.started
 
 
 @pytest.mark.asyncio
