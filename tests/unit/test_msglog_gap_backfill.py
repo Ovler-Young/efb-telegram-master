@@ -17,6 +17,7 @@ from efb_telegram_master.db import (
 )
 from efb_telegram_master.msglog_backfill import (
     BackfillRow,
+    GapResult,
     MsgLogBackfillStore,
     MsgLogGap,
     MsgLogGapBackfiller,
@@ -105,7 +106,20 @@ def test_gap_discovery_uses_strict_threshold_and_numeric_chat_order(msglog_datab
 def test_gap_discovery_uses_id_one_as_the_virtual_leading_bound(msglog_database):
     _log(23)
 
-    assert MsgLogBackfillStore().find_gaps() == [MsgLogGap(-100, 1, 23)]
+    assert MsgLogBackfillStore().find_gaps() == [MsgLogGap(-100, 0, 23)]
+
+
+@pytest.mark.asyncio
+async def test_backfill_leading_gap_includes_message_id_one(msglog_database):
+    _log(22)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    gap = MsgLogGap(-100, 0, 22)
+    history = _History({gap: [_message(1, 1000)]})
+
+    await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
+
+    assert history.started == [gap]
+    assert MsgLog.get_by_id("-100.1").text == "content"
 
 
 @pytest.mark.asyncio
@@ -148,21 +162,21 @@ async def test_telethon_history_uses_gap_bound_when_nothing_predates_cutoff():
 
             async def messages():
                 if "offset_date" not in kwargs:
-                    for message_id in (2, 3):
+                    for message_id in (1, 2, 3):
                         yield SimpleNamespace(id=message_id)
 
             return messages()
 
-    gap = MsgLogGap(-100, 1, 4)
+    gap = MsgLogGap(-100, 0, 4)
     source = TelethonHistorySource(Client())
     received = [message.id async for message in source.iter_gap(gap)]
 
-    assert received == [2, 3]
+    assert received == [1, 2, 3]
     assert calls == [(-100, {
         "limit": 1,
         "offset_date": msglog_backfill.RECOVERY_SCAN_START,
     }), (-100, {
-        "min_id": 1,
+        "min_id": 0,
         "max_id": 4,
         "reverse": True,
     })]
@@ -264,8 +278,49 @@ async def test_backfill_aborts_gap_without_writing_when_any_source_fails(msglog_
     assert auxiliary.started == []
     assert MsgLog.select().where(MsgLog.master_msg_id.in_(["-100.2", "-100.3"])).count() == 0
     assert MsgLog.get_by_id("-100.50").text == "existing"
-    assert MsgLogBackfillCheckpoint.get(MsgLogBackfillCheckpoint.left == 1).cursor == 1
+    assert MsgLogBackfillCheckpoint.get(MsgLogBackfillCheckpoint.left == 1).cursor == 2
     assert second_gap not in primary.started
+
+
+@pytest.mark.asyncio
+async def test_backfill_chunk_boundaries_resume_without_holes(msglog_database):
+    class ChunkStore(MsgLogBackfillStore):
+        CHUNK_MESSAGE_SPAN = 1000
+
+    class AllMessagesHistory:
+        def __init__(self, fail_at=None):
+            self.fail_at = fail_at
+            self.started = []
+
+        async def iter_gap(self, gap):
+            self.started.append(gap)
+            if gap == self.fail_at:
+                raise RuntimeError("history failed")
+            for message_id in range(gap.left + 1, gap.right):
+                yield _message(message_id, 1000)
+
+    _log(2003)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    gap = MsgLogGap(-100, 0, 2003)
+    failed_chunk = MsgLogGap(-100, 1000, 2001)
+    store = ChunkStore()
+
+    with pytest.raises(RuntimeError, match="history failed"):
+        await MsgLogGapBackfiller(
+            store, AllMessagesHistory(fail_at=failed_chunk), main_bot_id=1000
+        ).run()
+
+    assert MsgLogBackfillCheckpoint.get().cursor == 1001
+    resumed_history = AllMessagesHistory()
+    results = await MsgLogGapBackfiller(store, resumed_history, main_bot_id=1000).run()
+
+    assert resumed_history.started == [failed_chunk, MsgLogGap(-100, 2000, 2003)]
+    assert results == [GapResult(gap, 1002, {"deleted": 0})]
+    assert MsgLogBackfillCheckpoint.select().count() == 0
+    assert {
+        int(row.master_msg_id.rsplit(".", 1)[1])
+        for row in MsgLog.select(MsgLog.master_msg_id)
+    } == set(range(1, 2004))
 
 
 @pytest.mark.asyncio
@@ -426,7 +481,7 @@ def test_chunk_write_rolls_back_cursor_and_preserves_existing_rows(msglog_databa
     with pytest.raises(RuntimeError, match="write failed"):
         store.insert_chunk_and_advance(pending, 23, [_row(2), _row(3)])
     assert MsgLog.select().where(MsgLog.master_msg_id.in_(["-100.2", "-100.3"])).count() == 0
-    assert MsgLogBackfillCheckpoint.get().cursor == 1
+    assert MsgLogBackfillCheckpoint.get().cursor == 2
 
     _log(2)
     store = MsgLogBackfillStore()
@@ -454,12 +509,18 @@ def test_snapshot_keeps_a_gap_after_live_rows_fragment_it(msglog_database):
     _log(43)
     store = MsgLogBackfillStore()
 
-    assert store.snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 1)]
+    assert store.snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 2)]
     for message_id in range(2, 23):
         _log(message_id)
 
     assert store.find_gaps() == []
-    assert store.snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 1)]
+    assert store.snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 2)]
+
+
+def test_snapshot_advances_legacy_checkpoint_to_the_first_unread_message(msglog_database):
+    MsgLogBackfillCheckpoint.create(chat_id=-100, left=1, right=43, cursor=1)
+
+    assert MsgLogBackfillStore().snapshot_gaps() == [PendingGap(MsgLogGap(-100, 1, 43), 2)]
 
 
 @pytest.mark.asyncio

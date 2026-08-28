@@ -128,7 +128,7 @@ class MsgLogBackfillStore:
         for chat_id in sorted(message_ids):
             ordered = sorted(set(message_ids[chat_id]))
             if ordered and ordered[0] - 1 > GAP_THRESHOLD:
-                gaps.append(MsgLogGap(chat_id, 1, ordered[0]))
+                gaps.append(MsgLogGap(chat_id, 0, ordered[0]))
             gaps.extend(
                 MsgLogGap(chat_id, left, right)
                 for left, right in zip(ordered, ordered[1:])
@@ -153,11 +153,24 @@ class MsgLogBackfillStore:
         with database.atomic():
             checkpoints = self._pending_gaps()
             if checkpoints:
-                return checkpoints
+                for pending_gap in checkpoints:
+                    if pending_gap.cursor <= pending_gap.gap.left:
+                        MsgLogBackfillCheckpoint.update(cursor=pending_gap.gap.left + 1).where(
+                            (MsgLogBackfillCheckpoint.chat_id == pending_gap.gap.chat_id)
+                            & (MsgLogBackfillCheckpoint.left == pending_gap.gap.left)
+                            & (MsgLogBackfillCheckpoint.right == pending_gap.gap.right)
+                            & (MsgLogBackfillCheckpoint.cursor == pending_gap.cursor)
+                        ).execute()
+                return self._pending_gaps()
             gaps = self.find_gaps()
             if gaps:
                 MsgLogBackfillCheckpoint.insert_many([
-                    {"chat_id": gap.chat_id, "left": gap.left, "right": gap.right, "cursor": gap.left}
+                    {
+                        "chat_id": gap.chat_id,
+                        "left": gap.left,
+                        "right": gap.right,
+                        "cursor": gap.left + 1,
+                    }
                     for gap in gaps
                 ]).execute()
             return self._pending_gaps()
@@ -179,7 +192,7 @@ class MsgLogBackfillStore:
         next_cursor: int,
         rows: Sequence[BackfillRow],
     ) -> int:
-        if not pending_gap.cursor < next_cursor <= pending_gap.gap.right:
+        if not pending_gap.gap.left < pending_gap.cursor < next_cursor <= pending_gap.gap.right:
             raise ValueError("Backfill checkpoint cursor is outside its gap")
         with database.atomic():
             inserted = self._insert_rows(rows)
@@ -248,7 +261,7 @@ class MsgLogGapBackfiller:
             cursor = pending_gap.cursor
             while cursor < pending_gap.gap.right:
                 next_cursor = min(cursor + self.store.CHUNK_MESSAGE_SPAN, pending_gap.gap.right)
-                chunk_gap = MsgLogGap(pending_gap.gap.chat_id, cursor, next_cursor)
+                chunk_gap = MsgLogGap(pending_gap.gap.chat_id, cursor - 1, next_cursor)
                 rows, chunk_skipped = await self._fetch_gap(chunk_gap)
                 inserted += self.store.insert_chunk_and_advance(
                     PendingGap(pending_gap.gap, cursor), next_cursor, rows
