@@ -139,6 +139,7 @@ async def test_telethon_history_uses_cutoff_probe_before_ascending_interval():
 
     gap = MsgLogGap(-100, 1, 13)
     source = TelethonHistorySource(Client())
+    assert await source.cutoff_cursor(gap.chat_id) == 11
     received = [message.id async for message in source.iter_gap(gap)]
 
     assert received == [11, 12]
@@ -146,7 +147,7 @@ async def test_telethon_history_uses_cutoff_probe_before_ascending_interval():
         "limit": 1,
         "offset_date": msglog_backfill.RECOVERY_SCAN_START,
     }), (-100, {
-        "min_id": 10,
+        "min_id": 1,
         "max_id": 13,
         "reverse": True,
     })]
@@ -169,6 +170,7 @@ async def test_telethon_history_uses_gap_bound_when_nothing_predates_cutoff():
 
     gap = MsgLogGap(-100, 0, 4)
     source = TelethonHistorySource(Client())
+    assert await source.cutoff_cursor(gap.chat_id) is None
     received = [message.id async for message in source.iter_gap(gap)]
 
     assert received == [1, 2, 3]
@@ -180,6 +182,33 @@ async def test_telethon_history_uses_gap_bound_when_nothing_predates_cutoff():
         "max_id": 4,
         "reverse": True,
     })]
+
+
+@pytest.mark.asyncio
+async def test_backfill_clamps_a_leading_gap_before_requesting_history(msglog_database):
+    class CutoffHistory:
+        def __init__(self):
+            self.probes = []
+            self.started = []
+
+        async def cutoff_cursor(self, chat_id):
+            self.probes.append(chat_id)
+            return 4001
+
+        async def iter_gap(self, gap):
+            self.started.append(gap)
+            raise RuntimeError("history failed")
+            yield None
+
+    _log(5003)
+    history = CutoffHistory()
+
+    with pytest.raises(RuntimeError, match="history failed"):
+        await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
+
+    assert history.probes == [-100]
+    assert history.started == [MsgLogGap(-100, 4000, 5001)]
+    assert MsgLogBackfillCheckpoint.get().cursor == 4001
 
 
 @pytest.mark.asyncio

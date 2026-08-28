@@ -81,25 +81,31 @@ class HistorySource(Protocol):
 class TelethonHistorySource:
     def __init__(self, client: object) -> None:
         self.client = client
+        self._cutoff_cursors: dict[int, Optional[int]] = {}
 
-    async def iter_gap(self, gap: MsgLogGap) -> AsyncIterator[object]:
-        lower_bound = gap.left
+    async def cutoff_cursor(self, chat_id: int) -> Optional[int]:
+        if chat_id in self._cutoff_cursors:
+            return self._cutoff_cursors[chat_id]
+
         cutoff_probe = self.client.iter_messages(  # type: ignore[attr-defined]
-            gap.chat_id,
+            chat_id,
             limit=1,
             offset_date=RECOVERY_SCAN_START,
         )
         async for cutoff_anchor in cutoff_probe:
             cutoff_anchor_id = getattr(cutoff_anchor, "id", None)
             if isinstance(cutoff_anchor_id, bool) or not isinstance(cutoff_anchor_id, int):
-                raise ValueError(f"Telegram history cutoff probe for {gap.chat_id} has no integer message ID")
-            lower_bound = max(lower_bound, cutoff_anchor_id)
-            break
-        if lower_bound >= gap.right - 1:
-            return
+                raise ValueError(f"Telegram history cutoff probe for {chat_id} has no integer message ID")
+            self._cutoff_cursors[chat_id] = cutoff_anchor_id + 1
+            return cutoff_anchor_id + 1
+
+        self._cutoff_cursors[chat_id] = None
+        return None
+
+    async def iter_gap(self, gap: MsgLogGap) -> AsyncIterator[object]:
         iterator = self.client.iter_messages(  # type: ignore[attr-defined]
             gap.chat_id,
-            min_id=lower_bound,
+            min_id=gap.left,
             max_id=gap.right,
             reverse=True,
         )
@@ -266,13 +272,16 @@ class MsgLogGapBackfiller:
             raise ValueError("At least one Telegram history source is required")
         self.main_bot_id = main_bot_id
         self.auxiliary_bot_ids = frozenset(auxiliary_bot_ids)
+        self._recovery_cursors: dict[int, int] = {}
 
     async def run(self) -> list[GapResult]:
         results: list[GapResult] = []
         for pending_gap in self.store.snapshot_gaps():
             inserted = 0
             skipped: Counter[str] = Counter()
-            cursor = pending_gap.cursor
+            cursor = await self._recovery_cursor(pending_gap)
+            if cursor > pending_gap.cursor:
+                self.store.insert_chunk_and_advance(pending_gap, cursor, ())
             while cursor < pending_gap.gap.right:
                 next_cursor = min(cursor + self.store.CHUNK_MESSAGE_SPAN, pending_gap.gap.right)
                 chunk_gap = MsgLogGap(pending_gap.gap.chat_id, cursor - 1, next_cursor)
@@ -284,6 +293,26 @@ class MsgLogGapBackfiller:
                 cursor = next_cursor
             results.append(GapResult(pending_gap.gap, inserted, dict(skipped)))
         return results
+
+    async def _recovery_cursor(self, pending_gap: PendingGap) -> int:
+        cutoff_cursor = self._recovery_cursors.get(pending_gap.gap.chat_id)
+        if cutoff_cursor is None:
+            cutoff_cursor = 0
+            for history in self.histories:
+                source_cutoff = getattr(history, "cutoff_cursor", None)
+                if source_cutoff is None:
+                    continue
+                source_cursor = await source_cutoff(pending_gap.gap.chat_id)
+                if source_cursor is None:
+                    continue
+                if isinstance(source_cursor, bool) or not isinstance(source_cursor, int):
+                    raise ValueError(
+                        f"Telegram history cutoff probe for {pending_gap.gap.chat_id} has no integer message ID"
+                    )
+                cutoff_cursor = max(cutoff_cursor, source_cursor)
+            self._recovery_cursors[pending_gap.gap.chat_id] = cutoff_cursor
+
+        return min(max(pending_gap.cursor, cutoff_cursor), pending_gap.gap.right)
 
     async def _fetch_gap(self, gap: MsgLogGap) -> tuple[list[BackfillRow], Counter[str]]:
         associations = self.store.topic_associations(gap.chat_id)
