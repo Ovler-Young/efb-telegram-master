@@ -60,12 +60,19 @@ class GapResult:
 
 
 class HistorySource(Protocol):
+    async def get_anchors(self, gap: MsgLogGap) -> Sequence[object]: ...
+
     def iter_gap(self, gap: MsgLogGap) -> AsyncIterator[object]: ...
 
 
 class TelethonHistorySource:
     def __init__(self, client: object) -> None:
         self.client = client
+
+    async def get_anchors(self, gap: MsgLogGap) -> Sequence[object]:
+        return await self.client.get_messages(  # type: ignore[attr-defined,no-any-return]
+            gap.chat_id, ids=[gap.left, gap.right]
+        )
 
     async def iter_gap(self, gap: MsgLogGap) -> AsyncIterator[object]:
         iterator = self.client.iter_messages(  # type: ignore[attr-defined]
@@ -81,7 +88,7 @@ class TelethonHistorySource:
 class MsgLogBackfillStore:
     """Read MsgLog anchors and atomically insert one completed gap."""
 
-    INSERT_CHUNK_SIZE = 500
+    INSERT_CHUNK_SIZE = 400
 
     def find_gaps(self) -> list[MsgLogGap]:
         message_ids: dict[int, list[int]] = defaultdict(list)
@@ -124,7 +131,20 @@ class MsgLogBackfillStore:
         inserted = 0
         with database.atomic():
             for batch in chunked(payloads, self.INSERT_CHUNK_SIZE):
-                inserted += self._insert_batch(batch)
+                message_ids = [str(row["master_msg_id"]) for row in batch]
+                query = MsgLog.select(MsgLog.master_msg_id, MsgLog.master_msg_id_alt).where(
+                    (MsgLog.master_msg_id.in_(message_ids)) |
+                    (MsgLog.master_msg_id_alt.in_(message_ids))
+                ).tuples()
+                existing = {
+                    str(message_id)
+                    for row in cast(Iterable[tuple[object, object]], query)
+                    for message_id in row
+                    if message_id is not None
+                }
+                pending = [row for row in batch if row["master_msg_id"] not in existing]
+                if pending:
+                    inserted += self._insert_batch(pending)
         return inserted
 
     @staticmethod
@@ -147,6 +167,16 @@ class MsgLogGapBackfiller:
         return results
 
     async def _fetch_gap(self, gap: MsgLogGap) -> tuple[list[BackfillRow], Counter[str]]:
+        anchors = await self.history.get_anchors(gap)
+        anchor_ids = {
+            message_id
+            for message in anchors
+            if type(message).__name__ != "MessageEmpty"
+            and not isinstance((message_id := getattr(message, "id", None)), bool)
+            and isinstance(message_id, int)
+        }
+        if anchor_ids != {gap.left, gap.right}:
+            raise ValueError(f"Telegram history anchors for {gap.chat_id} are not both visible")
         associations = self.store.topic_associations(gap.chat_id)
         rows: list[BackfillRow] = []
         skipped: Counter[str] = Counter()
@@ -161,7 +191,7 @@ class MsgLogGapBackfiller:
             previous_id = message_id
             seen += 1
 
-            skip_reason, row = self._build_row(message, gap.chat_id, associations)
+            skip_reason, row = await self._build_row(message, gap.chat_id, associations)
             if row is None:
                 skipped[skip_reason] += 1
             else:
@@ -169,7 +199,7 @@ class MsgLogGapBackfiller:
         skipped["deleted"] += gap.missing_count - seen
         return rows, skipped
 
-    def _build_row(
+    async def _build_row(
         self,
         message: object,
         chat_id: int,
@@ -186,9 +216,19 @@ class MsgLogGapBackfiller:
         if isinstance(topic_id, bool) or not isinstance(topic_id, int) or topic_id not in associations:
             return "unmapped", None
 
-        sender_id = getattr(message, "sender_id", None)
+        sender = getattr(message, "sender", None)
+        if sender is None:
+            get_sender = getattr(message, "get_sender", None)
+            if not callable(get_sender):
+                raise ValueError(f"Telegram message {chat_id}.{getattr(message, 'id', '?')} has no sender entity")
+            sender = await get_sender()
+        if sender is None:
+            raise ValueError(f"Telegram message {chat_id}.{getattr(message, 'id', '?')} has no sender entity")
+        if not bool(getattr(sender, "bot", False)):
+            return "human", None
+        sender_id = getattr(sender, "id", None)
         if isinstance(sender_id, bool) or not isinstance(sender_id, int):
-            raise ValueError(f"Telegram message {chat_id}.{getattr(message, 'id', '?')} has no sender identity")
+            raise ValueError(f"Telegram message {chat_id}.{getattr(message, 'id', '?')} has no bot identity")
         slave_uid = associations[topic_id]
         slave_channel_id, _, _ = chat_id_str_to_id(slave_uid)
         media_type, msg_type, mime = self._content_type(message)

@@ -1,9 +1,12 @@
 import datetime
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 from peewee import SqliteDatabase
+from telegram import Chat, Message, Update
 
+from efb_telegram_master import TelegramChannel
 from efb_telegram_master.db import MsgLog, SYNTHETIC_MSGLOG_PREFIX, TopicAssoc, database
 from efb_telegram_master.msglog_backfill import (
     BackfillRow,
@@ -37,10 +40,18 @@ def _log(message_id: int, *, chat_id: int = -100) -> None:
     )
 
 
-def _message(message_id: int, sender_id: int, *, topic_id: int = 9, text: str = "content"):
+def _message(
+    message_id: int,
+    sender_id: int,
+    *,
+    topic_id: int = 9,
+    text: str = "content",
+    bot: bool = True,
+):
     return SimpleNamespace(
         id=message_id,
         sender_id=sender_id,
+        sender=SimpleNamespace(id=sender_id, bot=bot),
         reply_to=SimpleNamespace(reply_to_top_id=topic_id),
         message=text,
         media=None,
@@ -50,13 +61,20 @@ def _message(message_id: int, sender_id: int, *, topic_id: int = 9, text: str = 
 
 
 class _History:
-    def __init__(self, messages_by_gap, *, fail_at=None):
+    def __init__(self, messages_by_gap, *, fail_at=None, anchors_by_gap=None):
         self.messages_by_gap = messages_by_gap
         self.fail_at = fail_at
+        self.anchors_by_gap = anchors_by_gap or {}
         self.started = []
 
+    async def get_anchors(self, gap):
+        self.started.append(("anchors", gap))
+        return self.anchors_by_gap.get(
+            gap, (SimpleNamespace(id=gap.left), SimpleNamespace(id=gap.right))
+        )
+
     async def iter_gap(self, gap):
-        self.started.append(gap)
+        self.started.append(("gap", gap))
         if gap == self.fail_at:
             raise RuntimeError("history failed")
         for message in self.messages_by_gap.get(gap, ()):
@@ -87,8 +105,12 @@ async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration()
     calls = []
 
     class Client:
+        async def get_messages(self, chat_id, **kwargs):
+            calls.append(("anchors", chat_id, kwargs))
+            return [SimpleNamespace(id=message_id) for message_id in kwargs["ids"]]
+
         def iter_messages(self, chat_id, **kwargs):
-            calls.append((chat_id, kwargs))
+            calls.append(("gap", chat_id, kwargs))
 
             async def messages():
                 for message_id in (11, 12):
@@ -97,10 +119,16 @@ async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration()
             return messages()
 
     gap = MsgLogGap(-100, 10, 13)
-    received = [message.id async for message in TelethonHistorySource(Client()).iter_gap(gap)]
+    source = TelethonHistorySource(Client())
+    anchors = await source.get_anchors(gap)
+    received = [message.id async for message in source.iter_gap(gap)]
 
+    assert [message.id for message in anchors] == [10, 13]
     assert received == [11, 12]
-    assert calls == [(-100, {"min_id": 10, "max_id": 13, "reverse": True})]
+    assert calls == [
+        ("anchors", -100, {"ids": [10, 13]}),
+        ("gap", -100, {"min_id": 10, "max_id": 13, "reverse": True}),
+    ]
 
 
 @pytest.mark.asyncio
@@ -110,13 +138,19 @@ async def test_backfill_is_serial_stops_on_failure_and_preserves_sender_identity
     TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
     first = MsgLogGap(-100, 1, 23)
     second = MsgLogGap(-100, 23, 50)
-    history = _History({first: [_message(2, 1000), _message(3, 2000)]}, fail_at=second)
+    history = _History({
+        first: [_message(2, 1000), _message(3, 2000), _message(4, 3000, bot=False)]
+    }, fail_at=second)
 
     with pytest.raises(RuntimeError, match="history failed"):
         await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
 
-    assert history.started == [first, second]
-    rows = list(MsgLog.select().where(MsgLog.master_msg_id.in_(["-100.2", "-100.3"])).order_by(MsgLog.master_msg_id))
+    assert history.started == [
+        ("anchors", first), ("gap", first), ("anchors", second), ("gap", second)
+    ]
+    rows = list(MsgLog.select().where(
+        MsgLog.master_msg_id.in_(["-100.2", "-100.3", "-100.4"])
+    ).order_by(MsgLog.master_msg_id))
     assert [(row.master_msg_id, row.sender_bot_id, row.slave_origin_uid) for row in rows] == [
         ("-100.2", None, "tests.mocks.slave chat"),
         ("-100.3", "2000", "tests.mocks.slave chat"),
@@ -162,6 +196,18 @@ def test_gap_insert_rolls_back_all_chunks_and_does_not_overwrite(msglog_database
     assert MsgLog.get_by_id("-100.3").text == "new"
 
 
+def test_alternate_id_is_not_a_gap_anchor_or_overwritten(msglog_database):
+    _log(1)
+    _log(50)
+    MsgLog.update(master_msg_id_alt="-100.23").where(MsgLog.master_msg_id == "-100.50").execute()
+
+    assert MsgLogBackfillStore().find_gaps() == [MsgLogGap(-100, 1, 50)]
+    assert MsgLogBackfillStore().insert_gap([_row(23), _row(24)]) == 1
+    assert MsgLog.get_by_id("-100.50").master_msg_id_alt == "-100.23"
+    assert MsgLog.get_or_none(MsgLog.master_msg_id == "-100.23") is None
+    assert MsgLog.get_by_id("-100.24").text == "new"
+
+
 @pytest.mark.asyncio
 async def test_unmapped_and_service_messages_are_skipped_as_one_completed_gap(msglog_database):
     for message_id in (1, 23):
@@ -177,3 +223,48 @@ async def test_unmapped_and_service_messages_are_skipped_as_one_completed_gap(ms
     assert results[0].inserted == 1
     assert results[0].skipped == {"unmapped": 1, "service": 1, "deleted": 18}
     assert MsgLog.get_by_id("-100.4").slave_origin_uid == "tests.mocks.slave chat"
+
+
+@pytest.mark.asyncio
+async def test_invisible_anchor_stops_before_writes_or_next_gap(msglog_database):
+    for message_id in (1, 23, 50):
+        _log(message_id)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    first = MsgLogGap(-100, 1, 23)
+    second = MsgLogGap(-100, 23, 50)
+    history = _History(
+        {first: [_message(2, 1000)], second: [_message(24, 1000)]},
+        anchors_by_gap={first: (SimpleNamespace(id=1),)},
+    )
+
+    with pytest.raises(ValueError, match="not both visible"):
+        await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
+
+    assert history.started == [("anchors", first)]
+    assert MsgLog.get_or_none(MsgLog.master_msg_id == "-100.2") is None
+
+
+def test_react_rejects_synthetic_msglog_identity():
+    chat = Chat(-100, "supergroup")
+    target = Message(2, datetime.datetime.now(datetime.timezone.utc), chat, text="target")
+    command = Message(
+        3,
+        datetime.datetime.now(datetime.timezone.utc),
+        chat,
+        text="/react value",
+        reply_to_message=target,
+    )
+    channel = object.__new__(TelegramChannel)
+    channel.db = SimpleNamespace(
+        get_msg_log=Mock(return_value=SimpleNamespace(
+            slave_message_id=f"{SYNTHETIC_MSGLOG_PREFIX}-100.2"
+        ))
+    )
+    channel.bot_manager = Mock()
+
+    with patch("efb_telegram_master.sync_reply_text") as reply, \
+            patch("efb_telegram_master.coordinator.send_status") as send_status:
+        TelegramChannel.react(channel, Update(1, message=command), Mock())
+
+    reply.assert_called_once()
+    send_status.assert_not_called()
