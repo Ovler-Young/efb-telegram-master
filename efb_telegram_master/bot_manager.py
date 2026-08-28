@@ -488,9 +488,9 @@ class TelegramBotManager(LocaleMixin):
         self._bot_chat_state_lock = threading.Lock()
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
-        self._queued_blocking_log_contexts: dict[int, QueuedDbLogContext] = {}
+        self._queued_db_log_contexts: dict[int, QueuedDbLogContext] = {}
         self._queued_completion_callbacks: dict[int, Optional[Callable[[], None]]] = {}
-        self._queued_log_context_lock = threading.Lock()
+        self._queued_db_log_context_lock = threading.Lock()
         self._last_metrics_snapshot = 0.0
         from .etm_metrics import Metrics, start_metrics_server
         metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
@@ -1096,9 +1096,9 @@ class TelegramBotManager(LocaleMixin):
                 durable_requests, self._queue_operation
             )
             if db_log_context is not None:
-                with self._queued_log_context_lock:
+                with self._queued_db_log_context_lock:
                     if blocking_context:
-                        self._queued_blocking_log_contexts[row_id] = db_log_context
+                        self._queued_db_log_contexts[row_id] = db_log_context
                     else:
                         self._queued_completion_callbacks[row_id] = db_log_context.on_complete
             self._outbound_scheduler.wake_event.set()
@@ -1439,11 +1439,11 @@ class TelegramBotManager(LocaleMixin):
             raise QueuePersistenceError("Queued Telegram completion receipt has an invalid shape.")
         return cast(TelegramMessage, value[0]), value[1]
 
-    def _pop_queued_blocking_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
+    def _pop_queued_db_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
         if not isinstance(row_id, int):
             return None
-        contexts = getattr(self, "_queued_blocking_log_contexts", None)
-        context_lock = getattr(self, "_queued_log_context_lock", None)
+        contexts = getattr(self, "_queued_db_log_contexts", None)
+        context_lock = getattr(self, "_queued_db_log_context_lock", None)
         if contexts is None or context_lock is None:
             return None
         with context_lock:
@@ -1453,7 +1453,7 @@ class TelegramBotManager(LocaleMixin):
         if not isinstance(row_id, int):
             return None
         callbacks = getattr(self, "_queued_completion_callbacks", None)
-        context_lock = getattr(self, "_queued_log_context_lock", None)
+        context_lock = getattr(self, "_queued_db_log_context_lock", None)
         if callbacks is None or context_lock is None:
             return None
         with context_lock:
@@ -1466,7 +1466,7 @@ class TelegramBotManager(LocaleMixin):
         *,
         sender_bot_id: Optional[str] = None,
     ) -> None:
-        db_log_context = self._pop_queued_blocking_log_context(row_id)
+        db_log_context = self._pop_queued_db_log_context(row_id)
         if db_log_context is None:
             return
         if real_tg_msg is None:
@@ -1484,11 +1484,11 @@ class TelegramBotManager(LocaleMixin):
         """Write a persisted Telegram completion to MsgLog."""
         if row.log_context is None or row.completion_receipt is None:
             return False
-        etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
-        real_tg_msg, sender_bot_id = self._decode_queued_completion_receipt(
-            row.completion_receipt
-        )
         try:
+            etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
+            real_tg_msg, sender_bot_id = self._decode_queued_completion_receipt(
+                row.completion_receipt
+            )
             etm_msg.type_telegram = get_msg_type(real_tg_msg)
             etm_msg.put_telegram_file(real_tg_msg)
             self.channel.db.add_or_update_message_log(
@@ -1499,7 +1499,7 @@ class TelegramBotManager(LocaleMixin):
             )
         except Exception as error:
             self.logger.warning(
-                "DB reconciliation failed for durable queue row %s: %s", row.id, error
+                "MsgLog reconciliation failed for durable queue row %s: %s", row.id, error
             )
             return False
         self._run_database_update_callback(self._pop_queued_completion_callback(row.id))
