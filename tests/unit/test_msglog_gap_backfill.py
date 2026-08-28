@@ -109,6 +109,16 @@ def test_gap_discovery_uses_id_one_as_the_virtual_leading_bound(msglog_database)
     assert MsgLogBackfillStore().find_gaps() == [MsgLogGap(-100, 0, 23)]
 
 
+def test_recovery_scan_starts_one_day_before_the_loss():
+    assert msglog_backfill.RECOVERY_SCAN_START == datetime.datetime(
+        2026, 7, 13, 18, 22, 3, tzinfo=datetime.timezone.utc
+    )
+    assert (
+        msglog_backfill.LOSS_INTRODUCED_AT - msglog_backfill.RECOVERY_SCAN_START
+        == datetime.timedelta(days=1)
+    )
+
+
 @pytest.mark.asyncio
 async def test_backfill_leading_gap_includes_message_id_one(msglog_database):
     _log(22)

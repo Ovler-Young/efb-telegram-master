@@ -32,7 +32,7 @@ from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 CHANNEL_ID = ModuleID("blueset.telegram")
 GAP_THRESHOLD = 20
 LOSS_INTRODUCED_AT = datetime.datetime(2026, 7, 14, 18, 22, 3, tzinfo=datetime.timezone.utc)
-RECOVERY_SCAN_START = datetime.datetime(2026, 7, 13, tzinfo=datetime.timezone.utc)
+RECOVERY_SCAN_START = LOSS_INTRODUCED_AT - datetime.timedelta(days=1)
 
 
 @dataclass(frozen=True, order=True)
