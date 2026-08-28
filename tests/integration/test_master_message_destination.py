@@ -7,10 +7,11 @@ Only testing with text messages, as everything else shall follow suit.
 """
 
 import asyncio
+import re
 import time
 from contextlib import suppress
 from typing import List
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from pytest import mark, raises
 from telethon.tl.custom import Message, MessageButton
@@ -26,19 +27,25 @@ retry_on_integration_timeout = mark.flaky(
 pytestmark = mark.asyncio
 
 
-async def test_master_master_quick_reply_no_cache(helper, client, bot_id, slave, channel):
+async def test_master_master_quick_reply_no_cache(helper, client, bot_id, slave, channel,
+                                                  private_response):
     assert channel.chat_dest_cache.enabled
     channel.chat_dest_cache.weak.clear()
     channel.chat_dest_cache.strong.clear()
     slave.clear_messages()
 
-    await client.send_message(bot_id,
-                              "test_master_master_quick_reply_no_cache this shall not be sent due to empty cache")
-    await helper.wait_for_message()
+    await private_response(
+        lambda: client.send_message(
+            bot_id,
+            "test_master_master_quick_reply_no_cache this shall not be sent due to empty cache",
+        ),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id), timeout),
+    )
     assert slave.messages.empty()
 
 
-async def test_master_master_quick_reply(helper, client, bot_id, slave, channel):
+async def test_master_master_quick_reply(helper, client, bot_id, slave, channel,
+                                         private_response):
     """Tests if the quick reply cache exists, and changes afterwards by
     incoming message from slave channel.
     """
@@ -47,22 +54,27 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel)
 
     chat = slave.chat_with_alias
     content = "test_master_master_quick_reply set cache with chat head"
-    # Send a message to ``chat`` via chat head
-    await client.send_message(bot_id, f"/chat {chat.uid}")
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+    message = await private_response(
+        lambda: client.send_message(bot_id, f"/chat {chat.uid}"),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+    )
     await message.click(0)
     message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & ~has_button)
     await message.reply(content)
-    message = slave.messages.get(timeout=5)
+    message = await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
     assert message.text == content
     assert message.chat == chat
 
     content = "test_master_master_quick_reply send new message with quick reply"
-    await client.send_message(bot_id, content)
-    text = await helper.wait_for_message_text(in_chats(bot_id))
+    text = await private_response(
+        lambda: client.send_message(bot_id, content),
+        lambda timeout: helper.wait_for_message_text(
+            in_chats(bot_id) & regex(re.escape(chat.display_name)), timeout
+        ),
+    )
     assert chat.display_name in text, f"{text!r} is not a warning message for {chat}"
-    message = slave.messages.get(timeout=5)
+    message = await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
 
     assert message.text == content
@@ -71,54 +83,74 @@ async def test_master_master_quick_reply(helper, client, bot_id, slave, channel)
     content = "test_master_master_quick_reply send another new message " \
               "with quick reply, should give no warning"
     await client.send_message(bot_id, content)
-    message = slave.messages.get(timeout=5)
+    message = await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
     assert message.text == content
     assert message.chat == chat
-    # Error message shall not appear again
     with raises(asyncio.TimeoutError):
         await helper.wait_for_message_text(in_chats(bot_id) & regex(chat.display_name), timeout=3)
 
-    # Clear destination with new message from slave channel
     chat_alt = slave.chat_without_alias
-    message = slave.send_text_message(chat_alt, author=chat_alt.other)
-    text = await helper.wait_for_message_text(in_chats(bot_id))
+    message = None
+
+    async def send_incoming_message():
+        nonlocal message
+        message = slave.send_text_message(chat_alt, author=chat_alt.other)
+
+    text = await private_response(
+        send_incoming_message,
+        lambda timeout: helper.wait_for_message_text(
+            in_chats(bot_id) & regex(re.escape(message.text if message else "")), timeout
+        ),
+    )
+    assert message is not None
     assert message.text in text  # there might be message header in ``text``
 
     content = "test_master_master_quick_reply this shall not be sent due to cleared cache"
-    await client.send_message(bot_id, content)
-    message = await helper.wait_for_message(in_chats(bot_id))  # Error message
+    message = await private_response(
+        lambda: client.send_message(bot_id, content),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id), timeout),
+    )  # Error message
     assert slave.messages.empty()
     await cancel_destination_suggestion(helper, message)
 
 
-async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, slave, channel):
+async def test_master_master_quick_reply_cache_expiry(helper, client, bot_id, slave, channel,
+                                                       private_response):
     assert channel.chat_dest_cache.enabled
     slave.clear_messages()
 
     chat = slave.chat_with_alias
     content = "test_master_master_quick_reply_cache_expiry set cache with chat head"
-    # slave.send_text_message(chat, author=chat)
-    # Send a message to ``chat`` via chat head
-    await client.send_message(bot_id, f"/chat {chat.uid}")
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+    message = await private_response(
+        lambda: client.send_message(bot_id, f"/chat {chat.uid}"),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+    )
     await message.click(0)
     message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & ~has_button)
     await message.reply(content)
-    slave.messages.get(timeout=5)
+    await asyncio.to_thread(slave.messages.get, timeout=5)
     slave.messages.task_done()
 
-    time_now = time.time()
-    with patch("time.time", MagicMock(return_value=time_now + 24 * 60 * 60)):  # one day later
-        content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
-        await client.send_message(bot_id, content)
-        message = await helper.wait_for_message(in_chats(bot_id) & text)  # Error message
-        assert slave.messages.empty()
+    # Mutate only the cache entry. Patching ``time.time`` changes the shared
+    # module object Telethon also uses for its transport deadlines.
+    human_chat_cache_key = str((await client.get_me()).id)
+    assert human_chat_cache_key in channel.chat_dest_cache.weak
+    channel.chat_dest_cache.weak[human_chat_cache_key].expiry = time.time() - 1
+    content = "test_master_master_quick_reply_cache_expiry this shall not be sent due to expired cache"
+    message = await private_response(
+        lambda: client.send_message(bot_id, content),
+        lambda timeout: helper.wait_for_message(
+            in_chats(bot_id) & text & regex("Error: No recipient specified"), timeout
+        ),
+    )
+    assert slave.messages.empty()
     await cancel_destination_suggestion(helper, message)
 
 
 @retry_on_integration_timeout
-async def test_master_master_destination_suggestion(helper, client, bot_id, slave, channel):
+async def test_master_master_destination_suggestion(helper, client, bot_id, slave, channel,
+                                                    private_response):
     with patch.dict(channel.flag.config, send_to_last_chat="disabled"), \
          patch.multiple(channel.chat_dest_cache, enabled=False):
         assert not channel.chat_dest_cache.enabled
@@ -128,8 +160,17 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         await helper.wait_for_message_text(in_chats(bot_id) & regex(previous_message.text))
 
         content = "test_master_master_destination_suggestion this shall be replied with a list of candidates"
-        sent_message: Message = await client.send_message(bot_id, content)
-        message: Message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+        sent_message: Message | None = None
+
+        async def send_message() -> None:
+            nonlocal sent_message
+            sent_message = await client.send_message(bot_id, content)
+
+        message: Message = await private_response(
+            send_message,
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+        )
+        assert sent_message is not None
         buttons: List[List[MessageButton]] = message.buttons
         chat_buttons = [
             button
@@ -141,12 +182,23 @@ async def test_master_master_destination_suggestion(helper, client, bot_id, slav
         # await buttons[-1][0].click()  # Cancel the error message.
 
         await chat_buttons[0].click()  # deliver the message
+        await helper.wait_for_message(
+            in_chats(bot_id) & edited(message.id) & text
+            & regex(r"^Delivering the message to .+\.$")
+        )
+        slave_message = await asyncio.to_thread(slave.messages.get, timeout=15)
+        slave.messages.task_done()
+        assert slave_message.text == content
+        assert slave_message.chat == chat
         slave.clear_messages()
 
         content = "test_master_master_destination_suggestion edited message shall be delivered without a prompt"
         await sent_message.edit(text=content)
-        slave_message = slave.messages.get(timeout=15)
+        slave_message = await asyncio.to_thread(slave.messages.get, timeout=15)
+        slave.messages.task_done()
         assert slave_message.text == content
+        assert slave_message.chat == chat
+        assert slave_message.edit
 
 
 

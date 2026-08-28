@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
+import pytest
 import telegram
 from telegram import Update
 
@@ -12,17 +13,9 @@ from ehforwarderbot.types import ChatID
 
 from efb_telegram_master import utils
 from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
+from efb_telegram_master.constants import Flags
 from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
-from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
-from tests.integration.test_backfill_history import (
-    _expected_relink_send_count,
-    _migration_activity_completed,
-    _queue_activity_completed,
-    _queue_metrics_snapshot,
-)
-
-
 def _build_link_update(chat_id, *, is_forum=False):
     effective_chat = SimpleNamespace(id=chat_id, is_forum=is_forum, type="group")
     message = Mock()
@@ -53,96 +46,14 @@ def _sent_link_message(chat_id, message_id, sender_bot_id=None):
     return sent_message
 
 
-def test_backfill_queue_activity_requires_exact_success_without_failure_or_in_flight():
-    metrics = Metrics()
-    manager = SimpleNamespace(_metrics=metrics)
-    before = _queue_metrics_snapshot(manager)
-
-    for _ in range(2):
-        metrics.record_enqueued("normal", "send_message")
-    metrics.record_completion("normal", "send_message", "main", "success")
-    metrics.record_completion("normal", "send_message", "auxiliary", "success")
-    after = _queue_metrics_snapshot(manager)
-
-    assert _queue_activity_completed(before, after, expected_count=2)
-
-    metrics.record_completion("normal", "send_message", "auxiliary", "failure")
-    failed = _queue_metrics_snapshot(manager)
-    assert not _queue_activity_completed(before, failed, expected_count=2)
-
-    metrics.increment_in_flight("normal", "send_message", "main")
-    in_flight = _queue_metrics_snapshot(manager)
-    assert not _queue_activity_completed(failed, in_flight, expected_count=0)
-
-
-def test_backfill_relink_counts_status_send_separately_from_migrated_content():
-    metrics = Metrics()
-    manager = SimpleNamespace(_metrics=metrics)
-    before = _queue_metrics_snapshot(manager)
-    migrated_count = 2
-
-    for _ in range(migrated_count + 1):
-        metrics.record_enqueued("normal", "send_message")
-        metrics.record_completion("normal", "send_message", "main", "success")
-    after = _queue_metrics_snapshot(manager)
-
-    assert _expected_relink_send_count(migrated_count) == 3
-    assert _queue_activity_completed(
-        before,
-        after,
-        expected_count=_expected_relink_send_count(migrated_count),
-    )
-    assert _migration_activity_completed(
-        activity_observed=True,
-        expected={0, 1},
-        db_indices=[0, 1],
-        telegram_indices=[0, 1],
-        target_entry_count=0,
-        queue_completed=True,
-    )
-
-
-def test_backfill_migration_terminal_requires_observed_activity_and_empty_target_entries():
-    expected = {0, 1}
-    assert not _migration_activity_completed(
-        activity_observed=False,
-        expected=expected,
-        db_indices=[0, 1],
-        telegram_indices=[0, 1],
-        target_entry_count=0,
-        queue_completed=True,
-    )
-    assert not _migration_activity_completed(
-        activity_observed=True,
-        expected=expected,
-        db_indices=[0, 1],
-        telegram_indices=[0, 1, 1],
-        target_entry_count=0,
-        queue_completed=True,
-    )
-    assert not _migration_activity_completed(
-        activity_observed=True,
-        expected=expected,
-        db_indices=[0, 1],
-        telegram_indices=[0, 1],
-        target_entry_count=1,
-        queue_completed=True,
-    )
-    assert _migration_activity_completed(
-        activity_observed=True,
-        expected=expected,
-        db_indices=[0, 1],
-        telegram_indices=[0, 1],
-        target_entry_count=0,
-        queue_completed=True,
-    )
-
-
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    ChatBindingManager._set_conversation_state(
+        channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC
+    )
     update = _build_link_update(bot_group)
 
     sent_message = _sent_link_message(bot_group, 500)
@@ -155,7 +66,27 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
 
     migrate_chat_history.assert_called_once()
     send_history_link.assert_not_called()
+    assert storage_key not in channel.chat_binding.link_handler._conversations
     _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
+    chat = channel.chat_manager.update_chat_obj(slave.chat_with_alias)
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(106))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    ChatBindingManager._set_conversation_state(
+        channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC
+    )
+    update = _build_link_update(bot_group)
+
+    with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 506)), \
+         patch.object(chat, "link", side_effect=RuntimeError("link failed")):
+        with pytest.raises(RuntimeError, match="link failed"):
+            channel.chat_binding.link_chat(update, [token])
+
+    assert storage_key in channel.chat_binding.msg_storage
+    assert channel.chat_binding.link_handler._conversations[storage_key] == Flags.LINK_EXEC
 
 
 def test_link_chat_edits_status_message_with_sender_bot(channel, slave, bot_group):

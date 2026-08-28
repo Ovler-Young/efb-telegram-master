@@ -21,13 +21,14 @@ from telegram import (
     InputMediaDocument, InputMediaLivePhoto, InputMediaPhoto, InputMediaVideo, PhotoSize,
     Sticker, Video, Voice,
 )
+from telegram.error import RetryAfter
 
 
 @dataclass(frozen=True)
 class _DirectMediaArgument:
     index: int
     keyword: str
-    telegram_type: type
+    telegram_type: Optional[type]
 
 
 QUEUED_OPERATIONS = frozenset({
@@ -35,7 +36,10 @@ QUEUED_OPERATIONS = frozenset({
     "send_video", "send_animation", "send_voice", "send_sticker",
     "send_media_group", "copy_message", "forward_message",
     "edit_message_text", "edit_message_caption", "edit_message_media",
-    "delete_message",
+    "delete_message", "edit_message_reply_markup",
+    "send_location", "send_venue", "create_forum_topic", "edit_forum_topic",
+    "reopen_forum_topic", "set_chat_title", "set_chat_photo", "pin_chat_message",
+    "set_chat_description",
 })
 REQUIRED_SENDER_OPERATIONS = frozenset({
     "edit_message_text", "edit_message_caption", "edit_message_media", "delete_message",
@@ -49,6 +53,7 @@ _DIRECT_MEDIA_ARGUMENTS = {
     "send_sticker": _DirectMediaArgument(1, "sticker", Sticker),
     "send_video": _DirectMediaArgument(1, "video", Video),
     "send_voice": _DirectMediaArgument(1, "voice", Voice),
+    "set_chat_photo": _DirectMediaArgument(1, "photo", None),
 }
 _THUMBNAIL_OPERATIONS = frozenset({"send_animation", "send_audio", "send_document", "send_video"})
 _KEYWORD_MEDIA_ARGUMENTS = {"send_video": ("cover",)}
@@ -154,6 +159,21 @@ class SubmittedCall:
     future: Future
 
 
+@dataclass(frozen=True)
+class BlockingMediaRetry:
+    """An in-memory retry for one blocking media edit.
+
+    Blocking rows are intentionally removed before submission, so this state
+    must never survive a scheduler restart.
+    """
+
+    row: QueuedCall
+    selection: SenderSelection
+    retry_at: float
+    deadline: float
+    error: RetryAfter
+
+
 def _restore_inline_media(
     content: bytes,
     filename: Optional[str],
@@ -202,6 +222,11 @@ class QueueAdapter(Protocol):
     def record_queued_failure(
         self, row: QueuedCall, error: BaseException, selection: SenderSelection
     ) -> QueuedCompletionDecision:
+        ...
+
+    def record_queued_retry_after(
+        self, row: QueuedCall, error: RetryAfter, selection: SenderSelection
+    ) -> None:
         ...
 
     def record_queued_success(
@@ -678,6 +703,7 @@ class OutboundQueueScheduler:
         self.failure: Optional[QueuePersistenceError] = None
         self.in_flight: dict[int, SubmittedCall] = {}
         self.in_flight_destinations: set[int] = set()
+        self.blocking_media_retries: dict[int, BlockingMediaRetry] = {}
         self.next_deadline: Optional[float] = None
 
     @staticmethod
@@ -698,10 +724,108 @@ class OutboundQueueScheduler:
     def _wake_on_future_completion(self, _future: Future) -> None:
         self.wake_event.set()
 
+    @staticmethod
+    def _retry_after_seconds(error: RetryAfter) -> float:
+        retry_after = error.retry_after
+        return retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else float(retry_after)
+
+    @staticmethod
+    def _is_blocking_media_retry(row: QueuedCall, error: BaseException) -> bool:
+        return (
+            row.priority == 1
+            and row.operation == "edit_message_media"
+            and isinstance(error, RetryAfter)
+        )
+
+    def _fail_blocking_retry(self, retry: BlockingMediaRetry, error: BaseException) -> None:
+        # A delayed retry retains the manager's database-update context.  Claim
+        # it before completing the terminal adapter path so concurrent terminal
+        # conditions cannot consume that context or fail the waiter twice.
+        if self.blocking_media_retries.pop(retry.row.id, None) is not retry:
+            return
+        self.adapter.record_queued_failure(retry.row, error, retry.selection)
+        self.queue.fail_waiter(retry.row.id, error)
+        if self.queue.metrics is not None:
+            self.queue.metrics.record_completion(
+                retry.row.priority, retry.row.operation,
+                self._sender_kind(retry.selection), "failure"
+            )
+
+    def _schedule_blocking_retry_before_deadline(
+        self, retry: BlockingMediaRetry, retry_at: Optional[float] = None
+    ) -> bool:
+        """Schedule a retry only while its original wall-clock deadline remains valid."""
+        remaining = retry.deadline - time.time()
+        if remaining <= 0:
+            self._fail_blocking_retry(retry, retry.error)
+            return False
+        deadline_at = time.monotonic() + remaining
+        self._schedule_retry(deadline_at if retry_at is None else min(retry_at, deadline_at))
+        return True
+
+    def _dispatch_blocking_media_retries(self) -> None:
+        now = time.monotonic()
+        for row_id, retry in tuple(self.blocking_media_retries.items()):
+            if retry.retry_at > now:
+                self._schedule_blocking_retry_before_deadline(retry, retry.retry_at)
+                continue
+            if time.time() >= retry.deadline:
+                self._fail_blocking_retry(retry, retry.error)
+                continue
+            if retry.row.telegram_chat_id in self.in_flight_destinations:
+                self._schedule_blocking_retry_before_deadline(retry)
+                continue
+            if not self._permits.acquire(blocking=False):
+                self._schedule_blocking_retry_before_deadline(retry)
+                continue
+            decision = self.adapter.select_sender(retry.row, now)
+            if decision.terminal_error_class is not None:
+                self._permits.release()
+                self._fail_blocking_retry(
+                    retry, RequiredSenderUnavailableError(decision.terminal_error_class)
+                )
+                continue
+            if decision.selection is None:
+                self._permits.release()
+                if decision.retry_at is not None:
+                    self._schedule_blocking_retry_before_deadline(retry, decision.retry_at)
+                continue
+            if (
+                decision.selection.sender is not retry.selection.sender
+                or decision.selection.sender_bot_id != retry.selection.sender_bot_id
+            ):
+                self._permits.release()
+                self._fail_blocking_retry(retry, retry.error)
+                continue
+            if not self.adapter.acquire_sender_limits(retry.selection, retry.row.telegram_chat_id):
+                self._permits.release()
+                self._schedule_blocking_retry_before_deadline(retry, now + 0.25)
+                continue
+            try:
+                args, kwargs = self.queue.decode_payload(retry.row.payload)
+                future = self.executor.submit(
+                    self.adapter.execute_queued_call, retry.row, args, kwargs, retry.selection
+                )
+            except BaseException as error:
+                self._permits.release()
+                self._fail_blocking_retry(retry, error)
+                continue
+            self.blocking_media_retries.pop(row_id, None)
+            future.add_done_callback(self._wake_on_future_completion)
+            self.in_flight[row_id] = SubmittedCall(retry.row, retry.selection, future)
+            self.in_flight_destinations.add(retry.row.telegram_chat_id)
+            if self.queue.metrics is not None:
+                self.queue.metrics.increment_in_flight(
+                    retry.row.priority, retry.row.operation, self._sender_kind(retry.selection)
+                )
+
     def _stop_for_persistence_error(self, error: Exception) -> None:
-        persistence_error = QueuePersistenceError("Outbound queue deletion failed.")
-        persistence_error.__cause__ = error
-        self.failure = persistence_error
+        if self.failure is None:
+            persistence_error = QueuePersistenceError("Outbound queue deletion failed.")
+            persistence_error.__cause__ = error
+            self.failure = persistence_error
+        else:
+            persistence_error = self.failure
         self.stopping = True
         self.queue.fail_all_waiters(persistence_error)
         self.wake_event.set()
@@ -711,8 +835,12 @@ class OutboundQueueScheduler:
             if self.stopping:
                 return
             self.next_deadline = None
+            self._dispatch_blocking_media_retries()
+            retry_destinations = {
+                retry.row.telegram_chat_id for retry in self.blocking_media_retries.values()
+            }
             for row in self.queue.heads():
-                if row.telegram_chat_id in self.in_flight_destinations:
+                if row.telegram_chat_id in self.in_flight_destinations or row.telegram_chat_id in retry_destinations:
                     continue
                 try:
                     args, kwargs = self.queue.decode_payload(row.payload)
@@ -737,7 +865,8 @@ class OutboundQueueScheduler:
                         self._stop_for_persistence_error(delete_error)
                         return
                     self._record_terminal_discard(row)
-                    self.queue.fail_waiter(row.id, RequiredSenderUnavailableError(decision.terminal_error_class))
+                    unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
+                    self.queue.fail_waiter(row.id, unavailable_error)
                     continue
                 if decision.selection is None:
                     self._permits.release()
@@ -746,7 +875,8 @@ class OutboundQueueScheduler:
                     continue
                 if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
                     self._permits.release()
-                    self._schedule_retry(now + 0.25)
+                    retry_at = now + 0.25
+                    self._schedule_retry(retry_at)
                     continue
                 retained = row.priority == 0
                 if not retained:
@@ -768,7 +898,8 @@ class OutboundQueueScheduler:
                     if retained:
                         self._schedule_retry(now + 0.25)
                     else:
-                        self.queue.fail_waiter(row.id, ExecutorSubmitError("Unable to submit queued Telegram call."))
+                        error = ExecutorSubmitError("Unable to submit queued Telegram call.")
+                        self.queue.fail_waiter(row.id, error)
                     continue
                 future.add_done_callback(self._wake_on_future_completion)
                 self.in_flight[row.id] = SubmittedCall(row, decision.selection, future)
@@ -795,6 +926,20 @@ class OutboundQueueScheduler:
                 try:
                     result = submitted.future.result()
                 except BaseException as error:
+                    if self._is_blocking_media_retry(submitted.row, error):
+                        assert isinstance(error, RetryAfter)
+                        retry_after = self._retry_after_seconds(error)
+                        deadline = submitted.row.created_at + 300.0
+                        if not self.stopping and time.time() + retry_after <= deadline:
+                            self.adapter.record_queued_retry_after(
+                                submitted.row, error, submitted.selection
+                            )
+                            retry_at = time.monotonic() + retry_after
+                            self.blocking_media_retries[row_id] = BlockingMediaRetry(
+                                submitted.row, submitted.selection, retry_at, deadline, error
+                            )
+                            self._schedule_retry(retry_at)
+                            continue
                     decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
                     if decision.kind == "retry_eventual" and submitted.row.priority == 0:
                         if self.stopping:
@@ -840,7 +985,9 @@ class OutboundQueueScheduler:
     def stop_and_drain(self, timeout: float = 5.0) -> None:
         with self._lock:
             self.stopping = True
-            stopped_error = SchedulerStoppedError("Outbound scheduler stopped.")
+            stopped_error = self.failure or SchedulerStoppedError("Outbound scheduler stopped.")
+            for retry in tuple(self.blocking_media_retries.values()):
+                self._fail_blocking_retry(retry, stopped_error)
             for row_id in tuple(self.queue.waiters):
                 if row_id not in self.in_flight:
                     self.queue.fail_waiter(row_id, stopped_error)

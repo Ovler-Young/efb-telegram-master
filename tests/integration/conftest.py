@@ -1,18 +1,30 @@
 import asyncio
+import inspect
 import logging
 import threading
 import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Set
 
 import pytest
+import pytest_asyncio
 from telethon import TelegramClient
 
-from .helper.helper import TelegramIntegrationTestHelper
+from efb_telegram_master import TelegramChannel
+
+from .helper.helper import TelegramIntegrationTestHelper, wait_for_private_response
 from ..bot import get_user_session
 
 pytest.register_assert_rewrite("tests.integration.utils")
 
+
+def pytest_collection_modifyitems(items):
+    """Keep the shared Telethon client and its consumers on one event loop."""
+    integration_directory = Path(__file__).parent
+    for item in items:
+        if integration_directory in item.path.parents and inspect.iscoroutinefunction(item.obj):
+            item.add_marker(pytest.mark.asyncio(loop_scope="session"), append=False)
 
 @pytest.fixture(scope="session")
 def user_session_info():
@@ -46,7 +58,7 @@ def filter_chats(bot_id, bot_groups, bot_channels, bot_topic_group) -> Set[int]:
     return chats
 
 
-@pytest.fixture(scope="function")
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def helper_wrap(user_session, api_id, api_hash, bot_id,
                       filter_chats, aux_bot_ids) -> AsyncGenerator[TelegramIntegrationTestHelper, None]:
     loop = asyncio.get_running_loop()
@@ -66,17 +78,10 @@ async def helper(helper_wrap, slave) -> AsyncGenerator[TelegramIntegrationTestHe
     assert slave.messages.empty()
     slave.clear_statuses()
     assert slave.statuses.empty()
-    yield helper_wrap
-
-
-@pytest.fixture(scope="function", autouse=True)
-async def rate_limit_delay():
-    """
-    Telegram Bot API rate limits are easy to hit in CI.
-    Add a small delay between integration tests to reduce flakiness.
-    """
-    yield
-    await asyncio.sleep(6)
+    try:
+        yield helper_wrap
+    finally:
+        helper_wrap.clear_queue()
 
 
 @pytest.fixture(scope="session")
@@ -184,3 +189,19 @@ def poll_bot(channel, poll_bot_factory):
 @pytest.fixture(scope="function")
 async def client(helper_wrap) -> AsyncGenerator[TelegramClient, None]:
     yield helper_wrap.client
+
+
+def _primary_bot_limiter_delay(channel: TelegramChannel, target_chat_id: int) -> float:
+    """Local integration seam for observing the primary bot's outbound limiter."""
+    return channel.bot_manager._rate_limiter.peek_delay(target_chat_id)
+
+
+@pytest.fixture
+def private_response(channel: TelegramChannel, bot_id: int):
+    """Wait for a private response within one deadline."""
+    async def wait(trigger, receive, *, source_channel: TelegramChannel = channel,
+                   target_chat_id: int = bot_id):
+        limiter_delay = lambda: _primary_bot_limiter_delay(source_channel, target_chat_id)
+        return await wait_for_private_response(limiter_delay, trigger, receive)
+
+    return wait

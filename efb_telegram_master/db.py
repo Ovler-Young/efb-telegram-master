@@ -234,8 +234,8 @@ class DatabaseManager:
         db_type = db_config.get('type', 'sqlite')
 
         if db_type == 'postgresql':
-            from playhouse.pool import PooledPostgresqlExtDatabase
             from playhouse.migrate import PostgresqlMigrator
+            from playhouse.postgres_ext import PooledPostgresqlExtDatabase
             actual_db = PooledPostgresqlExtDatabase(
                 db_config.get('database', 'efb_telegram'),
                 host=db_config.get('host', 'localhost'),

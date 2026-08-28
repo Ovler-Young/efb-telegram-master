@@ -327,7 +327,6 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
 ) -> None:
     manager = object.__new__(TelegramBotManager)
     manager._bot_chat_disabled_until = {("10", 100): 1_111.0}
-    manager._bot_chat_retry_failures = {("10", 100): 2}
     manager.bot_pool = None
     task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
     selection = SimpleNamespace(sender_bot_id="10")
@@ -335,8 +334,7 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
 
     retry = manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
     assert retry.kind.name == "RETRY_EVENTUAL"
-    assert retry.retry_at == 1_120.0
-    assert manager._bot_chat_retry_failures == {("10", 100): 3}
+    assert retry.retry_at == 1_020.0
 
     blocking = manager.record_queued_failure(
         SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=1),
@@ -344,20 +342,17 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
         selection,
     )
     assert blocking.kind.name == "TERMINAL_FAILURE"
-    assert manager._bot_chat_retry_failures == {("10", 100): 3}
 
 
-def test_terminal_eventual_failure_clears_streak_without_clearing_cooldown() -> None:
+def test_terminal_eventual_failure_does_not_clear_existing_cooldown() -> None:
     manager = object.__new__(TelegramBotManager)
     manager._bot_chat_disabled_until = {("10", 100): 1_025.0}
-    manager._bot_chat_retry_failures = {("10", 100): 1}
     manager.bot_pool = None
     task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
 
     decision = manager.record_queued_failure(task, Exception("send failed"), SimpleNamespace(sender_bot_id="10"))
 
     assert decision.kind.name == "TERMINAL_FAILURE"
-    assert manager._bot_chat_retry_failures == {}
     assert manager._bot_chat_disabled_until == {("10", 100): 1_025.0}
 
 
@@ -736,7 +731,6 @@ def test_queued_success_writes_deferred_db_mapping_once():
     on_complete = Mock()
     manager._queued_db_log_contexts = {7: QueuedDbLogContext(etm_msg, old_msg_id, on_complete)}
     manager._queued_db_log_context_lock = threading.Lock()
-    manager._bot_chat_retry_failures = {}
     manager.bot_pool = None
     manager._write_database_update = Mock()
     row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
@@ -788,7 +782,6 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     manager._queued_db_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
     manager._queued_db_log_context_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
-    manager._bot_chat_retry_failures = {}
     manager.bot_pool = None
     row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
 
@@ -931,21 +924,17 @@ def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():
     )
 
 
-@pytest.mark.parametrize(
-    ("operation", "args"),
-    [
-        ("edit_message_reply_markup", ()),
-        ("send_location", (123, 1.0, 2.0)),
-        ("send_venue", (123, 1.0, 2.0, "title", "address")),
-        ("get_me", ()),
-    ],
-)
-def test_direct_operations_strip_private_queue_metadata_before_calling_bot(operation, args):
+def test_queued_chat_mutation_strips_private_queue_metadata_before_enqueue():
     manager = _make_queueing_manager()
-    getattr(manager._bot, operation).return_value = operation
 
-    result = getattr(manager, operation)(
-        *args,
+    def send_location(chat_id, latitude, longitude):
+        return chat_id, latitude, longitude
+
+    manager._bot.send_location = send_location
+    manager._enqueue_blocking_api_operation = Mock(return_value=True)
+
+    result = manager.send_location(
+        123, 1.0, 2.0,
         _sender_bot_id="777",
         _slave_id="slave.chat",
         _send_mode="eventual",
@@ -954,14 +943,19 @@ def test_direct_operations_strip_private_queue_metadata_before_calling_bot(opera
         _queued_db_log_context=Mock(),
     )
 
-    assert result == operation
-    getattr(manager._bot, operation).assert_called_once_with(*args)
-    manager._enqueue_blocking_send_and_wait.assert_not_called()
+    assert result is True
+    request = manager._enqueue_blocking_api_operation.call_args.kwargs
+    assert request["kwargs"] == {}
+    assert request["required_sender_bot_id"] == "__main__"
 
 
-def test_rate_limit_decorators_no_longer_exist():
-    assert not hasattr(TelegramBotManager.Decorators, "rate_limit_decorator")
-    assert not hasattr(TelegramBotManager.Decorators, "handle_rate_limit_error")
+def test_direct_operation_strips_private_queue_metadata_before_calling_bot():
+    manager = _make_queueing_manager()
+    manager._bot.get_me.return_value = "bot"
+
+    assert manager.get_me(_send_mode="eventual") == "bot"
+
+    manager._bot.get_me.assert_called_once_with()
 
 
 def test_async_runtime_call_waits_for_bound_loop_before_falling_back():
