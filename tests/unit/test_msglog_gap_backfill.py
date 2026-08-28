@@ -1,0 +1,179 @@
+import datetime
+from types import SimpleNamespace
+
+import pytest
+from peewee import SqliteDatabase
+
+from efb_telegram_master.db import MsgLog, SYNTHETIC_MSGLOG_PREFIX, TopicAssoc, database
+from efb_telegram_master.msglog_backfill import (
+    BackfillRow,
+    MsgLogBackfillStore,
+    MsgLogGap,
+    MsgLogGapBackfiller,
+    TelethonHistorySource,
+)
+
+
+@pytest.fixture
+def msglog_database():
+    sqlite = SqliteDatabase(":memory:")
+    database.initialize(sqlite)
+    sqlite.connect()
+    sqlite.create_tables([MsgLog, TopicAssoc])
+    yield sqlite
+    sqlite.close()
+
+
+def _log(message_id: int, *, chat_id: int = -100) -> None:
+    MsgLog.create(
+        master_msg_id=f"{chat_id}.{message_id}",
+        slave_message_id=f"source-{message_id}",
+        text="existing",
+        slave_origin_uid="tests.mocks.slave chat",
+        slave_member_uid="tests.mocks.slave __self__",
+        media_type="Text",
+        msg_type="Text",
+        sent_to="blueset.telegram",
+    )
+
+
+def _message(message_id: int, sender_id: int, *, topic_id: int = 9, text: str = "content"):
+    return SimpleNamespace(
+        id=message_id,
+        sender_id=sender_id,
+        reply_to=SimpleNamespace(reply_to_top_id=topic_id),
+        message=text,
+        media=None,
+        action=None,
+        date=datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc),
+    )
+
+
+class _History:
+    def __init__(self, messages_by_gap, *, fail_at=None):
+        self.messages_by_gap = messages_by_gap
+        self.fail_at = fail_at
+        self.started = []
+
+    async def iter_gap(self, gap):
+        self.started.append(gap)
+        if gap == self.fail_at:
+            raise RuntimeError("history failed")
+        for message in self.messages_by_gap.get(gap, ()):
+            yield message
+
+
+def test_gap_discovery_uses_strict_threshold_and_numeric_chat_order(msglog_database):
+    for message_id in (1, 22, 23):
+        _log(message_id, chat_id=-10)
+    for message_id in (1, 23):
+        _log(message_id, chat_id=-20)
+    MsgLog.create(
+        master_msg_id="invalid",
+        slave_message_id="invalid",
+        text="",
+        slave_origin_uid="tests.mocks.slave chat",
+        slave_member_uid="tests.mocks.slave __self__",
+        media_type="Text",
+        msg_type="Text",
+        sent_to="blueset.telegram",
+    )
+
+    assert MsgLogBackfillStore().find_gaps() == [MsgLogGap(-20, 1, 23)]
+
+
+@pytest.mark.asyncio
+async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration():
+    calls = []
+
+    class Client:
+        def iter_messages(self, chat_id, **kwargs):
+            calls.append((chat_id, kwargs))
+
+            async def messages():
+                for message_id in (11, 12):
+                    yield SimpleNamespace(id=message_id)
+
+            return messages()
+
+    gap = MsgLogGap(-100, 10, 13)
+    received = [message.id async for message in TelethonHistorySource(Client()).iter_gap(gap)]
+
+    assert received == [11, 12]
+    assert calls == [(-100, {"min_id": 10, "max_id": 13, "reverse": True})]
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_serial_stops_on_failure_and_preserves_sender_identity(msglog_database):
+    for message_id in (1, 23, 50):
+        _log(message_id)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    first = MsgLogGap(-100, 1, 23)
+    second = MsgLogGap(-100, 23, 50)
+    history = _History({first: [_message(2, 1000), _message(3, 2000)]}, fail_at=second)
+
+    with pytest.raises(RuntimeError, match="history failed"):
+        await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
+
+    assert history.started == [first, second]
+    rows = list(MsgLog.select().where(MsgLog.master_msg_id.in_(["-100.2", "-100.3"])).order_by(MsgLog.master_msg_id))
+    assert [(row.master_msg_id, row.sender_bot_id, row.slave_origin_uid) for row in rows] == [
+        ("-100.2", None, "tests.mocks.slave chat"),
+        ("-100.3", "2000", "tests.mocks.slave chat"),
+    ]
+
+
+def _row(message_id: int, text: str = "new") -> BackfillRow:
+    return BackfillRow(
+        master_msg_id=f"-100.{message_id}",
+        slave_message_id=f"{SYNTHETIC_MSGLOG_PREFIX}-100.{message_id}",
+        text=text,
+        slave_origin_uid="tests.mocks.slave chat",
+        slave_member_uid="tests.mocks.slave __self__",
+        media_type="Text",
+        mime=None,
+        msg_type="Text",
+        sent_to="blueset.telegram",
+        sender_bot_id=None,
+        time=None,
+    )
+
+
+def test_gap_insert_rolls_back_all_chunks_and_does_not_overwrite(msglog_database):
+    class FailingStore(MsgLogBackfillStore):
+        INSERT_CHUNK_SIZE = 1
+
+        def __init__(self):
+            self.calls = 0
+
+        def _insert_batch(self, rows):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("write failed")
+            return super()._insert_batch(rows)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        FailingStore().insert_gap([_row(2), _row(3)])
+    assert MsgLog.select().where(MsgLog.master_msg_id.in_(["-100.2", "-100.3"])).count() == 0
+
+    _log(2)
+    assert MsgLogBackfillStore().insert_gap([_row(2, "replacement"), _row(3)]) == 1
+    assert MsgLog.get_by_id("-100.2").text == "existing"
+    assert MsgLog.get_by_id("-100.3").text == "new"
+
+
+@pytest.mark.asyncio
+async def test_unmapped_and_service_messages_are_skipped_as_one_completed_gap(msglog_database):
+    for message_id in (1, 23):
+        _log(message_id)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    gap = MsgLogGap(-100, 1, 23)
+    service = _message(3, 1000)
+    service.action = object()
+    history = _History({gap: [_message(2, 1000, topic_id=99), service, _message(4, 1000)]})
+
+    results = await MsgLogGapBackfiller(MsgLogBackfillStore(), history, main_bot_id=1000).run()
+
+    assert results[0].inserted == 1
+    assert results[0].skipped == {"unmapped": 1, "service": 1, "deleted": 18}
+    assert MsgLog.get_by_id("-100.4").slave_origin_uid == "tests.mocks.slave chat"

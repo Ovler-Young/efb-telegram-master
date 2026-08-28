@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from .chat import ETMChatMember, ETMChatType
 
 database = DatabaseProxy()
+SYNTHETIC_MSGLOG_PREFIX = "mtproto-backfill:"
 
 
 class DatabaseMetrics(Protocol):

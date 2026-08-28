@@ -72,6 +72,9 @@ setup(
     ],
     extras_require={
         "tests": tests_require,
+        "msglog-backfill": [
+            "telethon",
+        ],
         "tgs": [
             "lottie",
             "cairosvg",  # required by ``lottie`` to export GIF
@@ -82,6 +85,7 @@ setup(
     },
     entry_points={
         "ehforwarderbot.master": "blueset.telegram = efb_telegram_master:TelegramChannel",
-        "ehforwarderbot.wizard": "blueset.telegram = efb_telegram_master.wizard:wizard"
+        "ehforwarderbot.wizard": "blueset.telegram = efb_telegram_master.wizard:wizard",
+        "console_scripts": "etm-msglog-backfill = efb_telegram_master.msglog_backfill:main",
     }
 )
