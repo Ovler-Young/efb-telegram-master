@@ -2,15 +2,13 @@ import os
 import logging
 import pickle
 import uuid
-from datetime import datetime
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 from prometheus_client import generate_latest
 
-from ehforwarderbot import Message, MsgType
+from ehforwarderbot import MsgType
 from ehforwarderbot.types import MessageID
 
 from efb_telegram_master import db as db_module
