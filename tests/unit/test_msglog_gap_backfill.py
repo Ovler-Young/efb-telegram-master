@@ -528,7 +528,6 @@ def test_snapshot_advances_interior_legacy_checkpoint_to_the_first_unread_messag
 async def test_legacy_leading_checkpoint_includes_message_id_one(msglog_database):
     MsgLogBackfillCheckpoint.create(chat_id=-100, left=1, right=43, cursor=1)
     TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
-    legacy_gap = MsgLogGap(-100, 1, 43)
     normalized_gap = MsgLogGap(-100, 0, 43)
     history = _History({normalized_gap: [_message(1, 1000)]})
     store = MsgLogBackfillStore()
