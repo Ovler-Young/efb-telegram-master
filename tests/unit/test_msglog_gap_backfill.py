@@ -115,12 +115,17 @@ async def test_telethon_history_uses_exclusive_anchors_and_ascending_iteration()
 
             return messages()
 
-    gap = MsgLogGap(-100, 10, 13)
+    gap = MsgLogGap(-100, 1, 13)
     source = TelethonHistorySource(Client())
     received = [message.id async for message in source.iter_gap(gap)]
 
     assert received == [11, 12]
-    assert calls == [(-100, {"min_id": 10, "max_id": 13, "reverse": True})]
+    assert calls == [(-100, {
+        "min_id": 1,
+        "max_id": 13,
+        "offset_date": msglog_backfill.RECOVERY_SCAN_START,
+        "reverse": True,
+    })]
 
 
 @pytest.mark.asyncio
@@ -213,11 +218,16 @@ async def test_command_starts_main_and_auxiliary_bot_history_sources(tmp_path, m
             self.api_hash = api_hash
             self.receive_updates = receive_updates
             self.started_with = None
+            self.verified = False
             self.disconnected = False
             clients.append(self)
 
         async def start(self, *, bot_token):
             self.started_with = bot_token
+
+        async def get_me(self):
+            self.verified = True
+            return SimpleNamespace(id=int(self.started_with.partition(":")[0]), bot=True)
 
         async def disconnect(self):
             self.disconnected = True
@@ -258,8 +268,67 @@ async def test_command_starts_main_and_auxiliary_bot_history_sources(tmp_path, m
         str(tmp_path / "backfill-2000"),
         str(tmp_path / "backfill-3000"),
     ]
-    assert all(client.receive_updates is False and client.disconnected for client in clients)
+    assert all(client.receive_updates is False and client.verified and client.disconnected for client in clients)
     assert len(captured["histories"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_command_ignores_nonmatching_bot_session_and_uses_verified_source(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        'token: "1000:main"\n'
+        'auxiliary_bots:\n'
+        '  - token: "2000:auxiliary"\n'
+    )
+    clients = []
+    captured = {}
+
+    class Client:
+        def __init__(self, session, api_id, api_hash, *, receive_updates):
+            self.started_with = None
+            self.disconnected = False
+            clients.append(self)
+
+        async def start(self, *, bot_token):
+            self.started_with = bot_token
+
+        async def get_me(self):
+            if self.started_with.startswith("1000:"):
+                return SimpleNamespace(id=9999, bot=False)
+            return SimpleNamespace(id=2000, bot=True)
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    class Manager:
+        def __init__(self, channel):
+            self.channel = channel
+
+        def stop_worker(self):
+            pass
+
+    class Backfiller:
+        def __init__(self, store, histories, *, main_bot_id):
+            captured["histories"] = histories
+            captured["main_bot_id"] = main_bot_id
+
+        async def run(self):
+            return []
+
+    monkeypatch.setattr(msglog_backfill, "get_config_path", lambda channel_id: config_path)
+    monkeypatch.setattr(msglog_backfill, "DatabaseManager", Manager)
+    monkeypatch.setattr(msglog_backfill, "MsgLogGapBackfiller", Backfiller)
+    monkeypatch.setitem(sys.modules, "telethon", SimpleNamespace(TelegramClient=Client))
+
+    results = await msglog_backfill._run_command(SimpleNamespace(
+        profile="default", session=tmp_path / "backfill", api_id=1, api_hash="hash"
+    ))
+
+    assert results == []
+    assert captured["main_bot_id"] == 1000
+    assert len(captured["histories"]) == 1
+    assert captured["histories"][0].client is clients[1]
+    assert all(client.disconnected for client in clients)
 
 
 def _row(message_id: int, text: str = "new") -> BackfillRow:

@@ -25,6 +25,7 @@ from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 CHANNEL_ID = ModuleID("blueset.telegram")
 GAP_THRESHOLD = 20
 LOSS_INTRODUCED_AT = datetime.datetime(2026, 7, 14, 18, 22, 3, tzinfo=datetime.timezone.utc)
+RECOVERY_SCAN_START = datetime.datetime(2026, 7, 13, tzinfo=datetime.timezone.utc)
 
 
 @dataclass(frozen=True, order=True)
@@ -73,6 +74,7 @@ class TelethonHistorySource:
             gap.chat_id,
             min_id=gap.left,
             max_id=gap.right,
+            offset_date=RECOVERY_SCAN_START,
             reverse=True,
         )
         async for message in iterator:
@@ -340,9 +342,18 @@ async def _run_command(args: argparse.Namespace) -> list[GapResult]:
             )
             try:
                 await client.start(bot_token=bot_token)
+                bot = await client.get_me()
+                if (
+                    not bool(getattr(bot, "bot", False))
+                    or getattr(bot, "id", None) != int(bot_id)
+                ):
+                    raise ValueError(f"Telethon session does not belong to configured bot {bot_id}")
             except Exception as error:
                 failures.append(error)
-                await client.disconnect()
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 continue
             clients.append(client)
             histories.append(TelethonHistorySource(client))
