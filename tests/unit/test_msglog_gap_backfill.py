@@ -1,4 +1,5 @@
 import datetime
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -15,6 +16,7 @@ from efb_telegram_master.msglog_backfill import (
     MsgLogGapBackfiller,
     TelethonHistorySource,
 )
+import efb_telegram_master.msglog_backfill as msglog_backfill
 
 
 @pytest.fixture
@@ -56,7 +58,7 @@ def _message(
         message=text,
         media=None,
         action=None,
-        date=datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc),
+        date=datetime.datetime(2026, 7, 15, tzinfo=datetime.timezone.utc),
     )
 
 
@@ -91,6 +93,12 @@ def test_gap_discovery_uses_strict_threshold_and_numeric_chat_order(msglog_datab
     )
 
     assert MsgLogBackfillStore().find_gaps() == [MsgLogGap(-20, 1, 23)]
+
+
+def test_gap_discovery_uses_id_one_as_the_virtual_leading_bound(msglog_database):
+    _log(23)
+
+    assert MsgLogBackfillStore().find_gaps() == [MsgLogGap(-100, 1, 23)]
 
 
 @pytest.mark.asyncio
@@ -137,6 +145,121 @@ async def test_backfill_is_serial_stops_on_failure_and_preserves_sender_identity
         ("-100.2", None, "tests.mocks.slave chat"),
         ("-100.3", "2000", "tests.mocks.slave chat"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_backfill_excludes_messages_before_the_loss_cutoff(msglog_database):
+    for message_id in (1, 23):
+        _log(message_id)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    gap = MsgLogGap(-100, 1, 23)
+    before_loss = _message(2, 1000)
+    eastern = datetime.timezone(datetime.timedelta(hours=2))
+    before_loss.date = datetime.datetime(2026, 7, 14, 20, 22, 2, tzinfo=eastern)
+    at_loss = _message(3, 1000)
+    at_loss.date = datetime.datetime(2026, 7, 14, 20, 22, 3, tzinfo=eastern)
+
+    results = await MsgLogGapBackfiller(
+        MsgLogBackfillStore(), _History({gap: [before_loss, at_loss]}), main_bot_id=1000
+    ).run()
+
+    assert results[0].skipped == {"before_loss": 1, "deleted": 19}
+    assert MsgLog.get_or_none(MsgLog.master_msg_id == "-100.2") is None
+    assert MsgLog.get_by_id("-100.3").time == at_loss.date
+
+
+@pytest.mark.asyncio
+async def test_backfill_merges_available_histories_in_message_order(msglog_database):
+    for message_id in (1, 23):
+        _log(message_id)
+    TopicAssoc.create(topic_chat_id="-100", message_thread_id="9", slave_uid="tests.mocks.slave chat")
+    gap = MsgLogGap(-100, 1, 23)
+    primary = _History({gap: [_message(2, 1000), _message(4, 1000)]})
+    unavailable = _History({}, fail_at=gap)
+    auxiliary = _History({gap: [_message(2, 1000), _message(3, 2000)]})
+
+    results = await MsgLogGapBackfiller(
+        MsgLogBackfillStore(), [primary, unavailable, auxiliary], main_bot_id=1000
+    ).run()
+
+    assert results[0].inserted == 3
+    assert unavailable.started == [gap]
+    rows = list(MsgLog.select().where(
+        MsgLog.master_msg_id.in_(["-100.2", "-100.3", "-100.4"])
+    ).order_by(MsgLog.master_msg_id))
+    assert [(row.master_msg_id, row.sender_bot_id) for row in rows] == [
+        ("-100.2", None),
+        ("-100.3", "2000"),
+        ("-100.4", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_command_starts_main_and_auxiliary_bot_history_sources(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        'token: "1000:main"\n'
+        'auxiliary_bots:\n'
+        '  - token: "2000:auxiliary-one"\n'
+        '  - token: "3000:auxiliary-two"\n'
+    )
+    clients = []
+    captured = {}
+
+    class Client:
+        def __init__(self, session, api_id, api_hash, *, receive_updates):
+            self.session = session
+            self.api_id = api_id
+            self.api_hash = api_hash
+            self.receive_updates = receive_updates
+            self.started_with = None
+            self.disconnected = False
+            clients.append(self)
+
+        async def start(self, *, bot_token):
+            self.started_with = bot_token
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    class Manager:
+        stopped = False
+
+        def __init__(self, channel):
+            self.channel = channel
+
+        def stop_worker(self):
+            self.stopped = True
+
+    class Backfiller:
+        def __init__(self, store, histories, *, main_bot_id):
+            captured["histories"] = histories
+            captured["main_bot_id"] = main_bot_id
+
+        async def run(self):
+            return []
+
+    monkeypatch.setattr(msglog_backfill, "get_config_path", lambda channel_id: config_path)
+    monkeypatch.setattr(msglog_backfill, "DatabaseManager", Manager)
+    monkeypatch.setattr(msglog_backfill, "MsgLogGapBackfiller", Backfiller)
+    monkeypatch.setitem(sys.modules, "telethon", SimpleNamespace(TelegramClient=Client))
+
+    results = await msglog_backfill._run_command(SimpleNamespace(
+        profile="default", session=tmp_path / "backfill", api_id=1, api_hash="hash"
+    ))
+
+    assert results == []
+    assert captured["main_bot_id"] == 1000
+    assert [client.started_with for client in clients] == [
+        "1000:main", "2000:auxiliary-one", "3000:auxiliary-two"
+    ]
+    assert [client.session for client in clients] == [
+        str(tmp_path / "backfill-1000"),
+        str(tmp_path / "backfill-2000"),
+        str(tmp_path / "backfill-3000"),
+    ]
+    assert all(client.receive_updates is False and client.disconnected for client in clients)
+    assert len(captured["histories"]) == 3
 
 
 def _row(message_id: int, text: str = "new") -> BackfillRow:

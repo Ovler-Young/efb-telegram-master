@@ -24,6 +24,7 @@ from .utils import EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str
 
 CHANNEL_ID = ModuleID("blueset.telegram")
 GAP_THRESHOLD = 20
+LOSS_INTRODUCED_AT = datetime.datetime(2026, 7, 14, 18, 22, 3, tzinfo=datetime.timezone.utc)
 
 
 @dataclass(frozen=True, order=True)
@@ -97,6 +98,8 @@ class MsgLogBackfillStore:
         gaps: list[MsgLogGap] = []
         for chat_id in sorted(message_ids):
             ordered = sorted(set(message_ids[chat_id]))
+            if ordered and ordered[0] - 1 > GAP_THRESHOLD:
+                gaps.append(MsgLogGap(chat_id, 1, ordered[0]))
             gaps.extend(
                 MsgLogGap(chat_id, left, right)
                 for left, right in zip(ordered, ordered[1:])
@@ -146,9 +149,17 @@ class MsgLogBackfillStore:
 
 
 class MsgLogGapBackfiller:
-    def __init__(self, store: MsgLogBackfillStore, history: HistorySource, *, main_bot_id: int) -> None:
+    def __init__(
+        self,
+        store: MsgLogBackfillStore,
+        history: HistorySource | Sequence[HistorySource],
+        *,
+        main_bot_id: int,
+    ) -> None:
         self.store = store
-        self.history = history
+        self.histories = tuple(history) if isinstance(history, Sequence) else (history,)
+        if not self.histories:
+            raise ValueError("At least one Telegram history source is required")
         self.main_bot_id = main_bot_id
 
     async def run(self) -> list[GapResult]:
@@ -163,24 +174,47 @@ class MsgLogGapBackfiller:
         associations = self.store.topic_associations(gap.chat_id)
         rows: list[BackfillRow] = []
         skipped: Counter[str] = Counter()
+        messages_by_id: dict[int, object] = {}
+        failures: list[Exception] = []
+        successful_sources = 0
+        for history in self.histories:
+            try:
+                messages = await self._read_gap(history, gap)
+            except Exception as error:
+                failures.append(error)
+                continue
+            successful_sources += 1
+            for message in messages:
+                messages_by_id.setdefault(int(getattr(message, "id")), message)
+
+        if not successful_sources:
+            if failures:
+                raise failures[0]
+            raise RuntimeError(f"No Telegram history source could fetch {gap.chat_id} ({gap.left}, {gap.right})")
+
+        for message_id in sorted(messages_by_id):
+            message = messages_by_id[message_id]
+            skip_reason, row = await self._build_row(message, gap.chat_id, associations)
+            if row is None:
+                skipped[skip_reason] += 1
+            else:
+                rows.append(row)
+        skipped["deleted"] += gap.missing_count - len(messages_by_id)
+        return rows, skipped
+
+    @staticmethod
+    async def _read_gap(history: HistorySource, gap: MsgLogGap) -> list[object]:
+        messages: list[object] = []
         previous_id = gap.left
-        seen = 0
-        async for message in self.history.iter_gap(gap):
+        async for message in history.iter_gap(gap):
             message_id = getattr(message, "id", None)
             if isinstance(message_id, bool) or not isinstance(message_id, int):
                 raise ValueError(f"Telegram history for {gap.chat_id} contains a message without an integer ID")
             if not gap.left < message_id < gap.right or message_id <= previous_id:
                 raise ValueError(f"Telegram history for {gap.chat_id} is outside the requested ascending gap")
             previous_id = message_id
-            seen += 1
-
-            skip_reason, row = await self._build_row(message, gap.chat_id, associations)
-            if row is None:
-                skipped[skip_reason] += 1
-            else:
-                rows.append(row)
-        skipped["deleted"] += gap.missing_count - seen
-        return rows, skipped
+            messages.append(message)
+        return messages
 
     async def _build_row(
         self,
@@ -190,6 +224,11 @@ class MsgLogGapBackfiller:
     ) -> tuple[str, Optional[BackfillRow]]:
         if type(message).__name__ == "MessageEmpty":
             return "deleted", None
+        source_time = self._message_time(message)
+        if source_time is None:
+            return "unknown_time", None
+        if source_time < LOSS_INTRODUCED_AT:
+            return "before_loss", None
         if getattr(message, "action", None) is not None:
             return "service", None
         reply_to = getattr(message, "reply_to", None)
@@ -217,9 +256,6 @@ class MsgLogGapBackfiller:
         media_type, msg_type, mime = self._content_type(message)
         message_id = int(getattr(message, "id"))
         master_msg_id = f"{chat_id}.{message_id}"
-        source_time = getattr(message, "date", None)
-        if not isinstance(source_time, datetime.datetime):
-            source_time = None
         return "eligible", BackfillRow(
             master_msg_id=master_msg_id,
             slave_message_id=f"{SYNTHETIC_MSGLOG_PREFIX}{master_msg_id}",
@@ -233,6 +269,13 @@ class MsgLogGapBackfiller:
             sender_bot_id=None if sender_id == self.main_bot_id else str(sender_id),
             time=source_time,
         )
+
+    @staticmethod
+    def _message_time(message: object) -> Optional[datetime.datetime]:
+        source_time = getattr(message, "date", None)
+        if not isinstance(source_time, datetime.datetime) or source_time.tzinfo is None:
+            return None
+        return source_time.astimezone(datetime.timezone.utc)
 
     @staticmethod
     def _content_type(message: object) -> tuple[str, str, Optional[str]]:
@@ -253,7 +296,7 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument("--profile", default="default", help="EFB profile containing the Telegram Master config")
     parser.add_argument("--api-id", type=int, default=os.environ.get("TELEGRAM_API_ID"))
     parser.add_argument("--api-hash", default=os.environ.get("TELEGRAM_API_HASH"))
-    parser.add_argument("--session", type=Path, help="Telethon user session path")
+    parser.add_argument("--session", type=Path, help="Base path for per-bot Telethon sessions")
     args = parser.parse_args(argv)
     if not args.api_id or not args.api_hash:
         parser.error("--api-id and --api-hash (or TELEGRAM_API_ID and TELEGRAM_API_HASH) are required")
@@ -269,20 +312,49 @@ async def _run_command(args: argparse.Namespace) -> list[GapResult]:
     if not isinstance(token, str) or not token.partition(":")[0].isdigit():
         raise ValueError(f"Telegram bot token is missing from {config_path}")
     main_bot_id = int(token.partition(":")[0])
+    bot_tokens = [token]
+    auxiliary_bots = config.get("auxiliary_bots", [])
+    if not isinstance(auxiliary_bots, list):
+        raise ValueError(f"auxiliary_bots must be a list in {config_path}")
+    for index, auxiliary_bot in enumerate(auxiliary_bots):
+        auxiliary_token = auxiliary_bot.get("token") if isinstance(auxiliary_bot, dict) else None
+        if not isinstance(auxiliary_token, str) or not auxiliary_token.partition(":")[0].isdigit():
+            raise ValueError(f"auxiliary_bots[{index}] has an invalid Telegram bot token in {config_path}")
+        bot_tokens.append(auxiliary_token)
 
     manager = DatabaseManager(SimpleNamespace(channel_id=CHANNEL_ID, config=config))  # type: ignore[arg-type]
     session = args.session or get_data_path(CHANNEL_ID) / "msglog-backfill"
     try:
         from telethon import TelegramClient
 
-        client = TelegramClient(str(session), args.api_id, args.api_hash, receive_updates=False)
-        await client.start()
+        clients = []
+        histories = []
+        failures: list[Exception] = []
+        for bot_token in bot_tokens:
+            bot_id = bot_token.partition(":")[0]
+            client = TelegramClient(
+                str(session.with_name(f"{session.name}-{bot_id}")),
+                args.api_id,
+                args.api_hash,
+                receive_updates=False,
+            )
+            try:
+                await client.start(bot_token=bot_token)
+            except Exception as error:
+                failures.append(error)
+                await client.disconnect()
+                continue
+            clients.append(client)
+            histories.append(TelethonHistorySource(client))
+        if not histories:
+            raise RuntimeError("No configured Telegram bot could start a history source") from failures[0]
         try:
             return await MsgLogGapBackfiller(
-                MsgLogBackfillStore(), TelethonHistorySource(client), main_bot_id=main_bot_id
+                MsgLogBackfillStore(), histories, main_bot_id=main_bot_id
             ).run()
         finally:
-            await client.disconnect()
+            for client in clients:
+                await client.disconnect()
     finally:
         manager.stop_worker()
 
