@@ -184,6 +184,29 @@ Notable additions in this branch include:
   records which bot token sent each Telegram message so future edits/deletes
   can be routed to the correct bot.
 
+Importing a bounded message-log recovery artifact
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``etm-msglog-import`` restores ETM message-log rows from the version-1 JSONL
+artifact produced by ``tg-search recovery export``. Run it with the same
+mounted numeric chat-ID file used for the export:
+
+.. code:: shell
+
+    etm-msglog-import \
+        --profile default \
+        --artifact /recovery/recovery.jsonl \
+        --chat-file /recovery/chat-ids.txt
+
+The command validates the complete artifact before writing, reads the selected
+profile's bot and database configuration, and uses that profile's configured
+SQLite or PostgreSQL database. Only messages sent by the configured main or
+auxiliary bots and associated with an existing ETM forum topic are imported.
+Unrecognized senders and unbound topics are reported in the JSON summary.
+Existing primary or alternate Telegram message IDs are preserved, so the same
+artifact can be run again after an interruption. Writes are committed in
+short transactions; ``--chunk-size`` changes the default of 250 rows.
+
 Optional: Auxiliary bots (higher throughput)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -6,7 +6,7 @@ import pickle
 import time
 from contextlib import suppress
 from functools import partial, wraps
-from typing import Callable, Collection, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, cast
+from typing import Any, Callable, Collection, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, cast
 from pathlib import Path
 
 from peewee import (
@@ -37,7 +37,6 @@ from .utils import TelegramChatID, EFBChannelChatIDStr, TgChatMsgIDStr, message_
     chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID
 
 if TYPE_CHECKING:
-    from . import TelegramChannel
     from .chat import ETMChatMember, ETMChatType
 
 database = DatabaseProxy()
@@ -54,6 +53,13 @@ class DatabaseMetrics(Protocol):
 
     def record_database_method_call(self, method: str, seconds: float, outcome: str) -> None:
         ...
+
+
+class DatabaseChannel(Protocol):
+    """Channel configuration required to initialize the ETM database."""
+
+    channel_id: ModuleID
+    config: Dict[str, Any]
 
 
 def observe_database_method(method: str):
@@ -264,7 +270,7 @@ class DatabaseManager:
         "dead",
     )
 
-    def __init__(self, channel: 'TelegramChannel'):
+    def __init__(self, channel: DatabaseChannel):
         self._metrics: Optional[DatabaseMetrics] = None
         base_path = utils.get_data_path(channel.channel_id)
         self._base_path = base_path

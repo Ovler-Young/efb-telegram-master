@@ -82,6 +82,7 @@ setup(
     },
     entry_points={
         "ehforwarderbot.master": "blueset.telegram = efb_telegram_master:TelegramChannel",
-        "ehforwarderbot.wizard": "blueset.telegram = efb_telegram_master.wizard:wizard"
+        "ehforwarderbot.wizard": "blueset.telegram = efb_telegram_master.wizard:wizard",
+        "console_scripts": ["etm-msglog-import = efb_telegram_master.msglog_import:main"],
     }
 )
