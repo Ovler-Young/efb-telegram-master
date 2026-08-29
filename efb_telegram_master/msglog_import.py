@@ -21,7 +21,7 @@ from .db import (
     DatabaseManager,
     MsgLog,
     TopicAssoc,
-    database,
+    msglog_write_transaction,
 )
 from .msg_type import TGMsgType
 from .paths import get_config_path
@@ -630,7 +630,7 @@ def import_validated_artifact(
 
     for chunk in _chunks(prepared, chunk_size):
         candidate_ids = [row.master_message_id for row in chunk]
-        with database.atomic():
+        with msglog_write_transaction():
             existing_rows = MsgLog.select(
                 MsgLog.master_msg_id, MsgLog.master_msg_id_alt
             ).where(

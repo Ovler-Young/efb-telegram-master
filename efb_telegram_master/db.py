@@ -4,7 +4,7 @@ import datetime
 import logging
 import pickle
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from functools import partial, wraps
 from typing import Any, Callable, Collection, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, cast
 from pathlib import Path
@@ -19,6 +19,8 @@ from peewee import (
     IntegrityError,
     IntegerField,
     Model,
+    PostgresqlDatabase,
+    SqliteDatabase,
     TextField,
     fn,
 )
@@ -225,6 +227,32 @@ class MsgLog(BaseModel):
                         reactions[rk].append(chat_manager.get_chat_member(module_id, group_id, chat_id, build_dummy=True))  # type: ignore
                 msg.reactions = reactions
         return msg
+
+
+_MSGLOG_POSTGRES_LOCK_ID = 1163152717
+
+
+@contextmanager
+def msglog_write_transaction():
+    """Serialize MsgLog identity lookup and mutation in a short transaction."""
+    model_database = MsgLog._meta.database
+    actual_database = (
+        model_database.obj
+        if isinstance(model_database, DatabaseProxy)
+        else model_database
+    )
+    transaction = (
+        model_database.atomic("IMMEDIATE")
+        if isinstance(actual_database, SqliteDatabase)
+        else model_database.atomic()
+    )
+    with transaction:
+        if isinstance(actual_database, PostgresqlDatabase):
+            actual_database.execute_sql(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (_MSGLOG_POSTGRES_LOCK_ID,),
+            )
+        yield
 
 
 class HistoryMigrationEntry(BaseModel):
@@ -803,6 +831,16 @@ class DatabaseManager:
                                   old_message_id: Optional[OldMsgID] = None,
                                   sender_bot_id: Optional[str] = None):
         """Add or update a message into the database."""
+        with msglog_write_transaction():
+            self._add_or_update_message_log(
+                msg, master_message, old_message_id, sender_bot_id
+            )
+
+    def _add_or_update_message_log(self,
+                                   msg: ETMMsg,
+                                   master_message: Message,
+                                   old_message_id: OldMsgID | None,
+                                   sender_bot_id: str | None):
         sent_message_id = message_id_to_str(
             TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)
         )
@@ -825,6 +863,18 @@ class DatabaseManager:
             elif sent_message_id != old_message_id_str:
                 self.logger.debug("[%s] Message has an old ID: %s", sent_message_id, old_message_id_str)
                 master_msg_id, master_msg_id_alt = old_message_id_str, sent_message_id
+
+        if master_msg_id_alt is not None:
+            synthetic_conflicts = MsgLog.select().where(
+                (
+                    (MsgLog.master_msg_id == master_msg_id_alt)
+                    | (MsgLog.master_msg_id_alt == master_msg_id_alt)
+                )
+                & (MsgLog.master_msg_id != master_msg_id)
+                & MsgLog.slave_message_id.startswith(SYNTHETIC_MSGLOG_PREFIX)
+            )
+            for synthetic_conflict in synthetic_conflicts:
+                synthetic_conflict.delete_instance()
 
         if row is None:
             row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)

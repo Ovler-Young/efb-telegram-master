@@ -1,14 +1,20 @@
 import json
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from peewee import PostgresqlDatabase, SqliteDatabase
 
-from efb_telegram_master.db import MsgLog, TopicAssoc, database
+from efb_telegram_master import db as db_module
+from efb_telegram_master import msglog_import as msglog_import_module
+from efb_telegram_master.db import DatabaseManager, MsgLog, TopicAssoc, database
 from efb_telegram_master.msglog_import import (
     ImportValidationError,
     import_validated_artifact,
@@ -84,6 +90,122 @@ def _write_artifact(path: Path, messages, chats=None):
 def _validated(path, messages, chats=None, selected=(TOPIC_CHAT_ID,)):
     _write_artifact(path, messages, chats)
     return validate_artifact(path, "recovery", selected)
+
+
+def _live_message():
+    return SimpleNamespace(
+        uid="live-message",
+        chat=SimpleNamespace(module_id="tests.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.slave", uid="author"),
+        text="live text",
+        type=SimpleNamespace(name="Text"),
+        type_telegram=SimpleNamespace(value="Text"),
+        deliver_to=SimpleNamespace(channel_id="tests.slave"),
+        file_id=None,
+        file_unique_id=None,
+        mime=None,
+        is_system=False,
+        attributes=None,
+        commands=None,
+        substitutions=None,
+        reactions=None,
+        target=None,
+        sender_bot_id=None,
+    )
+
+
+def _run_primary_alternate_race(artifact, monkeypatch, first_writer):
+    old_message_id = 9001
+    imported_message_id = 1
+    imported_identity = f"{TOPIC_CHAT_ID}.{imported_message_id}"
+    live_identity = f"{TOPIC_CHAT_ID}.{old_message_id}"
+    MsgLog.create(
+        master_msg_id=live_identity,
+        master_msg_id_alt=None,
+        slave_message_id="live-message",
+        text="original live text",
+        slave_origin_uid="tests.slave chat",
+        slave_member_uid="tests.slave author",
+        media_type="Text",
+        msg_type="Text",
+        sent_to="tests.slave",
+    )
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    first_locked = Event()
+    release_first = Event()
+    second_attempted = Event()
+    allow_second_attempt = Event()
+    second_finished = Event()
+    original_transaction = db_module.msglog_write_transaction
+
+    @contextmanager
+    def first_transaction():
+        with original_transaction():
+            first_locked.set()
+            assert release_first.wait(5)
+            yield
+
+    @contextmanager
+    def second_transaction():
+        second_attempted.set()
+        assert allow_second_attempt.wait(5)
+        with original_transaction():
+            yield
+
+    def run_import():
+        return import_validated_artifact(artifact, {"token": "100:secret"})
+
+    def run_live():
+        manager.add_or_update_message_log(
+            _live_message(),
+            SimpleNamespace(
+                chat_id=int(TOPIC_CHAT_ID), message_id=imported_message_id
+            ),
+            old_message_id=(int(TOPIC_CHAT_ID), old_message_id),
+        )
+
+    if first_writer == "import":
+        monkeypatch.setattr(
+            msglog_import_module, "msglog_write_transaction", first_transaction
+        )
+        monkeypatch.setattr(
+            db_module, "msglog_write_transaction", second_transaction
+        )
+        first_call, second_call = run_import, run_live
+    else:
+        monkeypatch.setattr(db_module, "msglog_write_transaction", first_transaction)
+        monkeypatch.setattr(
+            msglog_import_module, "msglog_write_transaction", second_transaction
+        )
+        first_call, second_call = run_live, run_import
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(first_call)
+        assert first_locked.wait(5)
+
+        def tracked_second():
+            try:
+                return second_call()
+            finally:
+                second_finished.set()
+
+        second_future = executor.submit(tracked_second)
+        assert second_attempted.wait(5)
+        allow_second_attempt.set()
+        assert not second_finished.wait(0.2)
+        release_first.set()
+        first_result = first_future.result(timeout=5)
+        second_result = second_future.result(timeout=5)
+
+    summary = first_result if first_writer == "import" else second_result
+    row = MsgLog.get_by_id(live_identity)
+    assert MsgLog.select().count() == 1
+    assert row.master_msg_id_alt == imported_identity
+    assert row.slave_message_id == "live-message"
+    assert row.text == "live text"
+    assert summary.imported == (1 if first_writer == "import" else 0)
+    assert summary.existing == (0 if first_writer == "import" else 1)
 
 
 @contextmanager
@@ -262,6 +384,20 @@ def test_primary_and_alternate_ids_are_both_preserved(tmp_path, sqlite_database)
     assert MsgLog.get_by_id(f"{TOPIC_CHAT_ID}.3").text == "message-3"
 
 
+@pytest.mark.parametrize("first_writer", ["import", "live"])
+def test_sqlite_primary_alternate_identity_race_keeps_the_live_row(
+    tmp_path, sqlite_database, monkeypatch, first_writer
+):
+    artifact = _validated(tmp_path / "race.jsonl", [_message(1)])
+    TopicAssoc.create(
+        topic_chat_id=TOPIC_CHAT_ID,
+        message_thread_id="900",
+        slave_uid="tests.slave destination",
+    )
+
+    _run_primary_alternate_race(artifact, monkeypatch, first_writer)
+
+
 def test_conflicting_topic_associations_abort_before_writes(tmp_path, sqlite_database):
     artifact = _validated(tmp_path / "topic-conflict.jsonl", [_message(1)])
     TopicAssoc.create(
@@ -328,7 +464,7 @@ def test_chunk_failure_rolls_back_current_chunk_and_rerun_resumes(
     not os.getenv("TEST_POSTGRES_HOST"),
     reason="PostgreSQL test environment is not configured",
 )
-def test_postgresql_import_uses_the_same_peewee_path(tmp_path):
+def test_postgresql_import_uses_the_same_peewee_path(tmp_path, monkeypatch):
     connection_kwargs = {
         "database": os.environ["TEST_POSTGRES_DB"],
         "host": os.environ["TEST_POSTGRES_HOST"],
@@ -362,6 +498,12 @@ def test_postgresql_import_uses_the_same_peewee_path(tmp_path):
             second = import_validated_artifact(artifact, {"token": "100:secret"})
             assert first.imported == 1
             assert second.existing == 1
+            for first_writer in ("import", "live"):
+                MsgLog.delete().execute()
+                with monkeypatch.context() as race_patch:
+                    _run_primary_alternate_race(
+                        artifact, race_patch, first_writer
+                    )
     finally:
         if test_database is not None and not test_database.is_closed():
             test_database.close()
