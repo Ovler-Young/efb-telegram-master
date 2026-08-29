@@ -854,7 +854,8 @@ class DatabaseManager:
         row.pickle = pickle_data
 
         try:
-            result = save()
+            with MsgLog._meta.database.atomic():
+                result = save()
         except IntegrityError:
             if not inserting:
                 raise

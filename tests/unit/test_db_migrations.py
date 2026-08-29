@@ -30,6 +30,28 @@ from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 
 
+def _live_message_for_reconciliation():
+    return SimpleNamespace(
+        uid=MessageID("live-message"),
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"),
+        text="live message",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+        file_id="live-file",
+        file_unique_id="live-file-unique",
+        mime="text/plain",
+        is_system=False,
+        attributes=None,
+        commands=None,
+        substitutions=None,
+        target=None,
+        sender_bot_id="777",
+        reactions={},
+    )
+
+
 def test_msglog_schema_has_sender_bot_id(channel):
     columns = {column.name for column in channel.db.database.get_columns("msglog")} if hasattr(channel.db, "database") else None
     if columns is None:
@@ -246,51 +268,35 @@ def test_live_message_log_replaces_synthetic_row_inserted_concurrently(monkeypat
     test_db = SqliteDatabase(":memory:")
     manager = object.__new__(DatabaseManager)
     manager.logger = Mock()
-    message = SimpleNamespace(
-        uid=MessageID("live-message"),
-        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
-        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"),
-        text="live message",
-        type=MsgType.Text,
-        type_telegram=TGMsgType.Text,
-        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
-        file_id="live-file",
-        file_unique_id="live-file-unique",
-        mime="text/plain",
-        is_system=False,
-        attributes=None,
-        commands=None,
-        substitutions=None,
-        target=None,
-        sender_bot_id="777",
-        reactions={},
-    )
+    message = _live_message_for_reconciliation()
     master_msg_id = "100.10"
-    original_save = MsgLog.save
-    inserted_synthetic_row = False
+    original_get_or_none = MsgLog.get_or_none
+    initial_lookup_complete = False
 
-    def insert_synthetic_before_live_save(row, *args, **kwargs):
-        nonlocal inserted_synthetic_row
-        if kwargs.get("force_insert") and not inserted_synthetic_row:
-            inserted_synthetic_row = True
-            MsgLog.insert(
-                master_msg_id=master_msg_id,
-                slave_message_id=f"{SYNTHETIC_MSGLOG_PREFIX}{master_msg_id}",
-                text="synthetic message",
-                slave_origin_uid="tests.mocks.slave synthetic-chat",
-                slave_member_uid="tests.mocks.slave synthetic-author",
-                msg_type=MsgType.Text.name,
-                sent_to="tests.mocks.slave",
-            ).execute()
-        return original_save(row, *args, **kwargs)
+    def miss_initial_lookup(*args, **kwargs):
+        nonlocal initial_lookup_complete
+        if not initial_lookup_complete:
+            initial_lookup_complete = True
+            return None
+        return original_get_or_none(*args, **kwargs)
 
     with test_db.bind_ctx([MsgLog]):
         test_db.create_tables([MsgLog])
-        monkeypatch.setattr(MsgLog, "save", insert_synthetic_before_live_save)
-
-        manager.add_or_update_message_log(
-            message, SimpleNamespace(chat_id=100, message_id=10), sender_bot_id="777"
+        MsgLog.create(
+            master_msg_id=master_msg_id,
+            slave_message_id=f"{SYNTHETIC_MSGLOG_PREFIX}{master_msg_id}",
+            text="synthetic message",
+            slave_origin_uid="tests.mocks.slave synthetic-chat",
+            slave_member_uid="tests.mocks.slave synthetic-author",
+            msg_type=MsgType.Text.name,
+            sent_to="tests.mocks.slave",
         )
+        monkeypatch.setattr(MsgLog, "get_or_none", miss_initial_lookup)
+
+        with test_db.atomic():
+            manager.add_or_update_message_log(
+                message, SimpleNamespace(chat_id=100, message_id=10), sender_bot_id="777"
+            )
 
         row = MsgLog.get_by_id(master_msg_id)
         assert MsgLog.select().count() == 1
@@ -300,6 +306,121 @@ def test_live_message_log_replaces_synthetic_row_inserted_concurrently(monkeypat
         assert row.slave_member_uid == "tests.mocks.slave author"
         assert row.sender_bot_id == "777"
         assert row.file_id == "live-file"
+
+
+def test_live_message_log_reraises_unrelated_insert_integrity_error(monkeypatch):
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    message = _live_message_for_reconciliation()
+    original_save = MsgLog.save
+
+    def fail_live_insert(row, *args, **kwargs):
+        if kwargs.get("force_insert"):
+            raise db_module.IntegrityError("unrelated constraint")
+        return original_save(row, *args, **kwargs)
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        monkeypatch.setattr(MsgLog, "save", fail_live_insert)
+
+        with (
+            pytest.raises(db_module.IntegrityError, match="unrelated constraint"),
+            test_db.atomic(),
+        ):
+            manager.add_or_update_message_log(
+                message, SimpleNamespace(chat_id=100, message_id=11)
+            )
+
+
+@pytest.mark.skipif(
+    not os.getenv("TEST_POSTGRES_HOST"),
+    reason="PostgreSQL test environment is not configured",
+)
+def test_postgresql_live_message_log_recovers_from_concurrent_synthetic_insert(monkeypatch):
+    from peewee import PostgresqlDatabase
+
+    connection_kwargs = {
+        "database": os.environ["TEST_POSTGRES_DB"],
+        "host": os.environ["TEST_POSTGRES_HOST"],
+        "port": int(os.environ["TEST_POSTGRES_PORT"]),
+        "user": os.environ["TEST_POSTGRES_USER"],
+        "password": os.environ["TEST_POSTGRES_PASSWORD"],
+    }
+    database_name = f"etm_msglog_race_{uuid.uuid4().hex}"
+    admin_db = PostgresqlDatabase(**connection_kwargs)
+    admin_db.connect()
+    admin_db.connection().autocommit = True
+    test_db = None
+    race_db = None
+    try:
+        admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
+        database_kwargs = {
+            key: value for key, value in connection_kwargs.items() if key != "database"
+        }
+        test_db = PostgresqlDatabase(database_name, **database_kwargs)
+        race_db = PostgresqlDatabase(database_name, **database_kwargs)
+        test_db.connect()
+        race_db.connect()
+
+        manager = object.__new__(DatabaseManager)
+        manager.logger = Mock()
+        message = _live_message_for_reconciliation()
+        master_msg_id = "100.10"
+        original_save = MsgLog.save
+        inserted_synthetic_row = False
+
+        def insert_synthetic_before_live_save(row, *args, **kwargs):
+            nonlocal inserted_synthetic_row
+            if kwargs.get("force_insert") and not inserted_synthetic_row:
+                inserted_synthetic_row = True
+                with race_db.atomic():
+                    race_db.execute_sql(
+                        "INSERT INTO msglog "
+                        "(master_msg_id, slave_message_id, text, slave_origin_uid, "
+                        "slave_member_uid, msg_type, sent_to) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            master_msg_id,
+                            f"{SYNTHETIC_MSGLOG_PREFIX}{master_msg_id}",
+                            "synthetic message",
+                            "tests.mocks.slave synthetic-chat",
+                            "tests.mocks.slave synthetic-author",
+                            MsgType.Text.name,
+                            "tests.mocks.slave",
+                        ),
+                    )
+            return original_save(row, *args, **kwargs)
+
+        with test_db.bind_ctx([MsgLog]):
+            test_db.create_tables([MsgLog])
+            monkeypatch.setattr(MsgLog, "save", insert_synthetic_before_live_save)
+
+            with test_db.atomic():
+                manager.add_or_update_message_log(
+                    message, SimpleNamespace(chat_id=100, message_id=10), sender_bot_id="777"
+                )
+
+            row = MsgLog.get_by_id(master_msg_id)
+            assert MsgLog.select().count() == 1
+            assert row.slave_message_id == "live-message"
+            assert row.text == "live message"
+            assert row.sender_bot_id == "777"
+            assert row.file_id == "live-file"
+    finally:
+        if race_db is not None and not race_db.is_closed():
+            race_db.close()
+        if test_db is not None and not test_db.is_closed():
+            test_db.close()
+        admin_db.execute_sql(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()",
+            (database_name,),
+        )
+        admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
+        admin_db.close()
 
 
 def test_build_etm_msg_restores_sender_bot_id(channel, slave):
