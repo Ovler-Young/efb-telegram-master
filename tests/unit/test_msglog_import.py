@@ -28,9 +28,9 @@ def _manifest(chats=None):
         "version": 1,
         "owner": {
             "profile": "recovery",
-            "telegramUserId": "700",
-            "username": "owner",
-            "name": "Owner",
+            "telegramUserId": "9007199254740993123",
+            "username": None,
+            "name": "Owner Account",
         },
         "window": {"from": WINDOW_FROM, "to": WINDOW_TO, "semantics": "[from,to)"},
         "chats": chats
@@ -139,6 +139,15 @@ def test_artifact_validation_rejects_rows_before_import(tmp_path, sqlite_databas
     with pytest.raises(ImportValidationError, match="outside"):
         validate_artifact(outside_path, "recovery", (TOPIC_CHAT_ID,))
     assert MsgLog.select().count() == 0
+
+
+def test_artifact_accepts_producer_owner_without_username(tmp_path):
+    artifact_path = _write_artifact(tmp_path / "producer.jsonl", [])
+
+    artifact = validate_artifact(artifact_path, "recovery", (TOPIC_CHAT_ID,))
+
+    assert artifact.profile == "recovery"
+    assert artifact.messages == ()
 
 
 def test_sqlite_import_filters_senders_resolves_topics_and_is_idempotent(

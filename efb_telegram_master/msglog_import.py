@@ -247,9 +247,16 @@ def _parse_manifest(
     _canonical_decimal(
         owner["telegramUserId"], "Artifact owner Telegram user ID", positive=True
     )
-    if not all(isinstance(owner[key], str) for key in ("profile", "username", "name")):
+    if (
+        not isinstance(owner["profile"], str)
+        or not isinstance(owner["name"], str)
+        or (
+            owner["username"] is not None
+            and not isinstance(owner["username"], str)
+        )
+    ):
         raise ImportValidationError(
-            "Artifact owner profile, username, and name must be strings"
+            "Artifact owner profile and name must be strings; username must be a string or null"
         )
 
     window = value["window"]
