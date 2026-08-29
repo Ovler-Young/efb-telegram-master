@@ -16,6 +16,7 @@ from peewee import (
     DatabaseProxy,
     DateTimeField,
     DoesNotExist,
+    IntegrityError,
     IntegerField,
     Model,
     TextField,
@@ -40,6 +41,12 @@ if TYPE_CHECKING:
     from .chat import ETMChatMember, ETMChatType
 
 database = DatabaseProxy()
+SYNTHETIC_MSGLOG_PREFIX = "mtproto-backfill:"
+
+
+def is_synthetic_msglog_id(slave_message_id: str) -> bool:
+    """Return whether a slave message ID represents a synthetic MsgLog row."""
+    return slave_message_id.startswith(SYNTHETIC_MSGLOG_PREFIX)
 
 
 class DatabaseMetrics(Protocol):
@@ -815,6 +822,7 @@ class DatabaseManager:
 
         if row is None:
             row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
+        inserting = row is None
         if row is not None:
             save = row.save
             self.logger.debug("[%s] Message record is found in database, update it", master_msg_id)
@@ -839,7 +847,29 @@ class DatabaseManager:
         pickle_data = self.pickle_misc_msg(msg)
         row.pickle = pickle_data
 
-        result = save()
+        try:
+            result = save()
+        except IntegrityError:
+            if not inserting:
+                raise
+            row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
+            if row is None:
+                raise
+            self.logger.debug("[%s] Message record appeared during insert, update it", master_msg_id)
+            row.master_msg_id_alt = master_msg_id_alt
+            row.text = msg.text
+            row.slave_origin_uid = chat_id_to_str(chat=msg.chat)
+            row.slave_member_uid = chat_id_to_str(chat=msg.author)
+            row.msg_type = msg.type.name
+            row.sent_to = msg.deliver_to.channel_id
+            row.slave_message_id = msg.uid or f"{self.FAIL_FLAG}.{time.time()}"
+            row.media_type = msg.type_telegram.value
+            row.file_id = msg.file_id
+            row.file_unique_id = msg.file_unique_id
+            row.mime = msg.mime
+            row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
+            row.pickle = pickle_data
+            result = row.save()
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
 
     @observe_database_method("get_msg_log")

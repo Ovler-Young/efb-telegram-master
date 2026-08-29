@@ -22,6 +22,7 @@ from ehforwarderbot.status import MessageRemoval
 from ehforwarderbot.types import ModuleID, MessageID, ChatID
 from . import utils
 from .chat_destination_cache import ChatDestinationCache
+from .db import is_synthetic_msglog_id
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType, get_msg_type
@@ -186,6 +187,9 @@ class MasterMessageProcessor(LocaleMixin):
         if update.edited_message or update.edited_channel_post:
             self.logger.debug('[%s] Message is edited: %s', mid, message.edit_date)
             msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update))
+            if msg_log and is_synthetic_msglog_id(msg_log.slave_message_id):
+                self.logger.info("Ignoring edit for synthetic MsgLog message %s.", mid)
+                return
             if not msg_log or msg_log.slave_message_id == self.db.FAIL_FLAG:
                 sync_reply_text(self.bot, message,
                                 self._("Error: This message cannot be edited, and thus is not sent. (ME01)"),
@@ -505,6 +509,9 @@ class MasterMessageProcessor(LocaleMixin):
             self.logger.error("[%s] Quoted message not found in database, give up quoting.",
                               tg_msg.message_id)
             return etm_msg
+        if is_synthetic_msglog_id(target_log.slave_message_id):
+            self.logger.info("[%s] Ignoring quote to synthetic MsgLog message.", tg_msg.message_id)
+            return etm_msg
         target_channel, _, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(target_log.slave_origin_uid))
         if target_channel != channel:
             self.logger.error("[%s] Quoted message is sent to channel %s, but this message is sent to %s, give up quoting.",
@@ -590,7 +597,8 @@ class MasterMessageProcessor(LocaleMixin):
             master_msg_id=utils.message_id_to_str(
                 chat_id=TelegramChatID(reply.chat_id),
                 message_id=TelegramMessageID(reply.message_id)))
-        if not msg_log or msg_log.slave_member_uid == self.db.FAIL_FLAG:
+        if not msg_log or msg_log.slave_member_uid == self.db.FAIL_FLAG or \
+                is_synthetic_msglog_id(msg_log.slave_message_id):
             return self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."
             ))

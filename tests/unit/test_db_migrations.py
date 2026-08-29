@@ -20,6 +20,7 @@ from efb_telegram_master.db import (
     DatabaseManager,
     HistoryMigrationEntry,
     MsgLog,
+    SYNTHETIC_MSGLOG_PREFIX,
     TopicAssoc,
     database,
 )
@@ -237,6 +238,68 @@ def test_repeated_delivery_reconciliation_keeps_one_master_message(channel, slav
     assert len(rows) == 1
     assert rows[0].sender_bot_id == "777"
     rows[0].delete_instance()
+
+
+def test_live_message_log_replaces_synthetic_row_inserted_concurrently(monkeypatch):
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    message = SimpleNamespace(
+        uid=MessageID("live-message"),
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"),
+        text="live message",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+        file_id="live-file",
+        file_unique_id="live-file-unique",
+        mime="text/plain",
+        is_system=False,
+        attributes=None,
+        commands=None,
+        substitutions=None,
+        target=None,
+        sender_bot_id="777",
+        reactions={},
+    )
+    master_msg_id = "100.10"
+    original_save = MsgLog.save
+    inserted_synthetic_row = False
+
+    def insert_synthetic_before_live_save(row, *args, **kwargs):
+        nonlocal inserted_synthetic_row
+        if kwargs.get("force_insert") and not inserted_synthetic_row:
+            inserted_synthetic_row = True
+            MsgLog.insert(
+                master_msg_id=master_msg_id,
+                slave_message_id=f"{SYNTHETIC_MSGLOG_PREFIX}{master_msg_id}",
+                text="synthetic message",
+                slave_origin_uid="tests.mocks.slave synthetic-chat",
+                slave_member_uid="tests.mocks.slave synthetic-author",
+                msg_type=MsgType.Text.name,
+                sent_to="tests.mocks.slave",
+            ).execute()
+        return original_save(row, *args, **kwargs)
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        monkeypatch.setattr(MsgLog, "save", insert_synthetic_before_live_save)
+
+        manager.add_or_update_message_log(
+            message, SimpleNamespace(chat_id=100, message_id=10), sender_bot_id="777"
+        )
+
+        row = MsgLog.get_by_id(master_msg_id)
+        assert MsgLog.select().count() == 1
+        assert row.slave_message_id == "live-message"
+        assert row.text == "live message"
+        assert row.slave_origin_uid == "tests.mocks.slave chat"
+        assert row.slave_member_uid == "tests.mocks.slave author"
+        assert row.sender_bot_id == "777"
+        assert row.file_id == "live-file"
 
 
 def test_build_etm_msg_restores_sender_bot_id(channel, slave):

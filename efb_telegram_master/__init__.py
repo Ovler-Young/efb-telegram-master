@@ -39,7 +39,7 @@ from .chat_binding import ChatBindingManager
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import CommandsManager
-from .db import DatabaseManager
+from .db import DatabaseManager, is_synthetic_msglog_id
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
 from .paths import LOCALE_DIR, get_config_path
@@ -455,7 +455,7 @@ class TelegramChannel(MasterChannel):
         target: Message = message.reply_to_message
         msg_log = self.db.get_msg_log(master_msg_id=etm_utils.message_id_to_str(chat_id=TelegramChatID(target.chat_id),
                                                                                 message_id=TelegramMessageID(target.message_id)))
-        if msg_log is None:
+        if msg_log is None or is_synthetic_msglog_id(msg_log.slave_message_id):
             sync_reply_text(self.bot_manager, message,
                             self._("The message you replied to is not recorded in ETM database. "
                                    "You cannot react to this message."))
