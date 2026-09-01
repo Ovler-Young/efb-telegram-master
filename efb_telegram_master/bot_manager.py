@@ -72,6 +72,10 @@ class QueuedCompletionDecision:
 class QueuedChatMigrationRetry(Exception):
     """Retry a retained call after handling Telegram chat migration."""
 
+    def __init__(self, message: str, retry_delay: float = 0.0):
+        super().__init__(message)
+        self.retry_delay = retry_delay
+
 
 class QueuedDbLogContext(NamedTuple):
     """Database log context carried by a queued send task."""
@@ -1388,7 +1392,9 @@ class TelegramBotManager(LocaleMixin):
                     self.channel.chat_binding.chat_migration_by_id(old_chat_id, error.new_chat_id)
                 except Exception as migration_error:
                     if getattr(row, "priority", 1) == 0:
-                        raise QueuedChatMigrationRetry(str(migration_error)) from migration_error
+                        raise QueuedChatMigrationRetry(
+                            str(migration_error), self.TRANSPORT_RETRY_SECONDS
+                        ) from migration_error
                     raise
                 telegram_args, telegram_kwargs = self._rewrite_queued_chat_id(
                     row.operation, telegram_args, telegram_kwargs, error.new_chat_id
@@ -1594,7 +1600,7 @@ class TelegramBotManager(LocaleMixin):
         if row.priority == 0 and isinstance(error, QueuedChatMigrationRetry):
             return QueuedCompletionDecision(
                 QueuedCompletionKind.RETRY_EVENTUAL,
-                time.monotonic(),
+                time.monotonic() + error.retry_delay,
                 "migration",
             )
 

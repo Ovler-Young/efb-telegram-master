@@ -777,12 +777,16 @@ class OutboundQueue:
                 if cursor.rowcount != 1:
                     raise QueuePersistenceError(f"Queued row {row_id} cannot be retargeted.")
                 self.connection.commit()
-            except Exception:
+            except Exception as error:
                 try:
                     self.connection.rollback()
                 except sqlite3.Error:
                     pass
-                raise
+                if isinstance(error, QueuePersistenceError):
+                    raise
+                raise QueuePersistenceError(
+                    f"Queued row {row_id} retarget persistence failed."
+                ) from error
 
     def delete(self, row_id: int) -> None:
         with self._lock:
@@ -999,8 +1003,11 @@ class OutboundQueueScheduler:
 
     def _stop_for_persistence_error(self, error: Exception) -> None:
         if self.failure is None:
-            persistence_error = QueuePersistenceError("Outbound queue deletion failed.")
-            persistence_error.__cause__ = error
+            if isinstance(error, QueuePersistenceError):
+                persistence_error = error
+            else:
+                persistence_error = QueuePersistenceError("Outbound queue deletion failed.")
+                persistence_error.__cause__ = error
             self.failure = persistence_error
         else:
             persistence_error = self.failure
@@ -1151,6 +1158,9 @@ class OutboundQueueScheduler:
                         self.queue.metrics.record_failure(
                             submitted.row.priority, submitted.row.operation, "execution"
                         )
+                    if isinstance(error, QueuePersistenceError):
+                        self._stop_for_persistence_error(error)
+                        return
                     if self._is_blocking_media_retry(submitted.row, error):
                         assert isinstance(error, RetryAfter)
                         retry_after = self._retry_after_seconds(error)
