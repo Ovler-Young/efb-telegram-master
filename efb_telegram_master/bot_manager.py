@@ -342,6 +342,7 @@ class TelegramBotManager(LocaleMixin):
     MEMBERSHIP_RECHECK_SECONDS = 0.25
     SHUTDOWN_DRAIN_TIMEOUT = 5.0
     SHUTDOWN_JOIN_GRACE = 1.0
+    TRANSPORT_RETRY_SECONDS = 1.0
     _bot_chat_state_lock_initialization_lock = threading.Lock()
 
     # Type declarations for instance attributes assigned in __init__
@@ -361,6 +362,7 @@ class TelegramBotManager(LocaleMixin):
         logger = logging.getLogger(__name__)
         _POSITIONAL_CHAT_ID_INDICES = {
             'edit_message_text': 1,
+            'edit_message_media': 1,
         }
 
         @classmethod
@@ -524,12 +526,6 @@ class TelegramBotManager(LocaleMixin):
                 registry=self._metrics.registry,
             )
 
-        self._send_worker_thread = threading.Thread(
-            target=self._queued_send_worker,
-            name="ETM queued send worker",
-            daemon=True
-        )
-        self._send_worker_thread.start()
         self.logger.debug("Durable outbound system initialized...")
 
         self.logger.debug("Adding base dispatchers...")
@@ -649,6 +645,17 @@ class TelegramBotManager(LocaleMixin):
         self._runtime.bind_loop(asyncio.get_running_loop())
         for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
             aux_bot.bind_runtime(self._runtime)
+        if (
+            not self._send_worker_stop.is_set()
+            and not self._outbound_scheduler.stopping
+            and getattr(self, "_send_worker_thread", None) is None
+        ):
+            self._send_worker_thread = threading.Thread(
+                target=self._queued_send_worker,
+                name="ETM queued send worker",
+                daemon=True,
+            )
+            self._send_worker_thread.start()
         self._shutdown_complete_event.clear()
 
 
@@ -791,7 +798,7 @@ class TelegramBotManager(LocaleMixin):
     def _queued_chat_id_argument(
         operation: str, args: tuple, kwargs: Mapping[str, object]
     ) -> object:
-        chat_id_index = 1 if operation == "edit_message_text" else 0
+        chat_id_index = TelegramBotManager.Decorators._POSITIONAL_CHAT_ID_INDICES.get(operation, 0)
         return args[chat_id_index] if len(args) > chat_id_index else kwargs.get("chat_id")
 
     def _queued_operation_callable(self, operation: str) -> Callable[..., object]:
@@ -1337,6 +1344,32 @@ class TelegramBotManager(LocaleMixin):
         method = getattr(sender, row.operation)
         telegram_kwargs = self._strip_private_queue_metadata(kwargs)
         telegram_args = args
+        migration_retried = False
+
+        def call_method() -> object:
+            nonlocal migration_retried, telegram_args, telegram_kwargs
+            try:
+                return method(*telegram_args, **telegram_kwargs)
+            except telegram.error.ChatMigrated as error:
+                if migration_retried:
+                    raise
+                migration_retried = True
+                old_chat_id = self._queued_chat_id_argument(
+                    row.operation, telegram_args, telegram_kwargs
+                )
+                self.channel.chat_binding.chat_migration_by_id(old_chat_id, error.new_chat_id)
+                if "chat_id" in telegram_kwargs:
+                    telegram_kwargs["chat_id"] = error.new_chat_id
+                else:
+                    chat_id_index = self.Decorators._POSITIONAL_CHAT_ID_INDICES.get(
+                        row.operation, 0
+                    )
+                    mutable_args = list(telegram_args)
+                    mutable_args[chat_id_index] = error.new_chat_id
+                    telegram_args = tuple(mutable_args)
+                self._rewind_queued_files(telegram_args, telegram_kwargs)
+                return method(*telegram_args, **telegram_kwargs)
+
         content_spec = {
             "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
             "edit_message_text": ("text", 0, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
@@ -1374,13 +1407,13 @@ class TelegramBotManager(LocaleMixin):
                 else:
                     telegram_kwargs[content_key] = truncated
         try:
-            result = method(*telegram_args, **telegram_kwargs)
+            result = call_method()
         except telegram.error.BadRequest as error:
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
             telegram_kwargs.pop("parse_mode")
             self._rewind_queued_files(telegram_args, telegram_kwargs)
-            result = method(*telegram_args, **telegram_kwargs)
+            result = call_method()
         if attachment is None or content_key is None:
             return result
         chat_id = self._queued_chat_id_argument(row.operation, telegram_args, telegram_kwargs)
@@ -1535,6 +1568,16 @@ class TelegramBotManager(LocaleMixin):
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = retry_at
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
+
+        if (
+            row.priority == 0
+            and isinstance(error, telegram.error.NetworkError)
+            and not isinstance(error, telegram.error.BadRequest)
+        ):
+            return QueuedCompletionDecision(
+                QueuedCompletionKind.RETRY_EVENTUAL,
+                time.monotonic() + self.TRANSPORT_RETRY_SECONDS,
+            )
 
         cooldown_seconds = self._rate_limit_retry_after_seconds(cast(Exception, error))
         if cooldown_seconds is not None:

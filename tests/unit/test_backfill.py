@@ -281,7 +281,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
     assert entries[1]["formatted_text"] is None
 
 
-def test_process_pending_history_migrations_waits_before_next_enqueue_and_deletes_successes():
+def test_process_pending_history_migrations_transfers_entries_to_durable_queue_before_waiting():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager._history_migration_lock = threading.Lock()
     manager.logger = Mock()
@@ -327,15 +327,18 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
     def get_history_migration_entries(_slave_chat_id, _tg_chat_id, _thread_id):
         return list(pending_entries)
 
+    events = []
+
+    def delete_entry(entry_id):
+        events.append(("delete", entry_id))
+        pending_entries.remove(next(entry for entry in pending_entries if entry.id == entry_id))
+
     manager.db = SimpleNamespace(
         get_next_history_migration_target=Mock(side_effect=get_next_history_migration_target),
         get_history_migration_entries=Mock(side_effect=get_history_migration_entries),
         get_recent_messages=Mock(),
-        delete_history_migration_entry=Mock(side_effect=lambda entry_id: pending_entries.remove(
-            next(entry for entry in pending_entries if entry.id == entry_id)
-        )),
+        delete_history_migration_entry=Mock(side_effect=delete_entry),
     )
-    events = []
 
     class Waiter:
         def __init__(self, entry_id):
@@ -396,14 +399,14 @@ def test_process_pending_history_migrations_waits_before_next_enqueue_and_delete
         ),
     ])
     assert events == [
-        ("enqueue", 1), ("wait", 1),
-        ("enqueue", 2), ("wait", 2),
-        ("enqueue", 3), ("wait", 3),
+        ("enqueue", 1), ("delete", 1), ("wait", 1),
+        ("enqueue", 2), ("delete", 2), ("wait", 2),
+        ("enqueue", 3), ("delete", 3), ("wait", 3),
     ]
     assert pending_entries == []
 
 
-def test_history_migration_retains_entry_and_logs_completed_count_on_waiter_failure():
+def test_history_migration_continues_after_terminal_delivery_failure():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager.logger = Mock()
     entry = SimpleNamespace(
@@ -424,12 +427,78 @@ def test_history_migration_retains_entry_and_logs_completed_count_on_waiter_fail
 
     processed = ChatBindingManager._process_history_migration_target(manager, entry)
 
+    assert processed is True
+    manager.db.delete_history_migration_entry.assert_called_once_with(7)
+    manager.logger.warning.assert_called_once_with(
+        "History migration entry %d failed after durable enqueue: %s",
+        7,
+        ANY,
+    )
+
+
+def test_history_migration_retains_entry_when_durable_enqueue_fails():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.logger = Mock()
+    entry = SimpleNamespace(
+        id=9,
+        slave_chat_id="tests.mocks.slave.chat",
+        target_chat_id="12345",
+        message_thread_id=None,
+        source_master_msg_id="10.20",
+        formatted_text="first\n",
+    )
+    manager.db = SimpleNamespace(
+        get_history_migration_entries=Mock(return_value=[entry]),
+        delete_history_migration_entry=Mock(),
+    )
+    manager.bot = SimpleNamespace(
+        enqueue_history_operation=Mock(side_effect=RuntimeError("queue unavailable"))
+    )
+
+    processed = ChatBindingManager._process_history_migration_target(manager, entry)
+
     assert processed is False
     manager.db.delete_history_migration_entry.assert_not_called()
     manager.logger.warning.assert_called_once_with(
-        "History migration entry %d retained after %d completed calls: %s",
-        7,
-        0,
+        "History migration entry %d retained because durable enqueue failed: %s",
+        9,
+        ANY,
+    )
+
+
+def test_history_migration_discards_unpreparable_entry_and_continues():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.logger = Mock()
+    invalid = SimpleNamespace(
+        id=10,
+        slave_chat_id="tests.mocks.slave.chat",
+        target_chat_id="12345",
+        message_thread_id=None,
+    )
+    valid = SimpleNamespace(id=11)
+    manager.db = SimpleNamespace(
+        get_history_migration_entries=Mock(return_value=[invalid, valid]),
+        delete_history_migration_entry=Mock(),
+    )
+    completed_waiter = Future()
+    completed_waiter.set_result(None)
+    manager.bot = SimpleNamespace(
+        enqueue_history_operation=Mock(return_value=completed_waiter)
+    )
+
+    with patch.object(
+        ChatBindingManager,
+        "_prepare_history_migration_call",
+        side_effect=[ValueError("invalid source id"), ("send_message", {"chat_id": 12345})],
+    ):
+        processed = ChatBindingManager._process_history_migration_target(manager, invalid)
+
+    assert processed is True
+    assert manager.db.delete_history_migration_entry.call_args_list == [call(10), call(11)]
+    manager.bot.enqueue_history_operation.assert_called_once()
+    manager.logger.warning.assert_called_once_with(
+        "History migration entry %d discarded because it could not be prepared: %s",
+        10,
         ANY,
     )
 
