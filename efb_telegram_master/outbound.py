@@ -21,7 +21,7 @@ from telegram import (
     InputMediaDocument, InputMediaLivePhoto, InputMediaPhoto, InputMediaVideo, PhotoSize,
     Sticker, Video, Voice,
 )
-from telegram.error import RetryAfter
+from telegram.error import NetworkError, RetryAfter
 
 
 @dataclass(frozen=True)
@@ -760,6 +760,38 @@ class OutboundQueue:
                     pass
                 raise
 
+    def migrate_destination(
+        self,
+        old_chat_id: int,
+        new_chat_id: int,
+        rewrite_payload: Callable[[str, tuple, dict, int], tuple[tuple, dict]],
+    ) -> None:
+        """Atomically retarget queued calls after Telegram migrates a chat."""
+        with self._lock:
+            try:
+                self.connection.execute("BEGIN")
+                rows = self.connection.execute(
+                    "SELECT id, operation, payload FROM outbound_queue "
+                    "WHERE telegram_chat_id = ? AND delivery_state = 'queued'",
+                    (old_chat_id,),
+                ).fetchall()
+                for row_id, operation, payload in rows:
+                    args, kwargs = self.decode_payload(payload)
+                    migrated_args, migrated_kwargs = rewrite_payload(
+                        str(operation), args, kwargs, new_chat_id
+                    )
+                    self.connection.execute(
+                        "UPDATE outbound_queue SET telegram_chat_id = ?, payload = ? WHERE id = ?",
+                        (new_chat_id, self.encode_payload(migrated_args, migrated_kwargs), row_id),
+                    )
+                self.connection.commit()
+            except Exception:
+                try:
+                    self.connection.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
     def delete(self, row_id: int) -> None:
         with self._lock:
             try:
@@ -1150,9 +1182,15 @@ class OutboundQueueScheduler:
                             raise RuntimeError("Retry decision requires a retry deadline.")
                         self._schedule_retry(decision.retry_at)
                         if self.queue.metrics is not None:
+                            if isinstance(error, RetryAfter):
+                                retry_reason = "rate_limit"
+                            elif isinstance(error, NetworkError):
+                                retry_reason = "transport"
+                            else:
+                                retry_reason = "membership"
                             self.queue.metrics.record_retry(
                                 submitted.row.priority, submitted.row.operation,
-                                "rate_limit" if isinstance(error, RetryAfter) else "membership"
+                                retry_reason,
                             )
                         continue
                     if submitted.row.priority == 0:
