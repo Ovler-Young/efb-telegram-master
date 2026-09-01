@@ -17,7 +17,11 @@ from telegram import InputMediaDocument
 from telegram.error import ChatMigrated, NetworkError, RetryAfter, TelegramError
 
 import efb_telegram_master.outbound as outbound
-from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
+from efb_telegram_master.bot_manager import (
+    QueuedChatMigrationRetry,
+    QueuedDbLogContext,
+    TelegramBotManager,
+)
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
@@ -85,6 +89,7 @@ class ControlledExecutor:
 class CompletionDecision:
     kind: str
     retry_at: float | None = None
+    retry_reason: str | None = None
 
 
 class AlwaysAvailableLimiter:
@@ -1028,47 +1033,96 @@ def test_scheduler_records_transport_retry_reason(tmp_path: Path) -> None:
     queue.close()
 
 
-@pytest.mark.parametrize("transient_error", [RetryAfter(10), NetworkError("connection lost")])
-def test_chat_migration_retargets_retained_destination_before_transient_retry(
-    tmp_path: Path, transient_error: BaseException
-) -> None:
-    queue = OutboundQueue(tmp_path)
-    first_id, _first_waiter = enqueue(queue, 61, "first")
-    second_id, _second_waiter = enqueue(queue, 61, "second")
-    row = queue.heads()[0]
+def test_chat_migration_redispatches_retained_row_only_after_harvest(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    first_id, _waiter = enqueue(queue, 61, "first")
     sender = Mock()
-    sender.send_message.side_effect = [
-        ChatMigrated(62),
-        transient_error,
-    ]
+    sender.send_message.side_effect = [ChatMigrated(62), "sent"]
     manager = manager_adapter()
+    manager._bot = sender
     manager._outbound_queue = queue
     manager.channel = SimpleNamespace(
         chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
     )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=2)
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    function, arguments, first_future = executor.submissions[0]
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        function(*arguments)
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    first_future.set_exception(caught.value)
+    scheduler.harvest_completed()
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="migration"} 1.0'
+        in generate_latest(metrics.registry).decode()
+    )
+    scheduler.dispatch_once()
+
+    assert len(executor.submissions) == 2
+    retried_row = executor.submissions[1][1][0]
+    assert retried_row.id == first_id
+    assert retried_row.telegram_chat_id == 62
+    assert queue.decode_payload(retried_row.payload)[1]["chat_id"] == 62
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(61, 62)
+    queue.close()
+
+
+def test_chat_migration_binding_failure_retains_original_row(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, 61, "first")
+    row = queue.heads()[0]
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(
+            chat_migration_by_id=Mock(side_effect=RuntimeError("database unavailable"))
+        )
+    )
     selection = SenderSelection(sender=sender, sender_bot_id=None)
 
-    with pytest.raises(type(transient_error)) as caught:
-        manager.execute_queued_call(
-            row, *queue.decode_payload(row.payload), selection
-        )
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        manager.execute_queued_call(row, *queue.decode_payload(row.payload), selection)
 
     decision = manager.record_queued_failure(row, caught.value, selection)
     assert decision.kind.name == "RETRY_EVENTUAL"
-    migrated_rows = queue.heads()
-    assert [migrated_row.telegram_chat_id for migrated_row in migrated_rows] == [62]
+    assert decision.retry_reason == "migration"
+    retained = queue.heads()[0]
+    assert retained.id == row_id
+    assert retained.telegram_chat_id == 61
+    assert queue.decode_payload(retained.payload)[1]["chat_id"] == 61
+    queue.close()
+
+
+def test_retarget_updates_only_current_row_and_ignores_corrupt_sibling(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    first_id, _waiter = enqueue(queue, 61, "first")
+    second_id, _second_waiter = enqueue(queue, 61, "second")
+    queue.connection.execute(
+        "UPDATE outbound_queue SET payload = X'02' WHERE id = ?", (second_id,)
+    )
+    queue.connection.commit()
+
+    queue.retarget(first_id, 62, (), {"chat_id": 62, "text": "first"})
+
     stored_rows = queue.connection.execute(
         "SELECT id, telegram_chat_id, payload FROM outbound_queue ORDER BY id"
     ).fetchall()
-    assert [stored_row[0] for stored_row in stored_rows] == [first_id, second_id]
-    assert [stored_row[1] for stored_row in stored_rows] == [62, 62]
-    assert [
-        queue.decode_payload(stored_row[2])[1]["chat_id"] for stored_row in stored_rows
-    ] == [62, 62]
-    if isinstance(transient_error, RetryAfter):
-        assert (None, 62) in manager._bot_chat_disabled_until
-        assert (None, 61) not in manager._bot_chat_disabled_until
-    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(61, 62)
+    assert [(stored_rows[0][0], stored_rows[0][1])] == [(first_id, 62)]
+    assert queue.decode_payload(stored_rows[0][2])[1]["chat_id"] == 62
+    assert (stored_rows[1][0], stored_rows[1][1], stored_rows[1][2]) == (
+        second_id,
+        61,
+        b"\x02",
+    )
     queue.close()
 
 

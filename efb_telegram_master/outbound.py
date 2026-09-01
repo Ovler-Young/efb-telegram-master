@@ -155,6 +155,10 @@ class QueuedCompletionDecision(Protocol):
     def retry_at(self) -> Optional[float]:
         ...
 
+    @property
+    def retry_reason(self) -> Optional[str]:
+        ...
+
 
 @dataclass
 class SubmittedCall:
@@ -760,30 +764,18 @@ class OutboundQueue:
                     pass
                 raise
 
-    def migrate_destination(
-        self,
-        old_chat_id: int,
-        new_chat_id: int,
-        rewrite_payload: Callable[[str, tuple, dict, int], tuple[tuple, dict]],
-    ) -> None:
-        """Atomically retarget queued calls after Telegram migrates a chat."""
+    def retarget(self, row_id: int, new_chat_id: int, args: tuple, kwargs: dict) -> None:
+        """Atomically retarget one retained queued call."""
         with self._lock:
             try:
                 self.connection.execute("BEGIN")
-                rows = self.connection.execute(
-                    "SELECT id, operation, payload FROM outbound_queue "
-                    "WHERE telegram_chat_id = ? AND delivery_state = 'queued'",
-                    (old_chat_id,),
-                ).fetchall()
-                for row_id, operation, payload in rows:
-                    args, kwargs = self.decode_payload(payload)
-                    migrated_args, migrated_kwargs = rewrite_payload(
-                        str(operation), args, kwargs, new_chat_id
-                    )
-                    self.connection.execute(
-                        "UPDATE outbound_queue SET telegram_chat_id = ?, payload = ? WHERE id = ?",
-                        (new_chat_id, self.encode_payload(migrated_args, migrated_kwargs), row_id),
-                    )
+                cursor = self.connection.execute(
+                    "UPDATE outbound_queue SET telegram_chat_id = ?, payload = ? "
+                    "WHERE id = ? AND delivery_state = 'queued'",
+                    (new_chat_id, self.encode_payload(args, kwargs), row_id),
+                )
+                if cursor.rowcount != 1:
+                    raise QueuePersistenceError(f"Queued row {row_id} cannot be retargeted.")
                 self.connection.commit()
             except Exception:
                 try:
@@ -1044,7 +1036,11 @@ class OutboundQueueScheduler:
                 retry.row.telegram_chat_id for retry in self.blocking_media_retries.values()
             }
             for row in self.queue.heads():
-                if row.telegram_chat_id in self.in_flight_destinations or row.telegram_chat_id in retry_destinations:
+                if (
+                    row.id in self.in_flight
+                    or row.telegram_chat_id in self.in_flight_destinations
+                    or row.telegram_chat_id in retry_destinations
+                ):
                     continue
                 try:
                     args, kwargs = self.queue.decode_payload(row.payload)
@@ -1182,12 +1178,14 @@ class OutboundQueueScheduler:
                             raise RuntimeError("Retry decision requires a retry deadline.")
                         self._schedule_retry(decision.retry_at)
                         if self.queue.metrics is not None:
-                            if isinstance(error, RetryAfter):
-                                retry_reason = "rate_limit"
-                            elif isinstance(error, NetworkError):
-                                retry_reason = "transport"
-                            else:
-                                retry_reason = "membership"
+                            retry_reason = getattr(decision, "retry_reason", None)
+                            if retry_reason is None:
+                                if isinstance(error, RetryAfter):
+                                    retry_reason = "rate_limit"
+                                elif isinstance(error, NetworkError):
+                                    retry_reason = "transport"
+                                else:
+                                    retry_reason = "membership"
                             self.queue.metrics.record_retry(
                                 submitted.row.priority, submitted.row.operation,
                                 retry_reason,
