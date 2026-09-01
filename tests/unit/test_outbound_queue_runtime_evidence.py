@@ -1092,13 +1092,53 @@ def test_chat_migration_binding_failure_retains_original_row(tmp_path: Path) -> 
     with pytest.raises(QueuedChatMigrationRetry) as caught:
         manager.execute_queued_call(row, *queue.decode_payload(row.payload), selection)
 
-    decision = manager.record_queued_failure(row, caught.value, selection)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 50.0)
+        decision = manager.record_queued_failure(row, caught.value, selection)
     assert decision.kind.name == "RETRY_EVENTUAL"
     assert decision.retry_reason == "migration"
+    assert decision.retry_at == 51.0
     retained = queue.heads()[0]
     assert retained.id == row_id
     assert retained.telegram_chat_id == 61
     assert queue.decode_payload(retained.payload)[1]["chat_id"] == 61
+    queue.close()
+
+
+def test_chat_migration_retarget_failure_stops_scheduler_and_retains_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, 61, "first")
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._bot = sender
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    persistence_error = QueuePersistenceError("injected retarget failure")
+    monkeypatch.setattr(queue, "retarget", Mock(side_effect=persistence_error))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    function, arguments, future = executor.submissions[0]
+    with pytest.raises(QueuePersistenceError) as caught:
+        function(*arguments)
+    future.set_exception(caught.value)
+    scheduler.harvest_completed()
+
+    assert scheduler.stopping
+    assert scheduler.failure is persistence_error
+    with pytest.raises(QueuePersistenceError):
+        waiter.result()
+    retained = queue.heads()[0]
+    assert retained.id == row_id
+    assert retained.telegram_chat_id == 61
+    assert queue.decode_payload(retained.payload)[1]["chat_id"] == 61
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(61, 62)
     queue.close()
 
 
