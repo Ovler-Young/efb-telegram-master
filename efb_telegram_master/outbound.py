@@ -828,6 +828,7 @@ class OutboundQueueScheduler:
         self.in_flight: dict[int, SubmittedCall] = {}
         self.in_flight_destinations: set[int] = set()
         self.blocking_media_retries: dict[int, BlockingMediaRetry] = {}
+        self._row_not_before: dict[int, float] = {}
         self.next_deadline: Optional[float] = None
 
     @staticmethod
@@ -1012,6 +1013,7 @@ class OutboundQueueScheduler:
         else:
             persistence_error = self.failure
         self.stopping = True
+        self._row_not_before.clear()
         self.queue.fail_all_waiters(persistence_error)
         self.wake_event.set()
 
@@ -1029,6 +1031,7 @@ class OutboundQueueScheduler:
             except Exception:
                 continue
             self._record_submitted_removal(row)
+            self._row_not_before.pop(row.id, None)
             reconciled.add(row.id)
         return reconciled
 
@@ -1049,6 +1052,13 @@ class OutboundQueueScheduler:
                     or row.telegram_chat_id in retry_destinations
                 ):
                     continue
+                now = time.monotonic()
+                not_before = self._row_not_before.get(row.id)
+                if not_before is not None:
+                    if now < not_before:
+                        self._schedule_retry(not_before)
+                        continue
+                    self._row_not_before.pop(row.id, None)
                 try:
                     args, kwargs = self.queue.decode_payload(row.payload)
                 except InvalidQueuedPayloadError as error:
@@ -1058,6 +1068,7 @@ class OutboundQueueScheduler:
                         self._stop_for_persistence_error(delete_error)
                         return
                     self._record_terminal_discard(row)
+                    self._row_not_before.pop(row.id, None)
                     self._record_dispatch("failed")
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
@@ -1069,7 +1080,6 @@ class OutboundQueueScheduler:
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_retry(row.priority, row.operation, "worker_capacity")
                     continue
-                now = time.monotonic()
                 decision = self.adapter.select_sender(row, now)
                 if decision.terminal_error_class is not None:
                     self._permits.release()
@@ -1079,6 +1089,7 @@ class OutboundQueueScheduler:
                         self._stop_for_persistence_error(delete_error)
                         return
                     self._record_terminal_discard(row)
+                    self._row_not_before.pop(row.id, None)
                     self._record_dispatch("failed")
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
@@ -1186,6 +1197,7 @@ class OutboundQueueScheduler:
                             continue
                         if decision.retry_at is None:
                             raise RuntimeError("Retry decision requires a retry deadline.")
+                        self._row_not_before[row_id] = decision.retry_at
                         self._schedule_retry(decision.retry_at)
                         if self.queue.metrics is not None:
                             retry_reason = getattr(decision, "retry_reason", None)
@@ -1208,6 +1220,7 @@ class OutboundQueueScheduler:
                             self._stop_for_persistence_error(delete_error)
                             return
                         self._record_terminal_discard(submitted.row)
+                        self._row_not_before.pop(row_id, None)
                     self.queue.fail_waiter(row_id, error)
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_failure(
@@ -1215,6 +1228,7 @@ class OutboundQueueScheduler:
                         )
                     self._record_terminal_completion(submitted.row, submitted.selection, "failure")
                 else:
+                    self._row_not_before.pop(row_id, None)
                     self._record_executor_attempt_duration(submitted, "success")
                     if submitted.row.log_context is not None:
                         receipt_encoder = getattr(self.adapter, "encode_queued_completion_receipt", None)
@@ -1251,6 +1265,7 @@ class OutboundQueueScheduler:
     def stop_and_drain(self, timeout: float = 5.0) -> None:
         with self._lock:
             self.stopping = True
+            self._row_not_before.clear()
             stopped_error = self.failure or SchedulerStoppedError("Outbound scheduler stopped.")
             for retry in tuple(self.blocking_media_retries.values()):
                 self._fail_blocking_retry(retry, stopped_error)

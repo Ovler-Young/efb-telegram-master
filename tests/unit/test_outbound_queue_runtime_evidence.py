@@ -1033,6 +1033,40 @@ def test_scheduler_records_transport_retry_reason(tmp_path: Path) -> None:
     queue.close()
 
 
+def test_transport_retry_deadline_blocks_only_its_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    first_id, _first_waiter = enqueue(queue, 50, "first")
+    manager = manager_adapter()
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=2)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(NetworkError("connection lost"))
+    scheduler.harvest_completed()
+    second_id, _second_waiter = enqueue(queue, 50, "second")
+    other_id, _other_waiter = enqueue(queue, 51, "other")
+
+    scheduler.dispatch_once()
+
+    assert scheduler.next_deadline == 101.0
+    assert [submission[1][0].id for submission in executor.submissions] == [first_id, other_id]
+
+    clock["now"] = 101.0
+    scheduler.dispatch_once()
+
+    assert [submission[1][0].id for submission in executor.submissions] == [
+        first_id,
+        other_id,
+        first_id,
+    ]
+    assert second_id not in [submission[1][0].id for submission in executor.submissions]
+    queue.close()
+
+
 def test_chat_migration_redispatches_retained_row_only_after_harvest(tmp_path: Path) -> None:
     metrics = Metrics()
     queue = OutboundQueue(tmp_path, metrics=metrics)
@@ -1102,6 +1136,44 @@ def test_chat_migration_binding_failure_retains_original_row(tmp_path: Path) -> 
     assert retained.id == row_id
     assert retained.telegram_chat_id == 61
     assert queue.decode_payload(retained.payload)[1]["chat_id"] == 61
+    queue.close()
+
+
+def test_chat_migration_binding_failure_observes_retry_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, 61, "first")
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._bot = sender
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(
+            chat_migration_by_id=Mock(side_effect=RuntimeError("database unavailable"))
+        )
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
+    clock = {"now": 50.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    function, arguments, future = executor.submissions[0]
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        function(*arguments)
+    future.set_exception(caught.value)
+    scheduler.harvest_completed()
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    assert scheduler.next_deadline == 51.0
+
+    clock["now"] = 51.0
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 2
+    assert executor.submissions[1][1][0].id == row_id
     queue.close()
 
 
