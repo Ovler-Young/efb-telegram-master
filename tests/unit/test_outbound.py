@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+from unittest.mock import Mock, patch
 
 import pytest
 from telegram import (
@@ -69,6 +70,45 @@ def test_queue_schema_wal_and_restart_retention(tmp_path):
     restarted.delete(row_id)
     restarted.close()
     assert OutboundQueue(tmp_path).heads() == []
+
+
+def test_queue_removal_clamps_residence_after_wall_clock_rollback(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    enqueue(queue, QueueRequest("send_message", (), {"chat_id": 12, "text": "first"}))
+    row = queue.heads()[0]
+    metrics = Mock()
+    queue.metrics = metrics
+
+    with patch("efb_telegram_master.outbound.time.time", return_value=row.created_at - 1):
+        queue.record_removal(row, "submitted")
+
+    metrics.record_removal.assert_called_once_with(0, "send_message", "submitted", 0.0)
+
+
+def test_destination_snapshot_limits_and_ranks_in_sql_order(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    enqueue(
+        queue,
+        QueueRequest("send_message", (), {"chat_id": 30, "text": "a"}),
+        QueueRequest("send_message", (), {"chat_id": 30, "text": "b"}),
+    )
+    enqueue(
+        queue,
+        QueueRequest("send_message", (), {"chat_id": 20, "text": "a"}),
+        QueueRequest("send_message", (), {"chat_id": 20, "text": "b"}),
+    )
+    enqueue(queue, QueueRequest("send_message", (), {"chat_id": 10, "text": "only"}))
+    queue.connection.execute(
+        "UPDATE outbound_queue SET created_at = CASE telegram_chat_id WHEN 20 THEN 90 ELSE 95 END"
+    )
+    queue.connection.commit()
+
+    with patch("efb_telegram_master.outbound.time.time", return_value=100):
+        assert queue.destination_snapshot(2) == [
+            ("rank_1", 2, 10.0),
+            ("rank_2", 2, 5.0),
+        ]
+        assert queue.destination_snapshot(0) == []
 
 
 def test_queue_adds_delivery_columns_to_existing_database(tmp_path):

@@ -1491,6 +1491,45 @@ def test_parse_metrics_config_defaults_and_disables_invalid_endpoint_options():
     assert logger.warning.call_count == 2
 
 
+def test_metrics_endpoint_bind_failure_is_non_fatal_but_programming_errors_propagate():
+    manager = object.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._metrics = Metrics()
+    bind_error = OSError("address already in use")
+
+    with patch(
+        "efb_telegram_master.etm_metrics.start_metrics_server",
+        side_effect=bind_error,
+    ):
+        assert manager._start_metrics_endpoint("127.0.0.1", 9101) is None
+
+    manager.logger.warning.assert_called_once_with(
+        "Unable to start Prometheus endpoint on %s:%d: %s",
+        "127.0.0.1",
+        9101,
+        bind_error,
+    )
+
+    with patch(
+        "efb_telegram_master.etm_metrics.start_metrics_server",
+        side_effect=ValueError("invalid registry"),
+    ), pytest.raises(ValueError, match="invalid registry"):
+        manager._start_metrics_endpoint("127.0.0.1", 9101)
+
+
+def test_destination_metrics_pass_configured_limit_to_queue_query():
+    manager = object.__new__(TelegramBotManager)
+    manager._metrics = Mock()
+    manager._outbound_queue = Mock()
+    manager._outbound_queue.destination_snapshot.return_value = []
+
+    manager._register_runtime_metric_collectors(3)
+
+    snapshot = manager._metrics.register_destination_queue_collector.call_args.args[0]
+    assert snapshot() == []
+    manager._outbound_queue.destination_snapshot.assert_called_once_with(3)
+
+
 @pytest.mark.asyncio
 async def test_shutdown_ptb_application_signals_stop_running():
     application = SimpleNamespace(stop_running=Mock())

@@ -494,7 +494,7 @@ class TelegramBotManager(LocaleMixin):
         self._queued_completion_callbacks: dict[int, Optional[Callable[[], None]]] = {}
         self._queued_db_log_context_lock = threading.Lock()
         self._last_metrics_snapshot = 0.0
-        from .etm_metrics import Metrics, start_metrics_server
+        from .etm_metrics import Metrics
         metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
         self._metrics = Metrics(namespace="etm")
         channel.db.set_metrics(self._metrics)
@@ -520,11 +520,7 @@ class TelegramBotManager(LocaleMixin):
 
         if metrics_endpoint is not None:
             metrics_host, metrics_port = metrics_endpoint
-            self._metrics_httpd = start_metrics_server(
-                metrics_host,
-                metrics_port,
-                registry=self._metrics.registry,
-            )
+            self._metrics_httpd = self._start_metrics_endpoint(metrics_host, metrics_port)
 
         self.logger.debug("Durable outbound system initialized...")
 
@@ -948,6 +944,17 @@ class TelegramBotManager(LocaleMixin):
 
         return top_n, (host, port)
 
+    def _start_metrics_endpoint(self, host: str, port: int):
+        from .etm_metrics import start_metrics_server
+
+        try:
+            return start_metrics_server(host, port, registry=self._metrics.registry)
+        except OSError as error:
+            self.logger.warning(
+                "Unable to start Prometheus endpoint on %s:%d: %s", host, port, error
+            )
+            return None
+
     def _register_runtime_metric_collectors(self, top_n: int) -> None:
         """Bind bounded scrape callbacks after all outbound runtime state exists."""
         from .etm_metrics import DestinationQueueSnapshot, WorkerSnapshot
@@ -955,7 +962,7 @@ class TelegramBotManager(LocaleMixin):
         def destination_snapshot() -> list[DestinationQueueSnapshot]:
             return [
                 DestinationQueueSnapshot(destination, depth, oldest_age)
-                for destination, depth, oldest_age in self._outbound_queue.destination_snapshot()
+                for destination, depth, oldest_age in self._outbound_queue.destination_snapshot(top_n)
             ]
 
         def worker_snapshot() -> WorkerSnapshot:

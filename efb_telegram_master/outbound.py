@@ -368,7 +368,8 @@ class OutboundQueue:
 
     def record_removal(self, row: QueuedCall, outcome: str) -> None:
         if self.metrics is not None:
-            self.metrics.record_removal(row.priority, row.operation, outcome, time.time() - row.created_at)
+            residence_seconds = max(0.0, time.time() - row.created_at)
+            self.metrics.record_removal(row.priority, row.operation, outcome, residence_seconds)
         self.refresh_depth()
 
     @staticmethod
@@ -714,12 +715,14 @@ class OutboundQueue:
             heads.append(QueuedCall(*row))
         return heads
 
-    def destination_snapshot(self) -> list[tuple[str, int, float]]:
+    def destination_snapshot(self, limit: int) -> list[tuple[str, int, float]]:
         """Return ranked queue destinations without exposing Telegram chat IDs."""
         with self._lock:
             rows = self.connection.execute(
                 "SELECT telegram_chat_id, COUNT(*), MIN(created_at) FROM outbound_queue "
-                "GROUP BY telegram_chat_id ORDER BY COUNT(*) DESC, telegram_chat_id ASC"
+                "GROUP BY telegram_chat_id "
+                "ORDER BY COUNT(*) DESC, telegram_chat_id ASC LIMIT ?",
+                (limit,),
             ).fetchall()
         now = time.time()
         return [
