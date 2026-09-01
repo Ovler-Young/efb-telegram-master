@@ -78,6 +78,7 @@ class AuxiliaryBot:
         self._membership_cache: Dict[int, Tuple[bool, float]] = {}
         self._membership_lock = threading.Lock()
         self._pending_probes: set[int] = set()
+        self._membership_generation: Dict[int, int] = {}
         self._metrics = None
         self._membership_changed_callback: Optional[Callable[['AuxiliaryBot', int, bool], None]] = None
 
@@ -222,9 +223,19 @@ class AuxiliaryBot:
     def update_membership(self, chat_id: int, is_member: bool) -> None:
         """Update the membership cache directly (e.g. from chat_left handler)."""
         with self._membership_lock:
+            self._membership_generation[chat_id] = self._membership_generation.get(chat_id, 0) + 1
             self._membership_cache[chat_id] = (is_member, time.time())
-        if self._membership_changed_callback is not None:
-            self._membership_changed_callback(self, chat_id, is_member)
+            if self._membership_changed_callback is not None:
+                self._membership_changed_callback(self, chat_id, is_member)
+
+    def _update_probed_membership(self, chat_id: int, is_member: bool, generation: int) -> bool:
+        with self._membership_lock:
+            if self._membership_generation.get(chat_id, 0) != generation:
+                return False
+            self._membership_cache[chat_id] = (is_member, time.time())
+            if self._membership_changed_callback is not None:
+                self._membership_changed_callback(self, chat_id, is_member)
+        return True
 
     def _start_membership_probe(self, chat_id: int) -> None:
         """Start a background thread to check membership via get_chat_member API."""
@@ -232,37 +243,40 @@ class AuxiliaryBot:
             if chat_id in self._pending_probes:
                 return
             self._pending_probes.add(chat_id)
+            generation = self._membership_generation.get(chat_id, 0)
 
         thread = threading.Thread(
             target=self._probe_membership,
-            args=(chat_id,),
+            args=(chat_id, generation),
             daemon=True,
             name=f"AuxBotMemberProbe-{self.bot_id}-{chat_id}"
         )
         thread.start()
 
-    def _probe_membership(self, chat_id: int) -> None:
+    def _probe_membership(self, chat_id: int, generation: Optional[int] = None) -> None:
         """Background probe: call get_chat_member and update cache."""
+        if generation is None:
+            with self._membership_lock:
+                generation = self._membership_generation.get(chat_id, 0)
         try:
             member: telegram.ChatMember = cast(
                 telegram.ChatMember,
                 _resolve_bot_result(self.async_bot.get_chat_member(chat_id, self.bot_id), self._runtime),
             )
             is_member = member.status in ('member', 'administrator', 'creator', 'restricted')
-            self.update_membership(chat_id, is_member)
+            self._update_probed_membership(chat_id, is_member, generation)
             self._record_membership_probe("ok_member" if is_member else "ok_not_member")
             logger.debug("Membership probe for bot %d in chat %d: %s (status=%s)",
                          self.bot_id, chat_id, is_member, member.status)
         except telegram.error.Forbidden:
-            self.update_membership(chat_id, False)
+            self._update_probed_membership(chat_id, False, generation)
             self._record_membership_probe("forbidden")
             logger.warning("Membership probe for bot %d in chat %d got Forbidden", self.bot_id, chat_id)
         except telegram.error.BadRequest as e:
-            self.update_membership(chat_id, False)
+            self._update_probed_membership(chat_id, False, generation)
             self._record_membership_probe("bad_request")
             logger.debug("Membership probe for bot %d in chat %d failed: %s", self.bot_id, chat_id, e)
         except Exception as e:
-            self.update_membership(chat_id, False)
             self._record_membership_probe("error")
             logger.warning("Membership probe failed for bot %d in chat %d: %s", self.bot_id, chat_id, e)
         finally:
