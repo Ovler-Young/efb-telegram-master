@@ -1024,6 +1024,7 @@ def test_public_positional_edit_retries_chat_migration_without_replacing_text():
     manager.channel = SimpleNamespace(
         chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
     )
+    manager._outbound_queue = Mock()
 
     def send_and_wait(_slave_id, _chat_id, fn, args, kwargs, cleanup_files=None):
         send_kwargs = {key: value for key, value in kwargs.items() if not key.startswith("_")}
@@ -1053,6 +1054,7 @@ def test_public_positional_edit_retries_chat_migration_without_replacing_text():
 
 def test_queued_positional_media_edit_retries_chat_migration_with_new_chat_id():
     manager = object.__new__(TelegramBotManager)
+    manager._outbound_queue = Mock()
     old_chat_id = 123
     new_chat_id = 456
     media = object()
@@ -1080,6 +1082,7 @@ def test_queued_positional_media_edit_retries_chat_migration_with_new_chat_id():
     manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(
         old_chat_id, new_chat_id
     )
+    manager._outbound_queue.migrate_destination.assert_called_once()
 
 
 def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():

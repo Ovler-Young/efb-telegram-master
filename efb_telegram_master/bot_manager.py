@@ -797,6 +797,21 @@ class TelegramBotManager(LocaleMixin):
         chat_id_index = TelegramBotManager.Decorators._POSITIONAL_CHAT_ID_INDICES.get(operation, 0)
         return args[chat_id_index] if len(args) > chat_id_index else kwargs.get("chat_id")
 
+    @staticmethod
+    def _rewrite_queued_chat_id(
+        operation: str, args: tuple, kwargs: dict, new_chat_id: int
+    ) -> tuple[tuple, dict]:
+        if "chat_id" in kwargs:
+            migrated_kwargs = dict(kwargs)
+            migrated_kwargs["chat_id"] = new_chat_id
+            return args, migrated_kwargs
+        chat_id_index = TelegramBotManager.Decorators._POSITIONAL_CHAT_ID_INDICES.get(
+            operation, 0
+        )
+        migrated_args = list(args)
+        migrated_args[chat_id_index] = new_chat_id
+        return tuple(migrated_args), kwargs
+
     def _queued_operation_callable(self, operation: str) -> Callable[..., object]:
         method = self._queue_operation(operation)
 
@@ -1364,18 +1379,21 @@ class TelegramBotManager(LocaleMixin):
                 old_chat_id = self._queued_chat_id_argument(
                     row.operation, telegram_args, telegram_kwargs
                 )
+                self._outbound_queue.migrate_destination(
+                    self._normalize_telegram_chat_id(old_chat_id),
+                    error.new_chat_id,
+                    self._rewrite_queued_chat_id,
+                )
                 self.channel.chat_binding.chat_migration_by_id(old_chat_id, error.new_chat_id)
-                if "chat_id" in telegram_kwargs:
-                    telegram_kwargs["chat_id"] = error.new_chat_id
-                else:
-                    chat_id_index = self.Decorators._POSITIONAL_CHAT_ID_INDICES.get(
-                        row.operation, 0
-                    )
-                    mutable_args = list(telegram_args)
-                    mutable_args[chat_id_index] = error.new_chat_id
-                    telegram_args = tuple(mutable_args)
+                telegram_args, telegram_kwargs = self._rewrite_queued_chat_id(
+                    row.operation, telegram_args, telegram_kwargs, error.new_chat_id
+                )
                 self._rewind_queued_files(telegram_args, telegram_kwargs)
-                return method(*telegram_args, **telegram_kwargs)
+                try:
+                    return method(*telegram_args, **telegram_kwargs)
+                except (telegram.error.RetryAfter, telegram.error.NetworkError) as retry_error:
+                    setattr(retry_error, "_etm_telegram_chat_id", error.new_chat_id)
+                    raise
 
         content_spec = {
             "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
@@ -1561,7 +1579,8 @@ class TelegramBotManager(LocaleMixin):
     def record_queued_failure(
         self, row, error: BaseException, selection: SenderSelection
     ) -> QueuedCompletionDecision:
-        key = (selection.sender_bot_id, row.telegram_chat_id)
+        telegram_chat_id = getattr(error, "_etm_telegram_chat_id", row.telegram_chat_id)
+        key = (selection.sender_bot_id, telegram_chat_id)
         if selection.sender_bot_id is not None and row.slave_id:
             with self._get_bot_chat_state_lock():
                 affinities = getattr(self, "_membership_failure_affinities", None)

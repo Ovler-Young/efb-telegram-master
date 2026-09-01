@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 from prometheus_client import generate_latest
 from telegram import InputMediaDocument
-from telegram.error import NetworkError, RetryAfter, TelegramError
+from telegram.error import ChatMigrated, NetworkError, RetryAfter, TelegramError
 
 import efb_telegram_master.outbound as outbound
 from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
@@ -103,6 +103,7 @@ def auxiliary_probe_publishing_non_membership(bot_id: int, chat_id: int) -> Auxi
     )
     auxiliary._runtime = None
     auxiliary._membership_cache = {}
+    auxiliary._membership_generation = {}
     auxiliary._membership_lock = threading.Lock()
     auxiliary._pending_probes = {chat_id}
     auxiliary._metrics = None
@@ -998,6 +999,76 @@ def test_scheduler_records_attempt_failure_and_only_terminal_success_after_retry
     assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
     assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="failure",priority="normal"}' not in rendered
     assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    queue.close()
+
+
+def test_scheduler_records_transport_retry_reason(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    enqueue(queue, 50, "transport retry")
+    adapter = RecordingAdapter(
+        failure_decision=CompletionDecision("retry_eventual", retry_at=10.0)
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(NetworkError("connection lost"))
+    scheduler.harvest_completed()
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="transport"} 1.0' in rendered
+    )
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="membership"}' not in rendered
+    )
+    queue.close()
+
+
+@pytest.mark.parametrize("transient_error", [RetryAfter(10), NetworkError("connection lost")])
+def test_chat_migration_retargets_retained_destination_before_transient_retry(
+    tmp_path: Path, transient_error: BaseException
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    first_id, _first_waiter = enqueue(queue, 61, "first")
+    second_id, _second_waiter = enqueue(queue, 61, "second")
+    row = queue.heads()[0]
+    sender = Mock()
+    sender.send_message.side_effect = [
+        ChatMigrated(62),
+        transient_error,
+    ]
+    manager = manager_adapter()
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    selection = SenderSelection(sender=sender, sender_bot_id=None)
+
+    with pytest.raises(type(transient_error)) as caught:
+        manager.execute_queued_call(
+            row, *queue.decode_payload(row.payload), selection
+        )
+
+    decision = manager.record_queued_failure(row, caught.value, selection)
+    assert decision.kind.name == "RETRY_EVENTUAL"
+    migrated_rows = queue.heads()
+    assert [migrated_row.telegram_chat_id for migrated_row in migrated_rows] == [62]
+    stored_rows = queue.connection.execute(
+        "SELECT id, telegram_chat_id, payload FROM outbound_queue ORDER BY id"
+    ).fetchall()
+    assert [stored_row[0] for stored_row in stored_rows] == [first_id, second_id]
+    assert [stored_row[1] for stored_row in stored_rows] == [62, 62]
+    assert [
+        queue.decode_payload(stored_row[2])[1]["chat_id"] for stored_row in stored_rows
+    ] == [62, 62]
+    if isinstance(transient_error, RetryAfter):
+        assert (None, 62) in manager._bot_chat_disabled_until
+        assert (None, 61) not in manager._bot_chat_disabled_until
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(61, 62)
     queue.close()
 
 
