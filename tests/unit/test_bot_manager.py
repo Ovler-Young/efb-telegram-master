@@ -334,7 +334,7 @@ def test_default_connection_pool_size_uses_worker_count_multiplier(monkeypatch):
     assert TelegramBotManager._default_connection_pool_size({}) == 4
 
 
-def test_queued_failure_decision_retries_only_eventual_retry_after(
+def test_queued_failure_decision_retries_eventual_rate_limits_and_transport_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = object.__new__(TelegramBotManager)
@@ -349,12 +349,24 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
     assert retry.kind.name == "RETRY_EVENTUAL"
     assert retry.retry_at == 1_020.0
 
+    for error in (telegram.error.TimedOut(), telegram.error.NetworkError("connection lost")):
+        retry = manager.record_queued_failure(task, error, selection)
+        assert retry.kind.name == "RETRY_EVENTUAL"
+        assert retry.retry_at == 1_001.0
+
     blocking = manager.record_queued_failure(
         SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=1),
         telegram.error.RetryAfter(20),
         selection,
     )
     assert blocking.kind.name == "TERMINAL_FAILURE"
+
+    semantic = manager.record_queued_failure(
+        task,
+        telegram.error.BadRequest("chat not found"),
+        selection,
+    )
+    assert semantic.kind.name == "TERMINAL_FAILURE"
 
 
 def test_terminal_eventual_failure_does_not_clear_existing_cooldown() -> None:
@@ -1039,6 +1051,37 @@ def test_public_positional_edit_retries_chat_migration_without_replacing_text():
     manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(old_chat_id, new_chat_id)
 
 
+def test_queued_positional_media_edit_retries_chat_migration_with_new_chat_id():
+    manager = object.__new__(TelegramBotManager)
+    old_chat_id = 123
+    new_chat_id = 456
+    media = object()
+    sender = Mock()
+    sender.edit_message_media.side_effect = [
+        telegram.error.ChatMigrated(new_chat_id),
+        "edited",
+    ]
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+
+    result = manager.execute_queued_call(
+        SimpleNamespace(operation="edit_message_media"),
+        (media, old_chat_id, 789, "inline-id"),
+        {"reply_markup": "keyboard"},
+        SenderSelection(sender=sender, sender_bot_id=None),
+    )
+
+    assert result == "edited"
+    assert sender.edit_message_media.call_args_list == [
+        call(media, old_chat_id, 789, "inline-id", reply_markup="keyboard"),
+        call(media, new_chat_id, 789, "inline-id", reply_markup="keyboard"),
+    ]
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(
+        old_chat_id, new_chat_id
+    )
+
+
 def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():
     manager = object.__new__(TelegramBotManager)
     manager._enqueue_requests = Mock(return_value=("row-1", Mock()))
@@ -1456,6 +1499,40 @@ async def test_shutdown_ptb_application_signals_stop_running():
     await TelegramBotManager._shutdown_ptb_application(manager)
 
     application.stop_running.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_post_init_starts_durable_worker_after_runtime_binding():
+    manager = object.__new__(TelegramBotManager)
+    events: list[str] = []
+    manager._runtime = SimpleNamespace(bind_loop=lambda _loop: events.append("bind"))
+    manager.bot_pool = None
+    manager._send_worker_stop = threading.Event()
+    manager._outbound_scheduler = SimpleNamespace(stopping=False)
+    manager._shutdown_complete_event = threading.Event()
+    worker = Mock()
+    worker.start.side_effect = lambda: events.append("start")
+
+    with patch("efb_telegram_master.bot_manager.threading.Thread", return_value=worker):
+        await manager._post_init(SimpleNamespace())
+
+    assert events == ["bind", "start"]
+
+
+@pytest.mark.asyncio
+async def test_post_init_does_not_start_worker_after_shutdown_before_start():
+    manager = object.__new__(TelegramBotManager)
+    manager._runtime = SimpleNamespace(bind_loop=Mock())
+    manager.bot_pool = None
+    manager._send_worker_stop = threading.Event()
+    manager._send_worker_stop.set()
+    manager._outbound_scheduler = SimpleNamespace(stopping=True)
+    manager._shutdown_complete_event = threading.Event()
+
+    with patch("efb_telegram_master.bot_manager.threading.Thread") as thread:
+        await manager._post_init(SimpleNamespace())
+
+    thread.assert_not_called()
 
 
 def test_polling_passes_custom_timeout_to_manual_lifecycle():
