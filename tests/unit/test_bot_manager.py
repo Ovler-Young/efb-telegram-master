@@ -1082,7 +1082,7 @@ def test_queued_positional_media_edit_retries_chat_migration_with_new_chat_id():
     manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(
         old_chat_id, new_chat_id
     )
-    manager._outbound_queue.migrate_destination.assert_called_once()
+    manager._outbound_queue.retarget.assert_not_called()
 
 
 def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():

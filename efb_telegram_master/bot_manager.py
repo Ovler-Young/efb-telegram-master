@@ -66,6 +66,11 @@ class QueuedCompletionDecision:
 
     kind: QueuedCompletionKind
     retry_at: Optional[float] = None
+    retry_reason: Optional[str] = None
+
+
+class QueuedChatMigrationRetry(Exception):
+    """Retry a retained call after handling Telegram chat migration."""
 
 
 class QueuedDbLogContext(NamedTuple):
@@ -1379,16 +1384,23 @@ class TelegramBotManager(LocaleMixin):
                 old_chat_id = self._queued_chat_id_argument(
                     row.operation, telegram_args, telegram_kwargs
                 )
-                self._outbound_queue.migrate_destination(
-                    self._normalize_telegram_chat_id(old_chat_id),
-                    error.new_chat_id,
-                    self._rewrite_queued_chat_id,
-                )
-                self.channel.chat_binding.chat_migration_by_id(old_chat_id, error.new_chat_id)
+                try:
+                    self.channel.chat_binding.chat_migration_by_id(old_chat_id, error.new_chat_id)
+                except Exception as migration_error:
+                    if getattr(row, "priority", 1) == 0:
+                        raise QueuedChatMigrationRetry(str(migration_error)) from migration_error
+                    raise
                 telegram_args, telegram_kwargs = self._rewrite_queued_chat_id(
                     row.operation, telegram_args, telegram_kwargs, error.new_chat_id
                 )
                 self._rewind_queued_files(telegram_args, telegram_kwargs)
+                if getattr(row, "priority", 1) == 0:
+                    self._outbound_queue.retarget(
+                        row.id, error.new_chat_id, telegram_args, telegram_kwargs
+                    )
+                    raise QueuedChatMigrationRetry(
+                        f"Telegram chat migrated to {error.new_chat_id}."
+                    ) from error
                 try:
                     return method(*telegram_args, **telegram_kwargs)
                 except (telegram.error.RetryAfter, telegram.error.NetworkError) as retry_error:
@@ -1579,6 +1591,13 @@ class TelegramBotManager(LocaleMixin):
     def record_queued_failure(
         self, row, error: BaseException, selection: SenderSelection
     ) -> QueuedCompletionDecision:
+        if row.priority == 0 and isinstance(error, QueuedChatMigrationRetry):
+            return QueuedCompletionDecision(
+                QueuedCompletionKind.RETRY_EVENTUAL,
+                time.monotonic(),
+                "migration",
+            )
+
         telegram_chat_id = getattr(error, "_etm_telegram_chat_id", row.telegram_chat_id)
         key = (selection.sender_bot_id, telegram_chat_id)
         if selection.sender_bot_id is not None and row.slave_id:
