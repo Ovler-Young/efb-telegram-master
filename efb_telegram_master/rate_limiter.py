@@ -103,6 +103,17 @@ class SlidingWindowRateLimiter:
             self._leak(chat_bucket)
             return chat_bucket.count(), self._global_bucket.count()
 
+    def occupancy_snapshot(self) -> dict[str, float]:
+        """Return aggregate limiter occupancy without exposing chat identities."""
+        with self._lock:
+            self._leak(self._global_bucket)
+            global_occupancy = self._global_bucket.count() / GLOBAL_LIMIT
+            chat_occupancy = 0.0
+            for bucket in self._chat_buckets.values():
+                self._leak(bucket)
+                chat_occupancy = max(chat_occupancy, bucket.count() / CHAT_LIMIT)
+            return {"global": global_occupancy, "chat": chat_occupancy}
+
     def _delay(self, bucket: InMemoryBucket, limit: int, seconds: float) -> float:
         self._leak(bucket)
         if bucket.count() < limit:

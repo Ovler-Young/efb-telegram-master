@@ -2,6 +2,7 @@ import asyncio
 import base64
 import inspect
 import io
+import logging
 import string
 import random
 import threading
@@ -13,6 +14,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 import telegram.error
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from prometheus_client import generate_latest
 
 from efb_telegram_master.bot_manager import (
     QueuedDbLogContext,
@@ -21,7 +23,17 @@ from efb_telegram_master.bot_manager import (
     TelegramBotManager,
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
+
+
+class DurableMessage:
+    def __init__(self) -> None:
+        self.type_telegram = None
+        self.receipt = None
+
+    def put_telegram_file(self, receipt) -> None:
+        self.receipt = receipt
 
 
 def _bind_blocking_enqueue_helper(manager):
@@ -322,10 +334,11 @@ def test_default_connection_pool_size_uses_worker_count_multiplier(monkeypatch):
     assert TelegramBotManager._default_connection_pool_size({}) == 4
 
 
-def test_queued_failure_decision_retries_only_eventual_retry_after(
+def test_queued_failure_decision_retries_eventual_rate_limits_and_transport_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {("10", 100): 1_111.0}
     manager.bot_pool = None
     task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
@@ -336,6 +349,11 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
     assert retry.kind.name == "RETRY_EVENTUAL"
     assert retry.retry_at == 1_020.0
 
+    for error in (telegram.error.TimedOut(), telegram.error.NetworkError("connection lost")):
+        retry = manager.record_queued_failure(task, error, selection)
+        assert retry.kind.name == "RETRY_EVENTUAL"
+        assert retry.retry_at == 1_001.0
+
     blocking = manager.record_queued_failure(
         SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=1),
         telegram.error.RetryAfter(20),
@@ -343,9 +361,17 @@ def test_queued_failure_decision_retries_only_eventual_retry_after(
     )
     assert blocking.kind.name == "TERMINAL_FAILURE"
 
+    semantic = manager.record_queued_failure(
+        task,
+        telegram.error.BadRequest("chat not found"),
+        selection,
+    )
+    assert semantic.kind.name == "TERMINAL_FAILURE"
+
 
 def test_terminal_eventual_failure_does_not_clear_existing_cooldown() -> None:
     manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {("10", 100): 1_025.0}
     manager.bot_pool = None
     task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
@@ -768,7 +794,7 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
     wake_event.set.side_effect = assert_context_registered
     row_id, _waiter = TelegramBotManager._enqueue_requests(
         manager,
-        [Mock()],
+        [QueueRequest("send_message", (), {"_send_mode": "blocking"})],
         db_log_context=db_context,
     )
 
@@ -780,7 +806,9 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     manager = object.__new__(TelegramBotManager)
     on_complete = Mock()
     manager._queued_db_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
+    manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
+    manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
     manager.bot_pool = None
     row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
@@ -795,6 +823,134 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
     assert decision.kind.name == "TERMINAL_FAILURE"
     on_complete.assert_called_once_with()
     assert manager._queued_db_log_contexts == {}
+
+
+def test_durable_reconciliation_retries_db_write_and_preserves_sender(monkeypatch):
+    manager = object.__new__(TelegramBotManager)
+    etm_msg = DurableMessage()
+    real_tg_msg = SimpleNamespace(chat_id=123, message_id=9)
+    db_write = Mock(side_effect=RuntimeError("database unavailable"))
+    manager.channel = SimpleNamespace(
+        db=SimpleNamespace(add_or_update_message_log=db_write)
+    )
+    manager.logger = Mock()
+    on_complete = Mock()
+    manager._queued_completion_callbacks = {7: on_complete}
+    manager._queued_db_log_context_lock = threading.Lock()
+    monkeypatch.setattr("efb_telegram_master.bot_manager.get_msg_type", lambda _message: "text")
+    row = SimpleNamespace(
+        id=7,
+        log_context=TelegramBotManager._encode_queued_log_context(
+            QueuedDbLogContext(etm_msg, None)
+        ),
+        completion_receipt=TelegramBotManager.encode_queued_completion_receipt(
+            real_tg_msg, SenderSelection(object(), "10")
+        ),
+    )
+
+    assert not TelegramBotManager.reconcile_queued_delivery(manager, row)
+    assert 7 in manager._queued_completion_callbacks
+    on_complete.assert_not_called()
+
+    db_write.side_effect = None
+    assert TelegramBotManager.reconcile_queued_delivery(manager, row)
+    persisted_msg, persisted_receipt, old_msg_id = db_write.call_args.args
+    assert isinstance(persisted_msg, DurableMessage)
+    assert (persisted_receipt.chat_id, persisted_receipt.message_id) == (123, 9)
+    assert old_msg_id is None
+    assert db_write.call_args.kwargs == {"sender_bot_id": "10"}
+    on_complete.assert_called_once_with()
+    assert manager._queued_completion_callbacks == {}
+
+
+def test_durable_reconciliation_logs_corrupt_context_and_keeps_it_pending(caplog):
+    manager = object.__new__(TelegramBotManager)
+    manager.logger = logging.getLogger("tests.durable_reconciliation")
+    row = SimpleNamespace(
+        id=7,
+        log_context=b"corrupt",
+        completion_receipt=b"\x01receipt",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=manager.logger.name):
+        assert not TelegramBotManager.reconcile_queued_delivery(manager, row)
+
+    assert "MsgLog reconciliation failed for durable queue row 7" in caplog.text
+
+
+def test_cooldown_metrics_snapshot_blocks_mutation_until_iteration_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingCooldowns(dict):
+        def __init__(self) -> None:
+            super().__init__({(None, 100): 1_020.0})
+            self.snapshot_started = threading.Event()
+            self.allow_iteration = threading.Event()
+
+        def items(self):
+            iterator = iter(super().items())
+            self.snapshot_started.set()
+            assert self.allow_iteration.wait(timeout=1)
+            return iterator
+
+    class TrackingLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._acquire_count = 0
+            self._count_lock = threading.Lock()
+            self.second_acquire_attempted = threading.Event()
+
+        def __enter__(self):
+            with self._count_lock:
+                self._acquire_count += 1
+                if self._acquire_count == 2:
+                    self.second_acquire_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            self._lock.release()
+
+    manager = object.__new__(TelegramBotManager)
+    cooldowns = BlockingCooldowns()
+    lock = TrackingLock()
+    manager._bot_chat_state_lock = lock
+    manager._bot_chat_disabled_until = cooldowns
+    metrics = Metrics()
+    metrics.register_cooldown_collector(manager._cooldown_snapshot)
+    rendered: list[bytes] = []
+    errors: list[BaseException] = []
+
+    def render_metrics() -> None:
+        try:
+            rendered.append(generate_latest(metrics.registry))
+        except BaseException as error:
+            errors.append(error)
+
+    def record_cooldown() -> None:
+        manager.record_queued_retry_after(
+            SimpleNamespace(telegram_chat_id=200),
+            telegram.error.RetryAfter(20),
+            SimpleNamespace(sender_bot_id="10"),
+        )
+
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 1_000.0)
+    snapshot_thread = threading.Thread(target=render_metrics)
+    snapshot_thread.start()
+    assert cooldowns.snapshot_started.wait(timeout=1)
+
+    mutation_thread = threading.Thread(target=record_cooldown)
+    mutation_thread.start()
+    assert lock.second_acquire_attempted.wait(timeout=1)
+
+    cooldowns.allow_iteration.set()
+    snapshot_thread.join(timeout=1)
+    mutation_thread.join(timeout=1)
+
+    assert not snapshot_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert errors == []
+    assert b'etm_outbound_cooldown_seconds{sender_kind="main"} 20.0' in rendered[0]
 
 
 @pytest.mark.parametrize(
@@ -868,6 +1024,7 @@ def test_public_positional_edit_retries_chat_migration_without_replacing_text():
     manager.channel = SimpleNamespace(
         chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
     )
+    manager._outbound_queue = Mock()
 
     def send_and_wait(_slave_id, _chat_id, fn, args, kwargs, cleanup_files=None):
         send_kwargs = {key: value for key, value in kwargs.items() if not key.startswith("_")}
@@ -893,6 +1050,39 @@ def test_public_positional_edit_retries_chat_migration_without_replacing_text():
     assert calls[1].args[2:] == (message_id, later_argument)
     assert calls[1].kwargs == {"parse_mode": "HTML"}
     manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(old_chat_id, new_chat_id)
+
+
+def test_queued_positional_media_edit_retries_chat_migration_with_new_chat_id():
+    manager = object.__new__(TelegramBotManager)
+    manager._outbound_queue = Mock()
+    old_chat_id = 123
+    new_chat_id = 456
+    media = object()
+    sender = Mock()
+    sender.edit_message_media.side_effect = [
+        telegram.error.ChatMigrated(new_chat_id),
+        "edited",
+    ]
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+
+    result = manager.execute_queued_call(
+        SimpleNamespace(operation="edit_message_media"),
+        (media, old_chat_id, 789, "inline-id"),
+        {"reply_markup": "keyboard"},
+        SenderSelection(sender=sender, sender_bot_id=None),
+    )
+
+    assert result == "edited"
+    assert sender.edit_message_media.call_args_list == [
+        call(media, old_chat_id, 789, "inline-id", reply_markup="keyboard"),
+        call(media, new_chat_id, 789, "inline-id", reply_markup="keyboard"),
+    ]
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(
+        old_chat_id, new_chat_id
+    )
+    manager._outbound_queue.retarget.assert_not_called()
 
 
 def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():
@@ -1169,7 +1359,10 @@ def test_graceful_stop_signals_manual_event_on_event_loop_when_runtime_loop_miss
 def test_graceful_stop_shuts_down_metrics_server():
     shutdown_complete_event = threading.Event()
     shutdown_complete_event.set()
-    metrics_httpd = Mock()
+    metrics_thread = Mock()
+    metrics_thread.is_alive.side_effect = [True, False]
+    metrics_thread.ident = -1
+    metrics_httpd = Mock(thread=metrics_thread)
     manager = SimpleNamespace(
         logger=Mock(),
         stop_queued_worker=Mock(),
@@ -1192,6 +1385,22 @@ def test_graceful_stop_shuts_down_metrics_server():
 
     metrics_httpd.shutdown.assert_called_once_with()
     metrics_httpd.server_close.assert_called_once_with()
+    metrics_thread.join.assert_not_called()
+    assert manager._metrics_httpd is None
+
+
+def test_metrics_server_stop_closes_unstarted_server_without_shutdown_or_join():
+    metrics_thread = Mock()
+    metrics_thread.is_alive.return_value = False
+    metrics_httpd = Mock(thread=metrics_thread)
+    manager = SimpleNamespace(_metrics_httpd=metrics_httpd, SHUTDOWN_JOIN_GRACE=1.0)
+
+    TelegramBotManager._stop_metrics_server(manager)
+    TelegramBotManager._stop_metrics_server(manager)
+
+    metrics_httpd.shutdown.assert_not_called()
+    metrics_httpd.server_close.assert_called_once_with()
+    metrics_thread.join.assert_not_called()
 
 
 def test_stop_worker_join_covers_outbound_drain_deadline():
@@ -1285,6 +1494,45 @@ def test_parse_metrics_config_defaults_and_disables_invalid_endpoint_options():
     assert logger.warning.call_count == 2
 
 
+def test_metrics_endpoint_bind_failure_is_non_fatal_but_programming_errors_propagate():
+    manager = object.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._metrics = Metrics()
+    bind_error = OSError("address already in use")
+
+    with patch(
+        "efb_telegram_master.etm_metrics.start_metrics_server",
+        side_effect=bind_error,
+    ):
+        assert manager._start_metrics_endpoint("127.0.0.1", 9101) is None
+
+    manager.logger.warning.assert_called_once_with(
+        "Unable to start Prometheus endpoint on %s:%d: %s",
+        "127.0.0.1",
+        9101,
+        bind_error,
+    )
+
+    with patch(
+        "efb_telegram_master.etm_metrics.start_metrics_server",
+        side_effect=ValueError("invalid registry"),
+    ), pytest.raises(ValueError, match="invalid registry"):
+        manager._start_metrics_endpoint("127.0.0.1", 9101)
+
+
+def test_destination_metrics_pass_configured_limit_to_queue_query():
+    manager = object.__new__(TelegramBotManager)
+    manager._metrics = Mock()
+    manager._outbound_queue = Mock()
+    manager._outbound_queue.destination_snapshot.return_value = []
+
+    manager._register_runtime_metric_collectors(3)
+
+    snapshot = manager._metrics.register_destination_queue_collector.call_args.args[0]
+    assert snapshot() == []
+    manager._outbound_queue.destination_snapshot.assert_called_once_with(3)
+
+
 @pytest.mark.asyncio
 async def test_shutdown_ptb_application_signals_stop_running():
     application = SimpleNamespace(stop_running=Mock())
@@ -1293,6 +1541,40 @@ async def test_shutdown_ptb_application_signals_stop_running():
     await TelegramBotManager._shutdown_ptb_application(manager)
 
     application.stop_running.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_post_init_starts_durable_worker_after_runtime_binding():
+    manager = object.__new__(TelegramBotManager)
+    events: list[str] = []
+    manager._runtime = SimpleNamespace(bind_loop=lambda _loop: events.append("bind"))
+    manager.bot_pool = None
+    manager._send_worker_stop = threading.Event()
+    manager._outbound_scheduler = SimpleNamespace(stopping=False)
+    manager._shutdown_complete_event = threading.Event()
+    worker = Mock()
+    worker.start.side_effect = lambda: events.append("start")
+
+    with patch("efb_telegram_master.bot_manager.threading.Thread", return_value=worker):
+        await manager._post_init(SimpleNamespace())
+
+    assert events == ["bind", "start"]
+
+
+@pytest.mark.asyncio
+async def test_post_init_does_not_start_worker_after_shutdown_before_start():
+    manager = object.__new__(TelegramBotManager)
+    manager._runtime = SimpleNamespace(bind_loop=Mock())
+    manager.bot_pool = None
+    manager._send_worker_stop = threading.Event()
+    manager._send_worker_stop.set()
+    manager._outbound_scheduler = SimpleNamespace(stopping=True)
+    manager._shutdown_complete_event = threading.Event()
+
+    with patch("efb_telegram_master.bot_manager.threading.Thread") as thread:
+        await manager._post_init(SimpleNamespace())
+
+    thread.assert_not_called()
 
 
 def test_polling_passes_custom_timeout_to_manual_lifecycle():

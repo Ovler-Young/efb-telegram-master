@@ -10,6 +10,7 @@ import io
 import logging
 import numbers
 import os
+import pickle
 import re
 import threading
 import time
@@ -39,6 +40,7 @@ from .outbound import (
     OutboundQueueScheduler,
     QUEUED_OPERATIONS,
     QueueEnqueueError,
+    QueuePersistenceError,
     QueueRequest,
     SchedulerStoppedError,
     SenderSelection,
@@ -64,6 +66,15 @@ class QueuedCompletionDecision:
 
     kind: QueuedCompletionKind
     retry_at: Optional[float] = None
+    retry_reason: Optional[str] = None
+
+
+class QueuedChatMigrationRetry(Exception):
+    """Retry a retained call after handling Telegram chat migration."""
+
+    def __init__(self, message: str, retry_delay: float = 0.0):
+        super().__init__(message)
+        self.retry_delay = retry_delay
 
 
 class QueuedDbLogContext(NamedTuple):
@@ -340,6 +351,8 @@ class TelegramBotManager(LocaleMixin):
     MEMBERSHIP_RECHECK_SECONDS = 0.25
     SHUTDOWN_DRAIN_TIMEOUT = 5.0
     SHUTDOWN_JOIN_GRACE = 1.0
+    TRANSPORT_RETRY_SECONDS = 1.0
+    _bot_chat_state_lock_initialization_lock = threading.Lock()
 
     # Type declarations for instance attributes assigned in __init__
     application: Application
@@ -358,6 +371,7 @@ class TelegramBotManager(LocaleMixin):
         logger = logging.getLogger(__name__)
         _POSITIONAL_CHAT_ID_INDICES = {
             'edit_message_text': 1,
+            'edit_message_media': 1,
         }
 
         @classmethod
@@ -482,22 +496,21 @@ class TelegramBotManager(LocaleMixin):
         from concurrent.futures import ThreadPoolExecutor
 
         self._send_worker_stop = threading.Event()
+        self._bot_chat_state_lock = threading.Lock()
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
         self._queued_db_log_contexts: dict[int, QueuedDbLogContext] = {}
+        self._queued_completion_callbacks: dict[int, Optional[Callable[[], None]]] = {}
         self._queued_db_log_context_lock = threading.Lock()
         self._last_metrics_snapshot = 0.0
-        from .etm_metrics import Metrics, start_metrics_server
-        _metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
+        from .etm_metrics import Metrics
+        metrics_top_n, metrics_endpoint = self._parse_metrics_config(config.get('metrics'), self.logger)
         self._metrics = Metrics(namespace="etm")
+        channel.db.set_metrics(self._metrics)
+        if self.bot_pool:
+            for auxiliary in self.bot_pool.bots:
+                auxiliary.bind_metrics(self._metrics)
         self._metrics_httpd = None
-        if metrics_endpoint is not None:
-            metrics_host, metrics_port = metrics_endpoint
-            self._metrics_httpd = start_metrics_server(
-                metrics_host,
-                metrics_port,
-                registry=self._metrics.registry,
-            )
 
         self._send_worker_count = self.DEFAULT_SEND_WORKER_COUNT
         self._outbound_queue = OutboundQueue(channel.db._base_path, metrics=self._metrics)
@@ -512,13 +525,12 @@ class TelegramBotManager(LocaleMixin):
             executor=self._send_executor,
             worker_count=self._send_worker_count,
         )
+        self._register_runtime_metric_collectors(metrics_top_n)
 
-        self._send_worker_thread = threading.Thread(
-            target=self._queued_send_worker,
-            name="ETM queued send worker",
-            daemon=True
-        )
-        self._send_worker_thread.start()
+        if metrics_endpoint is not None:
+            metrics_host, metrics_port = metrics_endpoint
+            self._metrics_httpd = self._start_metrics_endpoint(metrics_host, metrics_port)
+
         self.logger.debug("Durable outbound system initialized...")
 
         self.logger.debug("Adding base dispatchers...")
@@ -638,6 +650,17 @@ class TelegramBotManager(LocaleMixin):
         self._runtime.bind_loop(asyncio.get_running_loop())
         for aux_bot in (self.bot_pool.bots if self.bot_pool else []):
             aux_bot.bind_runtime(self._runtime)
+        if (
+            not self._send_worker_stop.is_set()
+            and not self._outbound_scheduler.stopping
+            and getattr(self, "_send_worker_thread", None) is None
+        ):
+            self._send_worker_thread = threading.Thread(
+                target=self._queued_send_worker,
+                name="ETM queued send worker",
+                daemon=True,
+            )
+            self._send_worker_thread.start()
         self._shutdown_complete_event.clear()
 
 
@@ -780,8 +803,23 @@ class TelegramBotManager(LocaleMixin):
     def _queued_chat_id_argument(
         operation: str, args: tuple, kwargs: Mapping[str, object]
     ) -> object:
-        chat_id_index = 1 if operation == "edit_message_text" else 0
+        chat_id_index = TelegramBotManager.Decorators._POSITIONAL_CHAT_ID_INDICES.get(operation, 0)
         return args[chat_id_index] if len(args) > chat_id_index else kwargs.get("chat_id")
+
+    @staticmethod
+    def _rewrite_queued_chat_id(
+        operation: str, args: tuple, kwargs: dict, new_chat_id: int
+    ) -> tuple[tuple, dict]:
+        if "chat_id" in kwargs:
+            migrated_kwargs = dict(kwargs)
+            migrated_kwargs["chat_id"] = new_chat_id
+            return args, migrated_kwargs
+        chat_id_index = TelegramBotManager.Decorators._POSITIONAL_CHAT_ID_INDICES.get(
+            operation, 0
+        )
+        migrated_args = list(args)
+        migrated_args[chat_id_index] = new_chat_id
+        return tuple(migrated_args), kwargs
 
     def _queued_operation_callable(self, operation: str) -> Callable[..., object]:
         method = self._queue_operation(operation)
@@ -930,6 +968,79 @@ class TelegramBotManager(LocaleMixin):
 
         return top_n, (host, port)
 
+    def _start_metrics_endpoint(self, host: str, port: int):
+        from .etm_metrics import start_metrics_server
+
+        try:
+            return start_metrics_server(host, port, registry=self._metrics.registry)
+        except OSError as error:
+            self.logger.warning(
+                "Unable to start Prometheus endpoint on %s:%d: %s", host, port, error
+            )
+            return None
+
+    def _register_runtime_metric_collectors(self, top_n: int) -> None:
+        """Bind bounded scrape callbacks after all outbound runtime state exists."""
+        from .etm_metrics import DestinationQueueSnapshot, WorkerSnapshot
+
+        def destination_snapshot() -> list[DestinationQueueSnapshot]:
+            return [
+                DestinationQueueSnapshot(destination, depth, oldest_age)
+                for destination, depth, oldest_age in self._outbound_queue.destination_snapshot(top_n)
+            ]
+
+        def worker_snapshot() -> WorkerSnapshot:
+            worker = getattr(self, "_send_worker_thread", None)
+            return WorkerSnapshot(
+                healthy=bool(worker is not None and worker.is_alive()),
+                in_flight=self._outbound_scheduler.in_flight_count(),
+            )
+
+        self._metrics.register_destination_queue_collector(destination_snapshot, top_n)
+        self._metrics.register_worker_collector(worker_snapshot)
+        self._metrics.register_cooldown_collector(self._cooldown_snapshot)
+        self._metrics.register_auxiliary_count_collector(self._auxiliary_count_snapshot)
+        self._metrics.register_membership_cache_collector(self._membership_cache_snapshot)
+        self._metrics.register_rate_limit_occupancy_collector(self._rate_limit_occupancy_snapshot)
+
+    def _get_bot_chat_state_lock(self):
+        lock = getattr(self, "_bot_chat_state_lock", None)
+        if lock is not None:
+            return lock
+        with self._bot_chat_state_lock_initialization_lock:
+            lock = getattr(self, "_bot_chat_state_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._bot_chat_state_lock = lock
+            return lock
+
+    def _cooldown_snapshot(self) -> dict[str, float]:
+        now = time.monotonic()
+        cooldowns = {"main": 0.0, "auxiliary": 0.0}
+        with self._get_bot_chat_state_lock():
+            cooldown_entries = tuple(self._bot_chat_disabled_until.items())
+        for (sender_bot_id, _chat_id), deadline in cooldown_entries:
+            sender_kind = "main" if sender_bot_id is None else "auxiliary"
+            cooldowns[sender_kind] = max(cooldowns[sender_kind], max(0.0, deadline - now))
+        return cooldowns
+
+    def _auxiliary_count_snapshot(self) -> dict[str, int]:
+        if not self.bot_pool:
+            return {"enabled": 0, "disabled": 0}
+        return self.bot_pool.auxiliary_count_snapshot()
+
+    def _membership_cache_snapshot(self) -> dict[str, int]:
+        if not self.bot_pool:
+            return {"member": 0, "not_member": 0, "unknown_probe_pending": 0}
+        return self.bot_pool.membership_cache_snapshot()
+
+    def _rate_limit_occupancy_snapshot(self) -> dict[str, float]:
+        occupancy = self._rate_limiter.occupancy_snapshot()
+        if self.bot_pool:
+            for scope, value in self.bot_pool.rate_limit_occupancy_snapshot().items():
+                occupancy[scope] = max(occupancy[scope], value)
+        return occupancy
+
     def _init_bot_pool(self, aux_configs: list, config: dict, channel: 'TelegramChannel'):
         """Initialize the auxiliary bot pool from config."""
         req_kwargs = {
@@ -1003,10 +1114,31 @@ class TelegramBotManager(LocaleMixin):
                     "Outbound scheduler stopped."
                 )
                 raise error
-            row_id, waiter = self._outbound_queue.enqueue_many(requests, self._queue_operation)
+            durable_requests = requests
+            if db_log_context is not None:
+                blocking_context = any(
+                    request.kwargs.get("_send_mode", "eventual") == "blocking"
+                    for request in requests
+                )
+                if not blocking_context:
+                    encoded_context = self._encode_queued_log_context(db_log_context)
+                    durable_requests = [
+                        QueueRequest(
+                            request.operation, request.args, request.kwargs, encoded_context
+                        )
+                        for request in requests
+                    ]
+            else:
+                blocking_context = False
+            row_id, waiter = self._outbound_queue.enqueue_many(
+                durable_requests, self._queue_operation
+            )
             if db_log_context is not None:
                 with self._queued_db_log_context_lock:
-                    self._queued_db_log_contexts[row_id] = db_log_context
+                    if blocking_context:
+                        self._queued_db_log_contexts[row_id] = db_log_context
+                    else:
+                        self._queued_completion_callbacks[row_id] = db_log_context.on_complete
             self._outbound_scheduler.wake_event.set()
             return str(row_id), waiter
 
@@ -1197,7 +1329,8 @@ class TelegramBotManager(LocaleMixin):
     def _select_available_sender(
         self, selection: SenderSelection, chat_id: int, now: float
     ) -> SenderSelectionResult:
-        cooldown_until = self._bot_chat_disabled_until.get((selection.sender_bot_id, chat_id), 0.0)
+        with self._get_bot_chat_state_lock():
+            cooldown_until = self._bot_chat_disabled_until.get((selection.sender_bot_id, chat_id), 0.0)
         limiter_delay = self._sender_limiter_delay(selection, chat_id)
         retry_at = max(cooldown_until, now + limiter_delay)
         if retry_at > now:
@@ -1242,6 +1375,44 @@ class TelegramBotManager(LocaleMixin):
         method = getattr(sender, row.operation)
         telegram_kwargs = self._strip_private_queue_metadata(kwargs)
         telegram_args = args
+        migration_retried = False
+
+        def call_method() -> object:
+            nonlocal migration_retried, telegram_args, telegram_kwargs
+            try:
+                return method(*telegram_args, **telegram_kwargs)
+            except telegram.error.ChatMigrated as error:
+                if migration_retried:
+                    raise
+                migration_retried = True
+                old_chat_id = self._queued_chat_id_argument(
+                    row.operation, telegram_args, telegram_kwargs
+                )
+                try:
+                    self.channel.chat_binding.chat_migration_by_id(old_chat_id, error.new_chat_id)
+                except Exception as migration_error:
+                    if getattr(row, "priority", 1) == 0:
+                        raise QueuedChatMigrationRetry(
+                            str(migration_error), self.TRANSPORT_RETRY_SECONDS
+                        ) from migration_error
+                    raise
+                telegram_args, telegram_kwargs = self._rewrite_queued_chat_id(
+                    row.operation, telegram_args, telegram_kwargs, error.new_chat_id
+                )
+                self._rewind_queued_files(telegram_args, telegram_kwargs)
+                if getattr(row, "priority", 1) == 0:
+                    self._outbound_queue.retarget(
+                        row.id, error.new_chat_id, telegram_args, telegram_kwargs
+                    )
+                    raise QueuedChatMigrationRetry(
+                        f"Telegram chat migrated to {error.new_chat_id}."
+                    ) from error
+                try:
+                    return method(*telegram_args, **telegram_kwargs)
+                except (telegram.error.RetryAfter, telegram.error.NetworkError) as retry_error:
+                    setattr(retry_error, "_etm_telegram_chat_id", error.new_chat_id)
+                    raise
+
         content_spec = {
             "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
             "edit_message_text": ("text", 0, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
@@ -1279,13 +1450,13 @@ class TelegramBotManager(LocaleMixin):
                 else:
                     telegram_kwargs[content_key] = truncated
         try:
-            result = method(*telegram_args, **telegram_kwargs)
+            result = call_method()
         except telegram.error.BadRequest as error:
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
             telegram_kwargs.pop("parse_mode")
             self._rewind_queued_files(telegram_args, telegram_kwargs)
-            result = method(*telegram_args, **telegram_kwargs)
+            result = call_method()
         if attachment is None or content_key is None:
             return result
         chat_id = self._queued_chat_id_argument(row.operation, telegram_args, telegram_kwargs)
@@ -1306,6 +1477,44 @@ class TelegramBotManager(LocaleMixin):
         )
         return result
 
+    @staticmethod
+    def _encode_queued_log_context(context: QueuedDbLogContext) -> bytes:
+        try:
+            return b"\x01" + pickle.dumps((context.etm_msg, context.old_msg_id), protocol=5)
+        except Exception as error:
+            raise QueueEnqueueError("Unable to serialize queued database log context.") from error
+
+    @staticmethod
+    def _decode_queued_log_context(payload: object) -> tuple['ETMMsg', Optional['OldMsgID']]:
+        if not isinstance(payload, bytes) or not payload or payload[0] != 1:
+            raise QueuePersistenceError("Queued database log context has an unknown version.")
+        try:
+            value = pickle.loads(payload[1:])
+        except Exception as error:
+            raise QueuePersistenceError("Queued database log context cannot be decoded.") from error
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise QueuePersistenceError("Queued database log context has an invalid shape.")
+        return cast('ETMMsg', value[0]), cast(Optional['OldMsgID'], value[1])
+
+    @staticmethod
+    def encode_queued_completion_receipt(result: object, selection: SenderSelection) -> bytes:
+        try:
+            return b"\x01" + pickle.dumps((result, selection.sender_bot_id), protocol=5)
+        except Exception as error:
+            raise QueuePersistenceError("Unable to serialize queued Telegram completion receipt.") from error
+
+    @staticmethod
+    def _decode_queued_completion_receipt(payload: object) -> tuple[TelegramMessage, Optional[str]]:
+        if not isinstance(payload, bytes) or not payload or payload[0] != 1:
+            raise QueuePersistenceError("Queued Telegram completion receipt has an unknown version.")
+        try:
+            value = pickle.loads(payload[1:])
+        except Exception as error:
+            raise QueuePersistenceError("Queued Telegram completion receipt cannot be decoded.") from error
+        if not isinstance(value, tuple) or len(value) != 2 or not isinstance(value[1], (str, type(None))):
+            raise QueuePersistenceError("Queued Telegram completion receipt has an invalid shape.")
+        return cast(TelegramMessage, value[0]), value[1]
+
     def _pop_queued_db_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
         if not isinstance(row_id, int):
             return None
@@ -1315,6 +1524,16 @@ class TelegramBotManager(LocaleMixin):
             return None
         with context_lock:
             return contexts.pop(row_id, None)
+
+    def _pop_queued_completion_callback(self, row_id: object) -> Optional[Callable[[], None]]:
+        if not isinstance(row_id, int):
+            return None
+        callbacks = getattr(self, "_queued_completion_callbacks", None)
+        context_lock = getattr(self, "_queued_db_log_context_lock", None)
+        if callbacks is None or context_lock is None:
+            return None
+        with context_lock:
+            return callbacks.pop(row_id, None)
 
     def _finish_queued_database_update(
         self,
@@ -1337,14 +1556,40 @@ class TelegramBotManager(LocaleMixin):
             on_complete=db_log_context.on_complete,
         )
 
+    def reconcile_queued_delivery(self, row) -> bool:
+        """Write a persisted Telegram completion to MsgLog."""
+        if row.log_context is None or row.completion_receipt is None:
+            return False
+        try:
+            etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
+            real_tg_msg, sender_bot_id = self._decode_queued_completion_receipt(
+                row.completion_receipt
+            )
+            etm_msg.type_telegram = get_msg_type(real_tg_msg)
+            etm_msg.put_telegram_file(real_tg_msg)
+            self.channel.db.add_or_update_message_log(
+                etm_msg,
+                real_tg_msg,
+                old_msg_id,
+                sender_bot_id=sender_bot_id,
+            )
+        except Exception as error:
+            self.logger.warning(
+                "MsgLog reconciliation failed for durable queue row %s: %s", row.id, error
+            )
+            return False
+        self._run_database_update_callback(self._pop_queued_completion_callback(row.id))
+        return True
+
     def record_queued_success(
         self, row, result: object, selection: SenderSelection
     ) -> QueuedCompletionDecision:
-        self._finish_queued_database_update(
-            getattr(row, "id", None),
-            cast(TelegramMessage, result),
-            sender_bot_id=selection.sender_bot_id,
-        )
+        if getattr(row, "log_context", None) is None:
+            self._finish_queued_database_update(
+                getattr(row, "id", None),
+                cast(TelegramMessage, result),
+                sender_bot_id=selection.sender_bot_id,
+            )
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
         return QueuedCompletionDecision(QueuedCompletionKind.SUCCESS)
@@ -1352,23 +1597,47 @@ class TelegramBotManager(LocaleMixin):
     def record_queued_failure(
         self, row, error: BaseException, selection: SenderSelection
     ) -> QueuedCompletionDecision:
-        key = (selection.sender_bot_id, row.telegram_chat_id)
+        if row.priority == 0 and isinstance(error, QueuedChatMigrationRetry):
+            return QueuedCompletionDecision(
+                QueuedCompletionKind.RETRY_EVENTUAL,
+                time.monotonic() + error.retry_delay,
+                "migration",
+            )
+
+        telegram_chat_id = getattr(error, "_etm_telegram_chat_id", row.telegram_chat_id)
+        key = (selection.sender_bot_id, telegram_chat_id)
         if selection.sender_bot_id is not None and row.slave_id:
-            affinities = getattr(self, "_membership_failure_affinities", None)
-            if affinities is None:
-                affinities = self._membership_failure_affinities = {}
-            affinities.setdefault(key, set()).add(row.slave_id)
+            with self._get_bot_chat_state_lock():
+                affinities = getattr(self, "_membership_failure_affinities", None)
+                if affinities is None:
+                    affinities = self._membership_failure_affinities = {}
+                affinities.setdefault(key, set()).add(row.slave_id)
 
         if row.priority == 0 and isinstance(error, telegram.error.RetryAfter):
             retry_after = self._retry_after_seconds(error)
             retry_at = time.monotonic() + retry_after
-            self._bot_chat_disabled_until[key] = retry_at
+            with self._get_bot_chat_state_lock():
+                self._bot_chat_disabled_until[key] = retry_at
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
+
+        if (
+            row.priority == 0
+            and isinstance(error, telegram.error.NetworkError)
+            and not isinstance(error, telegram.error.BadRequest)
+        ):
+            return QueuedCompletionDecision(
+                QueuedCompletionKind.RETRY_EVENTUAL,
+                time.monotonic() + self.TRANSPORT_RETRY_SECONDS,
+            )
 
         cooldown_seconds = self._rate_limit_retry_after_seconds(cast(Exception, error))
         if cooldown_seconds is not None:
-            self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
+            with self._get_bot_chat_state_lock():
+                self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
         self._finish_queued_database_update(getattr(row, "id", None))
+        self._run_database_update_callback(
+            self._pop_queued_completion_callback(getattr(row, "id", None))
+        )
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
     def record_queued_retry_after(
@@ -1376,13 +1645,15 @@ class TelegramBotManager(LocaleMixin):
     ) -> None:
         """Record a sender/chat cooldown without completing the queued database update."""
         retry_at = time.monotonic() + self._retry_after_seconds(error)
-        self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = retry_at
+        with self._get_bot_chat_state_lock():
+            self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = retry_at
 
     def remove_confirmed_non_member_affinity_for_sender_chat(
         self, sender_bot_id: str, telegram_chat_id: int
     ) -> None:
-        affinities = getattr(self, "_membership_failure_affinities", {})
-        slave_ids = affinities.pop((sender_bot_id, telegram_chat_id), set())
+        with self._get_bot_chat_state_lock():
+            affinities = getattr(self, "_membership_failure_affinities", {})
+            slave_ids = affinities.pop((sender_bot_id, telegram_chat_id), set())
         if self.bot_pool:
             for slave_id in slave_ids:
                 self.bot_pool.remove_failed_membership_affinity(slave_id, sender_bot_id)
@@ -1878,10 +2149,7 @@ class TelegramBotManager(LocaleMixin):
         # Stop the queued send worker first
         self.stop_queued_worker()
 
-        metrics_httpd = getattr(self, '_metrics_httpd', None)
-        if metrics_httpd:
-            metrics_httpd.shutdown()
-            metrics_httpd.server_close()
+        TelegramBotManager._stop_metrics_server(self)
 
         # Shut down auxiliary bot pool
         if self.bot_pool:
@@ -1949,6 +2217,21 @@ class TelegramBotManager(LocaleMixin):
             else:
                 self._runtime.clear_loop()
         self.logger.info("Graceful shutdown completed")
+
+    def _stop_metrics_server(self) -> None:
+        """Stop the serving metrics thread without joining an unstarted thread."""
+        metrics_httpd = getattr(self, '_metrics_httpd', None)
+        if metrics_httpd is None:
+            return
+        self._metrics_httpd = None
+        thread = getattr(metrics_httpd, 'thread', None)
+        try:
+            if thread is not None and thread.is_alive():
+                metrics_httpd.shutdown()
+        finally:
+            metrics_httpd.server_close()
+        if thread is not None and thread.is_alive() and thread.ident != threading.get_ident():
+            thread.join(timeout=self.SHUTDOWN_JOIN_GRACE)
 
     def __del__(self):
         """Ensure cleanup on object destruction"""

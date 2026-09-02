@@ -5,8 +5,8 @@ import logging
 import pickle
 import time
 from contextlib import suppress
-from functools import partial
-from typing import Collection, Dict, List, Optional, Tuple, TYPE_CHECKING, cast
+from functools import partial, wraps
+from typing import Callable, Collection, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, cast
 from pathlib import Path
 
 from peewee import (
@@ -40,6 +40,38 @@ if TYPE_CHECKING:
     from .chat import ETMChatMember, ETMChatType
 
 database = DatabaseProxy()
+
+
+class DatabaseMetrics(Protocol):
+    """Metrics interface injected by the bot manager after construction."""
+
+    def record_database_method_call(self, method: str, seconds: float, outcome: str) -> None:
+        ...
+
+
+def observe_database_method(method: str):
+    """Measure one public database operation with a statically bounded method label."""
+    def decorate(call: Callable):
+        @wraps(call)
+        def wrapped(manager: 'DatabaseManager', *args, **kwargs):
+            started = time.perf_counter()
+            outcome = "success"
+            try:
+                return call(manager, *args, **kwargs)
+            except Exception:
+                outcome = "failure"
+                raise
+            finally:
+                metrics = getattr(manager, "_metrics", None)
+                if metrics is not None:
+                    try:
+                        metrics.record_database_method_call(method, time.perf_counter() - started, outcome)
+                    except Exception:
+                        manager.logger.exception("Unable to record database method metric: %s", method)
+
+        return wrapped
+
+    return decorate
 
 PickledDict = TypedDict('PickledDict', {
     "target": TgChatMsgIDStr,
@@ -226,6 +258,7 @@ class DatabaseManager:
     )
 
     def __init__(self, channel: 'TelegramChannel'):
+        self._metrics: Optional[DatabaseMetrics] = None
         base_path = utils.get_data_path(channel.channel_id)
         self._base_path = base_path
 
@@ -289,6 +322,11 @@ class DatabaseManager:
         self.logger.debug("Database migration finished...")
         self._observe_legacy_outbound_rows()
 
+    def set_metrics(self, metrics: DatabaseMetrics) -> None:
+        """Attach the metrics recorder created after the database manager."""
+        self._metrics = metrics
+
+    @observe_database_method("stop_worker")
     def stop_worker(self):
         stop = getattr(database.obj, "stop", None)
         if callable(stop):
@@ -493,6 +531,7 @@ class DatabaseManager:
                 state_summary,
             )
 
+    @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,
                        slave_uid: EFBChannelChatIDStr,
                        multiple_slave: bool = False):
@@ -510,8 +549,8 @@ class DatabaseManager:
         self.remove_chat_assoc(slave_uid=slave_uid)
         return ChatAssoc.create(master_uid=master_uid, slave_uid=slave_uid)
 
-    @staticmethod
-    def remove_chat_assoc(master_uid: Optional[EFBChannelChatIDStr] = None,
+    @observe_database_method("remove_chat_assoc")
+    def remove_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None,
                           slave_uid: Optional[EFBChannelChatIDStr] = None):
         """
         Remove chat associations (chat links).
@@ -540,8 +579,8 @@ class DatabaseManager:
         except DoesNotExist:
             return 0
 
-    @staticmethod
-    def get_master_msg_id(message: EFBMessage) -> Optional[TgChatMsgIDStr]:
+    @observe_database_method("get_master_msg_id")
+    def get_master_msg_id(self, message: EFBMessage) -> Optional[TgChatMsgIDStr]:
         """Get master message ID from a message object."""
         log: Optional[MsgLog] = MsgLog.get_or_none(
             MsgLog.slave_origin_uid == chat_id_to_str(chat=message.chat),
@@ -591,8 +630,8 @@ class DatabaseManager:
             return pickle.dumps(data)
         return None
 
-    @staticmethod
-    def get_chat_assoc(master_uid: Optional[EFBChannelChatIDStr] = None,
+    @observe_database_method("get_chat_assoc")
+    def get_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None,
                        slave_uid: Optional[EFBChannelChatIDStr] = None
                        ) -> List[EFBChannelChatIDStr]:
         """
@@ -626,6 +665,7 @@ class DatabaseManager:
         except DoesNotExist:
             return []
 
+    @observe_database_method("add_topic_assoc")
     def add_topic_assoc(self, topic_chat_id: TelegramChatID,
                        message_thread_id: TelegramTopicID,
                        slave_uid: EFBChannelChatIDStr, ):
@@ -642,8 +682,8 @@ class DatabaseManager:
         self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
         return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
 
-    @staticmethod
-    def get_topic_thread_id(slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
+    @observe_database_method("get_topic_thread_id")
+    def get_topic_thread_id(self, slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
         """
         Get topic association (topic link) information.
         Only one parameter is to be provided.
@@ -670,8 +710,8 @@ class DatabaseManager:
             pass
         return None
 
-    @staticmethod
-    def get_topic_slave(topic_chat_id: TelegramChatID,
+    @observe_database_method("get_topic_slave")
+    def get_topic_slave(self, topic_chat_id: TelegramChatID,
                         message_thread_id: Optional[TelegramTopicID] = None,
                         ) -> Optional[EFBChannelChatIDStr]:
         """
@@ -697,8 +737,8 @@ class DatabaseManager:
         except AttributeError:
             return None
 
-    @staticmethod
-    def get_topic_slaves(topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
+    @observe_database_method("get_topic_slaves")
+    def get_topic_slaves(self, topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
         """
         Get topic association (topic link) information.
         Only one parameter is to be provided.
@@ -718,8 +758,8 @@ class DatabaseManager:
         except AttributeError:
             return None
 
-    @staticmethod
-    def remove_topic_assoc(topic_chat_id: Optional[TelegramChatID] = None,
+    @observe_database_method("remove_topic_assoc")
+    def remove_topic_assoc(self, topic_chat_id: Optional[TelegramChatID] = None,
                            message_thread_id: Optional[TelegramTopicID] = None,
                            slave_uid: Optional[EFBChannelChatIDStr] = None):
         """
@@ -743,6 +783,7 @@ class DatabaseManager:
         except DoesNotExist:
             return 0
 
+    @observe_database_method("add_or_update_message_log")
     def add_or_update_message_log(self,
                                   msg: ETMMsg,
                                   master_message: Message,
@@ -801,8 +842,8 @@ class DatabaseManager:
         result = save()
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
 
-    @staticmethod
-    def get_msg_log(master_msg_id: Optional[TgChatMsgIDStr] = None,
+    @observe_database_method("get_msg_log")
+    def get_msg_log(self, master_msg_id: Optional[TgChatMsgIDStr] = None,
                     slave_msg_id: Optional[MessageID] = None,
                     slave_origin_uid: Optional[EFBChannelChatIDStr] = None) -> Optional[MsgLog]:
         """Get message log by message ID.
@@ -831,8 +872,8 @@ class DatabaseManager:
         except DoesNotExist:
             return None
 
-    @staticmethod
-    def delete_msg_log(master_msg_id: Optional[TgChatMsgIDStr] = None,
+    @observe_database_method("delete_msg_log")
+    def delete_msg_log(self, master_msg_id: Optional[TgChatMsgIDStr] = None,
                        slave_msg_id: Optional[EFBChannelChatIDStr] = None,
                        slave_origin_uid: Optional[EFBChannelChatIDStr] = None):
         """Remove a message log by message ID.
@@ -857,8 +898,8 @@ class DatabaseManager:
         except DoesNotExist:
             return
 
-    @staticmethod
-    def get_slave_chat_info(slave_channel_id: Optional[ModuleID] = None,
+    @observe_database_method("get_slave_chat_info")
+    def get_slave_chat_info(self, slave_channel_id: Optional[ModuleID] = None,
                             slave_chat_uid: Optional[ChatID] = None,
                             slave_chat_group_id: Optional[ChatID] = None
                             ) -> Optional[SlaveChatInfo]:
@@ -878,6 +919,7 @@ class DatabaseManager:
         except DoesNotExist:
             return None
 
+    @observe_database_method("set_slave_chat_info")
     def set_slave_chat_info(self, chat_object: 'ETMChatType') -> SlaveChatInfo:
         """
         Insert or update slave chat info entry
@@ -922,15 +964,15 @@ class DatabaseManager:
                                         slave_chat_type=slave_chat_type,
                                         pickle=chat_object.pickle)
 
-    @staticmethod
-    def delete_slave_chat_info(slave_channel_id: ModuleID, slave_chat_uid: ChatID, slave_chat_group_id: Optional[ChatID] = None):
+    @observe_database_method("delete_slave_chat_info")
+    def delete_slave_chat_info(self, slave_channel_id: ModuleID, slave_chat_uid: ChatID, slave_chat_group_id: Optional[ChatID] = None):
         return SlaveChatInfo.delete() \
             .where((SlaveChatInfo.slave_channel_id == slave_channel_id) &
                    (SlaveChatInfo.slave_chat_uid == slave_chat_uid) &
                    (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id)).execute()
 
-    @staticmethod
-    def get_recent_slave_chats(master_chat_id: TelegramChatID, limit=5) -> List[EFBChannelChatIDStr]:
+    @observe_database_method("get_recent_slave_chats")
+    def get_recent_slave_chats(self, master_chat_id: TelegramChatID, limit=5) -> List[EFBChannelChatIDStr]:
         query = MsgLog \
             .select(MsgLog.slave_origin_uid, fn.MAX(MsgLog.time)) \
             .where(MsgLog.master_msg_id.startswith("{}.".format(master_chat_id))) \
@@ -940,8 +982,8 @@ class DatabaseManager:
 
         return [EFBChannelChatIDStr(i.slave_origin_uid) for i in query]
 
-    @staticmethod
-    def get_last_message(slave_chat_id: EFBChannelChatIDStr) -> Optional[MsgLog]:
+    @observe_database_method("get_last_message")
+    def get_last_message(self, slave_chat_id: EFBChannelChatIDStr) -> Optional[MsgLog]:
         try:
             return MsgLog.select().where(
                 MsgLog.slave_origin_uid == slave_chat_id
@@ -949,8 +991,8 @@ class DatabaseManager:
         except DoesNotExist:
             return None
 
-    @staticmethod
-    def get_recent_messages(slave_chat_id: EFBChannelChatIDStr, limit: int = 1000) -> List[MsgLog]:
+    @observe_database_method("get_recent_messages")
+    def get_recent_messages(self, slave_chat_id: EFBChannelChatIDStr, limit: int = 1000) -> List[MsgLog]:
         """Get recent messages from a specific slave chat for migration purposes.
 
         Args:
@@ -987,14 +1029,15 @@ class DatabaseManager:
             return base_filter & HistoryMigrationEntry.message_thread_id.is_null(True)
         return base_filter & (HistoryMigrationEntry.message_thread_id == thread_value)
 
-    @staticmethod
+    @observe_database_method("replace_history_migration_entries")
     def replace_history_migration_entries(
+        self,
         slave_chat_id: EFBChannelChatIDStr,
         target_chat_id: int,
         message_thread_id: Optional[TelegramTopicID],
         entries: List[Dict[str, object]],
     ) -> int:
-        target_filter = DatabaseManager._history_migration_target_filter(
+        target_filter = self._history_migration_target_filter(
             slave_chat_id,
             target_chat_id,
             message_thread_id,
@@ -1005,25 +1048,26 @@ class DatabaseManager:
                 HistoryMigrationEntry.insert_many(entries).execute()
         return len(entries)
 
-    @staticmethod
-    def has_pending_history_migrations() -> bool:
+    @observe_database_method("has_pending_history_migrations")
+    def has_pending_history_migrations(self) -> bool:
         return HistoryMigrationEntry.select().exists()
 
-    @staticmethod
-    def get_next_history_migration_target() -> Optional[HistoryMigrationEntry]:
+    @observe_database_method("get_next_history_migration_target")
+    def get_next_history_migration_target(self) -> Optional[HistoryMigrationEntry]:
         return (
             HistoryMigrationEntry.select()
             .order_by(HistoryMigrationEntry.id.asc())
             .first()
         )
 
-    @staticmethod
+    @observe_database_method("get_history_migration_entries")
     def get_history_migration_entries(
+        self,
         slave_chat_id: EFBChannelChatIDStr,
         target_chat_id: int,
         message_thread_id: Optional[TelegramTopicID] = None,
     ) -> List[HistoryMigrationEntry]:
-        target_filter = DatabaseManager._history_migration_target_filter(
+        target_filter = self._history_migration_target_filter(
             slave_chat_id,
             target_chat_id,
             message_thread_id,
@@ -1034,8 +1078,8 @@ class DatabaseManager:
             .order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
         )
 
-    @staticmethod
-    def delete_history_migration_entry(entry_id: int) -> int:
+    @observe_database_method("delete_history_migration_entry")
+    def delete_history_migration_entry(self, entry_id: int) -> int:
         return int(
             HistoryMigrationEntry.delete()
             .where(HistoryMigrationEntry.id == entry_id)
