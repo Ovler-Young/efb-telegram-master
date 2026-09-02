@@ -240,6 +240,7 @@ def _expected_stream_indices(expected_count: int) -> Set[int]:
 @dataclass(frozen=True)
 class QueueMetricSnapshot:
     enqueued: float
+    transport_retries: float
     main_successes: float
     auxiliary_successes: float
     main_failures: float
@@ -273,6 +274,10 @@ def _queue_metrics_snapshot(bot_manager) -> QueueMetricSnapshot:
 
     return QueueMetricSnapshot(
         enqueued=sample(f"{prefix}_enqueued_total", common),
+        transport_retries=sample(
+            f"{prefix}_retries_total",
+            {**common, "reason": "transport"},
+        ),
         main_successes=completion("main", "success"),
         auxiliary_successes=completion("auxiliary", "success"),
         main_failures=completion("main", "failure"),
@@ -305,7 +310,8 @@ def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricS
 
 def _migration_activity_completed(*, activity_observed: bool, expected: Set[int],
                                   db_indices: List[int], telegram_indices: List[int],
-                                  target_entry_count: int, queue_completed: bool) -> bool:
+                                  target_entry_count: int, queue_completed: bool,
+                                  transport_retry_delta: float) -> bool:
     expected_count = len(expected)
     return (
         activity_observed
@@ -314,7 +320,7 @@ def _migration_activity_completed(*, activity_observed: bool, expected: Set[int]
         and set(db_indices) == expected
         and len(db_indices) == expected_count
         and set(telegram_indices) == expected
-        and len(telegram_indices) == expected_count
+        and expected_count <= len(telegram_indices) <= expected_count + transport_retry_delta
     )
 
 
@@ -366,9 +372,11 @@ async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_cha
         ]
 
         metrics_current = _queue_metrics_snapshot(channel_with_auxiliary_bots.bot_manager)
+        transport_retry_delta = metrics_current.transport_retries - metrics_before.transport_retries
         last_debug = (
             f"db={len(db_logs)} (idx={len(db_indices)}/{expected_count}), "
             f"tg={len(group_messages)} (idx={len(group_indices)}/{expected_count}), "
+            f"transport_retry_delta={transport_retry_delta}, "
             f"metrics_before={metrics_before!r}, metrics_current={metrics_current!r}"
         )
 
@@ -376,7 +384,7 @@ async def _wait_for_stream_stable(channel_with_auxiliary_bots, client, *, tg_cha
             set(db_indices) == expected
             and len(db_indices) == expected_count
             and set(group_indices) == expected
-            and len(group_indices) == expected_count
+            and expected_count <= len(group_indices) <= expected_count + transport_retry_delta
             and _queue_activity_completed(metrics_before, metrics_current, expected_count=expected_count)
         ):
             return db_logs, group_messages, metrics_current
@@ -418,10 +426,12 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
             metrics_current,
             expected_count=expected_count,
         )
+        transport_retry_delta = metrics_current.transport_retries - metrics_before.transport_retries
         last_debug = (
             f"migration_observed={activity_observed}, db_idx={len(db_indices)}/{expected_count}, "
             f"tg_idx={len(telegram_indices)}/{expected_count}, target_entries={target_entry_count}, "
             f"expected_migration_sends={expected_count}, "
+            f"transport_retry_delta={transport_retry_delta}, "
             f"metrics_before={metrics_before!r}, metrics_current={metrics_current!r}"
         )
         if _migration_activity_completed(
@@ -431,6 +441,7 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
             telegram_indices=telegram_indices,
             target_entry_count=target_entry_count,
             queue_completed=queue_completed,
+            transport_retry_delta=transport_retry_delta,
         ):
             return recent, metrics_current
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -491,7 +502,15 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
 
     group_indices = [idx for msg in group_messages for idx in _extract_stream_indices(msg.raw_text or "", prefix)]
     assert set(group_indices) == _expected_stream_indices(STREAM_MESSAGE_COUNT)
-    assert len(group_indices) == STREAM_MESSAGE_COUNT, "Expected exactly 120 stream messages in the Telegram group."
+    stream_transport_retry_delta = (
+        stream_metrics_after.transport_retries - stream_metrics_before.transport_retries
+    )
+    assert STREAM_MESSAGE_COUNT <= len(group_indices) <= (
+        STREAM_MESSAGE_COUNT + stream_transport_retry_delta
+    ), (
+        f"Expected Telegram occurrences to match the logical stream plus at most its transport retries; "
+        f"got {len(group_indices)}, transport_retry_delta={stream_transport_retry_delta}."
+    )
 
     db_indices = [idx for log in db_logs for idx in _extract_stream_indices(log.text or "", prefix)]
     assert set(db_indices) == _expected_stream_indices(STREAM_MESSAGE_COUNT)
