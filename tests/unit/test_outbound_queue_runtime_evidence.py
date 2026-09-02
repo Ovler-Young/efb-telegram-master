@@ -516,6 +516,75 @@ def test_blocking_media_edit_retries_at_telegram_deadline_with_rewound_payload(
     assert waiter.result() == "edited"
 
 
+def test_blocking_media_edit_retry_uses_migrated_destination_after_retry_after(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    old_chat_id = 67
+    new_chat_id = 68
+    manager = manager_adapter()
+    manager._bot = Mock()
+    manager._bot.edit_message_media.side_effect = [
+        ChatMigrated(new_chat_id),
+        RetryAfter(121),
+        "edited",
+    ]
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    manager._outbound_queue = retained_queue
+    row_id, waiter = _enqueue_blocking_media_edit(
+        retained_queue, io.BufferedReader(io.BytesIO(b"media")), "__main__"
+    )
+    later_id, later_waiter = retained_queue.enqueue_many(
+        [QueueRequest(
+            "send_message",
+            (),
+            {"chat_id": new_chat_id, "text": "later", "_send_mode": "blocking"},
+        )],
+        lambda _operation: send_message,
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    first_function, first_args, first_future = executor.submissions[0]
+    with pytest.raises(RetryAfter) as raised:
+        first_function(*first_args)
+    first_future.set_exception(raised.value)
+    scheduler.harvest_completed()
+
+    retry = scheduler.blocking_media_retries[row_id]
+    retry_args, _retry_kwargs = retained_queue.decode_payload(retry.row.payload)
+    assert retry.row.telegram_chat_id == new_chat_id
+    assert retry_args[1] == new_chat_id
+    assert manager._bot_chat_disabled_until == {(None, new_chat_id): 221.0}
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+    retry_function, retry_submission_args, retry_future = executor.submissions[1]
+    assert retry_submission_args[0].telegram_chat_id == new_chat_id
+    assert retry_submission_args[1][1] == new_chat_id
+    retry_future.set_result(retry_function(*retry_submission_args))
+    scheduler.harvest_completed()
+    assert waiter.result() == "edited"
+    assert [entry.args[1] for entry in manager._bot.edit_message_media.call_args_list] == [
+        old_chat_id,
+        new_chat_id,
+        new_chat_id,
+    ]
+
+    scheduler.dispatch_once()
+    assert executor.submissions[2][1][0].id == later_id
+    executor.submissions[2][2].set_result("later")
+    scheduler.harvest_completed()
+    assert later_waiter.result() == "later"
+
+
 def test_blocking_media_retry_preserves_database_context_until_real_manager_success(
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:

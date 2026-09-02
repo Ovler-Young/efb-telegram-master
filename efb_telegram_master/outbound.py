@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import Executor, Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Protocol
 from urllib.parse import unquote, urlsplit
@@ -217,6 +217,12 @@ class _InlineMediaSnapshot:
 
 
 class QueueAdapter(Protocol):
+    @staticmethod
+    def _rewrite_queued_chat_id(
+        operation: str, args: tuple, kwargs: dict, new_chat_id: int
+    ) -> tuple[tuple, dict]:
+        ...
+
     def select_sender(self, row: QueuedCall, now: float) -> SenderSelectionResult:
         ...
 
@@ -908,6 +914,20 @@ class OutboundQueueScheduler:
             and isinstance(error, RetryAfter)
         )
 
+    def _blocking_media_retry_row(self, row: QueuedCall, error: RetryAfter) -> QueuedCall:
+        migrated_chat_id = getattr(error, "_etm_telegram_chat_id", row.telegram_chat_id)
+        if migrated_chat_id == row.telegram_chat_id:
+            return row
+        args, kwargs = self.queue.decode_payload(row.payload)
+        args, kwargs = self.adapter._rewrite_queued_chat_id(
+            row.operation, args, kwargs, migrated_chat_id
+        )
+        return replace(
+            row,
+            telegram_chat_id=migrated_chat_id,
+            payload=self.queue.encode_payload(args, kwargs),
+        )
+
     def _fail_blocking_retry(self, retry: BlockingMediaRetry, error: BaseException) -> None:
         # A delayed retry retains the manager's database-update context.  Claim
         # it before completing the terminal adapter path so concurrent terminal
@@ -1177,12 +1197,13 @@ class OutboundQueueScheduler:
                         retry_after = self._retry_after_seconds(error)
                         deadline = submitted.row.created_at + 300.0
                         if not self.stopping and time.time() + retry_after <= deadline:
+                            retry_row = self._blocking_media_retry_row(submitted.row, error)
                             self.adapter.record_queued_retry_after(
-                                submitted.row, error, submitted.selection
+                                retry_row, error, submitted.selection
                             )
                             retry_at = time.monotonic() + retry_after
                             self.blocking_media_retries[row_id] = BlockingMediaRetry(
-                                submitted.row, submitted.selection, retry_at, deadline, error
+                                retry_row, submitted.selection, retry_at, deadline, error
                             )
                             self._schedule_retry(retry_at)
                             if self.queue.metrics is not None:
