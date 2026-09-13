@@ -555,7 +555,35 @@ def test_slave_message_image_sends_placeholder_when_remote_image_url_fails():
     assert hasattr(second_call.args[1], "read")
     assert second_call.kwargs["caption"] == "remote &lt;image&gt;"
     assert second_call.kwargs["_send_mode"] == "blocking"
+    # Both the failed URL send and the fallback placeholder must carry the
+    # queue DB-log context so the visible message is persisted durably.
+    assert processor._make_send_kwargs.call_count == 2
+    assert processor._make_send_kwargs.call_args.kwargs == {
+        "mode": "blocking",
+        "on_complete": None,
+    }
     processor.bot.send_document.assert_not_called()
+
+
+def test_dispatch_message_defers_write_when_queue_logged_durably():
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.logger = Mock()
+    processor.db = Mock()
+    processor.bot = Mock()
+    processor.chat_manager = Mock()
+    processor.channel = SimpleNamespace(commands=Mock())
+    processor.flag = Mock(return_value=False)
+    message = build_remote_image_message()
+    receipt = SimpleNamespace(durable_db_logged=True)
+
+    with patch.object(SlaveMessageProcessor, "slave_message_image", return_value=receipt):
+        SlaveMessageProcessor.dispatch_message(
+            processor, message, "__template__", None, 100, None,
+        )
+
+    # The durable queue already owns the MsgLog write; the lossy post-send
+    # write path must not run again.
+    processor.bot.write_db_mapping.assert_not_called()
 
 
 def test_slave_message_image_edits_remote_image_url_media():
