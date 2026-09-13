@@ -658,8 +658,6 @@ class OutboundQueue:
         payload = self.encode_payload(telegram_args, telegram_kwargs)
         if request.log_context is not None and not isinstance(request.log_context, bytes):
             raise QueueEnqueueError("Queued log context must be bytes when supplied.")
-        if request.log_context is not None and priority != 0:
-            raise QueueEnqueueError("Queued log context requires an eventual send.")
         return (
             request.operation, telegram_args, telegram_kwargs, chat_id, priority,
             slave_id, required_sender, payload, request.log_context,
@@ -935,6 +933,13 @@ class OutboundQueueScheduler:
         if self.blocking_media_retries.pop(retry.row.id, None) is not retry:
             return
         self.adapter.record_queued_failure(retry.row, error, retry.selection)
+        if retry.row.log_context is not None:
+            try:
+                self.queue.delete(retry.row.id)
+            except Exception as delete_error:
+                self._stop_for_persistence_error(delete_error)
+                return
+            self._record_terminal_discard(retry.row)
         self.queue.fail_waiter(retry.row.id, error)
         if self.queue.metrics is not None:
             self.queue.metrics.record_failure(retry.row.priority, retry.row.operation, "terminal")
@@ -1131,7 +1136,9 @@ class OutboundQueueScheduler:
                     retry_at = now + 0.25
                     self._schedule_retry(retry_at)
                     continue
-                retained = row.priority == 0
+                # Rows carrying a durable log context are retained until the
+                # MsgLog write is committed, regardless of blocking priority.
+                retained = row.priority == 0 or row.log_context is not None
                 if not retained:
                     try:
                         self.queue.delete(row.id)
@@ -1234,7 +1241,7 @@ class OutboundQueueScheduler:
                                 retry_reason,
                             )
                         continue
-                    if submitted.row.priority == 0:
+                    if submitted.row.priority == 0 or submitted.row.log_context is not None:
                         try:
                             self.queue.delete(row_id)
                         except Exception as delete_error:

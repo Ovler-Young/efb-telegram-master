@@ -929,6 +929,7 @@ class TelegramBotManager(LocaleMixin):
             function_args,
             blocking_kwargs,
             cleanup_files=cleanup_files,
+            db_log_context=db_log_context,
         )
 
     def _call_direct_operation(
@@ -1116,29 +1117,19 @@ class TelegramBotManager(LocaleMixin):
                 raise error
             durable_requests = requests
             if db_log_context is not None:
-                blocking_context = any(
-                    request.kwargs.get("_send_mode", "eventual") == "blocking"
+                encoded_context = self._encode_queued_log_context(db_log_context)
+                durable_requests = [
+                    QueueRequest(
+                        request.operation, request.args, request.kwargs, encoded_context
+                    )
                     for request in requests
-                )
-                if not blocking_context:
-                    encoded_context = self._encode_queued_log_context(db_log_context)
-                    durable_requests = [
-                        QueueRequest(
-                            request.operation, request.args, request.kwargs, encoded_context
-                        )
-                        for request in requests
-                    ]
-            else:
-                blocking_context = False
+                ]
             row_id, waiter = self._outbound_queue.enqueue_many(
                 durable_requests, self._queue_operation
             )
             if db_log_context is not None:
                 with self._queued_db_log_context_lock:
-                    if blocking_context:
-                        self._queued_db_log_contexts[row_id] = db_log_context
-                    else:
-                        self._queued_completion_callbacks[row_id] = db_log_context.on_complete
+                    self._queued_completion_callbacks[row_id] = db_log_context.on_complete
             self._outbound_scheduler.wake_event.set()
             return str(row_id), waiter
 
@@ -1198,6 +1189,7 @@ class TelegramBotManager(LocaleMixin):
         kwargs: dict,
         *,
         cleanup_files: Optional[list] = None,
+        db_log_context: Optional[QueuedDbLogContext] = None,
     ) -> SendReceipt:
         queued_kwargs = dict(kwargs)
         if slave_id:
@@ -1205,7 +1197,7 @@ class TelegramBotManager(LocaleMixin):
         queued_kwargs["_send_mode"] = "blocking"
         row_id, queue_waiter = self._enqueue_requests([
             QueueRequest(function.__name__, args[1:] if args and args[0] is self else args, queued_kwargs)
-        ])
+        ], db_log_context=db_log_context)
         for path in cleanup_files or ():
             try:
                 os.unlink(path)
@@ -1217,7 +1209,11 @@ class TelegramBotManager(LocaleMixin):
             raise RuntimeError(
                 f"Blocking send to chat {chat_id} timed out after {self.BLOCKING_SEND_TIMEOUT:g}s"
             ) from error
-        return self._make_send_receipt(result, task_id=row_id)
+        return self._make_send_receipt(
+            result,
+            task_id=row_id,
+            durable_db_logged=db_log_context is not None,
+        )
 
     def enqueue_history_operation(
         self,

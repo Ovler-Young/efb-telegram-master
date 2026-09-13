@@ -952,6 +952,90 @@ def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path):
     assert restarted.sent_pending() == []
 
 
+def test_blocking_log_context_row_survives_restart_before_send(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest(
+        "send_message", (),
+        {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
+        log_context=b"\x01context",
+    ))
+    queue.close()
+
+    restarted = OutboundQueue(tmp_path)
+    adapter = DurableAdapter(reconcile=True)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(restarted, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        # The blocking row stays durable while its Telegram call is in flight,
+        # so a crash before the MsgLog write can still be reconciled.
+        assert [row.id for row in restarted.heads()] == [row_id]
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    assert adapter.calls == [(row_id, 7, "send_message")]
+    assert adapter.reconciled == [row_id]
+    assert restarted.heads() == []
+    assert restarted.sent_pending() == []
+
+
+def test_blocking_failed_reconciliation_keeps_row_for_retry(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, QueueRequest(
+        "send_message", (),
+        {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
+        log_context=b"\x01context",
+    ))
+    adapter = DurableAdapter(reconcile=False)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+        # Telegram accepted the message; a failed MsgLog write retains the row
+        # for reconciliation instead of dropping the mapping.
+        assert waiter.result(timeout=1) == row_id
+        assert [row.id for row in queue.sent_pending()] == [row_id]
+        assert queue.heads() == []
+
+        adapter.reconcile = True
+        scheduler.dispatch_once()
+
+    assert adapter.calls == [(row_id, 7, "send_message")]
+    assert queue.sent_pending() == []
+    assert queue.heads() == []
+
+
+def test_blocking_terminal_failure_discards_retained_log_context_row(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, QueueRequest(
+        "send_message", (),
+        {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
+        log_context=b"\x01context",
+    ))
+
+    class FailingAdapter(DurableAdapter):
+        def execute_queued_call(self, row, args, kwargs, selection):
+            raise RuntimeError("send failed")
+
+        def record_queued_failure(self, row, error, selection):
+            return CompletionDecision("terminal_failure")
+
+    adapter = FailingAdapter(reconcile=True)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        with pytest.raises(RuntimeError, match="send failed"):
+            scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    # Nothing was sent, so the retained row must not linger for redelivery.
+    assert queue.heads() == []
+    assert queue.sent_pending() == []
+    with pytest.raises(RuntimeError, match="send failed"):
+        waiter.result(timeout=1)
+
+
 def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(tmp_path):
     queue = OutboundQueue(tmp_path)
     normal_id, _normal = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "normal"}))

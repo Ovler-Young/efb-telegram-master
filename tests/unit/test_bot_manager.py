@@ -38,7 +38,8 @@ class DurableMessage:
 
 def _bind_blocking_enqueue_helper(manager):
     if "_enqueue_blocking_send_and_wait" not in getattr(manager, "__dict__", {}):
-        def _enqueue_blocking_send_and_wait(slave_id, chat_id, fn, args, kwargs, cleanup_files=None):
+        def _enqueue_blocking_send_and_wait(slave_id, chat_id, fn, args, kwargs, cleanup_files=None,
+                                            db_log_context=None):
             queued_args = args[1:] if args and args[0] is manager else args
             result = manager.execute_queued_call(
                 SimpleNamespace(operation=fn.__name__),
@@ -50,7 +51,11 @@ def _bind_blocking_enqueue_helper(manager):
             required_sender = kwargs.get("_required_sender_bot_id")
             if required_sender not in {None, "__main__"}:
                 sender_bot_id = required_sender
-            return SendReceipt(message=result, sender_bot_id=sender_bot_id)
+            return SendReceipt(
+                message=result,
+                sender_bot_id=sender_bot_id,
+                durable_db_logged=db_log_context is not None,
+            )
 
         manager._enqueue_blocking_send_and_wait = Mock(side_effect=_enqueue_blocking_send_and_wait)
     return manager
@@ -737,6 +742,25 @@ def test_queued_route_defers_db_mapping_context_outside_telegram_kwargs():
     assert eventual_call.kwargs["db_log_context"] is db_context
 
 
+def test_blocking_route_forwards_db_mapping_context_to_durable_queue():
+    manager = _make_queueing_manager()
+    db_context = QueuedDbLogContext(Mock(), None, Mock())
+
+    manager.edit_message_text(
+        chat_id=123,
+        message_id=9,
+        text="updated",
+        _send_mode="blocking",
+        _slave_id="slave.chat",
+        _queued_db_log_context=db_context,
+    )
+
+    manager._enqueue_eventual_send.assert_not_called()
+    blocking_call = manager._enqueue_blocking_send_and_wait.call_args
+    assert blocking_call.args[4]["text"] == "updated"
+    assert blocking_call.kwargs["db_log_context"] is db_context
+
+
 def test_queued_route_rejects_invalid_db_mapping_context():
     manager = _make_queueing_manager()
 
@@ -776,8 +800,8 @@ def test_queued_success_writes_deferred_db_mapping_once():
 
 def test_enqueue_registers_deferred_mapping_before_waking_worker():
     manager = object.__new__(TelegramBotManager)
-    db_context = QueuedDbLogContext(Mock(), None, Mock())
-    manager._queued_db_log_contexts = {}
+    db_context = QueuedDbLogContext(DurableMessage(), None, Mock())
+    manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
     wake_event = Mock()
     manager._outbound_scheduler = SimpleNamespace(
@@ -789,7 +813,13 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
     manager._queue_operation = Mock()
 
     def assert_context_registered() -> None:
-        assert manager._queued_db_log_contexts == {7: db_context}
+        assert manager._queued_completion_callbacks == {7: db_context.on_complete}
+        requests = manager._outbound_queue.enqueue_many.call_args.args[0]
+        stored_msg, stored_old_msg_id = TelegramBotManager._decode_queued_log_context(
+            requests[0].log_context
+        )
+        assert isinstance(stored_msg, DurableMessage)
+        assert stored_old_msg_id is None
 
     wake_event.set.side_effect = assert_context_registered
     row_id, _waiter = TelegramBotManager._enqueue_requests(
@@ -1026,9 +1056,13 @@ def test_public_positional_edit_retries_chat_migration_without_replacing_text():
     )
     manager._outbound_queue = Mock()
 
-    def send_and_wait(_slave_id, _chat_id, fn, args, kwargs, cleanup_files=None):
+    def send_and_wait(_slave_id, _chat_id, fn, args, kwargs, cleanup_files=None,
+                      db_log_context=None):
         send_kwargs = {key: value for key, value in kwargs.items() if not key.startswith("_")}
-        return SendReceipt(message=fn(*args, **send_kwargs))
+        return SendReceipt(
+            message=fn(*args, **send_kwargs),
+            durable_db_logged=db_log_context is not None,
+        )
 
     manager._enqueue_blocking_send_and_wait = Mock(side_effect=send_and_wait)
 
