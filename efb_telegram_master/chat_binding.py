@@ -1562,8 +1562,13 @@ class ChatBindingManager(LocaleMixin):
                     thread_id,
                 )
             except Exception as error:
-                self._log_history_migration_failure(entry.id, 0, error)
-                return False
+                self.logger.warning(
+                    "History migration entry %d discarded because it could not be prepared: %s",
+                    entry.id,
+                    error,
+                )
+                self.db.delete_history_migration_entry(entry.id)
+                continue
 
             if prepared_call is None:
                 self.db.delete_history_migration_entry(entry.id)
@@ -1571,7 +1576,6 @@ class ChatBindingManager(LocaleMixin):
                 continue
 
             operation, kwargs = prepared_call
-            completed_call_count = 0
             try:
                 waiter = self.bot.enqueue_history_operation(
                     source_key=str(slave_chat_id),
@@ -1581,13 +1585,23 @@ class ChatBindingManager(LocaleMixin):
                     kwargs=kwargs,
                     history_entry_ids=[entry.id],
                 )
-                waiter.result()
-                completed_call_count += 1
             except BaseException as error:
-                self._log_history_migration_failure(entry.id, completed_call_count, error)
+                self.logger.warning(
+                    "History migration entry %d retained because durable enqueue failed: %s",
+                    entry.id,
+                    error,
+                )
                 return False
 
             self.db.delete_history_migration_entry(entry.id)
+            try:
+                waiter.result()
+            except BaseException as error:
+                self.logger.warning(
+                    "History migration entry %d failed after durable enqueue: %s",
+                    entry.id,
+                    error,
+                )
         return True
 
     @staticmethod
@@ -1621,19 +1635,6 @@ class ChatBindingManager(LocaleMixin):
         if thread_id is not None:
             kwargs['message_thread_id'] = thread_id
         return 'copy_message', kwargs
-
-    def _log_history_migration_failure(
-        self,
-        entry_id: int,
-        completed_call_count: int,
-        error: BaseException,
-    ) -> None:
-        self.logger.warning(
-            "History migration entry %d retained after %d completed calls: %s",
-            entry_id,
-            completed_call_count,
-            error,
-        )
 
     @staticmethod
     def truncate_ellipsis(text: str, length: int) -> str:

@@ -560,6 +560,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                        reply_markup: Optional[ReplyMarkup],
                                        silent: bool,
                                        *,
+                                       msg: Message,
+                                       on_db_complete: Optional[Callable[[], None]] = None,
                                        as_document: bool = False) -> telegram.Message:
         placeholder = self._remote_image_placeholder()
         filename = "remote-image-placeholder.png"
@@ -572,14 +574,18 @@ class SlaveMessageProcessor(LocaleMixin):
                                               message_thread_id=thread_id,
                                               reply_markup=reply_markup,
                                               disable_notification=silent,
-                                              _send_mode="blocking")
+                                              **self._make_send_kwargs(
+                                                  msg, mode='blocking', on_complete=on_db_complete,
+                                              ))
             return self.bot.send_photo(tg_dest, file, prefix=msg_template, suffix=reactions,
                                        caption=text, parse_mode="HTML",
                                        reply_to_message_id=target_msg_id,
                                        message_thread_id=thread_id,
                                        reply_markup=reply_markup,
                                        disable_notification=silent,
-                                       _send_mode="blocking")
+                                       **self._make_send_kwargs(
+                                           msg, mode='blocking', on_complete=on_db_complete,
+                                       ))
         finally:
             placeholder.close()
             self._cleanup_pending_local_api_files()
@@ -755,7 +761,8 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.logger.warning('[%s] Failed to send remote image URL, sending editable placeholder. Reason: %s',
                                     msg.uid, e)
                 return self._send_remote_image_placeholder(tg_dest, thread_id, msg_template, reactions, text,
-                                                           target_msg_id, reply_markup, silent)
+                                                           target_msg_id, reply_markup, silent,
+                                                           msg=msg, on_db_complete=on_db_complete)
 
         msg_file = msg.file
         assert msg_file is not None
@@ -1120,7 +1127,8 @@ class SlaveMessageProcessor(LocaleMixin):
                     self.logger.warning('[%s] Failed to send remote image URL as document, sending editable placeholder. '
                                         'Reason: %s', msg.uid, e)
                     return self._send_remote_image_placeholder(tg_dest, thread_id, msg_template, reactions, text,
-                                                               target_msg_id, reply_markup, silent, as_document=True)
+                                                               target_msg_id, reply_markup, silent, as_document=True,
+                                                               msg=msg, on_db_complete=on_db_complete)
 
             file_too_large = self.check_file_size(msg.file)
             edit_media = msg.edit_media
