@@ -9,7 +9,10 @@ outbound database in the same channel data directory.
 
 Startup adds missing nullable historical columns and lookup indexes in one
 schema transaction. Existing message IDs, timestamps, duplicate source-message
-mappings and association rows are not rewritten or deduplicated. On a large
+mappings and association rows are not rewritten or deduplicated. Unknown message
+timestamps remain NULL; lookups explicitly keep them last in descending order
+and first in ascending order on both backends, preserving SQLite behavior.
+PostgreSQL time indexes use the same ordering. On a large
 SQLite database the first index build needs disk space and exclusive writer
 access; deploy during a maintenance window rather than interrupting the build.
 

@@ -470,6 +470,25 @@ def test_cutover_receipt_cannot_be_reused_for_another_target(sqlite_source, post
     assert json.loads((sqlite_source / migrate_db.RECEIPT_FILE).read_text())["import_id"] == receipt["import_id"]
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_null_timestamp_order_is_consistent_across_backends(sqlite_source, postgres_config, manager_factory, backend):
+    if backend == "postgresql":
+        migrate_db.migrate(sqlite_source, postgres_config)
+    manager = manager_factory(sqlite_source, postgres_config if backend == "postgresql" else None)
+    assert manager.get_last_message("slave.chat").master_msg_id == "中.3"
+    assert [row.master_msg_id for row in manager.get_recent_messages("slave.chat", limit=0)] == ["ä.2", "z.1", "中.3"]
+    with connection_scope(manager._managed_database):
+        for key, origin, source_id, timestamp in (
+            ("null-copy", "slave.chat", "slave.z.1", None),
+            ("42.1", "unknown-time", "one", None),
+            ("42.2", "known-time", "two", datetime(2020, 1, 1)),
+        ):
+            MsgLog.create(master_msg_id=key, slave_message_id=source_id, text="test", slave_origin_uid=origin,
+                          msg_type="Text", sent_to="test", time=timestamp)
+    assert manager.get_msg_log(slave_msg_id="slave.z.1", slave_origin_uid="slave.chat").master_msg_id == "z.1"
+    assert manager.get_recent_slave_chats(42, limit=1) == ["known-time"]
+
+
 @pytest.mark.parametrize("invalid", [{}, {"version": 999}, []])
 def test_corrupt_import_manifest_cannot_authorize_startup(sqlite_source, postgres_config, invalid):
     migrate_db.migrate(sqlite_source, postgres_config)

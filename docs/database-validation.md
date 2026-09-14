@@ -10,9 +10,9 @@ created a separate schema; no production database was accessed.
 
 | Python | Peewee | Full unit suite | Database availability |
 | --- | --- | --- | --- |
-| 3.10.20 | 3.19.0 | 406 passed, 68 skipped | PostgreSQL configured |
-| 3.12.3 | 4.5.1 | 406 passed, 68 skipped | PostgreSQL configured |
-| 3.14.6 | 4.5.1 | 406 passed, 68 skipped | PostgreSQL configured |
+| 3.10.20 | 3.19.0 | 408 passed, 68 skipped | PostgreSQL configured |
+| 3.12.3 | 4.5.1 | 408 passed, 68 skipped | PostgreSQL configured |
+| 3.14.6 | 4.5.1 | 408 passed, 68 skipped | PostgreSQL configured |
 
 The 68 skips require Telegram credentials in the existing test suite. They are
 not migration-test skips and are not represented as passing live Telegram tests.
@@ -25,7 +25,9 @@ WAL backups, old archive preservation, source/target/queue divergence, invalid
 manifests, unsupported historical data, optional nullable column projection,
 primary-key preservation and subsequent sequence allocation, connection return
 across 24 short-lived threads, nested connection ownership, new/reply/edit/reaction
-log operations and restartable history backfill.
+log operations and restartable history backfill. Nullable timestamp ordering is
+checked on both backends, including latest-message lookup, oldest-first history,
+source-message lookup with an undated duplicate, and latest active chat selection.
 
 The large-import test streams 6,003 messages, including 6,000 additional rows with
 6,144-character text, using batches of 32; Python peak allocation must remain

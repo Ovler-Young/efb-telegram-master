@@ -17,6 +17,7 @@ from peewee import (
     DoesNotExist,
     IntegerField,
     Model,
+    PostgresqlDatabase,
     TextField,
     fn,
 )
@@ -360,9 +361,10 @@ class DatabaseManager:
 
     @staticmethod
     def _create_lookup_indexes(db):
+        time_order = "time DESC NULLS LAST" if isinstance(db, PostgresqlDatabase) else "time DESC"
         for name, table, columns in (
-            ("msglog_slave_lookup", "msglog", "slave_origin_uid, slave_message_id, time DESC"),
-            ("msglog_chat_time", "msglog", "slave_origin_uid, time DESC"),
+            ("msglog_slave_lookup", "msglog", f"slave_origin_uid, slave_message_id, {time_order}"),
+            ("msglog_chat_time", "msglog", f"slave_origin_uid, {time_order}"),
             ("msglog_master_alt", "msglog", "master_msg_id_alt"),
             ("chatassoc_slave_lookup", "chatassoc", "slave_uid"),
             ("chatassoc_master_lookup", "chatassoc", "master_uid"),
@@ -737,11 +739,11 @@ class DatabaseManager:
         try:
             if master_msg_id:
                 return MsgLog.select().where(MsgLog.master_msg_id == master_msg_id) \
-                    .order_by(MsgLog.time.desc()).first()
+                    .order_by(MsgLog.time.desc(nulls="LAST")).first()
             else:
                 return MsgLog.select().where((MsgLog.slave_message_id == slave_msg_id) &
                                              (MsgLog.slave_origin_uid == slave_origin_uid)
-                                             ).order_by(MsgLog.time.desc()).first()
+                                             ).order_by(MsgLog.time.desc(nulls="LAST")).first()
         except DoesNotExist:
             return None
 
@@ -850,7 +852,7 @@ class DatabaseManager:
             .select(MsgLog.slave_origin_uid, fn.MAX(MsgLog.time)) \
             .where(MsgLog.master_msg_id.startswith("{}.".format(master_chat_id))) \
             .group_by(MsgLog.slave_origin_uid) \
-            .order_by(fn.MAX(MsgLog.time).desc()) \
+            .order_by(fn.MAX(MsgLog.time).desc(nulls="LAST")) \
             .limit(limit)
 
         return [EFBChannelChatIDStr(i.slave_origin_uid) for i in query]
@@ -860,7 +862,7 @@ class DatabaseManager:
         try:
             return MsgLog.select().where(
                 MsgLog.slave_origin_uid == slave_chat_id
-            ).order_by(MsgLog.time.desc()).limit(1).first()
+            ).order_by(MsgLog.time.desc(nulls="LAST")).limit(1).first()
         except DoesNotExist:
             return None
 
@@ -878,7 +880,7 @@ class DatabaseManager:
         try:
             query = MsgLog.select().where(
                 MsgLog.slave_origin_uid == slave_chat_id
-            ).order_by(MsgLog.time.asc())
+            ).order_by(MsgLog.time.asc(nulls="FIRST"))
 
             if limit > 0:
                 query = query.limit(limit)

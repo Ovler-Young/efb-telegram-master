@@ -33,8 +33,8 @@ def test_lookup_indexes_cover_real_queries_and_survive_restart(manager, tmp_path
                 text="text", slave_origin_uid="slave.chat", msg_type="Text", sent_to="test",
             )
         queries = (
-            MsgLog.select().where((MsgLog.slave_origin_uid == "slave.chat") & (MsgLog.slave_message_id == "source.49")).order_by(MsgLog.time.desc()).limit(1),
-            MsgLog.select().where(MsgLog.slave_origin_uid == "slave.chat").order_by(MsgLog.time.desc()).limit(1),
+            MsgLog.select().where((MsgLog.slave_origin_uid == "slave.chat") & (MsgLog.slave_message_id == "source.49")).order_by(MsgLog.time.desc(nulls="LAST")).limit(1),
+            MsgLog.select().where(MsgLog.slave_origin_uid == "slave.chat").order_by(MsgLog.time.desc(nulls="LAST")).limit(1),
             MsgLog.select().where((MsgLog.master_msg_id == "master.49") | (MsgLog.master_msg_id_alt == "master.49")).limit(1),
         )
         for query in queries:
