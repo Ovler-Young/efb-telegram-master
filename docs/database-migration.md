@@ -31,6 +31,27 @@ receipts per sweep, with persisted exponential delays of 1, 2, 4, 8, 16, 32 and
 then 60 seconds. A failed receipt is retained, never resent as a Telegram message
 and never discarded just to reduce CPU. Restarting does not reset the delay.
 
+Restart recovery also bounds bytes, not just record counts. Durable log contexts
+now store only the inputs needed for MsgLog, not group member caches, local file
+buffers, vendor data, or recursively quoted messages. Both historical format 1
+and new format 2 are readable. Historical message restoration is log-only: it
+must not download, reopen or transcode attachments. Pending contexts are loaded
+one at a time; history preparation and resumed history work use batches of 32.
+
+The scheduler waits for enqueue/completion events or the actual retry deadline,
+not four full queue scans per second. Automatic receipt recovery yields between
+batches for at least 250 ms and at least the preceding batch's work duration.
+Fresh live completions still write their own receipt immediately.
+
+The encoded in-flight queue data budget is 128 MiB. A single historical context
+or queued call over that budget stops recovery *before* its BLOB is loaded; its
+row ID and size are reported and the record is retained for offline diagnosis.
+Do not delete such a row or raise the limit blindly. This bounds recovery BLOB
+loads; it is not a hard limit on total process RSS, upstream channel caches, or
+media conversion performed outside this queue. During a memory incident, stop
+the bot and automatic restarts before diagnosis, keeping both databases and WAL
+files intact. This hotfix does not require a PostgreSQL cutover.
+
 ## Before migration
 
 Use a dedicated empty PostgreSQL database or schema and install the PostgreSQL

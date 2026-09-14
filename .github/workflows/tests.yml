@@ -16,6 +16,11 @@ on:
       - '.github/workflows/tests.yml'
       - 'pytest.ini'
   workflow_dispatch:
+    inputs:
+      restart_regression:
+        description: One Python unit job plus focused live Telegram restart regressions
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
@@ -32,7 +37,7 @@ jobs:
       fail-fast: true
       max-parallel: 1
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ${{ fromJSON(inputs.restart_regression && '["3.12"]' || '["3.10", "3.11", "3.12", "3.13", "3.14"]') }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -115,7 +120,7 @@ jobs:
         TEST_POSTGRES_USER: postgres
         TEST_POSTGRES_PASSWORD: postgres
       run: |
-        pytest --mode=unit -v tests/unit/test_database_safety.py tests/unit/test_database_performance.py tests/unit/test_db_migrations.py tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py
+        pytest --mode=unit -v tests/unit/test_database_safety.py tests/unit/test_database_performance.py tests/unit/test_restart_memory.py tests/unit/test_db_migrations.py tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py
 
   integration:
     if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'
@@ -157,6 +162,7 @@ jobs:
         sudo apt install -y ffmpeg libmagic-dev libwebp-dev
     - name: Test integration suite
       env:
+        RESTART_REGRESSION: ${{ inputs.restart_regression }}
         TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
         GROUPS: ${{ secrets.TELEGRAM_GROUPS }}
@@ -173,4 +179,9 @@ jobs:
         TEST_POSTGRES_USER: postgres
         TEST_POSTGRES_PASSWORD: postgres
       run: |
-        pytest -vv -r a -l --color=yes --mode=integration
+        python -c 'import os; required = ("TOKEN", "ADMINS", "GROUPS", "USER_SESSION", "API_ID", "API_HASH"); missing = [name for name in required if not os.getenv(name)]; assert not missing, "Missing live-test credentials: " + ", ".join(missing)'
+        if [ "$RESTART_REGRESSION" = "true" ]; then
+          pytest -vv -r a --color=yes --mode=integration tests/integration/test_simple.py tests/integration/test_react.py tests/integration/test_backfill.py tests/integration/test_slave_message.py tests/integration/test_slave_message_file.py
+        else
+          pytest -vv -r a -l --color=yes --mode=integration
+        fi

@@ -131,6 +131,7 @@ class QueuedCall:
     log_context: Optional[bytes]
     delivery_state: str
     completion_receipt: Optional[bytes]
+    stored_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -300,6 +301,9 @@ class OutboundQueue:
     """Own the queue connection, codec, and transactional row mutations."""
 
     filename = "outbound-queue.sqlite3"
+    # Protect restart from already-inflated historical rows before reading their
+    # BLOBs. Oversized rows are retained and reported, never silently discarded.
+    MAX_REPLAY_BYTES = 128 * 1024 * 1024
 
     def __init__(self, channel_data_path: Path | str, metrics: Optional[QueueMetrics] = None):
         self.path = Path(channel_data_path) / self.filename
@@ -723,12 +727,14 @@ class OutboundQueue:
     def heads(self, *, include_payload: bool = True) -> list[QueuedCall]:
         payload = "q.payload" if include_payload else "X''"
         context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
+        receipt = "q.completion_receipt" if include_payload else "NULL"
         with self._lock:
             # Select IDs using a covering index before reading any media BLOBs.
             # Priority is either 0 or 1; within a priority the smallest ID wins.
             rows = self.connection.execute(
                 f"SELECT q.id, q.priority, q.telegram_chat_id, q.operation, {payload}, q.slave_id, "
-                f"q.required_sender_bot_id, q.created_at, {context}, q.delivery_state, q.completion_receipt "
+                f"q.required_sender_bot_id, q.created_at, {context}, q.delivery_state, {receipt}, "
+                "length(q.payload) + COALESCE(length(q.log_context), 0) + COALESCE(length(q.completion_receipt), 0) "
                 "FROM outbound_queue AS q JOIN ("
                 "SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id "
                 "FROM outbound_queue WHERE delivery_state = 'queued' GROUP BY telegram_chat_id"
@@ -739,6 +745,12 @@ class OutboundQueue:
     def load_queued(self, row_id: int) -> QueuedCall:
         """Load upload bytes only once a worker and sender can accept this row."""
         with self._lock:
+            size = self.connection.execute(
+                "SELECT length(payload) + COALESCE(length(log_context), 0) + COALESCE(length(completion_receipt), 0) "
+                "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'", (row_id,),
+            ).fetchone()
+            if size is not None:
+                self.check_replay_size(row_id, size[0])
             row = self.connection.execute(
                 "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
                 "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
@@ -746,7 +758,15 @@ class OutboundQueue:
             ).fetchone()
         if row is None:
             raise QueuePersistenceError(f"Queued row {row_id} disappeared before dispatch.")
-        return QueuedCall(*row)
+        return replace(QueuedCall(*row), stored_bytes=int(size[0]))
+
+    def check_replay_size(self, row_id: int, size: int) -> None:
+        if size > self.MAX_REPLAY_BYTES:
+            raise QueuePersistenceError(
+                f"Queue row {row_id} needs {size} encoded bytes, exceeding the "
+                f"{self.MAX_REPLAY_BYTES}-byte replay budget. Row retained; "
+                "offline recovery is required before it can be loaded safely."
+            )
 
     def destination_snapshot(self, limit: int) -> list[tuple[str, int, float]]:
         """Return ranked queue destinations without exposing Telegram chat IDs."""
@@ -767,6 +787,12 @@ class OutboundQueue:
         self, *, due_before: Optional[float] = None, limit: int = -1,
         row_id: Optional[int] = None,
     ) -> list[QueuedCall]:
+        return list(self.iter_sent_pending(due_before=due_before, limit=limit, row_id=row_id))
+
+    def iter_sent_pending(
+        self, *, due_before: Optional[float] = None, limit: int = -1,
+        row_id: Optional[int] = None,
+    ):
         filters = ["delivery_state = 'sent_pending'"]
         parameters: list[object] = []
         if due_before is not None:
@@ -777,15 +803,30 @@ class OutboundQueue:
             parameters.append(row_id)
         parameters.append(limit)
         with self._lock:
-            # Reconciliation only needs the context and receipt, never upload bytes.
-            rows = self.connection.execute(
-                "SELECT id, priority, telegram_chat_id, operation, X'', slave_id, "
-                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
+            # Read IDs first: 32 historical contexts can themselves occupy GBs.
+            identifiers = self.connection.execute(
+                "SELECT id, COALESCE(length(log_context), 0) + COALESCE(length(completion_receipt), 0) "
                 "FROM outbound_queue WHERE " + " AND ".join(filters) +
-                " ORDER BY reconcile_after, id LIMIT ?",
-                parameters,
+                " ORDER BY reconcile_after, id LIMIT ?", parameters,
             ).fetchall()
-        return [QueuedCall(*row) for row in rows]
+        for identifier, size in identifiers:
+            self.check_replay_size(identifier, size)
+            with self._lock:
+                row = self.connection.execute(
+                    "SELECT id, priority, telegram_chat_id, operation, X'', slave_id, "
+                    "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
+                    "FROM outbound_queue WHERE id = ? AND delivery_state = 'sent_pending'",
+                    (identifier,),
+                ).fetchone()
+            if row is not None:
+                yield QueuedCall(*row)
+            del row
+
+    def next_reconciliation_time(self) -> Optional[float]:
+        with self._lock:
+            return self.connection.execute(
+                "SELECT MIN(reconcile_after) FROM outbound_queue WHERE delivery_state = 'sent_pending'"
+            ).fetchone()[0]
 
     def defer_reconciliation(self, row_ids: list[int], now: float) -> None:
         """Persist exponential retry delays (1s to 60s), including across restarts."""
@@ -893,6 +934,7 @@ class OutboundQueueScheduler:
         self.blocking_media_retries: dict[int, BlockingMediaRetry] = {}
         self._row_not_before: dict[int, float] = {}
         self.next_deadline: Optional[float] = None
+        self._reconciliation_not_before = 0.0
 
     @staticmethod
     def _sender_kind(selection: SenderSelection) -> str:
@@ -909,6 +951,7 @@ class OutboundQueueScheduler:
 
     def _record_terminal_discard(self, row: QueuedCall) -> None:
         self.queue.record_removal(row, "terminal_discard")
+        self.wake_event.set()  # A new head at this destination may now be runnable.
 
     def _record_dispatch(self, outcome: str) -> None:
         if self.queue.metrics is not None:
@@ -1108,24 +1151,40 @@ class OutboundQueueScheduler:
         reconciler = getattr(self.adapter, "reconcile_queued_delivery", None)
         if not callable(reconciler):
             return set()
+        started = time.monotonic()
+        if row_id is None and started < self._reconciliation_not_before:
+            self._schedule_retry(self._reconciliation_not_before)
+            return set()
         reconciled: set[int] = set()
         failed: list[int] = []
-        for row in self.queue.sent_pending(
-            due_before=time.time(), limit=self.RECONCILIATION_BATCH_SIZE, row_id=row_id,
-        ):
-            try:
-                if not reconciler(row):
+        try:
+            for row in self.queue.iter_sent_pending(
+                due_before=time.time(), limit=self.RECONCILIATION_BATCH_SIZE, row_id=row_id,
+            ):
+                try:
+                    if not reconciler(row):
+                        failed.append(row.id)
+                        continue
+                    self.queue.delete(row.id)
+                except Exception:
                     failed.append(row.id)
                     continue
-                self.queue.delete(row.id)
-            except Exception:
-                failed.append(row.id)
-                continue
-            self._record_submitted_removal(row)
-            self._row_not_before.pop(row.id, None)
-            reconciled.add(row.id)
-        try:
+                self._record_submitted_removal(row)
+                self._row_not_before.pop(row.id, None)
+                reconciled.add(row.id)
             self.queue.defer_reconciliation(failed, time.time())
+            finished = time.monotonic()
+            if row_id is None and (reconciled or failed):
+                # Old receipt recovery yields at least as long as it worked.
+                # Wakes from new traffic must not bypass this recovery pacing;
+                # freshly completed live receipts still reconcile immediately.
+                self._reconciliation_not_before = finished + max(0.25, finished - started)
+            due = self.queue.next_reconciliation_time()
+            if due is not None:
+                self._schedule_retry(max(
+                    self._reconciliation_not_before,
+                    finished + max(0.01, due - time.time()),
+                ))
         except Exception as error:
             self._stop_for_persistence_error(error)
         return reconciled
@@ -1134,11 +1193,14 @@ class OutboundQueueScheduler:
         with self._lock:
             if self.stopping:
                 return
+            self.next_deadline = None
             self.reconcile_sent_pending()
             if self.stopping:
                 return
-            self.next_deadline = None
             self._dispatch_blocking_media_retries()
+            if not self._permits.acquire(blocking=False):
+                return  # A future completion will wake us; do not scan the backlog.
+            self._permits.release()
             retry_destinations = {
                 retry.row.telegram_chat_id for retry in self.blocking_media_retries.values()
             }
@@ -1149,6 +1211,15 @@ class OutboundQueueScheduler:
                     or row.telegram_chat_id in retry_destinations
                 ):
                     continue
+                try:
+                    self.queue.check_replay_size(row.id, row.stored_bytes)
+                except QueuePersistenceError as error:
+                    self._stop_for_persistence_error(error)
+                    return
+                retained_bytes = sum(item.row.stored_bytes for item in self.in_flight.values())
+                retained_bytes += sum(item.row.stored_bytes for item in self.blocking_media_retries.values())
+                if retained_bytes + row.stored_bytes > self.queue.MAX_REPLAY_BYTES:
+                    continue  # Existing completion/retry events release this byte budget.
                 now = time.monotonic()
                 not_before = self._row_not_before.get(row.id)
                 if not_before is not None:
@@ -1241,6 +1312,7 @@ class OutboundQueueScheduler:
                         submit_error = ExecutorSubmitError("Unable to submit queued Telegram call.")
                         self._record_terminal_completion(row, decision.selection, "failure")
                         self.queue.fail_waiter(row.id, submit_error)
+                        self.wake_event.set()
                     continue
                 self._record_dispatch("submitted")
                 future.add_done_callback(self._wake_on_future_completion)

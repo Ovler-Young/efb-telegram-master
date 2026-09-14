@@ -6,7 +6,6 @@ import logging
 import string
 import random
 import threading
-from datetime import timedelta
 from typing import Iterator, BinaryIO
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -27,13 +26,8 @@ from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
 
 
-class DurableMessage:
-    def __init__(self) -> None:
-        self.type_telegram = None
-        self.receipt = None
-
-    def put_telegram_file(self, receipt) -> None:
-        self.receipt = receipt
+from efb_telegram_master.message import ETMMsg
+from tests.unit.test_restart_memory import message_with_group
 
 
 def _bind_blocking_enqueue_helper(manager):
@@ -800,7 +794,7 @@ def test_queued_success_writes_deferred_db_mapping_once():
 
 def test_enqueue_registers_deferred_mapping_before_waking_worker():
     manager = object.__new__(TelegramBotManager)
-    db_context = QueuedDbLogContext(DurableMessage(), None, Mock())
+    db_context = QueuedDbLogContext(message_with_group(), None, Mock())
     manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
     wake_event = Mock()
@@ -818,7 +812,8 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
         stored_msg, stored_old_msg_id = TelegramBotManager._decode_queued_log_context(
             requests[0].log_context
         )
-        assert isinstance(stored_msg, DurableMessage)
+        assert isinstance(stored_msg, ETMMsg)
+        assert stored_msg.uid == db_context.etm_msg.uid
         assert stored_old_msg_id is None
 
     wake_event.set.side_effect = assert_context_registered
@@ -857,7 +852,7 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
 
 def test_durable_reconciliation_retries_db_write_and_preserves_sender(monkeypatch):
     manager = object.__new__(TelegramBotManager)
-    etm_msg = DurableMessage()
+    etm_msg = message_with_group()
     real_tg_msg = SimpleNamespace(chat_id=123, message_id=9)
     db_write = Mock(side_effect=RuntimeError("database unavailable"))
     manager.channel = SimpleNamespace(
@@ -885,7 +880,8 @@ def test_durable_reconciliation_retries_db_write_and_preserves_sender(monkeypatc
     db_write.side_effect = None
     assert TelegramBotManager.reconcile_queued_delivery(manager, row)
     persisted_msg, persisted_receipt, old_msg_id = db_write.call_args.args
-    assert isinstance(persisted_msg, DurableMessage)
+    assert isinstance(persisted_msg, ETMMsg)
+    assert persisted_msg.uid == etm_msg.uid
     assert (persisted_receipt.chat_id, persisted_receipt.message_id) == (123, 9)
     assert old_msg_id is None
     assert db_write.call_args.kwargs == {"sender_bot_id": "10"}
@@ -1461,6 +1457,7 @@ def test_worker_finalizes_resources_once_after_stop_join_timeout():
     manager._send_worker_stop = threading.Event()
     manager._outbound_scheduler = SimpleNamespace(
         stopping=True,
+        failure=None,
         stop_and_drain=Mock(),
         wake_event=threading.Event(),
     )
@@ -1493,6 +1490,7 @@ def test_queued_worker_finalizes_resources_after_stop_timeout():
     manager._send_worker_stop = threading.Event()
     manager._outbound_scheduler = SimpleNamespace(
         stopping=True,
+        failure=None,
         stop_and_drain=Mock(),
     )
     manager._send_executor = Mock()

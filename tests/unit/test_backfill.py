@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
 import pytest
-import telegram
 from telegram import Update
 
 from efb_telegram_master import TelegramChannel
@@ -272,7 +271,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
         12345,
     )
 
-    entries = manager.db.replace_history_migration_entries.call_args.args[3]
+    entries = list(manager.db.replace_history_migration_entries.call_args.args[3])
     assert queued_count == 2
     assert len(entries) == 2
     assert entries[0]["source_master_msg_id"] == "10.20"
@@ -324,7 +323,7 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
     def get_next_history_migration_target():
         return pending_entries[0] if pending_entries else None
 
-    def get_history_migration_entries(_slave_chat_id, _tg_chat_id, _thread_id):
+    def get_history_migration_entries(_slave_chat_id, _tg_chat_id, _thread_id, limit=None):
         return list(pending_entries)
 
     events = []

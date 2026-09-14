@@ -519,9 +519,67 @@ def test_null_timestamp_order_is_consistent_across_backends(sqlite_source, postg
                           msg_type="Text", sent_to="test", time=timestamp)
     assert manager.get_msg_log(slave_msg_id="slave.z.1", slave_origin_uid="slave.chat").master_msg_id == "z.1"
     assert manager.get_recent_slave_chats(42, limit=1) == ["known-time"]
+    expected = [row.master_msg_id for row in manager.get_recent_messages("slave.chat", limit=0)]
+    seen = []
+    after = None
+    for _ in range(len(expected) + 1):
+        page = manager.get_recent_messages("slave.chat", limit=1, after=after)
+        if not page:
+            break
+        seen.append(page[0].master_msg_id)
+        after = page[0].time, page[0].master_msg_id
+    assert seen == expected
 
 
-@pytest.mark.parametrize("invalid", [{}, {"version": 999}, []])
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_real_log_reconciliation_preserves_message_fields_without_media_io(
+    sqlite_source, postgres_config, manager_factory, backend, legacy,
+):
+    import logging
+    from telegram import Chat, Message as TelegramMessage
+    from ehforwarderbot.message import Substitutions
+    from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
+    from efb_telegram_master.message import ETMMsg
+    from efb_telegram_master.outbound import SenderSelection
+    from tests.unit.test_restart_memory import message_with_group
+
+    if backend == "postgresql":
+        migrate_db.migrate(sqlite_source, postgres_config)
+    manager = manager_factory(sqlite_source, postgres_config if backend == "postgresql" else None)
+    target = message_with_group()
+    target.uid = "target-message"
+    manager.add_or_update_message_log(target, SimpleNamespace(chat_id=123, message_id=100))
+    message = message_with_group(32768)
+    message.target = target
+    message.file_id = "metadata-only-no-download"
+    message.is_system = True
+    message.substitutions = Substitutions({(0, 7): message.author})
+    message.reactions = {"👍": tuple(message.chat.members)}
+    manager.add_or_update_message_log(message, SimpleNamespace(chat_id=123, message_id=101), sender_bot_id="aux-123")
+    original = manager.get_msg_log(master_msg_id="123.101")
+    context = (b"\x01" + pickle.dumps((message, None), protocol=5) if legacy else
+               TelegramBotManager._encode_queued_log_context(QueuedDbLogContext(message, None)))
+    receipt = TelegramMessage(message_id=102, date=datetime(2020, 1, 1), chat=Chat(123, "private"), text=message.text)
+    row = SimpleNamespace(
+        id=1, log_context=context,
+        completion_receipt=TelegramBotManager.encode_queued_completion_receipt(receipt, SenderSelection(None, "aux-123")),
+    )
+    adapter = object.__new__(TelegramBotManager)
+    adapter.channel = SimpleNamespace(db=manager)
+    adapter.logger = logging.getLogger("tests.real-reconciliation")
+    adapter._queued_completion_callbacks = {}
+    adapter._queued_db_log_context_lock = threading.Lock()
+    with patch.object(ETMMsg, "_load_file", side_effect=AssertionError("unexpected media I/O")):
+        assert adapter.reconcile_queued_delivery(row)
+        assert adapter.reconcile_queued_delivery(row)  # Repeated receipt is still idempotent.
+    recovered = manager.get_msg_log(master_msg_id="123.102")
+    for field in MsgLog._meta.sorted_fields:
+        if field.name not in ("master_msg_id", "time"):
+            assert getattr(recovered, field.name) == getattr(original, field.name), field.name
+
+
+@pytest.mark.parametrize("invalid",  [{}, {"version": 999}, []])
 def test_corrupt_import_manifest_cannot_authorize_startup(sqlite_source, postgres_config, invalid):
     migrate_db.migrate(sqlite_source, postgres_config)
     target = postgresql_database(postgres_config)

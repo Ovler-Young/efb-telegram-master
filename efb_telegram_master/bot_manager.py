@@ -16,16 +16,15 @@ import threading
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from functools import wraps
-from typing import TYPE_CHECKING, BinaryIO, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
+from typing import TYPE_CHECKING, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
-from urllib.request import url2pathname
 from unittest.mock import Mock, patch
 
 import telegram.constants
 import telegram.error
-from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, Update, User
+from telegram import File, ForumTopic, InlineKeyboardMarkup, Update, User
 from telegram import Message as TelegramMessage
 from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
 from telegram.ext import _applicationbuilder as ptb_applicationbuilder
@@ -48,7 +47,6 @@ from .outbound import (
 )
 from .ptb_compat import Filters
 from .rate_limiter import SlidingWindowRateLimiter
-from .utils import TelegramChatID, TelegramMessageID, message_id_to_str
 
 
 BotChatKey: TypeAlias = Tuple[Optional[str], int]
@@ -1475,22 +1473,23 @@ class TelegramBotManager(LocaleMixin):
 
     @staticmethod
     def _encode_queued_log_context(context: QueuedDbLogContext) -> bytes:
+        from .queued_log import encode
+
         try:
-            return b"\x01" + pickle.dumps((context.etm_msg, context.old_msg_id), protocol=5)
+            return encode(context.etm_msg, context.old_msg_id)
         except Exception as error:
             raise QueueEnqueueError("Unable to serialize queued database log context.") from error
 
     @staticmethod
     def _decode_queued_log_context(payload: object) -> tuple['ETMMsg', Optional['OldMsgID']]:
-        if not isinstance(payload, bytes) or not payload or payload[0] != 1:
+        from .queued_log import decode
+
+        if not isinstance(payload, bytes) or not payload or payload[0] not in (1, 2):
             raise QueuePersistenceError("Queued database log context has an unknown version.")
         try:
-            value = pickle.loads(payload[1:])
+            return decode(payload)
         except Exception as error:
             raise QueuePersistenceError("Queued database log context cannot be decoded.") from error
-        if not isinstance(value, tuple) or len(value) != 2:
-            raise QueuePersistenceError("Queued database log context has an invalid shape.")
-        return cast('ETMMsg', value[0]), cast(Optional['OldMsgID'], value[1])
 
     @staticmethod
     def encode_queued_completion_receipt(result: object, selection: SenderSelection) -> bytes:
@@ -1658,13 +1657,17 @@ class TelegramBotManager(LocaleMixin):
         self.logger.debug("Outbound queue worker started")
         try:
             while not self._send_worker_stop.is_set() and not self._outbound_scheduler.stopping:
+                # Clear before examining work: enqueues/completions during the
+                # sweep must stay signalled, not be lost after wait returns.
+                self._outbound_scheduler.wake_event.clear()
                 self._outbound_scheduler.harvest_completed()
                 self._outbound_scheduler.dispatch_once()
                 deadline = self._outbound_scheduler.next_deadline
-                timeout = 0.25 if deadline is None else max(0.0, min(0.25, deadline - time.monotonic()))
+                timeout = None if deadline is None else max(0.01, deadline - time.monotonic())
                 self._outbound_scheduler.wake_event.wait(timeout=timeout)
-                self._outbound_scheduler.wake_event.clear()
         finally:
+            if self._outbound_scheduler.failure is not None:
+                self.logger.error("Outbound recovery stopped; durable rows retained: %s", self._outbound_scheduler.failure)
             self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
             self._finalize_outbound_resources()
             self.logger.debug("Outbound queue worker stopped")
@@ -2034,7 +2037,7 @@ class TelegramBotManager(LocaleMixin):
     @Decorators.retry_on_chat_migration
     def answer_callback_query(self, *args, prefix="", suffix="", text=None,
                               message_id=None, **kwargs):
-        chat_id = kwargs.pop('chat_id', None)
+        kwargs.pop('chat_id', None)
         if text is None:
             return self._bot.answer_callback_query(
                 *args, **kwargs
