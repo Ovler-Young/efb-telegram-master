@@ -54,7 +54,7 @@ setup(
         "python-telegram-bot~=22.7",
         "python-magic",
         "ffmpeg-python",
-        "peewee",
+        "peewee>=3.19,<5",
         "requests",
         "pydub",
         "audioop-lts; python_version >= '3.13'",

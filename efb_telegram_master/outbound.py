@@ -336,6 +336,14 @@ class OutboundQueue:
                 "CREATE INDEX IF NOT EXISTS outbound_queue_destination_priority_id "
                 "ON outbound_queue (telegram_chat_id, priority DESC, id ASC)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS outbound_queue_state_destination_priority_id "
+                "ON outbound_queue (delivery_state, telegram_chat_id, priority DESC, id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS outbound_queue_reconciliation_due "
+                "ON outbound_queue (delivery_state, reconcile_after, id)"
+            )
             connection.commit()
             self._connection = connection
             self.refresh_depth()
@@ -358,6 +366,14 @@ class OutboundQueue:
             )
         if "completion_receipt" not in columns:
             connection.execute("ALTER TABLE outbound_queue ADD COLUMN completion_receipt BLOB NULL")
+        if "reconcile_after" not in columns:
+            connection.execute(
+                "ALTER TABLE outbound_queue ADD COLUMN reconcile_after REAL NOT NULL DEFAULT 0"
+            )
+        if "reconcile_attempts" not in columns:
+            connection.execute(
+                "ALTER TABLE outbound_queue ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0"
+            )
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -704,24 +720,33 @@ class OutboundQueue:
             self.waiters[identifiers[0]] = waiter
             return identifiers[0], waiter
 
-    def heads(self) -> list[QueuedCall]:
+    def heads(self, *, include_payload: bool = True) -> list[QueuedCall]:
+        payload = "q.payload" if include_payload else "X''"
+        context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
         with self._lock:
-            # The current bounded queue is read in sort order so Python can
-            # preserve priority/FIFO semantics while selecting one row per destination.
+            # Select IDs using a covering index before reading any media BLOBs.
+            # Priority is either 0 or 1; within a priority the smallest ID wins.
             rows = self.connection.execute(
+                f"SELECT q.id, q.priority, q.telegram_chat_id, q.operation, {payload}, q.slave_id, "
+                f"q.required_sender_bot_id, q.created_at, {context}, q.delivery_state, q.completion_receipt "
+                "FROM outbound_queue AS q JOIN ("
+                "SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id "
+                "FROM outbound_queue WHERE delivery_state = 'queued' GROUP BY telegram_chat_id"
+                ") AS heads ON q.id = heads.head_id ORDER BY q.telegram_chat_id"
+            ).fetchall()
+        return [QueuedCall(*row) for row in rows]
+
+    def load_queued(self, row_id: int) -> QueuedCall:
+        """Load upload bytes only once a worker and sender can accept this row."""
+        with self._lock:
+            row = self.connection.execute(
                 "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
                 "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
-                "FROM outbound_queue WHERE delivery_state = 'queued' "
-                "ORDER BY telegram_chat_id ASC, priority DESC, id ASC"
-            ).fetchall()
-        heads: list[QueuedCall] = []
-        destinations: set[int] = set()
-        for row in rows:
-            if int(row[2]) in destinations:
-                continue
-            destinations.add(int(row[2]))
-            heads.append(QueuedCall(*row))
-        return heads
+                "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'", (row_id,),
+            ).fetchone()
+        if row is None:
+            raise QueuePersistenceError(f"Queued row {row_id} disappeared before dispatch.")
+        return QueuedCall(*row)
 
     def destination_snapshot(self, limit: int) -> list[tuple[str, int, float]]:
         """Return ranked queue destinations without exposing Telegram chat IDs."""
@@ -738,14 +763,48 @@ class OutboundQueue:
             for rank, (_chat_id, depth, oldest_created_at) in enumerate(rows, start=1)
         ]
 
-    def sent_pending(self) -> list[QueuedCall]:
+    def sent_pending(
+        self, *, due_before: Optional[float] = None, limit: int = -1,
+        row_id: Optional[int] = None,
+    ) -> list[QueuedCall]:
+        filters = ["delivery_state = 'sent_pending'"]
+        parameters: list[object] = []
+        if due_before is not None:
+            filters.append("reconcile_after <= ?")
+            parameters.append(due_before)
+        if row_id is not None:
+            filters.append("id = ?")
+            parameters.append(row_id)
+        parameters.append(limit)
         with self._lock:
+            # Reconciliation only needs the context and receipt, never upload bytes.
             rows = self.connection.execute(
-                "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
+                "SELECT id, priority, telegram_chat_id, operation, X'', slave_id, "
                 "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
-                "FROM outbound_queue WHERE delivery_state = 'sent_pending' ORDER BY id ASC"
+                "FROM outbound_queue WHERE " + " AND ".join(filters) +
+                " ORDER BY reconcile_after, id LIMIT ?",
+                parameters,
             ).fetchall()
         return [QueuedCall(*row) for row in rows]
+
+    def defer_reconciliation(self, row_ids: list[int], now: float) -> None:
+        """Persist exponential retry delays (1s to 60s), including across restarts."""
+        if not row_ids:
+            return
+        with self._lock:
+            try:
+                self.connection.execute("BEGIN")
+                self.connection.executemany(
+                    "UPDATE outbound_queue SET "
+                    "reconcile_after = ? + MIN(60, 1 << MIN(reconcile_attempts, 6)), "
+                    "reconcile_attempts = MIN(reconcile_attempts + 1, 7) "
+                    "WHERE id = ? AND delivery_state = 'sent_pending'",
+                    [(now, row_id) for row_id in row_ids],
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
 
     def record_telegram_completion(self, row_id: int, receipt: bytes) -> None:
         if not isinstance(receipt, bytes):
@@ -1042,22 +1101,33 @@ class OutboundQueueScheduler:
         self.queue.fail_all_waiters(persistence_error)
         self.wake_event.set()
 
-    def reconcile_sent_pending(self) -> set[int]:
-        """Apply persisted Telegram receipts before dispatching queued calls."""
+    RECONCILIATION_BATCH_SIZE = 32
+
+    def reconcile_sent_pending(self, row_id: Optional[int] = None) -> set[int]:
+        """Apply a bounded batch; failed receipts stay durable with retry deadlines."""
         reconciler = getattr(self.adapter, "reconcile_queued_delivery", None)
         if not callable(reconciler):
             return set()
         reconciled: set[int] = set()
-        for row in self.queue.sent_pending():
+        failed: list[int] = []
+        for row in self.queue.sent_pending(
+            due_before=time.time(), limit=self.RECONCILIATION_BATCH_SIZE, row_id=row_id,
+        ):
             try:
                 if not reconciler(row):
+                    failed.append(row.id)
                     continue
                 self.queue.delete(row.id)
             except Exception:
+                failed.append(row.id)
                 continue
             self._record_submitted_removal(row)
             self._row_not_before.pop(row.id, None)
             reconciled.add(row.id)
+        try:
+            self.queue.defer_reconciliation(failed, time.time())
+        except Exception as error:
+            self._stop_for_persistence_error(error)
         return reconciled
 
     def dispatch_once(self) -> None:
@@ -1065,12 +1135,14 @@ class OutboundQueueScheduler:
             if self.stopping:
                 return
             self.reconcile_sent_pending()
+            if self.stopping:
+                return
             self.next_deadline = None
             self._dispatch_blocking_media_retries()
             retry_destinations = {
                 retry.row.telegram_chat_id for retry in self.blocking_media_retries.values()
             }
-            for row in self.queue.heads():
+            for row in self.queue.heads(include_payload=False):
                 if (
                     row.id in self.in_flight
                     or row.telegram_chat_id in self.in_flight_destinations
@@ -1084,22 +1156,6 @@ class OutboundQueueScheduler:
                         self._schedule_retry(not_before)
                         continue
                     self._row_not_before.pop(row.id, None)
-                try:
-                    args, kwargs = self.queue.decode_payload(row.payload)
-                except InvalidQueuedPayloadError as error:
-                    try:
-                        self.queue.delete(row.id)
-                    except Exception as delete_error:
-                        self._stop_for_persistence_error(delete_error)
-                        return
-                    self._record_terminal_discard(row)
-                    self._row_not_before.pop(row.id, None)
-                    self._record_dispatch("failed")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
-                    self._record_terminal_completion(row, None, "failure")
-                    self.queue.fail_waiter(row.id, error)
-                    continue
                 if not self._permits.acquire(blocking=False):
                     self._record_dispatch("deferred")
                     if self.queue.metrics is not None:
@@ -1128,6 +1184,28 @@ class OutboundQueueScheduler:
                     if decision.retry_at is not None:
                         self._schedule_retry(decision.retry_at)
                     continue
+                try:
+                    row = self.queue.load_queued(row.id)
+                    args, kwargs = self.queue.decode_payload(row.payload)
+                except InvalidQueuedPayloadError as error:
+                    self._permits.release()
+                    try:
+                        self.queue.delete(row.id)
+                    except Exception as delete_error:
+                        self._stop_for_persistence_error(delete_error)
+                        return
+                    self._record_terminal_discard(row)
+                    self._row_not_before.pop(row.id, None)
+                    self._record_dispatch("failed")
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
+                    self._record_terminal_completion(row, None, "failure")
+                    self.queue.fail_waiter(row.id, error)
+                    continue
+                except Exception as error:
+                    self._permits.release()
+                    self._stop_for_persistence_error(error)
+                    return
                 if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
                     self._permits.release()
                     self._record_dispatch("deferred")
@@ -1152,7 +1230,7 @@ class OutboundQueueScheduler:
                     future = self.executor.submit(
                         self.adapter.execute_queued_call, row, args, kwargs, decision.selection
                     )
-                except Exception as error:
+                except Exception:
                     self._permits.release()
                     self._record_dispatch("failed")
                     if self.queue.metrics is not None:
@@ -1161,9 +1239,9 @@ class OutboundQueueScheduler:
                     if retained:
                         self._schedule_retry(now + 0.25)
                     else:
-                        error = ExecutorSubmitError("Unable to submit queued Telegram call.")
+                        submit_error = ExecutorSubmitError("Unable to submit queued Telegram call.")
                         self._record_terminal_completion(row, decision.selection, "failure")
-                        self.queue.fail_waiter(row.id, error)
+                        self.queue.fail_waiter(row.id, submit_error)
                     continue
                 self._record_dispatch("submitted")
                 future.add_done_callback(self._wake_on_future_completion)
@@ -1274,7 +1352,10 @@ class OutboundQueueScheduler:
                         except Exception as persistence_error:
                             self._stop_for_persistence_error(persistence_error)
                             return
-                        self.reconcile_sent_pending()
+                        # Do not rescan the entire pending-log backlog per completion.
+                        self.reconcile_sent_pending(row_id)
+                        if self.stopping:
+                            return
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
                     if submitted.row.priority == 0 and submitted.row.log_context is None:
                         try:

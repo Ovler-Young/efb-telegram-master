@@ -922,7 +922,8 @@ def test_log_context_survives_restart_before_send(tmp_path):
     assert restarted.sent_pending() == []
 
 
-def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path):
+def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path, monkeypatch):
+    monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1000.0)
     queue = OutboundQueue(tmp_path)
     row_id, waiter = enqueue(queue, QueueRequest(
         "send_message", (), {"chat_id": 7, "text": "durable"}, log_context=b"\x01context",
@@ -943,6 +944,9 @@ def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path):
     second_adapter = DurableAdapter(reconcile=True)
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(restarted, second_adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        assert second_adapter.reconciled == []  # Restart must retain the retry deadline.
+        monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1001.0)
         scheduler.dispatch_once()
         scheduler.dispatch_once()
 
@@ -978,7 +982,8 @@ def test_blocking_log_context_row_survives_restart_before_send(tmp_path):
     assert restarted.sent_pending() == []
 
 
-def test_blocking_failed_reconciliation_keeps_row_for_retry(tmp_path):
+def test_blocking_failed_reconciliation_keeps_row_for_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1000.0)
     queue = OutboundQueue(tmp_path)
     row_id, waiter = enqueue(queue, QueueRequest(
         "send_message", (),
@@ -999,6 +1004,9 @@ def test_blocking_failed_reconciliation_keeps_row_for_retry(tmp_path):
         assert queue.heads() == []
 
         adapter.reconcile = True
+        scheduler.dispatch_once()
+        assert [row.id for row in queue.sent_pending()] == [row_id]
+        monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1001.0)
         scheduler.dispatch_once()
 
     assert adapter.calls == [(row_id, 7, "send_message")]

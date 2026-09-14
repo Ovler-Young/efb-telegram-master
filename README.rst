@@ -136,6 +136,7 @@ A sample config file can be as follows:
     #   user: postgres
     #   password: ""
     #   max_connections: 8
+    #   pool_timeout: 5
     #   stale_timeout: 300
 
     # [Experimental Flags]
@@ -167,14 +168,31 @@ sample above) and install the optional dependency set:
 
     pip install "efb-telegram-master[postgresql]"
 
-On first startup with PostgreSQL enabled, ETM can automatically import data
-from an existing SQLite database (if present) and rename the old SQLite file
-to ``tgdata.db.migrated`` as a backup.
+Existing SQLite data must be imported explicitly while the bot and all other
+writers are stopped. Startup never imports or renames a database automatically.
+Use a private YAML file containing the target ``database`` mapping:
+
+.. code:: shell
+
+    python -m efb_telegram_master.migrate_db \
+        --data-dir /absolute/path/to/channel-data \
+        --config /private/path/postgresql.yaml
+
+The importer snapshots both SQLite stores, streams and verifies every supported
+row, and records a recoverable cutover before PostgreSQL startup is permitted.
+The original SQLite files and older backups are retained. The outbound queue
+continues to use ``outbound-queue.sqlite3``; keep it in the same data directory.
+Read the `migration and rollback guide <docs/database-migration.md>`_ before
+changing production configuration.
 
 Database migrations (what to expect)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-ETM performs basic database migrations automatically on startup.
+ETM upgrades missing historical columns and query indexes automatically on
+startup in a schema transaction; this is separate from the offline cross-backend
+import above. A large first-time index build should be allowed to finish during
+a maintenance window. Database operation scopes return pooled connections even
+on errors, and the data directory is protected against a second runtime/importer.
 Notable additions in this branch include:
 
 - **Forum topics associations** (for ``topic_group``): ETM stores a mapping
