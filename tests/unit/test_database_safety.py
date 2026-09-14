@@ -158,6 +158,38 @@ def test_real_postgresql_import_preserves_every_field_id_queue_and_next_sequence
     assert manager.get_msg_log(master_msg_id="z.1").time == datetime(2020, 1, 2, 3, 4, 5, 123456)
 
 
+def test_imported_target_cannot_be_treated_as_native_when_local_files_are_missing(sqlite_source, postgres_config, manager_factory):
+    migrate_db.migrate(sqlite_source, postgres_config)
+    (sqlite_source / "tgdata.db").unlink()
+    (sqlite_source / migrate_db.RECEIPT_FILE).unlink()
+    with pytest.raises(RuntimeError, match="explicit offline import"):
+        manager_factory(sqlite_source, postgres_config)
+    assert not (sqlite_source / "tgdata.db").exists()
+
+
+def test_runtime_does_not_recreate_missing_imported_tables(sqlite_source, postgres_config, manager_factory):
+    migrate_db.migrate(sqlite_source, postgres_config)
+    target = postgresql_database(postgres_config)
+    try:
+        with connection_scope(target):
+            target.execute_sql("DROP TABLE msglog")
+        with pytest.raises(RuntimeError, match="Imported PostgreSQL tables are missing"):
+            manager_factory(sqlite_source, postgres_config)
+        with connection_scope(target):
+            assert "msglog" not in target.get_tables(schema=current_schema(target))
+    finally:
+        target.close_all()
+
+
+def test_runtime_requires_the_retained_outbound_queue(sqlite_source, postgres_config, manager_factory):
+    migrate_db.migrate(sqlite_source, postgres_config)
+    queue_path = sqlite_source / "outbound-queue.sqlite3"
+    queue_path.unlink()
+    with pytest.raises(RuntimeError, match="outbound queue"):
+        manager_factory(sqlite_source, postgres_config)
+    assert not queue_path.exists()  # Never silently create an empty replacement.
+
+
 def test_source_wal_backup_is_independently_readable(sqlite_source, postgres_config):
     path = sqlite_source / "tgdata.db"
     with closing(sqlite3.connect(path)) as writer:

@@ -5,14 +5,16 @@ Branch: `fix/sqlite-performance-safe-postgres`.
 
 ## Executed acceptance matrix
 
-All three runs used a real, isolated PostgreSQL 16.2 server. Each acceptance test
-created a separate schema; no production database was accessed.
+All five final runs used a real, isolated PostgreSQL 16.2 server. Each acceptance
+test created a separate schema; no production database was accessed.
 
 | Python | Peewee | Full unit suite | Database availability |
 | --- | --- | --- | --- |
-| 3.10.20 | 3.19.0 | 408 passed, 68 skipped | PostgreSQL configured |
-| 3.12.3 | 4.5.1 | 408 passed, 68 skipped | PostgreSQL configured |
-| 3.14.6 | 4.5.1 | 408 passed, 68 skipped | PostgreSQL configured |
+| 3.10.20 | 3.19.0 | 411 passed, 68 skipped | PostgreSQL configured |
+| 3.11.15 | 4.5.1 | 411 passed, 68 skipped | PostgreSQL configured |
+| 3.12.3 | 4.5.1 | 411 passed, 68 skipped | PostgreSQL configured |
+| 3.13.14 | 4.5.1 | 411 passed, 68 skipped | PostgreSQL configured |
+| 3.14.6 | 4.5.1 | 411 passed, 68 skipped | PostgreSQL configured |
 
 The 68 skips require Telegram credentials in the existing test suite. They are
 not migration-test skips and are not represented as passing live Telegram tests.
@@ -34,8 +36,16 @@ The large-import test streams 6,003 messages, including 6,000 additional rows wi
 below 12 MiB. This catches whole-table Python materialization on both source and
 verification paths. It does not assert a machine-independent import throughput.
 
+The final review added failing regression checks before fixing four remaining
+edge cases: removing the local source and receipt could bypass cutover validation;
+a missing imported outbound queue was not rejected; the final sender-limit gate
+still ran after media loading; and missing imported PostgreSQL tables could be
+silently recreated empty. All four checks now pass. An imported target cannot
+become a native deployment merely because its local files went missing. Startup
+will not silently replace a missing queue or imported table with an empty one.
+
 Queue tests enforce bounded BLOB loading, priority/FIFO preservation, metadata-only
-selection while workers or senders are unavailable, bounded fair reconciliation,
+selection while workers, senders or rate-limit permits are unavailable, bounded fair reconciliation,
 persisted capped exponential deadlines across restarts, no resend of accepted
 Telegram receipts, and fail-stop retention when retry persistence itself fails.
 
@@ -49,9 +59,9 @@ peak allocation measured separately. All versions returned identical 20 head IDs
 
 | Method | Median wall time | Median CPU time | Python peak allocation |
 | --- | ---: | ---: | ---: |
-| Original full-queue heads | 61.320 ms | 61.314 ms | 125.448 MiB |
-| New heads with selected payloads | 1.094 ms | 1.092 ms | 1.257 MiB |
-| New scheduler metadata heads | 0.312 ms | 0.310 ms | 0.006 MiB |
+| Original full-queue heads | 64.685 ms | 64.680 ms | 125.448 MiB |
+| New heads with selected payloads | 1.103 ms | 1.101 ms | 1.257 MiB |
+| New scheduler metadata heads | 0.315 ms | 0.313 ms | 0.006 MiB |
 
 The metadata-only call is followed by loading the specific payload when it can
 actually be dispatched. These are isolated queue-method measurements, not a

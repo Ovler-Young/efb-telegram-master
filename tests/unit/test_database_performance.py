@@ -214,7 +214,14 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
         scheduler.dispatch_once()
         assert loads == []
         scheduler._permits.release()
-        monkeypatch.setattr(adapter, "select_sender", lambda row, now: SenderSelectionResult(retry_at=now + 60))
-        scheduler.dispatch_once()
+        with monkeypatch.context() as unavailable:
+            unavailable.setattr(adapter, "select_sender", lambda row, now: SenderSelectionResult(retry_at=now + 60))
+            scheduler.dispatch_once()
+            assert loads == []
+        monkeypatch.setattr(adapter, "acquire_sender_limits", lambda selection, chat_id: False)
+        for _ in range(3):
+            scheduler.dispatch_once()
         assert loads == []
+        assert len(queue.heads(include_payload=False)) == 10
+        assert adapter.calls == []
     queue.close()

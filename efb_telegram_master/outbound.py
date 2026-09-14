@@ -1184,6 +1184,13 @@ class OutboundQueueScheduler:
                     if decision.retry_at is not None:
                         self._schedule_retry(decision.retry_at)
                     continue
+                if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
+                    self._permits.release()
+                    self._record_dispatch("deferred")
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_retry(row.priority, row.operation, "rate_limit")
+                    self._schedule_retry(now + 0.25)
+                    continue
                 try:
                     row = self.queue.load_queued(row.id)
                     args, kwargs = self.queue.decode_payload(row.payload)
@@ -1206,14 +1213,6 @@ class OutboundQueueScheduler:
                     self._permits.release()
                     self._stop_for_persistence_error(error)
                     return
-                if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
-                    self._permits.release()
-                    self._record_dispatch("deferred")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_retry(row.priority, row.operation, "rate_limit")
-                    retry_at = now + 0.25
-                    self._schedule_retry(retry_at)
-                    continue
                 # Rows carrying a durable log context are retained until the
                 # MsgLog write is committed, regardless of blocking priority.
                 retained = row.priority == 0 or row.log_context is not None

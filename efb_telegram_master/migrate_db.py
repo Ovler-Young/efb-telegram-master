@@ -44,7 +44,8 @@ def _fingerprint(path: Path) -> dict:
 
 
 def _read_import(db) -> Optional[dict]:
-    if IMPORT_TABLE not in db.get_tables(schema=current_schema(db)):
+    tables = set(db.get_tables(schema=current_schema(db)))
+    if IMPORT_TABLE not in tables:
         return None
     rows = db.execute_sql(f"SELECT manifest FROM {IMPORT_TABLE} WHERE id = 1").fetchall()
     if len(rows) != 1:
@@ -58,6 +59,12 @@ def _read_import(db) -> Optional[dict]:
         or "queue" not in manifest
     ):
         raise RuntimeError("Unsupported or corrupt PostgreSQL import record; preserving both databases.")
+    missing = set(manifest["tables"]) - tables
+    if missing:
+        raise RuntimeError(
+            f"Imported PostgreSQL tables are missing: {sorted(missing)}; "
+            "refusing to recreate empty replacements. Restore the complete target."
+        )
     return manifest
 
 
@@ -69,9 +76,9 @@ def validate_runtime_cutover(directory: Path, db) -> None:
         if receipt_path.exists():
             raise RuntimeError("This directory was cut over to PostgreSQL; refusing to resume its stale SQLite database.")
         return
-    if not source_path.exists() and not receipt_path.exists():
-        return  # A native PostgreSQL deployment, not an implicit import.
     manifest = _read_import(db)
+    if not source_path.exists() and not receipt_path.exists() and manifest is None:
+        return  # A native PostgreSQL deployment, not an implicit import.
     if manifest is None or not receipt_path.exists():
         raise RuntimeError(
             "SQLite data requires an explicit offline import: run python -m "
@@ -81,6 +88,11 @@ def validate_runtime_cutover(directory: Path, db) -> None:
     receipt = json.loads(receipt_path.read_text())
     if receipt.get("import_id") != manifest.get("import_id"):
         raise RuntimeError("Cutover receipt belongs to a different PostgreSQL import; preserving both databases.")
+    if manifest["queue"] is not None and not (directory / "outbound-queue.sqlite3").is_file():
+        raise RuntimeError(
+            "The imported outbound queue is missing; refusing to replace pending sends and "
+            "Telegram receipts with an empty queue. Restore the current queue before startup."
+        )
     if source_path.exists() and receipt.get("source_fingerprint") != _fingerprint(source_path):
         raise RuntimeError("SQLite source changed after import; refusing an ambiguous cutover. Keep both databases offline.")
 

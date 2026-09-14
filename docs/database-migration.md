@@ -25,7 +25,8 @@ busy timeout and the existing synchronous durability setting.
 
 The outbound scheduler selects per-destination head IDs using a covering index.
 It does not load upload bytes for every queued item, in-flight destination or
-worker/sender that is unavailable. Failed MsgLog reconciliation is limited to 32
+worker/sender that is unavailable. The final rate-limit permit is also checked
+before loading a selected message's media. Failed MsgLog reconciliation is limited to 32
 receipts per sweep, with persisted exponential delays of 1, 2, 4, 8, 16, 32 and
 then 60 seconds. A failed receipt is retained, never resent as a Telegram message
 and never discarded just to reduce CPU. Restarting does not reset the delay.
@@ -116,7 +117,14 @@ Startup requires the matching target import record and local cutover receipt;
 an existing `chatassoc` table alone no longer counts as a completed migration.
 The retained SQLite source is treated as frozen. The receipt blocks accidentally
 starting SQLite again in the same directory, and PostgreSQL startup rejects a
-source that has changed since cutover.
+source that has changed since cutover. Removing the local source and receipt does
+not bypass verification: the imported target still requires its matching receipt.
+Every imported table must still exist; a missing table causes startup to fail
+rather than silently recreating an empty replacement. Restore the complete target
+when recovering an incomplete PostgreSQL restore.
+If the import included an outbound queue, that file must still exist at startup;
+the runtime refuses to silently replace it with an empty queue. Restore the current
+queue, not a stale pre-send snapshot, when recovering missing local files.
 
 ## Failure and restart behavior
 
