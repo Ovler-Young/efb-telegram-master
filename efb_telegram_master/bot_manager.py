@@ -1691,6 +1691,7 @@ class TelegramBotManager(LocaleMixin):
         if operation in MESSAGE_CREATING_OPERATIONS and (
             getattr(error, "_etm_primary_accepted", False)
             or ambiguous_network or not isinstance(error, telegram.error.TelegramError)
+            or (type(error) is telegram.error.TelegramError and isinstance(error.__cause__, ValueError))
         ):
             self.logger.error(
                 "Telegram delivery unconfirmed for queue row %s (%s, sender=%s, error=%s/%s). "

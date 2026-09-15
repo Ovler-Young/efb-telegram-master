@@ -9,7 +9,7 @@ import httpx
 import pytest
 from telegram import Bot, Chat, Document, Message, Update, User
 from telegram.error import NetworkError, TimedOut, RetryAfter
-from telegram.request import HTTPXRequest
+from telegram.request import BaseRequest, HTTPXRequest
 
 from efb_telegram_master.outbound import (
     DeliveryUncertainError, OutboundQueue, OutboundQueueScheduler, QueueRequest, QueuePersistenceError, _NamedMediaFile,
@@ -323,6 +323,27 @@ def test_381_mb_sidecar_reaches_http_transport_without_whole_file_read(tmp_path,
         runtime.call(bot.shutdown())
         runtime.shutdown()
         queue.close()
+
+
+def test_invalid_json_response_is_not_treated_as_definite_rejection(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
+    accepted = []
+    manager = setup_manager(queue)
+    def send(*args, **kwargs):
+        accepted.append(True)
+        return BaseRequest.parse_json_payload(b"not a valid Telegram response")
+    manager._bot = SimpleNamespace(send_document=send)
+    for _ in range(3):
+        manager._outbound_scheduler.dispatch_once()
+        manager._outbound_scheduler.harvest_completed()
+    assert len(accepted) == 1
+    state, receipt, held = queue.connection.execute(
+        "SELECT delivery_state, completion_receipt, delivery_hold FROM outbound_queue WHERE id=?", (row_id,)
+    ).fetchone()
+    assert state == "queued" and receipt is None and held.startswith("uncertain:")
+    assert list(queue.media_dir.iterdir())
+    queue.close()
 
 
 def test_failed_supplement_does_not_retry_an_accepted_primary_file(tmp_path):
