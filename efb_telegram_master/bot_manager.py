@@ -38,6 +38,8 @@ from .outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
     QUEUED_OPERATIONS,
+    MESSAGE_CREATING_OPERATIONS,
+    transport_definitely_not_sent,
     QueueEnqueueError,
     QueuePersistenceError,
     QueueRequest,
@@ -55,6 +57,7 @@ BotChatKey: TypeAlias = Tuple[Optional[str], int]
 class QueuedCompletionKind(str, Enum):
     RETRY_EVENTUAL = "retry_eventual"
     TERMINAL_FAILURE = "terminal_failure"
+    DELIVERY_UNCERTAIN = "delivery_uncertain"
     SUCCESS = "success"
 
 
@@ -1387,8 +1390,8 @@ class TelegramBotManager(LocaleMixin):
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
-        telegram_kwargs = self._strip_private_queue_metadata(kwargs)
-        telegram_args = args
+        telegram_kwargs = cast(dict, OutboundQueue.streaming_uploads(self._strip_private_queue_metadata(kwargs)))
+        telegram_args = cast(tuple, OutboundQueue.streaming_uploads(args))
         migration_retried = False
 
         def call_method() -> object:
@@ -1600,6 +1603,54 @@ class TelegramBotManager(LocaleMixin):
         self._run_database_update_callback(self._pop_queued_completion_callback(row.id))
         return True
 
+    def confirm_queued_delivery(self, row_id: int, message: TelegramMessage) -> bool:
+        """Resolve a held send using an admin-selected, actual Telegram reply message.
+
+        Never sends the original payload. Receipt persistence precedes MsgLog,
+        so a failed database write can be retried without another Telegram send.
+        """
+        with self._outbound_scheduler._lock:
+            if row_id in self._outbound_scheduler.in_flight:
+                raise ValueError("This send attempt is still running; it cannot be confirmed concurrently.")
+            queue = self._outbound_queue
+            with queue._lock:
+                metadata = queue.connection.execute(
+                    "SELECT telegram_chat_id, delivery_state, delivery_hold, attempt_sender_bot_id, "
+                    "log_context IS NOT NULL, operation FROM outbound_queue WHERE id=?", (row_id,),
+                ).fetchone()
+            if metadata is None:
+                raise ValueError("Queue row does not exist; no data was changed.")
+            chat_id, state, hold, sender_id, has_log, operation = metadata
+            if state != "queued" or hold is None:
+                raise ValueError("Only a held, unconfirmed send can be confirmed.")
+            expected_sender = sender_id or str(self.me.id if self.me is not None else "")
+            if hold == "uncertain:operator_observed_delivery" and message.from_user is not None:
+                # Old versions did not record the attempt's bot. An explicit offline
+                # operator hold can be resolved only with a currently configured bot.
+                actual_sender = str(message.from_user.id)
+                if actual_sender == str(self.me.id if self.me is not None else ""):
+                    sender_id, expected_sender = None, actual_sender
+                elif self.bot_pool and self.bot_pool.get_bot_by_id(actual_sender) is not None:
+                    sender_id, expected_sender = actual_sender, actual_sender
+            if (message.chat_id != chat_id or message.from_user is None
+                    or not message.from_user.is_bot or str(message.from_user.id) != expected_sender
+                    or message.forward_origin is not None):
+                raise ValueError("Reply to the original message from the recorded bot in the original chat, not a forward.")
+            if operation == "send_document" and message.document is None:
+                raise ValueError("This queue row requires the original document message.")
+            selection = SenderSelection(sender=None, sender_bot_id=sender_id)
+            queue.record_telegram_completion(row_id, self.encode_queued_completion_receipt(message, selection))
+            if has_log:
+                completed = row_id in self._outbound_scheduler.reconcile_sent_pending(row_id)
+            else:
+                # An explicit success receipt resolves control messages without MsgLog context.
+                completed_row = next(queue.iter_sent_pending(row_id=row_id))
+                queue.delete(row_id)
+                queue.record_removal(completed_row, "submitted")
+                completed = True
+            self._outbound_scheduler.wake_event.set()
+            return completed
+
     def record_queued_success(
         self, row, result: object, selection: SenderSelection
     ) -> QueuedCompletionDecision:
@@ -1622,6 +1673,26 @@ class TelegramBotManager(LocaleMixin):
                 time.monotonic() + error.retry_delay,
                 "migration",
             )
+
+        operation = getattr(row, "operation", None)
+        ambiguous_network = (
+            isinstance(error, telegram.error.NetworkError)
+            and not isinstance(error, telegram.error.BadRequest)
+            and not transport_definitely_not_sent(error)
+        )
+        # No response is not a negative acknowledgment. Retain the log and media,
+        # and never let a restart turn an unknown result into another remote send.
+        if operation in MESSAGE_CREATING_OPERATIONS and (
+            ambiguous_network or not isinstance(error, telegram.error.TelegramError)
+        ):
+            self.logger.error(
+                "Telegram delivery unconfirmed for queue row %s (%s, sender=%s, error=%s/%s). "
+                "Row, media and MsgLog context retained; automatic resend disabled. "
+                "Confirm an existing Telegram message before resolving this row.",
+                row.id, operation, selection.sender_bot_id or "main",
+                type(error).__name__, type(error.__cause__).__name__ if error.__cause__ else "none",
+            )
+            return QueuedCompletionDecision(QueuedCompletionKind.DELIVERY_UNCERTAIN)
 
         telegram_chat_id = getattr(error, "_etm_telegram_chat_id", row.telegram_chat_id)
         key = (selection.sender_bot_id, telegram_chat_id)

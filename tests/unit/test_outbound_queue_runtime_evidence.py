@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass
 import io
+import httpx
 from pathlib import Path
 import sqlite3
 import threading
@@ -1099,7 +1100,9 @@ def test_scheduler_records_transport_retry_reason(tmp_path: Path) -> None:
     scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
 
     scheduler.dispatch_once()
-    executor.submissions[0][2].set_exception(NetworkError("connection lost"))
+    connect_error = NetworkError("connection failed before request")
+    connect_error.__cause__ = httpx.ConnectError("connection refused")
+    executor.submissions[0][2].set_exception(connect_error)
     scheduler.harvest_completed()
 
     rendered = generate_latest(metrics.registry).decode()
@@ -1126,7 +1129,9 @@ def test_transport_retry_deadline_blocks_only_its_destination(
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
 
     scheduler.dispatch_once()
-    executor.submissions[0][2].set_exception(NetworkError("connection lost"))
+    connect_error = NetworkError("connection failed before request")
+    connect_error.__cause__ = httpx.ConnectError("connection refused")
+    executor.submissions[0][2].set_exception(connect_error)
     scheduler.harvest_completed()
     second_id, _second_waiter = enqueue(queue, 50, "second")
     other_id, _other_waiter = enqueue(queue, 51, "other")

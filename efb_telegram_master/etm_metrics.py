@@ -22,7 +22,7 @@ _DISPATCH_OUTCOMES = frozenset({"submitted", "deferred", "failed"})
 _RETRY_REASONS = frozenset(
     {"rate_limit", "membership", "migration", "transport", "worker_capacity"}
 )
-_FAILURE_STAGES = frozenset({"dispatch", "execution", "terminal"})
+_FAILURE_STAGES = frozenset({"dispatch", "execution", "terminal", "uncertain"})
 _AUXILIARY_STATES = frozenset({"enabled", "disabled"})
 _MEMBERSHIP_CACHE_STATES = frozenset({"member", "not_member", "unknown_probe_pending"})
 _MEMBERSHIP_PROBE_OUTCOMES = frozenset({"ok_member", "ok_not_member", "forbidden", "bad_request", "error"})

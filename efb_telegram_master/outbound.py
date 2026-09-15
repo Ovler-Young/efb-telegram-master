@@ -26,6 +26,7 @@ from telegram import (
     Sticker, Video, Voice,
 )
 from telegram.error import NetworkError, RetryAfter
+import httpx
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,20 @@ QUEUED_OPERATIONS = frozenset({
     "reopen_forum_topic", "set_chat_title", "set_chat_photo", "pin_chat_message",
     "set_chat_description",
 })
+# These calls create a remote object; retrying after a lost response can duplicate it.
+MESSAGE_CREATING_OPERATIONS = frozenset(
+    name for name in QUEUED_OPERATIONS
+    if name.startswith("send_") or name in {"copy_message", "forward_message", "create_forum_topic"}
+)
+
+
+def transport_definitely_not_sent(error: BaseException) -> bool:
+    """Only connection establishment/pool failures prove no request was sent."""
+    return isinstance(error, NetworkError) and isinstance(
+        error.__cause__, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+    )
+
+
 REQUIRED_SENDER_OPERATIONS = frozenset({
     "edit_message_text", "edit_message_caption", "edit_message_media", "delete_message",
 })
@@ -99,6 +114,11 @@ class SchedulerStoppedError(QueueError):
 
 
 class QueuePersistenceError(QueueError):
+    pass
+
+
+class DeliveryUncertainError(QueueError):
+    """Remote send may have succeeded; preserve the row and require confirmation."""
     pass
 
 
@@ -250,6 +270,8 @@ class _NamedMediaFile(io.BufferedReader):
 
     @property
     def name(self):
+        if self._filename is None:
+            raise AttributeError("Unnamed media stream")
         return self._filename
 
 
@@ -420,6 +442,11 @@ class OutboundQueue:
             connection.execute(
                 "ALTER TABLE outbound_queue ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0"
             )
+        # Additive metadata: do not rebuild the large queue or change its legacy CHECK.
+        for name, kind in (("delivery_hold", "TEXT"), ("attempt_sender_bot_id", "TEXT"),
+                           ("attempt_started_at", "REAL")):
+            if name not in columns:
+                connection.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL")
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -887,6 +914,27 @@ class OutboundQueue:
             pass
 
     @classmethod
+    def streaming_uploads(cls, value: object) -> object:
+        """PTB otherwise reads a raw file handle completely before making HTTP."""
+        if isinstance(value, _NamedMediaFile):
+            return InputFile(value, filename=getattr(value, "name", None), attach=True, read_file_handle=False)
+        if isinstance(value, tuple):
+            return tuple(cls.streaming_uploads(item) for item in value)
+        if isinstance(value, list):
+            return [cls.streaming_uploads(item) for item in value]
+        if isinstance(value, dict):
+            return {key: cls.streaming_uploads(item) for key, item in value.items()}
+        if isinstance(value, InputMedia):
+            media = copy.copy(value)
+            object.__setattr__(media, "media", cls.streaming_uploads(value.media))
+            for field in _INPUT_MEDIA_ATTACHMENT_FIELDS.get(type(value), ()):
+                attachment = getattr(value, field, None)
+                if attachment is not None:
+                    object.__setattr__(media, field, cls.streaming_uploads(attachment))
+            return media
+        return value
+
+    @classmethod
     def payload_closeables(cls, *values: object) -> tuple[object, ...]:
         result: list[object] = []
         seen: set[int] = set()
@@ -1053,16 +1101,17 @@ class OutboundQueue:
             return identifiers[0], waiter
 
     def heads(
-        self, *, include_payload: bool = True, excluded_ids: Iterable[int] = ()
+        self, *, include_payload: bool = True, excluded_ids: Iterable[int] = (),
+        ready_only: bool = False,
     ) -> list[QueuedCall]:
         payload = "q.payload" if include_payload else "X''"
         context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
         receipt = "q.completion_receipt" if include_payload else "NULL"
         excluded = tuple(excluded_ids)
-        exclusion_sql = ""
+        exclusion_sql = " AND delivery_hold IS NULL" if ready_only else ""
         parameters: tuple[object, ...] = ()
         if excluded:
-            exclusion_sql = " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
+            exclusion_sql += " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
             parameters = tuple(excluded)
         with self._lock:
             # Select one runnable head per destination before reading media BLOBs.
@@ -1273,6 +1322,38 @@ class OutboundQueue:
                 self.connection.rollback()
                 raise
 
+    def begin_delivery_attempt(self, row_id: int, selection: SenderSelection) -> None:
+        """Persist before submission: an interrupted send is not safe to replay."""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold='in_flight', attempt_sender_bot_id=?, "
+                "attempt_started_at=? WHERE id=? AND delivery_state='queued' AND delivery_hold IS NULL",
+                (selection.sender_bot_id, time.time(), row_id),
+            )
+            if cursor.rowcount != 1:
+                raise QueuePersistenceError(f"Queue row {row_id} is not available for a send attempt.")
+
+    def release_delivery_attempt(self, row_id: int) -> None:
+        """Use only when submission failed or Telegram definitely rejected the call."""
+        with self._lock, self.connection:
+            self.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold=NULL WHERE id=? AND delivery_state='queued'",
+                (row_id,),
+            )
+
+    def hold_uncertain_delivery(self, row_id: int, error: BaseException) -> None:
+        # Store class names only, never credentials, request objects or tracebacks.
+        reason = type(error).__name__
+        if error.__cause__ is not None:
+            reason += "/" + type(error.__cause__).__name__
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold=? WHERE id=? AND delivery_state='queued'",
+                ("uncertain:" + reason, row_id),
+            )
+            if cursor.rowcount != 1:
+                raise QueuePersistenceError(f"Queue row {row_id} disappeared while preserving an uncertain send.")
+
     def record_telegram_completion(self, row_id: int, receipt: bytes) -> None:
         if not isinstance(receipt, bytes):
             raise QueuePersistenceError("Queued Telegram completion receipt must be bytes.")
@@ -1280,7 +1361,7 @@ class OutboundQueue:
             try:
                 self.connection.execute("BEGIN")
                 cursor = self.connection.execute(
-                    "UPDATE outbound_queue SET delivery_state = 'sent_pending', completion_receipt = ? "
+                    "UPDATE outbound_queue SET delivery_state = 'sent_pending', completion_receipt = ?, delivery_hold = NULL "
                     "WHERE id = ? AND delivery_state = 'queued'",
                     (receipt, row_id),
                 )
@@ -1691,7 +1772,7 @@ class OutboundQueueScheduler:
                     continue
                 self.quarantined_rows.pop(row_id, None)
             for row in self.queue.heads(
-                include_payload=False, excluded_ids=self.quarantined_rows
+                include_payload=False, excluded_ids=self.quarantined_rows, ready_only=True
             ):
                 if (
                     row.id in self.in_flight
@@ -1796,7 +1877,7 @@ class OutboundQueueScheduler:
                     return
                 # Rows carrying a durable log context are retained until the
                 # MsgLog write is committed, regardless of blocking priority.
-                retained = row.priority == 0 or row.log_context is not None
+                retained = row.priority == 0 or row.log_context is not None or row.operation in MESSAGE_CREATING_OPERATIONS
                 if not retained:
                     try:
                         self.queue.delete(row.id, cleanup_media=False)
@@ -1806,6 +1887,16 @@ class OutboundQueueScheduler:
                         return
                     self._record_submitted_removal(row)
                 closeables = self.queue.payload_closeables(args, kwargs)
+                attempt_marked = False
+                if row.operation in MESSAGE_CREATING_OPERATIONS:
+                    try:
+                        self.queue.begin_delivery_attempt(row.id, decision.selection)
+                        attempt_marked = True
+                    except Exception as persistence_error:
+                        self.queue.close_payload_resources(closeables)
+                        self._permits.release()
+                        self._stop_for_persistence_error(persistence_error)
+                        return
                 try:
                     dispatched_at = self._record_dispatch_attempt(row)
                     future = self.executor.submit(
@@ -1814,6 +1905,12 @@ class OutboundQueueScheduler:
                 except Exception:
                     self.queue.close_payload_resources(closeables)
                     self._permits.release()
+                    if attempt_marked:
+                        try:
+                            self.queue.release_delivery_attempt(row.id)
+                        except Exception as persistence_error:
+                            self._stop_for_persistence_error(persistence_error)
+                            return
                     self._record_dispatch("failed")
                     if self.queue.metrics is not None:
                         self.queue.metrics.record_dispatch_failure(row.priority, row.operation)
@@ -1886,7 +1983,25 @@ class OutboundQueueScheduler:
                                 )
                             continue
                     decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
+                    if decision.kind == "delivery_uncertain":
+                        try:
+                            self.queue.hold_uncertain_delivery(row_id, error)
+                        except Exception as persistence_error:
+                            self._stop_for_persistence_error(persistence_error)
+                            return
+                        self.queue.fail_waiter(row_id, DeliveryUncertainError(
+                            f"Queue row {row_id}: Telegram delivery is unconfirmed; automatic resend disabled."
+                        ))
+                        if self.queue.metrics is not None:
+                            self.queue.metrics.record_failure(submitted.row.priority, submitted.row.operation, "uncertain")
+                        continue
                     if decision.kind == "retry_eventual" and submitted.row.priority == 0:
+                        if submitted.row.operation in MESSAGE_CREATING_OPERATIONS:
+                            try:
+                                self.queue.release_delivery_attempt(row_id)
+                            except Exception as persistence_error:
+                                self._stop_for_persistence_error(persistence_error)
+                                return
                         if self.stopping:
                             self.queue.fail_waiter(row_id, SchedulerStoppedError("Outbound scheduler stopped."))
                             continue
@@ -1908,7 +2023,8 @@ class OutboundQueueScheduler:
                                 retry_reason,
                             )
                         continue
-                    if submitted.row.priority == 0 or submitted.row.log_context is not None:
+                    if (submitted.row.priority == 0 or submitted.row.log_context is not None
+                            or submitted.row.operation in MESSAGE_CREATING_OPERATIONS):
                         try:
                             self.queue.delete(row_id)
                         except Exception as delete_error:
@@ -1948,7 +2064,7 @@ class OutboundQueueScheduler:
                         if self.stopping:
                             return
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
-                    if submitted.row.priority == 0 and submitted.row.log_context is None:
+                    if (submitted.row.priority == 0 or submitted.row.operation in MESSAGE_CREATING_OPERATIONS) and submitted.row.log_context is None:
                         try:
                             self.queue.delete(row_id)
                         except Exception as delete_error:

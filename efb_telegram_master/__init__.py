@@ -156,6 +156,10 @@ class TelegramChannel(MasterChannel):
             CommandHandler("react", self.bot_manager.as_async_callback(self.react), filters=non_edit_filter)
         )
 
+        self.bot_manager.dispatcher.add_handler(
+            CommandHandler("confirm_send", self.bot_manager.as_async_callback(self.confirm_send), filters=non_edit_filter)
+        )
+
         # Register master message handlers after commands to prevent commands
         # commands to be delivered as messages
         self.master_messages: MasterMessageProcessor = MasterMessageProcessor(self)
@@ -431,6 +435,25 @@ class TelegramChannel(MasterChannel):
         if len(raw_args) > len(args):
             return raw_args
         return args
+
+    def confirm_send(self, update: Update, context: CallbackContext):
+        """An admin may confirm a held send by replying to its actual Telegram message."""
+        user, message = update.effective_user, update.effective_message
+        if user is None or user.id not in self.config["admins"] or message is None:
+            return
+        args = context.args or []
+        if len(args) != 1 or not args[0].isdigit() or message.reply_to_message is None:
+            sync_reply_text(self.bot_manager, message,
+                            "Reply to the already delivered bot message with /confirm_send <queue-row-id>. This does not resend it.")
+            return
+        try:
+            complete = self.bot_manager.confirm_queued_delivery(int(args[0]), message.reply_to_message)
+        except ValueError as error:
+            sync_reply_text(self.bot_manager, message, str(error))
+            return
+        sync_reply_text(self.bot_manager, message,
+                        "Delivery confirmed; stored message log retained. No resend was made." if complete else
+                        "Telegram receipt saved; MsgLog reconciliation remains pending. No resend will be made.")
 
     def react(self, update: Update, context: CallbackContext):
         """React to a message."""
