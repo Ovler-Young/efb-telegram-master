@@ -1,5 +1,6 @@
 """Real Telegram acceptance followed by injected loss of the response."""
 import asyncio
+from functools import wraps
 import uuid
 
 import httpx
@@ -22,6 +23,7 @@ async def test_remote_accepted_document_is_not_resent_after_response_loss(channe
     accepted = []
     original_send = Bot.send_document
 
+    @wraps(original_send)
     async def accept_then_lose_response(bot, *args, **kwargs):
         result = await original_send(bot, *args, **kwargs)
         if kwargs.get("filename") == filename:
