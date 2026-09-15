@@ -340,6 +340,9 @@ class OutboundQueue:
     # Protect restart from already-inflated historical rows before reading their
     # BLOBs. Oversized rows are retained and reported, never silently discarded.
     MAX_REPLAY_BYTES = 128 * 1024 * 1024
+    # Legacy v1 rows may contain one complete media file inline. Recover one
+    # such row at a time, rewrite it to v2 sidecar storage, then let normal
+    # replay budgeting apply to the compact row.
 
     def __init__(self, channel_data_path: Path | str, metrics: Optional[QueueMetrics] = None):
         self.path = Path(channel_data_path) / self.filename
@@ -1107,6 +1110,82 @@ class OutboundQueue:
             ).fetchone()
         return None if row is None else int(row[0])
 
+    def queued_payload_version(self, row_id: int) -> Optional[int]:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT hex(substr(payload, 1, 1)) FROM outbound_queue "
+                "WHERE id = ? AND delivery_state = 'queued'",
+                (row_id,),
+            ).fetchone()
+        if row is None or not row[0]:
+            return None
+        return int(str(row[0]), 16)
+
+    def load_legacy_queued_for_recovery(self, row_id: int) -> QueuedCall:
+        """Load one bounded v1 row so it can be rewritten to sidecar storage."""
+        with self._lock:
+            metadata = self.connection.execute(
+                "SELECT length(payload) + COALESCE(length(log_context), 0) + "
+                "COALESCE(length(completion_receipt), 0), hex(substr(payload, 1, 1)) "
+                "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'",
+                (row_id,),
+            ).fetchone()
+            if metadata is None:
+                raise QueuePersistenceError(f"Queued row {row_id} disappeared before recovery.")
+            size, version_hex = int(metadata[0]), str(metadata[1])
+            if version_hex != "01":
+                raise QueuePersistenceError(f"Queued row {row_id} is not a legacy v1 payload.")
+            row = self.connection.execute(
+                "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
+                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
+                "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'",
+                (row_id,),
+            ).fetchone()
+        if row is None:
+            raise QueuePersistenceError(f"Queued row {row_id} disappeared before recovery.")
+        return replace(QueuedCall(*row), stored_bytes=size)
+
+    def rewrite_legacy_media_payload(self, row: QueuedCall) -> QueuedCall:
+        """Rewrite one loaded v1 media call to compact v2 sidecar storage."""
+        if not row.payload or row.payload[0] != 1:
+            return row
+        args, kwargs = self.decode_payload_raw(row.payload)
+        normalized_args, normalized_kwargs = self._normalize_direct_media(
+            row.operation, args, kwargs, frozenset()
+        )
+        normalized_args, normalized_kwargs = self._normalize_nested_media(
+            row.operation, normalized_args, normalized_kwargs, frozenset()
+        )
+        normalized_kwargs = self._normalize_thumbnail(
+            row.operation, normalized_kwargs, frozenset()
+        )
+        normalized_kwargs = self._normalize_keyword_media(
+            row.operation, normalized_kwargs, frozenset()
+        )
+        payload = self.encode_payload(normalized_args, normalized_kwargs)
+        try:
+            with self._lock:
+                self.connection.execute("BEGIN")
+                cursor = self.connection.execute(
+                    "UPDATE outbound_queue SET payload = ? "
+                    "WHERE id = ? AND delivery_state = 'queued' AND substr(payload, 1, 1) = X'01'",
+                    (payload, row.id),
+                )
+                if cursor.rowcount != 1:
+                    raise QueuePersistenceError(
+                        f"Queued row {row.id} changed before legacy recovery could commit."
+                    )
+                self.connection.commit()
+        except Exception:
+            try:
+                self.connection.rollback()
+            except sqlite3.Error:
+                pass
+            self.cleanup_payload_media(payload)
+            raise
+        compact_size = len(payload) + len(row.log_context or b"") + len(row.completion_receipt or b"")
+        return replace(row, payload=payload, stored_bytes=compact_size)
+
     def check_replay_size(self, row_id: int, size: int) -> None:
         if size > self.MAX_REPLAY_BYTES:
             raise QueuePersistenceError(
@@ -1605,6 +1684,10 @@ class OutboundQueueScheduler:
                 try:
                     self.queue.check_replay_size(row_id, stored_size)
                 except QueuePersistenceError:
+                    # A legacy v1 row can be compacted to sidecar-backed v2.
+                    # Re-admit it so one recovery attempt can run normally.
+                    if self.queue.queued_payload_version(row_id) == 1:
+                        self.quarantined_rows.pop(row_id, None)
                     continue
                 self.quarantined_rows.pop(row_id, None)
             for row in self.queue.heads(
@@ -1622,17 +1705,18 @@ class OutboundQueueScheduler:
                     except QueuePersistenceError:
                         continue
                     self.quarantined_rows.pop(row.id, None)
+                legacy_recovery = False
                 try:
                     self.queue.check_replay_size(row.id, row.stored_bytes)
                 except QueuePersistenceError as error:
-                    # Legacy v1 payloads may contain an entire media file. One
-                    # oversized historical row must block only its destination,
-                    # not stop Telegram delivery for every linked chat.
-                    self.quarantined_rows[row.id] = str(error)
-                    continue
+                    if self.queue.queued_payload_version(row.id) == 1:
+                        legacy_recovery = True
+                    else:
+                        self.quarantined_rows[row.id] = str(error)
+                        continue
                 retained_bytes = sum(item.row.stored_bytes for item in self.in_flight.values())
                 retained_bytes += sum(item.row.stored_bytes for item in self.blocking_media_retries.values())
-                if retained_bytes + row.stored_bytes > self.queue.MAX_REPLAY_BYTES:
+                if not legacy_recovery and retained_bytes + row.stored_bytes > self.queue.MAX_REPLAY_BYTES:
                     continue  # Existing completion/retry events release this byte budget.
                 now = time.monotonic()
                 not_before = self._row_not_before.get(row.id)
@@ -1677,7 +1761,12 @@ class OutboundQueueScheduler:
                     self._schedule_retry(now + 0.25)
                     continue
                 try:
-                    row = self.queue.load_queued(row.id)
+                    if legacy_recovery:
+                        row = self.queue.load_legacy_queued_for_recovery(row.id)
+                        row = self.queue.rewrite_legacy_media_payload(row)
+                        self.queue.check_replay_size(row.id, row.stored_bytes)
+                    else:
+                        row = self.queue.load_queued(row.id)
                     args, kwargs = self.queue.decode_payload(row.payload)
                 except InvalidQueuedPayloadError as error:
                     self._permits.release()
@@ -1694,6 +1783,13 @@ class OutboundQueueScheduler:
                     self._record_terminal_completion(row, None, "failure")
                     self.queue.fail_waiter(row.id, error)
                     continue
+                except QueuePersistenceError as error:
+                    self._permits.release()
+                    if legacy_recovery:
+                        self.quarantined_rows[row.id] = str(error)
+                        continue
+                    self._stop_for_persistence_error(error)
+                    return
                 except Exception as error:
                     self._permits.release()
                     self._stop_for_persistence_error(error)

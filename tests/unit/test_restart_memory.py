@@ -189,6 +189,49 @@ def test_quarantined_row_is_rechecked_when_replay_budget_changes(tmp_path):
         queue.close()
 
 
+def test_oversized_legacy_media_is_compacted_and_sent_without_blocking_same_destination(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    queue.MAX_REPLAY_BYTES = 1024 * 1024
+    legacy_payload = b"\x01" + pickle.dumps(
+        ((1, io.BytesIO(b"x" * (2 * 1024 * 1024))), {}), protocol=5
+    )
+    with queue.connection:
+        cursor = queue.connection.execute(
+            "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at) "
+            "VALUES(0,1,'send_document',?,0)",
+            (legacy_payload,),
+        )
+        legacy_id = int(cursor.lastrowid)
+    newer_id, _waiter = queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": 1, "text": "new"})],
+        lambda name: send_message if name == "send_message" else (lambda chat_id, document: None),
+    )
+    adapter = DurableAdapter(reconcile=True)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+            scheduler.dispatch_once()
+            assert legacy_id in scheduler.in_flight
+            compact = queue.connection.execute(
+                "SELECT substr(payload,1,1), length(payload) FROM outbound_queue WHERE id = ?",
+                (legacy_id,),
+            ).fetchone()
+            assert compact[0] == b"\x02"
+            assert compact[1] < 4096
+            assert len(list(queue.media_dir.iterdir())) == 1
+            scheduler.in_flight[legacy_id].future.result(timeout=1)
+            scheduler.harvest_completed()
+            scheduler.dispatch_once()
+            assert newer_id in scheduler.in_flight
+            scheduler.in_flight[newer_id].future.result(timeout=1)
+            scheduler.harvest_completed()
+        assert [call[0] for call in adapter.calls] == [legacy_id, newer_id]
+        assert queue.heads() == []
+        assert list(queue.media_dir.iterdir()) == []
+    finally:
+        queue.close()
+
+
 def test_worker_count_does_not_override_replay_byte_budget(tmp_path):
     queue = OutboundQueue(tmp_path)
     queue.MAX_REPLAY_BYTES = 1024
