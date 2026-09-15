@@ -55,8 +55,10 @@ MESSAGE_CREATING_OPERATIONS = frozenset(
 
 def transport_definitely_not_sent(error: BaseException) -> bool:
     """Only connection establishment/pool failures prove no request was sent."""
-    return isinstance(error, NetworkError) and isinstance(
-        error.__cause__, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+    return (
+        not getattr(error, "_etm_primary_accepted", False)
+        and isinstance(error, NetworkError)
+        and isinstance(error.__cause__, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
     )
 
 
@@ -1346,6 +1348,8 @@ class OutboundQueue:
         reason = type(error).__name__
         if error.__cause__ is not None:
             reason += "/" + type(error.__cause__).__name__
+        if getattr(error, "_etm_primary_accepted", False):
+            reason += "/primary_accepted"
         with self._lock, self.connection:
             cursor = self.connection.execute(
                 "UPDATE outbound_queue SET delivery_hold=? WHERE id=? AND delivery_state='queued'",

@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       restart_regression:
-        description: One Python unit job plus focused live Telegram restart regressions
+        description: Queue/restart unit regressions plus focused live Telegram integration
         type: boolean
         default: false
 
@@ -71,7 +71,11 @@ jobs:
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       run: |
-        pytest -vv -r a -l --color=yes --mode=unit
+        if [ "${{ inputs.restart_regression }}" = "true" ]; then
+          pytest -vv -r a --color=yes --mode=unit tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_restart_memory.py tests/unit/test_delivery_uncertainty.py
+        else
+          pytest -vv -r a -l --color=yes --mode=unit
+        fi
 
   database:
     # Database acceptance must run without Telegram secrets and must not be

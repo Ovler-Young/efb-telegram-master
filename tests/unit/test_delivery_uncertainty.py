@@ -325,6 +325,33 @@ def test_381_mb_sidecar_reaches_http_transport_without_whole_file_read(tmp_path,
         queue.close()
 
 
+def test_failed_supplement_does_not_retry_an_accepted_primary_file(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, _ = queue.enqueue_many([QueueRequest(
+        "send_document", (42, b"archive bytes"), {"filename": "archive.zip", "caption": "x" * 2048}
+    )], lambda _: document)
+    manager = setup_manager(queue)
+    accepted = []
+    def send(*args, **kwargs):
+        if kwargs.get("reply_to_message_id") == 100:
+            try:
+                raise httpx.ConnectError("supplement was not sent")
+            except httpx.ConnectError as cause:
+                raise NetworkError("connection refused") from cause
+        accepted.append(True)
+        return delivered_message()
+    manager._bot = SimpleNamespace(send_document=send)
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    for _ in range(6):
+        manager._outbound_scheduler.dispatch_once()
+        manager._outbound_scheduler.harvest_completed()
+    assert len(accepted) == 1
+    assert queue.connection.execute(
+        "SELECT delivery_hold FROM outbound_queue WHERE id=?", (row_id,)
+    ).fetchone()[0].endswith("/primary_accepted")
+    queue.close()
+
+
 def test_attempt_marker_failure_prevents_network_send(tmp_path, monkeypatch):
     queue = OutboundQueue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)

@@ -1489,13 +1489,19 @@ class TelegramBotManager(LocaleMixin):
             else ".html" if original_parse_mode == "html" else ".txt"
         )
         label = "Message" if content_key == "text" else "Caption"
-        sender.send_document(
-            chat_id,
-            attachment,
-            filename=f"{chat_id}_{message_id}{extension}",
-            reply_to_message_id=message_id,
-            caption=f"{label} is truncated due to its length. Full message is sent as attachment.",
-        )
+        try:
+            sender.send_document(
+                chat_id,
+                attachment,
+                filename=f"{chat_id}_{message_id}{extension}",
+                reply_to_message_id=message_id,
+                caption=f"{label} is truncated due to its length. Full message is sent as attachment.",
+            )
+        except BaseException as error:
+            # A failed supplemental RPC must never cause the accepted primary
+            # message/file to be uploaded again, even on a ConnectError.
+            setattr(error, "_etm_primary_accepted", True)
+            raise
         return result
 
     @staticmethod
@@ -1683,7 +1689,8 @@ class TelegramBotManager(LocaleMixin):
         # No response is not a negative acknowledgment. Retain the log and media,
         # and never let a restart turn an unknown result into another remote send.
         if operation in MESSAGE_CREATING_OPERATIONS and (
-            ambiguous_network or not isinstance(error, telegram.error.TelegramError)
+            getattr(error, "_etm_primary_accepted", False)
+            or ambiguous_network or not isinstance(error, telegram.error.TelegramError)
         ):
             self.logger.error(
                 "Telegram delivery unconfirmed for queue row %s (%s, sender=%s, error=%s/%s). "
