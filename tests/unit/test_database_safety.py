@@ -579,7 +579,45 @@ def test_real_log_reconciliation_preserves_message_fields_without_media_io(
             assert getattr(recovered, field.name) == getattr(original, field.name), field.name
 
 
-@pytest.mark.parametrize("invalid",  [{}, {"version": 999}, []])
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_durable_reaction_reply_updates_the_canonical_mapping(
+    sqlite_source, postgres_config, manager_factory, backend,
+):
+    import logging
+    from efb_telegram_master.slave_message import SlaveMessageProcessor
+    from tests.unit.test_restart_memory import message_with_group
+
+    if backend == "postgresql":
+        migrate_db.migrate(sqlite_source, postgres_config)
+    manager = manager_factory(sqlite_source, postgres_config if backend == "postgresql" else None)
+    message = message_with_group()
+    manager.add_or_update_message_log(message, SimpleNamespace(chat_id=123, message_id=101))
+    processor = object.__new__(SlaveMessageProcessor)
+    processor.logger = logging.getLogger("tests.canonical-reaction")
+    processor.chat_manager = SimpleNamespace(update_chat_obj=lambda chat: chat)
+    destinations = []
+
+    def send(msg, destination, thread_id, template, reactions, edit_id, target_id, markup, silent, *, on_db_complete):
+        context = processor._make_send_kwargs(msg, edit_id, on_complete=on_db_complete)["_queued_db_log_context"]
+        destinations.append(context.old_msg_id)
+        manager.add_or_update_message_log(
+            context.etm_msg, SimpleNamespace(chat_id=123, message_id=102), context.old_msg_id,
+        )
+        return SimpleNamespace(durable_db_logged=True)
+
+    processor.slave_message_text = send
+    processor.dispatch_message(
+        message, "", None, 123, None,
+        database_old_msg_id=(123, 101), target_msg_id_override=101,
+    )
+    assert destinations == [(123, 101)]
+    canonical = manager.get_msg_log(master_msg_id="123.101")
+    assert canonical.master_msg_id_alt == "123.102"
+    assert manager.get_msg_log(master_msg_id="123.102") is None
+    assert processor._make_send_kwargs(message, None, on_complete=None)["_queued_db_log_context"].old_msg_id is None
+
+
+@pytest.mark.parametrize("invalid", [{}, {"version": 999}, []])
 def test_corrupt_import_manifest_cannot_authorize_startup(sqlite_source, postgres_config, invalid):
     migrate_db.migrate(sqlite_source, postgres_config)
     target = postgresql_database(postgres_config)
