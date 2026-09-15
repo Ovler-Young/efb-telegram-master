@@ -5,7 +5,7 @@ import logging
 import pickle
 import time
 from contextlib import nullcontext, suppress
-from functools import partial, wraps
+from functools import wraps
 from typing import Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING
 
 from peewee import (
@@ -691,31 +691,45 @@ class DatabaseManager:
 
         if row is None:
             row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
-        if row is not None:
-            save = row.save
+        existing = row is not None
+        if existing:
             self.logger.debug("[%s] Message record is found in database, update it", master_msg_id)
         else:
             row = MsgLog()
-            save = partial(row.save, force_insert=True)
             self.logger.debug("[%s] Message record is not found in database, insert it", master_msg_id)
 
-        row.master_msg_id = master_msg_id
-        row.master_msg_id_alt = master_msg_id_alt
-        row.text = msg.text
-        row.slave_origin_uid = chat_id_to_str(chat=msg.chat)
-        row.slave_member_uid = chat_id_to_str(chat=msg.author)
-        row.msg_type = msg.type.name
-        row.sent_to = msg.deliver_to.channel_id
-        row.slave_message_id = msg.uid or f"{self.FAIL_FLAG}.{time.time()}"
-        row.media_type = msg.type_telegram.value
-        row.file_id = msg.file_id
-        row.file_unique_id = msg.file_unique_id
-        row.mime = msg.mime
-        row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
-        pickle_data = self.pickle_misc_msg(msg)
-        row.pickle = pickle_data
-
-        result = save()
+        assert row is not None
+        values = {
+            "master_msg_id": master_msg_id,
+            "master_msg_id_alt": master_msg_id_alt,
+            "text": msg.text,
+            "slave_origin_uid": chat_id_to_str(chat=msg.chat),
+            "slave_member_uid": chat_id_to_str(chat=msg.author),
+            "msg_type": msg.type.name,
+            "sent_to": msg.deliver_to.channel_id,
+            "slave_message_id": msg.uid or f"{self.FAIL_FLAG}.{time.time()}",
+            "media_type": msg.type_telegram.value,
+            "file_id": msg.file_id,
+            "file_unique_id": msg.file_unique_id,
+            "mime": msg.mime,
+            "sender_bot_id": sender_bot_id or getattr(msg, 'sender_bot_id', None),
+            "pickle": self.pickle_misc_msg(msg),
+        }
+        if existing:
+            changed = {
+                name: value for name, value in values.items()
+                if getattr(row, name) != value
+            }
+            for name, value in changed.items():
+                setattr(row, name, value)
+            if changed:
+                result = row.save(only=[MsgLog._meta.fields[name] for name in changed])
+            else:
+                result = 0
+        else:
+            for name, value in values.items():
+                setattr(row, name, value)
+            result = row.save(force_insert=True)
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
 
     @observe_database_method("get_msg_log")
