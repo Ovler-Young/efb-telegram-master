@@ -54,6 +54,19 @@ def enqueue(queue, *requests):
     return queue.enqueue_many(requests, operation)
 
 
+def media_bytes(value):
+    if isinstance(value, InputFile):
+        value = value.input_file_content
+    if isinstance(value, bytes):
+        return value
+    position = value.tell()
+    value.seek(0)
+    try:
+        return value.read()
+    finally:
+        value.seek(position)
+
+
 def test_queue_schema_wal_and_restart_retention(tmp_path):
     queue = OutboundQueue(tmp_path)
     row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 12, "text": "first"}))
@@ -194,18 +207,20 @@ class _UnrestorableStream(io.BytesIO):
     "stream",
     [_UntellableStream(b"media"), _UnreadableStream(b"media"), _UnrestorableStream(b"media")],
 )
-def test_media_snapshot_classifies_stream_read_and_restore_failures(stream):
+def test_media_snapshot_classifies_stream_read_and_restore_failures(tmp_path, stream):
+    queue = OutboundQueue(tmp_path)
     with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
-        OutboundQueue._snapshot_media_value(stream)
+        queue._snapshot_media_value(stream)
 
     assert not stream.closed
 
 
-def test_media_snapshot_restores_position_after_read_failure():
+def test_media_snapshot_restores_position_after_read_failure(tmp_path):
+    queue = OutboundQueue(tmp_path)
     stream = _UnreadableStream(b"media")
 
     with pytest.raises(QueueEnqueueError):
-        OutboundQueue._snapshot_media_value(stream)
+        queue._snapshot_media_value(stream)
 
     assert stream.tell() == 2
 
@@ -255,9 +270,8 @@ def test_initial_send_media_streams_enqueue_as_inline_version_one_snapshots(
     row = queue.heads()[0]
     decoded_args, decoded_kwargs = queue.decode_payload(row.payload)
     decoded_media = decoded_kwargs[media_key] if keyword else decoded_args[1]
-    assert row.payload[0] == 1
-    assert decoded_media.tell() == 0
-    assert decoded_media.read() == content
+    assert row.payload[0] == 2
+    assert media_bytes(decoded_media) == content
     assert decoded_kwargs["disable_notification"] is True
 
 
@@ -297,8 +311,7 @@ def test_thumbnail_keyword_enqueues_an_inline_snapshot(tmp_path):
     assert thumbnail.tell() == 3
     thumbnail.close()
     decoded_thumbnail = queue.decode_payload(queue.heads()[0].payload)[1]["thumbnail"]
-    assert decoded_thumbnail.tell() == 0
-    assert decoded_thumbnail.read() == b"thumbnail"
+    assert media_bytes(decoded_thumbnail) == b"thumbnail"
 
 
 @pytest.mark.parametrize(
@@ -350,16 +363,12 @@ def test_video_cover_enqueues_an_inline_version_one_snapshot(
         local_path.unlink()
     row = queue.heads()[0]
     decoded_cover = queue.decode_payload(row.payload)[1]["cover"]
-    assert row.payload[0] == 1
+    assert row.payload[0] == 2
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 1
-    if isinstance(decoded_cover, bytes):
-        assert decoded_cover == content
-    elif isinstance(decoded_cover, InputFile):
-        assert decoded_cover.input_file_content == content
+    assert media_bytes(decoded_cover) == content
+    if isinstance(decoded_cover, InputFile):
         assert decoded_cover.filename == expected_filename
     else:
-        assert decoded_cover.tell() == 0
-        assert decoded_cover.read() == content
         assert getattr(decoded_cover, "name", None) == expected_filename
 
 
@@ -407,7 +416,7 @@ def test_edit_media_snapshots_nested_input_file_and_attach_name(
     decoded = decoded_kwargs["media"] if keyword else decoded_args[0]
     assert decoded.caption == "caption"
     assert decoded.media.attach_name == attach_name
-    assert decoded.media.input_file_content == content
+    assert media_bytes(decoded.media) == content
 
 
 @pytest.mark.parametrize("keyword", [False, True], ids=["positional", "keyword"])
@@ -436,8 +445,11 @@ def test_media_group_snapshots_nested_files_thumbnails_and_attach_names(tmp_path
     assert decoded_kwargs["disable_notification"] is True
     assert (decoded[0].media.attach_name, decoded[1].media.attach_name,
             decoded[1].thumbnail.attach_name) == attach_names
-    assert (decoded[0].media.input_file_content, decoded[1].media.input_file_content,
-            decoded[1].thumbnail.input_file_content) == (b"photo", b"video", b"thumb")
+    assert (
+        media_bytes(decoded[0].media),
+        media_bytes(decoded[1].media),
+        media_bytes(decoded[1].thumbnail),
+    ) == (b"photo", b"video", b"thumb")
 
 
 @pytest.mark.parametrize(
@@ -492,7 +504,7 @@ def test_media_group_accepts_exact_supported_subtypes_and_normalizes_upload_fiel
     assert decoded_kwargs == {"disable_notification": True, "protect_content": True}
     for field, (content, filename, attach_name) in expected.items():
         delivered = getattr(decoded, field)
-        assert delivered.input_file_content == content
+        assert media_bytes(delivered) == content
         assert delivered.filename == filename
         assert delivered.attach_name == attach_name
 
@@ -554,12 +566,11 @@ def test_nested_input_media_preserves_bytes_filename_precedence_and_attachment_l
         local_path.unlink()
     delivered = queue.decode_payload(queue.heads()[0].payload)[0][1][0].media
     if isinstance(delivered, InputFile):
-        assert delivered.input_file_content == content
+        assert media_bytes(delivered) == content
         assert delivered.filename == expected_filename
         assert delivered.attach_name == expected_attach_name
     else:
-        assert delivered.tell() == 0
-        assert delivered.read() == content
+        assert media_bytes(delivered) == content
         assert getattr(delivered, "name", None) == expected_filename
 
 
@@ -598,8 +609,7 @@ def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
     media = reopened.decode_payload(row.payload)[0][1]
     assert row.id == row_id
     assert row.payload == persisted_payload
-    assert media.tell() == 0
-    assert media.read() == b"reopened media"
+    assert media_bytes(media) == b"reopened media"
     reopened.close()
 
 
@@ -618,7 +628,7 @@ def test_set_chat_photo_snapshots_an_open_file_before_persistence(tmp_path):
     row = queue.heads()[0]
     restored_photo = queue.decode_payload(row.payload)[0][1]
     assert row.id == row_id
-    assert restored_photo.read() == b"chat photo"
+    assert media_bytes(restored_photo) == b"chat photo"
 
 
 @pytest.mark.parametrize("input_kind", ["string", "path"])
@@ -651,10 +661,87 @@ def test_local_file_media_is_owned_inline_after_enqueue_and_reopen(
     row = reopened.heads()[0]
     decoded_media = reopened.decode_payload(row.payload)[0][1]
     assert row.id == row_id
-    assert decoded_media.tell() == 0
-    assert decoded_media.read() == original_content
+    assert len(row.payload) < 4096
+    assert media_bytes(decoded_media) == original_content
     assert decoded_media.name == source_path.name
+    assert len(list(reopened.media_dir.iterdir())) == 1
+    reopened.delete(row_id)
+    assert list(reopened.media_dir.iterdir()) == []
     reopened.close()
+
+
+def test_corrupt_live_v2_payload_preserves_all_sidecars_during_orphan_scan(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    orphan = queue.media_dir / "media-unknown.bin"
+    orphan.write_bytes(b"must preserve")
+    with queue.connection:
+        queue.connection.execute(
+            "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+            "VALUES(0,1,'send_message',?,0)",
+            (b"\x02not-a-pickle",),
+        )
+    queue.close()
+
+    reopened = OutboundQueue(tmp_path)
+    try:
+        assert orphan.read_bytes() == b"must preserve"
+    finally:
+        reopened.close()
+
+
+def test_orphan_sidecar_is_removed_on_restart_while_live_sidecar_is_preserved(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    live_id, _waiter = queue.enqueue_many(
+        [QueueRequest("send_document", (100, io.BytesIO(b"live")), {})],
+        lambda _name: media_operation,
+    )
+    live_files = {path.name for path in queue.media_dir.iterdir()}
+    assert len(live_files) == 1
+    orphan = queue.media_dir / "media-orphan.bin"
+    orphan.write_bytes(b"orphan")
+    queue.close()
+
+    reopened = OutboundQueue(tmp_path)
+    try:
+        assert not orphan.exists()
+        assert {path.name for path in reopened.media_dir.iterdir()} == live_files
+        assert reopened.heads()[0].id == live_id
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("cleanup_path_kind", ["absolute", "relative"])
+def test_local_tdlib_file_uri_stays_out_of_sqlite_and_is_cleaned_after_row_delete(
+    tmp_path, monkeypatch, cleanup_path_kind
+):
+    source_path = tmp_path / "tdlib-large.bin"
+    with source_path.open("wb") as source:
+        source.truncate(381_320_453)
+    queue = OutboundQueue(tmp_path)
+    uri = source_path.as_uri()
+    cleanup_path = str(source_path)
+    if cleanup_path_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        cleanup_path = source_path.name
+
+    row_id, _waiter = queue.enqueue_many(
+        [QueueRequest(
+            "send_document",
+            (100, uri),
+            {},
+            cleanup_files=(cleanup_path,),
+        )],
+        lambda _name: media_operation,
+    )
+
+    row = queue.heads()[0]
+    assert row.id == row_id
+    assert len(row.payload) < 4096
+    assert source_path.exists()
+    assert queue.decode_payload(row.payload)[0][1] == uri
+
+    queue.delete(row_id)
+    assert not source_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -765,7 +852,7 @@ def test_nested_media_accepts_file_ids_urls_bytes_and_matching_telegram_objects(
     decoded = queue.decode_payload(queue.heads()[0].payload)[0][1]
     assert decoded[0].media == "photo-id"
     assert decoded[1].media == "https://example.com/photo.jpg"
-    assert decoded[2].media.input_file_content == b"photo-bytes"
+    assert media_bytes(decoded[2].media) == b"photo-bytes"
     assert decoded[3].media == photo_size
 
 

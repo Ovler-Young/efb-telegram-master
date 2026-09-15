@@ -17,8 +17,8 @@ from ehforwarderbot.chat import GroupChat, ChatMember
 from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
-from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler
-from tests.unit.test_outbound import DurableAdapter
+from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest
+from tests.unit.test_outbound import DurableAdapter, send_message
 
 
 def message_with_group(extra_bytes=0):
@@ -113,11 +113,75 @@ def test_oversized_legacy_record_is_retained_without_loading_it(tmp_path, state,
                 peak = tracemalloc.get_traced_memory()[1]
             finally:
                 tracemalloc.stop()
-            assert scheduler.stopping
-            assert "Row retained" in str(scheduler.failure)
+            if state == "queued":
+                assert not scheduler.stopping
+                assert scheduler.failure is None
+                assert scheduler.quarantined_rows
+                assert "Row retained" in next(iter(scheduler.quarantined_rows.values()))
+            else:
+                assert scheduler.stopping
+                assert "Row retained" in str(scheduler.failure)
             assert peak < 1024 * 1024
             assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 1
             assert adapter.calls == [] and adapter.reconciled == []
+    finally:
+        queue.close()
+
+
+def test_oversized_legacy_row_quarantines_only_its_destination(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    queue.MAX_REPLAY_BYTES = 1024 * 1024
+    with queue.connection:
+        queue.connection.execute(
+            "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at) "
+            "VALUES(0,1,'send_message',zeroblob(?),0)",
+            (8 * 1024 * 1024,),
+        )
+    normal_id, _waiter = queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": 2, "text": "ok"})],
+        lambda _name: send_message,
+    )
+    adapter = DurableAdapter(reconcile=True)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+            scheduler.dispatch_once()
+            assert scheduler.quarantined_rows
+            assert not scheduler.stopping
+            assert normal_id in scheduler.in_flight
+            scheduler.in_flight[normal_id].future.result(timeout=1)
+            scheduler.harvest_completed()
+        assert adapter.calls == [(normal_id, 2, "send_message")]
+    finally:
+        queue.close()
+
+
+def test_quarantined_row_is_rechecked_when_replay_budget_changes(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    payload = b"\x01" + pickle.dumps(((), {"chat_id": 1, "text": "x" * (2 * 1024 * 1024)}), protocol=5)
+    with queue.connection:
+        queue.connection.execute(
+            "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at) "
+            "VALUES(0,1,'send_message',?,0)",
+            (payload,),
+        )
+    queue.MAX_REPLAY_BYTES = 1024 * 1024
+    adapter = DurableAdapter(reconcile=True)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+            scheduler.dispatch_once()
+            assert scheduler.quarantined_rows
+            assert not scheduler.in_flight
+
+            queue.MAX_REPLAY_BYTES = 4 * 1024 * 1024
+            scheduler.dispatch_once()
+            assert scheduler.quarantined_rows == {}
+            assert len(scheduler.in_flight) == 1
+            submitted = next(iter(scheduler.in_flight.values()))
+            submitted.future.result(timeout=1)
+            scheduler.harvest_completed()
+        assert adapter.calls and adapter.calls[0][1:] == (1, "send_message")
     finally:
         queue.close()
 

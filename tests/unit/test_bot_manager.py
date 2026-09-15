@@ -23,7 +23,9 @@ from efb_telegram_master.bot_manager import (
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
+from efb_telegram_master.outbound import (
+    OutboundQueue, QueueEnqueueError, QueuePersistenceError, QueueRequest, SenderSelection,
+)
 
 
 from efb_telegram_master.message import ETMMsg
@@ -254,12 +256,17 @@ def test_queued_document_filename_precedence(tmp_path, kind, expected_filename):
     args, decoded_kwargs = queue.decode_payload(queue.heads()[0].payload)
     delivered = args[1]
     if isinstance(delivered, InputFile):
-        assert delivered.input_file_content == b"media"
+        content = delivered.input_file_content
+        if isinstance(content, bytes):
+            assert content == b"media"
+        else:
+            assert content.tell() == 0
+            assert content.read() == b"media"
     else:
         assert delivered.tell() == 0
         assert delivered.read() == b"media"
     if expected_filename is None:
-        assert not hasattr(delivered, "name")
+        assert getattr(delivered, "name", None) is None
         assert "filename" not in decoded_kwargs
     else:
         actual_filename = delivered.filename if isinstance(delivered, InputFile) else delivered.name
@@ -284,7 +291,7 @@ def test_prechange_version_one_payloads_decode_and_execute_without_reencoding(
     assert payload[0] == 1
     encoder = Mock(side_effect=AssertionError("legacy payload must not be re-encoded"))
     monkeypatch.setattr(OutboundQueue, "encode_payload", encoder)
-    args, kwargs = OutboundQueue.decode_payload(payload)
+    args, kwargs = OutboundQueue.decode_payload_raw(payload)
     manager = object.__new__(TelegramBotManager)
     sender = Mock()
 
@@ -825,6 +832,27 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
 
     assert row_id == "7"
     wake_event.set.assert_called_once_with()
+
+
+def test_stopped_scheduler_raises_fresh_failures_without_growing_stored_traceback():
+    manager = object.__new__(TelegramBotManager)
+    stored_failure = QueuePersistenceError("oversized legacy row")
+    manager._outbound_scheduler = SimpleNamespace(
+        _lock=threading.RLock(), stopping=True, failure=stored_failure,
+    )
+    errors = []
+
+    for _ in range(50):
+        with pytest.raises(QueuePersistenceError) as raised:
+            TelegramBotManager._enqueue_requests(
+                manager,
+                [QueueRequest("send_message", (), {"chat_id": 1, "text": "x"})],
+            )
+        errors.append(raised.value)
+
+    assert all(error is not stored_failure for error in errors)
+    assert len({id(error) for error in errors}) == 50
+    assert stored_failure.__traceback__ is None
 
 
 def test_terminal_queued_failure_releases_deferred_mapping_callback():

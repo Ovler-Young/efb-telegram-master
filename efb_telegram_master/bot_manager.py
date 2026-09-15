@@ -1109,16 +1109,20 @@ class TelegramBotManager(LocaleMixin):
     ) -> tuple[str, Future]:
         with self._outbound_scheduler._lock:
             if self._outbound_scheduler.stopping:
-                error = self._outbound_scheduler.failure or SchedulerStoppedError(
-                    "Outbound scheduler stopped."
-                )
-                raise error
+                failure = self._outbound_scheduler.failure
+                if failure is not None:
+                    raise QueuePersistenceError(str(failure)) from None
+                raise SchedulerStoppedError("Outbound scheduler stopped.") from None
             durable_requests = requests
             if db_log_context is not None:
                 encoded_context = self._encode_queued_log_context(db_log_context)
                 durable_requests = [
                     QueueRequest(
-                        request.operation, request.args, request.kwargs, encoded_context
+                        request.operation,
+                        request.args,
+                        request.kwargs,
+                        encoded_context,
+                        request.cleanup_files,
                     )
                     for request in requests
                 ]
@@ -1143,14 +1147,22 @@ class TelegramBotManager(LocaleMixin):
         operation = function.__name__
         telegram_args = args[1:] if args and args[0] is self else args
         queued_kwargs = dict(kwargs)
-        row_id, _ = self._enqueue_requests([
-            QueueRequest(operation=operation, args=telegram_args, kwargs=queued_kwargs)
-        ], db_log_context=db_log_context)
-        for path in cleanup_files or ():
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+        try:
+            row_id, _ = self._enqueue_requests([
+                QueueRequest(
+                    operation=operation,
+                    args=telegram_args,
+                    kwargs=queued_kwargs,
+                    cleanup_files=tuple(str(path) for path in cleanup_files or ()),
+                )
+            ], db_log_context=db_log_context)
+        except BaseException:
+            for path in cleanup_files or ():
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            raise
         return row_id
 
     def _enqueue_eventual_send(
@@ -1193,14 +1205,22 @@ class TelegramBotManager(LocaleMixin):
         if slave_id:
             queued_kwargs["_slave_id"] = slave_id
         queued_kwargs["_send_mode"] = "blocking"
-        row_id, queue_waiter = self._enqueue_requests([
-            QueueRequest(function.__name__, args[1:] if args and args[0] is self else args, queued_kwargs)
-        ], db_log_context=db_log_context)
-        for path in cleanup_files or ():
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+        try:
+            row_id, queue_waiter = self._enqueue_requests([
+                QueueRequest(
+                    function.__name__,
+                    args[1:] if args and args[0] is self else args,
+                    queued_kwargs,
+                    cleanup_files=tuple(str(path) for path in cleanup_files or ()),
+                )
+            ], db_log_context=db_log_context)
+        except BaseException:
+            for path in cleanup_files or ():
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            raise
         try:
             result = queue_waiter.result(timeout=self.BLOCKING_SEND_TIMEOUT)
         except FutureTimeoutError as error:
@@ -1395,8 +1415,12 @@ class TelegramBotManager(LocaleMixin):
                 )
                 self._rewind_queued_files(telegram_args, telegram_kwargs)
                 if getattr(row, "priority", 1) == 0:
+                    raw_args, raw_kwargs = self._outbound_queue.decode_payload_raw(row.payload)
+                    raw_args, raw_kwargs = self._rewrite_queued_chat_id(
+                        row.operation, raw_args, raw_kwargs, error.new_chat_id
+                    )
                     self._outbound_queue.retarget(
-                        row.id, error.new_chat_id, telegram_args, telegram_kwargs
+                        row.id, error.new_chat_id, raw_args, raw_kwargs
                     )
                     raise QueuedChatMigrationRetry(
                         f"Telegram chat migrated to {error.new_chat_id}."

@@ -96,6 +96,7 @@ def sqlite_source(tmp_path):
             source_master_msg_id="z.1", formatted_text="historic", source_time=datetime(2020, 1, 2), position=0,
         )
     queue = OutboundQueue(directory)
+    (queue.media_dir / "media-fixture.bin").write_bytes(b"durable media fixture")
     with queue.connection:
         queue.connection.executemany(
             "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at,"
@@ -111,6 +112,18 @@ def sqlite_source(tmp_path):
 def source_rows(directory):
     with closing(sqlite3.connect(directory / "tgdata.db")) as source:
         return {model._meta.table_name: list(migrate_db._source_rows(source, model)) for model in MODELS}
+
+
+def test_queue_digest_legacy_manifest_accepts_only_empty_sidecar_state():
+    legacy = {"sha256": "queue"}
+    assert migrate_db._queue_digest_matches({"sha256": "queue", "media": None}, legacy)
+    assert migrate_db._queue_digest_matches(
+        {"sha256": "queue", "media": {"files": 0, "bytes": 0, "sha256": "empty"}}, legacy
+    )
+    assert not migrate_db._queue_digest_matches(
+        {"sha256": "queue", "media": {"files": 1, "bytes": 1, "sha256": "media"}}, legacy
+    )
+    assert not migrate_db._queue_digest_matches({"sha256": "changed", "media": None}, legacy)
 
 
 @pytest.fixture
@@ -296,7 +309,7 @@ def test_process_death_recovery(sqlite_source, postgres_config, point):
     assert receipt["tables"]["msglog"]["rows"] == 3
 
 
-@pytest.mark.parametrize("side", ["source", "target", "queue"])
+@pytest.mark.parametrize("side", ["source", "target", "queue", "queue-media"])
 def test_resume_rejects_divergence(sqlite_source, postgres_config, side):
     migrate_db.migrate(sqlite_source, postgres_config)
     if side == "target":
@@ -304,6 +317,9 @@ def test_resume_rejects_divergence(sqlite_source, postgres_config, side):
         with connection_scope(target):
             target.execute_sql("UPDATE msglog SET text = 'changed' WHERE master_msg_id = 'z.1'")
         target.close_all()
+    elif side == "queue-media":
+        media_file = next((sqlite_source / "outbound-media").iterdir())
+        media_file.write_bytes(b"changed media")
     else:
         path = sqlite_source / ("tgdata.db" if side == "source" else "outbound-queue.sqlite3")
         with closing(sqlite3.connect(path)) as connection:

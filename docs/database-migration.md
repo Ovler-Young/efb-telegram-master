@@ -2,10 +2,12 @@
 
 ## Runtime behavior
 
-The channel has two stores. `tgdata.db` holds message logs and associations;
-`outbound-queue.sqlite3` holds outbound requests, media snapshots and Telegram
-completion receipts. Selecting PostgreSQL changes the first store only. Keep the
-outbound database in the same channel data directory.
+The channel has two logical stores. `tgdata.db` holds message logs and associations;
+the outbound store consists of `outbound-queue.sqlite3` plus `outbound-media/`.
+The SQLite file holds request metadata, compact durable media references and Telegram
+completion receipts; queue-owned media bytes live in `outbound-media/`. Selecting
+PostgreSQL changes the first store only. Keep both outbound paths in the same channel
+data directory.
 
 Startup adds missing nullable historical columns and lookup indexes in one
 schema transaction. Existing message IDs, timestamps, duplicate source-message
@@ -43,14 +45,25 @@ not four full queue scans per second. Automatic receipt recovery yields between
 batches for at least 250 ms and at least the preceding batch's work duration.
 Fresh live completions still write their own receipt immediately.
 
-The encoded in-flight queue data budget is 128 MiB. A single historical context
-or queued call over that budget stops recovery *before* its BLOB is loaded; its
-row ID and size are reported and the record is retained for offline diagnosis.
-Do not delete such a row or raise the limit blindly. This bounds recovery BLOB
-loads; it is not a hard limit on total process RSS, upstream channel caches, or
-media conversion performed outside this queue. During a memory incident, stop
-the bot and automatic restarts before diagnosis, keeping both databases and WAL
-files intact. This hotfix does not require a PostgreSQL cutover.
+The encoded in-flight queue data budget is 128 MiB. New media is streamed into a
+queue-owned sidecar file and the SQLite payload stays small; local Bot API `file://`
+media that ETM already owns remains an external durable reference. Historical v1
+rows may still contain an entire media file inline. An oversized legacy queued row
+is quarantined before its BLOB is loaded and blocks only its own destination; other
+destinations continue. The row is re-evaluated if the byte budget changes or after
+restart. Oversized sent-pending reconciliation state still fails closed because it
+contains the only durable Telegram completion receipt. Do not delete such rows or
+raise the limit blindly. This budget bounds recovery BLOB loads; it is not a hard
+limit on total process RSS, upstream channel caches, or media conversion outside
+the queue. During a memory incident, stop the bot and automatic restarts before
+diagnosis, keeping both databases, WAL files and `outbound-media/` intact.
+
+Sidecar files are removed after their queue row reaches a terminal state. On startup,
+ETM removes queue-owned sidecars that no live v2 row references. If any live v2
+payload is corrupt and its references cannot be inspected, orphan cleanup is
+intentionally skipped rather than risk deleting still-needed media. Missing media
+referenced by a valid live row fails queue startup instead of silently discarding the
+row.
 
 ## Before migration
 
@@ -113,7 +126,8 @@ The importer:
 
 1. Takes ownership of the local directory and fences writes to both SQLite
    stores. It uses SQLite's backup API to create independently readable,
-   integrity-checked snapshots, including committed WAL data. Existing files,
+   integrity-checked snapshots, including committed WAL data, and also copies
+   `outbound-media/` with a streamed content digest. Existing files, queue media,
    WAL sidecars and any `tgdata.db.migrated` archive are never renamed, deleted
    or overwritten.
 2. Imports all five supported application tables into an empty target, preserving
@@ -144,8 +158,11 @@ Every imported table must still exist; a missing table causes startup to fail
 rather than silently recreating an empty replacement. Restore the complete target
 when recovering an incomplete PostgreSQL restore.
 If the import included an outbound queue, that file must still exist at startup;
-the runtime refuses to silently replace it with an empty queue. Restore the current
-queue, not a stale pre-send snapshot, when recovering missing local files.
+the runtime refuses to silently replace it with an empty queue. `outbound-media/`
+is part of the same durable queue state: valid v2 rows whose referenced media is
+missing fail closed rather than being silently dropped. Restore the current queue
+and its matching media directory, not a stale pre-send snapshot, when recovering
+missing local files.
 
 ## Failure and restart behavior
 
@@ -172,11 +189,12 @@ Do not bypass the receipt or source-change guards to merge histories.
 
 ## Rollback boundary
 
-Before the PostgreSQL-backed bot has resumed, rollback can restore **both**
-SQLite snapshots into a fresh channel directory with the original configuration.
-Leave the current directory, cutover receipt and PostgreSQL target intact until
-the restored copy is verified. This avoids overwriting the only source or
-confusing a frozen source with a current queue.
+Before the PostgreSQL-backed bot has resumed, rollback can restore the `tgdata.db`
+snapshot and the complete outbound snapshot (`outbound-queue.sqlite3` together
+with `outbound-media/`) into a fresh channel directory with the original
+configuration. Leave the current directory, cutover receipt and PostgreSQL target
+intact until the restored copy is verified. This avoids overwriting the only
+source or confusing a frozen source with a current queue.
 
 After the bot has resumed, changing `database.type` back to SQLite is not a
 lossless rollback: new MsgLog rows, queue removals, retries and Telegram receipts

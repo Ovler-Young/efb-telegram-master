@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -228,6 +229,50 @@ def _digest(rows) -> dict:
     return {"rows": count, "sha256": digest.hexdigest()}
 
 
+def _media_directory_digest(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    if not path.is_dir():
+        raise RuntimeError(f"Outbound media path is not a directory: {path}")
+    digest = hashlib.sha256()
+    files = 0
+    total_bytes = 0
+    for candidate in sorted(path.iterdir(), key=lambda item: item.name):
+        if candidate.is_symlink() or not candidate.is_file():
+            raise RuntimeError(f"Unexpected outbound media entry: {candidate.name}")
+        stat = candidate.stat()
+        digest.update(_json([candidate.name, stat.st_size]).encode())
+        with candidate.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        files += 1
+        total_bytes += stat.st_size
+    return {"files": files, "bytes": total_bytes, "sha256": digest.hexdigest()}
+
+
+def _backup_media_directory(source: Path, destination: Path) -> None:
+    before = _media_directory_digest(source)
+    if before is None:
+        return
+    destination.mkdir(mode=0o700)
+    for candidate in sorted(source.iterdir(), key=lambda item: item.name):
+        if candidate.is_symlink() or not candidate.is_file():
+            raise RuntimeError(f"Unexpected outbound media entry: {candidate.name}")
+        target = destination / candidate.name
+        with candidate.open("rb") as reader, target.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+    _sync_directory(destination)
+    after = _media_directory_digest(source)
+    copied = _media_directory_digest(destination)
+    if before != after or copied != after:
+        raise RuntimeError("Outbound media changed during backup; keep all writers stopped and retry.")
+
+
 def _queue_digest(path: Path) -> Optional[dict]:
     if not path.exists():
         return None
@@ -239,7 +284,27 @@ def _queue_digest(path: Path) -> Optional[dict]:
             digest.update(_json([table, schema]).encode())
             for row in source.execute(f"SELECT * FROM {_quote(table)} ORDER BY rowid"):
                 _hash_row(digest, row)
-        return {"sha256": digest.hexdigest()}
+        return {
+            "sha256": digest.hexdigest(),
+            "media": _media_directory_digest(path.parent / "outbound-media"),
+        }
+
+
+def _queue_digest_matches(current: Optional[dict], recorded: Optional[dict]) -> bool:
+    if current == recorded:
+        return True
+    # Imports committed before queue sidecars existed recorded only the SQLite
+    # digest. Treat a missing/empty media directory as the same historical state.
+    if not isinstance(current, dict) or not isinstance(recorded, dict):
+        return False
+    if "media" in recorded or current.get("sha256") != recorded.get("sha256"):
+        return False
+    media = current.get("media")
+    return media is None or (
+        isinstance(media, dict)
+        and media.get("files") == 0
+        and media.get("bytes") == 0
+    )
 
 
 def _target_digest(db, model, batch_size: int) -> dict:
@@ -321,6 +386,7 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
             with ExitStack() as fences:
                 fences.enter_context(_fence(source_path))
                 queue_path = directory / "outbound-queue.sqlite3"
+                queue_media_path = directory / "outbound-media"
                 if queue_path.exists():
                     fences.enter_context(_fence(queue_path))
                 backup_root = directory / "database-backups"
@@ -329,6 +395,7 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
                 _backup(source_path, archive / source_path.name)
                 if queue_path.exists():
                     _backup(queue_path, archive / queue_path.name)
+                    _backup_media_directory(queue_media_path, archive / queue_media_path.name)
                 for path in (archive, backup_root, directory):
                     _sync_directory(path)
                 logger.info("Consistent SQLite backups: %s", archive)
@@ -361,7 +428,7 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
                             names = ", ".join(_quote(model._meta.table_name) for model in MODELS)
                             db.execute_sql(f"LOCK TABLE {names} IN SHARE ROW EXCLUSIVE MODE")
                             tables = {model._meta.table_name: _digest(_source_rows(source, model)) for model in MODELS}
-                            if tables != manifest["tables"] or queue_summary != manifest["queue"]:
+                            if tables != manifest["tables"] or not _queue_digest_matches(queue_summary, manifest["queue"]):
                                 raise RuntimeError("Source changed since the committed import; refusing to merge divergent databases.")
                         for model in MODELS:
                             if _target_digest(db, model, batch_size) != tables[model._meta.table_name]:
