@@ -1049,21 +1049,33 @@ class OutboundQueue:
             self.waiters[identifiers[0]] = waiter
             return identifiers[0], waiter
 
-    def heads(self, *, include_payload: bool = True) -> list[QueuedCall]:
+    def heads(
+        self, *, include_payload: bool = True, excluded_ids: Iterable[int] = ()
+    ) -> list[QueuedCall]:
         payload = "q.payload" if include_payload else "X''"
         context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
         receipt = "q.completion_receipt" if include_payload else "NULL"
+        excluded = tuple(excluded_ids)
+        exclusion_sql = ""
+        parameters: tuple[object, ...] = ()
+        if excluded:
+            exclusion_sql = " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
+            parameters = tuple(excluded)
         with self._lock:
-            # Select IDs using a covering index before reading any media BLOBs.
-            # Priority is either 0 or 1; within a priority the smallest ID wins.
+            # Select one runnable head per destination before reading media BLOBs.
+            # Quarantined historical rows may be skipped explicitly so one
+            # unreplayable attachment does not strand all newer traffic for the
+            # same Telegram destination.
             rows = self.connection.execute(
                 f"SELECT q.id, q.priority, q.telegram_chat_id, q.operation, {payload}, q.slave_id, "
                 f"q.required_sender_bot_id, q.created_at, {context}, q.delivery_state, {receipt}, "
                 "length(q.payload) + COALESCE(length(q.log_context), 0) + COALESCE(length(q.completion_receipt), 0) "
                 "FROM outbound_queue AS q JOIN ("
                 "SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id "
-                "FROM outbound_queue WHERE delivery_state = 'queued' GROUP BY telegram_chat_id"
-                ") AS heads ON q.id = heads.head_id ORDER BY q.telegram_chat_id"
+                "FROM outbound_queue WHERE delivery_state = 'queued'" + exclusion_sql +
+                " GROUP BY telegram_chat_id"
+                ") AS heads ON q.id = heads.head_id ORDER BY q.telegram_chat_id",
+                parameters,
             ).fetchall()
         return [QueuedCall(*row) for row in rows]
 
@@ -1084,6 +1096,16 @@ class OutboundQueue:
         if row is None:
             raise QueuePersistenceError(f"Queued row {row_id} disappeared before dispatch.")
         return replace(QueuedCall(*row), stored_bytes=int(size[0]))
+
+    def queued_stored_size(self, row_id: int) -> Optional[int]:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT length(payload) + COALESCE(length(log_context), 0) + "
+                "COALESCE(length(completion_receipt), 0) "
+                "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'",
+                (row_id,),
+            ).fetchone()
+        return None if row is None else int(row[0])
 
     def check_replay_size(self, row_id: int, size: int) -> None:
         if size > self.MAX_REPLAY_BYTES:
@@ -1575,7 +1597,19 @@ class OutboundQueueScheduler:
             retry_destinations = {
                 retry.row.telegram_chat_id for retry in self.blocking_media_retries.values()
             }
-            for row in self.queue.heads(include_payload=False):
+            for row_id in tuple(self.quarantined_rows):
+                stored_size = self.queue.queued_stored_size(row_id)
+                if stored_size is None:
+                    self.quarantined_rows.pop(row_id, None)
+                    continue
+                try:
+                    self.queue.check_replay_size(row_id, stored_size)
+                except QueuePersistenceError:
+                    continue
+                self.quarantined_rows.pop(row_id, None)
+            for row in self.queue.heads(
+                include_payload=False, excluded_ids=self.quarantined_rows
+            ):
                 if (
                     row.id in self.in_flight
                     or row.telegram_chat_id in self.in_flight_destinations

@@ -128,7 +128,8 @@ def test_oversized_legacy_record_is_retained_without_loading_it(tmp_path, state,
         queue.close()
 
 
-def test_oversized_legacy_row_quarantines_only_its_destination(tmp_path):
+@pytest.mark.parametrize("same_destination", [False, True], ids=["other-destination", "same-destination"])
+def test_oversized_legacy_row_does_not_block_newer_runnable_rows(tmp_path, same_destination):
     queue = OutboundQueue(tmp_path)
     queue.MAX_REPLAY_BYTES = 1024 * 1024
     with queue.connection:
@@ -137,8 +138,9 @@ def test_oversized_legacy_row_quarantines_only_its_destination(tmp_path):
             "VALUES(0,1,'send_message',zeroblob(?),0)",
             (8 * 1024 * 1024,),
         )
+    normal_chat = 1 if same_destination else 2
     normal_id, _waiter = queue.enqueue_many(
-        [QueueRequest("send_message", (), {"chat_id": 2, "text": "ok"})],
+        [QueueRequest("send_message", (), {"chat_id": normal_chat, "text": "ok"})],
         lambda _name: send_message,
     )
     adapter = DurableAdapter(reconcile=True)
@@ -147,11 +149,12 @@ def test_oversized_legacy_row_quarantines_only_its_destination(tmp_path):
             scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
             scheduler.dispatch_once()
             assert scheduler.quarantined_rows
+            scheduler.dispatch_once()
             assert not scheduler.stopping
             assert normal_id in scheduler.in_flight
             scheduler.in_flight[normal_id].future.result(timeout=1)
             scheduler.harvest_completed()
-        assert adapter.calls == [(normal_id, 2, "send_message")]
+        assert adapter.calls == [(normal_id, normal_chat, "send_message")]
     finally:
         queue.close()
 
