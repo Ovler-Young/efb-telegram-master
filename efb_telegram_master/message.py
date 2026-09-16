@@ -230,3 +230,7 @@ class ETMMsg(Message):
                 self.file_id = message.video_note.file_id
                 self.file_unique_id = message.video_note.file_unique_id
                 self.mime = 'video/mpeg'
+            else:
+                return
+
+        self.file_bot_id = None

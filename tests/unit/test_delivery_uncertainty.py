@@ -927,3 +927,41 @@ def test_main_reply_confirmation_preserves_file_issuer_through_restart(tmp_path,
         manager._bot.get_file.assert_called_once_with("file-id")
     finally:
         queue.close()
+
+
+@pytest.mark.parametrize("sender_kwargs, expected", [({}, "901"), ({"sender_bot_id": None}, None),
+                                                    ({"sender_bot_id": "902"}, "902")])
+def test_msglog_distinguishes_omitted_sender_from_main(tmp_path, manager_factory, sender_kwargs, expected):
+    db = manager_factory(tmp_path)
+    message = message_with_group()
+    message.sender_bot_id = "901"
+    db.add_or_update_message_log(message, delivered_message(901), **sender_kwargs)
+    assert db.get_msg_log(master_msg_id="42.100").sender_bot_id == expected
+
+
+@pytest.mark.parametrize("media", ["document", "photo"])
+def test_fresh_media_discards_previous_file_owner_override(media):
+    from efb_telegram_master.msg_type import get_msg_type
+
+    message = message_with_group()
+    message.sender_bot_id = "901"
+    message.file_bot_id = "__main__"
+    message.file_id = "old-observed-id"
+    data = delivered_message(901).to_dict()
+    attachment = {"file_id": "fresh-aux-id", "file_unique_id": "fresh-unique-id"}
+    data.pop("document")
+    data[media] = attachment if media == "document" else [{**attachment, "width": 1, "height": 1}]
+    receipt = Message.de_json(data, None)
+    message.type_telegram = get_msg_type(receipt)
+    message.put_telegram_file(receipt)
+    assert message.file_id == "fresh-aux-id" and message.file_bot_id is None
+    assert message.sender_bot_id == "901"
+    manager = manager_adapter()
+    owner = SimpleNamespace(disabled=False, bot=SimpleNamespace(
+        get_file=Mock(side_effect=BadRequest("stop before download")),
+    ))
+    manager.bot_pool = SimpleNamespace(get_bot_by_id=lambda bot_id: owner if bot_id == "901" else None)
+    manager._bot = SimpleNamespace(get_file=Mock(side_effect=AssertionError("main does not own fresh media")))
+    with patch("efb_telegram_master.message.coordinator", SimpleNamespace(master=SimpleNamespace(bot_manager=manager))):
+        message._load_file()
+    owner.bot.get_file.assert_called_once_with("fresh-aux-id")

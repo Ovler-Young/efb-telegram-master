@@ -7,8 +7,9 @@ import time
 import tempfile
 import uuid
 from contextlib import nullcontext, suppress
+from enum import Enum
 from functools import wraps
-from typing import Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING
+from typing import Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING, Union
 
 from peewee import (
     AutoField,
@@ -49,6 +50,10 @@ if TYPE_CHECKING:
     from .chat import ETMChatMember, ETMChatType
 
 database = DatabaseProxy()
+
+
+class _SenderDefault(Enum):
+    INHERIT = 0
 
 
 class DatabaseMetrics(Protocol):
@@ -702,8 +707,10 @@ class DatabaseManager:
                                   msg: ETMMsg,
                                   master_message: Message,
                                   old_message_id: Optional[OldMsgID] = None,
-                                  sender_bot_id: Optional[str] = None):
-        """Log a receipt; sender_bot_id is its author, including None for main."""
+                                  sender_bot_id: Union[str, None, _SenderDefault] = _SenderDefault.INHERIT):
+        """Inherit an omitted sender from msg; explicit None identifies main."""
+        if sender_bot_id is _SenderDefault.INHERIT:
+            sender_bot_id = msg.sender_bot_id
         sent_message_id = message_id_to_str(
             TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)
         )
