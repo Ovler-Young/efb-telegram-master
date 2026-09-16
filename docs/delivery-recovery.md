@@ -38,11 +38,12 @@ limit, or longer timeout can supply that missing evidence.
    delivered bot message** with `/confirm_send ROW_ID`. A forward is not accepted.
    The chat and sending bot must match the recorded attempt. An operator hold
    from an old version accepts only one of the currently configured bots.
-5. The reply supplies the actual Telegram Message and file ID. The handler saves
-   its receipt first and invokes the existing MsgLog reconciliation path without
-   another send. The queue row/media are removed only after successful MsgLog
-   reconciliation. On a database failure the receipt stays `sent_pending` and is
-   retried as a log write, never as another upload.
+5. The reply supplies the actual Telegram Message and file ID. The handler keeps
+   the actual author separate from the bot that issued the observed file ID.
+   It saves both in the receipt and invokes MsgLog reconciliation without
+   resending the confirmed message. The queue row/media are removed only after
+   successful MsgLog reconciliation. On a database failure the receipt stays
+   `sent_pending` and is retried as a log write, never as another upload.
 
 The command deliberately does not delete any duplicate messages already on
 Telegram and does not fabricate a message ID. Confirming the wrong queued item
@@ -51,7 +52,33 @@ message. If no delivered message can be established, keep the row held and
 investigate. There is no automatic "assume failure and resend" timer.
 
 Do not downgrade to a revision that ignores `delivery_hold`: it can replay held
-rows. The normal PostgreSQL backup includes these additive queue columns.
+rows. The current decoder accepts older author-only receipts and new receipts
+with a separate file-ID issuer; older code cannot decode the new three-element
+receipts, even though their format prefix is unchanged. This is not rollback
+compatibility. The migration backup includes the queue columns and receipts.
+Historically misrecorded file owners are not retroactively repaired.
+
+## Primary messages and supplemental work
+
+For long text or captions, the primary response receipt and a separate durable
+full-content attachment request commit together. MsgLog reconciles the primary
+message independently of the attachment. A failed attachment does not cause the
+primary message to be resent. Permanent supplemental rejection retains the work
+with a `supplement_failed:` hold; an ambiguous supplemental send stays uncertain
+and needs confirmation of that supplemental row. Confirming a held primary
+message also preserves any required supplemental work.
+
+History media acquisition has a different retry boundary: after an explicit copy
+rejection, a transient `get_file` or download failure can retry before any
+fallback upload is attempted. Acquisition backoff persists across restart,
+caps its exponential component at 60 seconds and respects a longer RetryAfter.
+Permanent acquisition rejection or an unavailable issuer retains failed work.
+A lost copy or upload response still needs confirmation; it never authorizes an
+acquisition retry that would duplicate an uncertain send.
+
+The file-ID issuer is used only for acquisition. Normal sends, supplemental sends
+and history text batching use ordinary sender selection, without pinning to the
+original bot. Edit/delete routing continues to use the actual author.
 
 ## Diagnostics and streaming
 
@@ -70,5 +97,11 @@ WHERE delivery_hold IS NOT NULL;
 Sidecar uploads are wrapped with PTB `InputFile(read_file_handle=False)`, including
 nested input media. Passing a normal file object to PTB would otherwise read the
 whole attachment before the HTTP request, defeating the sidecar memory benefit.
+Recovered legacy media retains its original filename and MIME metadata through
+sidecar storage and multipart upload. Failed preparation removes only newly
+created sidecars; failed decoding closes handles opened before the failure.
+Undecodable queued payloads remain held as `invalid_payload`, preserving the row
+and existing media while allowing later runnable rows to continue. This hold
+indicates a payload problem, not evidence that Telegram accepted the message.
 Configured request timeouts remain unchanged; expiry never authorizes an
 unconfirmed duplicate upload.
