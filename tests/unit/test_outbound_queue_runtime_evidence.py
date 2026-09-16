@@ -1355,7 +1355,7 @@ def test_manager_registers_runtime_snapshot_collectors_with_configured_destinati
     queue.close()
 
 
-def test_queue_metrics_start_from_retained_rows_and_publish_terminal_discard(tmp_path: Path) -> None:
+def test_queue_metrics_include_corrupt_retained_rows_without_removal(tmp_path: Path) -> None:
     retained = OutboundQueue(tmp_path)
     enqueue(retained, 53, "retained")
     retained.close()
@@ -1373,9 +1373,10 @@ def test_queue_metrics_start_from_retained_rows_and_publish_terminal_discard(tmp
     scheduler.dispatch_once()
 
     rendered = generate_latest(metrics.registry).decode()
-    assert "etm_outbound_queue_depth 1.0" in rendered
-    assert 'etm_outbound_queue_removals_total{operation="send_message",outcome="terminal_discard",priority="blocking"} 1.0' in rendered
-    assert 'etm_outbound_queue_residence_seconds_count{operation="send_message",outcome="terminal_discard",priority="blocking"} 1.0' in rendered
+    assert "etm_outbound_queue_depth 2.0" in rendered
+    assert 'outcome="terminal_discard"' not in rendered
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone() == (2,)
+    assert not scheduler.stopping
     queue.close()
 
 
@@ -1529,7 +1530,7 @@ def test_startup_wakes_recompute_deadline_without_dequeue_when_worker_permit_is_
     scheduler._permits.release()
 
 
-def test_invalid_payload_is_terminally_discarded_without_worker_or_sender_acquisition(
+def test_invalid_payload_is_retained_without_upload_and_later_traffic_runs(
     retained_queue: OutboundQueue,
 ) -> None:
     retained_queue.connection.execute(
@@ -1548,11 +1549,28 @@ def test_invalid_payload_is_terminally_discarded_without_worker_or_sender_acquis
     scheduler.dispatch_once()
 
     with pytest.raises(InvalidQueuedPayloadError):
-        waiter.result()
-    assert retained_queue.heads() == []
+        waiter.result(timeout=1)
+    assert row_id not in retained_queue.waiters
+    assert retained_queue.load_queued(row_id).payload == b"\x02"
+    assert retained_queue.heads(ready_only=True) == []
     assert executor.submissions == []
+    assert adapter.executed == []
     assert adapter.failures == []
     assert scheduler.in_flight == {}
+    assert not scheduler.stopping
+
+    valid_id, valid_waiter = enqueue(retained_queue, 151, "later valid message")
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    function, arguments, future = executor.submissions[0]
+    future.set_result(function(*arguments))
+    scheduler.harvest_completed()
+    assert valid_waiter.result(timeout=1) == valid_id
+    assert adapter.executed == [valid_id]
+    assert retained_queue.load_queued(row_id).payload == b"\x02"
+    assert retained_queue.heads(ready_only=True) == []
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
 
 
 def test_shutdown_final_snapshot_keeps_retained_eventual_rows(

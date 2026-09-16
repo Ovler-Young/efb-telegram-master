@@ -9,8 +9,11 @@ import logging
 import numbers
 import os
 import pickle
+import pickletools
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 from functools import partial
@@ -18,7 +21,7 @@ import time
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Optional, Protocol
+from typing import Callable, IO, Iterable, Mapping, Optional, Protocol
 from urllib.parse import unquote, urlsplit
 
 from telegram import (
@@ -125,6 +128,10 @@ class SchedulerStoppedError(QueueError):
 
 class QueuePersistenceError(QueueError):
     pass
+
+
+class OversizedQueuedPayloadError(QueuePersistenceError):
+    """A queued row exceeds the replay memory budget and remains retained."""
 
 
 class DeliveryUncertainError(QueueError):
@@ -287,6 +294,169 @@ class _StoredMediaSnapshot:
     input_file: bool = False
     attach_name: Optional[str] = None
     mimetype: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _LegacyInlineBlob:
+    """A v1 pickle byte string copied directly from SQLite into a sidecar."""
+
+    storage_name: str
+
+
+class _LegacyBytesIO:
+    """Receive a legacy BytesIO pickle state without materializing its bytes."""
+
+    def __setstate__(self, state) -> None:
+        try:
+            content = state[0]
+        except (IndexError, TypeError) as error:
+            raise InvalidQueuedPayloadError("Legacy BytesIO has an invalid state.") from error
+        if not isinstance(content, _LegacyInlineBlob):
+            raise InvalidQueuedPayloadError("Legacy BytesIO was not recovered as a sidecar.")
+        attributes = state[2] if len(state) > 2 else None
+        name = attributes.get("name") if isinstance(attributes, dict) else None
+        filename = Path(name).name if isinstance(name, (str, Path)) else None
+        self.snapshot = _StoredMediaSnapshot(content.storage_name, filename)
+
+
+def _restore_legacy_inline_blob(storage_name: str) -> _LegacyInlineBlob:
+    return _LegacyInlineBlob(storage_name)
+
+
+class _LegacyRecoveryUnpickler(pickle.Unpickler):
+    """Map v1 BytesIO objects to a state holder while decoding a filtered pickle."""
+
+    def find_class(self, module: str, name: str):
+        if module == "_io" and name == "BytesIO":
+            return _LegacyBytesIO
+        return super().find_class(module, name)
+
+
+# Python 3.10 can embed SQLite without exporting its C symbols. This helper
+# loads SQLite only in a separate process, so closing its files cannot release
+# the queue process's transaction locks. stdout carries a length then BLOB bytes.
+_SQLITE_BLOB_HELPER = r"""
+import ctypes
+import ctypes.util
+import os
+import sys
+
+name = ctypes.util.find_library("sqlite3")
+if not name:
+    raise RuntimeError("SQLite incremental BLOB access is unavailable")
+library = ctypes.CDLL(name)
+library.sqlite3_open_v2.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_char_p]
+library.sqlite3_close.argtypes = [ctypes.c_void_p]
+library.sqlite3_busy_timeout.argtypes = [ctypes.c_void_p, ctypes.c_int]
+library.sqlite3_blob_open.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_longlong, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+library.sqlite3_blob_bytes.argtypes = [ctypes.c_void_p]
+library.sqlite3_blob_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+library.sqlite3_blob_close.argtypes = [ctypes.c_void_p]
+database = ctypes.c_void_p()
+blob = ctypes.c_void_p()
+try:
+    if library.sqlite3_open_v2(os.fsencode(sys.argv[1]), ctypes.byref(database), 1, None):
+        raise RuntimeError("Cannot open queue")
+    library.sqlite3_busy_timeout(database, 5000)
+    if library.sqlite3_blob_open(database, b"main", b"outbound_queue", b"payload", int(sys.argv[2]), 0, ctypes.byref(blob)):
+        raise RuntimeError("Cannot open queued BLOB")
+    length = library.sqlite3_blob_bytes(blob)
+    sys.stdout.buffer.write(length.to_bytes(8, "little"))
+    sys.stdout.buffer.flush()
+    buffer = ctypes.create_string_buffer(64 * 1024)
+    for offset in range(0, length, len(buffer)):
+        size = min(len(buffer), length - offset)
+        if library.sqlite3_blob_read(blob, buffer, size, offset):
+            raise RuntimeError("Cannot read queued BLOB")
+        sys.stdout.buffer.write(buffer.raw[:size])
+    sys.stdout.buffer.flush()
+finally:
+    if blob.value:
+        library.sqlite3_blob_close(blob)
+    if database.value:
+        library.sqlite3_close(database)
+"""
+
+
+class _SQLiteBlobReader:
+    """Read one SQLite BLOB incrementally while preserving queue writer locks."""
+
+    def __init__(self, database: Path, row_id: int):
+        self._offset = 0
+        self._connection: Optional[sqlite3.Connection] = None
+        self._process: Optional[subprocess.Popen[bytes]] = None
+        self._stream: Optional[IO[bytes]] = None
+        try:
+            if hasattr(sqlite3.Connection, "blobopen"):
+                self._connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
+                blob = getattr(self._connection, "blobopen")("outbound_queue", "payload", row_id, readonly=True)
+                self._stream = blob
+                self.length = len(blob)
+            else:
+                self._process = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", _SQLITE_BLOB_HELPER, str(database), str(row_id)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+                self._stream = self._process.stdout
+                assert self._stream is not None
+                header = self._stream.read(8)
+                if len(header) != 8:
+                    raise QueuePersistenceError("Unable to open queued BLOB in the recovery process.")
+                self.length = int.from_bytes(header, "little")
+        except BaseException:
+            self.close()
+            raise
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = self.length - self._offset
+        size = min(size, self.length - self._offset)
+        if size <= 0:
+            return b""
+        assert self._stream is not None
+        value = self._stream.read(size)
+        if len(value) != size:
+            raise QueuePersistenceError("Unable to read queued BLOB incrementally.")
+        self._offset += size
+        return value
+
+    def readline(self, size: int = -1) -> bytes:
+        # Pickle only uses this for old text protocol payloads, which v1 never wrote.
+        return self.read(size)
+
+    def close(self) -> None:
+        try:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+        finally:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+            if self._process is not None:
+                if self._process.poll() is None:
+                    self._process.terminate()
+                self._process.wait()
+                self._process = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+
+class _BlobSlice:
+    def __init__(self, source: _SQLiteBlobReader, length: int):
+        self.source = source
+        self.remaining = length
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = self.remaining
+        value = self.source.read(min(size, self.remaining))
+        self.remaining -= len(value)
+        return value
 
 
 class _NamedMediaFile(io.BufferedReader):
@@ -520,6 +690,7 @@ class OutboundQueue:
         input_file: bool = False,
         attach_name: Optional[str] = None,
         mimetype: Optional[str] = None,
+        created_media: Optional[set[str]] = None,
     ) -> _StoredMediaSnapshot:
         suffix = Path(filename).suffix if filename else ""
         fd, path = tempfile.mkstemp(prefix="media-", suffix=suffix, dir=self.media_dir)
@@ -542,21 +713,32 @@ class OutboundQueue:
             except FileNotFoundError:
                 pass
             raise
-        return _StoredMediaSnapshot(
-            Path(path).name,
+        storage_name = Path(path).name
+        snapshot = _StoredMediaSnapshot(
+            storage_name,
             filename,
             input_file=input_file,
             attach_name=attach_name,
             mimetype=mimetype,
         )
+        if created_media is not None:
+            created_media.add(storage_name)
+        return snapshot
 
     def _snapshot_media_value(
         self,
         value: object,
         cleanup_files: frozenset[str] = frozenset(),
+        created_media: Optional[set[str]] = None,
     ) -> object:
+        if isinstance(value, _StoredMediaSnapshot):
+            return value
+        if isinstance(value, _LegacyInlineBlob):
+            return _StoredMediaSnapshot(value.storage_name, None)
+        if isinstance(value, _LegacyBytesIO):
+            return value.snapshot
         if isinstance(value, bytes):
-            return self._store_media_stream(io.BytesIO(value), None)
+            return self._store_media_stream(io.BytesIO(value), None, created_media=created_media)
         local_path = self._local_media_path(value)
         if local_path is not None:
             try:
@@ -575,7 +757,7 @@ class OutboundQueue:
                             cleanup_external=True,
                         )
                 with local_path.open("rb") as source:
-                    return self._store_media_stream(source, local_path.name)
+                    return self._store_media_stream(source, local_path.name, created_media=created_media)
             except (OSError, ValueError, QueueEnqueueError) as error:
                 raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
         if isinstance(value, str):
@@ -590,8 +772,9 @@ class OutboundQueue:
                     input_file=True,
                     attach_name=value.attach_name,
                     mimetype=value.mimetype,
+                    created_media=created_media,
                 )
-            captured = self._snapshot_media_value(stored_content, cleanup_files)
+            captured = self._snapshot_media_value(stored_content, cleanup_files, created_media)
             if isinstance(captured, _StoredMediaSnapshot):
                 return replace(
                     captured,
@@ -614,7 +797,7 @@ class OutboundQueue:
             seek(0)
             source_name = getattr(value, "name", None)
             filename = Path(source_name).name if isinstance(source_name, (str, Path)) else None
-            snapshot = self._store_media_stream(value, filename or None)
+            snapshot = self._store_media_stream(value, filename or None, created_media=created_media)
         except Exception as error:
             raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
         finally:
@@ -653,7 +836,7 @@ class OutboundQueue:
 
     @classmethod
     def _needs_media_snapshot(cls, value: object) -> bool:
-        return isinstance(value, bytes) or cls._local_media_path(value) is not None or isinstance(value, InputFile) or any(
+        return isinstance(value, (_StoredMediaSnapshot, _LegacyInlineBlob, _LegacyBytesIO, bytes)) or cls._local_media_path(value) is not None or isinstance(value, InputFile) or any(
             callable(getattr(value, name, None)) for name in ("tell", "seek", "read")
         )
 
@@ -668,7 +851,7 @@ class OutboundQueue:
         raise QueueEnqueueError("Unable to serialize queued Telegram call.")
 
     def _normalize_input_media(
-        self, value: object, cleanup_files: frozenset[str]
+        self, value: object, cleanup_files: frozenset[str], created_media: Optional[set[str]] = None,
     ) -> object:
         if not isinstance(value, InputMedia):
             return value
@@ -676,7 +859,7 @@ class OutboundQueue:
         self._validate_media_value(value.media, _NESTED_MEDIA_TYPES.get(type(value)))
         if self._needs_media_snapshot(value.media):
             object.__setattr__(
-                normalized, "media", self._snapshot_media_value(value.media, cleanup_files)
+                normalized, "media", self._snapshot_media_value(value.media, cleanup_files, created_media)
             )
         for field in _INPUT_MEDIA_ATTACHMENT_FIELDS.get(type(value), ()):
             attachment = getattr(value, field, None)
@@ -685,12 +868,13 @@ class OutboundQueue:
             self._validate_media_value(attachment)
             if self._needs_media_snapshot(attachment):
                 object.__setattr__(
-                    normalized, field, self._snapshot_media_value(attachment, cleanup_files)
+                    normalized, field, self._snapshot_media_value(attachment, cleanup_files, created_media)
                 )
         return normalized
 
     def _normalize_direct_media(
-        self, operation: str, args: tuple, kwargs: dict, cleanup_files: frozenset[str]
+        self, operation: str, args: tuple, kwargs: dict, cleanup_files: frozenset[str],
+        created_media: Optional[set[str]] = None,
     ) -> tuple[tuple, dict]:
         argument = _DIRECT_MEDIA_ARGUMENTS.get(operation)
         if argument is None:
@@ -703,7 +887,7 @@ class OutboundQueue:
         self._validate_media_value(value, argument.telegram_type)
         if not self._needs_media_snapshot(value):
             return args, kwargs
-        snapshot = self._snapshot_media_value(value, cleanup_files)
+        snapshot = self._snapshot_media_value(value, cleanup_files, created_media)
         explicit_filename = kwargs.get("filename")
         if explicit_filename is not None and not isinstance(explicit_filename, str):
             raise QueueEnqueueError("Unable to serialize queued Telegram call.")
@@ -718,7 +902,8 @@ class OutboundQueue:
         return args, normalized_kwargs
 
     def _normalize_nested_media(
-        self, operation: str, args: tuple, kwargs: dict, cleanup_files: frozenset[str]
+        self, operation: str, args: tuple, kwargs: dict, cleanup_files: frozenset[str],
+        created_media: Optional[set[str]] = None,
     ) -> tuple[tuple, dict]:
         argument = _NESTED_MEDIA_ARGUMENTS.get(operation)
         if argument is None:
@@ -734,11 +919,11 @@ class OutboundQueue:
                 type(item) in _MEDIA_GROUP_TYPES for item in value
             ):
                 raise QueueEnqueueError("Unable to serialize queued Telegram call.")
-            normalized = type(value)(self._normalize_input_media(item, cleanup_files) for item in value)
+            normalized = type(value)(self._normalize_input_media(item, cleanup_files, created_media) for item in value)
         else:
             if not isinstance(value, InputMedia):
                 raise QueueEnqueueError("Unable to serialize queued Telegram call.")
-            normalized = self._normalize_input_media(value, cleanup_files)
+            normalized = self._normalize_input_media(value, cleanup_files, created_media)
         if positional:
             normalized_args = list(args)
             normalized_args[index] = normalized
@@ -748,7 +933,8 @@ class OutboundQueue:
         return args, normalized_kwargs
 
     def _normalize_thumbnail(
-        self, operation: str, kwargs: dict, cleanup_files: frozenset[str]
+        self, operation: str, kwargs: dict, cleanup_files: frozenset[str],
+        created_media: Optional[set[str]] = None,
     ) -> dict:
         thumbnail = kwargs.get("thumbnail")
         if operation not in _THUMBNAIL_OPERATIONS or thumbnail is None:
@@ -757,11 +943,12 @@ class OutboundQueue:
         if not self._needs_media_snapshot(thumbnail):
             return kwargs
         normalized_kwargs = dict(kwargs)
-        normalized_kwargs["thumbnail"] = self._snapshot_media_value(thumbnail, cleanup_files)
+        normalized_kwargs["thumbnail"] = self._snapshot_media_value(thumbnail, cleanup_files, created_media)
         return normalized_kwargs
 
     def _normalize_keyword_media(
-        self, operation: str, kwargs: dict, cleanup_files: frozenset[str]
+        self, operation: str, kwargs: dict, cleanup_files: frozenset[str],
+        created_media: Optional[set[str]] = None,
     ) -> dict:
         keywords = _KEYWORD_MEDIA_ARGUMENTS.get(operation, ())
         normalized_kwargs = kwargs
@@ -772,7 +959,7 @@ class OutboundQueue:
             self._validate_media_value(value)
             if not self._needs_media_snapshot(value):
                 continue
-            snapshot = self._snapshot_media_value(value, cleanup_files)
+            snapshot = self._snapshot_media_value(value, cleanup_files, created_media)
             if normalized_kwargs is kwargs:
                 normalized_kwargs = dict(kwargs)
             normalized_kwargs[keyword] = snapshot
@@ -785,7 +972,7 @@ class OutboundQueue:
         except Exception as error:
             raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
 
-    def _restore_media_references(self, value: object) -> object:
+    def _restore_media_references(self, value: object, opened: list[object]) -> object:
         if isinstance(value, _StoredMediaSnapshot):
             if value.external_uri is not None:
                 return value.external_uri
@@ -798,7 +985,9 @@ class OutboundQueue:
                 raise InvalidQueuedPayloadError(
                     f"Queued media file {value.storage_name!r} is missing."
                 ) from error
+            opened.append(raw)
             stream = _NamedMediaFile(raw, value.filename)
+            opened.append(stream)
             if not value.input_file:
                 return stream
             input_file = InputFile(
@@ -812,19 +1001,19 @@ class OutboundQueue:
                 input_file.mimetype = value.mimetype
             return input_file
         if isinstance(value, tuple):
-            return tuple(self._restore_media_references(item) for item in value)
+            return tuple(self._restore_media_references(item, opened) for item in value)
         if isinstance(value, list):
-            return [self._restore_media_references(item) for item in value]
+            return [self._restore_media_references(item, opened) for item in value]
         if isinstance(value, dict):
-            return {key: self._restore_media_references(item) for key, item in value.items()}
+            return {key: self._restore_media_references(item, opened) for key, item in value.items()}
         if isinstance(value, InputMedia):
             restored_media = copy.copy(value)
-            object.__setattr__(restored_media, "media", self._restore_media_references(value.media))
+            object.__setattr__(restored_media, "media", self._restore_media_references(value.media, opened))
             for field in _INPUT_MEDIA_ATTACHMENT_FIELDS.get(type(value), ()):
                 attachment = getattr(value, field, None)
                 if attachment is not None:
                     object.__setattr__(
-                        restored_media, field, self._restore_media_references(attachment)
+                        restored_media, field, self._restore_media_references(attachment, opened)
                     )
             return restored_media
         return value
@@ -847,10 +1036,15 @@ class OutboundQueue:
     def decode_payload(self, payload: bytes) -> tuple[tuple, dict]:
         args, kwargs = self.decode_payload_raw(payload)
         if payload[0] == 2:
-            restored_args = self._restore_media_references(args)
-            restored_kwargs = self._restore_media_references(kwargs)
-            assert isinstance(restored_args, tuple) and isinstance(restored_kwargs, dict)
-            return restored_args, restored_kwargs
+            opened: list[object] = []
+            try:
+                restored_args = self._restore_media_references(args, opened)
+                restored_kwargs = self._restore_media_references(kwargs, opened)
+                assert isinstance(restored_args, tuple) and isinstance(restored_kwargs, dict)
+                return restored_args, restored_kwargs
+            except BaseException:
+                self.close_payload_resources(tuple(reversed(opened)))
+                raise
         return args, kwargs
 
     def _collect_media_references(self, value: object, found: list[_StoredMediaSnapshot]) -> None:
@@ -916,16 +1110,21 @@ class OutboundQueue:
     def _cleanup_orphan_media(self) -> None:
         referenced: set[str] = set()
         try:
-            cursor = self.connection.execute(
-                "SELECT payload FROM outbound_queue WHERE substr(payload, 1, 1) = X'02'"
-            )
-            for (payload,) in cursor:
-                try:
-                    value = pickle.loads(payload[1:])
-                except Exception:
-                    # A corrupt live row may still reference any sidecar name.
-                    # Preserve all files rather than risk deleting its media.
-                    return
+            cursor = self.connection.execute("SELECT id FROM outbound_queue")
+            for (row_id,) in cursor:
+                with _SQLiteBlobReader(self.path, int(row_id)) as payload:
+                    if payload.read(1) != b"\x02":
+                        continue
+                    # A v2 row can still contain oversized opaque data.  Keep
+                    # all sidecars until bounded recovery can inspect it.
+                    if payload.length > self.MAX_REPLAY_BYTES:
+                        return
+                    try:
+                        value = pickle.Unpickler(payload).load()
+                    except Exception:
+                        # A corrupt live row may still reference any sidecar name.
+                        # Preserve all files rather than risk deleting its media.
+                        return
                 references: list[_StoredMediaSnapshot] = []
                 self._collect_media_references(value, references)
                 for item in references:
@@ -1059,43 +1258,57 @@ class OutboundQueue:
             raise QueueEnqueueError("chat_id must be a non-Boolean integral value.")
         return int(chat_id)
 
-    def _prepare(self, request: QueueRequest, operation: Callable[..., object]) -> tuple[str, tuple, dict, int, int, Optional[str], Optional[str], bytes, Optional[bytes]]:
+    def _prepare(self, request: QueueRequest, operation: Callable[..., object]) -> tuple[str, tuple, dict, int, int, Optional[str], Optional[str], bytes, Optional[bytes], set[str]]:
         if not isinstance(request.operation, str) or not isinstance(request.args, tuple) or not isinstance(request.kwargs, dict):
             raise QueueEnqueueError("Queue request must be (operation: str, args: tuple, kwargs: dict).")
         cleanup_files = frozenset(
             str(Path(path).resolve()) for path in request.cleanup_files
         )
-        telegram_kwargs, priority, slave_id, required_sender = self._validate_metadata(
-            request.operation, request.kwargs
-        )
-        supplement = telegram_kwargs.pop(SUPPLEMENTAL_KEY, False)
-        history_replay = telegram_kwargs.pop(HISTORY_REPLAY_KEY, None)
-        if history_replay is not None and not isinstance(history_replay, dict):
-            raise QueueEnqueueError("History replay metadata must be a mapping.")
-        telegram_args, telegram_kwargs = self._normalize_direct_media(
-            request.operation, request.args, telegram_kwargs, cleanup_files
-        )
-        telegram_args, telegram_kwargs = self._normalize_nested_media(
-            request.operation, telegram_args, telegram_kwargs, cleanup_files
-        )
-        telegram_kwargs = self._normalize_thumbnail(
-            request.operation, telegram_kwargs, cleanup_files
-        )
-        telegram_kwargs = self._normalize_keyword_media(
-            request.operation, telegram_kwargs, cleanup_files
-        )
-        chat_id = self._destination(operation, telegram_args, telegram_kwargs)
-        if history_replay is not None:
-            telegram_kwargs[HISTORY_REPLAY_KEY] = history_replay
-        if supplement:
-            telegram_kwargs[SUPPLEMENTAL_KEY] = True
-        payload = self.encode_payload(telegram_args, telegram_kwargs)
-        if request.log_context is not None and not isinstance(request.log_context, bytes):
-            raise QueueEnqueueError("Queued log context must be bytes when supplied.")
-        return (
-            request.operation, telegram_args, telegram_kwargs, chat_id, priority,
-            slave_id, required_sender, payload, request.log_context,
-        )
+        created_media: set[str] = set()
+        try:
+            telegram_kwargs, priority, slave_id, required_sender = self._validate_metadata(
+                request.operation, request.kwargs
+            )
+            supplement = telegram_kwargs.pop(SUPPLEMENTAL_KEY, False)
+            history_replay = telegram_kwargs.pop(HISTORY_REPLAY_KEY, None)
+            if history_replay is not None and not isinstance(history_replay, dict):
+                raise QueueEnqueueError("History replay metadata must be a mapping.")
+            telegram_args, telegram_kwargs = self._normalize_direct_media(
+                request.operation, request.args, telegram_kwargs, cleanup_files, created_media
+            )
+            telegram_args, telegram_kwargs = self._normalize_nested_media(
+                request.operation, telegram_args, telegram_kwargs, cleanup_files, created_media
+            )
+            telegram_kwargs = self._normalize_thumbnail(
+                request.operation, telegram_kwargs, cleanup_files, created_media
+            )
+            telegram_kwargs = self._normalize_keyword_media(
+                request.operation, telegram_kwargs, cleanup_files, created_media
+            )
+            chat_id = self._destination(operation, telegram_args, telegram_kwargs)
+            if history_replay is not None:
+                telegram_kwargs[HISTORY_REPLAY_KEY] = history_replay
+            if supplement:
+                telegram_kwargs[SUPPLEMENTAL_KEY] = True
+            payload = self.encode_payload(telegram_args, telegram_kwargs)
+            if request.log_context is not None and not isinstance(request.log_context, bytes):
+                raise QueueEnqueueError("Queued log context must be bytes when supplied.")
+            return (
+                request.operation, telegram_args, telegram_kwargs, chat_id, priority,
+                slave_id, required_sender, payload, request.log_context, created_media,
+            )
+        except BaseException:
+            self._cleanup_created_media(created_media)
+            raise
+
+    def _cleanup_created_media(self, storage_names: Iterable[str]) -> None:
+        for storage_name in storage_names:
+            try:
+                (self.media_dir / storage_name).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
     def enqueue_many(
         self, requests: Iterable[QueueRequest], operation_resolver: Callable[[str], Callable[..., object]],
@@ -1110,12 +1323,12 @@ class OutboundQueue:
                 prepared.append(self._prepare(request, operation_resolver(request.operation)))
         except Exception:
             for item in prepared:
-                self.cleanup_payload_media(item[7])
+                self._cleanup_created_media(item[9])
             raise
         destinations = {(item[3], item[4]) for item in prepared}
         if len(destinations) != 1:
             for item in prepared:
-                self.cleanup_payload_media(item[7])
+                self._cleanup_created_media(item[9])
             raise QueueEnqueueError("Queued request sequence must share chat_id and priority.")
         with self._lock:
             try:
@@ -1128,7 +1341,7 @@ class OutboundQueue:
                 )
                 identifiers: list[int] = []
                 now = time.time()
-                for operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context in prepared:
+                for operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media in prepared:
                     cursor = self.connection.execute(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
@@ -1146,10 +1359,10 @@ class OutboundQueue:
                 except sqlite3.Error:
                     pass
                 for item in prepared:
-                    self.cleanup_payload_media(item[7])
+                    self._cleanup_created_media(item[9])
                 raise QueueEnqueueError("Unable to commit queued Telegram call.") from error
             if self.metrics is not None:
-                for operation, _args, _kwargs, _chat_id, priority, _slave_id, _required_sender, _payload, _log_context in prepared:
+                for operation, _args, _kwargs, _chat_id, priority, _slave_id, _required_sender, _payload, _log_context, _created_media in prepared:
                     self.metrics.record_enqueued(priority, operation)
             self.refresh_depth()
             waiter: Future = Future()
@@ -1242,82 +1455,371 @@ class OutboundQueue:
     def queued_payload_version(self, row_id: int) -> Optional[int]:
         with self._lock:
             row = self.connection.execute(
-                "SELECT hex(substr(payload, 1, 1)) FROM outbound_queue "
+                "SELECT 1 FROM outbound_queue "
                 "WHERE id = ? AND delivery_state = 'queued'",
                 (row_id,),
             ).fetchone()
-        if row is None or not row[0]:
-            return None
-        return int(str(row[0]), 16)
-
-    def load_legacy_queued_for_recovery(self, row_id: int) -> QueuedCall:
-        """Load one bounded v1 row so it can be rewritten to sidecar storage."""
-        with self._lock:
-            metadata = self.connection.execute(
-                "SELECT length(payload) + COALESCE(length(log_context), 0) + "
-                "COALESCE(length(completion_receipt), 0), hex(substr(payload, 1, 1)) "
-                "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'",
-                (row_id,),
-            ).fetchone()
-            if metadata is None:
-                raise QueuePersistenceError(f"Queued row {row_id} disappeared before recovery.")
-            size, version_hex = int(metadata[0]), str(metadata[1])
-            if version_hex != "01":
-                raise QueuePersistenceError(f"Queued row {row_id} is not a legacy v1 payload.")
-            row = self.connection.execute(
-                "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
-                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
-                "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'",
-                (row_id,),
-            ).fetchone()
         if row is None:
-            raise QueuePersistenceError(f"Queued row {row_id} disappeared before recovery.")
-        return replace(QueuedCall(*row), stored_bytes=size)
+            return None
+        with _SQLiteBlobReader(self.path, row_id) as payload:
+            marker = payload.read(1)
+        return marker[0] if marker else None
 
-    def rewrite_legacy_media_payload(self, row: QueuedCall) -> QueuedCall:
-        """Rewrite one loaded v1 media call to compact v2 sidecar storage."""
-        if not row.payload or row.payload[0] != 1:
-            return row
-        args, kwargs = self.decode_payload_raw(row.payload)
-        normalized_args, normalized_kwargs = self._normalize_direct_media(
-            row.operation, args, kwargs, frozenset()
+    @staticmethod
+    def _legacy_marker_pickle(storage_name: str) -> bytes:
+        module = b"efb_telegram_master.outbound"
+        name = b"_restore_legacy_inline_blob"
+        encoded_name = storage_name.encode("utf-8")
+        if len(encoded_name) > 255:
+            raise QueuePersistenceError("Legacy media storage name is unexpectedly long.")
+        return (
+            b"c" + module + b"\n" + name + b"\n" +
+            b"\x8c" + bytes((len(encoded_name),)) + encoded_name + b"\x85R"
         )
-        normalized_args, normalized_kwargs = self._normalize_nested_media(
-            row.operation, normalized_args, normalized_kwargs, frozenset()
-        )
-        normalized_kwargs = self._normalize_thumbnail(
-            row.operation, normalized_kwargs, frozenset()
-        )
-        normalized_kwargs = self._normalize_keyword_media(
-            row.operation, normalized_kwargs, frozenset()
-        )
-        payload = self.encode_payload(normalized_args, normalized_kwargs)
+
+    def _stream_legacy_pickle(
+        self, source: _SQLiteBlobReader, *, max_output_bytes: Optional[int] = None,
+    ) -> tuple[tuple, dict, set[str]]:
+        """Replace v1 ``BytesIO`` data while retaining bounded non-media values.
+
+        ``pickletools`` supplies the complete opcode table.  Argument sizes are
+        checked before a variable payload is read, so bytes inside ordinary
+        values are never mistaken for opcodes and cannot inflate recovery.
+        """
+        if max_output_bytes is None:
+            max_output_bytes = self.MAX_REPLAY_BYTES
+        output = bytearray()
+        opcodes = {operation.code: operation for operation in pickletools.opcodes}
+        created: set[str] = set()
+        marker = object()
+        other = object()
+        bytesio_class = object()
+        bytesio_instance = object()
+        stack: list[object] = []
+        memo: dict[int, object] = {}
+        expecting_bytesio_content = False
+        fixed_readers = {
+            "uint1": 1, "uint2": 2, "uint4": 4, "int4": 4,
+            "uint8": 8, "float8": 8,
+        }
+        sized_readers = {
+            "long1": 1, "long4": 4,
+            "string1": 1, "string4": 4,
+            "bytes1": 1, "bytes4": 4, "bytes8": 8,
+            "bytearray8": 8,
+            "unicodestring1": 1, "unicodestring4": 4,
+            "unicodestring8": 8,
+        }
+        newline_readers = {
+            "decimalnl_short", "decimalnl_long", "stringnl",
+            "unicodestringnl", "floatnl", "stringnl_noescape",
+            "stringnl_noescape_pair",
+        }
+
+        def take(size: int) -> bytes:
+            value = source.read(size)
+            if len(value) != size:
+                raise InvalidQueuedPayloadError("Legacy queued payload is truncated.")
+            return value
+
+        def reserve(size: int) -> None:
+            if len(output) + size > max_output_bytes:
+                raise OversizedQueuedPayloadError(
+                    f"Legacy payload needs more than the {self.MAX_REPLAY_BYTES}-byte replay budget. "
+                    "Row retained; offline recovery is required before it can be loaded safely."
+                )
+
+        def append(value: bytes) -> None:
+            reserve(len(value))
+            output.extend(value)
+
+        def pop() -> object:
+            return stack.pop() if stack else other
+
+        def pop_mark() -> list[object]:
+            items: list[object] = []
+            while stack:
+                item = stack.pop()
+                if item is marker:
+                    return items
+                items.append(item)
+            return items
+
+        def memoize(index: int) -> None:
+            memo[index] = stack[-1] if stack else other
+
+        def copy_newline() -> list[bytes]:
+            parts: list[bytes] = []
+            for _ in range(2):
+                part = bytearray()
+                while True:
+                    reserve(1)
+                    character = take(1)
+                    output.extend(character)
+                    if character == b"\n":
+                        break
+                    part.extend(character)
+                parts.append(bytes(part))
+                if current_reader != "stringnl_noescape_pair":
+                    break
+            return parts
+
+        def copy_nonmedia(prefix: bytes, size: int, *, note_unicode: bool) -> object:
+            reserve(len(prefix) + size)
+            output.extend(prefix)
+            remembered = bytearray() if note_unicode and size <= 256 else None
+            remaining = size
+            while remaining:
+                chunk = take(min(64 * 1024, remaining))
+                output.extend(chunk)
+                if remembered is not None:
+                    remembered.extend(chunk)
+                remaining -= len(chunk)
+            return bytes(remembered) if remembered is not None else other
+
         try:
-            with self._lock:
-                self.connection.execute("BEGIN")
+            while source._offset < source.length:
+                opcode = take(1)
+                operation = opcodes.get(opcode.decode("latin1"))
+                if operation is None:
+                    raise InvalidQueuedPayloadError("Legacy queued payload contains an unknown pickle opcode.")
+                name = operation.name
+                current_reader = operation.arg.reader.__name__.removeprefix("read_") if operation.arg else ""
+                if name == "FRAME":
+                    take(8)
+                    continue
+                if expecting_bytesio_content and name not in {
+                    "SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8", "MEMOIZE",
+                    "BINPUT", "LONG_BINPUT",
+                }:
+                    expecting_bytesio_content = False
+                append(opcode)
+                argument: object = None
+                if current_reader in fixed_readers:
+                    raw = take(fixed_readers[current_reader])
+                    append(raw)
+                    argument = int.from_bytes(raw, "little") if current_reader.startswith("uint") else None
+                elif current_reader in sized_readers:
+                    prefix_size = sized_readers[current_reader]
+                    prefix = take(prefix_size)
+                    size = int.from_bytes(prefix, "little")
+                    if expecting_bytesio_content and name in {
+                        "SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8",
+                    }:
+                        snapshot = self._store_media_stream(_BlobSlice(source, size), None)
+                        assert snapshot.storage_name is not None
+                        created.add(snapshot.storage_name)
+                        output[-1:] = self._legacy_marker_pickle(snapshot.storage_name)
+                        expecting_bytesio_content = False
+                        argument = other
+                    else:
+                        argument = copy_nonmedia(prefix, size, note_unicode=current_reader.startswith("unicodestring"))
+                elif current_reader in newline_readers:
+                    argument = copy_newline()
+                elif operation.arg is not None:
+                    raise InvalidQueuedPayloadError("Legacy queued payload has an unsupported pickle argument.")
+
+                if name == "MARK":
+                    stack.append(marker)
+                elif name in {"SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE"}:
+                    stack.append(argument if isinstance(argument, bytes) else other)
+                elif name in {"GLOBAL", "INST"}:
+                    parts = argument if isinstance(argument, list) else []
+                    stack.append(bytesio_class if parts == [b"_io", b"BytesIO"] else other)
+                elif name == "STACK_GLOBAL":
+                    class_name, module = pop(), pop()
+                    stack.append(bytesio_class if (module, class_name) == (b"_io", b"BytesIO") else other)
+                elif name in {"BINGET", "LONG_BINGET", "GET", "PUT", "BINPUT", "LONG_BINPUT"}:
+                    if isinstance(argument, list):
+                        argument = int(argument[0])
+                    if not isinstance(argument, int):
+                        raise InvalidQueuedPayloadError("Legacy pickle memo index is invalid.")
+                    if name in {"BINGET", "LONG_BINGET", "GET"}:
+                        stack.append(memo.get(argument, other))
+                    else:
+                        memoize(argument)
+                elif name == "MEMOIZE":
+                    memoize(len(memo))
+                elif name == "NEWOBJ":
+                    pop()
+                    cls = pop()
+                    stack.append(bytesio_instance if cls is bytesio_class else other)
+                    expecting_bytesio_content = cls is bytesio_class
+                elif name == "NEWOBJ_EX":
+                    pop(); pop()
+                    cls = pop()
+                    stack.append(bytesio_instance if cls is bytesio_class else other)
+                    expecting_bytesio_content = cls is bytesio_class
+                elif name == "OBJ":
+                    values = pop_mark()
+                    cls = values[-1] if values else other
+                    stack.append(bytesio_instance if cls is bytesio_class else other)
+                    expecting_bytesio_content = cls is bytesio_class
+                elif name == "BUILD":
+                    pop()
+                elif name in {"TUPLE", "LIST", "DICT", "FROZENSET"}:
+                    pop_mark(); stack.append(other)
+                elif name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                    for _ in range(int(name[-1])): pop()
+                    stack.append(other)
+                elif name in {"EMPTY_TUPLE", "EMPTY_LIST", "EMPTY_DICT", "EMPTY_SET"}:
+                    stack.append(other)
+                elif name in {"REDUCE", "RREDUCE"}:
+                    pop(); pop(); stack.append(other)
+                elif name == "APPEND":
+                    pop()
+                elif name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+                    pop_mark()
+                elif name == "SETITEM":
+                    pop(); pop()
+                elif name == "DUP":
+                    stack.append(stack[-1] if stack else other)
+                elif name == "POP":
+                    pop()
+                elif name == "POP_MARK":
+                    pop_mark()
+                elif name in {"PERSID", "BINPERSID", "EXT1", "EXT2", "EXT4"}:
+                    if name == "BINPERSID": pop()
+                    stack.append(other)
+                elif name not in {"PROTO", "STOP", "NEXT_BUFFER", "READONLY_BUFFER"}:
+                    stack.append(other)
+            value = _LegacyRecoveryUnpickler(io.BytesIO(output)).load()
+            if not isinstance(value, tuple) or len(value) != 2:
+                raise InvalidQueuedPayloadError("Queued payload has an invalid outer shape.")
+            args, kwargs = value
+            if not isinstance(args, tuple) or not isinstance(kwargs, dict):
+                raise InvalidQueuedPayloadError("Queued payload has invalid arguments.")
+            return args, kwargs, created
+        except Exception:
+            self._cleanup_created_media(created)
+            raise
+
+    def _replace_legacy_media_references(
+        self, value: object, memo: Optional[dict[int, object]] = None,
+    ) -> object:
+        """Replace streamed legacy objects everywhere they are aliased in a pickle."""
+        if memo is None:
+            memo = {}
+        cached = memo.get(id(value))
+        if cached is not None:
+            return cached
+        if isinstance(value, _LegacyInlineBlob):
+            snapshot = _StoredMediaSnapshot(value.storage_name, None)
+            memo[id(value)] = snapshot
+            return snapshot
+        if isinstance(value, _LegacyBytesIO):
+            memo[id(value)] = value.snapshot
+            return value.snapshot
+        if isinstance(value, tuple):
+            restored = tuple(self._replace_legacy_media_references(item, memo) for item in value)
+            memo[id(value)] = restored
+            return restored
+        if isinstance(value, list):
+            restored_list: list[object] = []
+            memo[id(value)] = restored_list
+            restored_list.extend(self._replace_legacy_media_references(item, memo) for item in value)
+            return restored_list
+        if isinstance(value, dict):
+            restored_dict: dict[object, object] = {}
+            memo[id(value)] = restored_dict
+            restored_dict.update(
+                (key, self._replace_legacy_media_references(item, memo))
+                for key, item in value.items()
+            )
+            return restored_dict
+        if isinstance(value, InputMedia):
+            restored_media = copy.copy(value)
+            memo[id(value)] = restored_media
+            object.__setattr__(
+                restored_media, "media", self._replace_legacy_media_references(value.media, memo)
+            )
+            for field in _INPUT_MEDIA_ATTACHMENT_FIELDS.get(type(value), ()):
+                attachment = getattr(value, field, None)
+                if attachment is not None:
+                    object.__setattr__(
+                        restored_media, field,
+                        self._replace_legacy_media_references(attachment, memo),
+                    )
+            return restored_media
+        return value
+
+    def recover_legacy_media_payload(self, row_id: int) -> QueuedCall:
+        """Compact one v1 media row without ever loading its inline BLOB."""
+        with self._lock:
+            created: set[str] = set()
+            try:
+                # A reserved writer transaction keeps the metadata snapshot and
+                # incremental BLOB read coherent with the guarded replacement.
+                self.connection.execute("BEGIN IMMEDIATE")
+                metadata_size = self.connection.execute(
+                    "SELECT COALESCE(length(log_context), 0) + COALESCE(length(completion_receipt), 0) "
+                    "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'", (row_id,),
+                ).fetchone()
+                if metadata_size is None:
+                    raise QueuePersistenceError(f"Queued row {row_id} disappeared before recovery.")
+                self.check_replay_size(row_id, int(metadata_size[0]))
+                metadata = self.connection.execute(
+                    "SELECT id, priority, telegram_chat_id, operation, slave_id, required_sender_bot_id, "
+                    "created_at, log_context, delivery_state, completion_receipt "
+                    "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'", (row_id,),
+                ).fetchone()
+                if metadata is None:
+                    raise QueuePersistenceError(f"Queued row {row_id} disappeared before recovery.")
+                with _SQLiteBlobReader(self.path, row_id) as source:
+                    if source.read(1) != b"\x01":
+                        raise QueuePersistenceError(f"Queued row {row_id} is not a legacy v1 payload.")
+                    metadata_bytes = len(metadata[7] or b"") + len(metadata[9] or b"")
+                    self.check_replay_size(row_id, metadata_bytes)
+                    args, kwargs, created = self._stream_legacy_pickle(
+                        source, max_output_bytes=self.MAX_REPLAY_BYTES - metadata_bytes,
+                    )
+                restored: dict[int, object] = {}
+                restored_args = self._replace_legacy_media_references(args, restored)
+                restored_kwargs = self._replace_legacy_media_references(kwargs, restored)
+                assert isinstance(restored_args, tuple) and isinstance(restored_kwargs, dict)
+                operation = str(metadata[3])
+                normalized_args, normalized_kwargs = self._normalize_direct_media(
+                    operation, restored_args, restored_kwargs, frozenset(), created
+                )
+                normalized_args, normalized_kwargs = self._normalize_nested_media(
+                    operation, normalized_args, normalized_kwargs, frozenset(), created
+                )
+                normalized_kwargs = self._normalize_thumbnail(
+                    operation, normalized_kwargs, frozenset(), created
+                )
+                normalized_kwargs = self._normalize_keyword_media(
+                    operation, normalized_kwargs, frozenset(), created
+                )
+                payload = self.encode_payload(normalized_args, normalized_kwargs)
+                references = self._media_reference_keys(payload)
+                self._cleanup_created_media(
+                    created - {name for kind, name in references if kind == "stored"}
+                )
                 cursor = self.connection.execute(
-                    "UPDATE outbound_queue SET payload = ? "
-                    "WHERE id = ? AND delivery_state = 'queued' AND substr(payload, 1, 1) = X'01'",
-                    (payload, row.id),
+                    "UPDATE outbound_queue SET payload = ? WHERE id = ? AND delivery_state = 'queued' "
+                    "AND created_at = ?", (payload, row_id, metadata[6]),
                 )
                 if cursor.rowcount != 1:
                     raise QueuePersistenceError(
-                        f"Queued row {row.id} changed before legacy recovery could commit."
+                        f"Queued row {row_id} changed before legacy recovery could commit."
                     )
                 self.connection.commit()
-        except Exception:
-            try:
-                self.connection.rollback()
-            except sqlite3.Error:
-                pass
-            self.cleanup_payload_media(payload)
-            raise
-        compact_size = len(payload) + len(row.log_context or b"") + len(row.completion_receipt or b"")
-        return replace(row, payload=payload, stored_bytes=compact_size)
+            except Exception:
+                try:
+                    self.connection.rollback()
+                except sqlite3.Error:
+                    pass
+                self._cleanup_created_media(created)
+                raise
+        return QueuedCall(
+            int(metadata[0]), int(metadata[1]), int(metadata[2]), operation, payload, metadata[4], metadata[5],
+            float(metadata[6]), metadata[7], str(metadata[8]), metadata[9],
+            len(payload) + len(metadata[7] or b"") + len(metadata[9] or b""),
+        )
 
     def check_replay_size(self, row_id: int, size: int) -> None:
         if size > self.MAX_REPLAY_BYTES:
-            raise QueuePersistenceError(
+            raise OversizedQueuedPayloadError(
                 f"Queue row {row_id} needs {size} encoded bytes, exceeding the "
                 f"{self.MAX_REPLAY_BYTES}-byte replay budget. Row retained; "
                 "offline recovery is required before it can be loaded safely."
@@ -1434,6 +1936,16 @@ class OutboundQueue:
             if cursor.rowcount != 1:
                 raise QueuePersistenceError(f"Queue row {row_id} disappeared while preserving an uncertain send.")
 
+    def hold_invalid_payload(self, row_id: int) -> None:
+        """Retain undecodable work while allowing later rows to dispatch."""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold='invalid_payload' "
+                "WHERE id=? AND delivery_state='queued'", (row_id,),
+            )
+            if cursor.rowcount != 1:
+                raise QueuePersistenceError(f"Queue row {row_id} disappeared before decode failure retention.")
+
     def hold_failed_history(self, row_id: int, error: BaseException, *, supplement: bool = False) -> None:
         """Keep rejected history or supplemental work available for repair."""
         with self._lock, self.connection:
@@ -1471,7 +1983,7 @@ class OutboundQueue:
             try:
                 self.connection.execute("BEGIN")
                 if prepared is not None:
-                    operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context = prepared
+                    operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media = prepared
                     self.connection.execute(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
@@ -1496,7 +2008,7 @@ class OutboundQueue:
                 except sqlite3.Error:
                     pass
                 if prepared is not None:
-                    self.cleanup_payload_media(prepared[7])
+                    self._cleanup_created_media(prepared[9])
                 raise
         if prepared is not None and self.metrics is not None:
             self.metrics.record_enqueued(prepared[4], prepared[0])
@@ -1562,16 +2074,19 @@ class OutboundQueue:
         payload: Optional[bytes] = None
         with self._lock:
             try:
-                self.connection.execute("BEGIN")
                 if cleanup_media:
-                    marker = self.connection.execute(
-                        "SELECT substr(payload, 1, 1) FROM outbound_queue WHERE id = ?",
-                        (row_id,),
+                    exists = self.connection.execute(
+                        "SELECT 1 FROM outbound_queue WHERE id = ?", (row_id,)
                     ).fetchone()
-                    if marker is not None and marker[0] == b"\x02":
+                    marker = b""
+                    if exists is not None:
+                        with _SQLiteBlobReader(self.path, row_id) as blob:
+                            marker = blob.read(1)
+                    if marker == b"\x02":
                         payload = self.connection.execute(
                             "SELECT payload FROM outbound_queue WHERE id = ?", (row_id,)
                         ).fetchone()[0]
+                self.connection.execute("BEGIN")
                 cursor = self.connection.execute("DELETE FROM outbound_queue WHERE id = ?", (row_id,))
                 if cursor.rowcount != 1:
                     raise QueuePersistenceError(f"Queued row {row_id} disappeared before deletion.")
@@ -2009,8 +2524,7 @@ class OutboundQueueScheduler:
                     continue
                 try:
                     if legacy_recovery:
-                        row = self.queue.load_legacy_queued_for_recovery(row.id)
-                        row = self.queue.rewrite_legacy_media_payload(row)
+                        row = self.queue.recover_legacy_media_payload(row.id)
                         self.queue.check_replay_size(row.id, row.stored_bytes)
                     else:
                         row = self.queue.load_queued(row.id)
@@ -2018,20 +2532,12 @@ class OutboundQueueScheduler:
                 except InvalidQueuedPayloadError as error:
                     self._permits.release()
                     try:
-                        if self._retain_failed_history(row, error):
-                            self._record_terminal_completion(row, None, "failure")
-                            continue
-                        self.queue.delete(row.id)
-                    except Exception as delete_error:
-                        self._stop_for_persistence_error(delete_error)
+                        self.queue.hold_invalid_payload(row.id)
+                    except Exception as persistence_error:
+                        self._stop_for_persistence_error(persistence_error)
                         return
-                    self._record_terminal_discard(row)
-                    self._row_not_before.pop(row.id, None)
-                    self._record_dispatch("failed")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
-                    self._record_terminal_completion(row, None, "failure")
                     self.queue.fail_waiter(row.id, error)
+                    self.wake_event.set()
                     continue
                 except QueuePersistenceError as error:
                     self._permits.release()
@@ -2047,15 +2553,16 @@ class OutboundQueueScheduler:
                 # Rows carrying a durable log context are retained until the
                 # MsgLog write is committed, regardless of blocking priority.
                 retained = row.priority == 0 or row.log_context is not None or row.operation in RETAINED_OPERATIONS
+                closeables = self.queue.payload_closeables(args, kwargs)
                 if not retained:
                     try:
                         self.queue.delete(row.id, cleanup_media=False)
                     except Exception as delete_error:
+                        self.queue.close_payload_resources(closeables)
                         self._permits.release()
                         self._stop_for_persistence_error(delete_error)
                         return
                     self._record_submitted_removal(row)
-                closeables = self.queue.payload_closeables(args, kwargs)
                 attempt_marked = False
                 if row.operation in RETAINED_OPERATIONS:
                     try:

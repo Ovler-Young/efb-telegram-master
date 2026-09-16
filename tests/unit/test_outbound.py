@@ -1,7 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 import io
+import pickle
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 from unittest.mock import Mock, patch
@@ -1203,3 +1206,290 @@ def test_shutdown_keeps_queued_row_and_fails_abandoned_waiter(tmp_path):
             waiter.result()
         assert row_id not in queue.waiters
         adapter.release.set()
+
+
+def test_failed_batch_cleans_only_new_sidecars_after_partial_preparation(tmp_path):
+    from efb_telegram_master.outbound import _LegacyInlineBlob
+
+    queue = OutboundQueue(tmp_path)
+    existing = queue._store_media_stream(io.BytesIO(b"existing"), "existing.bin")
+    assert existing.storage_name is not None
+
+    def send_video(chat_id, video, cover=None):
+        return chat_id, video, cover
+
+    requests = [
+        QueueRequest(
+            "send_video", (100, b"new"), {"cover": _LegacyInlineBlob(existing.storage_name)},
+        ),
+        QueueRequest("send_photo", (100, object()), {}),
+    ]
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        queue.enqueue_many(
+            requests,
+            lambda name: send_video if name == "send_video" else media_operation,
+        )
+
+    assert (queue.media_dir / existing.storage_name).read_bytes() == b"existing"
+    assert [path.name for path in queue.media_dir.iterdir()] == [existing.storage_name]
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+
+
+def test_legacy_recovery_preserves_opaque_binary_kwargs(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    try:
+        media = io.BytesIO(b"inline media")
+        legacy = b"\x01" + pickle.dumps(
+            ((100, media), {"api_kwargs": b"keep", "nested": {"alias": media}}), protocol=5,
+        )
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_document',?,0)", (legacy,),
+            )
+        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            assert args[1].read() == b"inline media"
+        finally:
+            args[1].close()
+        assert kwargs["api_kwargs"] == b"keep"
+        try:
+            assert kwargs["nested"]["alias"].read() == b"inline media"
+        finally:
+            kwargs["nested"]["alias"].close()
+    finally:
+        queue.close()
+
+
+def test_failed_legacy_recovery_keeps_preexisting_media_and_external_paths(tmp_path):
+    from efb_telegram_master.outbound import _LegacyInlineBlob, _StoredMediaSnapshot
+
+    queue = OutboundQueue(tmp_path)
+    existing = queue._store_media_stream(io.BytesIO(b"existing"), "existing.bin")
+    assert existing.storage_name is not None
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"external")
+    legacy = b"\x01" + pickle.dumps(
+        ((100, io.BytesIO(b"new")), {
+            "cover": _LegacyInlineBlob(existing.storage_name),
+            "api_kwargs": {"external": _StoredMediaSnapshot(
+                None, None, external.as_uri(), cleanup_external=True,
+            )},
+        }), protocol=5,
+    )
+    try:
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_video',?,0)", (legacy,),
+            )
+            queue.connection.execute(
+                "CREATE TRIGGER reject_legacy_recovery BEFORE UPDATE OF payload ON outbound_queue "
+                f"WHEN NEW.id = {int(cursor.lastrowid)} BEGIN SELECT RAISE(ABORT, 'stop'); END"
+            )
+        with pytest.raises(sqlite3.DatabaseError, match="stop"):
+            queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        assert (queue.media_dir / existing.storage_name).read_bytes() == b"existing"
+        assert external.read_bytes() == b"external"
+        assert {path.name for path in queue.media_dir.iterdir()} == {existing.storage_name}
+    finally:
+        queue.close()
+
+
+def test_legacy_recovery_preserves_bytearray_with_opcode_like_contents(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    try:
+        opaque = bytearray(b"abc\x95ABCDEFGHz")
+        legacy = b"\x01" + pickle.dumps(
+            ((100, io.BytesIO(b"inline media")), {"opaque": opaque}), protocol=5,
+        )
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_document',?,0)", (legacy,),
+            )
+        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            assert args[1].read() == b"inline media"
+        finally:
+            args[1].close()
+        assert kwargs["opaque"] == opaque
+    finally:
+        queue.close()
+
+
+def test_prepare_failure_after_snapshot_cleans_its_new_sidecar(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    existing = queue._store_media_stream(io.BytesIO(b"existing"), "existing.bin")
+    assert existing.storage_name is not None
+    try:
+        with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+            queue.enqueue_many(
+                [QueueRequest("send_document", (100, b"new"), {"filename": object()})],
+                lambda _name: lambda chat_id, document, filename=None: None,
+            )
+        assert (queue.media_dir / existing.storage_name).read_bytes() == b"existing"
+        assert {path.name for path in queue.media_dir.iterdir()} == {existing.storage_name}
+    finally:
+        queue.close()
+
+def test_legacy_recovery_streams_memoized_distinct_bytesio_media_and_aliases(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    first = io.BytesIO(b"first media")
+    second = io.BytesIO(b"second thumbnail")
+    legacy = b"\x01" + pickle.dumps(
+        ((100, first), {"thumbnail": second, "alias": first, "opaque": b"opaque bytes remain inline"}),
+        protocol=5,
+    )
+    try:
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_video',?,0)", (legacy,),
+            )
+        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            assert media_bytes(args[1]) == b"first media"
+            assert media_bytes(kwargs["thumbnail"]) == b"second thumbnail"
+            assert media_bytes(kwargs["alias"]) == b"first media"
+            assert kwargs["opaque"] == b"opaque bytes remain inline"
+            assert len(list(queue.media_dir.iterdir())) == 2
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+    finally:
+        queue.close()
+
+
+def test_nested_prepare_failure_reclaims_only_new_media(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    existing = queue._store_media_stream(io.BytesIO(b"existing"), None)
+    media = InputMediaVideo("remote-id")
+    object.__setattr__(media, "media", b"new video")
+    object.__setattr__(media, "thumbnail", object())
+    try:
+        with pytest.raises(QueueEnqueueError):
+            queue.enqueue_many(
+                [QueueRequest("send_media_group", (100, [media]), {})],
+                lambda _: lambda chat_id, media: None,
+            )
+        assert {path.name for path in queue.media_dir.iterdir()} == {existing.storage_name}
+        assert queue.heads() == []
+    finally:
+        queue.close()
+
+
+def test_partial_decode_closes_open_files_and_preserves_queued_data(tmp_path, monkeypatch):
+    import efb_telegram_master.outbound as outbound
+
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = queue.enqueue_many(
+        [QueueRequest("send_media_group", (100, [
+            InputMediaVideo(b"first"), InputMediaVideo(b"missing"),
+        ]), {})],
+        lambda _: lambda chat_id, media: None,
+    )
+    row = queue.load_queued(row_id)
+    args, _ = queue.decode_payload_raw(row.payload)
+    (queue.media_dir / args[1][1].media.storage_name).unlink()
+    opened = []
+    original = outbound._NamedMediaFile
+
+    def track(raw, filename):
+        stream = original(raw, filename)
+        opened.append(stream)
+        return stream
+
+    monkeypatch.setattr(outbound, "_NamedMediaFile", track)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            scheduler = OutboundQueueScheduler(queue, Adapter(), executor, worker_count=1)
+            scheduler.dispatch_once()
+            assert not scheduler.stopping
+            assert queue.heads(ready_only=True) == []
+            assert opened and all(stream.closed for stream in opened)
+            assert queue.load_queued(row_id).payload == row.payload
+            assert (queue.media_dir / args[1][0].media.storage_name).read_bytes() == b"first"
+            assert waiter.done()
+    finally:
+        queue.close()
+
+
+def test_legacy_recovery_excludes_competing_writer_until_commit(tmp_path, monkeypatch):
+    queue = OutboundQueue(tmp_path)
+    legacy = b"\x01" + pickle.dumps(((100, io.BytesIO(b"document")), {}), protocol=5)
+    with queue.connection:
+        queue.connection.execute(
+            "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+            "VALUES(0,100,'send_document',?,0)", (legacy,),
+        )
+    writer = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0.1)
+try:
+    connection.execute('BEGIN IMMEDIATE')
+except sqlite3.OperationalError as error:
+    assert 'locked' in str(error), error
+    print('blocked')
+else:
+    connection.execute('UPDATE outbound_queue SET telegram_chat_id=999 WHERE id=1')
+    connection.commit()
+    print('committed')
+finally:
+    connection.close()
+"""
+
+    def compete():
+        return subprocess.run(
+            [sys.executable, "-c", writer, str(queue.path)],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+
+    original = queue._replace_legacy_media_references
+    checked = False
+
+    def after_blob_close(value, memo=None):
+        nonlocal checked
+        if not checked:
+            checked = True
+            assert compete() == "blocked"
+        return original(value, memo)
+
+    monkeypatch.setattr(queue, "_replace_legacy_media_references", after_blob_close)
+    try:
+        queue.recover_legacy_media_payload(1)
+        assert checked
+        assert compete() == "committed"
+        assert queue.load_queued(1).telegram_chat_id == 999
+    finally:
+        queue.close()
+
+
+def test_legacy_recovery_preserves_multipart_filename_and_mime(tmp_path):
+    import httpx
+
+    queue = OutboundQueue(tmp_path)
+    document = io.BytesIO(b"%PDF-document")
+    document.name = "report.pdf"
+    legacy = b"\x01" + pickle.dumps(((100, document), {}), protocol=5)
+    try:
+        with queue.connection:
+            queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_document',?,0)", (legacy,),
+            )
+        row = queue.recover_legacy_media_payload(1)
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            upload = queue.streaming_uploads(args)[1]
+            request = httpx.Request("POST", "https://example.invalid", files={"document": upload.field_tuple})
+            multipart = b"".join(request.stream)
+            assert b'filename="report.pdf"' in multipart
+            assert b"Content-Type: application/pdf\r\n" in multipart
+            assert b"%PDF-document" in multipart
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+    finally:
+        queue.close()
