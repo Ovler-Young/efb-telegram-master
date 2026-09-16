@@ -19,10 +19,11 @@ from tests.unit.test_outbound_queue_runtime_evidence import ControlledExecutor, 
 
 
 @pytest.fixture
-def history(tmp_path, monkeypatch):
+def history(tmp_path, monkeypatch, request):
     previous = database.obj
     monkeypatch.setattr(db_module.utils, 'get_data_path', lambda _: tmp_path)
-    db = DatabaseManager(SimpleNamespace(channel_id='history-test', config={}))
+    config = {'database': request.getfixturevalue('postgres_config')} if getattr(request, 'param', None) == 'postgresql' else {}
+    db = DatabaseManager(SimpleNamespace(channel_id='history-test', config=config))
     binding = ChatBindingManager.__new__(ChatBindingManager)
     binding.db = db
     binding.chat_manager = Mock()
@@ -35,7 +36,7 @@ def history(tmp_path, monkeypatch):
         waiter.set_result(SimpleNamespace(message_id=len(calls)))
         return waiter
 
-    binding.bot = SimpleNamespace(enqueue_history_operation=enqueue)
+    binding.bot = SimpleNamespace(enqueue_history_operation=enqueue, owned_history_entries=lambda keys: set(), forget_history_entries=lambda keys: None)
     yield SimpleNamespace(db=db, binding=binding, calls=calls, path=tmp_path)
     db.stop_worker()
     database.initialize(previous)

@@ -1124,6 +1124,7 @@ class TelegramBotManager(LocaleMixin):
         requests: list[QueueRequest],
         *,
         db_log_context: Optional[QueuedDbLogContext] = None,
+        history_keys: Collection[str] = (),
     ) -> tuple[str, Future]:
         with self._outbound_scheduler._lock:
             if self._outbound_scheduler.stopping:
@@ -1145,7 +1146,7 @@ class TelegramBotManager(LocaleMixin):
                     for request in requests
                 ]
             row_id, waiter = self._outbound_queue.enqueue_many(
-                durable_requests, self._queue_operation
+                durable_requests, self._queue_operation, history_keys=history_keys
             )
             if db_log_context is not None:
                 with self._queued_db_log_context_lock:
@@ -1260,6 +1261,7 @@ class TelegramBotManager(LocaleMixin):
         args: tuple,
         kwargs: Mapping[str, object],
         history_entry_ids: Collection[int],
+        history_keys: Collection[str] = (),
     ) -> Future:
         del target_chat_id
         request_kwargs = dict(kwargs)
@@ -1274,8 +1276,19 @@ class TelegramBotManager(LocaleMixin):
         request_kwargs[HISTORY_REPLAY_KEY] = replay
         request_kwargs["_slave_id"] = HISTORY_SOURCE_PREFIX + source_key
         request_kwargs["_send_mode"] = "eventual"
-        _row_id, waiter = self._enqueue_requests([QueueRequest(operation, args, request_kwargs)])
+        _row_id, waiter = self._enqueue_requests(
+            [QueueRequest(operation, args, request_kwargs)], history_keys=history_keys
+        )
         return waiter
+
+    def history_ownership_page(self, after: str = "", limit: int = 100) -> list[str]:
+        return self._outbound_queue.history_ownership_page(after, limit)
+
+    def owned_history_entries(self, keys: Collection[str]) -> set[str]:
+        return self._outbound_queue.owned_history_entries(keys)
+
+    def forget_history_entries(self, keys: Collection[str]) -> None:
+        self._outbound_queue.forget_history_entries(keys)
 
     def _enqueue_blocking_api_operation(
         self,

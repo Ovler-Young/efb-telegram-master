@@ -4,6 +4,8 @@ import datetime
 import logging
 import pickle
 import time
+import tempfile
+import uuid
 from contextlib import nullcontext, suppress
 from functools import wraps
 from typing import Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING
@@ -19,6 +21,7 @@ from peewee import (
     Model,
     PostgresqlDatabase,
     TextField,
+    Tuple as SQLTuple,
     fn,
     chunked,
 )
@@ -234,10 +237,26 @@ class HistoryMigrationEntry(BaseModel):
     source_time = DateTimeField(null=True)
     position = IntegerField()
     created_at = DateTimeField(default=datetime.datetime.now)
+    generation = TextField(null=True)
+
+    @property
+    def ownership_key(self) -> str:
+        return f"{self.generation or 'legacy'}:{self.id}"
+
     class Meta:
         indexes = (
             (("slave_chat_id", "target_chat_id", "message_thread_id", "position"), False),
         )
+
+
+class HistoryMigrationTarget(BaseModel):
+    slave_chat_id = TextField()
+    target_chat_id = TextField()
+    message_thread_id = TextField(default="")
+    generation = TextField()
+
+    class Meta:
+        indexes = ((("slave_chat_id", "target_chat_id", "message_thread_id"), True),)
 
 
 class SlaveChatInfo(BaseModel):
@@ -335,14 +354,14 @@ class DatabaseManager:
         Initializing tables.
         """
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
         ])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
         ], safe=True)
 
     def _check_and_run_migrations(self):
@@ -366,6 +385,8 @@ class DatabaseManager:
         for name, table, columns in (
             ("msglog_slave_lookup", "msglog", f"slave_origin_uid, slave_message_id, {time_order}"),
             ("msglog_chat_time", "msglog", f"slave_origin_uid, {time_order}"),
+            ("msglog_history_seek", "msglog", "slave_origin_uid, time, master_msg_id"),
+            ("history_target_cleanup", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, id"),
             ("msglog_master_alt", "msglog", "master_msg_id_alt"),
             ("chatassoc_slave_lookup", "chatassoc", "slave_uid"),
             ("chatassoc_master_lookup", "chatassoc", "master_uid"),
@@ -893,28 +914,25 @@ class DatabaseManager:
         Returns:
             List[MsgLog]: List of recent message logs, ordered by time (oldest first)
         """
-        try:
-            query = MsgLog.select().where(
-                MsgLog.slave_origin_uid == slave_chat_id
-            ).order_by(MsgLog.time.asc(nulls="FIRST"), MsgLog.master_msg_id.asc())
+        base = MsgLog.select().where(MsgLog.slave_origin_uid == slave_chat_id)
+        pages = []
+        if after is None or after[0] is None:
+            unknown = base.where(MsgLog.time.is_null(True)).order_by(MsgLog.master_msg_id)
             if after is not None:
-                timestamp, identifier = after
-                if timestamp is None:
-                    page_filter = MsgLog.time.is_null(False) | (
-                        MsgLog.time.is_null(True) & (MsgLog.master_msg_id > identifier)
-                    )
-                else:
-                    page_filter = (MsgLog.time > timestamp) | (
-                        (MsgLog.time == timestamp) & (MsgLog.master_msg_id > identifier)
-                    )
-                query = query.where(page_filter)
-
+                unknown = unknown.where(MsgLog.master_msg_id > after[1])
+            pages.append(unknown)
+        known = base.where(MsgLog.time.is_null(False)).order_by(MsgLog.time, MsgLog.master_msg_id)
+        if after is not None and after[0] is not None:
+            known = known.where(SQLTuple(MsgLog.time, MsgLog.master_msg_id) > after)
+        pages.append(known)
+        rows = []
+        for query in pages:
             if limit > 0:
-                query = query.limit(limit)
-
-            return list(query)
-        except DoesNotExist:
-            return []
+                query = query.limit(limit - len(rows))
+            rows.extend(query)
+            if limit > 0 and len(rows) == limit:
+                break
+        return rows
 
     @staticmethod
     def _history_migration_target_filter(
@@ -944,25 +962,71 @@ class DatabaseManager:
             target_chat_id,
             message_thread_id,
         )
+        generation = uuid.uuid4().hex
         count = 0
-        with database.atomic():
-            HistoryMigrationEntry.delete().where(target_filter).execute()
-            for batch in chunked(entries, 32):
-                HistoryMigrationEntry.insert_many(batch).execute()
-                count += len(batch)
+        # Finish the finite read snapshot before taking any main-database write
+        # lock. The temporary stream bounds RAM even for million-message chats.
+        with tempfile.TemporaryFile() as spool:
+            with database.atomic():
+                if isinstance(database.obj, PostgresqlDatabase):
+                    database.execute_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                for entry in entries:
+                    pickle.dump(dict(entry, generation=generation), spool)
+                    count += 1
+            spool.seek(0)
+
+            def prepared():
+                for _ in range(count):
+                    yield pickle.load(spool)
+
+            for batch in chunked(prepared(), 32):
+                with database.atomic():
+                    HistoryMigrationEntry.insert_many(batch).execute()
+            # Publishing one pointer makes the entire replacement visible.
+            with database.atomic():
+                HistoryMigrationTarget.insert(
+                    slave_chat_id=str(slave_chat_id), target_chat_id=str(target_chat_id),
+                    message_thread_id=str(message_thread_id) if message_thread_id is not None else "",
+                    generation=generation,
+                ).on_conflict(
+                    conflict_target=[HistoryMigrationTarget.slave_chat_id,
+                                     HistoryMigrationTarget.target_chat_id,
+                                     HistoryMigrationTarget.message_thread_id],
+                    update={HistoryMigrationTarget.generation: generation},
+                ).execute()
+        obsolete = target_filter & (
+            HistoryMigrationEntry.generation.is_null(True) | (HistoryMigrationEntry.generation != generation)
+        )
+        after_id = 0
+        while True:
+            ids = [row.id for row in HistoryMigrationEntry.select(HistoryMigrationEntry.id)
+                   .where(obsolete & (HistoryMigrationEntry.id > after_id))
+                   .order_by(HistoryMigrationEntry.id).limit(32)]
+            if not ids:
+                break
+            HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(ids)).execute()
+            after_id = ids[-1]
         return count
+
+    @staticmethod
+    def _visible_history_entries():
+        target = HistoryMigrationTarget.select(HistoryMigrationTarget.generation).where(
+            (HistoryMigrationTarget.slave_chat_id == HistoryMigrationEntry.slave_chat_id) &
+            (HistoryMigrationTarget.target_chat_id == HistoryMigrationEntry.target_chat_id) &
+            (HistoryMigrationTarget.message_thread_id == fn.COALESCE(HistoryMigrationEntry.message_thread_id, ""))
+        )
+        return HistoryMigrationEntry.select().where(
+            (HistoryMigrationEntry.generation == target) |
+            (HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(target))
+        )
 
     @observe_database_method("has_pending_history_migrations")
     def has_pending_history_migrations(self) -> bool:
-        return HistoryMigrationEntry.select().exists()
+        return self._visible_history_entries().exists()
 
     @observe_database_method("get_next_history_migration_target")
     def get_next_history_migration_target(self) -> Optional[HistoryMigrationEntry]:
-        return (
-            HistoryMigrationEntry.select()
-            .order_by(HistoryMigrationEntry.id.asc())
-            .first()
-        )
+        return self._visible_history_entries().order_by(HistoryMigrationEntry.id).first()
 
     @observe_database_method("get_history_migration_entries")
     def get_history_migration_entries(
@@ -979,19 +1043,35 @@ class DatabaseManager:
             message_thread_id,
         )
         query = (
-            HistoryMigrationEntry.select()
+            self._visible_history_entries()
             .where(target_filter)
             .order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
         )
         if after is not None:
             position, identifier = after
             query = query.where(
-                (HistoryMigrationEntry.position > position) |
-                ((HistoryMigrationEntry.position == position) & (HistoryMigrationEntry.id > identifier))
+                SQLTuple(HistoryMigrationEntry.position, HistoryMigrationEntry.id) > (position, identifier)
             )
         if limit is not None:
             query = query.limit(limit)
         return list(query)
+
+    def get_history_migration_ownership_keys(self, entry_ids: Collection[int]) -> List[str]:
+        keys = {}
+        with connection_scope(self._managed_database):
+            for batch in chunked(entry_ids, 100):
+                for entry in HistoryMigrationEntry.select(
+                    HistoryMigrationEntry.id, HistoryMigrationEntry.generation,
+                ).where(HistoryMigrationEntry.id.in_(batch)):
+                    keys[entry.id] = entry.ownership_key
+        return [keys[identifier] for identifier in entry_ids]
+
+    def existing_history_ownership(self, keys: Collection[str]) -> set[str]:
+        ids = [int(key.rsplit(":", 1)[1]) for key in keys]
+        with connection_scope(self._managed_database):
+            return {entry.ownership_key for entry in HistoryMigrationEntry.select(
+                HistoryMigrationEntry.id, HistoryMigrationEntry.generation,
+            ).where(HistoryMigrationEntry.id.in_(ids))} & set(keys)
 
     @observe_database_method("delete_history_migration_entry")
     def delete_history_migration_entry(self, entry_id: int) -> int:
