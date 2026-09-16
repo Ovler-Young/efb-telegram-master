@@ -794,3 +794,54 @@ def test_shutdown_releases_accepted_future_with_unpersistable_receipt(tmp_path, 
     assert primary.call_count == 1
     assert queue.connection.execute("SELECT id FROM outbound_queue").fetchall() == [(row_id,)]
     queue.close()
+
+
+def test_receipt_recovery_during_drain_settles_primary_and_preserves_attachment(tmp_path, manager_factory):
+    from efb_telegram_master.etm_metrics import Metrics
+
+    db = manager_factory(tmp_path)
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    manager = setup_manager(queue)
+    manager.channel = SimpleNamespace(db=db)
+    context = manager._encode_queued_log_context(QueuedDbLogContext(message_with_group(), None))
+    row_id, waiter = queue.enqueue_many([QueueRequest(
+        "send_document", (42, b"archive bytes"), {"caption": "x" * 2048}, context
+    )], lambda _: document)
+    result = delivered_message()
+    primary = Mock(return_value=result)
+    manager._bot = SimpleNamespace(send_document=primary)
+    with queue.connection:
+        queue.connection.execute("CREATE TRIGGER fail_completion BEFORE UPDATE OF completion_receipt ON outbound_queue "
+                                 "BEGIN SELECT RAISE(FAIL, 'database unavailable'); END")
+    scheduler = manager._outbound_scheduler
+    scheduler.dispatch_once()
+    scheduler.harvest_completed()
+    assert scheduler.in_flight[row_id].future.done() and not waiter.done()
+    with queue.connection:
+        queue.connection.execute("DROP TRIGGER fail_completion")
+    scheduler.stop_and_drain(timeout=1.2)
+    assert waiter.result(timeout=0) is result
+    assert db.get_msg_log(master_msg_id="42.100").slave_message_id == "source-1"
+    assert scheduler.failure is None
+    assert not scheduler.in_flight and not scheduler.in_flight_destinations and not queue.waiters
+    assert scheduler._permits.acquire(blocking=False)
+    scheduler._permits.release()
+    # Repeated shutdown/harvest must not publish a second primary completion.
+    scheduler.harvest_completed()
+    scheduler.stop_and_drain(timeout=0)
+    completions = [sample for family in metrics.completions.collect() for sample in family.samples
+                   if sample.name.endswith("_total")]
+    assert len(completions) == 1 and completions[0].value == 1
+    assert completions[0].labels["outcome"] == "success"
+    assert all(sample.value == 0 for family in metrics.in_flight.collect() for sample in family.samples)
+    [(child_id, state, payload)] = queue.connection.execute(
+        "SELECT id, delivery_state, payload FROM outbound_queue"
+    ).fetchall()
+    assert child_id != row_id and state == "queued"
+    args, kwargs = queue.decode_payload(payload)
+    assert kwargs["reply_to_message_id"] == result.message_id
+    assert kwargs["document"].read() == b"x" * 2048
+    queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+    assert primary.call_count == 1
+    queue.close()

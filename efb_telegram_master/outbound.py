@@ -2235,7 +2235,7 @@ class OutboundQueueScheduler:
                                 return
                         # Do not rescan the entire pending-log backlog per completion.
                         self.reconcile_sent_pending(row_id)
-                        if self.stopping:
+                        if self.failure is not None:
                             return
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
                     if (submitted.row.priority == 0 or submitted.row.operation in RETAINED_OPERATIONS) and submitted.row.log_context is None:
