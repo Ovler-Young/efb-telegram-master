@@ -125,6 +125,44 @@ jobs:
         TEST_POSTGRES_PASSWORD: postgres
       run: |
         pytest --mode=unit -v tests/unit/test_database_safety.py tests/unit/test_database_performance.py tests/unit/test_restart_memory.py tests/unit/test_db_migrations.py tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py tests/unit/test_bot_manager.py tests/unit/test_outbound_adapter.py
+    - name: Verify SQLite 3.31.1 compatibility
+      if: matrix.python-version == '3.10'
+      timeout-minutes: 8
+      env:
+        TEST_POSTGRES_HOST: 127.0.0.1
+        TEST_POSTGRES_PORT: "5432"
+        TEST_POSTGRES_DB: efb_telegram
+        TEST_POSTGRES_USER: postgres
+        TEST_POSTGRES_PASSWORD: postgres
+      run: |
+        set -euo pipefail
+        sqlite_build_dir=$(mktemp -d "$RUNNER_TEMP/etm-sqlite331.XXXXXX")
+        sqlite_prefix="$sqlite_build_dir/install"
+        curl --fail --location --retry 2 --connect-timeout 20 --max-time 120 \
+          https://www.sqlite.org/2020/sqlite-autoconf-3310100.tar.gz \
+          --output "$sqlite_build_dir/sqlite.tar.gz"
+        tar -xzf "$sqlite_build_dir/sqlite.tar.gz" -C "$sqlite_build_dir"
+        cd "$sqlite_build_dir/sqlite-autoconf-3310100"
+        CFLAGS="-O2 -DSQLITE_ENABLE_DESERIALIZE" ./configure \
+          --prefix="$sqlite_prefix" --enable-shared --disable-static --disable-readline
+        make -j2 libsqlite3.la
+        make install-libLTLIBRARIES
+        cd "$GITHUB_WORKSPACE"
+        export LD_LIBRARY_PATH="$sqlite_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        export LD_PRELOAD="$sqlite_prefix/lib/libsqlite3.so.0${LD_PRELOAD:+:$LD_PRELOAD}"
+        python - <<'PY'
+        import sqlite3
+        assert sqlite3.sqlite_version == "3.31.1", sqlite3.sqlite_version
+        with sqlite3.connect(":memory:") as connection:
+            actual = connection.execute("SELECT sqlite_version()").fetchone()[0]
+        assert actual == "3.31.1", actual
+        print(f"Verified Python sqlite3 and SQL engine: {actual}")
+        PY
+        python -m pytest --mode=unit -v \
+          tests/unit/test_database_safety.py tests/unit/test_database_performance.py \
+          tests/unit/test_restart_memory.py tests/unit/test_outbound.py \
+          tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_history_replay.py \
+          tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py
 
   integration:
     if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'

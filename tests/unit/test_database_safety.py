@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import pytest
 from peewee import SqliteDatabase
+from playhouse.migrate import SqliteMigrator, migrate
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master import migrate_db
@@ -113,6 +114,14 @@ def sqlite_source(tmp_path):
 def source_rows(directory):
     with closing(sqlite3.connect(directory / "tgdata.db")) as source:
         return {model._meta.table_name: list(migrate_db._source_rows(source, model)) for model in MODELS}
+
+
+def remove_source_columns(directory, table, columns):
+    """Build historical source schemas using SQLite's pre-3.35 table-rebuild path."""
+    source = SqliteDatabase(str(directory / "tgdata.db"))
+    with source.connection_context(), source.atomic():
+        migrator = SqliteMigrator(source)
+        migrate(*(migrator.drop_column(table, column, legacy=True) for column in columns))
 
 
 def test_queue_digest_legacy_manifest_accepts_only_empty_sidecar_state():
@@ -369,9 +378,8 @@ def test_unsupported_source_data_fails_without_loss(sqlite_source, postgres_conf
 
 
 def test_historic_nullable_columns_and_missing_optional_tables(sqlite_source, postgres_config):
+    remove_source_columns(sqlite_source, "msglog", ("sender_bot_id", "file_unique_id", "master_msg_id_alt", "pickle", "time"))
     with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source:
-        for column in ("sender_bot_id", "file_unique_id", "master_msg_id_alt", "pickle", "time"):
-            source.execute(f"ALTER TABLE msglog DROP COLUMN {column}")
         source.execute("DROP TABLE topicassoc")
         source.execute("DROP TABLE historymigrationentry")
         source.commit()
@@ -969,9 +977,10 @@ def test_old_five_table_import_recovers_and_initializes_runtime_indexes(
         )) for model in migrate_db.CORE_MODELS}
         if not added_fields:
             source.execute("DROP TABLE historymigrationtarget")
-            source.execute("ALTER TABLE historymigrationentry DROP COLUMN generation")
-            if version == 1:
-                source.execute("ALTER TABLE msglog DROP COLUMN master_message_thread_id")
+    if not added_fields:
+        remove_source_columns(sqlite_source, "historymigrationentry", ("generation",))
+        if version == 1:
+            remove_source_columns(sqlite_source, "msglog", ("master_message_thread_id",))
     manifest = dict(receipt, version=version, tables=tables)
     if version == 1:
         manifest.pop("columns")
@@ -991,7 +1000,9 @@ def test_old_five_table_import_recovers_and_initializes_runtime_indexes(
         runtime = manager_factory(sqlite_source, postgres_config)
         assert runtime.get_next_history_migration_target().ownership_key == "legacy:74"
         with connection_scope(runtime._managed_database):
-            indexes = {index.name for index in runtime._managed_database.get_indexes("historymigrationentry")}
+            indexes = {index.name for index in runtime._managed_database.get_indexes(
+                "historymigrationentry", schema=current_schema(runtime._managed_database),
+            )}
             assert {"history_generation_id", "history_target_generation_position"} <= indexes
         runtime.stop_worker()
         # Startup adds nullable fields and an empty target table; those must not

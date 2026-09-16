@@ -11,6 +11,7 @@ import pytest
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler
+from tests.unit.test_database_safety import remove_source_columns
 from tests.unit.test_outbound import DurableAdapter
 
 
@@ -60,12 +61,8 @@ def test_partially_upgraded_schema_adds_only_missing_columns(tmp_path, monkeypat
     initial.stop_worker()
     with closing(sqlite3.connect(tmp_path / "tgdata.db")) as source:
         source.execute("DROP INDEX msglog_master_alt")
-        source.execute("ALTER TABLE msglog DROP COLUMN master_msg_id_alt")
-        source.execute("ALTER TABLE msglog DROP COLUMN pickle")
-        source.execute("ALTER TABLE slavechatinfo DROP COLUMN pickle")
         source.execute("DROP INDEX history_generation_id")
         source.execute("DROP INDEX history_target_generation_position")
-        source.execute("ALTER TABLE historymigrationentry DROP COLUMN generation")
         source.execute("DROP TABLE historymigrationtarget")
         source.execute(
             "INSERT INTO historymigrationentry "
@@ -73,6 +70,9 @@ def test_partially_upgraded_schema_adds_only_missing_columns(tmp_path, monkeypat
             "VALUES (74, 'slave.chat', '-1001', 'source.1', 0, '2026-01-01')"
         )
         source.commit()
+    remove_source_columns(tmp_path, "msglog", ("master_msg_id_alt", "pickle"))
+    remove_source_columns(tmp_path, "slavechatinfo", ("pickle",))
+    remove_source_columns(tmp_path, "historymigrationentry", ("generation",))
     upgraded = DatabaseManager(SimpleNamespace(channel_id="test.schema", config={}))
     try:
         with upgraded._managed_database.connection_context():
