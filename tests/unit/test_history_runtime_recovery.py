@@ -108,11 +108,11 @@ def test_history_seek_cost_does_not_grow_with_consumed_prefix(history, null_time
     timestamp = None if null_time else datetime(2026, 1, 1)
     with connection_scope(history.db._managed_database):
         with history.db._managed_database.atomic():
-            for offset in range(0, 100000, 500):
+            for offset in range(0, 100000, 100):
                 MsgLog.insert_many([
                     dict(master_msg_id=f'{i:06d}', slave_message_id=str(i), text='x',
                          slave_origin_uid='slave chat', msg_type='Text', sent_to='test', time=timestamp)
-                    for i in range(offset, offset + 500)
+                    for i in range(offset, offset + 100)
                 ]).execute()
         connection = history.db._managed_database.connection()
         costs = []
