@@ -1567,8 +1567,8 @@ class ChatBindingManager(LocaleMixin):
                     return
                 after = page[-1].position, page[-1].id
 
-        # Restore the original consecutive-text batching rule. Database page
-        # boundaries are not message boundaries; media and the text limit are.
+        # Merge consecutive text only while its original bot stays the same.
+        # Database pages are not boundaries; sender, media and text limit are.
         text_parts: List[str] = []
         entry_ids: List[int] = []
         text_kwargs: dict[str, object] = {}
@@ -1609,7 +1609,10 @@ class ChatBindingManager(LocaleMixin):
             operation, kwargs = prepared_call
             text = kwargs.get('text')
             if operation == 'send_message' and isinstance(text, str):
-                if text_parts and text_length + len(text) > 4096 - 20:
+                if text_parts and (
+                    text_length + len(text) > 4096 - 20
+                    or kwargs['_required_sender_bot_id'] != text_kwargs['_required_sender_bot_id']
+                ):
                     if not flush_text():
                         return False
                     text_length = 0
@@ -1658,8 +1661,15 @@ class ChatBindingManager(LocaleMixin):
     ) -> Optional[tuple[str, dict[str, object]]]:
         if entry.formatted_text == "":
             return None
+        source = self.db.get_msg_log(master_msg_id=TgChatMsgIDStr(entry.source_master_msg_id))
+        if source is None:
+            raise ValueError(f"Source MsgLog {entry.source_master_msg_id} is missing; cannot determine replay sender.")
+        # NULL is the existing MsgLog convention for the main bot, not a
+        # license to choose whichever auxiliary bot is currently available.
+        required_sender = source.sender_bot_id or '__main__'
         if entry.formatted_text is not None:
             kwargs: dict[str, object] = {
+                '_required_sender_bot_id': required_sender,
                 'chat_id': tg_chat_id,
                 'text': entry.formatted_text,
                 'parse_mode': 'Markdown',
@@ -1680,30 +1690,27 @@ class ChatBindingManager(LocaleMixin):
         }
         if thread_id is not None:
             kwargs['message_thread_id'] = thread_id
-        source = self.db.get_msg_log(master_msg_id=TgChatMsgIDStr(entry.source_master_msg_id))
-        if source is not None:
-            if source.master_msg_id_alt:
-                original_chat_id, original_msg_id = utils.message_id_str_to_id(
-                    TgChatMsgIDStr(source.master_msg_id_alt)
-                )
-                kwargs.update(from_chat_id=original_chat_id, message_id=original_msg_id)
-            # File IDs belong to the bot that obtained them. Use that same bot
-            # for the source copy and any acknowledged-copy-failure recovery.
-            kwargs['_required_sender_bot_id'] = source.sender_bot_id or '__main__'
-            media_arguments = {
-                'Photo': ('send_photo', 'photo'), 'Video': ('send_video', 'video'),
-                'Animation': ('send_animation', 'animation'), 'Document': ('send_document', 'document'),
-                'Audio': ('send_audio', 'audio'), 'Voice': ('send_voice', 'voice'),
-                'Sticker': ('send_sticker', 'sticker'), 'AnimatedSticker': ('send_sticker', 'sticker'),
-                'VideoSticker': ('send_sticker', 'sticker'),
-            }
-            media_call = media_arguments.get(source.media_type)
-            if media_call is not None and source.file_id:
-                operation, argument = media_call
-                fallback = {argument: source.file_id}
-                if argument != 'sticker' and source.text:
-                    fallback['caption'] = source.text
-                kwargs[HISTORY_REPLAY_KEY] = {'fallback_operation': operation, 'fallback_kwargs': fallback}
+        if source.master_msg_id_alt:
+            original_chat_id, original_msg_id = utils.message_id_str_to_id(
+                TgChatMsgIDStr(source.master_msg_id_alt)
+            )
+            kwargs.update(from_chat_id=original_chat_id, message_id=original_msg_id)
+        # The source copy and the file-ID fallback share one mandatory sender.
+        kwargs['_required_sender_bot_id'] = required_sender
+        media_arguments = {
+            'Photo': ('send_photo', 'photo'), 'Video': ('send_video', 'video'),
+            'Animation': ('send_animation', 'animation'), 'Document': ('send_document', 'document'),
+            'Audio': ('send_audio', 'audio'), 'Voice': ('send_voice', 'voice'),
+            'Sticker': ('send_sticker', 'sticker'), 'AnimatedSticker': ('send_sticker', 'sticker'),
+            'VideoSticker': ('send_sticker', 'sticker'),
+        }
+        media_call = media_arguments.get(source.media_type)
+        if media_call is not None and source.file_id:
+            operation, argument = media_call
+            fallback = {argument: source.file_id}
+            if argument != 'sticker' and source.text:
+                fallback['caption'] = source.text
+            kwargs[HISTORY_REPLAY_KEY] = {'fallback_operation': operation, 'fallback_kwargs': fallback}
         return 'copy_message', kwargs
 
     @staticmethod

@@ -1008,7 +1008,11 @@ class OutboundQueue:
             if required_sender is None:
                 raise QueueEnqueueError(f"{operation} requires _required_sender_bot_id.")
         elif required_sender is not None and required_sender != "__main__" and operation != "copy_message":
-            raise QueueEnqueueError(f"{operation} cannot require a sender.")
+            # Historical text and media must retain the original bot, unlike
+            # ordinary live sends that may use pool affinity/load balancing.
+            if not (operation in MESSAGE_CREATING_OPERATIONS
+                    and isinstance(telegram_kwargs.get(HISTORY_REPLAY_KEY), dict)):
+                raise QueueEnqueueError(f"{operation} cannot require a sender.")
         return telegram_kwargs, priority, slave_id, required_sender
 
     @staticmethod

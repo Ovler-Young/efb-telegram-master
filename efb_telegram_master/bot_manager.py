@@ -45,6 +45,7 @@ from .outbound import (
     QueueEnqueueError,
     QueuePersistenceError,
     QueueRequest,
+    RequiredSenderUnavailableError,
     SchedulerStoppedError,
     SenderSelection,
     SenderSelectionResult,
@@ -1251,6 +1252,8 @@ class TelegramBotManager(LocaleMixin):
     ) -> Future:
         del target_chat_id
         request_kwargs = dict(kwargs)
+        if not request_kwargs.get('_required_sender_bot_id'):
+            raise QueueEnqueueError('History replay requires its original sender bot.')
         metadata = request_kwargs.get(HISTORY_REPLAY_KEY)
         if metadata is not None and not isinstance(metadata, dict):
             raise QueueEnqueueError("History replay metadata must be a mapping.")
@@ -1294,23 +1297,27 @@ class TelegramBotManager(LocaleMixin):
             required_sender_bot_id="__main__",
         )
 
+    def _is_main_sender_id(self, sender_id: Optional[str]) -> bool:
+        me = getattr(self, 'me', None)
+        return sender_id == '__main__' or (
+            sender_id is not None and me is not None and sender_id == str(me.id)
+        )
+
     def select_sender(self, row, now: float) -> SenderSelectionResult:
         chat_id = row.telegram_chat_id
         required = row.required_sender_bot_id
-        if required == "__main__":
+        if required is None and row.slave_id and row.slave_id.startswith(HISTORY_SOURCE_PREFIX):
+            return SenderSelectionResult(terminal_error_class='history_sender_unknown')
+        if self._is_main_sender_id(required):
             return self._select_available_sender(SenderSelection(self._bot, None), chat_id, now)
         if required is not None:
             auxiliary = self.bot_pool.get_bot_by_id(required) if self.bot_pool else None
             if auxiliary is None or auxiliary.disabled:
-                if row.operation == 'copy_message':
-                    return self._select_available_sender(SenderSelection(self._bot, None), chat_id, now)
                 return SenderSelectionResult(terminal_error_class="required_sender_unavailable")
             membership = auxiliary.check_membership_tri(chat_id)
             if membership is None:
                 return SenderSelectionResult(retry_at=now + self.MEMBERSHIP_RECHECK_SECONDS)
             if membership is not True:
-                if row.operation == 'copy_message':
-                    return self._select_available_sender(SenderSelection(self._bot, None), chat_id, now)
                 return SenderSelectionResult(terminal_error_class="required_sender_unavailable")
             return self._select_available_sender(
                 SenderSelection(auxiliary.bot, str(auxiliary.bot_id)), chat_id, now
@@ -1402,6 +1409,16 @@ class TelegramBotManager(LocaleMixin):
         return (content, False) if isinstance(content, str) else (None, False)
 
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
+        # Check at the RPC boundary as well: a retry/fallback must never use
+        # another bot's saved file ID or change a history message's sender.
+        is_history = bool(getattr(row, 'slave_id', None) and row.slave_id.startswith(HISTORY_SOURCE_PREFIX))
+        if is_history:
+            required = row.required_sender_bot_id
+            matches = self._is_main_sender_id(required) if selection.sender_bot_id is None else (
+                required is not None and str(selection.sender_bot_id) == required
+            )
+            if not matches:
+                raise RequiredSenderUnavailableError('History replay sender does not match the original bot.')
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
         telegram_kwargs = cast(dict, OutboundQueue.streaming_uploads(self._strip_private_queue_metadata(kwargs)))
@@ -1491,7 +1508,8 @@ class TelegramBotManager(LocaleMixin):
             # Only an explicit negative acknowledgment permits a second send.
             # A missing response or timeout must keep using delivery uncertainty.
             if (row.operation == 'copy_message' and isinstance(replay, dict)
-                    and (selection.sender_bot_id or '__main__') == row.required_sender_bot_id
+                    and (selection.sender_bot_id == row.required_sender_bot_id
+                         or (selection.sender_bot_id is None and self._is_main_sender_id(row.required_sender_bot_id)))
                     and error.message.lower() in {
                 'message to copy not found', "message can't be copied", 'message cannot be copied',
                 'chat not found',

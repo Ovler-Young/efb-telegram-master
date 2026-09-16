@@ -1,0 +1,117 @@
+"""Live relink preserves original bot identities, text batches and saved media."""
+
+import asyncio
+import time
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+from ehforwarderbot import MsgType
+
+from efb_telegram_master import utils as etm_utils
+from .test_backfill_history import _ensure_users_in_group
+from .test_relink_history_media import wait_logged
+from .utils import get_start_token, link_chats
+
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(scope='module')
+def channel(channel_with_auxiliary_bots):
+    return channel_with_auxiliary_bots
+
+
+@pytest.fixture(scope='module')
+def slave(slave_with_auxiliary_bots):
+    return slave_with_auxiliary_bots
+
+
+async def test_relink_original_bots_for_text_photo_video_and_batch_boundaries(
+    channel, slave, client, helper, bot_id, bot_group, private_response,
+):
+    manager = channel.bot_manager
+    pool = manager.bot_pool
+    assert pool is not None and pool.bots, 'Real auxiliary credentials are required for sender ownership acceptance.'
+    auxiliary = next(bot for bot in pool.bots if not bot.disabled)
+    aux_id = int(auxiliary.bot_id)
+    await _ensure_users_in_group(client, bot_group, aux_id)
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if await asyncio.to_thread(auxiliary.check_membership_tri, bot_group) is True:
+            break
+        await asyncio.sleep(0.25)
+    else:
+        raise AssertionError('Auxiliary bot did not become a confirmed member of the test group.')
+
+    chat = slave.chat_with_alias
+    source = etm_utils.chat_id_to_str(chat=chat)
+    prefix = 'sender-' + uuid4().hex[:10]
+    labels = [f'{prefix} {letter}' for letter in 'ABCDEFGH']
+    saved = []
+    media_labels = []
+    original_media = []
+
+    def prefer(owner):
+        # Use the real pool's affinity API only for ORIGINAL messages. Replay
+        # must ignore the later affinity change and use each saved sender ID.
+        for bot in pool.bots:
+            pool.remove_failed_membership_affinity(source, bot.bot_id)
+        if owner == aux_id:
+            pool.record_successful_auxiliary_send(source, aux_id)
+
+    async def text_pair(start, owner):
+        prefer(owner)
+        for label in labels[start:start + 2]:
+            message = await asyncio.to_thread(slave.send_text_message, chat, chat.other, text=label)
+            row = await wait_logged(channel, source, message)
+            assert (int(row.sender_bot_id) if row.sender_bot_id else bot_id) == owner
+            saved.append(row)
+
+    async def media(kind, path, mime):
+        prefer(aux_id)
+        message = await asyncio.to_thread(slave.send_file_like_message, kind, Path(path), mime, chat, chat.other)
+        row = await wait_logged(channel, source, message)
+        assert row.sender_bot_id == str(aux_id) and row.file_id
+        source_chat, source_id = etm_utils.message_id_str_to_id(row.master_msg_id)
+        received = await client.get_messages(source_chat, ids=source_id)
+        assert received.sender_id == aux_id
+        saved.append(row)
+        media_labels.append(str(message.uid))
+        original_media.append(received)
+        # Force real saved-file-ID recovery: original source copy cannot work.
+        await asyncio.to_thread(auxiliary.bot.delete_message, source_chat, source_id)
+
+    with link_chats(channel, (chat,), bot_group):
+        await text_pair(0, bot_id)
+        await text_pair(2, aux_id)
+        await media(MsgType.Image, 'tests/mocks/image.png', 'image/png')
+        await text_pair(4, bot_id)
+        await media(MsgType.Video, 'tests/mocks/video_0.mp4', 'video/mp4')
+        await text_pair(6, aux_id)
+        prefer(bot_id)  # The currently preferred/available bot is NOT the owner of most history.
+
+        token = await get_start_token(client, helper, bot_id, chat.uid, private_response)
+        command = await client.send_message(bot_group, f'/start {token} true')
+        deadline = time.monotonic() + 240
+        matches = []
+        while time.monotonic() < deadline:
+            recent = await client.get_messages(bot_group, limit=100)
+            matches = sorted((msg for msg in recent if msg.id > command.id and (
+                prefix in (msg.raw_text or '') or any(label in (msg.raw_text or '') for label in media_labels)
+            )), key=lambda msg: msg.id)
+            if any(labels[-1] in (msg.raw_text or '') for msg in matches):
+                break
+            await asyncio.sleep(0.5)
+
+        assert len(matches) == 6, [(msg.id, msg.sender_id, msg.raw_text) for msg in matches]
+        assert [msg.sender_id for msg in matches] == [bot_id, aux_id, aux_id, bot_id, aux_id, aux_id]
+        for output, start in ((0, 0), (1, 2), (3, 4), (5, 6)):
+            assert labels[start] in matches[output].raw_text and labels[start + 1] in matches[output].raw_text
+        assert matches[2].photo.id == original_media[0].photo.id
+        assert matches[4].video is not None and matches[4].document.id == original_media[1].document.id
+        for row in saved:
+            current = channel.db.get_msg_log(master_msg_id=row.master_msg_id)
+            assert current is not None
+            assert (current.slave_message_id, current.text, current.file_id, current.sender_bot_id) == (
+                row.slave_message_id, row.text, row.file_id, row.sender_bot_id,
+            )

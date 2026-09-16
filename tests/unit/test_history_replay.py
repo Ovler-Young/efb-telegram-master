@@ -97,6 +97,36 @@ def test_text_batch_crosses_sqlite_page_boundaries_without_loading_entire_histor
     assert len(history.calls[0]['history_entry_ids']) == 75
 
 
+def test_text_batches_split_at_original_sender_changes_even_across_pages(history):
+    texts = [f'line {index:02d}\n' for index in range(70)]
+    target = populate(history, texts)
+    owners = [None] * 33 + ['aux-7'] * 34 + ['aux-8'] * 2 + [None]
+    with connection_scope(history.db._managed_database):
+        for index, owner in enumerate(owners):
+            MsgLog.update(sender_bot_id=owner).where(MsgLog.master_msg_id == f'-1001.{index + 1}').execute()
+    assert history.binding._process_history_migration_target(target)
+    assert [call['kwargs']['text'] for call in history.calls] == [
+        ''.join(texts[:33]), ''.join(texts[33:67]), ''.join(texts[67:69]), texts[69],
+    ]
+    assert [call['kwargs']['_required_sender_bot_id'] for call in history.calls] == [
+        '__main__', 'aux-7', 'aux-8', '__main__',
+    ]
+    with connection_scope(history.db._managed_database):
+        assert MsgLog.select().count() == 70
+        assert HistoryMigrationEntry.select().count() == 0
+
+
+@pytest.mark.parametrize('text', ['hello', None])
+def test_missing_source_log_retains_replay_instead_of_guessing_sender(history, text):
+    target = populate(history, [text])
+    with connection_scope(history.db._managed_database):
+        MsgLog.delete().execute()  # Simulate an incomplete source, not a runtime cleanup.
+    assert not history.binding._process_history_migration_target(target)
+    assert history.calls == []
+    with connection_scope(history.db._managed_database):
+        assert HistoryMigrationEntry.select().count() == 1
+
+
 def test_original_4076_character_boundary_is_preserved(history):
     target = populate(history, ['a' * 2038, 'b' * 2038, 'c'])
     history.binding._process_history_migration_target(target)
@@ -214,10 +244,10 @@ def test_unavailable_original_sender_never_reuses_its_file_id_with_main_bot(hist
         waiter = manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,
             operation=op, args=(), kwargs=kwargs, history_entry_ids=[target.id])
         scheduler.dispatch_once()
-        finish_attempt(executor, scheduler)
-        assert [kind for kind, _ in sender.calls] == ['copy_message']
+        assert executor.submissions == []
+        assert sender.calls == []  # Not even a source copy may switch to the main bot.
         assert waiter.exception() is not None
-        assert manager._outbound_queue.connection.execute('SELECT delivery_hold FROM outbound_queue').fetchone()[0] == 'history_failed:BadRequest'
+        assert manager._outbound_queue.connection.execute('SELECT delivery_hold FROM outbound_queue').fetchone()[0] == 'history_failed:RequiredSenderUnavailableError'
     finally:
         manager._outbound_queue.close()
 
@@ -273,7 +303,8 @@ def test_failed_video_replay_is_retained_and_later_history_can_continue(history)
         finish_attempt(executor, scheduler)
         assert manager._outbound_queue.connection.execute('SELECT delivery_hold FROM outbound_queue').fetchone()[0] == 'history_failed:BadRequest'
         waiter = manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,
-            operation='send_message', args=(), kwargs={'chat_id': -1002, 'text': 'later'}, history_entry_ids=[999])
+            operation='send_message', args=(), kwargs={'chat_id': -1002, 'text': 'later',
+                '_required_sender_bot_id': '__main__'}, history_entry_ids=[999])
         scheduler.dispatch_once()
         finish_attempt(executor, scheduler)
         assert waiter.result().message_id == 502

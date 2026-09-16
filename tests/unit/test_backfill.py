@@ -232,7 +232,9 @@ def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channe
         waiter = Future()
         waiter.set_result(None)
         waiters.append(waiter)
+    source = SimpleNamespace(sender_bot_id=None, master_msg_id_alt=None, media_type=None, file_id=None)
     with patch.object(channel.db, "get_recent_messages", return_value=msg_logs), \
+         patch.object(channel.db, "get_msg_log", return_value=source), \
          patch.object(channel.bot_manager, "enqueue_history_operation", side_effect=waiters) as enqueue:
         channel.chat_binding._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
 
@@ -337,7 +339,9 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
         get_next_history_migration_target=Mock(side_effect=get_next_history_migration_target),
         get_history_migration_entries=Mock(side_effect=get_history_migration_entries),
         get_recent_messages=Mock(),
-        get_msg_log=Mock(return_value=None),
+        get_msg_log=Mock(return_value=SimpleNamespace(
+            sender_bot_id=None, master_msg_id_alt=None, media_type='Photo', file_id=None,
+        )),
         delete_history_migration_entry=Mock(side_effect=delete_entry),
     )
 
@@ -367,6 +371,7 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
             kwargs={
                 "chat_id": 12345,
                 "text": "first\nsecond\n",
+                "_required_sender_bot_id": "__main__",
                 "parse_mode": "Markdown",
                 "disable_notification": True,
             },
@@ -381,6 +386,7 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
                 "chat_id": 12345,
                 "from_chat_id": 10,
                 "message_id": 22,
+                "_required_sender_bot_id": "__main__",
                 "disable_notification": True,
             },
             history_entry_ids=[3],
@@ -408,6 +414,7 @@ def test_history_migration_continues_after_terminal_delivery_failure():
         get_history_migration_entries=Mock(return_value=[entry]),
         delete_history_migration_entry=Mock(),
     )
+    manager.db.get_msg_log = Mock(return_value=SimpleNamespace(sender_bot_id=None))
     failed_waiter = Future()
     failed_waiter.set_exception(RuntimeError("Telegram failed"))
     manager.bot = SimpleNamespace(enqueue_history_operation=Mock(return_value=failed_waiter))
@@ -438,6 +445,7 @@ def test_history_migration_retains_entry_when_durable_enqueue_fails():
         get_history_migration_entries=Mock(return_value=[entry]),
         delete_history_migration_entry=Mock(),
     )
+    manager.db.get_msg_log = Mock(return_value=SimpleNamespace(sender_bot_id=None))
     manager.bot = SimpleNamespace(
         enqueue_history_operation=Mock(side_effect=RuntimeError("queue unavailable"))
     )
