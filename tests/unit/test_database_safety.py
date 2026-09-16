@@ -483,7 +483,7 @@ def test_migrated_runtime_new_reply_edit_reaction_and_backfill(sqlite_source, po
     chat = SimpleNamespace(module_id="slave", uid="chat")
     author = SimpleNamespace(module_id="slave", uid="author")
     message = SimpleNamespace(
-        uid="new-source", text="new message", chat=chat, author=author,
+        uid="new-source", text="new message", chat=chat, author=author, sender_bot_id=None,
         type=SimpleNamespace(name="Text"), type_telegram=SimpleNamespace(value="Text"),
         deliver_to=SimpleNamespace(channel_id="blueset.telegram"),
         file_id=None, file_unique_id=None, mime=None, is_system=False,
@@ -494,6 +494,7 @@ def test_migrated_runtime_new_reply_edit_reaction_and_backfill(sqlite_source, po
     reply = SimpleNamespace(**dict(vars(message), uid="reply-source", text="reply", target=message))
     manager.add_or_update_message_log(reply, SimpleNamespace(chat_id=-100123, message_id=101))
     stored_reply = manager.get_msg_log(master_msg_id="-100123.101")
+    assert stored_reply.sender_bot_id is None
     assert pickle.loads(stored_reply.pickle)["target"] == "-100123.100"
     message.text = "edited"
     message.reactions = {"👍": [author]}
