@@ -53,6 +53,7 @@ async def test_relink_groups_text_around_a_real_video(
         assert original_chat == bot_group
         assert video_log.media_type == 'Video' and video_log.file_id
         assert original_video.video is not None and video_label in original_video.raw_text
+        original_contents = await client.download_media(original_video, file=bytes)
         for label in labels[2:]:
             message = await asyncio.to_thread(slave.send_text_message, chat, chat.other, text=label)
             await helper.wait_for_message(in_chats(bot_group) & regex(label))
@@ -81,7 +82,7 @@ async def test_relink_groups_text_around_a_real_video(
         assert len(matches) == 3, [(msg.id, msg.raw_text) for msg in matches]
         assert labels[0] in matches[0].raw_text and labels[1] in matches[0].raw_text
         assert matches[1].video is not None and video_label in matches[1].raw_text
-        assert matches[1].document.id == original_video.document.id
+        assert await client.download_media(matches[1], file=bytes) == original_contents
         assert labels[2] in matches[2].raw_text and labels[3] in matches[2].raw_text
         for row in saved:
             current = channel.db.get_msg_log(master_msg_id=row.master_msg_id)

@@ -453,6 +453,15 @@ class OutboundQueue:
                            ("attempt_started_at", "REAL")):
             if name not in columns:
                 connection.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL")
+        # Undo only pre-submission holds caused by the removed history sender
+        # constraint. Attempted/uncertain deliveries must never be auto-replayed.
+        connection.execute(
+            "UPDATE outbound_queue SET delivery_hold=NULL "
+            "WHERE substr(slave_id, 1, ?) = ? AND delivery_state='queued' "
+            "AND delivery_hold='history_failed:RequiredSenderUnavailableError' "
+            "AND attempt_started_at IS NULL",
+            (len(HISTORY_SOURCE_PREFIX), HISTORY_SOURCE_PREFIX),
+        )
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -1008,11 +1017,7 @@ class OutboundQueue:
             if required_sender is None:
                 raise QueueEnqueueError(f"{operation} requires _required_sender_bot_id.")
         elif required_sender is not None and required_sender != "__main__" and operation != "copy_message":
-            # Historical text and media must retain the original bot, unlike
-            # ordinary live sends that may use pool affinity/load balancing.
-            if not (operation in MESSAGE_CREATING_OPERATIONS
-                    and isinstance(telegram_kwargs.get(HISTORY_REPLAY_KEY), dict)):
-                raise QueueEnqueueError(f"{operation} cannot require a sender.")
+            raise QueueEnqueueError(f"{operation} cannot require a sender.")
         return telegram_kwargs, priority, slave_id, required_sender
 
     @staticmethod

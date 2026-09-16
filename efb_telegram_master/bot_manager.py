@@ -12,16 +12,20 @@ import numbers
 import os
 import pickle
 import re
+import tempfile
 import threading
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Collection, Coroutine, Iterator, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
 from unittest.mock import Mock, patch
 
+import httpx
 import telegram.constants
 import telegram.error
 from telegram import File, ForumTopic, InlineKeyboardMarkup, Update, User
@@ -1252,12 +1256,13 @@ class TelegramBotManager(LocaleMixin):
     ) -> Future:
         del target_chat_id
         request_kwargs = dict(kwargs)
-        if not request_kwargs.get('_required_sender_bot_id'):
-            raise QueueEnqueueError('History replay requires its original sender bot.')
+        source_sender = request_kwargs.pop('_required_sender_bot_id', None)
         metadata = request_kwargs.get(HISTORY_REPLAY_KEY)
         if metadata is not None and not isinstance(metadata, dict):
             raise QueueEnqueueError("History replay metadata must be a mapping.")
         replay = dict(metadata or {})
+        if source_sender is not None:
+            replay.setdefault('source_sender_bot_id', source_sender)
         replay.update(source_key=source_key, entry_ids=list(history_entry_ids))
         request_kwargs[HISTORY_REPLAY_KEY] = replay
         request_kwargs["_slave_id"] = HISTORY_SOURCE_PREFIX + source_key
@@ -1306,8 +1311,9 @@ class TelegramBotManager(LocaleMixin):
     def select_sender(self, row, now: float) -> SenderSelectionResult:
         chat_id = row.telegram_chat_id
         required = row.required_sender_bot_id
-        if required is None and row.slave_id and row.slave_id.startswith(HISTORY_SOURCE_PREFIX):
-            return SenderSelectionResult(terminal_error_class='history_sender_unknown')
+        if row.slave_id and row.slave_id.startswith(HISTORY_SOURCE_PREFIX):
+            # Older replays stored the acquisition bot here, not a send constraint.
+            required = None
         if self._is_main_sender_id(required):
             return self._select_available_sender(SenderSelection(self._bot, None), chat_id, now)
         if required is not None:
@@ -1409,16 +1415,6 @@ class TelegramBotManager(LocaleMixin):
         return (content, False) if isinstance(content, str) else (None, False)
 
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
-        # Check at the RPC boundary as well: a retry/fallback must never use
-        # another bot's saved file ID or change a history message's sender.
-        is_history = bool(getattr(row, 'slave_id', None) and row.slave_id.startswith(HISTORY_SOURCE_PREFIX))
-        if is_history:
-            required = row.required_sender_bot_id
-            matches = self._is_main_sender_id(required) if selection.sender_bot_id is None else (
-                required is not None and str(selection.sender_bot_id) == required
-            )
-            if not matches:
-                raise RequiredSenderUnavailableError('History replay sender does not match the original bot.')
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
         telegram_kwargs = cast(dict, OutboundQueue.streaming_uploads(self._strip_private_queue_metadata(kwargs)))
@@ -1508,8 +1504,6 @@ class TelegramBotManager(LocaleMixin):
             # Only an explicit negative acknowledgment permits a second send.
             # A missing response or timeout must keep using delivery uncertainty.
             if (row.operation == 'copy_message' and isinstance(replay, dict)
-                    and (selection.sender_bot_id == row.required_sender_bot_id
-                         or (selection.sender_bot_id is None and self._is_main_sender_id(row.required_sender_bot_id)))
                     and error.message.lower() in {
                 'message to copy not found', "message can't be copied", 'message cannot be copied',
                 'chat not found',
@@ -1524,13 +1518,16 @@ class TelegramBotManager(LocaleMixin):
                     for key in ('chat_id', 'message_thread_id', 'disable_notification'):
                         if key in telegram_kwargs:
                             fallback_kwargs[key] = telegram_kwargs[key]
-                    self.logger.info(
-                        "History queue row %s: source copy unavailable; replaying saved media with %s.",
-                        row.id, fallback_operation,
-                    )
-                    return self.execute_queued_call(
-                        replace(row, operation=fallback_operation), (), fallback_kwargs, selection
-                    )
+                    argument = fallback_operation.removeprefix('send_')
+                    file_id = fallback_kwargs[argument]
+                    owner = replay.get('source_sender_bot_id', row.required_sender_bot_id)
+                    if 'source_sender_bot_id' not in replay and owner is None:
+                        raise RequiredSenderUnavailableError('Saved media has no acquisition bot.')
+                    with self._history_media_upload(file_id, owner) as upload:
+                        fallback_kwargs[argument] = upload
+                        return self.execute_queued_call(
+                            replace(row, operation=fallback_operation), (), fallback_kwargs, selection
+                        )
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
             telegram_kwargs.pop("parse_mode")
@@ -2181,9 +2178,46 @@ class TelegramBotManager(LocaleMixin):
         return self.send_message(update.effective_chat.id, errmsg,
                                  reply_to_message_id=update.effective_message.message_id)
 
-    @Decorators.retry_on_chat_migration
-    def get_file(self, file_id: str) -> File:
-        return cast(File, self._bot.get_file(file_id))
+    def get_file(self, file_id: str, *, sender_bot_id: Optional[str] = None) -> File:
+        """Resolve a saved file ID with its owner, independently of send routing."""
+        if sender_bot_id is None or self._is_main_sender_id(str(sender_bot_id)):
+            return cast(File, self._bot.get_file(file_id))
+        auxiliary = self.bot_pool.get_bot_by_id(sender_bot_id) if self.bot_pool else None
+        if auxiliary is None or auxiliary.disabled:
+            raise RequiredSenderUnavailableError('Saved media acquisition bot is unavailable.')
+        # Membership in the destination is irrelevant to getFile. Never fall
+        # back to the main bot with somebody else's opaque file ID.
+        return cast(File, auxiliary.bot.get_file(file_id))
+
+    @contextmanager
+    def _history_media_upload(self, file_id: str, owner: Optional[str]) -> Iterator[object]:
+        """Fetch with the owner; give bytes/path to the ordinary selected sender."""
+        file_meta = self.get_file(file_id, sender_bot_id=owner)
+        path = file_meta.file_path
+        if not path:
+            raise ValueError('Telegram returned no path for saved media.')
+        if not urlparse(path).scheme:
+            local = Path(path)
+            if getattr(self, '_local_mode', False):
+                yield local.resolve().as_uri()
+            else:
+                with local.open('rb') as stream:
+                    yield telegram.InputFile(stream, filename=local.name, read_file_handle=False)
+            return
+        # Keep owner-token URLs out of the outbound payload and other bots'
+        # requests. Stream to disk instead of buffering the complete attachment.
+        with tempfile.TemporaryFile() as stream:
+            try:
+                with httpx.stream('GET', path, timeout=120, follow_redirects=True) as response:
+                    response.raise_for_status()
+                    for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                        stream.write(chunk)
+            except httpx.HTTPError:
+                raise ValueError('Unable to download saved Telegram media.') from None
+            stream.seek(0)
+            yield telegram.InputFile(
+                stream, filename=Path(urlparse(path).path).name, read_file_handle=False,
+            )
 
     def delete_message(self, chat_id, message_id, _sender_bot_id=None):
         required_sender = str(_sender_bot_id) if _sender_bot_id else "__main__"

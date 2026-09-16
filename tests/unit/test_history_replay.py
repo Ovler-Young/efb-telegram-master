@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+from telegram import InputFile
 from telegram.error import BadRequest, TimedOut
 
 from efb_telegram_master import db as db_module
@@ -97,7 +98,7 @@ def test_text_batch_crosses_sqlite_page_boundaries_without_loading_entire_histor
     assert len(history.calls[0]['history_entry_ids']) == 75
 
 
-def test_text_batches_split_at_original_sender_changes_even_across_pages(history):
+def test_text_batches_ignore_original_sender_changes_across_pages(history):
     texts = [f'line {index:02d}\n' for index in range(70)]
     target = populate(history, texts)
     owners = [None] * 33 + ['aux-7'] * 34 + ['aux-8'] * 2 + [None]
@@ -105,26 +106,24 @@ def test_text_batches_split_at_original_sender_changes_even_across_pages(history
         for index, owner in enumerate(owners):
             MsgLog.update(sender_bot_id=owner).where(MsgLog.master_msg_id == f'-1001.{index + 1}').execute()
     assert history.binding._process_history_migration_target(target)
-    assert [call['kwargs']['text'] for call in history.calls] == [
-        ''.join(texts[:33]), ''.join(texts[33:67]), ''.join(texts[67:69]), texts[69],
-    ]
-    assert [call['kwargs']['_required_sender_bot_id'] for call in history.calls] == [
-        '__main__', 'aux-7', 'aux-8', '__main__',
-    ]
+    assert [call['kwargs']['text'] for call in history.calls] == [''.join(texts)]
+    assert all('_required_sender_bot_id' not in call['kwargs'] for call in history.calls)
     with connection_scope(history.db._managed_database):
         assert MsgLog.select().count() == 70
         assert HistoryMigrationEntry.select().count() == 0
 
 
 @pytest.mark.parametrize('text', ['hello', None])
-def test_missing_source_log_retains_replay_instead_of_guessing_sender(history, text):
+def test_missing_source_log_does_not_prevent_text_or_source_message_copy(history, text):
     target = populate(history, [text])
     with connection_scope(history.db._managed_database):
         MsgLog.delete().execute()  # Simulate an incomplete source, not a runtime cleanup.
-    assert not history.binding._process_history_migration_target(target)
-    assert history.calls == []
+    assert history.binding._process_history_migration_target(target)
+    assert len(history.calls) == 1
+    assert history.calls[0]['operation'] == ('send_message' if text is not None else 'copy_message')
+    assert '_required_sender_bot_id' not in history.calls[0]['kwargs']
     with connection_scope(history.db._managed_database):
-        assert HistoryMigrationEntry.select().count() == 1
+        assert HistoryMigrationEntry.select().count() == 0
 
 
 def test_original_4076_character_boundary_is_preserved(history):
@@ -147,6 +146,12 @@ class Sender:
         self.copy_error = copy_error
         self.media_error = media_error
         self.calls = []
+        self.file_requests = []
+        self.file_path = None
+
+    def get_file(self, file_id):
+        self.file_requests.append(file_id)
+        return SimpleNamespace(file_path=self.file_path)
 
     def copy_message(self, chat_id, from_chat_id, message_id, **kwargs):
         self.calls.append(('copy_message', dict(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id, **kwargs)))
@@ -155,8 +160,9 @@ class Sender:
         return SimpleNamespace(message_id=500)
 
     def send_video(self, chat_id, video, **kwargs):
-        self.calls.append(('send_video', dict(chat_id=chat_id, video=video, **kwargs)))
-        assert isinstance(video, str)  # A Telegram file ID, never a downloaded file.
+        assert isinstance(video, InputFile)  # Original bot's file ID is not passed to the sender.
+        contents = video.input_file_content.read(1024)
+        self.calls.append(('send_video', dict(chat_id=chat_id, video=contents, **kwargs)))
         if self.media_error:
             raise self.media_error
         return SimpleNamespace(message_id=501)
@@ -169,6 +175,9 @@ class Sender:
 def prepare_runtime(history, sender):
     manager = manager_adapter()
     manager._bot = sender
+    media = history.path / 'saved-video.mp4'
+    media.write_bytes(b'saved media')
+    sender.file_path = str(media)
     manager.logger = Mock()
     manager._outbound_queue = OutboundQueue(history.path)
     executor = ControlledExecutor()
@@ -189,33 +198,38 @@ def finish_attempt(executor, scheduler):
 
 
 @pytest.mark.parametrize('auxiliary', [False, True])
-def test_video_copy_missing_uses_saved_file_id_with_owning_sender(history, auxiliary):
+def test_video_copy_missing_fetches_with_owner_but_sends_normally(history, auxiliary):
     target = populate(history, [None])
     if auxiliary:
         with connection_scope(history.db._managed_database):
             MsgLog.update(sender_bot_id='aux-7').execute()
     sender = Sender(copy_error=BadRequest('Message to copy not found'))
     manager, executor, scheduler = prepare_runtime(history, sender)
+    owner = Sender() if auxiliary else sender
+    owner.file_path = sender.file_path
     if auxiliary:
-        manager._bot = Sender(copy_error=AssertionError('must not use main bot with an auxiliary file ID'))
-        aux = SimpleNamespace(disabled=False, bot_id='aux-7', bot=sender,
-                              check_membership_tri=lambda _: True, peek_delay=lambda _: 0,
+        aux = SimpleNamespace(disabled=False, bot_id='aux-7', bot=owner,
+                              check_membership_tri=lambda _: False, peek_delay=lambda _: 0,
                               try_acquire_limits=lambda _: True)
-        manager.bot_pool = SimpleNamespace(get_bot_by_id=lambda _: aux, record_successful_auxiliary_send=Mock())
+        manager.bot_pool = SimpleNamespace(get_bot_by_id=lambda _: aux,
+            candidate_bots=lambda _: [(aux, False)], record_successful_auxiliary_send=Mock())
     operation, kwargs = history.binding._prepare_history_migration_call(target, -1002, 42)
     waiter = manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,
         operation=operation, args=(), kwargs=kwargs, history_entry_ids=[target.id])
     try:
         queue = manager._outbound_queue
         original = queue.heads()[0]
-        assert original.required_sender_bot_id == ('aux-7' if auxiliary else '__main__')
+        assert original.required_sender_bot_id is None
         assert queue.decode_payload_raw(original.payload)[1][HISTORY_REPLAY_KEY]['entry_ids'] == [target.id]
         scheduler.dispatch_once()
         finish_attempt(executor, scheduler)
         assert waiter.result().message_id == 501
         assert [kind for kind, _ in sender.calls] == ['copy_message', 'send_video']
-        assert sender.calls[-1][1] == dict(chat_id=-1002, video='saved-video-file-id',
+        assert sender.calls[-1][1] == dict(chat_id=-1002, video=b'saved media',
             caption='video caption', message_thread_id=42, disable_notification=True)
+        assert owner.file_requests == ['saved-video-file-id']
+        if auxiliary:
+            assert owner.calls == [] and sender.file_requests == []
         assert not queue.heads()
         with connection_scope(history.db._managed_database):
             assert MsgLog.select().count() == 1
@@ -230,7 +244,9 @@ def test_edited_video_replay_copies_the_latest_alternate_message(history):
         MsgLog.update(master_msg_id_alt='-1009.88', sender_bot_id='aux-7').execute()
     op, kwargs = history.binding._prepare_history_migration_call(target, -1002, 42)
     assert op == 'copy_message'
-    assert (kwargs['from_chat_id'], kwargs['message_id'], kwargs['_required_sender_bot_id']) == (-1009, 88, 'aux-7')
+    assert (kwargs['from_chat_id'], kwargs['message_id']) == (-1009, 88)
+    assert kwargs[HISTORY_REPLAY_KEY]['source_sender_bot_id'] == 'aux-7'
+    assert '_required_sender_bot_id' not in kwargs
 
 
 def test_unavailable_original_sender_never_reuses_its_file_id_with_main_bot(history):
@@ -244,10 +260,11 @@ def test_unavailable_original_sender_never_reuses_its_file_id_with_main_bot(hist
         waiter = manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,
             operation=op, args=(), kwargs=kwargs, history_entry_ids=[target.id])
         scheduler.dispatch_once()
-        assert executor.submissions == []
-        assert sender.calls == []  # Not even a source copy may switch to the main bot.
+        finish_attempt(executor, scheduler)
+        assert [kind for kind, _ in sender.calls] == ['copy_message']
+        assert sender.file_requests == []  # The main bot cannot acquire another bot's file ID.
         assert waiter.exception() is not None
-        assert manager._outbound_queue.connection.execute('SELECT delivery_hold FROM outbound_queue').fetchone()[0] == 'history_failed:RequiredSenderUnavailableError'
+        assert manager._outbound_queue.connection.execute('SELECT delivery_hold FROM outbound_queue').fetchone()[0]
     finally:
         manager._outbound_queue.close()
 
@@ -303,8 +320,7 @@ def test_failed_video_replay_is_retained_and_later_history_can_continue(history)
         finish_attempt(executor, scheduler)
         assert manager._outbound_queue.connection.execute('SELECT delivery_hold FROM outbound_queue').fetchone()[0] == 'history_failed:BadRequest'
         waiter = manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,
-            operation='send_message', args=(), kwargs={'chat_id': -1002, 'text': 'later',
-                '_required_sender_bot_id': '__main__'}, history_entry_ids=[999])
+            operation='send_message', args=(), kwargs={'chat_id': -1002, 'text': 'later'}, history_entry_ids=[999])
         scheduler.dispatch_once()
         finish_attempt(executor, scheduler)
         assert waiter.result().message_id == 502

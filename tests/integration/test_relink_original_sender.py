@@ -1,9 +1,13 @@
-"""Live relink preserves original bot identities, text batches and saved media."""
+"""Live relink fetches media with its owner and sends through ordinary selection."""
 
 import asyncio
 import time
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
+from unittest.mock import patch
+
+from PIL import Image, ImageChops, ImageStat
 
 import pytest
 from ehforwarderbot import MsgType
@@ -26,7 +30,7 @@ def slave(slave_with_auxiliary_bots):
     return slave_with_auxiliary_bots
 
 
-async def test_relink_original_bots_for_text_photo_video_and_batch_boundaries(
+async def test_relink_owner_fetch_is_independent_of_sending_and_text_batching(
     channel, slave, client, helper, bot_id, bot_group, private_response,
 ):
     manager = channel.bot_manager
@@ -52,8 +56,8 @@ async def test_relink_original_bots_for_text_photo_video_and_batch_boundaries(
     original_media = []
 
     def prefer(owner):
-        # Use the real pool's affinity API only for ORIGINAL messages. Replay
-        # must ignore the later affinity change and use each saved sender ID.
+        # Seed original messages with different senders through real affinity.
+        # Historical identity must not override the ordinary replay selection.
         for bot in pool.bots:
             pool.remove_failed_membership_affinity(source, bot.bot_id)
         if owner == aux_id:
@@ -77,7 +81,7 @@ async def test_relink_original_bots_for_text_photo_video_and_batch_boundaries(
         assert received.sender_id == aux_id
         saved.append(row)
         media_labels.append(str(message.uid))
-        original_media.append(received)
+        original_media.append(await client.download_media(received, file=bytes))
         # Force real saved-file-ID recovery: original source copy cannot work.
         await asyncio.to_thread(auxiliary.bot.delete_message, source_chat, source_id)
 
@@ -91,24 +95,37 @@ async def test_relink_original_bots_for_text_photo_video_and_batch_boundaries(
         prefer(bot_id)  # The currently preferred/available bot is NOT the owner of most history.
 
         token = await get_start_token(client, helper, bot_id, chat.uid, private_response)
-        command = await client.send_message(bot_group, f'/start {token} true')
-        deadline = time.monotonic() + 240
-        matches = []
-        while time.monotonic() < deadline:
-            recent = await client.get_messages(bot_group, limit=100)
-            matches = sorted((msg for msg in recent if msg.id > command.id and (
-                prefix in (msg.raw_text or '') or any(label in (msg.raw_text or '') for label in media_labels)
-            )), key=lambda msg: msg.id)
-            if any(labels[-1] in (msg.raw_text or '') for msg in matches):
-                break
-            await asyncio.sleep(0.5)
+        with patch.object(auxiliary.bot, 'get_file', wraps=auxiliary.bot.get_file) as owner_fetch, \
+                patch.object(manager._bot, 'get_file', wraps=manager._bot.get_file) as main_fetch:
+            command = await client.send_message(bot_group, f'/start {token} true')
+            deadline = time.monotonic() + 240
+            matches = []
+            while time.monotonic() < deadline:
+                recent = await client.get_messages(bot_group, limit=100)
+                matches = sorted((msg for msg in recent if msg.id > command.id and (
+                    prefix in (msg.raw_text or '') or any(label in (msg.raw_text or '') for label in media_labels)
+                )), key=lambda msg: msg.id)
+                if any(labels[-1] in (msg.raw_text or '') for msg in matches):
+                    break
+                await asyncio.sleep(0.5)
+            assert {call.args[0] for call in owner_fetch.call_args_list} == {row.file_id for row in saved if row.file_id}
+            main_fetch.assert_not_called()
 
-        assert len(matches) == 6, [(msg.id, msg.sender_id, msg.raw_text) for msg in matches]
-        assert [msg.sender_id for msg in matches] == [bot_id, aux_id, aux_id, bot_id, aux_id, aux_id]
-        for output, start in ((0, 0), (1, 2), (3, 4), (5, 6)):
+        # Four consecutive texts from two original bots form ONE batch.
+        # Main is the normal sender here; auxiliary owns only the saved files.
+        assert len(matches) == 5, [(msg.id, msg.sender_id, msg.raw_text) for msg in matches]
+        assert all(msg.sender_id == bot_id for msg in matches)
+        assert all(label in matches[0].raw_text for label in labels[:4])
+        for output, start in ((2, 4), (4, 6)):
             assert labels[start] in matches[output].raw_text and labels[start + 1] in matches[output].raw_text
-        assert matches[2].photo.id == original_media[0].photo.id
-        assert matches[4].video is not None and matches[4].document.id == original_media[1].document.id
+        assert matches[1].photo is not None and matches[3].video is not None
+        photo_bytes = await client.download_media(matches[1], file=bytes)
+        with Image.open(BytesIO(original_media[0])) as original, Image.open(BytesIO(photo_bytes)) as restored:
+            assert original.size == restored.size
+            # Telegram can recompress a photo on upload; compare decoded content.
+            difference = ImageChops.difference(original.convert('RGB'), restored.convert('RGB'))
+            assert max(ImageStat.Stat(difference).mean) < 5
+        assert await client.download_media(matches[3], file=bytes) == original_media[1]
         for row in saved:
             current = channel.db.get_msg_log(master_msg_id=row.master_msg_id)
             assert current is not None

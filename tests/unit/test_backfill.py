@@ -371,7 +371,6 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
             kwargs={
                 "chat_id": 12345,
                 "text": "first\nsecond\n",
-                "_required_sender_bot_id": "__main__",
                 "parse_mode": "Markdown",
                 "disable_notification": True,
             },
@@ -386,7 +385,6 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
                 "chat_id": 12345,
                 "from_chat_id": 10,
                 "message_id": 22,
-                "_required_sender_bot_id": "__main__",
                 "disable_notification": True,
             },
             history_entry_ids=[3],
