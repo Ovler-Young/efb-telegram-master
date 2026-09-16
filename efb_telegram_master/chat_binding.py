@@ -1593,12 +1593,13 @@ class ChatBindingManager(LocaleMixin):
                 )
             except Exception as error:
                 self.logger.warning(
-                    "History migration entry %d discarded because it could not be prepared: %s",
+                    "History migration entry %d retained because it could not be prepared: %s",
                     entry.id,
                     error,
                 )
-                self.db.delete_history_migration_entry(entry.id)
-                continue
+                # In particular, a transient MsgLog lookup failure must not
+                # silently remove a video from the requested replay.
+                return False
 
             if prepared_call is None:
                 self.db.delete_history_migration_entry(entry.id)

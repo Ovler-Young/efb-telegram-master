@@ -45,6 +45,9 @@ A committed outbound request carries the source chat and all history-entry IDs
 for its batch. Only then are those staging entries removed. Original MsgLog
 records remain unchanged and are never deleted by history replay.
 
+Preparation errors (including a failed MsgLog lookup) retain the staging entries
+and stop that replay pass instead of silently skipping the source message.
+
 Rejected history deliveries remain in `outbound_queue` with a
 `history_failed:<exception class>` hold rather than being silently discarded.
 The failed Future logs the entry IDs and error. Held rows do not block later

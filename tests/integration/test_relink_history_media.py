@@ -44,11 +44,15 @@ async def test_relink_groups_text_around_a_real_video(
             'video/mp4', chat, chat.other,
         )
         video_label = str(video.uid)
-        original_video = await helper.wait_for_message(in_chats(bot_group) & regex(video_label))
         video_log = await wait_logged(channel, source, video)
+        original_chat, original_id = etm_utils.message_id_str_to_id(video_log.master_msg_id)
+        # The shared regex helper accepts text messages, not video captions.
+        # Independently fetch the actual message via the user session instead.
+        original_video = await client.get_messages(original_chat, ids=original_id)
         saved.append(video_log)
+        assert original_chat == bot_group
         assert video_log.media_type == 'Video' and video_log.file_id
-        assert original_video.video is not None
+        assert original_video.video is not None and video_label in original_video.raw_text
         for label in labels[2:]:
             message = await asyncio.to_thread(slave.send_text_message, chat, chat.other, text=label)
             await helper.wait_for_message(in_chats(bot_group) & regex(label))

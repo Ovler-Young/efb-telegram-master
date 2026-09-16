@@ -453,7 +453,7 @@ def test_history_migration_retains_entry_when_durable_enqueue_fails():
     )
 
 
-def test_history_migration_discards_unpreparable_entry_and_continues():
+def test_history_migration_retains_unpreparable_entry_without_claiming_completion():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager.logger = Mock()
     invalid = SimpleNamespace(
@@ -480,11 +480,11 @@ def test_history_migration_discards_unpreparable_entry_and_continues():
     ):
         processed = ChatBindingManager._process_history_migration_target(manager, invalid)
 
-    assert processed is True
-    assert manager.db.delete_history_migration_entry.call_args_list == [call(10), call(11)]
-    manager.bot.enqueue_history_operation.assert_called_once()
+    assert processed is False
+    manager.db.delete_history_migration_entry.assert_not_called()
+    manager.bot.enqueue_history_operation.assert_not_called()
     manager.logger.warning.assert_called_once_with(
-        "History migration entry %d discarded because it could not be prepared: %s",
+        "History migration entry %d retained because it could not be prepared: %s",
         10,
         ANY,
     )
