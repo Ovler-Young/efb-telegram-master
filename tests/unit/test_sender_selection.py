@@ -52,6 +52,7 @@ def _task(
     priority: int = 0,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        operation='edit_message_text',
         telegram_chat_id=chat_id,
         required_sender_bot_id=required_sender_bot_id,
         slave_id=slave_id,

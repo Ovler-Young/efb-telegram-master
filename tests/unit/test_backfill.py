@@ -212,7 +212,8 @@ def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channe
     for idx in range(3):
         msg_log = Mock()
         msg_log.master_msg_id = f"1.{idx}"
-        msg_log.text = "x" * 2000
+        # Each source exceeds half the batch limit, so these stay separate.
+        msg_log.text = "x" * 2500
         msg_log.media_type = "Text"
         msg_log.time = base_time + timedelta(seconds=idx)
         etm_msg = SimpleNamespace(author=SimpleNamespace(display_name=f"author-{idx}"))
@@ -336,6 +337,7 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
         get_next_history_migration_target=Mock(side_effect=get_next_history_migration_target),
         get_history_migration_entries=Mock(side_effect=get_history_migration_entries),
         get_recent_messages=Mock(),
+        get_msg_log=Mock(return_value=None),
         delete_history_migration_entry=Mock(side_effect=delete_entry),
     )
 
@@ -364,24 +366,11 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
             args=(),
             kwargs={
                 "chat_id": 12345,
-                "text": "first\n",
+                "text": "first\nsecond\n",
                 "parse_mode": "Markdown",
                 "disable_notification": True,
             },
-            history_entry_ids=[1],
-        ),
-        call(
-            source_key="tests.mocks.slave.chat",
-            target_chat_id=12345,
-            operation="send_message",
-            args=(),
-            kwargs={
-                "chat_id": 12345,
-                "text": "second\n",
-                "parse_mode": "Markdown",
-                "disable_notification": True,
-            },
-            history_entry_ids=[2],
+            history_entry_ids=[1, 2],
         ),
         call(
             source_key="tests.mocks.slave.chat",
@@ -398,8 +387,7 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
         ),
     ])
     assert events == [
-        ("enqueue", 1), ("delete", 1), ("wait", 1),
-        ("enqueue", 2), ("delete", 2), ("wait", 2),
+        ("enqueue", 1), ("delete", 1), ("delete", 2), ("wait", 1),
         ("enqueue", 3), ("delete", 3), ("wait", 3),
     ]
     assert pending_entries == []
@@ -429,8 +417,8 @@ def test_history_migration_continues_after_terminal_delivery_failure():
     assert processed is True
     manager.db.delete_history_migration_entry.assert_called_once_with(7)
     manager.logger.warning.assert_called_once_with(
-        "History migration entry %d failed after durable enqueue: %s",
-        7,
+        "History migration entries %s failed after durable enqueue: %s",
+        [7],
         ANY,
     )
 
@@ -459,8 +447,8 @@ def test_history_migration_retains_entry_when_durable_enqueue_fails():
     assert processed is False
     manager.db.delete_history_migration_entry.assert_not_called()
     manager.logger.warning.assert_called_once_with(
-        "History migration entry %d retained because durable enqueue failed: %s",
-        9,
+        "History migration entries %s retained because durable enqueue failed: %s",
+        [9],
         ANY,
     )
 

@@ -62,6 +62,10 @@ def transport_definitely_not_sent(error: BaseException) -> bool:
     )
 
 
+HISTORY_REPLAY_KEY = "_history_replay"
+HISTORY_SOURCE_PREFIX = "__history__:"
+
+
 REQUIRED_SENDER_OPERATIONS = frozenset({
     "edit_message_text", "edit_message_caption", "edit_message_media", "delete_message",
 })
@@ -1003,7 +1007,7 @@ class OutboundQueue:
         if operation in REQUIRED_SENDER_OPERATIONS:
             if required_sender is None:
                 raise QueueEnqueueError(f"{operation} requires _required_sender_bot_id.")
-        elif required_sender is not None and required_sender != "__main__":
+        elif required_sender is not None and required_sender != "__main__" and operation != "copy_message":
             raise QueueEnqueueError(f"{operation} cannot require a sender.")
         return telegram_kwargs, priority, slave_id, required_sender
 
@@ -1029,6 +1033,9 @@ class OutboundQueue:
         telegram_kwargs, priority, slave_id, required_sender = self._validate_metadata(
             request.operation, request.kwargs
         )
+        history_replay = telegram_kwargs.pop(HISTORY_REPLAY_KEY, None)
+        if history_replay is not None and not isinstance(history_replay, dict):
+            raise QueueEnqueueError("History replay metadata must be a mapping.")
         telegram_args, telegram_kwargs = self._normalize_direct_media(
             request.operation, request.args, telegram_kwargs, cleanup_files
         )
@@ -1042,6 +1049,8 @@ class OutboundQueue:
             request.operation, telegram_kwargs, cleanup_files
         )
         chat_id = self._destination(operation, telegram_args, telegram_kwargs)
+        if history_replay is not None:
+            telegram_kwargs[HISTORY_REPLAY_KEY] = history_replay
         payload = self.encode_payload(telegram_args, telegram_kwargs)
         if request.log_context is not None and not isinstance(request.log_context, bytes):
             raise QueueEnqueueError("Queued log context must be bytes when supplied.")
@@ -1358,6 +1367,16 @@ class OutboundQueue:
             if cursor.rowcount != 1:
                 raise QueuePersistenceError(f"Queue row {row_id} disappeared while preserving an uncertain send.")
 
+    def hold_failed_history(self, row_id: int, error: BaseException) -> None:
+        """Keep a rejected replay inspectable; it is neither delivered nor lost."""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold=? WHERE id=? AND delivery_state='queued'",
+                ("history_failed:" + type(error).__name__, row_id),
+            )
+            if cursor.rowcount != 1:
+                raise QueuePersistenceError(f"History queue row {row_id} disappeared before failure retention.")
+
     def record_telegram_completion(self, row_id: int, receipt: bytes) -> None:
         if not isinstance(receipt, bytes):
             raise QueuePersistenceError("Queued Telegram completion receipt must be bytes.")
@@ -1491,6 +1510,15 @@ class OutboundQueueScheduler:
         self.queue.record_removal(row, "submitted")
         if self.queue.metrics is not None:
             self.queue.metrics.record_dequeued(row.priority, row.operation)
+
+    def _retain_failed_history(self, row: QueuedCall, error: BaseException) -> bool:
+        if row.slave_id is None or not row.slave_id.startswith(HISTORY_SOURCE_PREFIX):
+            return False
+        self.queue.hold_failed_history(row.id, error)
+        self.queue.fail_waiter(row.id, _fresh_exception(error))
+        self._row_not_before.pop(row.id, None)
+        self.wake_event.set()
+        return True
 
     def _record_terminal_discard(self, row: QueuedCall) -> None:
         self.queue.record_removal(row, "terminal_discard")
@@ -1818,7 +1846,11 @@ class OutboundQueueScheduler:
                 decision = self.adapter.select_sender(row, now)
                 if decision.terminal_error_class is not None:
                     self._permits.release()
+                    unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
                     try:
+                        if self._retain_failed_history(row, unavailable_error):
+                            self._record_terminal_completion(row, None, "failure")
+                            continue
                         self.queue.delete(row.id)
                     except Exception as delete_error:
                         self._stop_for_persistence_error(delete_error)
@@ -1856,6 +1888,9 @@ class OutboundQueueScheduler:
                 except InvalidQueuedPayloadError as error:
                     self._permits.release()
                     try:
+                        if self._retain_failed_history(row, error):
+                            self._record_terminal_completion(row, None, "failure")
+                            continue
                         self.queue.delete(row.id)
                     except Exception as delete_error:
                         self._stop_for_persistence_error(delete_error)
@@ -2030,6 +2065,9 @@ class OutboundQueueScheduler:
                     if (submitted.row.priority == 0 or submitted.row.log_context is not None
                             or submitted.row.operation in MESSAGE_CREATING_OPERATIONS):
                         try:
+                            if self._retain_failed_history(submitted.row, error):
+                                self._record_terminal_completion(submitted.row, submitted.selection, "failure")
+                                continue
                             self.queue.delete(row_id)
                         except Exception as delete_error:
                             self._stop_for_persistence_error(delete_error)

@@ -15,7 +15,7 @@ import re
 import threading
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import wraps
 from typing import TYPE_CHECKING, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
@@ -35,6 +35,8 @@ from .bot_pool import BotPool
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
 from .outbound import (
+    HISTORY_REPLAY_KEY,
+    HISTORY_SOURCE_PREFIX,
     OutboundQueue,
     OutboundQueueScheduler,
     QUEUED_OPERATIONS,
@@ -103,6 +105,7 @@ _INTERNAL_KWARGS = frozenset({
     '_force_main_bot',
     '_required_sender_bot_id',
     '_queued_db_log_context',
+    HISTORY_REPLAY_KEY,
 })
 
 
@@ -1246,8 +1249,15 @@ class TelegramBotManager(LocaleMixin):
         kwargs: Mapping[str, object],
         history_entry_ids: Collection[int],
     ) -> Future:
-        del source_key, target_chat_id, history_entry_ids
+        del target_chat_id
         request_kwargs = dict(kwargs)
+        metadata = request_kwargs.get(HISTORY_REPLAY_KEY)
+        if metadata is not None and not isinstance(metadata, dict):
+            raise QueueEnqueueError("History replay metadata must be a mapping.")
+        replay = dict(metadata or {})
+        replay.update(source_key=source_key, entry_ids=list(history_entry_ids))
+        request_kwargs[HISTORY_REPLAY_KEY] = replay
+        request_kwargs["_slave_id"] = HISTORY_SOURCE_PREFIX + source_key
         request_kwargs["_send_mode"] = "eventual"
         _row_id, waiter = self._enqueue_requests([QueueRequest(operation, args, request_kwargs)])
         return waiter
@@ -1292,11 +1302,15 @@ class TelegramBotManager(LocaleMixin):
         if required is not None:
             auxiliary = self.bot_pool.get_bot_by_id(required) if self.bot_pool else None
             if auxiliary is None or auxiliary.disabled:
+                if row.operation == 'copy_message':
+                    return self._select_available_sender(SenderSelection(self._bot, None), chat_id, now)
                 return SenderSelectionResult(terminal_error_class="required_sender_unavailable")
             membership = auxiliary.check_membership_tri(chat_id)
             if membership is None:
                 return SenderSelectionResult(retry_at=now + self.MEMBERSHIP_RECHECK_SECONDS)
             if membership is not True:
+                if row.operation == 'copy_message':
+                    return self._select_available_sender(SenderSelection(self._bot, None), chat_id, now)
                 return SenderSelectionResult(terminal_error_class="required_sender_unavailable")
             return self._select_available_sender(
                 SenderSelection(auxiliary.bot, str(auxiliary.bot_id)), chat_id, now
@@ -1473,6 +1487,32 @@ class TelegramBotManager(LocaleMixin):
         try:
             result = call_method()
         except telegram.error.BadRequest as error:
+            replay = kwargs.get(HISTORY_REPLAY_KEY)
+            # Only an explicit negative acknowledgment permits a second send.
+            # A missing response or timeout must keep using delivery uncertainty.
+            if (row.operation == 'copy_message' and isinstance(replay, dict)
+                    and (selection.sender_bot_id or '__main__') == row.required_sender_bot_id
+                    and error.message.lower() in {
+                'message to copy not found', "message can't be copied", 'message cannot be copied',
+                'chat not found',
+            }):
+                fallback_operation = replay.get('fallback_operation')
+                fallback_arguments = replay.get('fallback_kwargs')
+                if fallback_operation in {
+                    'send_photo', 'send_video', 'send_animation', 'send_document',
+                    'send_audio', 'send_voice', 'send_sticker',
+                } and isinstance(fallback_arguments, dict):
+                    fallback_kwargs = dict(fallback_arguments)
+                    for key in ('chat_id', 'message_thread_id', 'disable_notification'):
+                        if key in telegram_kwargs:
+                            fallback_kwargs[key] = telegram_kwargs[key]
+                    self.logger.info(
+                        "History queue row %s: source copy unavailable; replaying saved media with %s.",
+                        row.id, fallback_operation,
+                    )
+                    return self.execute_queued_call(
+                        replace(row, operation=fallback_operation), (), fallback_kwargs, selection
+                    )
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
             telegram_kwargs.pop("parse_mode")
