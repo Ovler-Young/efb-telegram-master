@@ -845,3 +845,85 @@ def test_receipt_recovery_during_drain_settles_primary_and_preserves_attachment(
     queue.close_payload_resources(queue.payload_closeables(args, kwargs))
     assert primary.call_count == 1
     queue.close()
+
+
+def test_main_replacement_receipt_replaces_auxiliary_snapshot_identity(tmp_path, manager_factory):
+    from efb_telegram_master.outbound import SenderSelection
+
+    db = manager_factory(tmp_path)
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager.channel = SimpleNamespace(db=db)
+    message = message_with_group()
+    message.sender_bot_id = "901"
+    message.file_bot_id = "901"
+    message.file_id = "aux-original-id"
+    db.add_or_update_message_log(message, delivered_message(901), sender_bot_id="901")
+    context = manager._encode_queued_log_context(QueuedDbLogContext(message, (42, 100)))
+    row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"replacement"), {}, context)], lambda _: document)
+    receipt = Message.de_json({**delivered_message().to_dict(), "message_id": 101,
+                              "document": {"file_id": "main-replacement-id", "file_unique_id": "replacement"}}, None)
+    queue.record_telegram_completion(row_id, manager.encode_queued_completion_receipt(receipt, SenderSelection(None, None)))
+    try:
+        assert row_id in manager._outbound_scheduler.reconcile_sent_pending(row_id)
+        stored = db.get_msg_log(master_msg_id="42.100")
+        assert (stored.master_msg_id_alt, stored.file_id, stored.sender_bot_id, stored.file_bot_id) == (
+            "42.101", "main-replacement-id", None, None,
+        )
+    finally:
+        queue.close()
+
+
+def test_main_reply_confirmation_preserves_file_issuer_through_restart(tmp_path, manager_factory):
+    from efb_telegram_master import TelegramChannel
+    from efb_telegram_master.chat_binding import ChatBindingManager
+    from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
+
+    db = manager_factory(tmp_path)
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager.channel = SimpleNamespace(db=db)
+    source = message_with_group()
+    context = manager._encode_queued_log_context(QueuedDbLogContext(source, None))
+    row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {}, context)], lambda _: document)
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET delivery_hold='in_flight', attempt_sender_bot_id='901' WHERE id=?", (row_id,))
+    # This is the MAIN bot's incoming Update. The nested author is auxiliary,
+    # but the nested file ID is issued to the main bot observing the reply.
+    update = Update.de_json({"update_id": 1, "message": {
+        "message_id": 101, "date": 1, "chat": {"id": 42, "type": "supergroup"},
+        "from": {"id": 77, "is_bot": False, "first_name": "Admin"},
+        "text": f"/confirm_send {row_id}", "reply_to_message": delivered_message(901).to_dict(),
+    }}, Bot("900:test-token"))
+    channel = SimpleNamespace(config={"admins": [77]}, bot_manager=manager)
+    with patch("efb_telegram_master.sync_reply_text"), \
+            patch.object(db, "add_or_update_message_log", side_effect=RuntimeError("temporary DB outage")):
+        TelegramChannel.confirm_send(channel, update, SimpleNamespace(args=[str(row_id)]))
+    assert queue.connection.execute("SELECT delivery_state FROM outbound_queue").fetchone() == ("sent_pending",)
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager.channel = SimpleNamespace(db=db)
+    try:
+        with queue.connection:
+            queue.connection.execute("UPDATE outbound_queue SET reconcile_after=0")
+        assert row_id in manager._outbound_scheduler.reconcile_sent_pending(row_id)
+        stored = db.get_msg_log(master_msg_id="42.100")
+        assert (stored.sender_bot_id, stored.file_bot_id, stored.file_id) == ("901", "__main__", "file-id")
+        cache = SimpleNamespace(get_chat=lambda *a, **kw: source.chat,
+                                get_chat_member=lambda *a, **kw: source.author)
+        restored = stored.build_etm_msg(cache)
+        assert restored.sender_bot_id == "901" and restored.file_bot_id == "__main__"
+        snapshot, _ = manager._decode_queued_log_context(manager._encode_queued_log_context(QueuedDbLogContext(restored)))
+        assert snapshot.file_bot_id == "__main__"
+        binding = SimpleNamespace(db=db)
+        _, kwargs = ChatBindingManager._prepare_history_migration_call(binding, SimpleNamespace(
+            formatted_text=None, source_master_msg_id="42.100"), 43, None)
+        assert kwargs[HISTORY_REPLAY_KEY]["source_sender_bot_id"] == "__main__"
+        manager._bot = SimpleNamespace(get_file=Mock(side_effect=BadRequest("test stops before download")))
+        manager.bot_pool = SimpleNamespace(get_bot_by_id=Mock(side_effect=AssertionError("aux must not acquire main file")))
+        with patch("efb_telegram_master.message.coordinator", SimpleNamespace(master=SimpleNamespace(bot_manager=manager))):
+            restored._load_file()
+        manager._bot.get_file.assert_called_once_with("file-id")
+    finally:
+        queue.close()

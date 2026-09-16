@@ -60,6 +60,7 @@ def snapshot(message: ETMMsg) -> LogMessage:
     result.file_id = message.file_id
     result.file_unique_id = message.file_unique_id
     result.sender_bot_id = message.sender_bot_id
+    result.file_bot_id = message.file_bot_id
     result._ETMMsg__initialized = True
     if message.target:
         result.target = LogMessage(uid=message.target.uid, chat=_identity(message.target.chat))

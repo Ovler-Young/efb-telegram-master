@@ -86,6 +86,7 @@ def observe_database_method(method: str):
     return decorate
 
 PickledDict = TypedDict('PickledDict', {
+    "file_bot_id": str,
     "target": TgChatMsgIDStr,
     "is_system": bool,
     "attributes": MessageAttribute,
@@ -165,6 +166,12 @@ class MsgLog(BaseModel):
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
+    @property
+    def file_bot_id(self) -> Optional[str]:
+        """Bot that can acquire file_id, including legacy author-owned IDs."""
+        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
+        return misc.get("file_bot_id", self.sender_bot_id)
+
     def build_etm_msg(self, chat_manager: ChatObjectCacheManager,
                       recur: bool = True) -> ETMMsg:
         c_module, c_id, _ = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_origin_uid))
@@ -198,6 +205,7 @@ class MsgLog(BaseModel):
             pickle_data = bytes(self.pickle) if isinstance(self.pickle, memoryview) else self.pickle
             misc_data: PickledDict = pickle.loads(pickle_data)
 
+            msg.file_bot_id = misc_data.get('file_bot_id')
             if 'target' in misc_data and recur:
                 with connection_scope(self._meta.database):
                     target_row = self.get_or_none(MsgLog.master_msg_id == misc_data['target'])
@@ -508,6 +516,9 @@ class DatabaseManager:
         """
 
         data: PickledDict = {}
+        file_bot_id = getattr(message, "file_bot_id", None)
+        if file_bot_id is not None:
+            data["file_bot_id"] = file_bot_id
         if message.is_system:
             data['is_system'] = message.is_system
         if message.attributes:
@@ -692,7 +703,7 @@ class DatabaseManager:
                                   master_message: Message,
                                   old_message_id: Optional[OldMsgID] = None,
                                   sender_bot_id: Optional[str] = None):
-        """Add or update a message into the database."""
+        """Log a receipt; sender_bot_id is its author, including None for main."""
         sent_message_id = message_id_to_str(
             TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)
         )
@@ -739,7 +750,7 @@ class DatabaseManager:
             "file_id": msg.file_id,
             "file_unique_id": msg.file_unique_id,
             "mime": msg.mime,
-            "sender_bot_id": sender_bot_id or getattr(msg, 'sender_bot_id', None),
+            "sender_bot_id": sender_bot_id,
             "pickle": self.pickle_misc_msg(msg),
         }
         if existing:
