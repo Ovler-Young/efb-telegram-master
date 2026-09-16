@@ -681,9 +681,16 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
     legacy = {key: value for key, value in receipt.items() if key not in ("columns", "backup_queue", "source_fingerprint")}
     legacy["version"] = 1
     legacy["queue"] = {key: value for key, value in legacy["queue"].items() if key != "external"}
-    columns = [field.column_name for field in MsgLog._meta.sorted_fields if field.name != "master_message_thread_id"]
-    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source:
+    # The exact 1720ad5 MsgLog projection, including sender_bot_id before time.
+    columns = [
+        "master_msg_id", "master_msg_id_alt", "slave_message_id", "text", "slave_origin_uid",
+        "slave_origin_display_name", "slave_member_uid", "slave_member_display_name", "media_type",
+        "mime", "file_id", "file_unique_id", "msg_type", "pickle", "sent_to", "sender_bot_id", "time",
+    ]
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
         legacy["tables"]["msglog"] = migrate_db._digest(migrate_db._source_rows(source, MsgLog, columns))
+        source.execute("CREATE TABLE topiciconcache (id INTEGER PRIMARY KEY, icon TEXT)")
+        source.execute("CREATE TABLE useremojicache (user_id TEXT, emoji TEXT)")
     with connection_scope(target):
         target.execute_sql("ALTER TABLE msglog DROP COLUMN master_message_thread_id")
         target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s", (json.dumps(legacy),))
@@ -692,6 +699,7 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
     recovered = migrate_db.migrate(sqlite_source, postgres_config)
     assert recovered["import_id"] == receipt["import_id"]
     assert recovered["version"] == 1
+    assert recovered["tables"] == legacy["tables"]
     assert "external" in recovered["queue"]
     assert migrate_db.migrate(sqlite_source, postgres_config)["queue"] == recovered["queue"]
     external.write_bytes(b"changed external bytes")
@@ -700,7 +708,17 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
     external.write_bytes(b"legacy external bytes")
     with connection_scope(target):
         migrate_db.validate_runtime_cutover(sqlite_source, target)
+        assert not (migrate_db.CACHE_TABLES & set(target.get_tables(schema=current_schema(target))))
     target.close_all()
+    for table in sorted(migrate_db.CACHE_TABLES):
+        with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
+            assert source.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone() == (0,)
+            source.execute(f'INSERT INTO "{table}" VALUES (?, ?)', (1, "new data"))
+        with pytest.raises(RuntimeError, match="Unrecorded source cache.*no longer empty"):
+            migrate_db.migrate(sqlite_source, postgres_config)
+        with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
+            assert source.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone() == (1,)
+            source.execute(f'DELETE FROM "{table}"')
     with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
         source.execute("UPDATE msglog SET master_message_thread_id = 'new'")
     with pytest.raises(RuntimeError, match="unimported message thread"):
@@ -814,3 +832,52 @@ def test_external_queue_digest_detects_changed_and_missing_files(sqlite_source, 
     archive.mkdir()
     with pytest.raises(RuntimeError, match="External queued media is missing"):
         migrate_db._backup_queue(queue, archive)
+
+
+@pytest.mark.parametrize("altered", [None, "media", "queue"])
+def test_migrate_recovers_relocated_external_archive(sqlite_source, postgres_config, tmp_path, altered):
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"original media")
+    external_queue_payload(sqlite_source, external)
+    committed = migrate_db.migrate(sqlite_source, postgres_config)
+    restored = tmp_path / "restored"
+    shutil.copytree(committed["backup_directory"], restored)
+    external.unlink()
+    shutil.rmtree(sqlite_source)
+    assert migrate_db._queue_digest(restored / "outbound-queue.sqlite3") == committed["backup_queue"]
+    if altered == "media":
+        next((restored / "outbound-media").glob("external-*")).write_bytes(b"modified media")
+    elif altered == "queue":
+        with closing(sqlite3.connect(restored / "outbound-queue.sqlite3")) as queue, queue:
+            queue.execute("UPDATE outbound_queue SET created_at = created_at + 1 WHERE id = 1")
+    before = migrate_db._queue_digest(restored / "outbound-queue.sqlite3")
+    if altered:
+        with pytest.raises(RuntimeError, match="Source changed"):
+            migrate_db.migrate(restored, postgres_config)
+        assert not (restored / migrate_db.RECEIPT_FILE).exists()
+    else:
+        recovered = migrate_db.migrate(restored, postgres_config)
+        assert recovered["import_id"] == committed["import_id"]
+        assert recovered["tables"] == committed["tables"]
+        target = postgresql_database(postgres_config)
+        with connection_scope(target):
+            migrate_db.validate_runtime_cutover(restored, target)
+        target.close_all()
+        assert migrate_db.migrate(restored, postgres_config)["import_id"] == committed["import_id"]
+    assert migrate_db._queue_digest(restored / "outbound-queue.sqlite3") == before
+
+
+def test_v1_cache_discovery_preserves_only_empty_unrecorded_caches(sqlite_source):
+    manifest = {"version": 1, "tables": {model._meta.table_name: {} for model in MODELS}}
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
+        # Empty schemas accepted by v1 need no type conversion on recovery.
+        source.execute("CREATE TABLE topiciconcache (icon NUMERIC)")
+        source.execute("CREATE TABLE useremojicache (emoji TEXT)")
+        assert migrate_db._cache_models(source, manifest) == ()
+        migrate_db._validate_source(source, MODELS)
+        for table in sorted(migrate_db.CACHE_TABLES):
+            source.execute(f'INSERT INTO "{table}" VALUES (?)', (1,))
+            with pytest.raises(RuntimeError, match="Unrecorded source cache.*no longer empty"):
+                migrate_db._cache_models(source, manifest)
+            assert source.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone() == (1,)
+            source.execute(f'DELETE FROM "{table}"')

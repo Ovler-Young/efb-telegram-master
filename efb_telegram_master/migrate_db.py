@@ -151,7 +151,7 @@ def _source_tables(source: sqlite3.Connection) -> set[str]:
     return {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
-def _cache_models(source: sqlite3.Connection) -> tuple:
+def _cache_models(source: sqlite3.Connection, manifest=None) -> tuple:
     """Preserve only the two known historical caches, using their actual DDL."""
     models = []
     types = {"TEXT": TextField, "INTEGER": BigIntegerField, "INT": BigIntegerField,
@@ -159,6 +159,12 @@ def _cache_models(source: sqlite3.Connection) -> tuple:
              "BLOB": BlobField, "DATETIME": DateTimeField, "TIMESTAMP": DateTimeField,
              "REAL": DoubleField, "DOUBLE": DoubleField, "FLOAT": DoubleField}
     for table in sorted(CACHE_TABLES & _source_tables(source)):
+        if manifest is not None and manifest["version"] == 1 and table not in manifest["tables"]:
+            # v1 accepted empty caches without importing them. Preserve that
+            # projection only while there is still no unrecorded data.
+            if source.execute(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone():
+                raise RuntimeError(f"Unrecorded source cache {table!r} is no longer empty; source is preserved.")
+            continue
         columns = list(source.execute(f"PRAGMA table_xinfo({_quote(table)})"))
         fields = {}
         primary = []
@@ -580,12 +586,13 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
                     _sync_directory(path)
                 logger.info("Consistent SQLite backups: %s", archive)
                 with closing(sqlite3.connect(archive / source_path.name)) as source:
-                    models = MODELS + _cache_models(source)
-                    _validate_source(source, models)
-                    with connection_scope(db), db.bind_ctx(models), db.atomic():
+                    with ExitStack() as bindings, connection_scope(db), db.atomic():
                         db.execute_sql("SET LOCAL lock_timeout = '5s'")
                         db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
                         manifest = _read_import(db)
+                        models = MODELS + _cache_models(source, manifest)
+                        _validate_source(source, models)
+                        bindings.enter_context(db.bind_ctx(models))
                         receipt_path = directory / RECEIPT_FILE
                         if receipt_path.exists():
                             previous = json.loads(receipt_path.read_text())
@@ -613,9 +620,10 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
                             columns = _recovery_columns(source, models, manifest)
                             tables = {model._meta.table_name: _digest(_source_rows(source, model, columns[model._meta.table_name]))
                                       for model in models}
-                            if tables != manifest["tables"] or not _queue_digest_matches(
+                            queue_matches = _queue_digest_matches(
                                 queue_summary, manifest["queue"], legacy_external=manifest["version"] == 1
-                            ):
+                            ) or ("backup_queue" in manifest and queue_summary == manifest["backup_queue"])
+                            if tables != manifest["tables"] or not queue_matches:
                                 raise RuntimeError("Source changed since the committed import; refusing to merge divergent databases.")
                             if (queue_summary is not None and "external" in queue_summary
                                     and "external" not in manifest["queue"]):
