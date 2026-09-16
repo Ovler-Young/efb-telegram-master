@@ -699,3 +699,98 @@ def test_confirming_primary_after_crash_preserves_pending_attachment(tmp_path, o
     assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
     assert not list(queue.media_dir.iterdir())
     queue.close()
+
+
+@pytest.mark.parametrize("path", ["fallback", "ordinary_copy", "copy_after_retry"])
+def test_history_confirmation_after_crash_uses_last_attempted_operation(tmp_path, path):
+    from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
+
+    source = tmp_path / "saved-media"
+    source.write_bytes(b"saved media bytes")
+    queue = OutboundQueue(tmp_path)
+    row_id, _ = queue.enqueue_many([QueueRequest("copy_message", (), {
+        "chat_id": 42, "from_chat_id": 1, "message_id": 2, "_slave_id": "__history__:source",
+        HISTORY_REPLAY_KEY: {"source_sender_bot_id": "owner", "fallback_operation": "send_document",
+                             "fallback_kwargs": {"document": "saved-file", "caption": "x" * 2048}},
+    })], lambda _: lambda chat_id, from_chat_id, message_id: None)
+    copies = Mock(side_effect=(
+        [delivered_message()] if path == "ordinary_copy" else
+        [BadRequest("Message to copy not found"), delivered_message()]
+    ))
+    primary_uploads = []
+    attachments = []
+    def send(*args, **kwargs):
+        contents = kwargs["document"].input_file_content.read()
+        if kwargs.get("reply_to_message_id") == 100:
+            attachments.append(contents)
+        else:
+            primary_uploads.append(contents)
+            if path == "copy_after_retry":
+                raise RetryAfter(0)
+        return delivered_message()
+    sender = SimpleNamespace(copy_message=copies, send_document=send)
+    manager = setup_manager(queue)
+    manager._bot = sender
+    manager.get_file = Mock(return_value=SimpleNamespace(file_path=str(source)))
+    scheduler = manager._outbound_scheduler
+    scheduler.dispatch_once()
+    if path == "copy_after_retry":
+        scheduler.harvest_completed()
+        scheduler.dispatch_once()
+    # Lose the process after the ACK, before harvesting the primary receipt.
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager._bot = sender
+    manager._outbound_scheduler.dispatch_once()
+    assert manager.confirm_queued_delivery(row_id, delivered_message())
+    manager._outbound_scheduler.dispatch_once()
+    manager._outbound_scheduler.harvest_completed()
+    assert attachments == ([b"x" * 2048] if path == "fallback" else [])
+    assert primary_uploads == ([] if path == "ordinary_copy" else [b"saved media bytes"])
+    assert copies.call_count == (2 if path == "copy_after_retry" else 1)
+    assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
+    assert not list(queue.media_dir.iterdir())
+    queue.close()
+
+
+@pytest.mark.parametrize("timeout", [0, 1.1])
+def test_shutdown_releases_accepted_future_with_unpersistable_receipt(tmp_path, timeout):
+    from efb_telegram_master.etm_metrics import Metrics
+    from efb_telegram_master.outbound import SchedulerStoppedError
+
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    manager = setup_manager(queue)
+    row_id, waiter = queue.enqueue_many([QueueRequest(
+        "send_document", (42, b"archive bytes"), {"caption": "x" * 2048}
+    )], lambda _: document)
+    primary = Mock(return_value=delivered_message())
+    manager._bot = SimpleNamespace(send_document=primary)
+    with queue.connection:
+        queue.connection.execute("CREATE TRIGGER fail_completion BEFORE UPDATE OF completion_receipt ON outbound_queue "
+                                 "BEGIN SELECT RAISE(FAIL, 'database unavailable'); END")
+    scheduler = manager._outbound_scheduler
+    scheduler.dispatch_once()
+    scheduler.harvest_completed()
+    assert scheduler.in_flight[row_id].future.done() and not waiter.done()
+    scheduler.stop_and_drain(timeout=timeout)
+    with pytest.raises(SchedulerStoppedError):
+        waiter.result(timeout=1)
+    assert not scheduler.in_flight and not scheduler.in_flight_destinations and not queue.waiters
+    assert scheduler._permits.acquire(blocking=False)
+    scheduler._permits.release()
+    samples = [sample for family in metrics.in_flight.collect() for sample in family.samples]
+    assert samples and all(sample.value == 0 for sample in samples)
+    assert queue.connection.execute("SELECT id, delivery_hold, completion_receipt FROM outbound_queue").fetchall() == [
+        (row_id, "in_flight", None)
+    ]
+    assert len(list(queue.media_dir.iterdir())) == 1
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager._bot = SimpleNamespace(send_document=primary)
+    manager._outbound_scheduler.dispatch_once()
+    assert primary.call_count == 1
+    assert queue.connection.execute("SELECT id FROM outbound_queue").fetchall() == [(row_id,)]
+    queue.close()

@@ -1485,6 +1485,9 @@ class TelegramBotManager(LocaleMixin):
         telegram_kwargs = cast(dict, OutboundQueue.streaming_uploads(self._strip_private_queue_metadata(kwargs)))
         telegram_args = cast(tuple, OutboundQueue.streaming_uploads(args))
         migration_retried = False
+        replay = kwargs.get(HISTORY_REPLAY_KEY)
+        if row.operation == "copy_message" and isinstance(replay, dict) and replay.get("attempted_fallback"):
+            self._outbound_queue.record_history_fallback(row.id, None)
 
         def call_method() -> object:
             nonlocal migration_retried, telegram_args, telegram_kwargs
@@ -1568,6 +1571,7 @@ class TelegramBotManager(LocaleMixin):
                             upload = acquisition.enter_context(self._history_media_upload(file_id, owner))
                         except Exception as acquisition_error:
                             raise HistoryMediaAcquisitionError("Unable to acquire saved media.") from acquisition_error
+                        self._outbound_queue.record_history_fallback(row.id, fallback_operation)
                         fallback_kwargs[argument] = upload
                         return self.execute_queued_call(
                             replace(row, operation=fallback_operation), (), fallback_kwargs, selection
@@ -1705,11 +1709,11 @@ class TelegramBotManager(LocaleMixin):
             with queue._lock:
                 metadata = queue.connection.execute(
                     "SELECT telegram_chat_id, delivery_state, delivery_hold, attempt_sender_bot_id, "
-                    "log_context IS NOT NULL, operation FROM outbound_queue WHERE id=?", (row_id,),
+                    "log_context IS NOT NULL FROM outbound_queue WHERE id=?", (row_id,),
                 ).fetchone()
             if metadata is None:
                 raise ValueError("Queue row does not exist; no data was changed.")
-            chat_id, state, hold, sender_id, has_log, operation = metadata
+            chat_id, state, hold, sender_id, has_log = metadata
             if state != "queued" or hold is None:
                 raise ValueError("Only a held, unconfirmed send can be confirmed.")
             expected_sender = sender_id or str(self.me.id if self.me is not None else "")
@@ -1725,11 +1729,19 @@ class TelegramBotManager(LocaleMixin):
                     or not message.from_user.is_bot or str(message.from_user.id) != expected_sender
                     or message.forward_origin is not None):
                 raise ValueError("Reply to the original message from the recorded bot in the original chat, not a forward.")
-            if operation == "send_document" and message.document is None:
-                raise ValueError("This queue row requires the original document message.")
             selection = SenderSelection(sender=None, sender_bot_id=sender_id)
             row = queue.load_queued(row_id)
             args, kwargs = queue.decode_payload_raw(row.payload)
+            replay = kwargs.get(HISTORY_REPLAY_KEY)
+            if row.operation == "copy_message" and isinstance(replay, dict) and replay.get("attempted_fallback"):
+                fallback_kwargs = dict(replay["fallback_kwargs"])
+                for key in ("chat_id", "message_thread_id", "disable_notification"):
+                    if key in kwargs:
+                        fallback_kwargs[key] = kwargs[key]
+                row = replace(row, operation=replay["attempted_fallback"])
+                args, kwargs = (), fallback_kwargs
+            if row.operation == "send_document" and message.document is None:
+                raise ValueError("This queue row requires the original document message.")
             completion = self._queued_completion_result(row, args, kwargs, message, selection)
             if isinstance(completion, QueuedDeliveryResult):
                 queue.record_telegram_completion(

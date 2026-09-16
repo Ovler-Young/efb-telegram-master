@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -8,7 +7,7 @@ import telegram.error
 
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.bot_pool import BotPool
-from efb_telegram_master.outbound import SenderSelection
+from efb_telegram_master.outbound import OutboundQueue, QueuedCall, SenderSelection
 
 
 class Limiter:
@@ -50,9 +49,15 @@ def _task(
     slave_id: str | None = None,
     chat_id: int = 100,
     priority: int = 0,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> QueuedCall:
+    return QueuedCall(
+        id=1,
         operation='edit_message_text',
+        payload=OutboundQueue.encode_payload((), {"chat_id": chat_id, "message_id": 101, "text": "test"}),
+        created_at=0.0,
+        log_context=None,
+        delivery_state="queued",
+        completion_receipt=None,
         telegram_chat_id=chat_id,
         required_sender_bot_id=required_sender_bot_id,
         slave_id=slave_id,
@@ -171,7 +176,10 @@ def test_confirmed_non_member_removes_only_the_triggering_affinity() -> None:
     manager.bot_pool.record_successful_auxiliary_send("slave-b", 10)
 
     task = _task(slave_id="slave-a")
-    manager.record_queued_failure(task, Exception("membership probe pending"), SenderSelection(first.bot, "10"))
+    manager.record_queued_failure(
+        task, telegram.error.Forbidden("Bot is not a member of the chat"), SenderSelection(first.bot, "10")
+    )
+    assert manager.bot_pool.preferred_sender("slave-a") is first
     manager.remove_confirmed_non_member_affinity_for_sender_chat("10", task.telegram_chat_id)
 
     assert manager.bot_pool.preferred_sender("slave-a") is None

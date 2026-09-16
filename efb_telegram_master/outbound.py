@@ -1468,8 +1468,21 @@ class OutboundQueue:
             self.metrics.record_enqueued(prepared[4], prepared[0])
             self.metrics.set_queue_depth(depth)
 
+    def record_history_fallback(self, row_id: int, operation: Optional[str]) -> None:
+        """Record which history RPC may have been accepted, before making that RPC."""
+        with self._lock:
+            row = self.load_queued(row_id)
+            args, kwargs = self.decode_payload_raw(row.payload)
+            replay = dict(kwargs[HISTORY_REPLAY_KEY])
+            if operation is None:
+                replay.pop("attempted_fallback", None)
+            else:
+                replay["attempted_fallback"] = operation
+            kwargs[HISTORY_REPLAY_KEY] = replay
+            self.retarget(row_id, row.telegram_chat_id, args, kwargs)
+
     def retarget(self, row_id: int, new_chat_id: int, args: tuple, kwargs: dict) -> None:
-        """Atomically rewrite only the destination of one retained queued call."""
+        """Persist queued arguments and destination without changing durable media references."""
         with self._lock:
             try:
                 self.connection.execute("BEGIN")
@@ -2262,8 +2275,6 @@ class OutboundQueueScheduler:
         with self._lock:
             self.harvest_completed()
             for row_id, submitted in tuple(self.in_flight.items()):
-                if submitted.future.done():
-                    continue
                 self.in_flight.pop(row_id)
                 self.in_flight_destinations.discard(submitted.row.telegram_chat_id)
                 self._permits.release()
