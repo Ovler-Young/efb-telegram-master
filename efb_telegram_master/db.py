@@ -158,6 +158,8 @@ class MsgLog(BaseModel):
     """
     sent_to = TextField()
     """Module ID of the message sent to."""
+    master_message_thread_id = TextField(null=True)
+    """Telegram topic ID retained from historical message logs."""
     sender_bot_id = TextField(null=True)
     """Telegram bot user ID that sent this message. NULL means the main bot."""
     time = DateTimeField(default=datetime.datetime.now, null=True)

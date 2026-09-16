@@ -7,24 +7,32 @@ writers must be stopped. The existing outbound SQLite queue remains in place.
 import argparse
 import datetime
 import hashlib
+import io
 import json
 import logging
 import os
+import pickle
+import re
 import shutil
 import sqlite3
 import tempfile
 import uuid
 from contextlib import ExitStack, closing, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterator, Optional
 
-from peewee import AutoField, BlobField, CharField, DateTimeField, IntegerField, TextField, chunked
+from peewee import (
+    AutoField, BigIntegerField, BlobField, CharField, CompositeKey, DateTimeField, DoubleField, FloatField,
+    IntegerField, Model, TextField, chunked,
+)
 from ruamel.yaml import YAML
 
 from .db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc
 from .db_runtime import SCHEMA_LOCK, DataDirectoryLock, connection_scope, current_schema, postgresql_database
 
 MODELS = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
+CACHE_TABLES = {"topiciconcache", "useremojicache"}
 IMPORT_TABLE = "etm_sqlite_import"
 RECEIPT_FILE = ".postgresql-cutover.json"
 logger = logging.getLogger(__name__)
@@ -53,10 +61,15 @@ def _read_import(db) -> Optional[dict]:
         raise RuntimeError("Invalid PostgreSQL import record; refusing to infer migration success.")
     manifest = json.loads(rows[0][0])
     if (
-        not isinstance(manifest, dict) or manifest.get("version") != 1
+        not isinstance(manifest, dict) or manifest.get("version") not in (1, 2)
         or not isinstance(manifest.get("import_id"), str) or not manifest["import_id"]
         or not isinstance(manifest.get("tables"), dict)
-        or set(manifest["tables"]) != {model._meta.table_name for model in MODELS}
+        or not {model._meta.table_name for model in MODELS}.issubset(manifest["tables"])
+        or set(manifest["tables"]) - {model._meta.table_name for model in MODELS} - CACHE_TABLES
+        or (manifest.get("version") == 2 and (
+            not isinstance(manifest.get("columns"), dict)
+            or set(manifest["columns"]) != set(manifest["tables"])
+        ))
         or "queue" not in manifest
     ):
         raise RuntimeError("Unsupported or corrupt PostgreSQL import record; preserving both databases.")
@@ -138,15 +151,44 @@ def _source_tables(source: sqlite3.Connection) -> set[str]:
     return {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
-def _validate_source(source: sqlite3.Connection) -> None:
+def _cache_models(source: sqlite3.Connection) -> tuple:
+    """Preserve only the two known historical caches, using their actual DDL."""
+    models = []
+    types = {"TEXT": TextField, "INTEGER": BigIntegerField, "INT": BigIntegerField,
+             "BIGINT": BigIntegerField, "SMALLINT": BigIntegerField,
+             "BLOB": BlobField, "DATETIME": DateTimeField, "TIMESTAMP": DateTimeField,
+             "REAL": DoubleField, "DOUBLE": DoubleField, "FLOAT": DoubleField}
+    for table in sorted(CACHE_TABLES & _source_tables(source)):
+        columns = list(source.execute(f"PRAGMA table_xinfo({_quote(table)})"))
+        fields = {}
+        primary = []
+        for _, name, declared, not_null, default, pk, hidden in columns:
+            declared = declared.upper()
+            field_type = TextField if re.fullmatch(r"(?:VAR)?CHAR(?:\(\d+\))?", declared) else types.get(declared)
+            if field_type is None or hidden:
+                raise RuntimeError(f"Unsupported cache column {table}.{name}: {declared}; source is preserved.")
+            fields[name] = field_type(column_name=name, null=not not_null)
+            if pk:
+                primary.append((pk, name))
+        # Constraints beyond simple keys need an explicit conversion, not a guess.
+        if source.execute(f"PRAGMA foreign_key_list({_quote(table)})").fetchone():
+            raise RuntimeError(f"Unsupported foreign key in {table}; source is preserved.")
+        meta = type("Meta", (), {"table_name": table, "primary_key":
+                    CompositeKey(*(name for _, name in sorted(primary))) if primary else False})
+        model = type(table, (Model,), dict(fields, Meta=meta))
+        models.append(model)
+    return tuple(models)
+
+
+def _validate_source(source: sqlite3.Connection, models=MODELS) -> None:
     tables = _source_tables(source)
     if not {"msglog", "chatassoc", "slavechatinfo"}.issubset(tables):
         raise RuntimeError("Source is not a complete ETM database (msglog/chatassoc/slavechatinfo required).")
-    known = {model._meta.table_name for model in MODELS}
+    known = {model._meta.table_name for model in models}
     for table in tables - known:
         if not table.startswith("sqlite_") and source.execute(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone():
             raise RuntimeError(f"Nonempty unsupported source table {table!r}; refusing to drop data during import.")
-    for model in MODELS:
+    for model in models:
         table = model._meta.table_name
         if table not in tables:
             continue
@@ -174,6 +216,10 @@ def _value(field, value):
         if not isinstance(value, datetime.datetime) or value.tzinfo is not None:
             raise ValueError(f"Invalid or timezone-aware timestamp in {field.name}; conversion must be explicit")
         return value
+    if isinstance(field, FloatField):
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"Invalid real value in {field.name}")
+        return float(value)
     if isinstance(field, IntegerField):
         converted = int(value)
         if isinstance(value, float) and value != converted:
@@ -186,17 +232,38 @@ def _value(field, value):
     raise TypeError(f"Unsupported field type: {type(field).__name__}")
 
 
-def _source_rows(source: sqlite3.Connection, model) -> Iterator[tuple]:
+def _fields(model, columns=None):
+    fields = model._meta.sorted_fields
+    return fields if columns is None else [model._meta.columns[name] for name in columns]
+
+
+def _order(model, fields, *, postgres=False):
+    primary = model._meta.primary_key
+    if isinstance(primary, CompositeKey):
+        ordered = [model._meta.fields[name] for name in primary.field_names]
+    elif primary:
+        ordered = [primary]
+    else:
+        ordered = fields
+    terms = []
+    for field in ordered:
+        term = _quote(field.column_name)
+        if isinstance(field, TextField):
+            term += ' COLLATE "C"' if postgres else " COLLATE BINARY"
+        if postgres:
+            term += " NULLS FIRST"
+        terms.append(term)
+    return ", ".join(terms)
+
+
+def _source_rows(source: sqlite3.Connection, model, columns=None) -> Iterator[tuple]:
     table = model._meta.table_name
     if table not in _source_tables(source):
         return
     actual = {row[1] for row in source.execute(f"PRAGMA table_info({_quote(table)})")}
-    fields = model._meta.sorted_fields
+    fields = _fields(model, columns)
     projection = ", ".join(_quote(field.column_name) if field.column_name in actual else "NULL" for field in fields)
-    primary_key = model._meta.primary_key
-    order = _quote(primary_key.column_name)
-    if isinstance(primary_key, TextField):
-        order += " COLLATE BINARY"
+    order = _order(model, fields)
     cursor = source.execute(f"SELECT {projection} FROM {_quote(table)} ORDER BY {order}")
     try:
         for row in cursor:
@@ -273,31 +340,131 @@ def _backup_media_directory(source: Path, destination: Path) -> None:
         raise RuntimeError("Outbound media changed during backup; keep all writers stopped and retry.")
 
 
+def _external_payload(payload: bytes, visit) -> bytes:
+    """Visit references inside a v2 pickle without opening a live queue manager."""
+    if not payload or payload[0] != 2:
+        return payload
+    from .outbound import OutboundQueue, _StoredMediaSnapshot
+
+    changed = False
+
+    class MediaPickler(pickle.Pickler):
+        def reducer_override(self, value):
+            nonlocal changed
+            if isinstance(value, _StoredMediaSnapshot) and value.external_uri is not None:
+                replacement = visit(value)
+                changed = changed or replacement is not value
+                return replacement.__reduce_ex__(5)
+            return NotImplemented
+
+    value = OutboundQueue.decode_payload_raw(payload)
+    stream = io.BytesIO()
+    MediaPickler(stream, protocol=5).dump(value)
+    return b"\x02" + stream.getvalue() if changed else payload
+
+
+def _external_path(reference) -> Path:
+    from .outbound import OutboundQueue
+
+    path = OutboundQueue._local_media_path(reference.external_uri)
+    if path is None or not path.is_file():
+        raise RuntimeError("External queued media is missing or unsupported; backup is incomplete.")
+    return path
+
+
+def _file_digest(path: Path) -> dict:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return {"bytes": size, "sha256": digest.hexdigest()}
+
+
+def _backup_queue(source: Path, archive: Path) -> Optional[dict]:
+    before = _queue_digest(source)
+    if before is None:
+        return None
+    destination = archive / source.name
+    _backup(source, destination)
+    media = archive / "outbound-media"
+    _backup_media_directory(source.parent / "outbound-media", media)
+
+    def copy_external(reference):
+        path = _external_path(reference)
+        expected = _file_digest(path)
+        media.mkdir(mode=0o700, exist_ok=True)
+        name = "external-" + uuid.uuid4().hex
+        target = media / name
+        with path.open("rb") as reader, target.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        if _file_digest(target) != expected or _file_digest(path) != expected:
+            raise RuntimeError("External queued media changed during backup; keep all writers stopped and retry.")
+        return replace(reference, storage_name=name, external_uri=None, cleanup_external=False)
+
+    with closing(sqlite3.connect(destination)) as queue, queue:
+        if "outbound_queue" in _source_tables(queue):
+            for row_id, payload in queue.execute("SELECT rowid, payload FROM outbound_queue"):
+                restored = _external_payload(payload, copy_external)
+                if restored != payload:
+                    queue.execute("UPDATE outbound_queue SET payload = ? WHERE rowid = ?", (restored, row_id))
+    if media.exists():
+        _sync_directory(media)
+    with destination.open("rb") as stream:
+        os.fsync(stream.fileno())
+    if _queue_digest(source) != before:
+        raise RuntimeError("Outbound queue or media changed during backup; keep all writers stopped and retry.")
+    return before
+
+
 def _queue_digest(path: Path) -> Optional[dict]:
     if not path.exists():
         return None
     # Include all queue tables and columns, including future retry metadata.
     with closing(sqlite3.connect(path)) as source:
         digest = hashlib.sha256()
+        external = hashlib.sha256()
+        external_count = 0
+
+        def hash_external(reference):
+            nonlocal external_count
+            _hash_row(external, (reference.external_uri, _json(_file_digest(_external_path(reference)))))
+            external_count += 1
+            return reference
+
         for table in sorted(_source_tables(source)):
             schema = source.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()[0]
             digest.update(_json([table, schema]).encode())
+            columns = [row[1] for row in source.execute(f"PRAGMA table_info({_quote(table)})")]
+            payload_index = columns.index("payload") if table == "outbound_queue" and "payload" in columns else None
             for row in source.execute(f"SELECT * FROM {_quote(table)} ORDER BY rowid"):
                 _hash_row(digest, row)
-        return {
+                if payload_index is not None:
+                    _external_payload(row[payload_index], hash_external)
+        result = {
             "sha256": digest.hexdigest(),
             "media": _media_directory_digest(path.parent / "outbound-media"),
         }
+        if external_count:
+            result["external"] = {"references": external_count, "sha256": external.hexdigest()}
+        return result
 
 
-def _queue_digest_matches(current: Optional[dict], recorded: Optional[dict]) -> bool:
+def _queue_digest_matches(current: Optional[dict], recorded: Optional[dict], *, legacy_external=False) -> bool:
     if current == recorded:
         return True
     # Imports committed before queue sidecars existed recorded only the SQLite
     # digest. Treat a missing/empty media directory as the same historical state.
     if not isinstance(current, dict) or not isinstance(recorded, dict):
         return False
-    if "media" in recorded or current.get("sha256") != recorded.get("sha256"):
+    if legacy_external and "external" not in recorded:
+        current = {key: value for key, value in current.items() if key != "external"}
+        if current == recorded:
+            return True
+    if "external" in current or "media" in recorded or current.get("sha256") != recorded.get("sha256"):
         return False
     media = current.get("media")
     return media is None or (
@@ -307,12 +474,10 @@ def _queue_digest_matches(current: Optional[dict], recorded: Optional[dict]) -> 
     )
 
 
-def _target_digest(db, model, batch_size: int) -> dict:
-    fields = model._meta.sorted_fields
+def _target_digest(db, model, batch_size: int, columns=None) -> dict:
+    fields = _fields(model, columns)
     projection = ", ".join(_quote(field.column_name) for field in fields)
-    order = _quote(model._meta.primary_key.column_name)
-    if isinstance(model._meta.primary_key, TextField):
-        order += ' COLLATE "C"'  # Same byte ordering as SQLite BINARY, independent of locale.
+    order = _order(model, fields, postgres=True)
     # A normal psycopg2 cursor buffers the entire result even with fetchmany().
     if not db.in_transaction():
         raise RuntimeError("Content verification requires the import transaction")
@@ -325,9 +490,9 @@ def _target_digest(db, model, batch_size: int) -> dict:
         return _digest(tuple(_value(field, value) for field, value in zip(fields, row)) for row in cursor)
 
 
-def _import_rows(db, source: sqlite3.Connection, batch_size: int) -> dict:
+def _import_rows(db, source: sqlite3.Connection, batch_size: int, models=MODELS) -> dict:
     summaries = {}
-    for model in MODELS:
+    for model in models:
         count = 0
         digest = hashlib.sha256()
         for batch in chunked(_source_rows(source, model), batch_size):
@@ -347,6 +512,24 @@ def _import_rows(db, source: sqlite3.Connection, batch_size: int) -> dict:
             )
         logger.info("Imported %s: %d rows", model._meta.table_name, count)
     return summaries
+
+
+def _recovery_columns(source, models, manifest):
+    columns = {model._meta.table_name: [field.column_name for field in model._meta.sorted_fields] for model in models}
+    if set(columns) != set(manifest["tables"]):
+        raise RuntimeError("Source tables changed since the committed import.")
+    if manifest["version"] == 1:
+        # v1 hashes predate this optional field. Verify their original projection,
+        # but never let that projection hide newly populated source data.
+        columns["msglog"].remove("master_message_thread_id")
+        actual = {row[1] for row in source.execute('PRAGMA table_info("msglog")')}
+        if "master_message_thread_id" in actual and source.execute(
+            'SELECT 1 FROM msglog WHERE master_message_thread_id IS NOT NULL LIMIT 1'
+        ).fetchone():
+            raise RuntimeError("Source has unimported message thread IDs; preserving both databases.")
+    elif columns != manifest["columns"]:
+        raise RuntimeError("Source columns changed since the committed import.")
+    return columns
 
 
 def _write_receipt(path: Path, receipt: dict) -> None:
@@ -386,23 +569,20 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
             with ExitStack() as fences:
                 fences.enter_context(_fence(source_path))
                 queue_path = directory / "outbound-queue.sqlite3"
-                queue_media_path = directory / "outbound-media"
                 if queue_path.exists():
                     fences.enter_context(_fence(queue_path))
                 backup_root = directory / "database-backups"
                 backup_root.mkdir(mode=0o700, exist_ok=True)
                 archive = Path(tempfile.mkdtemp(prefix="sqlite-", dir=backup_root))
                 _backup(source_path, archive / source_path.name)
-                if queue_path.exists():
-                    _backup(queue_path, archive / queue_path.name)
-                    _backup_media_directory(queue_media_path, archive / queue_media_path.name)
+                queue_summary = _backup_queue(queue_path, archive)
                 for path in (archive, backup_root, directory):
                     _sync_directory(path)
                 logger.info("Consistent SQLite backups: %s", archive)
                 with closing(sqlite3.connect(archive / source_path.name)) as source:
-                    _validate_source(source)
-                    queue_summary = _queue_digest(archive / queue_path.name)
-                    with connection_scope(db), db.bind_ctx(MODELS), db.atomic():
+                    models = MODELS + _cache_models(source)
+                    _validate_source(source, models)
+                    with connection_scope(db), db.bind_ctx(models), db.atomic():
                         db.execute_sql("SET LOCAL lock_timeout = '5s'")
                         db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
                         manifest = _read_import(db)
@@ -414,27 +594,45 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
                         if manifest is None:
                             if db.get_tables(schema=current_schema(db)):
                                 raise RuntimeError("Target schema is not empty and has no verified import record; refusing to overwrite or skip SQLite.")
-                            db.create_tables(MODELS)
-                            tables = _import_rows(db, source, batch_size)
+                            db.create_tables(models)
+                            tables = _import_rows(db, source, batch_size, models)
+                            columns = {model._meta.table_name: [field.column_name for field in model._meta.sorted_fields]
+                                       for model in models}
                             DatabaseManager._create_lookup_indexes(db)
                             manifest = {
-                                "version": 1, "import_id": uuid.uuid4().hex,
-                                "tables": tables, "queue": queue_summary,
+                                "version": 2, "import_id": uuid.uuid4().hex,
+                                "tables": tables, "columns": columns, "queue": queue_summary,
+                                "backup_queue": _queue_digest(archive / queue_path.name),
                                 "backup_directory": str(archive),
                             }
                         else:
                             # Recovery must not verify different tables at different
                             # points in a concurrent target writer's transaction.
-                            names = ", ".join(_quote(model._meta.table_name) for model in MODELS)
+                            names = ", ".join(_quote(name) for name in manifest["tables"])
                             db.execute_sql(f"LOCK TABLE {names} IN SHARE ROW EXCLUSIVE MODE")
-                            tables = {model._meta.table_name: _digest(_source_rows(source, model)) for model in MODELS}
-                            if tables != manifest["tables"] or not _queue_digest_matches(queue_summary, manifest["queue"]):
+                            columns = _recovery_columns(source, models, manifest)
+                            tables = {model._meta.table_name: _digest(_source_rows(source, model, columns[model._meta.table_name]))
+                                      for model in models}
+                            if tables != manifest["tables"] or not _queue_digest_matches(
+                                queue_summary, manifest["queue"], legacy_external=manifest["version"] == 1
+                            ):
                                 raise RuntimeError("Source changed since the committed import; refusing to merge divergent databases.")
-                        for model in MODELS:
-                            if _target_digest(db, model, batch_size) != tables[model._meta.table_name]:
+                            if (queue_summary is not None and "external" in queue_summary
+                                    and "external" not in manifest["queue"]):
+                                logger.warning(
+                                    "Legacy import has no external-media content hashes. Verified current files and "
+                                    "established their first content baseline; pre-existing changes cannot be detected."
+                                )
+                            manifest = dict(manifest, queue=queue_summary,
+                                            backup_queue=_queue_digest(archive / queue_path.name),
+                                            backup_directory=str(archive))
+                        for model in models:
+                            if _target_digest(db, model, batch_size, columns[model._meta.table_name]) != tables[model._meta.table_name]:
                                 raise RuntimeError(f"Content verification failed for {model._meta.table_name}; both sources are preserved.")
+                        if _queue_digest(queue_path) != queue_summary:
+                            raise RuntimeError("Outbound queue or media changed during import; keep all writers stopped and retry.")
                         db.execute_sql(f"CREATE TABLE IF NOT EXISTS {IMPORT_TABLE} (id INTEGER PRIMARY KEY CHECK (id = 1), manifest TEXT NOT NULL)")
-                        db.execute_sql(f"INSERT INTO {IMPORT_TABLE} (id, manifest) VALUES (1, %s) ON CONFLICT (id) DO NOTHING", (_json(manifest),))
+                        db.execute_sql(f"INSERT INTO {IMPORT_TABLE} (id, manifest) VALUES (1, %s) ON CONFLICT (id) DO UPDATE SET manifest = EXCLUDED.manifest", (_json(manifest),))
             # SQLite locks/connections have closed, including any resulting WAL
             # checkpoint, so the recorded fingerprint is stable across startup.
             receipt = dict(manifest, source_fingerprint=_fingerprint(source_path))

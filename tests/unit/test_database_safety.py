@@ -3,6 +3,7 @@
 import json
 import os
 import pickle
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -250,8 +251,8 @@ def test_precommit_failure_rolls_back_and_keeps_sources(sqlite_source, postgres_
     before = source_rows(sqlite_source)
     original = migrate_db._import_rows
 
-    def fail_insert(db, source, batch_size):
-        original(db, source, batch_size)
+    def fail_insert(db, source, batch_size, models=MODELS):
+        original(db, source, batch_size, models)
         raise RuntimeError("injected insert failure")
 
     def fail_backup(*args):
@@ -390,12 +391,12 @@ def test_source_write_fence_and_runtime_ownership(sqlite_source, postgres_config
     manager.stop_worker()
     original = migrate_db._import_rows
 
-    def inspect_fences(db, source, batch_size):
+    def inspect_fences(db, source, batch_size, models=MODELS):
         for filename in ("tgdata.db", "outbound-queue.sqlite3"):
             with closing(sqlite3.connect(sqlite_source / filename, timeout=0)) as other:
                 with pytest.raises(sqlite3.OperationalError, match="locked"):
                     other.execute("BEGIN IMMEDIATE")
-        return original(db, source, batch_size)
+        return original(db, source, batch_size, models)
 
     monkeypatch.setattr(migrate_db, "_import_rows", inspect_fences)
     migrate_db.migrate(sqlite_source, postgres_config)
@@ -645,3 +646,171 @@ def test_corrupt_import_manifest_cannot_authorize_startup(sqlite_source, postgre
     with pytest.raises(RuntimeError, match="corrupt PostgreSQL import record"):
         migrate_db.migrate(sqlite_source, postgres_config)
     assert (sqlite_source / "tgdata.db").exists()
+
+
+def test_import_preserves_production_message_column_and_discovered_caches(sqlite_source, postgres_config):
+    # Cache shapes are discovered, not asserted as production DDL: that DDL is
+    # available only in the source database at migration time.
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
+        source.execute("UPDATE msglog SET master_message_thread_id = '9001' WHERE master_msg_id = 'z.1'")
+        source.execute("CREATE TABLE topiciconcache (chat_id INTEGER PRIMARY KEY, icon TEXT NOT NULL, data BLOB)")
+        source.execute("CREATE TABLE useremojicache (user_id TEXT NOT NULL, emoji_id TEXT NOT NULL, "
+                       "label TEXT, PRIMARY KEY (user_id, emoji_id))")
+        source.executemany("INSERT INTO topiciconcache VALUES (?, ?, ?)",
+                           [(2**40 + i, f"icon-{i}", b"\x00\xff" if i % 2 else None) for i in range(4107)])
+        source.executemany("INSERT INTO useremojicache VALUES (?, ?, ?)",
+                           [(f"user-{i}", "emoji", "中文" if i % 2 else None) for i in range(1074)])
+    receipt = migrate_db.migrate(sqlite_source, postgres_config, batch_size=128)
+    assert receipt["tables"]["topiciconcache"]["rows"] == 4107
+    assert receipt["tables"]["useremojicache"]["rows"] == 1074
+    target = postgresql_database(postgres_config)
+    with connection_scope(target):
+        assert target.execute_sql("SELECT master_message_thread_id FROM msglog WHERE master_msg_id = 'z.1'").fetchone() == ("9001",)
+        assert target.execute_sql("SELECT chat_id, icon, data FROM topiciconcache ORDER BY chat_id DESC LIMIT 1").fetchone()[:2] == (2**40 + 4106, "icon-4106")
+        migrate_db.validate_runtime_cutover(sqlite_source, target)
+    target.close_all()
+    assert migrate_db.migrate(sqlite_source, postgres_config)["import_id"] == receipt["import_id"]
+
+
+def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_source, postgres_config, tmp_path):
+    external = tmp_path / "legacy-upload.bin"
+    external.write_bytes(b"legacy external bytes")
+    external_queue_payload(sqlite_source, external)
+    receipt = migrate_db.migrate(sqlite_source, postgres_config)
+    target = postgresql_database(postgres_config)
+    legacy = {key: value for key, value in receipt.items() if key not in ("columns", "backup_queue", "source_fingerprint")}
+    legacy["version"] = 1
+    legacy["queue"] = {key: value for key, value in legacy["queue"].items() if key != "external"}
+    columns = [field.column_name for field in MsgLog._meta.sorted_fields if field.name != "master_message_thread_id"]
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source:
+        legacy["tables"]["msglog"] = migrate_db._digest(migrate_db._source_rows(source, MsgLog, columns))
+    with connection_scope(target):
+        target.execute_sql("ALTER TABLE msglog DROP COLUMN master_message_thread_id")
+        target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s", (json.dumps(legacy),))
+    target.close_all()
+    (sqlite_source / migrate_db.RECEIPT_FILE).unlink()
+    recovered = migrate_db.migrate(sqlite_source, postgres_config)
+    assert recovered["import_id"] == receipt["import_id"]
+    assert recovered["version"] == 1
+    assert "external" in recovered["queue"]
+    assert migrate_db.migrate(sqlite_source, postgres_config)["queue"] == recovered["queue"]
+    external.write_bytes(b"changed external bytes")
+    with pytest.raises(RuntimeError, match="Source changed"):
+        migrate_db.migrate(sqlite_source, postgres_config)
+    external.write_bytes(b"legacy external bytes")
+    with connection_scope(target):
+        migrate_db.validate_runtime_cutover(sqlite_source, target)
+    target.close_all()
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
+        source.execute("UPDATE msglog SET master_message_thread_id = 'new'")
+    with pytest.raises(RuntimeError, match="unimported message thread"):
+        migrate_db.migrate(sqlite_source, postgres_config)
+
+
+def external_queue_payload(directory, external):
+    from efb_telegram_master.outbound import _StoredMediaSnapshot
+    from telegram import InputMediaDocument
+
+    reference = _StoredMediaSnapshot(None, external.name, external_uri=external.as_uri(), cleanup_external=True)
+    payload = OutboundQueue.encode_payload((), {"media": [InputMediaDocument(reference)]})
+    with closing(sqlite3.connect(directory / "outbound-queue.sqlite3")) as queue, queue:
+        queue.execute("UPDATE outbound_queue SET operation = 'send_media_group', payload = ? WHERE id = 1", (payload,))
+    return payload
+
+
+def test_external_queue_backup_restores_elsewhere_without_original(sqlite_source, tmp_path):
+    import tracemalloc
+
+    external = tmp_path / "source upload.bin"
+    chunk = b"x" * (1024 * 1024)
+    with external.open("wb") as writer:
+        for _ in range(24):
+            writer.write(chunk)
+    original_payload = external_queue_payload(sqlite_source, external)
+    before = migrate_db._queue_digest(sqlite_source / "outbound-queue.sqlite3")
+    archive = tmp_path / "backup"
+    archive.mkdir()
+    tracemalloc.start()
+    try:
+        assert migrate_db._backup_queue(sqlite_source / "outbound-queue.sqlite3", archive) == before
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 16 * 1024 * 1024
+    backup_digest = migrate_db._queue_digest(archive / "outbound-queue.sqlite3")
+    assert migrate_db._queue_digest(sqlite_source / "outbound-queue.sqlite3") == before
+    with closing(sqlite3.connect(sqlite_source / "outbound-queue.sqlite3")) as queue:
+        assert queue.execute("SELECT payload FROM outbound_queue WHERE id = 1").fetchone()[0] == original_payload
+    assert external.stat().st_size == 24 * len(chunk)
+    restored = tmp_path / "restored"
+    shutil.copytree(archive, restored)
+    external.unlink()
+    shutil.rmtree(sqlite_source)
+    assert migrate_db._queue_digest(restored / "outbound-queue.sqlite3") == backup_digest
+    queue = OutboundQueue(restored)
+    try:
+        payload = queue.connection.execute("SELECT payload FROM outbound_queue WHERE id = 1").fetchone()[0]
+        _, kwargs = queue.decode_payload(payload)
+        stream = kwargs["media"][0].media
+        try:
+            for _ in range(24):
+                assert stream.read(len(chunk)) == chunk
+            assert stream.read(1) == b""
+        finally:
+            stream.close()
+        queue.cleanup_payload_media(payload)
+        assert not list(queue.media_dir.glob("external-*"))
+    finally:
+        queue.close()
+
+
+def test_external_queue_change_after_commit_prevents_recovery(sqlite_source, postgres_config, tmp_path):
+    external = tmp_path / "upload.bin"
+    external.write_bytes(b"before")
+    external_queue_payload(sqlite_source, external)
+    migrate_db.migrate(sqlite_source, postgres_config)
+    external.write_bytes(b"after!")
+    with pytest.raises(RuntimeError, match="Source changed"):
+        migrate_db.migrate(sqlite_source, postgres_config)
+
+
+def test_external_queue_change_during_import_rolls_back(sqlite_source, postgres_config, tmp_path, monkeypatch):
+    external = tmp_path / "upload.bin"
+    external.write_bytes(b"before")
+    external_queue_payload(sqlite_source, external)
+    original = migrate_db._import_rows
+
+    def change_external(*args):
+        result = original(*args)
+        external.write_bytes(b"after!")
+        return result
+
+    monkeypatch.setattr(migrate_db, "_import_rows", change_external)
+    with pytest.raises(RuntimeError, match="changed during import"):
+        migrate_db.migrate(sqlite_source, postgres_config)
+    target = postgresql_database(postgres_config)
+    with connection_scope(target):
+        assert target.get_tables(schema=current_schema(target)) == []
+    target.close_all()
+    assert not (sqlite_source / migrate_db.RECEIPT_FILE).exists()
+
+
+def test_external_queue_digest_detects_changed_and_missing_files(sqlite_source, tmp_path):
+    external = tmp_path / "upload.bin"
+    external.write_bytes(b"before")
+    external_queue_payload(sqlite_source, external)
+    queue = sqlite_source / "outbound-queue.sqlite3"
+    before = migrate_db._queue_digest(queue)
+    external.write_bytes(b"after!")
+    after = migrate_db._queue_digest(queue)
+    assert before["sha256"] == after["sha256"]
+    assert before["external"] != after["external"]
+    assert not migrate_db._queue_digest_matches(after, before)
+    legacy = {key: value for key, value in before.items() if key != "external"}
+    assert migrate_db._queue_digest_matches(before, legacy, legacy_external=True)
+    assert not migrate_db._queue_digest_matches(before, legacy)
+    external.unlink()
+    archive = tmp_path / "backup"
+    archive.mkdir()
+    with pytest.raises(RuntimeError, match="External queued media is missing"):
+        migrate_db._backup_queue(queue, archive)
