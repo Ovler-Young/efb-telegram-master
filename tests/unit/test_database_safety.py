@@ -798,8 +798,12 @@ def test_external_queue_backup_restores_elsewhere_without_original(sqlite_source
             assert stream.read(1) == b""
         finally:
             stream.close()
-        queue.cleanup_payload_media(payload)
-        assert not list(queue.media_dir.glob("external-*"))
+        queue.delete(1)
+        # The other fixture row has an unknown payload encoding. Its possible
+        # sidecars must survive startup; terminal cleanup removes only the
+        # attachment referenced by the restored, completed row.
+        assert {path.name for path in queue.media_dir.glob("external-*")} == {"external-1"}
+        assert (queue.media_dir / "external-1").read_bytes() == b"existing sidecar"
     finally:
         queue.close()
 
