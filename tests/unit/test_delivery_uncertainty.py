@@ -1,4 +1,5 @@
 """A missing HTTP response must not send an already accepted message again."""
+import asyncio
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
@@ -8,13 +9,13 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from telegram import Bot, Chat, Document, Message, Update, User
-from telegram.error import NetworkError, TimedOut, RetryAfter
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut, RetryAfter
 from telegram.request import BaseRequest, HTTPXRequest
 
 from efb_telegram_master.outbound import (
     DeliveryUncertainError, OutboundQueue, OutboundQueueScheduler, QueueRequest, QueuePersistenceError, _NamedMediaFile,
 )
-from efb_telegram_master.bot_manager import AsyncTelegramRuntime, SyncBotFacade, QueuedDbLogContext
+from efb_telegram_master.bot_manager import SyncBotFacade, QueuedDbLogContext
 from efb_telegram_master.hold_send import hold
 from tests.unit.test_database_safety import manager_factory as database_manager_fixture
 
@@ -83,6 +84,7 @@ def delivered_message(sender=900, chat=42):
 def setup_manager(queue):
     manager = manager_adapter()
     manager._outbound_queue = queue
+    manager._queue_operation = lambda _: document
     manager.me = User(900, "test-bot", True)
     manager._outbound_scheduler = OutboundQueueScheduler(queue, manager, ImmediateExecutor(), 1)
     return manager
@@ -225,7 +227,8 @@ def test_msglog_failure_keeps_receipt_and_never_reuploads(tmp_path, manager_fact
     queue.close()
 
 
-def test_real_ptb_httpx_lost_response_does_not_generate_second_send(tmp_path, monkeypatch):
+@pytest.mark.parametrize("supplemental", [False, True])
+def test_real_ptb_httpx_lost_response_does_not_generate_second_send(tmp_path, monkeypatch, supplemental):
     """Actual PTB + HTTPX exception conversion; no external Telegram side effects."""
     accepted = []
     original_read = _NamedMediaFile.read
@@ -233,38 +236,54 @@ def test_real_ptb_httpx_lost_response_does_not_generate_second_send(tmp_path, mo
         assert size > 0, "the Telegram SDK tried to materialize the entire upload"
         return original_read(stream, size)
     monkeypatch.setattr(_NamedMediaFile, "read", bounded_read)
+    class LostResponseBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"ok":true,"result":'
+            raise httpx.ReadTimeout("response body lost after remote acceptance")
+
     async def transport(request):
         if request.url.path.endswith("getMe"):
             return httpx.Response(200, json={"ok": True, "result": {"id": 900, "is_bot": True, "first_name": "test"}})
         assert request.url.path.endswith("sendDocument")
-        assert b"archive bytes" in await request.aread()
+        body = await request.aread()
+        assert (b"x" * 2048 if accepted else b"archive bytes") in body
         accepted.append(request.url.path)
-        raise httpx.ReadTimeout("lost response after remote acceptance", request=request)
+        if supplemental and len(accepted) == 1:
+            return httpx.Response(200, json={"ok": True, "result": delivered_message().to_dict()})
+        return httpx.Response(200, stream=LostResponseBody())
     request = HTTPXRequest(httpx_kwargs={"transport": httpx.MockTransport(transport)})
     bot = Bot("900:test-token", request=request)
     queue = OutboundQueue(tmp_path)
     manager = setup_manager(queue)
-    runtime = AsyncTelegramRuntime(manager.logger)
-    runtime._ensure_background_loop()
+    loop = asyncio.new_event_loop()
+    runtime = SimpleNamespace(call=loop.run_until_complete)
     runtime.call(bot.initialize())
     manager._bot = SyncBotFacade(bot, runtime)
     manager.TRANSPORT_RETRY_SECONDS = 0
-    row_id, waiter = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
+    row_id, waiter = queue.enqueue_many([QueueRequest(
+        "send_document", (42, b"archive bytes"), {"caption": "x" * 2048} if supplemental else {}
+    )], lambda _: document)
     try:
         manager._outbound_scheduler.dispatch_once()
+        if supplemental:
+            manager._outbound_scheduler.harvest_completed()
+            assert waiter.result(timeout=1).message_id == 100
+            manager._outbound_scheduler.dispatch_once()
+            [row_id] = manager._outbound_scheduler.in_flight
         failure = manager._outbound_scheduler.in_flight[row_id].future.exception()
         assert isinstance(failure, TimedOut), repr(failure)
         manager._outbound_scheduler.harvest_completed()
         for _ in range(6):
             manager._outbound_scheduler.dispatch_once()
             manager._outbound_scheduler.harvest_completed()
-        assert len(accepted) == 1
-        with pytest.raises(DeliveryUncertainError):
-            waiter.result()
+        assert len(accepted) == (2 if supplemental else 1)
+        if not supplemental:
+            with pytest.raises(DeliveryUncertainError):
+                waiter.result(timeout=1)
         assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0] == "uncertain:TimedOut/ReadTimeout"
     finally:
         runtime.call(bot.shutdown())
-        runtime.shutdown()
+        loop.close()
         queue.close()
 
 
@@ -305,8 +324,8 @@ def test_381_mb_sidecar_reaches_http_transport_without_whole_file_read(tmp_path,
     bot = Bot("900:test-token", request=request)
     queue = OutboundQueue(tmp_path)
     manager = setup_manager(queue)
-    runtime = AsyncTelegramRuntime(manager.logger)
-    runtime._ensure_background_loop()
+    loop = asyncio.new_event_loop()
+    runtime = SimpleNamespace(call=loop.run_until_complete)
     runtime.call(bot.initialize())
     manager._bot = SyncBotFacade(bot, runtime)
     tracemalloc.start()
@@ -321,7 +340,7 @@ def test_381_mb_sidecar_reaches_http_transport_without_whole_file_read(tmp_path,
     finally:
         tracemalloc.stop()
         runtime.call(bot.shutdown())
-        runtime.shutdown()
+        loop.close()
         queue.close()
 
 
@@ -346,30 +365,92 @@ def test_invalid_json_response_is_not_treated_as_definite_rejection(tmp_path):
     queue.close()
 
 
-def test_failed_supplement_does_not_retry_an_accepted_primary_file(tmp_path):
+@pytest.mark.parametrize("failure", [BadRequest("rejected attachment"), TimedOut("response lost")])
+def test_supplement_failure_keeps_content_and_reconciles_primary(tmp_path, manager_factory, failure):
+    db = manager_factory(tmp_path)
     queue = OutboundQueue(tmp_path)
-    row_id, _ = queue.enqueue_many([QueueRequest(
-        "send_document", (42, b"archive bytes"), {"filename": "archive.zip", "caption": "x" * 2048}
-    )], lambda _: document)
     manager = setup_manager(queue)
-    accepted = []
+    manager.channel = SimpleNamespace(db=db)
+    context = manager._encode_queued_log_context(QueuedDbLogContext(message_with_group(), None))
+    row_id, waiter = queue.enqueue_many([QueueRequest(
+        "send_document", (42, b"archive bytes"), {"filename": "archive.zip", "caption": "x" * 2048}, context
+    )], lambda _: document)
+    primary = Mock(return_value=delivered_message())
+    supplement = Mock(side_effect=failure)
     def send(*args, **kwargs):
-        if kwargs.get("reply_to_message_id") == 100:
-            try:
-                raise httpx.ConnectError("supplement was not sent")
-            except httpx.ConnectError as cause:
-                raise NetworkError("connection refused") from cause
-        accepted.append(True)
-        return delivered_message()
+        return (supplement if kwargs.get("reply_to_message_id") == 100 else primary)(*args, **kwargs)
     manager._bot = SimpleNamespace(send_document=send)
-    manager.TRANSPORT_RETRY_SECONDS = 0
-    for _ in range(6):
+    with patch.object(db, "add_or_update_message_log", side_effect=RuntimeError("temporary MsgLog failure")):
         manager._outbound_scheduler.dispatch_once()
         manager._outbound_scheduler.harvest_completed()
-    assert len(accepted) == 1
-    assert queue.connection.execute(
-        "SELECT delivery_hold FROM outbound_queue WHERE id=?", (row_id,)
-    ).fetchone()[0].endswith("/primary_accepted")
+        assert waiter.result(timeout=1).message_id == 100
+        state, receipt = queue.connection.execute(
+            "SELECT delivery_state, completion_receipt FROM outbound_queue WHERE id=?", (row_id,)
+        ).fetchone()
+        assert state == "sent_pending"
+        assert manager._decode_queued_completion_receipt(receipt)[0].message_id == 100
+    # Restart after primary receipt and supplemental work have committed together.
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager.channel = SimpleNamespace(db=db)
+    manager._bot = SimpleNamespace(send_document=send)
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET reconcile_after=0")
+    for _ in range(4):
+        manager._outbound_scheduler.dispatch_once()
+        manager._outbound_scheduler.harvest_completed()
+    assert primary.call_count == 1 and supplement.call_count == 1
+    assert db.get_msg_log(master_msg_id="42.100").slave_message_id == "source-1"
+    [(payload, held)] = queue.connection.execute("SELECT payload, delivery_hold FROM outbound_queue").fetchall()
+    assert held.startswith("supplement_failed:" if isinstance(failure, BadRequest) else "uncertain:")
+    args, kwargs = queue.decode_payload(payload)
+    assert kwargs["document"].read() == b"x" * 2048
+    queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+    queue.close()
+
+
+def test_primary_receipt_and_supplement_retry_atomic_commit_without_resending(tmp_path, monkeypatch):
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    row_id, waiter = queue.enqueue_many([QueueRequest(
+        "send_document", (42, b"archive bytes"), {"caption": "x" * 2048}
+    )], lambda _: document)
+    primary = Mock(return_value=delivered_message())
+    supplemental_calls = []
+    def send(*args, **kwargs):
+        if kwargs.get("reply_to_message_id") == 100:
+            supplemental_calls.append(kwargs)
+            return delivered_message()
+        return primary(*args, **kwargs)
+    manager._bot = SimpleNamespace(send_document=send)
+    clock = [100.0]
+    monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
+    # Fail after the supplemental INSERT, before the primary receipt UPDATE.
+    with queue.connection:
+        queue.connection.execute("CREATE TRIGGER fail_completion BEFORE UPDATE OF completion_receipt ON outbound_queue "
+                                 "BEGIN SELECT RAISE(FAIL, 'database unavailable'); END")
+    manager._outbound_scheduler.dispatch_once()
+    manager._outbound_scheduler.harvest_completed()
+    assert not waiter.done() and not supplemental_calls
+    manager._outbound_scheduler.dispatch_once()
+    assert manager._outbound_scheduler.next_deadline == 101.0
+    assert queue.connection.execute("SELECT id, delivery_hold FROM outbound_queue").fetchall() == [(row_id, "in_flight")]
+    assert len(list(queue.media_dir.iterdir())) == 1
+    with queue.connection:
+        queue.connection.execute("DROP TRIGGER fail_completion")
+    clock[0] += 2
+    manager._outbound_scheduler.harvest_completed()
+    assert waiter.result(timeout=1).message_id == 100
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager._bot = SimpleNamespace(send_document=send)
+    manager._outbound_scheduler.dispatch_once()
+    manager._outbound_scheduler.harvest_completed()
+    assert primary.call_count == 1 and len(supplemental_calls) == 1
+    assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
+    assert not list(queue.media_dir.iterdir())
     queue.close()
 
 
@@ -396,3 +477,225 @@ def test_confirmation_command_rejects_non_admin():
                     reply_to_message=delivered_message()))
     TelegramChannel.confirm_send(channel, update, SimpleNamespace(args=["1"]))
     manager.confirm_queued_delivery.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["get_file", "download", "missing_path"])
+def test_acquisition_failure_retries_after_restart_without_delivery_uncertainty(tmp_path, monkeypatch, stage):
+    from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
+
+    clock = [1000.0]
+    monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: clock[0])
+    monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
+    queue = OutboundQueue(tmp_path)
+    source = tmp_path / "saved-media"
+    source.write_bytes(b"saved media bytes")
+    row_id, _ = queue.enqueue_many([QueueRequest("copy_message", (), {
+        "chat_id": 42, "from_chat_id": 1, "message_id": 2, "_slave_id": "__history__:source",
+        HISTORY_REPLAY_KEY: {"source_sender_bot_id": "owner", "fallback_operation": "send_document",
+                             "fallback_kwargs": {"document": "saved-file"}},
+    })], lambda _: lambda chat_id, from_chat_id, message_id: None)
+    copies = Mock(side_effect=BadRequest("Message to copy not found"))
+    uploads = Mock(return_value=delivered_message())
+    manager = setup_manager(queue)
+    manager._bot = SimpleNamespace(copy_message=copies, send_document=uploads)
+    get_file = Mock(side_effect=TimedOut("getFile response lost")) if stage == "get_file" else Mock(
+        return_value=SimpleNamespace(file_path="https://example.invalid/media" if stage == "download" else None))
+    manager.get_file = get_file
+    with patch("efb_telegram_master.bot_manager.httpx.stream", side_effect=httpx.ReadTimeout("download failed")):
+        manager._outbound_scheduler.dispatch_once()
+        manager._outbound_scheduler.harvest_completed()
+    assert copies.call_count == 1 and uploads.call_count == 0
+    get_file.assert_called_once_with("saved-file", sender_bot_id="owner")
+    assert queue.connection.execute(
+        "SELECT delivery_hold, reconcile_attempts, reconcile_after FROM outbound_queue WHERE id=?", (row_id,)
+    ).fetchone() == (None, 1, 1001.0)
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager._bot = SimpleNamespace(copy_message=copies, send_document=uploads)
+    manager.get_file = Mock(return_value=SimpleNamespace(file_path=str(source)))
+    manager._outbound_scheduler.dispatch_once()
+    assert copies.call_count == 1
+    assert manager._outbound_scheduler.next_deadline == 1001.0
+    clock[0] += 1
+    manager._outbound_scheduler.dispatch_once()
+    manager._outbound_scheduler.harvest_completed()
+    assert copies.call_count == 2 and uploads.call_count == 1
+    assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
+    queue.close()
+
+
+def test_transient_acquisition_recovers_after_repeated_failures_and_restart(tmp_path, monkeypatch):
+    from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
+
+    clock = [1000.0]
+    monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: clock[0])
+    monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = queue.enqueue_many([QueueRequest("copy_message", (), {
+        "chat_id": 42, "from_chat_id": 1, "message_id": 2, "_slave_id": "__history__:source",
+        HISTORY_REPLAY_KEY: {"source_sender_bot_id": "owner", "fallback_operation": "send_document",
+                             "fallback_kwargs": {"document": "saved-file"}},
+    })], lambda _: lambda chat_id, from_chat_id, message_id: None)
+    manager = setup_manager(queue)
+    copies = Mock(side_effect=BadRequest("Message to copy not found"))
+    uploads = Mock(return_value=delivered_message())
+    manager._bot = SimpleNamespace(copy_message=copies, send_document=uploads)
+    manager.get_file = Mock(side_effect=TimedOut("getFile unavailable"))
+    delays = []
+    for _ in range(10):
+        manager._outbound_scheduler.dispatch_once()
+        manager._outbound_scheduler.harvest_completed()
+        assert not waiter.done()
+        delays.append(manager._outbound_scheduler.next_deadline - clock[0])
+        clock[0] = manager._outbound_scheduler.next_deadline
+    assert delays == [1, 2, 4, 8, 16, 32, 60, 60, 60, 60]
+    assert uploads.call_count == 0
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager._bot = SimpleNamespace(copy_message=copies, send_document=uploads)
+    source = tmp_path / "saved-media"
+    source.write_bytes(b"saved media bytes")
+    manager.get_file = Mock(return_value=SimpleNamespace(file_path=str(source)))
+    manager._outbound_scheduler.dispatch_once()
+    manager._outbound_scheduler.harvest_completed()
+    assert copies.call_count == 11 and uploads.call_count == 1
+    assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
+    queue.close()
+
+
+def test_long_edit_attachment_retries_presend_failure_and_holds_interrupted_send(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    _, waiter = queue.enqueue_many([QueueRequest("edit_message_text", (), {
+        "chat_id": 42, "message_id": 100, "text": "x" * 5000,
+        "_required_sender_bot_id": "__main__", "_send_mode": "blocking",
+    })], lambda _: lambda chat_id, message_id, text: None)
+    manager = setup_manager(queue)
+    primary = Mock(return_value=delivered_message())
+    failure = NetworkError("connection establishment failed")
+    failure.__cause__ = httpx.ConnectError("not sent")
+    supplement = Mock(side_effect=[failure, delivered_message()])
+    manager._bot = SimpleNamespace(edit_message_text=primary, send_document=supplement)
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    scheduler = manager._outbound_scheduler
+    scheduler.dispatch_once()
+    scheduler.harvest_completed()
+    assert waiter.result(timeout=1).message_id == 100
+    scheduler.dispatch_once()
+    scheduler.harvest_completed()
+    assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue").fetchone() == (None,)
+    scheduler.dispatch_once()
+    assert supplement.call_count == 2
+    # Crash after the supplemental request, before its receipt can be harvested.
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager._bot = SimpleNamespace(edit_message_text=primary, send_document=supplement)
+    manager._outbound_scheduler.dispatch_once()
+    assert primary.call_count == 1 and supplement.call_count == 2
+    assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue").fetchone() == ("in_flight",)
+    assert list(queue.media_dir.iterdir())
+    queue.close()
+
+
+@pytest.mark.parametrize("operation,result", [
+    ("send_document", SimpleNamespace(message_id=100, unpickleable=lambda: None)),
+    ("edit_message_text", True),
+])
+def test_unusable_primary_receipt_retains_full_content_without_occupying_worker(tmp_path, operation, result):
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    if operation == "send_document":
+        request = QueueRequest(operation, (42, b"archive bytes"), {"caption": "x" * 2048})
+        resolver = document
+    else:
+        request = QueueRequest(operation, (), {"chat_id": 42, "message_id": 100, "text": "x" * 5000,
+                                              "_required_sender_bot_id": "__main__"})
+        resolver = lambda chat_id, message_id, text: None
+    row_id, waiter = queue.enqueue_many([request], lambda _: resolver)
+    primary = Mock(return_value=result)
+    later = Mock(return_value=delivered_message())
+    manager._bot = SimpleNamespace(**{operation: primary, "send_message": later})
+    scheduler = manager._outbound_scheduler
+    scheduler.dispatch_once()
+    scheduler.harvest_completed()
+    with pytest.raises(DeliveryUncertainError):
+        waiter.result(timeout=1)
+    assert not scheduler.in_flight and not scheduler.stopping
+    payload, receipt, held = queue.connection.execute(
+        "SELECT payload, completion_receipt, delivery_hold FROM outbound_queue WHERE id=?", (row_id,)
+    ).fetchone()
+    assert receipt is None and held.startswith("uncertain:InvalidTelegramResponseError")
+    _, kwargs = queue.decode_payload_raw(payload)
+    assert kwargs.get("text", kwargs.get("caption")) in ("x" * 2048, "x" * 5000)
+    _, next_waiter = queue.enqueue_many([QueueRequest("send_message", (42, "later"), {})],
+                                      lambda _: lambda chat_id, text: None)
+    scheduler.dispatch_once()
+    scheduler.harvest_completed()
+    assert next_waiter.result(timeout=1).message_id == 100 and primary.call_count == 1
+    queue.close()
+
+
+@pytest.mark.parametrize("rejection", [BadRequest("File not found"), Forbidden("Bot was blocked")])
+def test_permanent_acquisition_rejection_is_retained_without_retry(tmp_path, rejection):
+    from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
+
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = queue.enqueue_many([QueueRequest("copy_message", (), {
+        "chat_id": 42, "from_chat_id": 1, "message_id": 2, "_slave_id": "__history__:source",
+        HISTORY_REPLAY_KEY: {"source_sender_bot_id": "owner", "fallback_operation": "send_document",
+                             "fallback_kwargs": {"document": "saved-file"}},
+    })], lambda _: lambda chat_id, from_chat_id, message_id: None)
+    manager = setup_manager(queue)
+    copies = Mock(side_effect=BadRequest("Message to copy not found"))
+    uploads = Mock()
+    manager._bot = SimpleNamespace(copy_message=copies, send_document=uploads)
+    manager.get_file = Mock(side_effect=rejection)
+    for _ in range(3):
+        manager._outbound_scheduler.dispatch_once()
+        manager._outbound_scheduler.harvest_completed()
+    assert waiter.exception(timeout=1) is not None
+    assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0].startswith("history_failed:")
+    assert copies.call_count == 1 and uploads.call_count == 0
+    queue.close()
+
+
+@pytest.mark.parametrize("operation", ["send_document", "edit_message_text"])
+def test_confirming_primary_after_crash_preserves_pending_attachment(tmp_path, operation):
+    queue = OutboundQueue(tmp_path)
+    if operation == "send_document":
+        request = QueueRequest(operation, (42, b"archive bytes"), {"caption": "x" * 2048})
+        resolver = document
+    else:
+        request = QueueRequest(operation, (), {"chat_id": 42, "message_id": 100, "text": "x" * 5000,
+                                              "_required_sender_bot_id": "__main__"})
+        resolver = lambda chat_id, message_id, text: None
+    row_id, _ = queue.enqueue_many([request], lambda _: resolver)
+    manager = setup_manager(queue)
+    primary = Mock(return_value=delivered_message())
+    attachments = []
+    def send(*args, **kwargs):
+        if kwargs.get("reply_to_message_id") == 100:
+            attachments.append(kwargs["document"].input_file_content.read())
+            return delivered_message()
+        return primary(*args, **kwargs)
+    sender = SimpleNamespace(send_document=send, edit_message_text=send)
+    manager._bot = sender
+    manager._outbound_scheduler.dispatch_once()
+    # The primary ACK reached the process, but its durable transaction did not run.
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    manager = setup_manager(queue)
+    manager._bot = sender
+    manager._outbound_scheduler.dispatch_once()
+    assert primary.call_count == 1 and not attachments
+    assert manager.confirm_queued_delivery(row_id, delivered_message())
+    assert primary.call_count == 1 and not attachments
+    manager._outbound_scheduler.dispatch_once()
+    manager._outbound_scheduler.harvest_completed()
+    assert primary.call_count == 1
+    assert attachments == [b"x" * (2048 if operation == "send_document" else 5000)]
+    assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
+    assert not list(queue.media_dir.iterdir())
+    queue.close()
