@@ -28,10 +28,24 @@ from peewee import (
 )
 from ruamel.yaml import YAML
 
-from .db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc
+from .db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, HistoryMigrationTarget, MsgLog, SlaveChatInfo, TopicAssoc
 from .db_runtime import SCHEMA_LOCK, DataDirectoryLock, connection_scope, current_schema, postgresql_database
 
-MODELS = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
+CORE_MODELS = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
+MODELS = CORE_MODELS + (HistoryMigrationTarget,)
+# Version 1 did not record its column projections in the manifest.
+V1_COLUMNS = {
+    "chatassoc": ["id", "master_uid", "slave_uid"],
+    "topicassoc": ["id", "topic_chat_id", "message_thread_id", "slave_uid"],
+    "slavechatinfo": ["id", "slave_channel_id", "slave_channel_emoji", "slave_chat_uid",
+                      "slave_chat_group_id", "slave_chat_name", "slave_chat_alias", "slave_chat_type", "pickle"],
+    "msglog": ["master_msg_id", "master_msg_id_alt", "slave_message_id", "text", "slave_origin_uid",
+               "slave_origin_display_name", "slave_member_uid", "slave_member_display_name", "media_type",
+               "mime", "file_id", "file_unique_id", "msg_type", "pickle", "sent_to", "sender_bot_id", "time"],
+    "historymigrationentry": ["id", "slave_chat_id", "target_chat_id", "message_thread_id",
+                              "source_master_msg_id", "formatted_text", "media_type", "source_time",
+                              "position", "created_at"],
+}
 CACHE_TABLES = {"topiciconcache", "useremojicache"}
 IMPORT_TABLE = "etm_sqlite_import"
 RECEIPT_FILE = ".postgresql-cutover.json"
@@ -64,7 +78,7 @@ def _read_import(db) -> Optional[dict]:
         not isinstance(manifest, dict) or manifest.get("version") not in (1, 2)
         or not isinstance(manifest.get("import_id"), str) or not manifest["import_id"]
         or not isinstance(manifest.get("tables"), dict)
-        or not {model._meta.table_name for model in MODELS}.issubset(manifest["tables"])
+        or not {model._meta.table_name for model in CORE_MODELS}.issubset(manifest["tables"])
         or set(manifest["tables"]) - {model._meta.table_name for model in MODELS} - CACHE_TABLES
         or (manifest.get("version") == 2 and (
             not isinstance(manifest.get("columns"), dict)
@@ -528,22 +542,40 @@ def _import_rows(db, source: sqlite3.Connection, batch_size: int, models=MODELS)
     return summaries
 
 
-def _recovery_columns(source, models, manifest):
-    columns = {model._meta.table_name: [field.column_name for field in model._meta.sorted_fields] for model in models}
-    if set(columns) != set(manifest["tables"]):
+def _recovery_columns(models, manifest):
+    available = {model._meta.table_name: model for model in models}
+    if not set(manifest["tables"]).issubset(available):
         raise RuntimeError("Source tables changed since the committed import.")
-    if manifest["version"] == 1:
-        # v1 hashes predate this optional field. Verify their original projection,
-        # but never let that projection hide newly populated source data.
-        columns["msglog"].remove("master_message_thread_id")
-        actual = {row[1] for row in source.execute('PRAGMA table_info("msglog")')}
-        if "master_message_thread_id" in actual and source.execute(
-            'SELECT 1 FROM msglog WHERE master_message_thread_id IS NOT NULL LIMIT 1'
-        ).fetchone():
-            raise RuntimeError("Source has unimported message thread IDs; preserving both databases.")
-    elif columns != manifest["columns"]:
-        raise RuntimeError("Source columns changed since the committed import.")
+    columns = V1_COLUMNS if manifest["version"] == 1 else manifest["columns"]
+    if set(columns) != set(manifest["tables"]):
+        raise RuntimeError("Unsupported column projection in committed import.")
+    for table, names in columns.items():
+        fields = available[table]._meta.sorted_fields
+        if (not isinstance(names, list) or not names
+                or names != [field.column_name for field in fields if field.column_name in names]
+                or any(not field.null and field.column_name not in names for field in fields)):
+            raise RuntimeError(f"Unsupported column projection in committed import: {table}.")
     return columns
+
+
+def _validate_recovery_extras(source, db, columns):
+    """Old projections may omit only empty tables and NULL added fields, on both sides."""
+    for label, tables, execute, actual_columns in (
+        ("Source", _source_tables(source), source.execute,
+         lambda table: {row[1] for row in source.execute(f"PRAGMA table_info({_quote(table)})")}),
+        ("Target", set(db.get_tables(schema=current_schema(db))), db.execute_sql,
+         lambda table: {field.name for field in db.get_columns(table, schema=current_schema(db))}),
+    ):
+        for table in tables:
+            if table == IMPORT_TABLE or table.startswith("sqlite_"):
+                continue
+            if table not in columns:
+                if execute(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone():
+                    raise RuntimeError(f"{label} has unrecorded data in {table}; preserving both databases.")
+                continue
+            for name in actual_columns(table) - set(columns[table]):
+                if execute(f"SELECT 1 FROM {_quote(table)} WHERE {_quote(name)} IS NOT NULL LIMIT 1").fetchone():
+                    raise RuntimeError(f"{label} has unrecorded data in {table}.{name}; preserving both databases.")
 
 
 def _write_receipt(path: Path, receipt: dict) -> None:
@@ -623,9 +655,11 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
                         else:
                             # Recovery must not verify different tables at different
                             # points in a concurrent target writer's transaction.
-                            names = ", ".join(_quote(name) for name in manifest["tables"])
+                            names = ", ".join(_quote(name) for name in db.get_tables(schema=current_schema(db)))
                             db.execute_sql(f"LOCK TABLE {names} IN SHARE ROW EXCLUSIVE MODE")
-                            columns = _recovery_columns(source, models, manifest)
+                            columns = _recovery_columns(models, manifest)
+                            _validate_recovery_extras(source, db, columns)
+                            models = tuple(model for model in models if model._meta.table_name in columns)
                             tables = {model._meta.table_name: _digest(_source_rows(source, model, columns[model._meta.table_name]))
                                       for model in models}
                             queue_matches = _queue_digest_matches(

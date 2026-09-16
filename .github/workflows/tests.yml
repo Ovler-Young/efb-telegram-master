@@ -72,7 +72,7 @@ jobs:
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       run: |
         if [ "${{ inputs.restart_regression }}" = "true" ]; then
-          pytest -vv -r a --color=yes --mode=unit tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_restart_memory.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py tests/unit/test_backfill.py
+          pytest -vv -r a --color=yes --mode=unit tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_restart_memory.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py tests/unit/test_bot_manager.py tests/unit/test_outbound_adapter.py tests/unit/test_backfill.py tests/unit/test_database_safety.py tests/unit/test_database_performance.py
         else
           pytest -vv -r a -l --color=yes --mode=unit
         fi
@@ -124,7 +124,7 @@ jobs:
         TEST_POSTGRES_USER: postgres
         TEST_POSTGRES_PASSWORD: postgres
       run: |
-        pytest --mode=unit -v tests/unit/test_database_safety.py tests/unit/test_database_performance.py tests/unit/test_restart_memory.py tests/unit/test_db_migrations.py tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py
+        pytest --mode=unit -v tests/unit/test_database_safety.py tests/unit/test_database_performance.py tests/unit/test_restart_memory.py tests/unit/test_db_migrations.py tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py tests/unit/test_bot_manager.py tests/unit/test_outbound_adapter.py
 
   integration:
     if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'

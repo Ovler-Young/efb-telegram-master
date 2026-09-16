@@ -63,6 +63,15 @@ def test_partially_upgraded_schema_adds_only_missing_columns(tmp_path, monkeypat
         source.execute("ALTER TABLE msglog DROP COLUMN master_msg_id_alt")
         source.execute("ALTER TABLE msglog DROP COLUMN pickle")
         source.execute("ALTER TABLE slavechatinfo DROP COLUMN pickle")
+        source.execute("DROP INDEX history_generation_id")
+        source.execute("DROP INDEX history_target_generation_position")
+        source.execute("ALTER TABLE historymigrationentry DROP COLUMN generation")
+        source.execute("DROP TABLE historymigrationtarget")
+        source.execute(
+            "INSERT INTO historymigrationentry "
+            "(id, slave_chat_id, target_chat_id, source_master_msg_id, position, created_at) "
+            "VALUES (74, 'slave.chat', '-1001', 'source.1', 0, '2026-01-01')"
+        )
         source.commit()
     upgraded = DatabaseManager(SimpleNamespace(channel_id="test.schema", config={}))
     try:
@@ -70,6 +79,9 @@ def test_partially_upgraded_schema_adds_only_missing_columns(tmp_path, monkeypat
             columns = {column.name for column in upgraded._managed_database.get_columns("msglog")}
             assert {"master_msg_id_alt", "pickle", "sender_bot_id"} <= columns
             assert "msglog_master_alt" in {index.name for index in upgraded._managed_database.get_indexes("msglog")}
+            history_indexes = {index.name for index in upgraded._managed_database.get_indexes("historymigrationentry")}
+            assert {"history_generation_id", "history_target_generation_position"} <= history_indexes
+        assert upgraded.get_next_history_migration_target().ownership_key == "legacy:74"
     finally:
         upgraded.stop_worker()
         database.initialize(previous)

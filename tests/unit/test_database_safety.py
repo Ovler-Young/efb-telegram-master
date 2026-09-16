@@ -25,7 +25,7 @@ from efb_telegram_master.db import (
     ChatAssoc, DatabaseManager, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database,
 )
 from efb_telegram_master.db_runtime import DataDirectoryLock, connection_scope, current_schema, postgresql_database
-from efb_telegram_master.outbound import OutboundQueue
+from efb_telegram_master.outbound import OutboundQueue, QueueRequest
 
 MODELS = migrate_db.MODELS
 
@@ -181,16 +181,17 @@ def test_imported_target_cannot_be_treated_as_native_when_local_files_are_missin
     assert not (sqlite_source / "tgdata.db").exists()
 
 
-def test_runtime_does_not_recreate_missing_imported_tables(sqlite_source, postgres_config, manager_factory):
+@pytest.mark.parametrize("table", ["msglog", "historymigrationtarget"])
+def test_runtime_does_not_recreate_missing_imported_tables(sqlite_source, postgres_config, manager_factory, table):
     migrate_db.migrate(sqlite_source, postgres_config)
     target = postgresql_database(postgres_config)
     try:
         with connection_scope(target):
-            target.execute_sql("DROP TABLE msglog")
+            target.execute_sql(f'DROP TABLE "{table}"')
         with pytest.raises(RuntimeError, match="Imported PostgreSQL tables are missing"):
             manager_factory(sqlite_source, postgres_config)
         with connection_scope(target):
-            assert "msglog" not in target.get_tables(schema=current_schema(target))
+            assert table not in target.get_tables(schema=current_schema(target))
     finally:
         target.close_all()
 
@@ -689,10 +690,16 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
     ]
     with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
         legacy["tables"]["msglog"] = migrate_db._digest(migrate_db._source_rows(source, MsgLog, columns))
+        legacy["tables"].pop("historymigrationtarget")
+        legacy["tables"]["historymigrationentry"] = migrate_db._digest(migrate_db._source_rows(
+            source, HistoryMigrationEntry, migrate_db.V1_COLUMNS["historymigrationentry"],
+        ))
         source.execute("CREATE TABLE topiciconcache (id INTEGER PRIMARY KEY, icon TEXT)")
         source.execute("CREATE TABLE useremojicache (user_id TEXT, emoji TEXT)")
     with connection_scope(target):
         target.execute_sql("ALTER TABLE msglog DROP COLUMN master_message_thread_id")
+        target.execute_sql("ALTER TABLE historymigrationentry DROP COLUMN generation")
+        target.execute_sql("DROP TABLE historymigrationtarget")
         target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s", (json.dumps(legacy),))
     target.close_all()
     (sqlite_source / migrate_db.RECEIPT_FILE).unlink()
@@ -721,7 +728,7 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
             source.execute(f'DELETE FROM "{table}"')
     with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
         source.execute("UPDATE msglog SET master_message_thread_id = 'new'")
-    with pytest.raises(RuntimeError, match="unimported message thread"):
+    with pytest.raises(RuntimeError, match="unrecorded data in msglog.master_message_thread_id"):
         migrate_db.migrate(sqlite_source, postgres_config)
 
 
@@ -892,3 +899,133 @@ def test_v1_cache_discovery_preserves_only_empty_unrecorded_caches(sqlite_source
                 migrate_db._cache_models(source, manifest)
             assert source.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone() == (1,)
             source.execute(f'DELETE FROM "{table}"')
+
+
+def test_import_recovery_cutover_preserves_published_history_and_queue_ownership(
+    sqlite_source, postgres_config, manager_factory,
+):
+    manager = manager_factory(sqlite_source)
+    manager.replace_history_migration_entries("slave.chat", -100123456789, 9001, [
+        dict(slave_chat_id="slave.chat", target_chat_id="-100123456789", message_thread_id="9001",
+             source_master_msg_id="z.1", formatted_text=text, position=position)
+        for position, text in enumerate(("first", "second"))
+    ])
+    pending = manager.get_history_migration_entries("slave.chat", -100123456789, 9001)
+    keys = {entry.ownership_key for entry in pending}
+    with connection_scope(manager._managed_database):
+        # A formatter interrupted before publication leaves a separate generation.
+        abandoned = HistoryMigrationEntry.create(
+            slave_chat_id="slave.chat", target_chat_id="-100123456789", message_thread_id="9001",
+            source_master_msg_id="z.1", formatted_text="unpublished", position=0, generation="interrupted",
+        )
+    manager.stop_worker()
+    queue = OutboundQueue(sqlite_source)
+
+    def send_message(chat_id, text):
+        raise AssertionError("Offline import must not send Telegram messages")
+
+    try:
+        queue.enqueue_many(
+            [QueueRequest("send_message", (), {"chat_id": -100123456789, "text": "first"})],
+            lambda _: send_message, history_keys=[pending[0].ownership_key],
+        )
+    finally:
+        queue.close()
+    before = source_rows(sqlite_source)
+    committed = migrate_db.migrate(sqlite_source, postgres_config, batch_size=1)
+    assert committed["tables"]["historymigrationtarget"]["rows"] == 1
+    assert committed["tables"]["historymigrationentry"]["rows"] == 3
+    (sqlite_source / migrate_db.RECEIPT_FILE).unlink()
+    recovered = migrate_db.migrate(sqlite_source, postgres_config, batch_size=1)
+    assert recovered["import_id"] == committed["import_id"]
+    assert recovered["tables"] == committed["tables"]
+    assert source_rows(sqlite_source) == before
+    restarted = manager_factory(sqlite_source, postgres_config)
+    assert restarted.get_next_history_migration_target().ownership_key == pending[0].ownership_key
+    assert {entry.ownership_key for entry in restarted.get_history_migration_entries(
+        "slave.chat", -100123456789, 9001,
+    )} == keys
+    with connection_scope(restarted._managed_database):
+        assert not HistoryMigrationEntry.select().where(HistoryMigrationEntry.id == abandoned.id).exists()
+    queue = OutboundQueue(sqlite_source)
+    try:
+        assert queue.owned_history_entries(keys) == {pending[0].ownership_key}
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("added_fields", [False, True])
+def test_old_five_table_import_recovers_and_initializes_runtime_indexes(
+    sqlite_source, postgres_config, manager_factory, version, added_fields,
+):
+    receipt = migrate_db.migrate(sqlite_source, postgres_config)
+    columns = {name: list(fields) for name, fields in migrate_db.V1_COLUMNS.items()}
+    if version == 2:
+        columns["msglog"] = receipt["columns"]["msglog"]
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
+        tables = {model._meta.table_name: migrate_db._digest(migrate_db._source_rows(
+            source, model, columns[model._meta.table_name],
+        )) for model in migrate_db.CORE_MODELS}
+        if not added_fields:
+            source.execute("DROP TABLE historymigrationtarget")
+            source.execute("ALTER TABLE historymigrationentry DROP COLUMN generation")
+            if version == 1:
+                source.execute("ALTER TABLE msglog DROP COLUMN master_message_thread_id")
+    manifest = dict(receipt, version=version, tables=tables)
+    if version == 1:
+        manifest.pop("columns")
+    else:
+        manifest["columns"] = columns
+    target = postgresql_database(postgres_config)
+    try:
+        with connection_scope(target):
+            target.execute_sql("DROP TABLE historymigrationtarget")
+            target.execute_sql("ALTER TABLE historymigrationentry DROP COLUMN generation")
+            if version == 1:
+                target.execute_sql("ALTER TABLE msglog DROP COLUMN master_message_thread_id")
+            target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s", (json.dumps(manifest),))
+        (sqlite_source / migrate_db.RECEIPT_FILE).unlink()
+        recovered = migrate_db.migrate(sqlite_source, postgres_config)
+        assert recovered["tables"] == tables
+        runtime = manager_factory(sqlite_source, postgres_config)
+        assert runtime.get_next_history_migration_target().ownership_key == "legacy:74"
+        with connection_scope(runtime._managed_database):
+            indexes = {index.name for index in runtime._managed_database.get_indexes("historymigrationentry")}
+            assert {"history_generation_id", "history_target_generation_position"} <= indexes
+        runtime.stop_worker()
+        # Startup adds nullable fields and an empty target table; those must not
+        # invalidate the committed historical projection on an offline retry.
+        assert migrate_db.migrate(sqlite_source, postgres_config)["tables"] == tables
+    finally:
+        target.close_all()
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("side", ["Source", "Target"])
+def test_old_projection_rejects_unrecorded_generation_or_publication(sqlite_source, tmp_path, version, side):
+    # Exercise both-side projection checks without requiring a PostgreSQL server.
+    target = SqliteDatabase(str(tmp_path / "target.db"))
+    columns = {name: list(fields) for name, fields in migrate_db.V1_COLUMNS.items()}
+    manifest = {"version": version, "tables": {name: {} for name in columns}, "columns": columns}
+    try:
+        with target.bind_ctx(MODELS), target.connection_context():
+            target.create_tables(MODELS)
+            with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
+                for model in MODELS:
+                    rows = list(migrate_db._source_rows(source, model))
+                    if rows:
+                        model.insert_many(rows, fields=model._meta.sorted_fields).execute()
+                projection = migrate_db._recovery_columns(MODELS, manifest)
+                migrate_db._validate_recovery_extras(source, target, projection)
+                execute = source.execute if side == "Source" else target.execute_sql
+                execute("UPDATE historymigrationentry SET generation = 'published'")
+                with pytest.raises(RuntimeError, match=f"{side} has unrecorded data in historymigrationentry.generation"):
+                    migrate_db._validate_recovery_extras(source, target, projection)
+                execute("UPDATE historymigrationentry SET generation = NULL")
+                execute("INSERT INTO historymigrationtarget (slave_chat_id, target_chat_id, message_thread_id, generation) "
+                        "VALUES ('slave.chat', '-100123456789', '9001', 'published')")
+                with pytest.raises(RuntimeError, match=f"{side} has unrecorded data in historymigrationtarget"):
+                    migrate_db._validate_recovery_extras(source, target, projection)
+    finally:
+        target.close()

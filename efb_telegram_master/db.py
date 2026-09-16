@@ -931,7 +931,7 @@ class DatabaseManager:
         if after is not None and after[0] is not None:
             known = known.where(SQLTuple(MsgLog.time, MsgLog.master_msg_id) > after)
         pages.append(known)
-        rows = []
+        rows: List[MsgLog] = []
         for query in pages:
             if limit > 0:
                 query = query.limit(limit - len(rows))
