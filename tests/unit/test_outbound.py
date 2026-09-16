@@ -1493,3 +1493,161 @@ def test_legacy_recovery_preserves_multipart_filename_and_mime(tmp_path):
             queue.close_payload_resources(queue.payload_closeables(args, kwargs))
     finally:
         queue.close()
+
+
+def test_unknown_payload_version_preserves_media_until_row_is_repaired(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, _ = queue.enqueue_many(
+        [QueueRequest("send_document", (1, b"recoverable media"), {})],
+        lambda _: media_operation,
+    )
+    payload = queue.load_queued(row_id).payload
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET payload=? WHERE id=?", (b"\x03" + payload[1:], row_id))
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    try:
+        assert queue.load_queued(row_id).payload == b"\x03" + payload[1:]
+        with queue.connection:
+            queue.connection.execute("UPDATE outbound_queue SET payload=? WHERE id=?", (payload, row_id))
+        args, kwargs = queue.decode_payload(queue.load_queued(row_id).payload)
+        try:
+            assert media_bytes(args[1]) == b"recoverable media"
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+        queue.delete(row_id)
+        assert list(queue.media_dir.iterdir()) == []
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize("publication", ["enqueue", "supplement", "legacy"])
+def test_queue_owner_excludes_cross_process_cleanup_during_publication(tmp_path, monkeypatch, publication):
+    queue = OutboundQueue(tmp_path)
+    if publication == "supplement":
+        parent_id, _ = enqueue(queue, QueueRequest("send_message", (1, "primary"), {}))
+    elif publication == "legacy":
+        payload = b"\x01" + pickle.dumps(((1, io.BytesIO(b"owned media")), {}), protocol=5)
+        with queue.connection:
+            parent_id = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,1,'send_document',?,0)", (payload,),
+            ).lastrowid
+    store = queue._store_media_stream
+    contender = """
+import sys
+from efb_telegram_master.outbound import OutboundQueue, QueuePersistenceError
+try:
+    queue = OutboundQueue(sys.argv[1])
+except QueuePersistenceError as error:
+    assert 'already in use' in str(error), error
+    print('excluded')
+else:
+    queue.close()
+    raise AssertionError('Concurrent queue owner was admitted')
+"""
+
+    def prepare(*args, **kwargs):
+        snapshot = store(*args, **kwargs)
+        result = subprocess.run(
+            [sys.executable, "-c", contender, str(tmp_path)],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        assert result.stdout.strip() == "excluded"
+        return snapshot
+
+    monkeypatch.setattr(queue, "_store_media_stream", prepare)
+    request = QueueRequest("send_document", (1, b"owned media"), {})
+    try:
+        if publication == "enqueue":
+            row_id, _ = queue.enqueue_many([request], lambda _: media_operation)
+        elif publication == "supplement":
+            queue.record_telegram_completion(parent_id, b"receipt", supplement=request, operation_resolver=lambda _: media_operation)
+            row_id = queue.heads()[0].id
+        else:
+            row_id = parent_id
+            queue.recover_legacy_media_payload(row_id)
+    finally:
+        queue.close()
+    # The next owner must acquire the lock and retain the committed media.
+    queue = OutboundQueue(tmp_path)
+    try:
+        args, kwargs = queue.decode_payload(queue.load_queued(row_id).payload)
+        try:
+            assert media_bytes(args[1]) == b"owned media"
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+        queue.delete(row_id)
+        assert list(queue.media_dir.iterdir()) == []
+    finally:
+        queue.close()
+
+
+def test_shutdown_waits_for_preparation_and_rejects_publication_after_close(tmp_path, monkeypatch):
+    from concurrent.futures import TimeoutError
+    from efb_telegram_master.bot_manager import TelegramBotManager
+    from efb_telegram_master.outbound import QueuePersistenceError
+
+    queue = OutboundQueue(tmp_path)
+    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._outbound_queue = queue
+    manager._outbound_finalization_lock = threading.Lock()
+    manager._outbound_resources_finalized = False
+    manager._send_executor = ThreadPoolExecutor(max_workers=1)
+    prepared = threading.Event()
+    release = threading.Event()
+    closing = threading.Event()
+    store = queue._store_media_stream
+
+    def prepare(*args, **kwargs):
+        snapshot = store(*args, **kwargs)
+        prepared.set()
+        assert release.wait(5)
+        return snapshot
+
+    def close():
+        closing.set()
+        manager.stop_queued_worker()
+
+    monkeypatch.setattr(queue, "_store_media_stream", prepare)
+    request = QueueRequest("send_document", (1, b"shutdown media"), {})
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publication = executor.submit(queue.enqueue_many, [request], lambda _: media_operation)
+        try:
+            assert prepared.wait(5)
+            shutdown = executor.submit(close)
+            assert closing.wait(5)
+            with pytest.raises(TimeoutError):
+                shutdown.result(timeout=0.05)
+        finally:
+            release.set()
+        row_id, _ = publication.result(timeout=5)
+        shutdown.result(timeout=5)
+    queue.close()  # Repeated shutdown must not affect a later owner.
+    with pytest.raises(QueuePersistenceError, match="closed"):
+        queue.enqueue_many([request], lambda _: media_operation)
+    with pytest.raises(QueuePersistenceError, match="closed"):
+        queue.record_telegram_completion(row_id, b"receipt", supplement=request, operation_resolver=lambda _: media_operation)
+    restarted = OutboundQueue(tmp_path)
+    try:
+        args, kwargs = restarted.decode_payload(restarted.load_queued(row_id).payload)
+        try:
+            assert media_bytes(args[1]) == b"shutdown media"
+        finally:
+            restarted.close_payload_resources(restarted.payload_closeables(args, kwargs))
+    finally:
+        restarted.close()
+
+
+def test_constructor_failure_releases_queue_ownership(tmp_path, monkeypatch):
+    with monkeypatch.context() as patcher:
+        patcher.setattr(OutboundQueue, "_migrate_schema", Mock(side_effect=RuntimeError("schema failure")))
+        with pytest.raises(RuntimeError, match="schema failure"):
+            OutboundQueue(tmp_path)
+    queue = OutboundQueue(tmp_path)
+    try:
+        row_id, _ = enqueue(queue, QueueRequest("send_message", (1, "after failed startup"), {}))
+        assert queue.load_queued(row_id).operation == "send_message"
+    finally:
+        queue.close()

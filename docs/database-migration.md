@@ -94,12 +94,17 @@ contract for those separate routines. During a memory incident, stop the bot and
 automatic restarts before diagnosis, keeping both databases, WAL files and
 `outbound-media/` intact.
 
-Sidecar files are removed after their queue row reaches a terminal state. On
-startup, ETM inspects payload markers incrementally and skips non-v2 payloads.
-If any live v2 payload exceeds the inspection budget or cannot be decoded, orphan
-cleanup is skipped to preserve potentially referenced files. Otherwise,
-unreferenced queue-owned sidecars are removed. Missing media referenced by a
-valid inspected row fails queue startup instead of silently discarding the row.
+Sidecar files are removed after their queue row reaches a terminal state. One
+queue owner holds `.outbound-queue.lock` for its lifetime, covering startup
+cleanup and sidecar publication; a second owner fails before inspecting or
+reclaiming media. Do not remove that lock file while an owner is running.
+
+Startup inspects payload markers incrementally and skips known v1 payloads.
+An unknown payload version, or any live v2 payload exceeding the inspection
+budget or failing to decode, disables orphan cleanup to preserve potentially
+referenced files. Otherwise, unreferenced queue-owned sidecars are removed.
+Missing media referenced by a valid inspected row fails queue startup instead
+of silently discarding the row.
 
 ## Before migration
 

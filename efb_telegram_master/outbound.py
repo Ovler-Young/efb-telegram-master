@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import inspect
 import io
 import logging
@@ -570,6 +571,7 @@ class OutboundQueue:
         self.media_dir = Path(channel_data_path) / "outbound-media"
         self._lock = threading.RLock()
         self._connection: Optional[sqlite3.Connection] = None
+        self._ownership_file: Optional[IO[bytes]] = None
         self.metrics = metrics
         self.waiters: dict[int, Future] = {}
         self._open()
@@ -578,6 +580,13 @@ class OutboundQueue:
         connection: Optional[sqlite3.Connection] = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Own media preparation, publication and startup reclamation before
+            # acquiring SQLite locks. Keep this file in place across owners.
+            self._ownership_file = (self.path.parent / ".outbound-queue.lock").open("a+b")
+            try:
+                fcntl.flock(self._ownership_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise QueuePersistenceError("Outbound queue is already in use by another owner.") from None
             self.media_dir.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
             connection.execute("PRAGMA journal_mode=WAL")
@@ -617,12 +626,18 @@ class OutboundQueue:
             self._connection = connection
             self._cleanup_orphan_media()
             self.refresh_depth()
-        except Exception:
-            if connection is not None:
-                try:
-                    connection.rollback()
-                finally:
-                    connection.close()
+        except BaseException:
+            try:
+                if connection is not None:
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
+            finally:
+                self._connection = None
+                if self._ownership_file is not None:
+                    self._ownership_file.close()
+                    self._ownership_file = None
             raise
 
     @staticmethod
@@ -670,6 +685,9 @@ class OutboundQueue:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+            if self._ownership_file is not None:
+                self._ownership_file.close()
+                self._ownership_file = None
 
     def refresh_depth(self) -> None:
         if self.metrics is not None:
@@ -1113,8 +1131,12 @@ class OutboundQueue:
             cursor = self.connection.execute("SELECT id FROM outbound_queue")
             for (row_id,) in cursor:
                 with _SQLiteBlobReader(self.path, int(row_id)) as payload:
-                    if payload.read(1) != b"\x02":
+                    version = payload.read(1)
+                    if version == b"\x01":
                         continue
+                    if version != b"\x02":
+                        # Unknown encodings may still own any of the sidecars.
+                        return
                     # A v2 row can still contain oversized opaque data.  Keep
                     # all sidecars until bounded recovery can inspect it.
                     if payload.length > self.MAX_REPLAY_BYTES:
@@ -1317,20 +1339,21 @@ class OutboundQueue:
         request_list = list(requests)
         if not request_list:
             raise QueueEnqueueError("Queued request sequence cannot be empty.")
-        prepared = []
-        try:
-            for request in request_list:
-                prepared.append(self._prepare(request, operation_resolver(request.operation)))
-        except Exception:
-            for item in prepared:
-                self._cleanup_created_media(item[9])
-            raise
-        destinations = {(item[3], item[4]) for item in prepared}
-        if len(destinations) != 1:
-            for item in prepared:
-                self._cleanup_created_media(item[9])
-            raise QueueEnqueueError("Queued request sequence must share chat_id and priority.")
         with self._lock:
+            self.connection  # Reject closed queues before creating sidecars.
+            prepared = []
+            try:
+                for request in request_list:
+                    prepared.append(self._prepare(request, operation_resolver(request.operation)))
+            except Exception:
+                for item in prepared:
+                    self._cleanup_created_media(item[9])
+                raise
+            destinations = {(item[3], item[4]) for item in prepared}
+            if len(destinations) != 1:
+                for item in prepared:
+                    self._cleanup_created_media(item[9])
+                raise QueueEnqueueError("Queued request sequence must share chat_id and priority.")
             try:
                 self.connection.execute("BEGIN")
                 # Receipts outlive queue-row completion until the source staging
@@ -1975,11 +1998,12 @@ class OutboundQueue:
     ) -> None:
         if not isinstance(receipt, bytes):
             raise QueuePersistenceError("Queued Telegram completion receipt must be bytes.")
-        prepared = None
-        if supplement is not None:
-            assert operation_resolver is not None
-            prepared = self._prepare(supplement, operation_resolver(supplement.operation))
         with self._lock:
+            self.connection  # Preparation must finish before ownership is released.
+            prepared = None
+            if supplement is not None:
+                assert operation_resolver is not None
+                prepared = self._prepare(supplement, operation_resolver(supplement.operation))
             try:
                 self.connection.execute("BEGIN")
                 if prepared is not None:

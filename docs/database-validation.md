@@ -102,8 +102,12 @@ this is not a blanket conversion of arbitrary bytes into attachments.
 Preparation and enqueue failures clean up newly created sidecars only. Partial
 decode failure closes opened handles. Invalid payloads receive a durable
 `invalid_payload` hold instead of being discarded, allowing later runnable rows
-to proceed. Startup skips non-v2 payloads after reading their markers and skips
-orphan deletion when an oversized or corrupt v2 payload cannot be inspected.
+to proceed. Startup skips known v1 payloads after reading their markers. An
+unknown version, or an oversized or corrupt v2 payload, disables orphan deletion.
+A lifetime `.outbound-queue.lock` excludes another queue owner from the same data
+directory. Preparation and publication also hold the instance lock so shutdown
+cannot release ownership while an unpublished sidecar is still being created.
+Constructor failure and close release ownership; the lock file stays in place.
 
 [`test_restart_memory.py`](../tests/unit/test_restart_memory.py) covers incremental
 recovery, startup inspection, oversized opaque-data retention and interrupted
@@ -122,8 +126,15 @@ for arbitrary inline queue BLOBs during offline migration.
 ## Running verification
 
 The [test workflow](../.github/workflows/tests.yml) defines a dedicated PostgreSQL
-service job, a Peewee matrix and SQLite compatibility checks. Database tests use
-isolated schemas; live Telegram checks require credentials and their configured
+service job, a Peewee matrix and SQLite compatibility checks. SQLite 3.31.1 is a
+compatibility target, not a production-version recommendation. SQLite documents
+a rare WAL-reset race fixed in 3.51.3 and later, with official backports including
+3.44.6 and 3.50.7: see [SQLite's WAL-reset advisory](https://sqlite.org/wal.html).
+Use a patched engine in production; the Python module's `sqlite3.sqlite_version`,
+not a separate CLI binary's version, identifies the application engine. This
+repository does not replace the host's SQLite library automatically.
+
+Database tests use isolated schemas; live Telegram checks require credentials and their configured
 integration environment. Neither phase-specific CI nor offline checks alone
 constitute final release or production acceptance.
 
