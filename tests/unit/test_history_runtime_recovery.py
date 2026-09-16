@@ -71,9 +71,10 @@ def test_replacement_publication_is_atomic_at_every_boundary(history, monkeypatc
         calls += 1
         # A separate connection can write after each staging page committed.
         with sqlite3.connect(history.path / 'tgdata.db', timeout=0.1) as live:
-            sql, params = history.db._visible_history_entries().select(HistoryMigrationEntry.formatted_text).sql()
-            assert live.execute(sql, params).fetchall() == [('old',)]
             live.execute("UPDATE msglog SET text = 'live'")
+        assert [entry.formatted_text for entry in history.db.get_history_migration_entries(
+            'slave chat', -1002, 42,
+        )] == ['old']
         if boundary == 'stage' and calls == 2:
             raise RuntimeError('interrupted')
         return original_insert(batch)
@@ -233,3 +234,116 @@ def test_durable_handoff_survives_each_interruption(history, monkeypatch, bounda
         assert [call[1]['text'] for call in sender.calls] == ['AB', 'AB']
     finally:
         manager._outbound_queue.close()
+
+
+def test_interrupted_generation_is_reclaimed_on_reopen_without_hidden_history_scans(history, monkeypatch):
+    from efb_telegram_master import db as db_module
+    from peewee import IntegrityError
+
+    published = populate(history, ['published'])
+    generation = published.generation
+    history.db.delete_history_migration_entry(published.id)
+    managed = history.db._managed_database
+    with connection_scope(managed):
+        HistoryMigrationTarget.delete().execute()
+        managed.execute_sql(
+            "CREATE TRIGGER interrupt_publication BEFORE INSERT ON historymigrationtarget "
+            "BEGIN SELECT RAISE(ABORT, 'publication interrupted'); END"
+        )
+    with pytest.raises(IntegrityError, match='publication interrupted'):
+        history.db.replace_history_migration_entries(
+            'slave chat', -1002, 42, (staging('hidden', i) for i in range(100000)),
+        )
+
+    def check_visibility(expected):
+        with connection_scope(history.db._managed_database):
+            connection = history.db._managed_database.connection()
+            steps = 0
+            statements = []
+
+            def progress():
+                nonlocal steps
+                steps += 1
+                return 0
+
+            connection.set_progress_handler(progress, 1)
+            connection.set_trace_callback(statements.append)
+            try:
+                assert history.db.has_pending_history_migrations() is bool(expected)
+                head = history.db.get_next_history_migration_target()
+                assert (head.formatted_text if head else None) == (expected[0] if expected else None)
+                page = history.db.get_history_migration_entries('slave chat', -1002, 42, limit=32)
+                assert [entry.formatted_text for entry in page] == expected
+            finally:
+                connection.set_progress_handler(None, 0)
+                connection.set_trace_callback(None)
+            assert steps < 3000, steps
+            plans = [row[3] for sql in statements if sql.lstrip().upper().startswith('SELECT')
+                     for row in connection.execute('EXPLAIN QUERY PLAN ' + sql)]
+            assert any('history_generation_id' in plan for plan in plans)
+            assert any('history_target_generation_position' in plan for plan in plans)
+
+    check_visibility([])
+    with connection_scope(managed):
+        assert HistoryMigrationEntry.select().count() == 100000
+        managed.execute_sql("DROP TRIGGER interrupt_publication")
+        HistoryMigrationTarget.create(slave_chat_id='slave chat', target_chat_id='-1002',
+                                      message_thread_id='42', generation=generation)
+        current = HistoryMigrationEntry.create(**staging('published', 100001), generation=generation)
+    check_visibility(['published'])
+    with connection_scope(managed):
+        legacy = HistoryMigrationEntry.create(**dict(staging('legacy'), target_chat_id='-1003'))
+    history.db.stop_worker()
+
+    create_database = db_module.sqlite_database
+    delete_sizes = []
+
+    def instrument_database(*args, **kwargs):
+        reopened = create_database(*args, **kwargs)
+        execute = reopened.execute_sql
+
+        def execute_sql(sql, params=None, *args, **kwargs):
+            if sql.startswith('DELETE FROM "historymigrationentry"'):
+                delete_sizes.append(len(params))
+                # Reclamation must not keep the startup schema transaction or
+                # the previous deletion's writer lock across batches.
+                with sqlite3.connect(history.path / 'tgdata.db', timeout=0.1) as live:
+                    live.execute("UPDATE msglog SET text = 'live during reclamation'")
+            return execute(sql, params, *args, **kwargs)
+
+        reopened.execute_sql = execute_sql
+        return reopened
+
+    monkeypatch.setattr(db_module, 'sqlite_database', instrument_database)
+    reopened = db_module.DatabaseManager(SimpleNamespace(channel_id='history-test', config={}))
+    history.db = reopened
+    try:
+        assert delete_sizes and max(delete_sizes) <= 256
+        with connection_scope(reopened._managed_database):
+            assert {row.id for row in HistoryMigrationEntry.select()} == {current.id, legacy.id}
+            assert HistoryMigrationEntry.get_by_id(current.id).generation == generation
+            assert MsgLog.select().count() == 1
+        check_visibility(['published'])
+    finally:
+        reopened.stop_worker()
+
+
+def test_visibility_checks_during_preparation_do_not_reclaim_active_generation(history, monkeypatch):
+    populate(history, ['published'])
+    original_insert = HistoryMigrationEntry.insert_many
+    batches = 0
+
+    def insert(batch):
+        nonlocal batches
+        batches += 1
+        assert history.db.has_pending_history_migrations()
+        assert history.db.get_next_history_migration_target().formatted_text == 'published'
+        assert [entry.formatted_text for entry in history.db.get_history_migration_entries('slave chat', -1002, 42)] == ['published']
+        assert HistoryMigrationEntry.select().count() == 1 + (batches - 1) * 32
+        return original_insert(batch)
+
+    monkeypatch.setattr(HistoryMigrationEntry, 'insert_many', insert)
+    assert history.db.replace_history_migration_entries(
+        'slave chat', -1002, 42, (staging('new', i) for i in range(70)),
+    ) == 70
+    assert len(history.db.get_history_migration_entries('slave chat', -1002, 42)) == 70

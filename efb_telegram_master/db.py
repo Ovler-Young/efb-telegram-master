@@ -17,6 +17,7 @@ from peewee import (
     DatabaseProxy,
     DateTimeField,
     DoesNotExist,
+    EnclosedNodeList,
     IntegerField,
     Model,
     PostgresqlDatabase,
@@ -323,6 +324,7 @@ class DatabaseManager:
                         validate_runtime_cutover(base_path, actual_db)
                     self._create_missing_tables()
                     self._check_and_run_migrations()
+                self._reclaim_inactive_history_at_startup()
                 self._observe_legacy_outbound_rows()
         except BaseException:
             actual_db.close_all()
@@ -386,6 +388,8 @@ class DatabaseManager:
             ("msglog_slave_lookup", "msglog", f"slave_origin_uid, slave_message_id, {time_order}"),
             ("msglog_chat_time", "msglog", f"slave_origin_uid, {time_order}"),
             ("msglog_history_seek", "msglog", "slave_origin_uid, time, master_msg_id"),
+            ("history_generation_id", "historymigrationentry", "generation, id"),
+            ("history_target_generation_position", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, generation, position, id"),
             ("history_target_cleanup", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, id"),
             ("msglog_master_alt", "msglog", "master_msg_id_alt"),
             ("chatassoc_slave_lookup", "chatassoc", "slave_uid"),
@@ -1009,24 +1013,46 @@ class DatabaseManager:
         return count
 
     @staticmethod
-    def _visible_history_entries():
-        target = HistoryMigrationTarget.select(HistoryMigrationTarget.generation).where(
+    def _history_entry_target():
+        return HistoryMigrationTarget.select(HistoryMigrationTarget.generation).where(
             (HistoryMigrationTarget.slave_chat_id == HistoryMigrationEntry.slave_chat_id) &
             (HistoryMigrationTarget.target_chat_id == HistoryMigrationEntry.target_chat_id) &
             (HistoryMigrationTarget.message_thread_id == fn.COALESCE(HistoryMigrationEntry.message_thread_id, ""))
         )
-        return HistoryMigrationEntry.select().where(
-            (HistoryMigrationEntry.generation == target) |
-            (HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(target))
-        )
+
+    def _reclaim_inactive_history_at_startup(self):
+        # The data-directory lock is held and this manager has not been exposed
+        # to preparation workers yet. Never run this sweep during preparation.
+        after_id = 0
+        while True:
+            rows = list(HistoryMigrationEntry.select(
+                HistoryMigrationEntry.id, HistoryMigrationEntry.generation,
+                self._history_entry_target().alias("published_generation"),
+            ).where(HistoryMigrationEntry.id > after_id).order_by(HistoryMigrationEntry.id).limit(256).dicts())
+            if not rows:
+                return
+            obsolete = [row["id"] for row in rows if row["generation"] != row["published_generation"]]
+            if obsolete:
+                HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(obsolete)).execute()
+            after_id = rows[-1]["id"]
 
     @observe_database_method("has_pending_history_migrations")
     def has_pending_history_migrations(self) -> bool:
-        return self._visible_history_entries().exists()
+        return self.get_next_history_migration_target() is not None
 
     @observe_database_method("get_next_history_migration_target")
     def get_next_history_migration_target(self) -> Optional[HistoryMigrationEntry]:
-        return self._visible_history_entries().order_by(HistoryMigrationEntry.id).first()
+        # Seek one head per published generation; ORDER BY id over a combined
+        # visibility predicate can instead scan every unpublished staging row.
+        head = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
+            HistoryMigrationEntry.generation == HistoryMigrationTarget.generation,
+        ).order_by(HistoryMigrationEntry.id).limit(1)
+        published_id = HistoryMigrationTarget.select(fn.MIN(EnclosedNodeList([head]))).scalar()
+        legacy_id = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
+            HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
+        ).order_by(HistoryMigrationEntry.id).limit(1).scalar()
+        ids = [identifier for identifier in (published_id, legacy_id) if identifier is not None]
+        return HistoryMigrationEntry.get_by_id(min(ids)) if ids else None
 
     @observe_database_method("get_history_migration_entries")
     def get_history_migration_entries(
@@ -1042,9 +1068,18 @@ class DatabaseManager:
             target_chat_id,
             message_thread_id,
         )
+        generation = HistoryMigrationTarget.select(HistoryMigrationTarget.generation).where(
+            (HistoryMigrationTarget.slave_chat_id == str(slave_chat_id)) &
+            (HistoryMigrationTarget.target_chat_id == str(target_chat_id)) &
+            (HistoryMigrationTarget.message_thread_id == (str(message_thread_id) if message_thread_id is not None else ""))
+        ).scalar()
+        generation_filter = (
+            (HistoryMigrationEntry.generation == generation) if generation is not None
+            else HistoryMigrationEntry.generation.is_null(True)
+        )
         query = (
-            self._visible_history_entries()
-            .where(target_filter)
+            HistoryMigrationEntry.select()
+            .where(target_filter & generation_filter)
             .order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
         )
         if after is not None:
