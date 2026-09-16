@@ -165,6 +165,14 @@ def _source_tables(source: sqlite3.Connection) -> set[str]:
     return {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
+def _source_columns(source: sqlite3.Connection, table: str) -> list:
+    columns = list(source.execute(f"PRAGMA table_xinfo({_quote(table)})"))
+    hidden = [row[1] for row in columns if row[6]]
+    if hidden:
+        raise RuntimeError(f"Unsupported generated or hidden columns in {table}: {hidden}; source is preserved.")
+    return columns
+
+
 def _cache_models(source: sqlite3.Connection, manifest=None) -> tuple:
     """Preserve only the two known historical caches, using their actual DDL."""
     models = []
@@ -179,13 +187,13 @@ def _cache_models(source: sqlite3.Connection, manifest=None) -> tuple:
             if source.execute(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone():
                 raise RuntimeError(f"Unrecorded source cache {table!r} is no longer empty; source is preserved.")
             continue
-        columns = list(source.execute(f"PRAGMA table_xinfo({_quote(table)})"))
+        columns = _source_columns(source, table)
         fields = {}
         primary = []
         for _, name, declared, not_null, default, pk, hidden in columns:
             declared = declared.upper()
             field_type = TextField if re.fullmatch(r"(?:VAR)?CHAR(?:\(\d+\))?", declared) else types.get(declared)
-            if field_type is None or hidden:
+            if field_type is None:
                 raise RuntimeError(f"Unsupported cache column {table}.{name}: {declared}; source is preserved.")
             fields[name] = field_type(column_name=name, null=not not_null)
             if pk:
@@ -212,7 +220,7 @@ def _validate_source(source: sqlite3.Connection, models=MODELS) -> None:
         table = model._meta.table_name
         if table not in tables:
             continue
-        actual = {row[1] for row in source.execute(f"PRAGMA table_info({_quote(table)})")}
+        actual = {row[1] for row in _source_columns(source, table)}
         fields = {field.column_name: field for field in model._meta.sorted_fields}
         unknown = actual - fields.keys()
         if unknown:
@@ -280,7 +288,7 @@ def _source_rows(source: sqlite3.Connection, model, columns=None) -> Iterator[tu
     table = model._meta.table_name
     if table not in _source_tables(source):
         return
-    actual = {row[1] for row in source.execute(f"PRAGMA table_info({_quote(table)})")}
+    actual = {row[1] for row in _source_columns(source, table)}
     fields = _fields(model, columns)
     projection = ", ".join(_quote(field.column_name) if field.column_name in actual else "NULL" for field in fields)
     order = _order(model, fields)
@@ -360,7 +368,7 @@ def _backup_media_directory(source: Path, destination: Path) -> None:
         raise RuntimeError("Outbound media changed during backup; keep all writers stopped and retry.")
 
 
-def _external_payload(payload: bytes, visit) -> bytes:
+def _media_payload(payload: bytes, visit) -> bytes:
     """Visit references inside a v2 pickle without opening a live queue manager."""
     if not payload or payload[0] != 2:
         return payload
@@ -371,7 +379,7 @@ def _external_payload(payload: bytes, visit) -> bytes:
     class MediaPickler(pickle.Pickler):
         def reducer_override(self, value):
             nonlocal changed
-            if isinstance(value, _StoredMediaSnapshot) and value.external_uri is not None:
+            if isinstance(value, _StoredMediaSnapshot):
                 replacement = visit(value)
                 changed = changed or replacement is not value
                 return replacement.__reduce_ex__(5)
@@ -414,6 +422,8 @@ def _backup_queue(source: Path, archive: Path) -> Optional[dict]:
 
     def copy_external(reference):
         nonlocal external_index
+        if reference.external_uri is None:
+            return reference
         path = _external_path(reference)
         expected = _file_digest(path)
         media.mkdir(mode=0o700, exist_ok=True)
@@ -436,7 +446,7 @@ def _backup_queue(source: Path, archive: Path) -> Optional[dict]:
     with closing(sqlite3.connect(destination)) as queue, queue:
         if "outbound_queue" in _source_tables(queue):
             for row_id, payload in queue.execute("SELECT rowid, payload FROM outbound_queue ORDER BY rowid"):
-                restored = _external_payload(payload, copy_external)
+                restored = _media_payload(payload, copy_external)
                 if restored != payload:
                     queue.execute("UPDATE outbound_queue SET payload = ? WHERE rowid = ?", (restored, row_id))
     if media.exists():
@@ -457,8 +467,12 @@ def _queue_digest(path: Path) -> Optional[dict]:
         external = hashlib.sha256()
         external_count = 0
 
-        def hash_external(reference):
+        def check_media(reference):
             nonlocal external_count
+            if reference.external_uri is None:
+                if reference.storage_name is None or not (path.parent / "outbound-media" / reference.storage_name).is_file():
+                    raise RuntimeError("Local queued media is missing; backup is incomplete.")
+                return reference
             _hash_row(external, (reference.external_uri, _json(_file_digest(_external_path(reference)))))
             external_count += 1
             return reference
@@ -466,12 +480,12 @@ def _queue_digest(path: Path) -> Optional[dict]:
         for table in sorted(_source_tables(source)):
             schema = source.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()[0]
             digest.update(_json([table, schema]).encode())
-            columns = [row[1] for row in source.execute(f"PRAGMA table_info({_quote(table)})")]
+            columns = [row[1] for row in _source_columns(source, table)]
             payload_index = columns.index("payload") if table == "outbound_queue" and "payload" in columns else None
             for row in source.execute(f"SELECT * FROM {_quote(table)} ORDER BY rowid"):
                 _hash_row(digest, row)
                 if payload_index is not None:
-                    _external_payload(row[payload_index], hash_external)
+                    _media_payload(row[payload_index], check_media)
         result = {
             "sha256": digest.hexdigest(),
             "media": _media_directory_digest(path.parent / "outbound-media"),
@@ -562,7 +576,7 @@ def _validate_recovery_extras(source, db, columns):
     """Old projections may omit only empty tables and NULL added fields, on both sides."""
     for label, tables, execute, actual_columns in (
         ("Source", _source_tables(source), source.execute,
-         lambda table: {row[1] for row in source.execute(f"PRAGMA table_info({_quote(table)})")}),
+         lambda table: {row[1] for row in _source_columns(source, table)}),
         ("Target", set(db.get_tables(schema=current_schema(db))), db.execute_sql,
          lambda table: {field.name for field in db.get_columns(table, schema=current_schema(db))}),
     ):

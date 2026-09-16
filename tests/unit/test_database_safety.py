@@ -1029,3 +1029,66 @@ def test_old_projection_rejects_unrecorded_generation_or_publication(sqlite_sour
                     migrate_db._validate_recovery_extras(source, target, projection)
     finally:
         target.close()
+
+
+def test_queue_backup_requires_referenced_local_sidecars(sqlite_source, tmp_path):
+    from efb_telegram_master.outbound import _StoredMediaSnapshot
+    from telegram import InputMediaDocument
+
+    media_path = sqlite_source / "outbound-media" / "media-fixture.bin"
+    payload = OutboundQueue.encode_payload((), {
+        "media": [InputMediaDocument(_StoredMediaSnapshot(media_path.name, "upload.bin"))],
+    })
+    queue_path = sqlite_source / "outbound-queue.sqlite3"
+    with closing(sqlite3.connect(queue_path)) as source, source:
+        source.execute("UPDATE outbound_queue SET operation = 'send_media_group', payload = ? WHERE id = 1", (payload,))
+    archive = tmp_path / "complete-backup"
+    archive.mkdir()
+    migrate_db._backup_queue(queue_path, archive)
+    restored = OutboundQueue(archive)
+    try:
+        _, kwargs = restored.decode_payload(payload)
+        with kwargs["media"][0].media as stream:
+            assert stream.read() == b"durable media fixture"
+    finally:
+        restored.close()
+
+    media_path.unlink()
+    incomplete = tmp_path / "incomplete-backup"
+    incomplete.mkdir()
+    with closing(sqlite3.connect(queue_path)) as source:
+        before = list(source.execute("SELECT * FROM outbound_queue ORDER BY id"))
+    with pytest.raises(RuntimeError, match="Local queued media is missing; backup is incomplete"):
+        migrate_db._backup_queue(queue_path, incomplete)
+    with closing(sqlite3.connect(queue_path)) as source:
+        assert list(source.execute("SELECT * FROM outbound_queue ORDER BY id")) == before
+    assert not media_path.exists()
+
+
+@pytest.mark.parametrize("storage", ["VIRTUAL", "STORED"])
+def test_generated_msglog_columns_rejected_on_import_and_recovery(sqlite_source, storage):
+    target = SqliteDatabase(":memory:")
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source, target.connection_context():
+        schema = source.execute("SELECT sql FROM sqlite_master WHERE name = 'msglog'").fetchone()[0]
+        columns = ", ".join(migrate_db._quote(row[1]) for row in source.execute('PRAGMA table_xinfo("msglog")'))
+        source.execute("ALTER TABLE msglog RENAME TO original_msglog")
+        source.execute(schema[:-1] + f", extra TEXT GENERATED ALWAYS AS (text || ' generated') {storage})")
+        source.execute(f"INSERT INTO msglog ({columns}) SELECT {columns} FROM original_msglog")
+        source.execute("DROP TABLE original_msglog")
+        before = list(source.execute("SELECT master_msg_id, extra FROM msglog ORDER BY master_msg_id"))
+        assert before and all(row[1].endswith(" generated") for row in before)
+        with pytest.raises(RuntimeError, match="Unsupported generated or hidden columns in msglog.*extra"):
+            migrate_db._validate_source(source)
+        with pytest.raises(RuntimeError, match="Unsupported generated or hidden columns in msglog.*extra"):
+            migrate_db._validate_recovery_extras(source, target, migrate_db.V1_COLUMNS)
+        assert list(source.execute("SELECT master_msg_id, extra FROM msglog ORDER BY master_msg_id")) == before
+
+
+@pytest.mark.parametrize("storage", ["VIRTUAL", "STORED"])
+def test_cache_discovery_rejects_generated_columns(sqlite_source, storage):
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
+        source.execute(f"CREATE TABLE useremojicache (id INTEGER PRIMARY KEY, emoji TEXT GENERATED ALWAYS AS ('emoji') {storage})")
+        source.execute("INSERT INTO useremojicache (id) VALUES (1)")
+        with pytest.raises(RuntimeError, match="Unsupported generated or hidden columns in useremojicache.*emoji"):
+            migrate_db._cache_models(source)
+        assert source.execute("SELECT id, emoji FROM useremojicache").fetchall() == [(1, "emoji")]
