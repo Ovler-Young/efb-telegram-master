@@ -745,6 +745,7 @@ def test_external_queue_backup_restores_elsewhere_without_original(sqlite_source
         for _ in range(24):
             writer.write(chunk)
     original_payload = external_queue_payload(sqlite_source, external)
+    (sqlite_source / "outbound-media" / "external-1").write_bytes(b"existing sidecar")
     before = migrate_db._queue_digest(sqlite_source / "outbound-queue.sqlite3")
     archive = tmp_path / "backup"
     archive.mkdir()
@@ -756,6 +757,11 @@ def test_external_queue_backup_restores_elsewhere_without_original(sqlite_source
         tracemalloc.stop()
     assert peak < 16 * 1024 * 1024
     backup_digest = migrate_db._queue_digest(archive / "outbound-queue.sqlite3")
+    second_archive = tmp_path / "backup-again"
+    second_archive.mkdir()
+    assert migrate_db._backup_queue(sqlite_source / "outbound-queue.sqlite3", second_archive) == before
+    assert migrate_db._queue_digest(second_archive / "outbound-queue.sqlite3") == backup_digest
+    assert (second_archive / "outbound-media" / "external-1").read_bytes() == b"existing sidecar"
     assert migrate_db._queue_digest(sqlite_source / "outbound-queue.sqlite3") == before
     with closing(sqlite3.connect(sqlite_source / "outbound-queue.sqlite3")) as queue:
         assert queue.execute("SELECT payload FROM outbound_queue WHERE id = 1").fetchone()[0] == original_payload
@@ -842,6 +848,11 @@ def test_migrate_recovers_relocated_external_archive(sqlite_source, postgres_con
     committed = migrate_db.migrate(sqlite_source, postgres_config)
     restored = tmp_path / "restored"
     shutil.copytree(committed["backup_directory"], restored)
+    retried = migrate_db.migrate(sqlite_source, postgres_config)
+    second_restore = tmp_path / "restored-again"
+    shutil.copytree(retried["backup_directory"], second_restore)
+    assert retried["import_id"] == committed["import_id"]
+    assert retried["backup_queue"] == committed["backup_queue"]
     external.unlink()
     shutil.rmtree(sqlite_source)
     assert migrate_db._queue_digest(restored / "outbound-queue.sqlite3") == committed["backup_queue"]
@@ -855,15 +866,15 @@ def test_migrate_recovers_relocated_external_archive(sqlite_source, postgres_con
         with pytest.raises(RuntimeError, match="Source changed"):
             migrate_db.migrate(restored, postgres_config)
         assert not (restored / migrate_db.RECEIPT_FILE).exists()
-    else:
-        recovered = migrate_db.migrate(restored, postgres_config)
+    for directory in ((second_restore,) if altered else (restored, second_restore, restored)):
+        recovered = migrate_db.migrate(directory, postgres_config)
         assert recovered["import_id"] == committed["import_id"]
         assert recovered["tables"] == committed["tables"]
+        assert recovered["backup_queue"] == committed["backup_queue"]
         target = postgresql_database(postgres_config)
         with connection_scope(target):
-            migrate_db.validate_runtime_cutover(restored, target)
+            migrate_db.validate_runtime_cutover(directory, target)
         target.close_all()
-        assert migrate_db.migrate(restored, postgres_config)["import_id"] == committed["import_id"]
     assert migrate_db._queue_digest(restored / "outbound-queue.sqlite3") == before
 
 

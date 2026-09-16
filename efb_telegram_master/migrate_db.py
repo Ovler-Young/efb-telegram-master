@@ -396,13 +396,21 @@ def _backup_queue(source: Path, archive: Path) -> Optional[dict]:
     _backup(source, destination)
     media = archive / "outbound-media"
     _backup_media_directory(source.parent / "outbound-media", media)
+    external_index = 0
 
     def copy_external(reference):
+        nonlocal external_index
         path = _external_path(reference)
         expected = _file_digest(path)
         media.mkdir(mode=0o700, exist_ok=True)
-        name = "external-" + uuid.uuid4().hex
-        target = media / name
+        # Stable row/reference order gives unchanged retries the same archived
+        # payload and media digest, while preserving existing sidecar names.
+        while True:
+            external_index += 1
+            name = f"external-{external_index}"
+            target = media / name
+            if not target.exists():
+                break
         with path.open("rb") as reader, target.open("xb") as writer:
             shutil.copyfileobj(reader, writer, length=1024 * 1024)
             writer.flush()
@@ -413,7 +421,7 @@ def _backup_queue(source: Path, archive: Path) -> Optional[dict]:
 
     with closing(sqlite3.connect(destination)) as queue, queue:
         if "outbound_queue" in _source_tables(queue):
-            for row_id, payload in queue.execute("SELECT rowid, payload FROM outbound_queue"):
+            for row_id, payload in queue.execute("SELECT rowid, payload FROM outbound_queue ORDER BY rowid"):
                 restored = _external_payload(payload, copy_external)
                 if restored != payload:
                     queue.execute("UPDATE outbound_queue SET payload = ? WHERE rowid = ?", (restored, row_id))
