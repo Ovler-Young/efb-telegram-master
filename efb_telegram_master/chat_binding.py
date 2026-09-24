@@ -105,7 +105,8 @@ class ChatBindingManager(LocaleMixin):
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
         self._topic_mutex = threading.Lock()
-        self._history_migration_lock = threading.Lock()
+        self._history_migration_locks_lock = threading.Lock()
+        self._history_migration_locks: Dict[int, threading.Lock] = {}
         self._history_migration_thread: Optional[threading.Thread] = None
 
         # Link handler
@@ -1477,23 +1478,37 @@ class ChatBindingManager(LocaleMixin):
         if existing_thread is not None and existing_thread.is_alive():
             return
         self._history_migration_thread = threading.Thread(
-            target=self._process_pending_history_migrations,
+            target=self._resume_pending_history_migrations,
             daemon=True,
             name="HistoryMigrationResume",
         )
         self._history_migration_thread.start()
 
+    def _resume_pending_history_migrations(self):
+        for target_chat_id in self.db.get_pending_history_migration_target_ids():
+            threading.Thread(
+                target=self._process_pending_history_migrations_for_target,
+                args=(int(target_chat_id),),
+                daemon=True,
+                name=f"HistoryMigration-{target_chat_id}",
+            ).start()
+
+    def _history_migration_lock_for_target(self, target_chat_id: int) -> threading.Lock:
+        with self._history_migration_locks_lock:
+            lock = self._history_migration_locks.get(target_chat_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._history_migration_locks[target_chat_id] = lock
+            return lock
+
     def _queue_and_process_history_migration(self, slave_chat_id: EFBChannelChatIDStr,
                                              tg_chat_id: int,
                                              thread_id: Optional[TelegramTopicID] = None):
         try:
-            self._history_migration_lock.acquire(blocking=True)
-            try:
+            with self._history_migration_lock_for_target(tg_chat_id):
                 queued_count = self._queue_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
                 if queued_count:
-                    self._process_pending_history_migrations_locked()
-            finally:
-                self._history_migration_lock.release()
+                    self._process_pending_history_migrations_locked(tg_chat_id)
         except Exception as e:
             self.logger.error("Error during history migration for %s: %s", slave_chat_id, e)
 
@@ -1532,17 +1547,16 @@ class ChatBindingManager(LocaleMixin):
         self.logger.info("Queued %s historical messages for chat %s", queued_count, slave_chat_id)
         return queued_count
 
-    def _process_pending_history_migrations(self, block: bool = False):
-        if not self._history_migration_lock.acquire(blocking=block):
-            return
-        try:
-            self._process_pending_history_migrations_locked()
-        finally:
-            self._history_migration_lock.release()
+    def _process_pending_history_migrations_for_target(self, target_chat_id: int):
+        with self._history_migration_lock_for_target(target_chat_id):
+            self._process_pending_history_migrations_locked(target_chat_id)
 
-    def _process_pending_history_migrations_locked(self):
+    def _process_pending_history_migrations_locked(self, target_chat_id: Optional[int] = None):
         while True:
-            target = self.db.get_next_history_migration_target()
+            if target_chat_id is None:
+                target = self.db.get_next_history_migration_target()
+            else:
+                target = self.db.get_next_history_migration_target(target_chat_id)
             if target is None:
                 return
             if not self._process_history_migration_target(target):

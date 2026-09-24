@@ -957,12 +957,22 @@ class DatabaseManager:
         return HistoryMigrationEntry.select().exists()
 
     @observe_database_method("get_next_history_migration_target")
-    def get_next_history_migration_target(self) -> Optional[HistoryMigrationEntry]:
-        return (
-            HistoryMigrationEntry.select()
-            .order_by(HistoryMigrationEntry.id.asc())
-            .first()
+    def get_next_history_migration_target(
+        self, target_chat_id: Optional[int] = None,
+    ) -> Optional[HistoryMigrationEntry]:
+        query = HistoryMigrationEntry.select()
+        if target_chat_id is not None:
+            query = query.where(HistoryMigrationEntry.target_chat_id == str(target_chat_id))
+        return query.order_by(HistoryMigrationEntry.id.asc()).first()
+
+    @observe_database_method("get_pending_history_migration_target_ids")
+    def get_pending_history_migration_target_ids(self) -> List[int]:
+        query = (
+            HistoryMigrationEntry.select(HistoryMigrationEntry.target_chat_id)
+            .group_by(HistoryMigrationEntry.target_chat_id)
+            .order_by(fn.MIN(HistoryMigrationEntry.id).asc())
         )
+        return [int(row.target_chat_id) for row in query]
 
     @observe_database_method("get_history_migration_entries")
     def get_history_migration_entries(

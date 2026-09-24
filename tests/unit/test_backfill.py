@@ -353,7 +353,7 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
 
     manager.bot = SimpleNamespace(enqueue_history_operation=Mock(side_effect=enqueue_history_operation))
 
-    ChatBindingManager._process_pending_history_migrations(manager)
+    ChatBindingManager._process_pending_history_migrations_locked(manager)
 
     manager.db.get_recent_messages.assert_not_called()
     manager.bot.enqueue_history_operation.assert_has_calls([
@@ -403,6 +403,79 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
         ("enqueue", 3), ("delete", 3), ("wait", 3),
     ]
     assert pending_entries == []
+
+
+def test_history_migrations_run_concurrently_per_target_group():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager._history_migration_locks_lock = threading.Lock()
+    manager._history_migration_locks = {}
+    manager.logger = Mock()
+
+    queued_targets = []
+    manager._queue_history_migration_entries = lambda _source, target, _thread: (
+        queued_targets.append(target) or 1
+    )
+
+    entered = {101: threading.Event(), 202: threading.Event()}
+    second_101_entered = threading.Event()
+    release_first_101 = threading.Event()
+    release_second_101 = threading.Event()
+    release_202 = threading.Event()
+    active_targets = set()
+    active_lock = threading.Lock()
+    starts = []
+
+    def process_target(target):
+        with active_lock:
+            assert target not in active_targets
+            active_targets.add(target)
+            starts.append(target)
+            if target == 101:
+                if starts.count(101) == 1:
+                    entered[101].set()
+                    release = release_first_101
+                else:
+                    second_101_entered.set()
+                    release = release_second_101
+            else:
+                entered[202].set()
+                release = release_202
+        assert release.wait(timeout=2)
+        with active_lock:
+            active_targets.remove(target)
+
+    manager._process_pending_history_migrations_locked = process_target
+
+    def migrate(target):
+        ChatBindingManager._queue_and_process_history_migration(manager, "source", target)
+
+    first_101 = threading.Thread(target=migrate, args=(101,))
+    first_101.start()
+    assert entered[101].wait(timeout=2)
+
+    worker_202 = threading.Thread(target=migrate, args=(202,))
+    worker_202.start()
+    assert entered[202].wait(timeout=2)
+
+    second_101_finished = threading.Event()
+    second_101 = threading.Thread(target=lambda: (migrate(101), second_101_finished.set()))
+    second_101.start()
+    assert not second_101_finished.wait(timeout=0.05)
+    assert starts == [101, 202]
+
+    release_first_101.set()
+    assert second_101_entered.wait(timeout=2)
+    assert starts.count(101) == 2
+
+    release_second_101.set()
+    release_202.set()
+    first_101.join(timeout=2)
+    second_101.join(timeout=2)
+    worker_202.join(timeout=2)
+    assert not first_101.is_alive()
+    assert not second_101.is_alive()
+    assert not worker_202.is_alive()
+    assert sorted(queued_targets) == [101, 101, 202]
 
 
 def test_history_migration_continues_after_terminal_delivery_failure():
