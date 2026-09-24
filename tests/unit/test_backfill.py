@@ -282,7 +282,6 @@ def test_queue_history_migration_entries_persists_pending_rows():
 
 def test_process_pending_history_migrations_transfers_entries_to_durable_queue_before_waiting():
     manager = ChatBindingManager.__new__(ChatBindingManager)
-    manager._history_migration_lock = threading.Lock()
     manager.logger = Mock()
     pending_entries = [
         SimpleNamespace(
