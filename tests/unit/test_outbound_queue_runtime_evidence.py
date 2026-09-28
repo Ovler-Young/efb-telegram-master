@@ -1550,6 +1550,53 @@ def test_invalid_payload_is_terminally_discarded_without_worker_or_sender_acquis
     assert scheduler.in_flight == {}
 
 
+def test_missing_external_media_is_discarded_without_blocking_other_queue_rows(
+    tmp_path: Path,
+) -> None:
+    external_media = tmp_path / "tdlib-temporary.bin"
+    external_media.write_bytes(b"temporary media")
+    queue = OutboundQueue(tmp_path)
+    missing_row_id, _waiter = queue.enqueue_many(
+        [QueueRequest(
+            "send_document",
+            (151, external_media.as_uri()),
+            {},
+            cleanup_files=(str(external_media),),
+        )],
+        lambda _operation: send_document,
+    )
+    same_destination_id, _waiter = enqueue(queue, 151, "after missing media")
+    other_destination_id, _waiter = enqueue(queue, 152, "other destination")
+    queue.close()
+    external_media.unlink()
+
+    queue = OutboundQueue(tmp_path)
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(
+        queue, RecordingAdapter(), executor, worker_count=2
+    )
+
+    scheduler.dispatch_once()
+
+    assert {row.id for row in queue.heads()} == {
+        same_destination_id,
+        other_destination_id,
+    }
+    assert [submission[1][0].id for submission in executor.submissions] == [
+        other_destination_id
+    ]
+    assert scheduler.wake_event.is_set()
+
+    scheduler.dispatch_once()
+
+    assert [submission[1][0].id for submission in executor.submissions] == [
+        other_destination_id,
+        same_destination_id,
+    ]
+    assert missing_row_id not in {row.id for row in queue.heads()}
+    queue.close()
+
+
 def test_shutdown_final_snapshot_keeps_retained_eventual_rows(
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:

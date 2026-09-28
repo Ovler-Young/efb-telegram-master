@@ -720,6 +720,11 @@ class OutboundQueue:
     def _restore_media_references(self, value: object) -> object:
         if isinstance(value, _StoredMediaSnapshot):
             if value.external_uri is not None:
+                external_path = self._local_media_path(value.external_uri)
+                if external_path is None or not external_path.is_file():
+                    raise InvalidQueuedPayloadError(
+                        f"Queued external media file {value.external_uri!r} is missing."
+                    )
                 return value.external_uri
             if value.storage_name is None:
                 raise InvalidQueuedPayloadError("Queued media reference has no storage path.")
@@ -868,12 +873,8 @@ class OutboundQueue:
                                 f"Queued media file {item.storage_name!r} is missing; row retained."
                             )
                         referenced.add(item.storage_name)
-                    elif item.cleanup_external and item.external_uri is not None:
-                        external = self._local_media_path(item.external_uri)
-                        if external is None or not external.is_file():
-                            raise QueuePersistenceError(
-                                "Queued external media file is missing; row retained."
-                            )
+                    # Temporary external files may be cleaned on restart. Dispatch
+                    # validates them and discards only the affected queue row.
         except sqlite3.Error:
             return
         try:
