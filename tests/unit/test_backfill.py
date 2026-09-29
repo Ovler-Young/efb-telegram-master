@@ -445,15 +445,16 @@ def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channe
     assert HistoryMigrationEntry.select().count() == 0
 
 
-def test_empty_history_backfill_sends_history_link_with_original_storage_key():
+def test_empty_history_backfill_sends_empty_history_notice_to_requested_thread():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager._history_migration_lock = threading.Lock()
     manager.logger = Mock()
+    manager.channel = SimpleNamespace(_=lambda message: message)
+    manager.bot = SimpleNamespace(send_message=Mock())
     manager.db = SimpleNamespace(
         get_recent_messages=Mock(return_value=[]),
         replace_history_migration_entries=Mock(return_value=0),
     )
-    manager.send_history_link = Mock()
     storage_key = (TelegramChatID(-100123), TelegramMessageID(456))
     thread_id = TelegramTopicID(789)
 
@@ -465,8 +466,11 @@ def test_empty_history_backfill_sends_history_link_with_original_storage_key():
         storage_key,
     )
 
-    manager.send_history_link.assert_called_once_with(
-        "tests.mocks.slave.chat", 12345, storage_key, thread_id
+    manager.bot.send_message.assert_called_once_with(
+        chat_id=12345,
+        text="No historical messages were available to backfill.",
+        disable_notification=True,
+        message_thread_id=thread_id,
     )
 
 

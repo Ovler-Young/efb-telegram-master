@@ -714,25 +714,30 @@ class ChatBindingManager(LocaleMixin):
             self.send_history_link(chat_uid, tg_chat_to_link.id, storage_key, thread_id)
 
     def send_history_link(self, slave_chat_id: EFBChannelChatIDStr,
-                           tg_chat_id: int, storage_key: Tuple[int, int], thread_id: Optional[TelegramTopicID] = None):
-        """Send a message with a link to the chat history."""
+                          tg_chat_id: int, storage_key: Tuple[int, int],
+                          thread_id: Optional[TelegramTopicID] = None,
+                          empty_history: bool = False):
+        """Send a history backfill status message."""
         try:
-            original_chat_id_int = int(storage_key[0])
-            original_msg_id = int(storage_key[1])
-
-            if str(original_chat_id_int).startswith("-100"):
-                # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
-                short_id = str(original_chat_id_int)[4:]
-                link = f"https://t.me/c/{short_id}/{original_msg_id}"
-            elif str(original_chat_id_int).startswith("-"):
-                # Regular group: use group link format
-                link = f"https://t.me/{abs(original_chat_id_int)}/{original_msg_id}"
+            if empty_history:
+                text = self._("No historical messages were available to backfill.")
             else:
-                # Channel or user: fallback to /c/{id}/{msg_id}
-                link = f"https://t.me/c/{original_chat_id_int}/{original_msg_id}"
+                original_chat_id_int = int(storage_key[0])
+                original_msg_id = int(storage_key[1])
 
-            text = self._("This chat was previously linked. History messages are not migrated. "
-                            "You can view previous messages here: {link}").format(link=link)
+                if str(original_chat_id_int).startswith("-100"):
+                    # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
+                    short_id = str(original_chat_id_int)[4:]
+                    link = f"https://t.me/c/{short_id}/{original_msg_id}"
+                elif str(original_chat_id_int).startswith("-"):
+                    # Regular group: use group link format
+                    link = f"https://t.me/{abs(original_chat_id_int)}/{original_msg_id}"
+                else:
+                    # Channel or user: fallback to /c/{id}/{msg_id}
+                    link = f"https://t.me/c/{original_chat_id_int}/{original_msg_id}"
+
+                text = self._("This chat was previously linked. History messages are not migrated. "
+                              "You can view previous messages here: {link}").format(link=link)
 
             kwargs = {
                 'chat_id': tg_chat_id,
@@ -1489,7 +1494,7 @@ class ChatBindingManager(LocaleMixin):
                 if queued_count:
                     self._process_pending_history_migrations_locked()
                 elif storage_key is not None:
-                    self.send_history_link(slave_chat_id, tg_chat_id, storage_key, thread_id)
+                    self.send_history_link(slave_chat_id, tg_chat_id, storage_key, thread_id, empty_history=True)
             finally:
                 self._history_migration_lock.release()
         except Exception as e:
