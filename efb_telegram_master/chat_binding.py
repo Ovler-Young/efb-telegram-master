@@ -707,7 +707,7 @@ class ChatBindingManager(LocaleMixin):
 
         if do_backfill:
             try:
-                self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id)
+                self.migrate_chat_history(chat_uid, tg_chat_to_link.id, thread_id, storage_key)
             except Exception as e:
                 self.logger.warning("History migration failed for %s: %s", chat_display_name, e)
                 try:
@@ -725,25 +725,30 @@ class ChatBindingManager(LocaleMixin):
             self.send_history_link(chat_uid, tg_chat_to_link.id, storage_key, thread_id)
 
     def send_history_link(self, slave_chat_id: EFBChannelChatIDStr,
-                           tg_chat_id: int, storage_key: Tuple[int, int], thread_id: Optional[TelegramTopicID] = None):
-        """Send a message with a link to the chat history."""
+                          tg_chat_id: int, storage_key: Tuple[int, int],
+                          thread_id: Optional[TelegramTopicID] = None,
+                          empty_history: bool = False):
+        """Send a history backfill status message."""
         try:
-            original_chat_id_int = int(storage_key[0])
-            original_msg_id = int(storage_key[1])
-
-            if str(original_chat_id_int).startswith("-100"):
-                # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
-                short_id = str(original_chat_id_int)[4:]
-                link = f"https://t.me/c/{short_id}/{original_msg_id}"
-            elif str(original_chat_id_int).startswith("-"):
-                # Regular group: use group link format
-                link = f"https://t.me/{abs(original_chat_id_int)}/{original_msg_id}"
+            if empty_history:
+                text = self._("No historical messages were available to backfill.")
             else:
-                # Channel or user: fallback to /c/{id}/{msg_id}
-                link = f"https://t.me/c/{original_chat_id_int}/{original_msg_id}"
+                original_chat_id_int = int(storage_key[0])
+                original_msg_id = int(storage_key[1])
 
-            text = self._("This chat was previously linked. History messages are not migrated. "
-                            "You can view previous messages here: {link}").format(link=link)
+                if str(original_chat_id_int).startswith("-100"):
+                    # Supergroup: remove '-100' prefix and use /c/{short_id}/{msg_id}
+                    short_id = str(original_chat_id_int)[4:]
+                    link = f"https://t.me/c/{short_id}/{original_msg_id}"
+                elif str(original_chat_id_int).startswith("-"):
+                    # Regular group: use group link format
+                    link = f"https://t.me/{abs(original_chat_id_int)}/{original_msg_id}"
+                else:
+                    # Channel or user: fallback to /c/{id}/{msg_id}
+                    link = f"https://t.me/c/{original_chat_id_int}/{original_msg_id}"
+
+                text = self._("This chat was previously linked. History messages are not migrated. "
+                              "You can view previous messages here: {link}").format(link=link)
 
             kwargs = {
                 'chat_id': tg_chat_id,
@@ -1437,7 +1442,8 @@ class ChatBindingManager(LocaleMixin):
         self.db.remove_chat_assoc(master_uid=from_str)
 
     def migrate_chat_history(self, slave_chat_id: EFBChannelChatIDStr,
-                           tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
+                             tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None,
+                             storage_key: Optional[Tuple[TelegramChatID, TelegramMessageID]] = None):
         """Migrate historical messages to the newly linked chat.
 
         This method starts a background thread to avoid blocking the bot.
@@ -1446,26 +1452,29 @@ class ChatBindingManager(LocaleMixin):
             slave_chat_id: The slave chat identifier
             tg_chat_id: The Telegram chat ID to migrate messages to
             thread_id: Optional thread ID for forum groups
+            storage_key: Original link-session message for the empty-history notice
         """
         # Run migration in background thread to avoid blocking the bot
         migration_thread = threading.Thread(
             target=self._queue_and_process_history_migration,
-            args=(slave_chat_id, tg_chat_id, thread_id),
+            args=(slave_chat_id, tg_chat_id, thread_id, storage_key),
             daemon=True,  # Allow program to exit even if migration is ongoing
             name=f"HistoryMigration-{slave_chat_id}"
         )
         migration_thread.start()
 
     def _migrate_chat_history_background(self, slave_chat_id: EFBChannelChatIDStr,
-                                       tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None):
+                                         tg_chat_id: int, thread_id: Optional[TelegramTopicID] = None,
+                                         storage_key: Optional[Tuple[TelegramChatID, TelegramMessageID]] = None):
         """Background method that performs the actual migration work.
 
         Args:
             slave_chat_id: The slave chat identifier
             tg_chat_id: The Telegram chat ID to migrate messages to
             thread_id: Optional thread ID for forum groups
+            storage_key: Original link-session message for the empty-history notice
         """
-        self._queue_and_process_history_migration(slave_chat_id, tg_chat_id, thread_id)
+        self._queue_and_process_history_migration(slave_chat_id, tg_chat_id, thread_id, storage_key)
 
     def resume_pending_history_migrations(self):
         try:
@@ -1504,12 +1513,15 @@ class ChatBindingManager(LocaleMixin):
 
     def _queue_and_process_history_migration(self, slave_chat_id: EFBChannelChatIDStr,
                                              tg_chat_id: int,
-                                             thread_id: Optional[TelegramTopicID] = None):
+                                             thread_id: Optional[TelegramTopicID] = None,
+                                             storage_key: Optional[Tuple[TelegramChatID, TelegramMessageID]] = None):
         try:
             with self._history_migration_lock_for_target(tg_chat_id):
                 queued_count = self._queue_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
                 if queued_count:
                     self._process_pending_history_migrations_locked(tg_chat_id)
+                elif storage_key is not None:
+                    self.send_history_link(slave_chat_id, tg_chat_id, storage_key, thread_id, empty_history=True)
         except Exception as e:
             self.logger.error("Error during history migration for %s: %s", slave_chat_id, e)
 
