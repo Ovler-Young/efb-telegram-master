@@ -28,7 +28,7 @@ async def wait_logged(channel, source, message):
 
 @pytest.mark.parametrize('remove_original_video', [False, True], ids=['copy-video', 'recover-deleted-video'])
 async def test_relink_groups_text_around_a_real_video(
-    channel, slave, client, helper, bot_id, bot_group, private_response, remove_original_video,
+    channel, slave, client, helper, bot_id, bot_group, private_response, remove_original_video, monkeypatch,
 ):
     chat = slave.chat_with_alias
     source = etm_utils.chat_id_to_str(chat=chat)
@@ -44,28 +44,32 @@ async def test_relink_groups_text_around_a_real_video(
         return message
 
     with link_chats(channel, (chat,), bot_group):
-        for label in labels[:2]:
-            message = await send_text_and_observe(label)
-            saved.append(await wait_logged(channel, source, message))
-        await wait_for_limiter_slot(limiter_delay)
-        video = await asyncio.to_thread(
-            slave.send_file_like_message, MsgType.Video, Path('tests/mocks/video_0.mp4'),
-            'video/mp4', chat, chat.other,
-        )
-        video_label = str(video.uid)
-        video_log = await wait_logged(channel, source, video)
-        original_chat, original_id = etm_utils.message_id_str_to_id(video_log.master_msg_id)
-        # The shared regex helper accepts text messages, not video captions.
-        # Independently fetch the actual message via the user session instead.
-        original_video = await client.get_messages(original_chat, ids=original_id)
-        saved.append(video_log)
-        assert original_chat == bot_group
-        assert video_log.media_type == 'Video' and video_log.file_id
-        assert original_video.video is not None and video_label in original_video.raw_text
-        original_contents = await client.download_media(original_video, file=bytes)
-        for label in labels[2:]:
-            message = await send_text_and_observe(label)
-            saved.append(await wait_logged(channel, source, message))
+        # Each observed source send needs one limiter slot for its body. Suppress
+        # its cosmetic action during setup so it cannot consume that slot first.
+        with monkeypatch.context() as source_setup:
+            source_setup.setattr(channel.bot_manager, 'send_chat_action', lambda *args, **kwargs: True)
+            for label in labels[:2]:
+                message = await send_text_and_observe(label)
+                saved.append(await wait_logged(channel, source, message))
+            await wait_for_limiter_slot(limiter_delay)
+            video = await asyncio.to_thread(
+                slave.send_file_like_message, MsgType.Video, Path('tests/mocks/video_0.mp4'),
+                'video/mp4', chat, chat.other,
+            )
+            video_label = str(video.uid)
+            video_log = await wait_logged(channel, source, video)
+            original_chat, original_id = etm_utils.message_id_str_to_id(video_log.master_msg_id)
+            # The shared regex helper accepts text messages, not video captions.
+            # Independently fetch the actual message via the user session instead.
+            original_video = await client.get_messages(original_chat, ids=original_id)
+            saved.append(video_log)
+            assert original_chat == bot_group
+            assert video_log.media_type == 'Video' and video_log.file_id
+            assert original_video.video is not None and video_label in original_video.raw_text
+            original_contents = await client.download_media(original_video, file=bytes)
+            for label in labels[2:]:
+                message = await send_text_and_observe(label)
+                saved.append(await wait_logged(channel, source, message))
 
         if remove_original_video:
             # The bot deletes only the test message it just sent. Its MsgLog
