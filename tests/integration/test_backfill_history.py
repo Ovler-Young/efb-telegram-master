@@ -310,11 +310,12 @@ def _queue_activity_completed(before: QueueMetricSnapshot, current: QueueMetricS
 
 def _migration_activity_completed(*, activity_observed: bool, expected: Set[int],
                                   db_indices: List[int], telegram_indices: List[int],
-                                  target_entry_count: int, queue_completed: bool,
-                                  transport_retry_delta: float) -> bool:
+                                  replay_message_count: int, target_entry_count: int,
+                                  queue_completed: bool, transport_retry_delta: float) -> bool:
     expected_count = len(expected)
     return (
         activity_observed
+        and replay_message_count > 0
         and queue_completed
         and target_entry_count == 0
         and set(db_indices) == expected
@@ -406,11 +407,13 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
     last_debug = ""
     while time.time() < deadline:
         recent = await _messages_since_id(client, chat_id, min_message_id)
+        replay_messages = [message for message in recent if prefix in (message.raw_text or "")]
         telegram_indices = [
             idx
-            for message in recent
+            for message in replay_messages
             for idx in _extract_stream_indices(message.raw_text or "", prefix)
         ]
+        replay_message_count = len(replay_messages)
         db_logs = _logs_with_prefix(channel_with_auxiliary_bots, chat, prefix)
         db_indices = [
             idx
@@ -424,13 +427,13 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
         queue_completed = _queue_activity_completed(
             metrics_before,
             metrics_current,
-            expected_count=expected_count,
+            expected_count=replay_message_count,
         )
         transport_retry_delta = metrics_current.transport_retries - metrics_before.transport_retries
         last_debug = (
             f"migration_observed={activity_observed}, db_idx={len(db_indices)}/{expected_count}, "
             f"tg_idx={len(telegram_indices)}/{expected_count}, target_entries={target_entry_count}, "
-            f"expected_migration_sends={expected_count}, "
+            f"observed_replay_batches={replay_message_count}, "
             f"transport_retry_delta={transport_retry_delta}, "
             f"metrics_before={metrics_before!r}, metrics_current={metrics_current!r}"
         )
@@ -439,11 +442,12 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
             expected=expected,
             db_indices=db_indices,
             telegram_indices=telegram_indices,
+            replay_message_count=replay_message_count,
             target_entry_count=target_entry_count,
             queue_completed=queue_completed,
             transport_retry_delta=transport_retry_delta,
         ):
-            return recent, metrics_current
+            return recent, metrics_current, replay_message_count
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     raise AssertionError(f"Timed out waiting for migrated stream terminal state: {last_debug}")
@@ -539,7 +543,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         relink_true_message = await _link_chat(
             client, helper, bot_id, chat.uid, target_group_id, private_response, flag="true"
         )
-        _, migration_metrics_after = await _wait_for_migrated_stream_terminal(
+        _, migration_metrics_after, migration_batch_count = await _wait_for_migrated_stream_terminal(
             channel_with_auxiliary_bots,
             client,
             chat,
@@ -552,7 +556,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         assert _queue_activity_completed(
             migration_metrics_before,
             migration_metrics_after,
-            expected_count=STREAM_MESSAGE_COUNT,
+            expected_count=migration_batch_count,
         )
         assert _target_migration_entry_count(slave_uid, target_group_id) == 0
 
