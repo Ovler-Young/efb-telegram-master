@@ -1468,7 +1468,7 @@ class ChatBindingManager(LocaleMixin):
 
     def resume_pending_history_migrations(self):
         try:
-            if self.db.has_pending_history_migrations():
+            if self.db.has_pending_history_migrations() or self.bot.history_ownership_page(limit=1):
                 self._start_history_migration_worker()
         except Exception as e:
             self.logger.warning("Failed to check pending history migrations: %s", e)
@@ -1542,6 +1542,14 @@ class ChatBindingManager(LocaleMixin):
             self._history_migration_lock.release()
 
     def _process_pending_history_migrations_locked(self):
+        after = ""
+        while True:
+            keys = self.bot.history_ownership_page(after=after)
+            if not keys:
+                break
+            present = self.db.existing_history_ownership(keys)
+            self.bot.forget_history_entries(set(keys) - present)
+            after = keys[-1]
         while True:
             target = self.db.get_next_history_migration_target()
             if target is None:
@@ -1562,7 +1570,13 @@ class ChatBindingManager(LocaleMixin):
                     page = self.db.get_history_migration_entries(
                         slave_chat_id, tg_chat_id, thread_id, limit=32, after=after
                     )
-                yield from page
+                owned = self.bot.owned_history_entries([entry.ownership_key for entry in page])
+                for entry in page:
+                    if entry.ownership_key in owned:
+                        self.db.delete_history_migration_entry(entry.id)
+                        self.bot.forget_history_entries([entry.ownership_key])
+                    else:
+                        yield entry
                 if len(page) < 32:
                     return
                 after = page[-1].position, page[-1].id
@@ -1627,10 +1641,11 @@ class ChatBindingManager(LocaleMixin):
 
     def _enqueue_history_batch(self, slave_chat_id, tg_chat_id, operation, kwargs, entry_ids) -> bool:
         identifiers = list(entry_ids)
+        keys = self.db.get_history_migration_ownership_keys(identifiers)
         try:
             waiter = self.bot.enqueue_history_operation(
                 source_key=str(slave_chat_id), target_chat_id=tg_chat_id,
-                operation=operation, args=(), kwargs=kwargs, history_entry_ids=identifiers,
+                operation=operation, args=(), kwargs=kwargs, history_entry_ids=identifiers, history_keys=keys,
             )
         except BaseException as error:
             self.logger.warning(
@@ -1642,6 +1657,7 @@ class ChatBindingManager(LocaleMixin):
         # The original MsgLog rows are never deleted or rewritten by backfill.
         for identifier in identifiers:
             self.db.delete_history_migration_entry(identifier)
+        self.bot.forget_history_entries(keys)
         try:
             waiter.result()
         except BaseException as error:
