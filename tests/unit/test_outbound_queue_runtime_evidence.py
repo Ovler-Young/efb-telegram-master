@@ -315,6 +315,7 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
 
     retry_after = RetryAfter(10)
     executor.submissions[0][2].set_exception(retry_after)
+    assert first_media.closed
     scheduler.harvest_completed()
     assert scheduler.wake_event.is_set()
     assert not first_waiter.done()
@@ -342,6 +343,7 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     assert [row.id for row in retained_queue.heads()] == [first_id]
 
     executor.submissions[1][2].set_result("sent")
+    assert retry_media.closed
     scheduler.harvest_completed()
     assert first_waiter.result() == "sent"
     assert [row.id for row in retained_queue.heads()] == [second_id]
@@ -498,7 +500,12 @@ def test_blocking_media_edit_retries_at_telegram_deadline_with_rewound_payload(
 
     scheduler.dispatch_once()
     first_media = executor.submissions[0][1][1][0].media
-    assert first_media.input_file_content == b"edited media"
+    first_content = first_media.input_file_content
+    if isinstance(first_content, bytes):
+        assert first_content == b"edited media"
+    else:
+        assert first_content.tell() == 0
+        assert first_content.read() == b"edited media"
     executor.submissions[0][2].set_exception(RetryAfter(121))
     scheduler.harvest_completed()
 
@@ -510,7 +517,12 @@ def test_blocking_media_edit_retries_at_telegram_deadline_with_rewound_payload(
     scheduler.dispatch_once()
     retry_media = executor.submissions[1][1][1][0].media
     assert retry_media is not first_media
-    assert retry_media.input_file_content == b"edited media"
+    retry_content = retry_media.input_file_content
+    if isinstance(retry_content, bytes):
+        assert retry_content == b"edited media"
+    else:
+        assert retry_content.tell() == 0
+        assert retry_content.read() == b"edited media"
     executor.submissions[1][2].set_result("edited")
     scheduler.harvest_completed()
     assert waiter.result() == "edited"
@@ -1272,7 +1284,9 @@ def test_chat_migration_retarget_failure_stops_scheduler_and_retains_row(
     scheduler.harvest_completed()
 
     assert scheduler.stopping
-    assert scheduler.failure is persistence_error
+    assert scheduler.failure is not persistence_error
+    assert str(scheduler.failure) == str(persistence_error)
+    assert scheduler.failure.__traceback__ is None
     with pytest.raises(QueuePersistenceError):
         waiter.result()
     retained = queue.heads()[0]

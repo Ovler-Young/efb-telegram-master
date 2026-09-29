@@ -1500,34 +1500,35 @@ class ChatBindingManager(LocaleMixin):
     def _queue_history_migration_entries(self, slave_chat_id: EFBChannelChatIDStr,
                                          tg_chat_id: int,
                                          thread_id: Optional[TelegramTopicID] = None) -> int:
-        recent_messages = self.db.get_recent_messages(slave_chat_id, limit=0)
+        def entries():
+            after = None
+            position = 0
+            while True:
+                page = self.db.get_recent_messages(slave_chat_id, limit=32, after=after)
+                for msg_log in page:
+                    message_text = msg_log.text or ""
+                    formatted_text = None
+                    if message_text.strip() and not (msg_log.media_type and msg_log.media_type != 'Text'):
+                        etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
+                        timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
+                        author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
+                        formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
+                    yield {
+                        "slave_chat_id": str(slave_chat_id),
+                        "target_chat_id": str(tg_chat_id),
+                        "message_thread_id": str(thread_id) if thread_id is not None else None,
+                        "source_master_msg_id": msg_log.master_msg_id,
+                        "formatted_text": formatted_text,
+                        "media_type": msg_log.media_type,
+                        "source_time": msg_log.time,
+                        "position": position,
+                    }
+                    position += 1
+                if len(page) < 32:
+                    return
+                after = page[-1].time, page[-1].master_msg_id
 
-        if not recent_messages:
-            self.db.replace_history_migration_entries(slave_chat_id, tg_chat_id, thread_id, [])
-            return 0
-
-        entries: List[Dict[str, object]] = []
-        for i, msg_log in enumerate(recent_messages):
-            message_text = msg_log.text or ""
-            formatted_text = None
-            if message_text.strip() and not (msg_log.media_type and msg_log.media_type != 'Text'):
-                etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
-                timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
-                author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
-                formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
-
-            entries.append({
-                "slave_chat_id": str(slave_chat_id),
-                "target_chat_id": str(tg_chat_id),
-                "message_thread_id": str(thread_id) if thread_id is not None else None,
-                "source_master_msg_id": msg_log.master_msg_id,
-                "formatted_text": formatted_text,
-                "media_type": msg_log.media_type,
-                "source_time": msg_log.time,
-                "position": i,
-            })
-
-        queued_count = self.db.replace_history_migration_entries(slave_chat_id, tg_chat_id, thread_id, entries)
+        queued_count = self.db.replace_history_migration_entries(slave_chat_id, tg_chat_id, thread_id, entries())
         self.logger.info("Queued %s historical messages for chat %s", queued_count, slave_chat_id)
         return queued_count
 
@@ -1551,9 +1552,9 @@ class ChatBindingManager(LocaleMixin):
         slave_chat_id = EFBChannelChatIDStr(target.slave_chat_id)
         tg_chat_id = int(target.target_chat_id)
         thread_id = TelegramTopicID(int(target.message_thread_id)) if target.message_thread_id is not None else None
-        entries = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
+        entries = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id, limit=32)
 
-        self.logger.info("Migrating %s pending historical messages for chat %s", len(entries), slave_chat_id)
+        self.logger.info("Migrating batch of %s pending historical messages for chat %s", len(entries), slave_chat_id)
         for entry in entries:
             try:
                 prepared_call = self._prepare_history_migration_call(

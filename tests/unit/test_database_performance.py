@@ -120,7 +120,9 @@ def test_sent_pending_never_fetches_upload_blobs_and_is_bounded(tmp_path):
 
 
 def test_failed_reconciliation_is_fair_bounded_and_not_retried_on_each_wake(tmp_path, monkeypatch):
-    monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1000.0)
+    now = [1000.0]
+    monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: now[0])
+    monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: now[0])
     queue = OutboundQueue(tmp_path)
     fill_queue(queue, 70, payload_size=10, state="sent_pending")
     adapter = DurableAdapter(reconcile=False)
@@ -128,8 +130,13 @@ def test_failed_reconciliation_is_fair_bounded_and_not_retried_on_each_wake(tmp_
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
         scheduler.dispatch_once()
         assert len(adapter.reconciled) == 32
+        for _ in range(20):
+            scheduler.dispatch_once()
+        assert len(adapter.reconciled) == 32  # New wakes cannot bypass recovery pacing.
+        now[0] += 0.25
         scheduler.dispatch_once()
         assert len(adapter.reconciled) == 64
+        now[0] += 0.25
         scheduler.dispatch_once()
         assert len(adapter.reconciled) == 70
         assert len(set(adapter.reconciled)) == 70
@@ -138,9 +145,10 @@ def test_failed_reconciliation_is_fair_bounded_and_not_retried_on_each_wake(tmp_
         assert len(adapter.reconciled) == 70
         assert adapter.calls == []  # Already sent rows must never go to Telegram again.
         adapter.reconcile = True
-        monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1001.0)
+        now[0] = 1001.0
         for _ in range(3):
             scheduler.dispatch_once()
+            now[0] += 0.25
         assert queue.sent_pending() == []
     queue.close()
 
@@ -225,3 +233,57 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
         assert len(queue.heads(include_payload=False)) == 10
         assert adapter.calls == []
     queue.close()
+
+
+def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager):
+    import logging
+    import threading
+    from concurrent.futures import Future
+    from efb_telegram_master.chat_binding import ChatBindingManager
+
+    count = 512
+    db = manager._managed_database
+    with db.connection_context(), db.atomic():
+        db.connection().executemany(
+            "INSERT INTO msglog(master_msg_id,slave_message_id,text,slave_origin_uid,msg_type,sent_to,media_type,time) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            ((f"123.{i:05d}", str(i), "x" * 32768, "history", "Image", "test", "Photo",
+              None if i % 3 == 0 else "2020-01-01 00:00:00") for i in range(count)),
+        )
+    binding = object.__new__(ChatBindingManager)
+    binding.db = manager
+    binding.logger = logging.getLogger("tests.history-memory")
+    binding._history_migration_lock = threading.Lock()
+    tracemalloc.start()
+    try:
+        assert binding._queue_history_migration_entries("history", 123) == count
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 1024 * 1024
+    with db.connection_context(), db.atomic():
+        expected = [row[0] for row in db.execute_sql(
+            "SELECT source_master_msg_id FROM historymigrationentry ORDER BY position"
+        )]
+        assert len(set(expected)) == count
+        # The resumed table also contains substantial text, independently of
+        # the large source MsgLog that was paged above.
+        db.execute_sql("UPDATE historymigrationentry SET formatted_text = ?", ("h" * 32768,))
+    sent = []
+
+    def enqueue(**kwargs):
+        sent.extend(kwargs["history_entry_ids"])
+        future = Future()
+        future.set_result(None)
+        return future
+
+    binding.bot = SimpleNamespace(enqueue_history_operation=enqueue)
+    tracemalloc.start()
+    try:
+        binding._process_pending_history_migrations()
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 1024 * 1024
+    assert len(sent) == count and len(set(sent)) == count
+    assert not manager.has_pending_history_migrations()
