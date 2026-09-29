@@ -36,6 +36,8 @@ class ETMMsg(Message):
     """Unique file ID from Telegram Bot API"""
     sender_bot_id: Optional[str] = None
     """Telegram bot user ID that sent this message. None means the main bot."""
+    file_bot_id: Optional[str] = None
+    """File ID issuer override; None inherits sender_bot_id, __main__ selects main."""
     type_telegram: TGMsgType
     """Type of message in Telegram Bot API"""
     chat: ETMChatType
@@ -66,7 +68,7 @@ class ETMMsg(Message):
             bot_manager = coordinator.master.bot_manager
 
             try:
-                file_meta = bot_manager.get_file(self.file_id, sender_bot_id=self.sender_bot_id)
+                file_meta = bot_manager.get_file(self.file_id, sender_bot_id=self.file_bot_id or self.sender_bot_id)
             except BadRequest:
                 logger.exception("Original bot could not resolve saved file metadata.")
                 return
@@ -228,3 +230,7 @@ class ETMMsg(Message):
                 self.file_id = message.video_note.file_id
                 self.file_unique_id = message.video_note.file_unique_id
                 self.mime = 'video/mpeg'
+            else:
+                return
+
+        self.file_bot_id = None
