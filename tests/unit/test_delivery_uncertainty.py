@@ -405,7 +405,7 @@ def test_supplement_failure_keeps_content_and_reconciles_primary(tmp_path, manag
     [(payload, held)] = queue.connection.execute("SELECT payload, delivery_hold FROM outbound_queue").fetchall()
     assert held.startswith("supplement_failed:" if isinstance(failure, BadRequest) else "uncertain:")
     args, kwargs = queue.decode_payload(payload)
-    assert kwargs["document"].read() == b"x" * 2048
+    assert kwargs["document"].input_file_content.read() == b"x" * 2048
     queue.close_payload_resources(queue.payload_closeables(args, kwargs))
     queue.close()
 
@@ -841,7 +841,7 @@ def test_receipt_recovery_during_drain_settles_primary_and_preserves_attachment(
     assert child_id != row_id and state == "queued"
     args, kwargs = queue.decode_payload(payload)
     assert kwargs["reply_to_message_id"] == result.message_id
-    assert kwargs["document"].read() == b"x" * 2048
+    assert kwargs["document"].input_file_content.read() == b"x" * 2048
     queue.close_payload_resources(queue.payload_closeables(args, kwargs))
     assert primary.call_count == 1
     queue.close()
