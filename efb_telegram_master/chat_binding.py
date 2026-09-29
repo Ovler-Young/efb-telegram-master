@@ -30,6 +30,7 @@ from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
+from .outbound import HISTORY_REPLAY_KEY
 from .ptb_compat import Filters, get_forwarded_chat, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, TgChatMsgIDStr, TelegramTopicID
 
@@ -1468,7 +1469,7 @@ class ChatBindingManager(LocaleMixin):
 
     def resume_pending_history_migrations(self):
         try:
-            if self.db.has_pending_history_migrations():
+            if self.db.has_pending_history_migrations() or self.bot.history_ownership_page(limit=1):
                 self._start_history_migration_worker()
         except Exception as e:
             self.logger.warning("Failed to check pending history migrations: %s", e)
@@ -1552,6 +1553,14 @@ class ChatBindingManager(LocaleMixin):
             self._process_pending_history_migrations_locked(target_chat_id)
 
     def _process_pending_history_migrations_locked(self, target_chat_id: Optional[int] = None):
+        after = ""
+        while True:
+            keys = self.bot.history_ownership_page(after=after)
+            if not keys:
+                break
+            present = self.db.existing_history_ownership(keys)
+            self.bot.forget_history_entries(set(keys) - present)
+            after = keys[-1]
         while True:
             if target_chat_id is None:
                 target = self.db.get_next_history_migration_target()
@@ -1566,10 +1575,44 @@ class ChatBindingManager(LocaleMixin):
         slave_chat_id = EFBChannelChatIDStr(target.slave_chat_id)
         tg_chat_id = int(target.target_chat_id)
         thread_id = TelegramTopicID(int(target.message_thread_id)) if target.message_thread_id is not None else None
-        entries = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id, limit=32)
+        def pending_entries():
+            after = None
+            while True:
+                if after is None:
+                    page = self.db.get_history_migration_entries(slave_chat_id, tg_chat_id, thread_id, limit=32)
+                else:
+                    page = self.db.get_history_migration_entries(
+                        slave_chat_id, tg_chat_id, thread_id, limit=32, after=after
+                    )
+                owned = self.bot.owned_history_entries([entry.ownership_key for entry in page])
+                for entry in page:
+                    if entry.ownership_key in owned:
+                        self.db.delete_history_migration_entry(entry.id)
+                        self.bot.forget_history_entries([entry.ownership_key])
+                    else:
+                        yield entry
+                if len(page) < 32:
+                    return
+                after = page[-1].position, page[-1].id
 
-        self.logger.info("Migrating batch of %s pending historical messages for chat %s", len(entries), slave_chat_id)
-        for entry in entries:
+        # Database pages and original senders are not text batch boundaries.
+        # Flush only for media or the existing Telegram text length limit.
+        text_parts: List[str] = []
+        entry_ids: List[int] = []
+        text_kwargs: dict[str, object] = {}
+        text_length = 0
+
+        def flush_text() -> bool:
+            if not entry_ids:
+                return True
+            kwargs = dict(text_kwargs, text="".join(text_parts))
+            if not self._enqueue_history_batch(slave_chat_id, tg_chat_id, "send_message", kwargs, entry_ids):
+                return False
+            text_parts.clear()
+            entry_ids.clear()
+            return True
+
+        for entry in pending_entries():
             try:
                 prepared_call = self._prepare_history_migration_call(
                     entry,
@@ -1578,12 +1621,13 @@ class ChatBindingManager(LocaleMixin):
                 )
             except Exception as error:
                 self.logger.warning(
-                    "History migration entry %d discarded because it could not be prepared: %s",
+                    "History migration entry %d retained because it could not be prepared: %s",
                     entry.id,
                     error,
                 )
-                self.db.delete_history_migration_entry(entry.id)
-                continue
+                # In particular, a transient MsgLog lookup failure must not
+                # silently remove a video from the requested replay.
+                return False
 
             if prepared_call is None:
                 self.db.delete_history_migration_entry(entry.id)
@@ -1591,36 +1635,53 @@ class ChatBindingManager(LocaleMixin):
                 continue
 
             operation, kwargs = prepared_call
-            try:
-                waiter = self.bot.enqueue_history_operation(
-                    source_key=str(slave_chat_id),
-                    target_chat_id=tg_chat_id,
-                    operation=operation,
-                    args=(),
-                    kwargs=kwargs,
-                    history_entry_ids=[entry.id],
-                )
-            except BaseException as error:
-                self.logger.warning(
-                    "History migration entry %d retained because durable enqueue failed: %s",
-                    entry.id,
-                    error,
-                )
+            text = kwargs.get('text')
+            if operation == 'send_message' and isinstance(text, str):
+                if text_parts and text_length + len(text) > 4096 - 20:
+                    if not flush_text():
+                        return False
+                    text_length = 0
+                text_kwargs = kwargs
+                text_parts.append(text)
+                entry_ids.append(entry.id)
+                text_length += len(text)
+                continue
+            if not flush_text():
                 return False
+            text_length = 0
+            if not self._enqueue_history_batch(slave_chat_id, tg_chat_id, operation, kwargs, [entry.id]):
+                return False
+        return flush_text()
 
-            self.db.delete_history_migration_entry(entry.id)
-            try:
-                waiter.result()
-            except BaseException as error:
-                self.logger.warning(
-                    "History migration entry %d failed after durable enqueue: %s",
-                    entry.id,
-                    error,
-                )
+    def _enqueue_history_batch(self, slave_chat_id, tg_chat_id, operation, kwargs, entry_ids) -> bool:
+        identifiers = list(entry_ids)
+        keys = self.db.get_history_migration_ownership_keys(identifiers)
+        try:
+            waiter = self.bot.enqueue_history_operation(
+                source_key=str(slave_chat_id), target_chat_id=tg_chat_id,
+                operation=operation, args=(), kwargs=kwargs, history_entry_ids=identifiers, history_keys=keys,
+            )
+        except BaseException as error:
+            self.logger.warning(
+                "History migration entries %s retained because durable enqueue failed: %s",
+                identifiers, error,
+            )
+            return False
+        # Ownership transfers to the durable outbound row, not to the Future.
+        # The original MsgLog rows are never deleted or rewritten by backfill.
+        for identifier in identifiers:
+            self.db.delete_history_migration_entry(identifier)
+        self.bot.forget_history_entries(keys)
+        try:
+            waiter.result()
+        except BaseException as error:
+            self.logger.warning(
+                "History migration entries %s failed after durable enqueue: %s", identifiers, error,
+            )
         return True
 
-    @staticmethod
     def _prepare_history_migration_call(
+        self,
         entry,
         tg_chat_id: int,
         thread_id: Optional[TelegramTopicID],
@@ -1649,6 +1710,33 @@ class ChatBindingManager(LocaleMixin):
         }
         if thread_id is not None:
             kwargs['message_thread_id'] = thread_id
+        source = self.db.get_msg_log(master_msg_id=TgChatMsgIDStr(entry.source_master_msg_id))
+        if source is None:
+            return 'copy_message', kwargs
+        if source.master_msg_id_alt:
+            original_chat_id, original_msg_id = utils.message_id_str_to_id(
+                TgChatMsgIDStr(source.master_msg_id_alt)
+            )
+            kwargs.update(from_chat_id=original_chat_id, message_id=original_msg_id)
+        media_arguments = {
+            'Photo': ('send_photo', 'photo'), 'Video': ('send_video', 'video'),
+            'Animation': ('send_animation', 'animation'), 'Document': ('send_document', 'document'),
+            'Audio': ('send_audio', 'audio'), 'Voice': ('send_voice', 'voice'),
+            'Sticker': ('send_sticker', 'sticker'), 'AnimatedSticker': ('send_sticker', 'sticker'),
+            'VideoSticker': ('send_sticker', 'sticker'),
+        }
+        media_call = media_arguments.get(source.media_type)
+        if media_call is not None and source.file_id:
+            operation, argument = media_call
+            fallback = {argument: source.file_id}
+            if argument != 'sticker' and source.text:
+                fallback['caption'] = source.text
+            # The stored file ID is fetched with its owner, not used to pin
+            # the sender. Recovered bytes use the ordinary outbound selection.
+            kwargs[HISTORY_REPLAY_KEY] = {
+                'fallback_operation': operation, 'fallback_kwargs': fallback,
+                'source_sender_bot_id': source.file_bot_id,
+            }
         return 'copy_message', kwargs
 
     @staticmethod
