@@ -54,7 +54,7 @@ def bot_groups(bot_info) -> List[int]:
     return bot_info['groups']
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def bot_group(bot_groups) -> int:
     return bot_groups[0]
 
