@@ -1163,10 +1163,16 @@ def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch)
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
         monkeypatch.setattr(queue, "delete", lambda _row_id: (_ for _ in ()).throw(sqlite3.OperationalError()))
         scheduler.dispatch_once()
+        # Message-creating calls are retained through the attempt, even when blocking.
+        scheduler.in_flight[_row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
         assert scheduler.stopping
         with pytest.raises(Exception, match="deletion failed"):
             waiter.result()
-        assert adapter.calls == []
+        assert len(adapter.calls) == 1
+        assert queue.connection.execute(
+            "SELECT delivery_hold FROM outbound_queue WHERE id=?", (_row_id,)
+        ).fetchone()[0] == "in_flight"
 
 
 def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path, monkeypatch):
