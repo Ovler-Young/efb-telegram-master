@@ -228,10 +228,6 @@ def _expected_stream_indices(expected_count: int) -> Set[int]:
     return set(range(expected_count))
 
 
-def _expected_relink_send_count(migrated_message_count: int) -> int:
-    return migrated_message_count + 1  # Relink status followed by migrated content.
-
-
 @dataclass(frozen=True)
 class QueueMetricSnapshot:
     enqueued: float
@@ -386,7 +382,6 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
                                              metrics_before: QueueMetricSnapshot,
                                              timeout: float = BACKFILL_WAIT_TIMEOUT):
     expected = _expected_stream_indices(expected_count)
-    expected_relink_send_count = _expected_relink_send_count(expected_count)
     slave_chat_id = etm_utils.chat_id_to_str(chat=chat)
     deadline = time.time() + timeout
     activity_observed = False
@@ -412,12 +407,12 @@ async def _wait_for_migrated_stream_terminal(channel_with_auxiliary_bots, client
         queue_completed = _queue_activity_completed(
             metrics_before,
             metrics_current,
-            expected_count=expected_relink_send_count,
+            expected_count=expected_count,
         )
         last_debug = (
             f"migration_observed={activity_observed}, db_idx={len(db_indices)}/{expected_count}, "
             f"tg_idx={len(telegram_indices)}/{expected_count}, target_entries={target_entry_count}, "
-            f"expected_relink_sends={expected_relink_send_count}, "
+            f"expected_migration_sends={expected_count}, "
             f"metrics_before={metrics_before!r}, metrics_current={metrics_current!r}"
         )
         if _migration_activity_completed(
@@ -531,7 +526,7 @@ async def test_auxiliary_bots_stream_blackbox_and_relink(channel_with_auxiliary_
         assert _queue_activity_completed(
             migration_metrics_before,
             migration_metrics_after,
-            expected_count=_expected_relink_send_count(STREAM_MESSAGE_COUNT),
+            expected_count=STREAM_MESSAGE_COUNT,
         )
         assert _target_migration_entry_count(slave_uid, target_group_id) == 0
 
