@@ -429,6 +429,9 @@ class OutboundQueue:
             )
             self._migrate_schema(connection)
             connection.execute(
+                "CREATE TABLE IF NOT EXISTS history_ownership (entry_key TEXT PRIMARY KEY)"
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS outbound_queue_destination_priority_id "
                 "ON outbound_queue (telegram_chat_id, priority DESC, id ASC)"
             )
@@ -1095,7 +1098,8 @@ class OutboundQueue:
         )
 
     def enqueue_many(
-        self, requests: Iterable[QueueRequest], operation_resolver: Callable[[str], Callable[..., object]]
+        self, requests: Iterable[QueueRequest], operation_resolver: Callable[[str], Callable[..., object]],
+        *, history_keys: Iterable[str] = (),
     ) -> tuple[int, Future]:
         request_list = list(requests)
         if not request_list:
@@ -1116,6 +1120,12 @@ class OutboundQueue:
         with self._lock:
             try:
                 self.connection.execute("BEGIN")
+                # Receipts outlive queue-row completion until the source staging
+                # records have been durably removed from either main DB backend.
+                self.connection.executemany(
+                    "INSERT INTO history_ownership (entry_key) VALUES (?)",
+                    ((key,) for key in history_keys),
+                )
                 identifiers: list[int] = []
                 now = time.time()
                 for operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context in prepared:
@@ -1145,6 +1155,30 @@ class OutboundQueue:
             waiter: Future = Future()
             self.waiters[identifiers[0]] = waiter
             return identifiers[0], waiter
+
+    def history_ownership_page(self, after: str = "", limit: int = 100) -> list[str]:
+        with self._lock:
+            return [row[0] for row in self.connection.execute(
+                "SELECT entry_key FROM history_ownership WHERE entry_key > ? ORDER BY entry_key LIMIT ?",
+                (after, limit),
+            )]
+
+    def owned_history_entries(self, keys: Iterable[str]) -> set[str]:
+        keys = list(keys)
+        if not keys:
+            return set()
+        with self._lock:
+            return {row[0] for row in self.connection.execute(
+                "SELECT entry_key FROM history_ownership WHERE entry_key IN (" +
+                ",".join("?" for _ in keys) + ")", keys,
+            )}
+
+    def forget_history_entries(self, keys: Iterable[str]) -> None:
+        """Called only after source staging deletion has committed."""
+        with self._lock, self.connection:
+            self.connection.executemany(
+                "DELETE FROM history_ownership WHERE entry_key = ?", ((key,) for key in keys)
+            )
 
     def heads(
         self, *, include_payload: bool = True, excluded_ids: Iterable[int] = (),
