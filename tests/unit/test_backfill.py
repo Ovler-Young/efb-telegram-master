@@ -281,7 +281,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
     assert entries[1]["formatted_text"] is None
 
 
-def test_process_pending_history_migrations_transfers_entries_to_durable_queue_before_waiting():
+def test_process_pending_history_migrations_waits_for_delivery_before_deleting_entries():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager._history_migration_lock = threading.Lock()
     manager.logger = Mock()
@@ -399,14 +399,14 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
         ),
     ])
     assert events == [
-        ("enqueue", 1), ("delete", 1), ("wait", 1),
-        ("enqueue", 2), ("delete", 2), ("wait", 2),
-        ("enqueue", 3), ("delete", 3), ("wait", 3),
+        ("enqueue", 1), ("wait", 1), ("delete", 1),
+        ("enqueue", 2), ("wait", 2), ("delete", 2),
+        ("enqueue", 3), ("wait", 3), ("delete", 3),
     ]
     assert pending_entries == []
 
 
-def test_history_migration_continues_after_terminal_delivery_failure():
+def test_history_migration_retains_entry_after_terminal_delivery_failure():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager.logger = Mock()
     entry = SimpleNamespace(
@@ -427,10 +427,10 @@ def test_history_migration_continues_after_terminal_delivery_failure():
 
     processed = ChatBindingManager._process_history_migration_target(manager, entry)
 
-    assert processed is True
-    manager.db.delete_history_migration_entry.assert_called_once_with(7)
+    assert processed is False
+    manager.db.delete_history_migration_entry.assert_not_called()
     manager.logger.warning.assert_called_once_with(
-        "History migration entry %d failed after durable enqueue: %s",
+        "History migration entry %d retained after durable enqueue failed: %s",
         7,
         ANY,
     )
