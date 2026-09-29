@@ -698,6 +698,13 @@ class OutboundQueue:
             depth = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
             self.metrics.set_queue_depth(int(depth))
 
+    def has_queued_calls(self) -> bool:
+        """Return whether a durable call is waiting without loading its payload."""
+        with self._lock:
+            return self.connection.execute(
+                "SELECT 1 FROM outbound_queue WHERE delivery_state = 'queued' LIMIT 1"
+            ).fetchone() is not None
+
     def record_removal(self, row: QueuedCall, outcome: str) -> None:
         if self.metrics is not None:
             residence_seconds = max(0.0, time.time() - row.created_at)
