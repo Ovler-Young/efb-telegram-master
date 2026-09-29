@@ -38,14 +38,22 @@ async def test_relink_owner_fetch_is_independent_of_sending_and_text_batching(
     assert pool is not None and pool.bots, 'Real auxiliary credentials are required for sender ownership acceptance.'
     auxiliary = next(bot for bot in pool.bots if not bot.disabled)
     aux_id = int(auxiliary.bot_id)
-    await _ensure_users_in_group(client, bot_group, aux_id)
+    enabled_auxiliaries = [bot for bot in pool.bots if not bot.disabled]
+    await _ensure_users_in_group(client, bot_group, [int(bot.bot_id) for bot in enabled_auxiliaries])
     deadline = time.monotonic() + 45
+    eligible_auxiliary_ids = set()
     while time.monotonic() < deadline:
-        if await asyncio.to_thread(auxiliary.check_membership_tri, bot_group) is True:
+        eligible_auxiliary_ids = {
+            int(bot.bot_id)
+            for bot in enabled_auxiliaries
+            if await asyncio.to_thread(bot.check_membership_tri, bot_group) is True
+        }
+        if aux_id in eligible_auxiliary_ids:
             break
         await asyncio.sleep(0.25)
     else:
         raise AssertionError('Auxiliary bot did not become a confirmed member of the test group.')
+    eligible_sender_ids = {bot_id, *eligible_auxiliary_ids}
 
     chat = slave.chat_with_alias
     source = etm_utils.chat_id_to_str(chat=chat)
@@ -112,9 +120,10 @@ async def test_relink_owner_fetch_is_independent_of_sending_and_text_batching(
             main_fetch.assert_not_called()
 
         # Four consecutive texts from two original bots form ONE batch.
-        # Main is the normal sender here; auxiliary owns only the saved files.
+        # Replay prefers the main bot but may use a confirmed auxiliary when the
+        # main bot has no limiter capacity. File ownership stays independent.
         assert len(matches) == 5, [(msg.id, msg.sender_id, msg.raw_text) for msg in matches]
-        assert all(msg.sender_id == bot_id for msg in matches)
+        assert all(msg.sender_id in eligible_sender_ids for msg in matches)
         assert all(label in matches[0].raw_text for label in labels[:4])
         for output, start in ((2, 4), (4, 6)):
             assert labels[start] in matches[output].raw_text and labels[start + 1] in matches[output].raw_text

@@ -5,6 +5,7 @@ from pytest import mark, raises
 
 from ehforwarderbot.chat import ChatNotificationState
 from tests.integration.helper.filters import in_chats, regex
+from tests.integration.helper.helper import wait_for_limiter_slot
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio
@@ -56,6 +57,7 @@ async def test_slave_message_notification_your_silent(helper, client, bot_group,
     chat = chat_caller(slave)
     with link_chats(channel, (chat,), bot_group), \
             patch.dict(channel.flag.config, your_message_on_slave="silent"):
+        await wait_for_limiter_slot(lambda: channel.bot_manager._rate_limiter.peek_delay(bot_group))
         efb_msg = slave.send_text_message(chat=chat, substitution=mention)
         tg_msg = await helper.wait_for_message(in_chats(bot_group) & regex(efb_msg.text))
         assert tg_msg.silent
