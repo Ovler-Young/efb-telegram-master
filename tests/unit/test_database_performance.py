@@ -265,7 +265,8 @@ def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager)
     binding = object.__new__(ChatBindingManager)
     binding.db = manager
     binding.logger = logging.getLogger("tests.history-memory")
-    binding._history_migration_lock = threading.Lock()
+    binding._history_migration_locks_lock = threading.Lock()
+    binding._history_migration_locks = {}
     tracemalloc.start()
     try:
         assert binding._queue_history_migration_entries("history", 123) == count
@@ -295,7 +296,7 @@ def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager)
     )
     tracemalloc.start()
     try:
-        binding._process_pending_history_migrations()
+        binding._process_pending_history_migrations_for_target(123)
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
