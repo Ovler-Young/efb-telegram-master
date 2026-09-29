@@ -67,6 +67,7 @@ setup(
         "humanize",
         "typing-extensions>=3.7.4.1",
         "prometheus_client",
+        "pyrate-limiter>=3.9.0",
     ],
     extras_require={
         "tests": tests_require,

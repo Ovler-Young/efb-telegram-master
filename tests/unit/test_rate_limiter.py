@@ -1,197 +1,128 @@
-"""Tests for the shared SlidingWindowRateLimiter."""
+"""Tests for the outbound sender limiter contract."""
 
-from collections import deque
-from unittest.mock import patch
+from __future__ import annotations
+
+from dataclasses import dataclass
 
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
-def _make_limiter(**kwargs):
-    defaults = dict(global_limit=5, global_window=1.0, chat_limit=3, chat_window=10.0, safety_margin=0)
-    defaults.update(kwargs)
-    return SlidingWindowRateLimiter(**defaults)
+@dataclass
+class MonotonicClock:
+    value: float = 0.0
+
+    def now(self) -> float:
+        return self.value
 
 
-# Basic delay / reserve
+def _make_limiter(clock: MonotonicClock) -> SlidingWindowRateLimiter:
+    return SlidingWindowRateLimiter(clock=clock.now)
 
 
-def test_first_request_has_zero_delay():
-    limiter = _make_limiter()
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.peek_delay(1) == 0.0
-        assert limiter.reserve_slot(1) == 0.0
+def test_global_capacity_is_28_acquisitions_per_bot_per_second() -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+
+    for _ in range(28):
+        assert limiter.try_acquire_global()
+
+    assert limiter.global_delay() > 0.0
+    assert not limiter.try_acquire_global()
+
+    clock.value = 1.0004
+    assert not limiter.try_acquire_global()
+
+    clock.value = 1.002
+    assert limiter.try_acquire_global()
 
 
-def test_peek_does_not_consume_slot():
-    limiter = _make_limiter(chat_limit=2)
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.peek_delay(1) == 0.0
-        assert limiter.peek_delay(1) == 0.0  # still 0; nothing consumed
-        limiter.reserve_slot(1)
-        limiter.reserve_slot(1)
-        assert limiter.peek_delay(1) > 0.0  # now full
+def test_chat_capacity_is_18_acquisitions_per_bot_chat_per_60_seconds() -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+
+    for _ in range(18):
+        assert limiter.try_acquire_chat(100)
+
+    assert limiter.chat_delay(100) > 0.0
+    assert not limiter.try_acquire_chat(100)
+    assert limiter.try_acquire_chat(200)
 
 
-def test_chat_limit_triggers_delay():
-    limiter = _make_limiter(chat_limit=2, chat_window=10.0)
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.reserve_slot(1) == 0.0
-        assert limiter.reserve_slot(1) == 0.0
-        delay = limiter.peek_delay(1)
-        assert delay > 0.0  # third request must wait
+def test_each_limiter_instance_has_independent_bot_global_key() -> None:
+    clock = MonotonicClock()
+    first_bot = _make_limiter(clock)
+    second_bot = _make_limiter(clock)
+
+    for _ in range(28):
+        assert first_bot.try_acquire_global()
+
+    assert first_bot.global_delay() > 0.0
+    assert second_bot.global_delay() == 0.0
+    assert second_bot.try_acquire_global()
 
 
-def test_global_limit_triggers_delay():
-    limiter = _make_limiter(global_limit=2, global_window=1.0, chat_limit=100)
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.reserve_slot(1) == 0.0
-        assert limiter.reserve_slot(2) == 0.0  # different chat
-        delay = limiter.peek_delay(3)
-        assert delay > 0.0  # global limit hit
+def test_acquisition_uses_monotonic_clock_not_wall_clock(monkeypatch) -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+
+    monkeypatch.setattr(
+        "efb_telegram_master.rate_limiter.time.time",
+        lambda: (_ for _ in ()).throw(AssertionError("wall clock used")),
+    )
+    assert limiter.try_acquire_global()
+    assert limiter.global_delay() == 0.0
 
 
-def test_different_chats_are_independent():
-    limiter = _make_limiter(chat_limit=1, chat_window=10.0, global_limit=100)
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.reserve_slot(1) == 0.0
-        assert limiter.peek_delay(1) > 0.0  # chat 1 full
-        assert limiter.peek_delay(2) == 0.0  # chat 2 still free
+def test_global_acquisition_precedes_chat_and_is_not_returned_after_chat_failure() -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+
+    for _ in range(18):
+        assert limiter.try_acquire_chat(100)
+
+    assert not limiter.try_acquire(100)
+    assert limiter.get_counts(100) == (18, 1)
 
 
-# Safety margin
+def test_acquire_runs_global_before_bot_chat() -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+    calls: list[str] = []
+    global_acquire = limiter.try_acquire_global
+    chat_acquire = limiter.try_acquire_chat
+
+    def acquire_global() -> bool:
+        calls.append("global")
+        return global_acquire()
+
+    def acquire_chat(chat_id: int) -> bool:
+        calls.append("chat")
+        return chat_acquire(chat_id)
+
+    setattr(limiter, "try_acquire_global", acquire_global)
+    setattr(limiter, "try_acquire_chat", acquire_chat)
+
+    assert limiter.try_acquire(100)
+    assert calls == ["global", "chat"]
 
 
-def test_safety_margin_reduces_effective_limit():
-    limiter = _make_limiter(chat_limit=3, safety_margin=1)
-    # effective chat limit = 3 - 1 = 2
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.reserve_slot(1) == 0.0
-        assert limiter.reserve_slot(1) == 0.0
-        assert limiter.peek_delay(1) > 0.0  # 2 consumed, margin=1; full
+def test_failed_or_cancelled_send_has_no_limiter_release_path() -> None:
+    clock = MonotonicClock()
+    limiter = _make_limiter(clock)
+
+    assert limiter.try_acquire(100)
+    assert limiter.get_counts(100) == (1, 1)
+    assert not hasattr(limiter, "release_slot")
+    assert limiter.get_counts(100) == (1, 1)
 
 
-# Timestamp cleanup
+def test_limiter_state_resets_on_process_restart() -> None:
+    clock = MonotonicClock()
+    first_process = _make_limiter(clock)
 
+    for _ in range(28):
+        assert first_process.try_acquire_global()
 
-def test_old_timestamps_are_cleaned_up():
-    limiter = _make_limiter(chat_limit=1, chat_window=5.0, global_limit=100)
-
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.reserve_slot(1)
-        assert limiter.peek_delay(1) > 0.0
-
-    # Advance time past the window
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=106.0):
-        assert limiter.peek_delay(1) == 0.0  # old timestamp cleaned up
-
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=106.0):
-        limiter.reserve_slot(2)
-        assert 1 not in limiter._chat_timestamps
-
-
-def test_release_slot_removes_latest_reservation():
-    limiter = _make_limiter()
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.reserve_slot(1)
-        limiter.release_slot(1)
-        assert limiter.get_counts(1) == (0, 0)
-        assert 1 not in limiter._chat_timestamps
-
-
-def test_release_slot_is_idempotent_without_reservation():
-    limiter = _make_limiter()
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.release_slot(1)
-        assert limiter.get_counts(1) == (0, 0)
-        assert 1 not in limiter._chat_timestamps
-
-        limiter._chat_timestamps[1] = deque()
-        limiter.release_slot(1)
-        assert limiter.get_counts(1) == (0, 0)
-        assert 1 not in limiter._chat_timestamps
-
-
-def test_peek_and_counts_do_not_create_empty_chat_key():
-    limiter = _make_limiter()
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        assert limiter.peek_delay(1) == 0.0
-        assert limiter.get_counts(1) == (0, 0)
-        assert 1 not in limiter._chat_timestamps
-
-
-# get_counts
-
-
-def test_get_counts_returns_correct_values():
-    limiter = _make_limiter()
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.reserve_slot(1)
-        limiter.reserve_slot(1)
-        limiter.reserve_slot(2)
-
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        chat_count, global_count = limiter.get_counts(1)
-        assert chat_count == 2
-        assert global_count == 3
-
-
-def test_chat_count_snapshot_returns_active_counts_and_effective_limit():
-    limiter = _make_limiter(chat_limit=3, safety_margin=1)
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.reserve_slot(1)
-        limiter.reserve_slot(1)
-        limiter.reserve_slot(2)
-
-        chat_counts, effective_limit = limiter.get_chat_count_snapshot()
-
-    assert chat_counts == {1: 2, 2: 1}
-    assert effective_limit == 2
-
-
-def test_chat_count_snapshot_cleans_up_expired_chats():
-    limiter = _make_limiter(chat_limit=3, chat_window=10.0)
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.reserve_slot(1)
-
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=111.0):
-        chat_counts, effective_limit = limiter.get_chat_count_snapshot()
-
-    assert chat_counts == {}
-    assert effective_limit == 3
-
-
-def test_reserved_slot_count_uses_global_window_cleanup():
-    limiter = _make_limiter(global_window=5.0, chat_window=100.0)
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=100.0):
-        limiter.reserve_slot(1)
-        limiter.reserve_slot(2)
-        assert limiter.get_reserved_slot_count() == 2
-
-    with patch("efb_telegram_master.rate_limiter.time.time", return_value=106.0):
-        assert limiter.get_reserved_slot_count() == 0
-
-
-# Thread safety (smoke)
-
-
-def test_concurrent_reserves_do_not_crash():
-    """Smoke test: many threads reserving simultaneously should not raise."""
-    import threading
-
-    limiter = _make_limiter(global_limit=1000, chat_limit=1000)
-    errors: list = []
-
-    def worker():
-        try:
-            for _ in range(50):
-                limiter.reserve_slot(1)
-        except Exception as exc:
-            errors.append(exc)
-
-    threads = [threading.Thread(target=worker) for _ in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert not errors
+    restarted_process = _make_limiter(clock)
+    assert restarted_process.global_delay() == 0.0
+    assert restarted_process.try_acquire_global()
