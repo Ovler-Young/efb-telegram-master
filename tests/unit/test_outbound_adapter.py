@@ -1,16 +1,21 @@
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
+
+import telegram.error
 
 import pytest
 
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
-from efb_telegram_master.outbound import QUEUED_OPERATIONS, QueueEnqueueError
+from efb_telegram_master.outbound import QUEUED_OPERATIONS, QueueEnqueueError, SenderSelection
 
 
 def _manager_with_adapter_stubs():
     manager = TelegramBotManager.__new__(TelegramBotManager)
     manager._bot = Mock()
     manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
+    manager._bot_chat_state_lock = threading.Lock()
+    manager._bot_chat_disabled_until = {}
     manager._make_send_receipt = TelegramBotManager._make_send_receipt.__get__(
         manager, TelegramBotManager
     )
@@ -101,6 +106,32 @@ def test_send_chat_action_is_direct_and_preserves_thread_id_without_mutating_cal
     manager._enqueue_blocking_send_and_wait.assert_not_called()
     manager._enqueue_blocking_api_operation.assert_not_called()
     assert "send_chat_action" not in QUEUED_OPERATIONS
+
+
+def test_retry_after_on_chat_action_queues_following_body_and_respects_cooldown(monkeypatch):
+    manager = _manager_with_adapter_stubs()
+    manager._bot.send_chat_action.side_effect = [telegram.error.RetryAfter(10), True]
+    manager._enqueue_eventual_send.return_value = "queued-body"
+    manager._rate_limiter = SimpleNamespace(peek_delay=lambda _chat_id: 0.0)
+    now = [1_000.0]
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: now[0])
+
+    assert manager.send_chat_action(chat_id=100, action="typing") is False
+    assert manager.send_message(
+        100, "body", _send_mode="eventual", _slave_id="slave.chat"
+    ) == "queued-body"
+    assert manager._enqueue_eventual_send.call_args.args[:2] == ("slave.chat", 100)
+    assert manager._enqueue_eventual_send.call_args.args[2].__name__ == "send_message"
+    selection = manager._select_available_sender(SenderSelection(manager._bot, None), 100, now[0])
+    assert selection.selection is None
+    assert selection.retry_at == 1_010.0
+
+    assert manager.send_chat_action(chat_id=100, action="typing") is False
+    assert manager._bot.send_chat_action.call_count == 1
+
+    now[0] = 1_010.0
+    assert manager.send_chat_action(chat_id=100, action="typing") is True
+    assert manager._bot.send_chat_action.call_count == 2
 
 
 @pytest.mark.parametrize(
