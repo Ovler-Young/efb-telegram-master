@@ -8,9 +8,12 @@ import pytest
 
 from efb_telegram_master.db import HistoryMigrationEntry, HistoryMigrationTarget, MsgLog
 from efb_telegram_master.db_runtime import connection_scope
-from tests.unit.test_database_safety import postgres_config, postgres_server_config
+from tests.unit.test_database_safety import (
+    postgres_config as postgres_config,
+    postgres_server_config as postgres_server_config,
+)
 from tests.unit.test_history_replay import (
-    history, populate, prepare_runtime, Sender, finish_attempt,
+    history as history, populate, prepare_runtime, Sender, finish_attempt,
 )
 
 
