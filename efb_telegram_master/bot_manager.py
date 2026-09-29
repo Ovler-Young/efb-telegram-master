@@ -1248,6 +1248,7 @@ class TelegramBotManager(LocaleMixin):
             ) from error
         return self._make_send_receipt(
             result,
+            sender_bot_id=getattr(queue_waiter, "sender_bot_id", None),
             task_id=row_id,
             durable_db_logged=db_log_context is not None,
         )

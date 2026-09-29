@@ -2135,6 +2135,12 @@ class OutboundQueue:
         if payload is not None:
             self.cleanup_payload_media(payload)
 
+    def complete_waiter(self, row_id: int, result: object, selection: SenderSelection) -> None:
+        waiter = self.waiters.pop(row_id, None)
+        if waiter is not None and not waiter.done():
+            setattr(waiter, "sender_bot_id", selection.sender_bot_id)
+            waiter.set_result(result)
+
     def fail_waiter(self, row_id: int, error: BaseException) -> None:
         waiter = self.waiters.pop(row_id, None)
         if waiter is not None and not waiter.done():
@@ -2837,9 +2843,7 @@ class OutboundQueueScheduler:
                         self._record_submitted_removal(submitted.row)
                     elif submitted.row.priority == 1 and submitted.row.log_context is None:
                         self.queue.cleanup_payload_media(submitted.row.payload)
-                    waiter = self.queue.waiters.pop(row_id, None)
-                    if waiter is not None and not waiter.done():
-                        waiter.set_result(result)
+                    self.queue.complete_waiter(row_id, result, submitted.selection)
                     self._record_terminal_completion(submitted.row, submitted.selection, "success")
             if any_harvested:
                 self.wake_event.set()
