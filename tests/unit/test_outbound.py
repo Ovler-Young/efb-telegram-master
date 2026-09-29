@@ -174,8 +174,8 @@ def test_media_snapshot_preserves_caller_stream_lifecycle_and_decodes_fresh_valu
     first = queue.decode_payload(payload)[1]["media"]
     second = queue.decode_payload(payload)[1]["media"]
     assert first is not second
-    assert first.tell() == second.tell() == 0
-    assert first.read() == second.read() == b"complete media"
+    assert first.input_file_content.tell() == second.input_file_content.tell() == 0
+    assert first.input_file_content.read() == second.input_file_content.read() == b"complete media"
 
 
 class _UnreadableStream(io.BytesIO):
@@ -367,7 +367,7 @@ def test_video_cover_enqueues_an_inline_version_one_snapshot(
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 1
     assert media_bytes(decoded_cover) == content
     if isinstance(decoded_cover, InputFile):
-        assert decoded_cover.filename == expected_filename
+        assert decoded_cover.filename == (expected_filename or "file")
     else:
         assert getattr(decoded_cover, "name", None) == expected_filename
 
@@ -567,7 +567,7 @@ def test_nested_input_media_preserves_bytes_filename_precedence_and_attachment_l
     delivered = queue.decode_payload(queue.heads()[0].payload)[0][1][0].media
     if isinstance(delivered, InputFile):
         assert media_bytes(delivered) == content
-        assert delivered.filename == expected_filename
+        assert delivered.filename == (expected_filename or "file")
         assert delivered.attach_name == expected_attach_name
     else:
         assert media_bytes(delivered) == content
@@ -663,7 +663,7 @@ def test_local_file_media_is_owned_inline_after_enqueue_and_reopen(
     assert row.id == row_id
     assert len(row.payload) < 4096
     assert media_bytes(decoded_media) == original_content
-    assert decoded_media.name == source_path.name
+    assert decoded_media.filename == source_path.name
     assert len(list(reopened.media_dir.iterdir())) == 1
     reopened.delete(row_id)
     assert list(reopened.media_dir.iterdir()) == []
