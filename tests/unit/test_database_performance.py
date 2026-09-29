@@ -11,6 +11,7 @@ import pytest
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler
+from tests.unit.test_database_safety import remove_source_columns
 from tests.unit.test_outbound import DurableAdapter
 
 
@@ -60,16 +61,27 @@ def test_partially_upgraded_schema_adds_only_missing_columns(tmp_path, monkeypat
     initial.stop_worker()
     with closing(sqlite3.connect(tmp_path / "tgdata.db")) as source:
         source.execute("DROP INDEX msglog_master_alt")
-        source.execute("ALTER TABLE msglog DROP COLUMN master_msg_id_alt")
-        source.execute("ALTER TABLE msglog DROP COLUMN pickle")
-        source.execute("ALTER TABLE slavechatinfo DROP COLUMN pickle")
+        source.execute("DROP INDEX history_generation_id")
+        source.execute("DROP INDEX history_target_generation_position")
+        source.execute("DROP TABLE historymigrationtarget")
+        source.execute(
+            "INSERT INTO historymigrationentry "
+            "(id, slave_chat_id, target_chat_id, source_master_msg_id, position, created_at) "
+            "VALUES (74, 'slave.chat', '-1001', 'source.1', 0, '2026-01-01')"
+        )
         source.commit()
+    remove_source_columns(tmp_path, "msglog", ("master_msg_id_alt", "pickle"))
+    remove_source_columns(tmp_path, "slavechatinfo", ("pickle",))
+    remove_source_columns(tmp_path, "historymigrationentry", ("generation",))
     upgraded = DatabaseManager(SimpleNamespace(channel_id="test.schema", config={}))
     try:
         with upgraded._managed_database.connection_context():
             columns = {column.name for column in upgraded._managed_database.get_columns("msglog")}
             assert {"master_msg_id_alt", "pickle", "sender_bot_id"} <= columns
             assert "msglog_master_alt" in {index.name for index in upgraded._managed_database.get_indexes("msglog")}
+            history_indexes = {index.name for index in upgraded._managed_database.get_indexes("historymigrationentry")}
+            assert {"history_generation_id", "history_target_generation_position"} <= history_indexes
+        assert upgraded.get_next_history_migration_target().ownership_key == "legacy:74"
     finally:
         upgraded.stop_worker()
         database.initialize(previous)
@@ -277,7 +289,10 @@ def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager)
         future.set_result(None)
         return future
 
-    binding.bot = SimpleNamespace(enqueue_history_operation=enqueue)
+    binding.bot = SimpleNamespace(
+        enqueue_history_operation=enqueue, history_ownership_page=lambda **kwargs: [],
+        owned_history_entries=lambda keys: set(), forget_history_entries=lambda keys: None,
+    )
     tracemalloc.start()
     try:
         binding._process_pending_history_migrations()
