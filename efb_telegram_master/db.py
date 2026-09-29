@@ -971,6 +971,7 @@ class DatabaseManager:
         target_chat_id: int,
         message_thread_id: Optional[TelegramTopicID] = None,
         limit: Optional[int] = None,
+        after: Optional[Tuple[int, int]] = None,
     ) -> List[HistoryMigrationEntry]:
         target_filter = self._history_migration_target_filter(
             slave_chat_id,
@@ -982,6 +983,12 @@ class DatabaseManager:
             .where(target_filter)
             .order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
         )
+        if after is not None:
+            position, identifier = after
+            query = query.where(
+                (HistoryMigrationEntry.position > position) |
+                ((HistoryMigrationEntry.position == position) & (HistoryMigrationEntry.id > identifier))
+            )
         if limit is not None:
             query = query.limit(limit)
         return list(query)
