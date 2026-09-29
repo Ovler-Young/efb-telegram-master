@@ -10,6 +10,7 @@ from ehforwarderbot import MsgType
 
 from efb_telegram_master import utils as etm_utils
 from .helper.filters import in_chats, regex
+from .helper.helper import wait_for_limiter_slot
 from .utils import get_start_token, link_chats
 
 pytestmark = pytest.mark.asyncio
@@ -34,11 +35,19 @@ async def test_relink_groups_text_around_a_real_video(
     prefix = 'relink-' + uuid4().hex[:10]
     labels = [f'{prefix} {letter}' for letter in 'ABCD']
     saved = []
+    limiter_delay = lambda: channel.bot_manager._rate_limiter.peek_delay(bot_group)
+
+    async def send_text_and_observe(label):
+        await wait_for_limiter_slot(limiter_delay)
+        message = await asyncio.to_thread(slave.send_text_message, chat, chat.other, text=label)
+        await helper.wait_for_message(in_chats(bot_group) & regex(label))
+        return message
+
     with link_chats(channel, (chat,), bot_group):
         for label in labels[:2]:
-            message = await asyncio.to_thread(slave.send_text_message, chat, chat.other, text=label)
-            await helper.wait_for_message(in_chats(bot_group) & regex(label))
+            message = await send_text_and_observe(label)
             saved.append(await wait_logged(channel, source, message))
+        await wait_for_limiter_slot(limiter_delay)
         video = await asyncio.to_thread(
             slave.send_file_like_message, MsgType.Video, Path('tests/mocks/video_0.mp4'),
             'video/mp4', chat, chat.other,
@@ -55,8 +64,7 @@ async def test_relink_groups_text_around_a_real_video(
         assert original_video.video is not None and video_label in original_video.raw_text
         original_contents = await client.download_media(original_video, file=bytes)
         for label in labels[2:]:
-            message = await asyncio.to_thread(slave.send_text_message, chat, chat.other, text=label)
-            await helper.wait_for_message(in_chats(bot_group) & regex(label))
+            message = await send_text_and_observe(label)
             saved.append(await wait_logged(channel, source, message))
 
         if remove_original_video:
