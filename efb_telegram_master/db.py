@@ -1061,18 +1061,38 @@ class DatabaseManager:
         return self.get_next_history_migration_target() is not None
 
     @observe_database_method("get_next_history_migration_target")
-    def get_next_history_migration_target(self) -> Optional[HistoryMigrationEntry]:
+    def get_next_history_migration_target(
+        self, target_chat_id: Optional[int] = None,
+    ) -> Optional[HistoryMigrationEntry]:
         # Seek one head per published generation; ORDER BY id over a combined
         # visibility predicate can instead scan every unpublished staging row.
+        target_filter = (
+            HistoryMigrationTarget.target_chat_id == str(target_chat_id)
+            if target_chat_id is not None else True
+        )
         head = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             HistoryMigrationEntry.generation == HistoryMigrationTarget.generation,
         ).order_by(HistoryMigrationEntry.id).limit(1)
-        published_id = HistoryMigrationTarget.select(fn.MIN(EnclosedNodeList([head]))).scalar()
+        published_id = HistoryMigrationTarget.select(fn.MIN(EnclosedNodeList([head]))).where(target_filter).scalar()
+        legacy_filter = HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
+        if target_chat_id is not None:
+            legacy_filter &= HistoryMigrationEntry.target_chat_id == str(target_chat_id)
         legacy_id = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
-            HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
+            legacy_filter
         ).order_by(HistoryMigrationEntry.id).limit(1).scalar()
         ids = [identifier for identifier in (published_id, legacy_id) if identifier is not None]
         return HistoryMigrationEntry.get_by_id(min(ids)) if ids else None
+
+    @observe_database_method("get_pending_history_migration_target_ids")
+    def get_pending_history_migration_target_ids(self) -> List[int]:
+        published = HistoryMigrationTarget.select(HistoryMigrationTarget.target_chat_id)
+        legacy = HistoryMigrationEntry.select(HistoryMigrationEntry.target_chat_id).where(
+            HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
+        )
+        target_ids = {int(row.target_chat_id) for row in published}
+        target_ids.update(int(row.target_chat_id) for row in legacy)
+        return [target_id for target_id in sorted(target_ids)
+                if self.get_next_history_migration_target(target_id) is not None]
 
     @observe_database_method("get_history_migration_entries")
     def get_history_migration_entries(
