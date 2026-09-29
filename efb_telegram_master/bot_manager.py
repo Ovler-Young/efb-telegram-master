@@ -2204,7 +2204,24 @@ class TelegramBotManager(LocaleMixin):
             api_kwargs = dict(cast(Mapping[str, object], queued_kwargs.get('api_kwargs', {})))
             api_kwargs['message_thread_id'] = message_thread_id
             queued_kwargs['api_kwargs'] = api_kwargs
-        return self._call_direct_operation("send_chat_action", args, queued_kwargs)
+
+        chat_id = self._normalize_telegram_chat_id(
+            self._queued_chat_id_argument("send_chat_action", args, queued_kwargs)
+        )
+        key = (None, chat_id)
+        now = time.monotonic()
+        with self._get_bot_chat_state_lock():
+            if self._bot_chat_disabled_until.get(key, 0.0) > now:
+                return False
+        try:
+            return self._call_direct_operation("send_chat_action", args, queued_kwargs)
+        except telegram.error.RetryAfter as error:
+            retry_at = time.monotonic() + self._retry_after_seconds(error)
+            with self._get_bot_chat_state_lock():
+                self._bot_chat_disabled_until[key] = max(
+                    self._bot_chat_disabled_until.get(key, 0.0), retry_at
+                )
+            return False
 
     @Decorators.retry_on_chat_migration
     def edit_message_reply_markup(self, *args, **kwargs):

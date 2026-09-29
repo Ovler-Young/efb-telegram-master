@@ -148,6 +148,10 @@ class InvalidQueuedPayloadError(QueueError):
     pass
 
 
+class MissingQueuedExternalMediaError(InvalidQueuedPayloadError):
+    pass
+
+
 class RequiredSenderUnavailableError(QueueError):
     pass
 
@@ -993,6 +997,11 @@ class OutboundQueue:
     def _restore_media_references(self, value: object, opened: list[object]) -> object:
         if isinstance(value, _StoredMediaSnapshot):
             if value.external_uri is not None:
+                external_path = self._local_media_path(value.external_uri)
+                if external_path is None or not external_path.is_file():
+                    raise MissingQueuedExternalMediaError(
+                        f"Queued external media file {value.external_uri!r} is missing."
+                    )
                 return value.external_uri
             if value.storage_name is None:
                 raise InvalidQueuedPayloadError("Queued media reference has no storage path.")
@@ -1157,12 +1166,8 @@ class OutboundQueue:
                                 f"Queued media file {item.storage_name!r} is missing; row retained."
                             )
                         referenced.add(item.storage_name)
-                    elif item.cleanup_external and item.external_uri is not None:
-                        external = self._local_media_path(item.external_uri)
-                        if external is None or not external.is_file():
-                            raise QueuePersistenceError(
-                                "Queued external media file is missing; row retained."
-                            )
+                    # Temporary external files may be cleaned on restart. Dispatch
+                    # validates them and discards only the affected queue row.
         except sqlite3.Error:
             return
         try:
@@ -2553,6 +2558,20 @@ class OutboundQueueScheduler:
                     else:
                         row = self.queue.load_queued(row.id)
                     args, kwargs = self.queue.decode_payload(row.payload)
+                except MissingQueuedExternalMediaError as error:
+                    self._permits.release()
+                    try:
+                        self.queue.delete(row.id)
+                    except Exception as delete_error:
+                        self._stop_for_persistence_error(delete_error)
+                        return
+                    self._record_terminal_discard(row)
+                    self._row_not_before.pop(row.id, None)
+                    self._record_dispatch("failed")
+                    if self.queue.metrics is not None:
+                        self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
+                    self.queue.fail_waiter(row.id, error)
+                    continue
                 except InvalidQueuedPayloadError as error:
                     self._permits.release()
                     try:
