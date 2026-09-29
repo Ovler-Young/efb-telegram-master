@@ -44,6 +44,29 @@ def test_slave_message_reaction_footer(slave):
     assert not footer
 
 
+def test_mock_slave_message_keeps_file_snapshot_after_producer_closes(slave, tmp_path):
+    source = tmp_path / "photo.png"
+    source.write_bytes(b"image-bytes")
+    original = Message(
+        chat=slave.chat_with_alias,
+        author=slave.chat_with_alias.self,
+        type=MsgType.Image,
+        file=source.open("rb"),
+        filename=source.name,
+        mime="image/png",
+    )
+
+    slave.send_message(original)
+    original.file.close()
+    queued = slave.messages.get_nowait()
+
+    assert queued is not original
+    assert queued.filename == "photo.png"
+    assert queued.mime == "image/png"
+    assert queued.file is not None
+    assert queued.file.read() == b"image-bytes"
+
+
 @fixture(scope="module")
 def generate_message_template(channel):
     return channel.slave_messages.generate_message_template

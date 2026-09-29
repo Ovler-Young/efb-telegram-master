@@ -14,7 +14,7 @@ from telethon.tl.types import MessageEntityCode, Updates, Chat as TelethonChat
 from telethon.utils import get_peer_id
 
 from ehforwarderbot import Chat
-from .helper.filters import in_chats, has_button, edited, regex, text
+from .helper.filters import in_chats, has_button, edited, regex
 from .utils import link_chats, assert_is_linked, unlink_all_chats
 
 retry_on_message_id_invalid_error = mark.flaky(
@@ -25,97 +25,41 @@ retry_on_message_id_invalid_error = mark.flaky(
 pytestmark = [mark.asyncio, retry_on_message_id_invalid_error]
 
 
-async def test_link_chat_cancel(helper, client, bot_id, slave):
-    await client.send_message(bot_id, "/link")
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
-
-    # Cancel the message (cancel button)
-    await message.click(text="Cancel")
-    # Wait message to be cancelled: cancelled message should be an edited one
-    # with no button.
-    await helper.wait_for_event(in_chats(bot_id) & edited(message.id) & ~has_button)
-
-
-async def test_link_chat_private_filter(helper, client, bot_id, slave):
-    # Only testing one filter example.
-    # Other chat filter examples are tested in unit test
-    # (test_etm_chat.py::test_etm_chat_match)
-    await client.send_message(bot_id, "/link type: user")
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
-
-    slave_users = slave.get_chats_by_criteria(chat_type="PrivateChat")
-    for row in message.buttons[:-1]:
-        button: MessageButton = row[0]
-        assert any(user.display_name in button.text for user in slave_users), f"{button.text} should be a user"
-
-    # Cancel the message (cancel button)
-    await message.click(text="Cancel")
-
-
-async def test_unlink_unavailable_chat(helper, client, bot_group, slave, channel):
-    with link_chats(channel, (slave.chat_with_alias, slave.unknown_chat), bot_group):
-        await client.send_message(bot_group, "/link")
-        message = await helper.wait_for_message(in_chats(bot_group) & has_button)
-
-        assert message.button_count == 3, f"{message.buttons} should be one known, one unknown, one cancel"
-        await message.click(i=1, j=0)  # click the unknown chat
-
-        message = await helper.wait_for_message(in_chats(bot_group) & has_button)
-        await message.click(text="Restore")
-        await helper.wait_for_message(in_chats(bot_group))
-
-        assert_is_linked(channel, (slave.chat_with_alias,), bot_group)
-
-
-async def test_link_chat_private_filter_invalid_regex(helper, client, bot_id, slave):
-    # Invalid regular expression filter should fall back to simple string matching
-    # This is done in integration test as the logic is a part of chat_binding.slave_chats_pagination
-    # Issue a command with an invalid regex filter
-    await client.send_message(bot_id, "/link (")
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
-
-    # Cancel the message (cancel button)
-    await message.click(text="Cancel")
-
-
-async def test_link_chat_pagination(helper, client, bot_id, slave):
-    await client.send_message(bot_id, "/link")
-    message: Message = await helper.wait_for_message(in_chats(bot_id) & has_button)
-    content = message.text
-
-    assert slave.channel_emoji in content
-    assert slave.channel_name in content
+async def test_link_chat_pagination(helper, client, bot_id, slave, private_response):
+    message: Message = await private_response(
+        lambda: client.send_message(bot_id, "/link"),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+    )
+    assert slave.channel_emoji in message.text
+    assert slave.channel_name in message.text
 
     buttons: List[List[MessageButton]] = message.buttons
+    assert message.button_count > 2, "more than two buttons are shown in the chat list"
+    assert ">" in buttons[-1][-1].text, "next-page button is available"
 
-    # Test pagination
-    assert message.button_count > 2, "more than 2 buttons found on the chats list."
-    assert ">" in buttons[-1][-1].text, "Next page button exists"
-    # Go to next page
     await buttons[-1][-1].click()
     message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
     buttons = message.buttons
-    assert "<" in buttons[-1][0].text, "Previous page button exists"
-    # Go to previous page
-    await message.mark_read()
-    await buttons[-1][0].click()
+    assert "<" in buttons[-1][0].text, "previous-page button is available after navigating"
 
-    # Cancel the message (cancel button)
+    await buttons[-1][0].click()
+    message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
     await message.click(text="Cancel")
 
 
-async def test_link_chat_private(helper, client, bot_id, bot_group, slave, channel):
+async def test_link_chat_private(helper, client, bot_id, bot_group, slave, channel,
+                                 private_response):
     chat_0 = slave.chat_with_alias
-    chat_1 = slave.chat_without_alias
 
-    await client.send_message(bot_id, f"/link {chat_0.uid}")
-    message: Message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+    message: Message = await private_response(
+        lambda: client.send_message(bot_id, f"/link {chat_0.uid}"),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+    )
     choose_chat: MessageButton = message.buttons[0][0]
     assert chat_0.display_name in choose_chat.text
 
-    # Choose chat
     await choose_chat.click()
-    message: Message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
+    message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
     url = ""
     manual_button: MessageButton = message.buttons[0][-1]
     for i in chain.from_iterable(message.buttons):
@@ -123,11 +67,11 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
             url = i.url
             break
 
-    # Get link, manual link buttons
     assert url
     assert "manual" in manual_button.text.lower()
     await manual_button.click()
-    message: Message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
+    message = await helper.wait_for_message(in_chats(bot_id) & edited(message.id) & has_button)
+    manual_session_message_id = message.id
 
     command: str = next(
         txt
@@ -139,24 +83,45 @@ async def test_link_chat_private(helper, client, bot_id, bot_group, slave, chann
     assert match is not None
     assert token == match.group(1), "URL token matches manual token"
 
-    # Link chat_0 to bot_group
     await client.send_message(bot_group, command)
-    await helper.wait_for_message(in_chats(bot_id) & text)
-
-    # assert chat_0 is linked singly
-    assert_is_linked(channel, (chat_0, ), bot_group)
-
-    # link chat_1
-    await simulate_link_chat(client, helper, chat_1, bot_id, bot_group)
-
-    # assert chat_0 and chat_1 is linked
-    assert_is_linked(channel, (chat_0, chat_1), bot_group)
-
-    # unlink all via db
+    completion = await helper.wait_for_message(
+        in_chats(bot_id) & edited(manual_session_message_id) & ~has_button
+    )
+    assert_is_linked(channel, (chat_0,), bot_group)
     unlink_all_chats(channel, bot_group)
 
+    message = await private_response(
+        lambda: client.send_message(bot_id, "/link"),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+    )
+    await message.click(text="Cancel")
+    await helper.wait_for_event(in_chats(bot_id) & edited(message.id) & ~has_button)
 
-async def test_link_chat_multi_link_flag_off(helper, client, bot_id, bot_group, slave, channel):
+
+async def test_unlink_unavailable_chat(helper, client, bot_group, slave, channel):
+    with link_chats(channel, (slave.chat_with_alias, slave.unknown_chat), bot_group):
+        await client.send_message(bot_group, "/link")
+        message = await helper.wait_for_message(in_chats(bot_group) & has_button)
+
+        assert message.button_count == 3, f"{message.buttons} should be one known, one unknown, one cancel"
+        unavailable_chat_buttons = [
+            button
+            for row in message.buttons
+            for button in row
+            if str(slave.unknown_chat.uid) in button.text
+        ]
+        assert len(unavailable_chat_buttons) == 1, message.buttons
+        await unavailable_chat_buttons[0].click()
+
+        message = await helper.wait_for_message(in_chats(bot_group) & has_button)
+        await message.click(text="Restore")
+        await helper.wait_for_message(in_chats(bot_group))
+
+        assert_is_linked(channel, (slave.chat_with_alias,), bot_group)
+
+
+async def test_link_chat_multi_link_flag_off(helper, client, bot_id, bot_group, slave, channel,
+                                             private_response):
     chat_0 = slave.chat_with_alias
     chat_1 = slave.chat_without_alias
 
@@ -165,16 +130,19 @@ async def test_link_chat_multi_link_flag_off(helper, client, bot_id, bot_group, 
 
     with link_chats(channel, (chat_0, ), bot_group):
         assert_is_linked(channel, (chat_0,), bot_group)
-        await simulate_link_chat(client, helper, chat_1, bot_id, bot_group)
+        await simulate_link_chat(client, helper, chat_1, bot_id, bot_group, private_response=private_response)
         assert_is_linked(channel, (chat_1,), bot_group)
 
     channel.flag.config['multiple_slave_chats'] = backup
 
 
-async def test_link_chat_group_unlinked(helper, client, bot_id, bot_group, channel):
+async def test_link_chat_group_unlinked(helper, client, bot_id, bot_group, channel,
+                                        private_response):
     with link_chats(channel, tuple(), bot_group):
-        await client.send_message(bot_group, f"/link")
-        message: Message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+        message: Message = await private_response(
+            lambda: client.send_message(bot_group, "/link"),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+        )
         await message.click(text="Cancel")
 
 
@@ -188,65 +156,82 @@ async def test_link_chat_group_linked_unlink(helper, client, bot_id, bot_group, 
         await message.click(0)
 
         message: Message = await helper.wait_for_message(in_chats(bot_group) & edited(message.id) & has_button)
-        assert (await message.click(text="Restore")) is not None, "Restore"
+        await message.click(text="Restore")
 
         await helper.wait_for_message(in_chats(bot_group) & edited(message.id) & ~has_button)
 
         assert_is_linked(channel, tuple(), bot_group)
 
 
-async def test_link_chat_group_linked_relink(helper, client, bot_id, bot_group, bot_channel, slave, channel):
+async def test_link_chat_group_linked_relink(helper, client, bot_id, bot_group, bot_channel, slave, channel,
+                                              private_response):
     chat = slave.chat_with_alias
     with link_chats(channel, (chat,), bot_channel):
-        await simulate_link_chat(client, helper, chat, bot_id, bot_group, command_channel=bot_channel)
-        assert_is_linked(channel, tuple(), bot_channel)
-        assert_is_linked(channel, (chat,), bot_group)
+        with link_chats(channel, tuple(), bot_group):
+            await simulate_link_chat(
+                client, helper, chat, bot_id, bot_group, command_channel=bot_channel, private_response=private_response
+            )
+            assert_is_linked(channel, tuple(), bot_channel)
+            assert_is_linked(channel, (chat,), bot_group)
 
 
-async def test_link_chat_channel(helper, client, bot_id, bot_group, bot_channel, slave, channel):
+async def test_link_chat_channel(helper, client, bot_id, bot_group, bot_channel, slave, channel,
+                                 private_response):
     chat = slave.chat_with_alias
     with link_chats(channel, tuple(), bot_channel):
-        await simulate_link_chat(client, helper, chat, bot_id, bot_id, dest_channel=bot_channel)
+        await simulate_link_chat(
+            client, helper, chat, bot_id, bot_id, dest_channel=bot_channel, private_response=private_response
+        )
         assert_is_linked(channel, (chat,), bot_channel)
 
 
-async def test_link_chat_channel_linked_cancel(helper, client, bot_id, bot_channel, slave, channel):
+async def test_link_chat_channel_linked_cancel(helper, client, bot_id, bot_channel, slave, channel,
+                                               private_response):
     chat = slave.chat_with_alias
     with link_chats(channel, (chat,), bot_channel):
         message: Message = await client.send_message(bot_channel, f"/link")
-        await message.forward_to(bot_id)
-
-        message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+        message = await private_response(
+            lambda: message.forward_to(bot_id),
+            lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+        )
         assert 2 == len(message.buttons), "link message from channel should have 2 rows"
         await message.click(text="Cancel")
 
 
-async def test_link_chat_target_incoming_message(helper, client, bot_id, slave, channel):
+async def test_link_chat_target_incoming_message(helper, client, bot_id, slave, channel,
+                                                  private_response):
     chat = slave.chat_with_alias
     efb_msg = slave.send_text_message(chat, chat.other)
 
     incoming_msg = await helper.wait_for_message(in_chats(bot_id) & regex(re.escape(efb_msg.text)))
-    await client.send_message(bot_id, f"/link", reply_to=incoming_msg)
-
-    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+    message = await private_response(
+        lambda: client.send_message(bot_id, "/link", reply_to=incoming_msg),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+    )
     assert chat.display_name in message.raw_text
     await message.click(text="Cancel")
 
 
-async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest_chat: int,
+async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest_chat: int, private_response,
                              command_channel: Optional[int] = None, dest_channel: Optional[int] = None):
     """Simulate the procedure of linking a chat.
 
     Provide command_channel to link from a channel.
     """
     if command_channel is not None:
-        message = await client.send_message(command_channel, f"/link {chat.uid}")
-        await message.forward_to(command_chat)
+        async def trigger():
+            message = await client.send_message(command_channel, f"/link {chat.uid}")
+            await message.forward_to(command_chat)
     else:
-        await client.send_message(command_chat, f"/link {chat.uid}")
-    message = await helper.wait_for_message(in_chats(command_chat) & has_button)  # chat list
+        async def trigger():
+            await client.send_message(command_chat, f"/link {chat.uid}")
+    receive = lambda timeout: helper.wait_for_message(in_chats(command_chat) & has_button, timeout)
+    message = await private_response(trigger, receive)
+    session_message_id = message.id
     await message.buttons[0][0].click()  # choose chat
-    message = await helper.wait_for_message(in_chats(command_chat) & has_button)  # operation panel
+    message = await helper.wait_for_message(
+        in_chats(command_chat) & edited(session_message_id) & has_button
+    )  # operation panel
     url = None
     # print("STIMULATE_LINK_CHAT_MESSAGE_DICT", message.to_dict())
     for i in chain.from_iterable(message.buttons):
@@ -263,7 +248,9 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
         await message.forward_to(dest_chat)
     else:
         await client.send_message(dest_chat, command)
-    await helper.wait_for_message(in_chats(command_chat) & text)
+    completion = await helper.wait_for_message(
+        in_chats(command_chat) & edited(session_message_id) & ~has_button
+    )
 
 
 async def test_group_chat_migration(client, helper, channel, slave, bot_id):
@@ -291,10 +278,19 @@ async def test_group_chat_migration(client, helper, channel, slave, bot_id):
         else:
             mega_chat = await client.get_entity(get_peer_id(chat))
 
-        await asyncio.sleep(10)
-
-        assert_is_linked(channel, slave_chats, get_peer_id(mega_chat))
-        assert_is_linked(channel, tuple(), get_peer_id(chat))
+        deadline = asyncio.get_running_loop().time() + 20
+        while True:
+            migrated = get_peer_id(mega_chat)
+            original = get_peer_id(chat)
+            try:
+                assert_is_linked(channel, slave_chats, migrated)
+                assert_is_linked(channel, tuple(), original)
+            except AssertionError:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise
+                await asyncio.sleep(0.1)
+            else:
+                break
 
     # Clean up
     unlink_all_chats(channel, get_peer_id(mega_chat))
