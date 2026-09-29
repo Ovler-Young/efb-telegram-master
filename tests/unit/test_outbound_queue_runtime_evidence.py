@@ -1764,3 +1764,97 @@ def test_initialization_failure_rolls_back_closes_and_retains_queue_file(
     assert len(InitializationFailureConnection.instances) == 1
     with pytest.raises(sqlite3.ProgrammingError):
         InitializationFailureConnection.instances[0].execute("SELECT 1")
+
+
+def test_blocking_send_receipt_keeps_actual_auxiliary_sender_after_deferred_dispatch(
+    retained_queue: OutboundQueue,
+) -> None:
+    class DeferredMainLimiter:
+        def peek_delay(self, _chat_id: int) -> float:
+            return 1.0
+
+        def try_acquire(self, _chat_id: int) -> bool:
+            raise AssertionError("the unavailable main bot must not dispatch")
+
+    def main_send_message(chat_id: int, text: str) -> object:
+        raise AssertionError("the unavailable main bot must not dispatch")
+
+    def main_edit_message_text(chat_id: int, message_id: int, text: str) -> object:
+        raise AssertionError("the unavailable main bot must not dispatch")
+
+    def auxiliary_send_message(chat_id: int, text: str) -> object:
+        return SimpleNamespace(message_id=91, chat=SimpleNamespace(id=chat_id))
+
+    def auxiliary_edit_message_text(chat_id: int, message_id: int, text: str) -> object:
+        return SimpleNamespace(message_id=message_id, chat=SimpleNamespace(id=chat_id))
+
+    main = SimpleNamespace(
+        send_message=main_send_message,
+        edit_message_text=main_edit_message_text,
+    )
+    auxiliary_bot = SimpleNamespace(
+        send_message=auxiliary_send_message,
+        edit_message_text=auxiliary_edit_message_text,
+    )
+    auxiliary = _required_auxiliary(auxiliary_bot)
+    manager = manager_adapter()
+    manager._bot = main
+    manager._rate_limiter = DeferredMainLimiter()
+    manager.bot_pool = BotPool([auxiliary], manager)
+    manager._outbound_queue = retained_queue
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+    manager._outbound_scheduler = scheduler
+    manager._queue_operation = lambda operation: getattr(manager._bot, operation)
+
+    receipt: list[object] = []
+    errors: list[BaseException] = []
+
+    def send() -> None:
+        try:
+            receipt.append(manager.send_message(chat_id=67, text="queued"))
+        except BaseException as error:
+            errors.append(error)
+
+    sender = threading.Thread(target=send)
+    sender.start()
+    for _ in range(100):
+        if retained_queue.heads():
+            break
+        threading.Event().wait(0.001)
+    assert not errors
+    assert retained_queue.heads()
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    submitted = next(iter(scheduler.in_flight.values()))
+    assert submitted.selection.sender_bot_id == "10"
+    result = SimpleNamespace(message_id=91, chat=SimpleNamespace(id=67))
+    executor.submissions[0][2].set_result(result)
+    scheduler.harvest_completed()
+    sender.join(timeout=1)
+
+    assert not sender.is_alive()
+    assert receipt[0].message is result
+    assert receipt[0].sender_bot_id == "10"
+
+    edit_receipt: list[object] = []
+    editor = threading.Thread(target=lambda: edit_receipt.append(manager.edit_message_text(
+        chat_id=67, message_id=91, text="updated", _sender_bot_id=receipt[0].sender_bot_id,
+    )))
+    editor.start()
+    for _ in range(100):
+        if retained_queue.heads():
+            break
+        threading.Event().wait(0.001)
+    assert retained_queue.heads()
+
+    scheduler.dispatch_once()
+    edited = next(iter(scheduler.in_flight.values()))
+    assert edited.selection.sender_bot_id == "10"
+    executor.submissions[1][2].set_result(result)
+    scheduler.harvest_completed()
+    editor.join(timeout=1)
+
+    assert not editor.is_alive()
+    assert edit_receipt[0].message is result
