@@ -689,7 +689,13 @@ class OutboundQueue:
         if not self._needs_media_snapshot(thumbnail):
             return kwargs
         normalized_kwargs = dict(kwargs)
-        normalized_kwargs["thumbnail"] = self._snapshot_media_value(thumbnail, cleanup_files)
+        snapshot = self._snapshot_media_value(thumbnail, cleanup_files)
+        if isinstance(snapshot, _StoredMediaSnapshot) and not snapshot.input_file:
+            attachment = InputFile(b"", attach=True)
+            snapshot = replace(
+                snapshot, input_file=True, attach_name=attachment.attach_name
+            )
+        normalized_kwargs["thumbnail"] = snapshot
         return normalized_kwargs
 
     def _normalize_keyword_media(
@@ -736,11 +742,9 @@ class OutboundQueue:
                     f"Queued media file {value.storage_name!r} is missing."
                 ) from error
             stream = _NamedMediaFile(raw, value.filename)
-            if not value.input_file:
-                return stream
             input_file = InputFile(
                 stream,
-                filename=value.filename,
+                filename=value.filename or "file",
                 attach=value.attach_name is not None,
                 read_file_handle=False,
             )
