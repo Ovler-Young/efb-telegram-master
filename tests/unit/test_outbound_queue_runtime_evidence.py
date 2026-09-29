@@ -311,12 +311,12 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     assert [row.id for row in retained_queue.heads()] == [first_id]
     assert len(executor.submissions) == 1
     first_media = executor.submissions[0][1][1][1]
-    assert first_media.tell() == 0
-    assert first_media.read() == b"retry media"
+    assert first_media.input_file_content.tell() == 0
+    assert first_media.input_file_content.read() == b"retry media"
 
     retry_after = RetryAfter(10)
     executor.submissions[0][2].set_exception(retry_after)
-    assert first_media.closed
+    assert first_media.input_file_content.closed
     scheduler.harvest_completed()
     assert scheduler.wake_event.is_set()
     assert not first_waiter.done()
@@ -339,12 +339,12 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     assert executor.submissions[1][1][0].id == first_id
     retry_media = executor.submissions[1][1][1][1]
     assert retry_media is not first_media
-    assert retry_media.tell() == 0
-    assert retry_media.read() == b"retry media"
+    assert retry_media.input_file_content.tell() == 0
+    assert retry_media.input_file_content.read() == b"retry media"
     assert [row.id for row in retained_queue.heads()] == [first_id]
 
     executor.submissions[1][2].set_result("sent")
-    assert retry_media.closed
+    assert retry_media.input_file_content.closed
     scheduler.harvest_completed()
     assert first_waiter.result() == "sent"
     assert [row.id for row in retained_queue.heads()] == [second_id]
@@ -406,8 +406,8 @@ def test_video_cover_retry_reconstructs_a_fresh_offset_zero_value(
 
     scheduler.dispatch_once()
     first_cover = executor.submissions[0][1][2]["cover"]
-    assert first_cover.tell() == 0
-    assert first_cover.read() == b"retry cover"
+    assert first_cover.input_file_content.tell() == 0
+    assert first_cover.input_file_content.read() == b"retry cover"
     executor.submissions[0][2].set_exception(RetryAfter(10))
     scheduler.harvest_completed()
 
@@ -416,8 +416,8 @@ def test_video_cover_retry_reconstructs_a_fresh_offset_zero_value(
     retry_cover = executor.submissions[1][1][2]["cover"]
     assert executor.submissions[1][1][0].id == row_id
     assert retry_cover is not first_cover
-    assert retry_cover.tell() == 0
-    assert retry_cover.read() == b"retry cover"
+    assert retry_cover.input_file_content.tell() == 0
+    assert retry_cover.input_file_content.read() == b"retry cover"
 
     executor.submissions[1][2].set_result("sent")
     scheduler.harvest_completed()
@@ -448,8 +448,8 @@ def test_nested_local_media_reopen_and_retry_reconstruct_distinct_offset_zero_va
     row = reopened.heads()[0]
     reopen_media = reopened.decode_payload(row.payload)[0][1][0].media
     assert row.id == row_id
-    assert reopen_media.tell() == 0
-    assert reopen_media.read() == b"nested retry media"
+    assert reopen_media.input_file_content.tell() == 0
+    assert reopen_media.input_file_content.read() == b"nested retry media"
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(
         reopened, manager_adapter(), executor, worker_count=1
@@ -460,8 +460,8 @@ def test_nested_local_media_reopen_and_retry_reconstruct_distinct_offset_zero_va
     scheduler.dispatch_once()
     first_media = executor.submissions[0][1][1][1][0].media
     assert first_media is not reopen_media
-    assert first_media.tell() == 0
-    assert first_media.read() == b"nested retry media"
+    assert first_media.input_file_content.tell() == 0
+    assert first_media.input_file_content.read() == b"nested retry media"
     executor.submissions[0][2].set_exception(RetryAfter(10))
     scheduler.harvest_completed()
 
@@ -470,8 +470,8 @@ def test_nested_local_media_reopen_and_retry_reconstruct_distinct_offset_zero_va
     retry_media = executor.submissions[1][1][1][1][0].media
     assert retry_media is not first_media
     assert retry_media is not reopen_media
-    assert retry_media.tell() == 0
-    assert retry_media.read() == b"nested retry media"
+    assert retry_media.input_file_content.tell() == 0
+    assert retry_media.input_file_content.read() == b"nested retry media"
     executor.submissions[1][2].set_result("sent")
     scheduler.harvest_completed()
     assert reopened.heads() == []
