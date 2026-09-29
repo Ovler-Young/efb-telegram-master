@@ -24,7 +24,7 @@ from efb_telegram_master.bot_manager import (
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import (
-    OutboundQueue, QueueEnqueueError, QueuePersistenceError, QueueRequest, SenderSelection,
+    OutboundQueue, QueueEnqueueError, QueuePersistenceError, QueueRequest, QueuedDeliveryResult, SenderSelection,
 )
 
 
@@ -38,11 +38,19 @@ def _bind_blocking_enqueue_helper(manager):
                                             db_log_context=None):
             queued_args = args[1:] if args and args[0] is manager else args
             result = manager.execute_queued_call(
-                SimpleNamespace(operation=fn.__name__),
+                SimpleNamespace(operation=fn.__name__, slave_id=slave_id),
                 queued_args,
                 kwargs,
                 SenderSelection(sender=manager._bot, sender_bot_id=None),
             )
+            if isinstance(result, QueuedDeliveryResult):
+                supplement = result.supplement
+                manager.execute_queued_call(
+                    SimpleNamespace(operation=supplement.operation, slave_id=slave_id),
+                    supplement.args, supplement.kwargs,
+                    SenderSelection(sender=manager._bot, sender_bot_id=None),
+                )
+                result = result.result
             sender_bot_id = None
             required_sender = kwargs.get("_required_sender_bot_id")
             if required_sender not in {None, "__main__"}:
@@ -496,13 +504,14 @@ def test_queued_execution_sends_full_oversized_content_as_attachment_for_positio
     sender.send_photo.return_value = SimpleNamespace(message_id=7)
 
     result = manager.execute_queued_call(
-        SimpleNamespace(operation=operation),
+        SimpleNamespace(operation=operation, slave_id="slave.chat"),
         queued_args,
         queued_kwargs,
-        SimpleNamespace(sender=sender),
+        SenderSelection(sender=sender, sender_bot_id=None),
     )
 
-    assert result.message_id == 7
+    assert isinstance(result, QueuedDeliveryResult)
+    assert result.result.message_id == 7
     sender_call = getattr(sender, operation).call_args
     if content_key in sender_call.kwargs:
         effective_content = sender_call.kwargs[content_key]
@@ -511,10 +520,12 @@ def test_queued_execution_sends_full_oversized_content_as_attachment_for_positio
     assert effective_content == full_content[:100] + "\n...\n" + full_content[-100:]
     assert "prefix" not in sender_call.kwargs
     assert "suffix" not in sender_call.kwargs
-    attachment = sender.send_document.call_args.args[1]
-    assert attachment.getvalue() == full_content.encode("utf-8")
-    assert "prefix" not in sender.send_document.call_args.kwargs
-    assert "suffix" not in sender.send_document.call_args.kwargs
+    assert result.supplement.operation == "send_document"
+    assert result.supplement.kwargs["document"] == full_content.encode("utf-8")
+    assert result.supplement.kwargs["_slave_id"] == "slave.chat"
+    assert result.supplement.kwargs["reply_to_message_id"] == 7
+    assert result.receipt
+    sender.send_document.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -659,11 +670,11 @@ def test_queued_edit_overflow_attaches_the_actual_prepared_content(
     sender = Mock()
     getattr(sender, operation).return_value = SimpleNamespace(message_id=789)
 
-    manager.execute_queued_call(
-        SimpleNamespace(operation=operation),
+    result = manager.execute_queued_call(
+        SimpleNamespace(operation=operation, slave_id=None),
         queued_args,
         queued_kwargs,
-        SimpleNamespace(sender=sender),
+        SenderSelection(sender=sender, sender_bot_id=None),
     )
 
     raw_call = getattr(sender, operation).call_args
@@ -672,9 +683,12 @@ def test_queued_edit_overflow_attaches_the_actual_prepared_content(
     if operation == "edit_message_caption" and positional:
         assert raw_call.args[2] == "inline-positional"
     _assert_raw_ptb_kwargs(raw_call.kwargs)
-    attachment = sender.send_document.call_args.args[1]
-    assert attachment.getvalue() == full_content.encode("utf-8")
-    _assert_raw_ptb_kwargs(sender.send_document.call_args.kwargs)
+    assert isinstance(result, QueuedDeliveryResult)
+    assert result.supplement.operation == "send_document"
+    assert result.supplement.kwargs["document"] == full_content.encode("utf-8")
+    assert result.supplement.kwargs["reply_to_message_id"] == 789
+    assert result.receipt
+    sender.send_document.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -6,22 +6,25 @@ import collections
 import collections.abc
 from enum import Enum
 import html
-import io
 import logging
 import numbers
 import os
 import pickle
 import re
+import tempfile
 import threading
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import wraps
-from typing import TYPE_CHECKING, Callable, Collection, Coroutine, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Collection, Coroutine, Iterator, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
 from unittest.mock import Mock, patch
 
+import httpx
 import telegram.constants
 import telegram.error
 from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, InputMedia, Update, User
@@ -35,12 +38,20 @@ from .bot_pool import BotPool
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
 from .outbound import (
+    HISTORY_REPLAY_KEY,
+    SUPPLEMENTAL_KEY,
+    QueuedDeliveryResult,
+    HISTORY_SOURCE_PREFIX,
     OutboundQueue,
     OutboundQueueScheduler,
     QUEUED_OPERATIONS,
+    RETAINED_OPERATIONS,
+    transport_definitely_not_sent,
     QueueEnqueueError,
     QueuePersistenceError,
+    InvalidTelegramResponseError,
     QueueRequest,
+    RequiredSenderUnavailableError,
     SchedulerStoppedError,
     SenderSelection,
     SenderSelectionResult,
@@ -55,6 +66,7 @@ BotChatKey: TypeAlias = Tuple[Optional[str], int]
 class QueuedCompletionKind(str, Enum):
     RETRY_EVENTUAL = "retry_eventual"
     TERMINAL_FAILURE = "terminal_failure"
+    DELIVERY_UNCERTAIN = "delivery_uncertain"
     SUCCESS = "success"
 
 
@@ -73,6 +85,10 @@ class QueuedChatMigrationRetry(Exception):
     def __init__(self, message: str, retry_delay: float = 0.0):
         super().__init__(message)
         self.retry_delay = retry_delay
+
+
+class HistoryMediaAcquisitionError(Exception):
+    """Saved media could not be acquired; no fallback send was attempted."""
 
 
 class QueuedDbLogContext(NamedTuple):
@@ -100,6 +116,8 @@ _INTERNAL_KWARGS = frozenset({
     '_force_main_bot',
     '_required_sender_bot_id',
     '_queued_db_log_context',
+    HISTORY_REPLAY_KEY,
+    SUPPLEMENTAL_KEY,
 })
 
 
@@ -1106,6 +1124,7 @@ class TelegramBotManager(LocaleMixin):
         requests: list[QueueRequest],
         *,
         db_log_context: Optional[QueuedDbLogContext] = None,
+        history_keys: Collection[str] = (),
     ) -> tuple[str, Future]:
         with self._outbound_scheduler._lock:
             if self._outbound_scheduler.stopping:
@@ -1127,7 +1146,7 @@ class TelegramBotManager(LocaleMixin):
                     for request in requests
                 ]
             row_id, waiter = self._outbound_queue.enqueue_many(
-                durable_requests, self._queue_operation
+                durable_requests, self._queue_operation, history_keys=history_keys
             )
             if db_log_context is not None:
                 with self._queued_db_log_context_lock:
@@ -1242,12 +1261,34 @@ class TelegramBotManager(LocaleMixin):
         args: tuple,
         kwargs: Mapping[str, object],
         history_entry_ids: Collection[int],
+        history_keys: Collection[str] = (),
     ) -> Future:
-        del source_key, target_chat_id, history_entry_ids
+        del target_chat_id
         request_kwargs = dict(kwargs)
+        source_sender = request_kwargs.pop('_required_sender_bot_id', None)
+        metadata = request_kwargs.get(HISTORY_REPLAY_KEY)
+        if metadata is not None and not isinstance(metadata, dict):
+            raise QueueEnqueueError("History replay metadata must be a mapping.")
+        replay = dict(metadata or {})
+        if source_sender is not None:
+            replay.setdefault('source_sender_bot_id', source_sender)
+        replay.update(source_key=source_key, entry_ids=list(history_entry_ids))
+        request_kwargs[HISTORY_REPLAY_KEY] = replay
+        request_kwargs["_slave_id"] = HISTORY_SOURCE_PREFIX + source_key
         request_kwargs["_send_mode"] = "eventual"
-        _row_id, waiter = self._enqueue_requests([QueueRequest(operation, args, request_kwargs)])
+        _row_id, waiter = self._enqueue_requests(
+            [QueueRequest(operation, args, request_kwargs)], history_keys=history_keys
+        )
         return waiter
+
+    def history_ownership_page(self, after: str = "", limit: int = 100) -> list[str]:
+        return self._outbound_queue.history_ownership_page(after, limit)
+
+    def owned_history_entries(self, keys: Collection[str]) -> set[str]:
+        return self._outbound_queue.owned_history_entries(keys)
+
+    def forget_history_entries(self, keys: Collection[str]) -> None:
+        self._outbound_queue.forget_history_entries(keys)
 
     def _enqueue_blocking_api_operation(
         self,
@@ -1281,10 +1322,19 @@ class TelegramBotManager(LocaleMixin):
             required_sender_bot_id="__main__",
         )
 
+    def _is_main_sender_id(self, sender_id: Optional[str]) -> bool:
+        me = getattr(self, 'me', None)
+        return sender_id == '__main__' or (
+            sender_id is not None and me is not None and sender_id == str(me.id)
+        )
+
     def select_sender(self, row, now: float) -> SenderSelectionResult:
         chat_id = row.telegram_chat_id
         required = row.required_sender_bot_id
-        if required == "__main__":
+        if row.slave_id and row.slave_id.startswith(HISTORY_SOURCE_PREFIX):
+            # Older replays stored the acquisition bot here, not a send constraint.
+            required = None
+        if self._is_main_sender_id(required):
             return self._select_available_sender(SenderSelection(self._bot, None), chat_id, now)
         if required is not None:
             auxiliary = self.bot_pool.get_bot_by_id(required) if self.bot_pool else None
@@ -1410,12 +1460,73 @@ class TelegramBotManager(LocaleMixin):
         content = kwargs.get(content_key)
         return (content, False) if isinstance(content, str) else (None, False)
 
+    @staticmethod
+    def _queued_full_content(
+        operation: str, args: tuple, kwargs: Mapping[str, object],
+    ) -> Optional[tuple[str, int, str, bool]]:
+        content_spec = {
+            "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
+            "edit_message_text": ("text", 0, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
+            "send_audio": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_voice": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_video": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_document": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_animation": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "send_photo": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+            "edit_message_caption": ("caption", 3, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
+        }.get(operation)
+        if content_spec is None:
+            return None
+        content_key, content_index, content_limit = content_spec
+        content, positional = TelegramBotManager._queued_content_argument(args, kwargs, content_key, content_index)
+        if content is None or len(content) < content_limit:
+            return None
+        return content_key, content_index, content, positional
+
+    def _queued_completion_result(
+        self, row, args: tuple, kwargs: dict, result: object, selection: SenderSelection,
+    ) -> object:
+        content = self._queued_full_content(row.operation, args, kwargs)
+        if content is None:
+            return result
+        content_key, _index, full_content, _positional = content
+        parse_mode = str(kwargs.get("parse_mode", "")).lower()
+        attachment_content = full_content
+        if parse_mode == "html":
+            attachment_content = (
+                "<html><head><meta charset='utf-8'></head>"
+                "<body><pre style='white-space:pre-wrap'>" + full_content + "</pre></body></html>"
+            )
+        chat_id = self._queued_chat_id_argument(row.operation, args, kwargs)
+        message_id = getattr(result, "message_id", None)
+        if chat_id is None or isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            raise InvalidTelegramResponseError("Telegram returned no usable message ID for the full-content attachment.")
+        try:
+            receipt = self.encode_queued_completion_receipt(result, selection)
+        except QueuePersistenceError as error:
+            raise InvalidTelegramResponseError("Unable to preserve the primary Telegram response.") from error
+        extension = ".md" if parse_mode == "markdown" else ".html" if parse_mode == "html" else ".txt"
+        label = "Message" if content_key == "text" else "Caption"
+        return QueuedDeliveryResult(result, QueueRequest("send_document", (), {
+            "chat_id": chat_id,
+            "document": attachment_content.encode("utf-8"),
+            "filename": f"{chat_id}_{message_id}{extension}",
+            "reply_to_message_id": message_id,
+            "caption": f"{label} is truncated due to its length. Full message is sent as attachment.",
+            "_slave_id": row.slave_id,
+            SUPPLEMENTAL_KEY: True,
+            **({"message_thread_id": kwargs["message_thread_id"]} if "message_thread_id" in kwargs else {}),
+        }), receipt)
+
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
-        telegram_kwargs = self._strip_private_queue_metadata(kwargs)
-        telegram_args = args
+        telegram_kwargs = cast(dict, OutboundQueue.streaming_uploads(self._strip_private_queue_metadata(kwargs)))
+        telegram_args = cast(tuple, OutboundQueue.streaming_uploads(args))
         migration_retried = False
+        replay = kwargs.get(HISTORY_REPLAY_KEY)
+        if row.operation == "copy_message" and isinstance(replay, dict) and replay.get("attempted_fallback"):
+            self._outbound_queue.record_history_fallback(row.id, None)
 
         def call_method() -> object:
             nonlocal migration_retried, telegram_args, telegram_kwargs
@@ -1457,69 +1568,65 @@ class TelegramBotManager(LocaleMixin):
                     setattr(retry_error, "_etm_telegram_chat_id", error.new_chat_id)
                     raise
 
-        content_spec = {
-            "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
-            "edit_message_text": ("text", 0, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
-            "send_audio": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_voice": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_video": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_document": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_animation": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_photo": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "edit_message_caption": ("caption", 3, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-        }.get(row.operation)
-        attachment: Optional[io.BytesIO] = None
-        content_key: Optional[str] = None
-        original_parse_mode = str(telegram_kwargs.get("parse_mode", "")).lower()
-        if content_spec is not None:
-            content_key, content_index, content_limit = content_spec
-            full_content, is_positional = self._queued_content_argument(
-                telegram_args, telegram_kwargs, content_key, content_index
-            )
-            if full_content is not None and len(full_content) >= content_limit:
-                attachment_content = full_content
-                if original_parse_mode == "html":
-                    attachment_content = (
-                        "<html><head><meta charset='utf-8'></head>"
-                        "<body><pre style='white-space:pre-wrap'>"
-                        + full_content
-                        + "</pre></body></html>"
-                    )
-                attachment = io.BytesIO(attachment_content.encode("utf-8"))
-                truncated = full_content[:100] + "\n...\n" + full_content[-100:]
-                if is_positional:
-                    mutable_args = list(telegram_args)
-                    mutable_args[content_index] = truncated
-                    telegram_args = tuple(mutable_args)
-                else:
-                    telegram_kwargs[content_key] = truncated
+        full_args, full_kwargs = telegram_args, dict(telegram_kwargs)
+        content = self._queued_full_content(row.operation, telegram_args, telegram_kwargs)
+        if content is not None:
+            content_key, content_index, full_content, is_positional = content
+            truncated = full_content[:100] + "\n...\n" + full_content[-100:]
+            if is_positional:
+                mutable_args = list(telegram_args)
+                mutable_args[content_index] = truncated
+                telegram_args = tuple(mutable_args)
+            else:
+                telegram_kwargs[content_key] = truncated
         try:
             result = call_method()
         except telegram.error.BadRequest as error:
+            replay = kwargs.get(HISTORY_REPLAY_KEY)
+            # Only an explicit negative acknowledgment permits a second send.
+            # A missing response or timeout must keep using delivery uncertainty.
+            if (row.operation == 'copy_message' and isinstance(replay, dict)
+                    and error.message.lower() in {
+                'message to copy not found', "message can't be copied", 'message cannot be copied',
+                'chat not found',
+            }):
+                fallback_operation = replay.get('fallback_operation')
+                fallback_arguments = replay.get('fallback_kwargs')
+                if fallback_operation in {
+                    'send_photo', 'send_video', 'send_animation', 'send_document',
+                    'send_audio', 'send_voice', 'send_sticker',
+                } and isinstance(fallback_arguments, dict):
+                    fallback_kwargs = dict(fallback_arguments)
+                    for key in ('chat_id', 'message_thread_id', 'disable_notification'):
+                        if key in telegram_kwargs:
+                            fallback_kwargs[key] = telegram_kwargs[key]
+                    argument = fallback_operation.removeprefix('send_')
+                    file_id = fallback_kwargs[argument]
+                    owner = replay.get('source_sender_bot_id', row.required_sender_bot_id)
+                    with ExitStack() as acquisition:
+                        try:
+                            if 'source_sender_bot_id' not in replay and owner is None:
+                                raise RequiredSenderUnavailableError('Saved media has no acquisition bot.')
+                            upload = acquisition.enter_context(self._history_media_upload(file_id, owner))
+                        except Exception as acquisition_error:
+                            raise HistoryMediaAcquisitionError("Unable to acquire saved media.") from acquisition_error
+                        self._outbound_queue.record_history_fallback(row.id, fallback_operation)
+                        fallback_kwargs[argument] = upload
+                        return self.execute_queued_call(
+                            replace(row, operation=fallback_operation), (), fallback_kwargs, selection
+                        )
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
             telegram_kwargs.pop("parse_mode")
             self._rewind_queued_files(telegram_args, telegram_kwargs)
             result = call_method()
-        if attachment is None or content_key is None:
+        if content is None:
             return result
         chat_id = self._queued_chat_id_argument(row.operation, telegram_args, telegram_kwargs)
-        message_id = getattr(result, "message_id", None)
-        if chat_id is None or message_id is None:
-            return result
-        extension = (
-            ".md" if original_parse_mode == "markdown"
-            else ".html" if original_parse_mode == "html" else ".txt"
+        full_args, full_kwargs = self._rewrite_queued_chat_id(
+            row.operation, full_args, full_kwargs, self._normalize_telegram_chat_id(chat_id)
         )
-        label = "Message" if content_key == "text" else "Caption"
-        sender.send_document(
-            chat_id,
-            attachment,
-            filename=f"{chat_id}_{message_id}{extension}",
-            reply_to_message_id=message_id,
-            caption=f"{label} is truncated due to its length. Full message is sent as attachment.",
-        )
-        return result
+        return self._queued_completion_result(row, full_args, full_kwargs, result, selection)
 
     @staticmethod
     def _encode_queued_log_context(context: QueuedDbLogContext) -> bytes:
@@ -1542,23 +1649,29 @@ class TelegramBotManager(LocaleMixin):
             raise QueuePersistenceError("Queued database log context cannot be decoded.") from error
 
     @staticmethod
-    def encode_queued_completion_receipt(result: object, selection: SenderSelection) -> bytes:
+    def encode_queued_completion_receipt(
+        result: object, selection: SenderSelection, *, file_bot_id: Optional[str] = None,
+    ) -> bytes:
         try:
-            return b"\x01" + pickle.dumps((result, selection.sender_bot_id), protocol=5)
+            value = ((result, selection.sender_bot_id) if file_bot_id is None else
+                     (result, selection.sender_bot_id, file_bot_id))
+            return b"\x01" + pickle.dumps(value, protocol=5)
         except Exception as error:
             raise QueuePersistenceError("Unable to serialize queued Telegram completion receipt.") from error
 
     @staticmethod
-    def _decode_queued_completion_receipt(payload: object) -> tuple[TelegramMessage, Optional[str]]:
+    def _decode_queued_completion_receipt(payload: object) -> tuple[TelegramMessage, Optional[str], Optional[str]]:
         if not isinstance(payload, bytes) or not payload or payload[0] != 1:
             raise QueuePersistenceError("Queued Telegram completion receipt has an unknown version.")
         try:
             value = pickle.loads(payload[1:])
         except Exception as error:
             raise QueuePersistenceError("Queued Telegram completion receipt cannot be decoded.") from error
-        if not isinstance(value, tuple) or len(value) != 2 or not isinstance(value[1], (str, type(None))):
+        if not isinstance(value, tuple) or len(value) not in (2, 3) or not isinstance(value[1], (str, type(None))):
             raise QueuePersistenceError("Queued Telegram completion receipt has an invalid shape.")
-        return cast(TelegramMessage, value[0]), value[1]
+        if len(value) == 3 and not isinstance(value[2], str):
+            raise QueuePersistenceError("Queued Telegram completion receipt has an invalid file owner.")
+        return cast(TelegramMessage, value[0]), value[1], value[2] if len(value) == 3 else None
 
     def _pop_queued_db_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
         if not isinstance(row_id, int):
@@ -1603,15 +1716,19 @@ class TelegramBotManager(LocaleMixin):
 
     def reconcile_queued_delivery(self, row) -> bool:
         """Write a persisted Telegram completion to MsgLog."""
-        if row.log_context is None or row.completion_receipt is None:
+        if row.completion_receipt is None:
             return False
+        if row.log_context is None:
+            return True
         try:
             etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
-            real_tg_msg, sender_bot_id = self._decode_queued_completion_receipt(
+            real_tg_msg, sender_bot_id, file_bot_id = self._decode_queued_completion_receipt(
                 row.completion_receipt
             )
             etm_msg.type_telegram = get_msg_type(real_tg_msg)
             etm_msg.put_telegram_file(real_tg_msg)
+            etm_msg.sender_bot_id = sender_bot_id
+            etm_msg.file_bot_id = file_bot_id
             self.channel.db.add_or_update_message_log(
                 etm_msg,
                 real_tg_msg,
@@ -1625,6 +1742,76 @@ class TelegramBotManager(LocaleMixin):
             return False
         self._run_database_update_callback(self._pop_queued_completion_callback(row.id))
         return True
+
+    def confirm_queued_delivery(
+        self, row_id: int, message: TelegramMessage, *, file_bot_id: Optional[str] = None,
+    ) -> bool:
+        """Resolve a held send using an admin-selected, actual Telegram reply message.
+
+        Never sends the original payload. Receipt persistence precedes MsgLog,
+        so a failed database write can be retried without another Telegram send.
+        file_bot_id identifies the observer of a nested reply; direct send
+        responses omit it and inherit the recorded author.
+        """
+        with self._outbound_scheduler._lock:
+            if row_id in self._outbound_scheduler.in_flight:
+                raise ValueError("This send attempt is still running; it cannot be confirmed concurrently.")
+            queue = self._outbound_queue
+            with queue._lock:
+                metadata = queue.connection.execute(
+                    "SELECT telegram_chat_id, delivery_state, delivery_hold, attempt_sender_bot_id, "
+                    "log_context IS NOT NULL FROM outbound_queue WHERE id=?", (row_id,),
+                ).fetchone()
+            if metadata is None:
+                raise ValueError("Queue row does not exist; no data was changed.")
+            chat_id, state, hold, sender_id, has_log = metadata
+            if state != "queued" or hold is None:
+                raise ValueError("Only a held, unconfirmed send can be confirmed.")
+            expected_sender = sender_id or str(self.me.id if self.me is not None else "")
+            if hold == "uncertain:operator_observed_delivery" and message.from_user is not None:
+                # Old versions did not record the attempt's bot. An explicit offline
+                # operator hold can be resolved only with a currently configured bot.
+                actual_sender = str(message.from_user.id)
+                if actual_sender == str(self.me.id if self.me is not None else ""):
+                    sender_id, expected_sender = None, actual_sender
+                elif self.bot_pool and self.bot_pool.get_bot_by_id(actual_sender) is not None:
+                    sender_id, expected_sender = actual_sender, actual_sender
+            if (message.chat_id != chat_id or message.from_user is None
+                    or not message.from_user.is_bot or str(message.from_user.id) != expected_sender
+                    or message.forward_origin is not None):
+                raise ValueError("Reply to the original message from the recorded bot in the original chat, not a forward.")
+            selection = SenderSelection(sender=None, sender_bot_id=sender_id)
+            row = queue.load_queued(row_id)
+            args, kwargs = queue.decode_payload_raw(row.payload)
+            replay = kwargs.get(HISTORY_REPLAY_KEY)
+            if row.operation == "copy_message" and isinstance(replay, dict) and replay.get("attempted_fallback"):
+                fallback_kwargs = dict(replay["fallback_kwargs"])
+                for key in ("chat_id", "message_thread_id", "disable_notification"):
+                    if key in kwargs:
+                        fallback_kwargs[key] = kwargs[key]
+                row = replace(row, operation=replay["attempted_fallback"])
+                args, kwargs = (), fallback_kwargs
+            if row.operation == "send_document" and message.document is None:
+                raise ValueError("This queue row requires the original document message.")
+            completion = self._queued_completion_result(row, args, kwargs, message, selection)
+            receipt = self.encode_queued_completion_receipt(message, selection, file_bot_id=file_bot_id)
+            if isinstance(completion, QueuedDeliveryResult):
+                queue.record_telegram_completion(
+                    row_id, receipt, supplement=completion.supplement,
+                    operation_resolver=self._queue_operation,
+                )
+            else:
+                queue.record_telegram_completion(row_id, receipt)
+            if has_log:
+                completed = row_id in self._outbound_scheduler.reconcile_sent_pending(row_id)
+            else:
+                # An explicit success receipt resolves control messages without MsgLog context.
+                completed_row = next(queue.iter_sent_pending(row_id=row_id))
+                queue.delete(row_id)
+                queue.record_removal(completed_row, "submitted")
+                completed = True
+            self._outbound_scheduler.wake_event.set()
+            return completed
 
     def record_queued_success(
         self, row, result: object, selection: SenderSelection
@@ -1648,6 +1835,38 @@ class TelegramBotManager(LocaleMixin):
                 time.monotonic() + error.retry_delay,
                 "migration",
             )
+
+        if isinstance(error, HistoryMediaAcquisitionError):
+            cause = error.__cause__
+            if isinstance(cause, (telegram.error.BadRequest, telegram.error.Forbidden, telegram.error.InvalidToken,
+                                  RequiredSenderUnavailableError)):
+                return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
+            retry_at = (time.monotonic() + self._retry_after_seconds(cause)
+                        if isinstance(cause, telegram.error.RetryAfter) else None)
+            return QueuedCompletionDecision(
+                QueuedCompletionKind.RETRY_EVENTUAL, retry_at, "acquisition"
+            )
+
+        operation = getattr(row, "operation", None)
+        ambiguous_network = (
+            isinstance(error, telegram.error.NetworkError)
+            and not isinstance(error, telegram.error.BadRequest)
+            and not transport_definitely_not_sent(error)
+        )
+        # No response is not a negative acknowledgment. Retain the log and media,
+        # and never let a restart turn an unknown result into another remote send.
+        if isinstance(error, InvalidTelegramResponseError) or operation in RETAINED_OPERATIONS and (
+            ambiguous_network or not isinstance(error, telegram.error.TelegramError)
+            or (type(error) is telegram.error.TelegramError and isinstance(error.__cause__, ValueError))
+        ):
+            self.logger.error(
+                "Telegram delivery unconfirmed for queue row %s (%s, sender=%s, error=%s/%s). "
+                "Row, media and MsgLog context retained; automatic resend disabled. "
+                "Confirm an existing Telegram message before resolving this row.",
+                row.id, operation, selection.sender_bot_id or "main",
+                type(error).__name__, type(error.__cause__).__name__ if error.__cause__ else "none",
+            )
+            return QueuedCompletionDecision(QueuedCompletionKind.DELIVERY_UNCERTAIN)
 
         telegram_chat_id = getattr(error, "_etm_telegram_chat_id", row.telegram_chat_id)
         key = (selection.sender_bot_id, telegram_chat_id)
@@ -1771,6 +1990,8 @@ class TelegramBotManager(LocaleMixin):
         try:
             etm_msg.type_telegram = get_msg_type(real_tg_msg)
             etm_msg.put_telegram_file(real_tg_msg)
+            etm_msg.sender_bot_id = sender_bot_id
+            etm_msg.file_bot_id = None
             self.channel.db.add_or_update_message_log(
                 etm_msg,
                 real_tg_msg,
@@ -2087,9 +2308,46 @@ class TelegramBotManager(LocaleMixin):
         return self.send_message(update.effective_chat.id, errmsg,
                                  reply_to_message_id=update.effective_message.message_id)
 
-    @Decorators.retry_on_chat_migration
-    def get_file(self, file_id: str) -> File:
-        return cast(File, self._bot.get_file(file_id))
+    def get_file(self, file_id: str, *, sender_bot_id: Optional[str] = None) -> File:
+        """Resolve a saved file ID with its owner, independently of send routing."""
+        if sender_bot_id is None or self._is_main_sender_id(str(sender_bot_id)):
+            return cast(File, self._bot.get_file(file_id))
+        auxiliary = self.bot_pool.get_bot_by_id(sender_bot_id) if self.bot_pool else None
+        if auxiliary is None or auxiliary.disabled:
+            raise RequiredSenderUnavailableError('Saved media acquisition bot is unavailable.')
+        # Membership in the destination is irrelevant to getFile. Never fall
+        # back to the main bot with somebody else's opaque file ID.
+        return cast(File, auxiliary.bot.get_file(file_id))
+
+    @contextmanager
+    def _history_media_upload(self, file_id: str, owner: Optional[str]) -> Iterator[object]:
+        """Fetch with the owner; give bytes/path to the ordinary selected sender."""
+        file_meta = self.get_file(file_id, sender_bot_id=owner)
+        path = file_meta.file_path
+        if not path:
+            raise ValueError('Telegram returned no path for saved media.')
+        if not urlparse(path).scheme:
+            local = Path(path)
+            if getattr(self, '_local_mode', False):
+                yield local.resolve().as_uri()
+            else:
+                with local.open('rb') as stream:
+                    yield telegram.InputFile(stream, filename=local.name, read_file_handle=False)
+            return
+        # Keep owner-token URLs out of the outbound payload and other bots'
+        # requests. Stream to disk instead of buffering the complete attachment.
+        with tempfile.TemporaryFile() as stream:
+            try:
+                with httpx.stream('GET', path, timeout=120, follow_redirects=True) as response:
+                    response.raise_for_status()
+                    for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                        stream.write(chunk)
+            except httpx.HTTPError:
+                raise ValueError('Unable to download saved Telegram media.') from None
+            stream.seek(0)
+            yield telegram.InputFile(
+                stream, filename=Path(urlparse(path).path).name, read_file_handle=False,
+            )
 
     def delete_message(self, chat_id, message_id, _sender_bot_id=None):
         required_sender = str(_sender_bot_id) if _sender_bot_id else "__main__"
