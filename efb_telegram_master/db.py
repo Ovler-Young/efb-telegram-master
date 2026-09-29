@@ -6,10 +6,21 @@ import pickle
 import time
 from contextlib import suppress
 from functools import partial
-from typing import List, Optional, Tuple, Dict, Collection, TYPE_CHECKING, cast
+from typing import Collection, Dict, List, Optional, Tuple, TYPE_CHECKING, cast
 from pathlib import Path
 
-from peewee import Model, TextField, DateTimeField, CharField, DoesNotExist, fn, BlobField, DatabaseProxy, IntegerField, AutoField
+from peewee import (
+    AutoField,
+    BlobField,
+    CharField,
+    DatabaseProxy,
+    DateTimeField,
+    DoesNotExist,
+    IntegerField,
+    Model,
+    TextField,
+    fn,
+)
 from playhouse.migrate import migrate
 from telegram import Message
 from typing_extensions import TypedDict
@@ -182,7 +193,6 @@ class HistoryMigrationEntry(BaseModel):
     source_time = DateTimeField(null=True)
     position = IntegerField()
     created_at = DateTimeField(default=datetime.datetime.now)
-
     class Meta:
         indexes = (
             (("slave_chat_id", "target_chat_id", "message_thread_id", "position"), False),
@@ -203,6 +213,17 @@ class SlaveChatInfo(BaseModel):
 class DatabaseManager:
     logger = logging.getLogger(__name__)
     FAIL_FLAG = '__fail__'
+    _LEGACY_OUTBOUND_TABLES = ("outbound_workflow", "outbound_task")
+    _LEGACY_OUTBOUND_STATES = (
+        "waiting_dependency",
+        "queued",
+        "leased",
+        "in_flight",
+        "sent_pending_log",
+        "completed",
+        "skipped",
+        "dead",
+    )
 
     def __init__(self, channel: 'TelegramChannel'):
         base_path = utils.get_data_path(channel.channel_id)
@@ -223,19 +244,24 @@ class DatabaseManager:
                 password=db_config.get('password', ''),
                 max_connections=db_config.get('max_connections', 8),
                 stale_timeout=db_config.get('stale_timeout', 300),
+                options=db_config.get('options', '-c timezone=UTC'),
             )
             self._migrator_cls = PostgresqlMigrator
             self._is_sqlite = False
         else:
-            from playhouse.sqliteq import SqliteQueueDatabase
+            from peewee import SqliteDatabase
             from playhouse.migrate import SqliteMigrator
-            actual_db = SqliteQueueDatabase(
+            actual_db = SqliteDatabase(
                 str(base_path / 'tgdata.db'),
-                autostart=False,
+                pragmas={
+                    "journal_mode": "wal",
+                    "foreign_keys": 1,
+                    "busy_timeout": 5000,
+                },
+                check_same_thread=False,
             )
             self._migrator_cls = SqliteMigrator
             self._is_sqlite = True
-            actual_db.start()
 
         database.initialize(actual_db)
         database.connect()
@@ -261,10 +287,12 @@ class DatabaseManager:
                 self._create_missing_tables()
                 self._check_and_run_migrations()
         self.logger.debug("Database migration finished...")
+        self._observe_legacy_outbound_rows()
 
     def stop_worker(self):
-        if self._is_sqlite:
-            database.obj.stop()
+        stop = getattr(database.obj, "stop", None)
+        if callable(stop):
+            stop()
         database.close()
 
     @staticmethod
@@ -272,12 +300,16 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry])
+        database.create_tables([
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+        ])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
-        database.create_tables([ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry], safe=True)
+        database.create_tables([
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+        ], safe=True)
 
     @staticmethod
     def _select_existing_columns(model, table_name: str, requested_fields: List):
@@ -304,7 +336,9 @@ class DatabaseManager:
         sqlite_db.start()
         sqlite_db.connect()
 
-        models = [ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry]
+        models = [
+            ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry,
+        ]
         with sqlite_db.bind_ctx(models):
             chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
                 ChatAssoc.master_uid, ChatAssoc.slave_uid
@@ -326,7 +360,8 @@ class DatabaseManager:
                 MsgLog.text, MsgLog.slave_origin_uid, MsgLog.slave_origin_display_name,
                 MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
                 MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
-                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id, MsgLog.time,
+                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id,
+                MsgLog.time,
             ])
             if HistoryMigrationEntry.table_exists():
                 history_migration_entries = self._select_existing_columns(HistoryMigrationEntry, "historymigrationentry", [
@@ -342,9 +377,8 @@ class DatabaseManager:
         sqlite_db.stop()
         sqlite_db.close()
 
-        self._create()
-
         with database.atomic():
+            self._create()
             for chat_assoc_batch in chunked(chat_assocs, 500):
                 ChatAssoc.insert_many(chat_assoc_batch).execute()
             for topic_assoc_batch in chunked(topic_assocs, 500):
@@ -425,6 +459,38 @@ class DatabaseManager:
             # Migration 4: Add column for sender bot ID (multi-bot pool support)
             migrate(
                 migrator.add_column("msglog", "sender_bot_id", MsgLog.sender_bot_id)
+            )
+
+    def _observe_legacy_outbound_rows(self) -> None:
+        """Report retained workflow rows without loading or changing them."""
+        table_names = set(database.get_tables())
+        workflow_table, task_table = self._LEGACY_OUTBOUND_TABLES
+        workflow_count = 0
+        task_count = 0
+        state_counts = {state: 0 for state in self._LEGACY_OUTBOUND_STATES}
+
+        if workflow_table in table_names:
+            workflow_count = int(
+                database.execute_sql(f'SELECT COUNT(*) FROM "{workflow_table}"').fetchone()[0]
+            )
+        if task_table in table_names:
+            task_rows = database.execute_sql(
+                f'SELECT state, COUNT(*) FROM "{task_table}" GROUP BY state'
+            ).fetchall()
+            for state, count in task_rows:
+                if state in state_counts:
+                    state_counts[state] = int(count)
+            task_count = sum(int(count) for _state, count in task_rows)
+
+        if workflow_count or task_count:
+            state_summary = ", ".join(
+                f"{state}={state_counts[state]}" for state in self._LEGACY_OUTBOUND_STATES
+            )
+            self.logger.warning(
+                "Retained legacy outbound rows: workflows=%d tasks=%d %s",
+                workflow_count,
+                task_count,
+                state_summary,
             )
 
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,
@@ -561,7 +627,7 @@ class DatabaseManager:
             return []
 
     def add_topic_assoc(self, topic_chat_id: TelegramChatID,
-                       message_thread_id: EFBChannelChatIDStr,
+                       message_thread_id: TelegramTopicID,
                        slave_uid: EFBChannelChatIDStr, ):
         """
         Add topic associations (topic links).
@@ -683,20 +749,32 @@ class DatabaseManager:
                                   old_message_id: Optional[OldMsgID] = None,
                                   sender_bot_id: Optional[str] = None):
         """Add or update a message into the database."""
-        master_msg_id = message_id_to_str(TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id))
+        sent_message_id = message_id_to_str(
+            TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)
+        )
+        master_msg_id = sent_message_id
         master_msg_id_alt = None
         self.logger.debug("[%s] Received message logging request of %s", master_msg_id, msg.uid)
 
+        row: Optional[MsgLog] = None
         if old_message_id is not None:
             old_message_id_str = message_id_to_str(*old_message_id)
-            if master_msg_id != old_message_id_str:
-                self.logger.debug("[%s] Message has an old ID: %s", master_msg_id, old_message_id_str)
-                master_msg_id, master_msg_id_alt = old_message_id_str, master_msg_id
+            row = MsgLog.get_or_none(
+                (MsgLog.master_msg_id == old_message_id_str) |
+                (MsgLog.master_msg_id_alt == old_message_id_str)
+            )
+            if row is not None:
+                master_msg_id = TgChatMsgIDStr(row.master_msg_id)
+                master_msg_id_alt = (
+                    sent_message_id if sent_message_id != master_msg_id else row.master_msg_id_alt
+                )
+            elif sent_message_id != old_message_id_str:
+                self.logger.debug("[%s] Message has an old ID: %s", sent_message_id, old_message_id_str)
+                master_msg_id, master_msg_id_alt = old_message_id_str, sent_message_id
 
-        row: MsgLog
-        r = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
-        if r is not None:
-            row = r
+        if row is None:
+            row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
+        if row is not None:
             save = row.save
             self.logger.debug("[%s] Message record is found in database, update it", master_msg_id)
         else:
@@ -718,8 +796,7 @@ class DatabaseManager:
         row.mime = msg.mime
         row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
         pickle_data = self.pickle_misc_msg(msg)
-        if pickle_data:
-            row.pickle = pickle_data
+        row.pickle = pickle_data
 
         result = save()
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
@@ -923,12 +1000,9 @@ class DatabaseManager:
             message_thread_id,
         )
         with database.atomic():
-            delete_result = HistoryMigrationEntry.delete().where(target_filter).execute()
-            DatabaseManager._wait_for_write_result(delete_result)
+            HistoryMigrationEntry.delete().where(target_filter).execute()
             if entries:
-                insert_result = HistoryMigrationEntry.insert_many(entries).execute()
-                DatabaseManager._wait_for_write_result(insert_result)
-        DatabaseManager._flush_write_queue()
+                HistoryMigrationEntry.insert_many(entries).execute()
         return len(entries)
 
     @staticmethod
@@ -937,7 +1011,11 @@ class DatabaseManager:
 
     @staticmethod
     def get_next_history_migration_target() -> Optional[HistoryMigrationEntry]:
-        return HistoryMigrationEntry.select().order_by(HistoryMigrationEntry.id.asc()).first()
+        return (
+            HistoryMigrationEntry.select()
+            .order_by(HistoryMigrationEntry.id.asc())
+            .first()
+        )
 
     @staticmethod
     def get_history_migration_entries(
@@ -957,30 +1035,9 @@ class DatabaseManager:
         )
 
     @staticmethod
-    def delete_history_migration_entries(entry_ids: Collection[int]) -> int:
-        if not entry_ids:
-            return 0
-        result = HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(list(entry_ids))).execute()
-        rowcount = DatabaseManager._wait_for_write_result(result)
-        DatabaseManager._flush_write_queue()
-        if rowcount is not None:
-            return rowcount
-        return cast(int, result)
-
-    @staticmethod
-    def _wait_for_write_result(result: object) -> Optional[int]:
-        with suppress(AttributeError):
-            return cast(int, getattr(result, "rowcount"))
-        return None
-
-    @staticmethod
-    def _flush_write_queue() -> None:
-        db_obj = database.obj
-        pause = getattr(db_obj, "pause", None)
-        unpause = getattr(db_obj, "unpause", None)
-        if not callable(pause) or not callable(unpause):
-            return
-
-        paused = pause()
-        if paused is not False:
-            unpause()
+    def delete_history_migration_entry(entry_id: int) -> int:
+        return int(
+            HistoryMigrationEntry.delete()
+            .where(HistoryMigrationEntry.id == entry_id)
+            .execute()
+        )

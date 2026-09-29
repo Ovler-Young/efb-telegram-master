@@ -1,8 +1,11 @@
 import os
+import logging
+import pickle
+import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -11,7 +14,14 @@ from ehforwarderbot.types import MessageID
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
-from efb_telegram_master.db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, MsgLog, TopicAssoc
+from efb_telegram_master.db import (
+    ChatAssoc,
+    DatabaseManager,
+    HistoryMigrationEntry,
+    MsgLog,
+    TopicAssoc,
+    database,
+)
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
@@ -45,40 +55,83 @@ def test_history_migration_entry_table_exists():
     assert "source_master_msg_id" not in msglog_columns
 
 
-def test_write_result_wait_reads_rowcount():
-    class WriteResult:
-        def __init__(self):
-            self.rowcount_read = False
+def test_history_migration_entries_have_no_active_workflow_fields():
+    from peewee import SqliteDatabase
 
-        @property
-        def rowcount(self):
-            self.rowcount_read = True
-            return 3
+    test_db = SqliteDatabase(":memory:")
+    models = [HistoryMigrationEntry, MsgLog]
+    with test_db.bind_ctx(models):
+        test_db.create_tables(models)
+        history_columns = {column.name for column in test_db.get_columns("historymigrationentry")}
 
-    result = WriteResult()
-
-    assert DatabaseManager._wait_for_write_result(result) == 3
-    assert result.rowcount_read
+    assert not {"outbound_workflow_id", "state", "last_error"}.intersection(history_columns)
 
 
-def test_flush_write_queue_pauses_and_unpauses_sqlite_queue(monkeypatch):
-    calls = []
+def test_database_manager_uses_transactional_wal_sqlite_without_creating_legacy_tables(tmp_path, monkeypatch):
+    from peewee import SqliteDatabase
 
-    class QueueDatabase:
-        def pause(self):
-            calls.append("pause")
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    channel = SimpleNamespace(channel_id="tests.sqlite", config={})
+    manager = DatabaseManager(channel)
+    try:
+        assert isinstance(database.obj, SqliteDatabase)
+        assert database.obj.pragma("journal_mode").lower() == "wal"
+        assert "outbound_workflow" not in database.get_tables()
+        assert "outbound_task" not in database.get_tables()
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
 
-        def unpause(self):
-            calls.append("unpause")
 
-    class DatabaseProxy:
-        obj = QueueDatabase()
+def test_startup_observes_raw_legacy_rows_without_mutating_them(tmp_path, monkeypatch, caplog):
+    from peewee import SqliteDatabase
 
-    monkeypatch.setattr(db_module, "database", DatabaseProxy())
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        raw_db.execute_sql(
+            "CREATE TABLE outbound_workflow (id INTEGER PRIMARY KEY, state TEXT, marker TEXT)"
+        )
+        raw_db.execute_sql(
+            "CREATE TABLE outbound_task (id INTEGER PRIMARY KEY, state TEXT, marker TEXT)"
+        )
+        raw_db.execute_sql(
+            "INSERT INTO outbound_workflow (id, state, marker) VALUES (1, 'completed', 'workflow-marker')"
+        )
+        for index, state in enumerate(DatabaseManager._LEGACY_OUTBOUND_STATES, start=1):
+            raw_db.execute_sql(
+                "INSERT INTO outbound_task (id, state, marker) VALUES (?, ?, ?)",
+                (index, state, f"marker-{index}"),
+            )
+        snapshot = {
+            table: raw_db.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            for table in DatabaseManager._LEGACY_OUTBOUND_TABLES
+        }
+    finally:
+        raw_db.close()
 
-    DatabaseManager._flush_write_queue()
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    channel = SimpleNamespace(channel_id="tests.legacy", config={})
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.db"):
+        manager = DatabaseManager(channel)
+    try:
+        observed = {
+            table: database.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            for table in DatabaseManager._LEGACY_OUTBOUND_TABLES
+        }
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
 
-    assert calls == ["pause", "unpause"]
+    assert observed == snapshot
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "workflows=1 tasks=8" in warnings[0]
+    for state in DatabaseManager._LEGACY_OUTBOUND_STATES:
+        assert f"{state}=1" in warnings[0]
 
 
 def test_topic_assoc_table_exists_and_round_trips(channel, slave):
@@ -175,6 +228,145 @@ def test_build_etm_msg_restores_sender_bot_id(channel, slave):
     row.delete_instance()
 
 
+def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
+    message = SimpleNamespace(
+        uid=MessageID("reaction-message"),
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"),
+        text="message",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+        file_id=None,
+        file_unique_id=None,
+        mime=None,
+        is_system=False,
+        attributes=None,
+        commands=None,
+        substitutions=None,
+        target=None,
+        sender_bot_id=None,
+        reactions={},
+    )
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=10))
+
+        message.reactions = {"R0": [reactor]}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=11),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(10)),
+            sender_bot_id="777",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.11", "777")
+        assert pickle.loads(bytes(row.pickle))["reactions"] == {"R0": ("tests.mocks.slave reactor",)}
+
+        message.reactions = {}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=11),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(11)),
+            sender_bot_id="777",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.11", "777")
+        assert row.pickle is None
+
+        message.reactions = {"R1": [reactor]}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=12),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(11)),
+            sender_bot_id="888",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.12", "888")
+        assert pickle.loads(bytes(row.pickle))["reactions"] == {"R1": ("tests.mocks.slave reactor",)}
+
+
+def test_reaction_alternate_db_failures_preserve_then_update_canonical_row():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
+    message = SimpleNamespace(
+        uid=MessageID("reaction-message"), chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"), text="message", type=MsgType.Text,
+        type_telegram=TGMsgType.Text, deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+        file_id=None, file_unique_id=None, mime=None, is_system=False, attributes=None, commands=None,
+        substitutions=None, target=None, sender_bot_id=None, reactions={"NEW": [reactor]},
+    )
+    scenarios = (
+        (None, 10, 11, 12),
+        ("100.11", 11, 12, 13),
+    )
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        for initial_alt, old_id, failed_id, success_id in scenarios:
+            MsgLog.delete().execute()
+            MsgLog.create(
+                master_msg_id="100.10", master_msg_id_alt=initial_alt, slave_message_id="reaction-message",
+                text="old", slave_origin_uid="tests.mocks.slave chat",
+                slave_member_uid="tests.mocks.slave author", msg_type=MsgType.Text.name,
+                sent_to="tests.mocks.slave", sender_bot_id="700",
+                pickle=pickle.dumps({"reactions": {"OLD": ("tests.mocks.slave reactor",)}}),
+            )
+
+            with patch.object(MsgLog, "save", side_effect=RuntimeError("db failed")):
+                with pytest.raises(RuntimeError, match="db failed"):
+                    manager.add_or_update_message_log(
+                        message, SimpleNamespace(chat_id=100, message_id=failed_id),
+                        old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="800",
+                    )
+
+            row = MsgLog.get()
+            assert (row.master_msg_id_alt, row.sender_bot_id) == (initial_alt, "700")
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "OLD": ("tests.mocks.slave reactor",),
+            }
+
+            manager.add_or_update_message_log(
+                message, SimpleNamespace(chat_id=100, message_id=success_id),
+                old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="900",
+            )
+            row = MsgLog.get()
+            assert MsgLog.select().count() == 1
+            assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == (
+                "100.10", f"100.{success_id}", "900",
+            )
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "NEW": ("tests.mocks.slave reactor",),
+            }
+
+            message.reactions = {"FINAL": [reactor]}
+            manager.add_or_update_message_log(
+                message, SimpleNamespace(chat_id=100, message_id=success_id),
+                old_message_id=(TelegramChatID(100), TelegramMessageID(success_id)), sender_bot_id="900",
+            )
+            row = MsgLog.get()
+            assert MsgLog.select().count() == 1
+            assert row.master_msg_id_alt == f"100.{success_id}"
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "FINAL": ("tests.mocks.slave reactor",),
+            }
+            message.reactions = {"NEW": [reactor]}
+
+
 @pytest.mark.skipif(
     not os.getenv("TEST_POSTGRES_HOST"),
     reason="PostgreSQL test environment is not configured",
@@ -189,3 +381,65 @@ def test_postgresql_env_is_configured():
     ]
     for key in required:
         assert os.getenv(key)
+
+
+@pytest.mark.skipif(
+    not os.getenv("TEST_POSTGRES_HOST"),
+    reason="PostgreSQL test environment is not configured",
+)
+def test_postgresql_observes_raw_legacy_rows_without_mutating_them():
+    from peewee import PostgresqlDatabase
+
+    connection_kwargs = {
+        "database": os.environ["TEST_POSTGRES_DB"],
+        "host": os.environ["TEST_POSTGRES_HOST"],
+        "port": int(os.environ["TEST_POSTGRES_PORT"]),
+        "user": os.environ["TEST_POSTGRES_USER"],
+        "password": os.environ["TEST_POSTGRES_PASSWORD"],
+    }
+    schema = f"etm_outbound_{uuid.uuid4().hex}"
+    admin_db = PostgresqlDatabase(**connection_kwargs)
+    admin_db.connect()
+    admin_db.execute_sql(f'CREATE SCHEMA "{schema}"')
+    admin_db.close()
+
+    original_database = database.obj
+    test_db = PostgresqlDatabase(
+        **connection_kwargs,
+        options=f'-c search_path="{schema}" -c timezone=UTC',
+    )
+    database.initialize(test_db)
+    test_db.connect()
+    try:
+        test_db.execute_sql("CREATE TABLE outbound_workflow (id BIGSERIAL PRIMARY KEY, marker TEXT)")
+        test_db.execute_sql(
+            "CREATE TABLE outbound_task (id BIGSERIAL PRIMARY KEY, state TEXT, marker TEXT)"
+        )
+        manager = object.__new__(DatabaseManager)
+        manager.logger = Mock()
+        test_db.execute_sql("INSERT INTO outbound_workflow (marker) VALUES ('workflow-marker')")
+        for index, state in enumerate(DatabaseManager._LEGACY_OUTBOUND_STATES, start=1):
+            test_db.execute_sql(
+                "INSERT INTO outbound_task (state, marker) VALUES (%s, %s)",
+                (state, f"marker-{index}"),
+            )
+        snapshot = {
+            table: test_db.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            for table in DatabaseManager._LEGACY_OUTBOUND_TABLES
+        }
+
+        manager._observe_legacy_outbound_rows()
+
+        observed = {
+            table: test_db.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            for table in DatabaseManager._LEGACY_OUTBOUND_TABLES
+        }
+        assert observed == snapshot
+        manager.logger.warning.assert_called_once()
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+        admin_db = PostgresqlDatabase(**connection_kwargs)
+        admin_db.connect()
+        admin_db.execute_sql(f'DROP SCHEMA "{schema}" CASCADE')
+        admin_db.close()
