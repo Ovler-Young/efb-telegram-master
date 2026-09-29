@@ -1992,6 +1992,11 @@ class TelegramBotManager(LocaleMixin):
         with self._get_bot_chat_state_lock():
             if self._bot_chat_disabled_until.get(key, 0.0) > now:
                 return False
+        outbound_queue = getattr(self, "_outbound_queue", None)
+        if outbound_queue is not None and outbound_queue.has_queued_calls():
+            return False
+        if not self._rate_limiter.try_acquire(chat_id):
+            return False
         try:
             return self._call_direct_operation("send_chat_action", args, queued_kwargs)
         except telegram.error.RetryAfter as error:

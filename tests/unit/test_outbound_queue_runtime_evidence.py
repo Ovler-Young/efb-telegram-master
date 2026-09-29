@@ -349,6 +349,45 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     assert [row.id for row in retained_queue.heads()] == [second_id]
 
 
+def test_chat_action_retry_after_keeps_public_eventual_body_queued_until_cooldown_ends(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = manager_adapter()
+    manager._bot = SimpleNamespace(
+        send_chat_action=Mock(side_effect=[RetryAfter(10), True]),
+        send_message=send_message,
+    )
+    manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
+    manager._bot_chat_state_lock = threading.Lock()
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+    manager._outbound_queue = retained_queue
+    manager._outbound_scheduler = scheduler
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    assert manager.send_chat_action(41, "typing") is False
+    receipt = manager.send_message(41, "body", _send_mode="eventual", _slave_id="slave.chat")
+    assert receipt.queued
+    assert len(retained_queue.heads()) == 1
+
+    scheduler.dispatch_once()
+    assert executor.submissions == []
+    assert scheduler.next_deadline == 110.0
+
+    clock["now"] = 110.0
+    assert manager.send_chat_action(41, "typing") is False
+    assert manager._bot.send_chat_action.call_count == 1
+
+    scheduler.dispatch_once()
+    submitted = executor.submissions[0]
+    submitted[2].set_result(submitted[0](*submitted[1]))
+    scheduler.harvest_completed()
+    assert submitted[2].result() == (41, "body")
+    assert retained_queue.heads() == []
+
+
 def test_video_cover_retry_reconstructs_a_fresh_offset_zero_value(
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
