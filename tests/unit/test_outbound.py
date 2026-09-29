@@ -1,9 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
 import io
+import pickle
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
+from unittest.mock import Mock, patch
 
 import pytest
 from telegram import (
@@ -53,6 +57,19 @@ def enqueue(queue, *requests):
     return queue.enqueue_many(requests, operation)
 
 
+def media_bytes(value):
+    if isinstance(value, InputFile):
+        value = value.input_file_content
+    if isinstance(value, bytes):
+        return value
+    position = value.tell()
+    value.seek(0)
+    try:
+        return value.read()
+    finally:
+        value.seek(position)
+
+
 def test_queue_schema_wal_and_restart_retention(tmp_path):
     queue = OutboundQueue(tmp_path)
     row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 12, "text": "first"}))
@@ -69,6 +86,69 @@ def test_queue_schema_wal_and_restart_retention(tmp_path):
     restarted.delete(row_id)
     restarted.close()
     assert OutboundQueue(tmp_path).heads() == []
+
+
+def test_queue_removal_clamps_residence_after_wall_clock_rollback(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    enqueue(queue, QueueRequest("send_message", (), {"chat_id": 12, "text": "first"}))
+    row = queue.heads()[0]
+    metrics = Mock()
+    queue.metrics = metrics
+
+    with patch("efb_telegram_master.outbound.time.time", return_value=row.created_at - 1):
+        queue.record_removal(row, "submitted")
+
+    metrics.record_removal.assert_called_once_with(0, "send_message", "submitted", 0.0)
+
+
+def test_destination_snapshot_limits_and_ranks_in_sql_order(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    enqueue(
+        queue,
+        QueueRequest("send_message", (), {"chat_id": 30, "text": "a"}),
+        QueueRequest("send_message", (), {"chat_id": 30, "text": "b"}),
+    )
+    enqueue(
+        queue,
+        QueueRequest("send_message", (), {"chat_id": 20, "text": "a"}),
+        QueueRequest("send_message", (), {"chat_id": 20, "text": "b"}),
+    )
+    enqueue(queue, QueueRequest("send_message", (), {"chat_id": 10, "text": "only"}))
+    queue.connection.execute(
+        "UPDATE outbound_queue SET created_at = CASE telegram_chat_id WHEN 20 THEN 90 ELSE 95 END"
+    )
+    queue.connection.commit()
+
+    with patch("efb_telegram_master.outbound.time.time", return_value=100):
+        assert queue.destination_snapshot(2) == [
+            ("rank_1", 2, 10.0),
+            ("rank_2", 2, 5.0),
+        ]
+        assert queue.destination_snapshot(0) == []
+
+
+def test_queue_adds_delivery_columns_to_existing_database(tmp_path):
+    path = tmp_path / OutboundQueue.filename
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE outbound_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "priority INTEGER NOT NULL, telegram_chat_id INTEGER NOT NULL, operation TEXT NOT NULL, "
+        "payload BLOB NOT NULL, slave_id TEXT NULL, required_sender_bot_id TEXT NULL, "
+        "created_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO outbound_queue (priority, telegram_chat_id, operation, payload, created_at) "
+        "VALUES (0, 9, 'send_message', X'01', 1)"
+    )
+    connection.commit()
+    connection.close()
+
+    queue = OutboundQueue(tmp_path)
+
+    row = queue.heads()[0]
+    assert row.delivery_state == "queued"
+    assert row.log_context is None
+    assert row.completion_receipt is None
 
 
 def test_payload_version_round_trip_and_invalid_shapes(tmp_path):
@@ -130,18 +210,20 @@ class _UnrestorableStream(io.BytesIO):
     "stream",
     [_UntellableStream(b"media"), _UnreadableStream(b"media"), _UnrestorableStream(b"media")],
 )
-def test_media_snapshot_classifies_stream_read_and_restore_failures(stream):
+def test_media_snapshot_classifies_stream_read_and_restore_failures(tmp_path, stream):
+    queue = OutboundQueue(tmp_path)
     with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
-        OutboundQueue._snapshot_media_value(stream)
+        queue._snapshot_media_value(stream)
 
     assert not stream.closed
 
 
-def test_media_snapshot_restores_position_after_read_failure():
+def test_media_snapshot_restores_position_after_read_failure(tmp_path):
+    queue = OutboundQueue(tmp_path)
     stream = _UnreadableStream(b"media")
 
     with pytest.raises(QueueEnqueueError):
-        OutboundQueue._snapshot_media_value(stream)
+        queue._snapshot_media_value(stream)
 
     assert stream.tell() == 2
 
@@ -191,9 +273,8 @@ def test_initial_send_media_streams_enqueue_as_inline_version_one_snapshots(
     row = queue.heads()[0]
     decoded_args, decoded_kwargs = queue.decode_payload(row.payload)
     decoded_media = decoded_kwargs[media_key] if keyword else decoded_args[1]
-    assert row.payload[0] == 1
-    assert decoded_media.tell() == 0
-    assert decoded_media.read() == content
+    assert row.payload[0] == 2
+    assert media_bytes(decoded_media) == content
     assert decoded_kwargs["disable_notification"] is True
 
 
@@ -233,8 +314,7 @@ def test_thumbnail_keyword_enqueues_an_inline_snapshot(tmp_path):
     assert thumbnail.tell() == 3
     thumbnail.close()
     decoded_thumbnail = queue.decode_payload(queue.heads()[0].payload)[1]["thumbnail"]
-    assert decoded_thumbnail.tell() == 0
-    assert decoded_thumbnail.read() == b"thumbnail"
+    assert media_bytes(decoded_thumbnail) == b"thumbnail"
 
 
 @pytest.mark.parametrize(
@@ -286,16 +366,12 @@ def test_video_cover_enqueues_an_inline_version_one_snapshot(
         local_path.unlink()
     row = queue.heads()[0]
     decoded_cover = queue.decode_payload(row.payload)[1]["cover"]
-    assert row.payload[0] == 1
+    assert row.payload[0] == 2
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 1
-    if isinstance(decoded_cover, bytes):
-        assert decoded_cover == content
-    elif isinstance(decoded_cover, InputFile):
-        assert decoded_cover.input_file_content == content
+    assert media_bytes(decoded_cover) == content
+    if isinstance(decoded_cover, InputFile):
         assert decoded_cover.filename == expected_filename
     else:
-        assert decoded_cover.tell() == 0
-        assert decoded_cover.read() == content
         assert getattr(decoded_cover, "name", None) == expected_filename
 
 
@@ -343,7 +419,7 @@ def test_edit_media_snapshots_nested_input_file_and_attach_name(
     decoded = decoded_kwargs["media"] if keyword else decoded_args[0]
     assert decoded.caption == "caption"
     assert decoded.media.attach_name == attach_name
-    assert decoded.media.input_file_content == content
+    assert media_bytes(decoded.media) == content
 
 
 @pytest.mark.parametrize("keyword", [False, True], ids=["positional", "keyword"])
@@ -372,8 +448,11 @@ def test_media_group_snapshots_nested_files_thumbnails_and_attach_names(tmp_path
     assert decoded_kwargs["disable_notification"] is True
     assert (decoded[0].media.attach_name, decoded[1].media.attach_name,
             decoded[1].thumbnail.attach_name) == attach_names
-    assert (decoded[0].media.input_file_content, decoded[1].media.input_file_content,
-            decoded[1].thumbnail.input_file_content) == (b"photo", b"video", b"thumb")
+    assert (
+        media_bytes(decoded[0].media),
+        media_bytes(decoded[1].media),
+        media_bytes(decoded[1].thumbnail),
+    ) == (b"photo", b"video", b"thumb")
 
 
 @pytest.mark.parametrize(
@@ -428,7 +507,7 @@ def test_media_group_accepts_exact_supported_subtypes_and_normalizes_upload_fiel
     assert decoded_kwargs == {"disable_notification": True, "protect_content": True}
     for field, (content, filename, attach_name) in expected.items():
         delivered = getattr(decoded, field)
-        assert delivered.input_file_content == content
+        assert media_bytes(delivered) == content
         assert delivered.filename == filename
         assert delivered.attach_name == attach_name
 
@@ -490,12 +569,11 @@ def test_nested_input_media_preserves_bytes_filename_precedence_and_attachment_l
         local_path.unlink()
     delivered = queue.decode_payload(queue.heads()[0].payload)[0][1][0].media
     if isinstance(delivered, InputFile):
-        assert delivered.input_file_content == content
+        assert media_bytes(delivered) == content
         assert delivered.filename == expected_filename
         assert delivered.attach_name == expected_attach_name
     else:
-        assert delivered.tell() == 0
-        assert delivered.read() == content
+        assert media_bytes(delivered) == content
         assert getattr(delivered, "name", None) == expected_filename
 
 
@@ -534,9 +612,26 @@ def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
     media = reopened.decode_payload(row.payload)[0][1]
     assert row.id == row_id
     assert row.payload == persisted_payload
-    assert media.tell() == 0
-    assert media.read() == b"reopened media"
+    assert media_bytes(media) == b"reopened media"
     reopened.close()
+
+
+def test_set_chat_photo_snapshots_an_open_file_before_persistence(tmp_path):
+    def set_chat_photo(chat_id, photo):
+        return True
+
+    queue = OutboundQueue(tmp_path)
+    photo = io.BufferedReader(io.BytesIO(b"chat photo"))
+    row_id, _waiter = queue.enqueue_many(
+        [QueueRequest("set_chat_photo", (100, photo), {"_send_mode": "blocking"})],
+        lambda _name: set_chat_photo,
+    )
+    photo.close()
+
+    row = queue.heads()[0]
+    restored_photo = queue.decode_payload(row.payload)[0][1]
+    assert row.id == row_id
+    assert media_bytes(restored_photo) == b"chat photo"
 
 
 @pytest.mark.parametrize("input_kind", ["string", "path"])
@@ -569,10 +664,87 @@ def test_local_file_media_is_owned_inline_after_enqueue_and_reopen(
     row = reopened.heads()[0]
     decoded_media = reopened.decode_payload(row.payload)[0][1]
     assert row.id == row_id
-    assert decoded_media.tell() == 0
-    assert decoded_media.read() == original_content
+    assert len(row.payload) < 4096
+    assert media_bytes(decoded_media) == original_content
     assert decoded_media.name == source_path.name
+    assert len(list(reopened.media_dir.iterdir())) == 1
+    reopened.delete(row_id)
+    assert list(reopened.media_dir.iterdir()) == []
     reopened.close()
+
+
+def test_corrupt_live_v2_payload_preserves_all_sidecars_during_orphan_scan(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    orphan = queue.media_dir / "media-unknown.bin"
+    orphan.write_bytes(b"must preserve")
+    with queue.connection:
+        queue.connection.execute(
+            "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+            "VALUES(0,1,'send_message',?,0)",
+            (b"\x02not-a-pickle",),
+        )
+    queue.close()
+
+    reopened = OutboundQueue(tmp_path)
+    try:
+        assert orphan.read_bytes() == b"must preserve"
+    finally:
+        reopened.close()
+
+
+def test_orphan_sidecar_is_removed_on_restart_while_live_sidecar_is_preserved(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    live_id, _waiter = queue.enqueue_many(
+        [QueueRequest("send_document", (100, io.BytesIO(b"live")), {})],
+        lambda _name: media_operation,
+    )
+    live_files = {path.name for path in queue.media_dir.iterdir()}
+    assert len(live_files) == 1
+    orphan = queue.media_dir / "media-orphan.bin"
+    orphan.write_bytes(b"orphan")
+    queue.close()
+
+    reopened = OutboundQueue(tmp_path)
+    try:
+        assert not orphan.exists()
+        assert {path.name for path in reopened.media_dir.iterdir()} == live_files
+        assert reopened.heads()[0].id == live_id
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("cleanup_path_kind", ["absolute", "relative"])
+def test_local_tdlib_file_uri_stays_out_of_sqlite_and_is_cleaned_after_row_delete(
+    tmp_path, monkeypatch, cleanup_path_kind
+):
+    source_path = tmp_path / "tdlib-large.bin"
+    with source_path.open("wb") as source:
+        source.truncate(381_320_453)
+    queue = OutboundQueue(tmp_path)
+    uri = source_path.as_uri()
+    cleanup_path = str(source_path)
+    if cleanup_path_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        cleanup_path = source_path.name
+
+    row_id, _waiter = queue.enqueue_many(
+        [QueueRequest(
+            "send_document",
+            (100, uri),
+            {},
+            cleanup_files=(cleanup_path,),
+        )],
+        lambda _name: media_operation,
+    )
+
+    row = queue.heads()[0]
+    assert row.id == row_id
+    assert len(row.payload) < 4096
+    assert source_path.exists()
+    assert queue.decode_payload(row.payload)[0][1] == uri
+
+    queue.delete(row_id)
+    assert not source_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -683,7 +855,7 @@ def test_nested_media_accepts_file_ids_urls_bytes_and_matching_telegram_objects(
     decoded = queue.decode_payload(queue.heads()[0].payload)[0][1]
     assert decoded[0].media == "photo-id"
     assert decoded[1].media == "https://example.com/photo.jpg"
-    assert decoded[2].media.input_file_content == b"photo-bytes"
+    assert media_bytes(decoded[2].media) == b"photo-bytes"
     assert decoded[3].media == photo_size
 
 
@@ -805,6 +977,163 @@ class Adapter:
         return CompletionDecision("success")
 
 
+class DurableAdapter(Adapter):
+    def __init__(self, reconcile: bool) -> None:
+        super().__init__()
+        self.reconcile = reconcile
+        self.reconciled: list[int] = []
+
+    def encode_queued_completion_receipt(self, result, selection):
+        return f"receipt:{result}:{selection.sender_bot_id}".encode()
+
+    def reconcile_queued_delivery(self, row):
+        self.reconciled.append(row.id)
+        return self.reconcile
+
+
+def test_log_context_survives_restart_before_send(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "durable"}, log_context=b"\x01context",
+    ))
+    queue.close()
+
+    restarted = OutboundQueue(tmp_path)
+    adapter = DurableAdapter(reconcile=True)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(restarted, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    assert adapter.calls == [(row_id, 7, "send_message")]
+    assert adapter.reconciled == [row_id]
+    assert restarted.heads() == []
+    assert restarted.sent_pending() == []
+
+
+def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path, monkeypatch):
+    monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1000.0)
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, QueueRequest(
+        "send_message", (), {"chat_id": 7, "text": "durable"}, log_context=b"\x01context",
+    ))
+    first_adapter = DurableAdapter(reconcile=False)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, first_adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    assert waiter.result(timeout=1) == row_id
+    assert first_adapter.calls == [(row_id, 7, "send_message")]
+    assert [row.id for row in queue.sent_pending()] == [row_id]
+    queue.close()
+
+    restarted = OutboundQueue(tmp_path)
+    second_adapter = DurableAdapter(reconcile=True)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(restarted, second_adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        assert second_adapter.reconciled == []  # Restart must retain the retry deadline.
+        monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1001.0)
+        scheduler.dispatch_once()
+        scheduler.dispatch_once()
+
+    assert second_adapter.reconciled == [row_id]
+    assert second_adapter.calls == []
+    assert restarted.heads() == []
+    assert restarted.sent_pending() == []
+
+
+def test_blocking_log_context_row_survives_restart_before_send(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest(
+        "send_message", (),
+        {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
+        log_context=b"\x01context",
+    ))
+    queue.close()
+
+    restarted = OutboundQueue(tmp_path)
+    adapter = DurableAdapter(reconcile=True)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(restarted, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        # The blocking row stays durable while its Telegram call is in flight,
+        # so a crash before the MsgLog write can still be reconciled.
+        assert [row.id for row in restarted.heads()] == [row_id]
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    assert adapter.calls == [(row_id, 7, "send_message")]
+    assert adapter.reconciled == [row_id]
+    assert restarted.heads() == []
+    assert restarted.sent_pending() == []
+
+
+def test_blocking_failed_reconciliation_keeps_row_for_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1000.0)
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, QueueRequest(
+        "send_message", (),
+        {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
+        log_context=b"\x01context",
+    ))
+    adapter = DurableAdapter(reconcile=False)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+        # Telegram accepted the message; a failed MsgLog write retains the row
+        # for reconciliation instead of dropping the mapping.
+        assert waiter.result(timeout=1) == row_id
+        assert [row.id for row in queue.sent_pending()] == [row_id]
+        assert queue.heads() == []
+
+        adapter.reconcile = True
+        scheduler.dispatch_once()
+        assert [row.id for row in queue.sent_pending()] == [row_id]
+        monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1001.0)
+        scheduler.dispatch_once()
+
+    assert adapter.calls == [(row_id, 7, "send_message")]
+    assert queue.sent_pending() == []
+    assert queue.heads() == []
+
+
+def test_blocking_terminal_failure_discards_retained_log_context_row(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, QueueRequest(
+        "send_message", (),
+        {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
+        log_context=b"\x01context",
+    ))
+
+    class FailingAdapter(DurableAdapter):
+        def execute_queued_call(self, row, args, kwargs, selection):
+            raise RuntimeError("send failed")
+
+        def record_queued_failure(self, row, error, selection):
+            return CompletionDecision("terminal_failure")
+
+    adapter = FailingAdapter(reconcile=True)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        scheduler.dispatch_once()
+        with pytest.raises(RuntimeError, match="send failed"):
+            scheduler.in_flight[row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
+
+    # Nothing was sent, so the retained row must not linger for redelivery.
+    assert queue.heads() == []
+    assert queue.sent_pending() == []
+    with pytest.raises(RuntimeError, match="send failed"):
+        waiter.result(timeout=1)
+
+
 def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(tmp_path):
     queue = OutboundQueue(tmp_path)
     normal_id, _normal = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "normal"}))
@@ -837,10 +1166,16 @@ def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch)
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
         monkeypatch.setattr(queue, "delete", lambda _row_id: (_ for _ in ()).throw(sqlite3.OperationalError()))
         scheduler.dispatch_once()
+        # Message-creating calls are retained through the attempt, even when blocking.
+        scheduler.in_flight[_row_id].future.result(timeout=1)
+        scheduler.harvest_completed()
         assert scheduler.stopping
         with pytest.raises(Exception, match="deletion failed"):
             waiter.result()
-        assert adapter.calls == []
+        assert len(adapter.calls) == 1
+        assert queue.connection.execute(
+            "SELECT delivery_hold FROM outbound_queue WHERE id=?", (_row_id,)
+        ).fetchone()[0] == "in_flight"
 
 
 def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path, monkeypatch):
@@ -871,3 +1206,448 @@ def test_shutdown_keeps_queued_row_and_fails_abandoned_waiter(tmp_path):
             waiter.result()
         assert row_id not in queue.waiters
         adapter.release.set()
+
+
+def test_failed_batch_cleans_only_new_sidecars_after_partial_preparation(tmp_path):
+    from efb_telegram_master.outbound import _LegacyInlineBlob
+
+    queue = OutboundQueue(tmp_path)
+    existing = queue._store_media_stream(io.BytesIO(b"existing"), "existing.bin")
+    assert existing.storage_name is not None
+
+    def send_video(chat_id, video, cover=None):
+        return chat_id, video, cover
+
+    requests = [
+        QueueRequest(
+            "send_video", (100, b"new"), {"cover": _LegacyInlineBlob(existing.storage_name)},
+        ),
+        QueueRequest("send_photo", (100, object()), {}),
+    ]
+    with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+        queue.enqueue_many(
+            requests,
+            lambda name: send_video if name == "send_video" else media_operation,
+        )
+
+    assert (queue.media_dir / existing.storage_name).read_bytes() == b"existing"
+    assert [path.name for path in queue.media_dir.iterdir()] == [existing.storage_name]
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
+
+
+def test_legacy_recovery_preserves_opaque_binary_kwargs(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    try:
+        media = io.BytesIO(b"inline media")
+        legacy = b"\x01" + pickle.dumps(
+            ((100, media), {"api_kwargs": b"keep", "nested": {"alias": media}}), protocol=5,
+        )
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_document',?,0)", (legacy,),
+            )
+        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            assert args[1].read() == b"inline media"
+        finally:
+            args[1].close()
+        assert kwargs["api_kwargs"] == b"keep"
+        try:
+            assert kwargs["nested"]["alias"].read() == b"inline media"
+        finally:
+            kwargs["nested"]["alias"].close()
+    finally:
+        queue.close()
+
+
+def test_failed_legacy_recovery_keeps_preexisting_media_and_external_paths(tmp_path):
+    from efb_telegram_master.outbound import _LegacyInlineBlob, _StoredMediaSnapshot
+
+    queue = OutboundQueue(tmp_path)
+    existing = queue._store_media_stream(io.BytesIO(b"existing"), "existing.bin")
+    assert existing.storage_name is not None
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"external")
+    legacy = b"\x01" + pickle.dumps(
+        ((100, io.BytesIO(b"new")), {
+            "cover": _LegacyInlineBlob(existing.storage_name),
+            "api_kwargs": {"external": _StoredMediaSnapshot(
+                None, None, external.as_uri(), cleanup_external=True,
+            )},
+        }), protocol=5,
+    )
+    try:
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_video',?,0)", (legacy,),
+            )
+            queue.connection.execute(
+                "CREATE TRIGGER reject_legacy_recovery BEFORE UPDATE OF payload ON outbound_queue "
+                f"WHEN NEW.id = {int(cursor.lastrowid)} BEGIN SELECT RAISE(ABORT, 'stop'); END"
+            )
+        with pytest.raises(sqlite3.DatabaseError, match="stop"):
+            queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        assert (queue.media_dir / existing.storage_name).read_bytes() == b"existing"
+        assert external.read_bytes() == b"external"
+        assert {path.name for path in queue.media_dir.iterdir()} == {existing.storage_name}
+    finally:
+        queue.close()
+
+
+def test_legacy_recovery_preserves_bytearray_with_opcode_like_contents(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    try:
+        opaque = bytearray(b"abc\x95ABCDEFGHz")
+        legacy = b"\x01" + pickle.dumps(
+            ((100, io.BytesIO(b"inline media")), {"opaque": opaque}), protocol=5,
+        )
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_document',?,0)", (legacy,),
+            )
+        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            assert args[1].read() == b"inline media"
+        finally:
+            args[1].close()
+        assert kwargs["opaque"] == opaque
+    finally:
+        queue.close()
+
+
+def test_prepare_failure_after_snapshot_cleans_its_new_sidecar(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    existing = queue._store_media_stream(io.BytesIO(b"existing"), "existing.bin")
+    assert existing.storage_name is not None
+    try:
+        with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
+            queue.enqueue_many(
+                [QueueRequest("send_document", (100, b"new"), {"filename": object()})],
+                lambda _name: lambda chat_id, document, filename=None: None,
+            )
+        assert (queue.media_dir / existing.storage_name).read_bytes() == b"existing"
+        assert {path.name for path in queue.media_dir.iterdir()} == {existing.storage_name}
+    finally:
+        queue.close()
+
+def test_legacy_recovery_streams_memoized_distinct_bytesio_media_and_aliases(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    first = io.BytesIO(b"first media")
+    second = io.BytesIO(b"second thumbnail")
+    legacy = b"\x01" + pickle.dumps(
+        ((100, first), {"thumbnail": second, "alias": first, "opaque": b"opaque bytes remain inline"}),
+        protocol=5,
+    )
+    try:
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_video',?,0)", (legacy,),
+            )
+        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            assert media_bytes(args[1]) == b"first media"
+            assert media_bytes(kwargs["thumbnail"]) == b"second thumbnail"
+            assert media_bytes(kwargs["alias"]) == b"first media"
+            assert kwargs["opaque"] == b"opaque bytes remain inline"
+            assert len(list(queue.media_dir.iterdir())) == 2
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+    finally:
+        queue.close()
+
+
+def test_nested_prepare_failure_reclaims_only_new_media(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    existing = queue._store_media_stream(io.BytesIO(b"existing"), None)
+    media = InputMediaVideo("remote-id")
+    object.__setattr__(media, "media", b"new video")
+    object.__setattr__(media, "thumbnail", object())
+    try:
+        with pytest.raises(QueueEnqueueError):
+            queue.enqueue_many(
+                [QueueRequest("send_media_group", (100, [media]), {})],
+                lambda _: lambda chat_id, media: None,
+            )
+        assert {path.name for path in queue.media_dir.iterdir()} == {existing.storage_name}
+        assert queue.heads() == []
+    finally:
+        queue.close()
+
+
+def test_partial_decode_closes_open_files_and_preserves_queued_data(tmp_path, monkeypatch):
+    import efb_telegram_master.outbound as outbound
+
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = queue.enqueue_many(
+        [QueueRequest("send_media_group", (100, [
+            InputMediaVideo(b"first"), InputMediaVideo(b"missing"),
+        ]), {})],
+        lambda _: lambda chat_id, media: None,
+    )
+    row = queue.load_queued(row_id)
+    args, _ = queue.decode_payload_raw(row.payload)
+    (queue.media_dir / args[1][1].media.storage_name).unlink()
+    opened = []
+    original = outbound._NamedMediaFile
+
+    def track(raw, filename):
+        stream = original(raw, filename)
+        opened.append(stream)
+        return stream
+
+    monkeypatch.setattr(outbound, "_NamedMediaFile", track)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            scheduler = OutboundQueueScheduler(queue, Adapter(), executor, worker_count=1)
+            scheduler.dispatch_once()
+            assert not scheduler.stopping
+            assert queue.heads(ready_only=True) == []
+            assert opened and all(stream.closed for stream in opened)
+            assert queue.load_queued(row_id).payload == row.payload
+            assert (queue.media_dir / args[1][0].media.storage_name).read_bytes() == b"first"
+            assert waiter.done()
+    finally:
+        queue.close()
+
+
+def test_legacy_recovery_excludes_competing_writer_until_commit(tmp_path, monkeypatch):
+    queue = OutboundQueue(tmp_path)
+    legacy = b"\x01" + pickle.dumps(((100, io.BytesIO(b"document")), {}), protocol=5)
+    with queue.connection:
+        queue.connection.execute(
+            "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+            "VALUES(0,100,'send_document',?,0)", (legacy,),
+        )
+    writer = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0.1)
+try:
+    connection.execute('BEGIN IMMEDIATE')
+except sqlite3.OperationalError as error:
+    assert 'locked' in str(error), error
+    print('blocked')
+else:
+    connection.execute('UPDATE outbound_queue SET telegram_chat_id=999 WHERE id=1')
+    connection.commit()
+    print('committed')
+finally:
+    connection.close()
+"""
+
+    def compete():
+        return subprocess.run(
+            [sys.executable, "-c", writer, str(queue.path)],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+
+    original = queue._replace_legacy_media_references
+    checked = False
+
+    def after_blob_close(value, memo=None):
+        nonlocal checked
+        if not checked:
+            checked = True
+            assert compete() == "blocked"
+        return original(value, memo)
+
+    monkeypatch.setattr(queue, "_replace_legacy_media_references", after_blob_close)
+    try:
+        queue.recover_legacy_media_payload(1)
+        assert checked
+        assert compete() == "committed"
+        assert queue.load_queued(1).telegram_chat_id == 999
+    finally:
+        queue.close()
+
+
+def test_legacy_recovery_preserves_multipart_filename_and_mime(tmp_path):
+    import httpx
+
+    queue = OutboundQueue(tmp_path)
+    document = io.BytesIO(b"%PDF-document")
+    document.name = "report.pdf"
+    legacy = b"\x01" + pickle.dumps(((100, document), {}), protocol=5)
+    try:
+        with queue.connection:
+            queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,100,'send_document',?,0)", (legacy,),
+            )
+        row = queue.recover_legacy_media_payload(1)
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            upload = queue.streaming_uploads(args)[1]
+            request = httpx.Request("POST", "https://example.invalid", files={"document": upload.field_tuple})
+            multipart = b"".join(request.stream)
+            assert b'filename="report.pdf"' in multipart
+            assert b"Content-Type: application/pdf\r\n" in multipart
+            assert b"%PDF-document" in multipart
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+    finally:
+        queue.close()
+
+
+def test_unknown_payload_version_preserves_media_until_row_is_repaired(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    row_id, _ = queue.enqueue_many(
+        [QueueRequest("send_document", (1, b"recoverable media"), {})],
+        lambda _: media_operation,
+    )
+    payload = queue.load_queued(row_id).payload
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET payload=? WHERE id=?", (b"\x03" + payload[1:], row_id))
+    queue.close()
+    queue = OutboundQueue(tmp_path)
+    try:
+        assert queue.load_queued(row_id).payload == b"\x03" + payload[1:]
+        with queue.connection:
+            queue.connection.execute("UPDATE outbound_queue SET payload=? WHERE id=?", (payload, row_id))
+        args, kwargs = queue.decode_payload(queue.load_queued(row_id).payload)
+        try:
+            assert media_bytes(args[1]) == b"recoverable media"
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+        queue.delete(row_id)
+        assert list(queue.media_dir.iterdir()) == []
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize("publication", ["enqueue", "supplement", "legacy"])
+def test_queue_owner_excludes_cross_process_cleanup_during_publication(tmp_path, monkeypatch, publication):
+    queue = OutboundQueue(tmp_path)
+    if publication == "supplement":
+        parent_id, _ = enqueue(queue, QueueRequest("send_message", (1, "primary"), {}))
+    elif publication == "legacy":
+        payload = b"\x01" + pickle.dumps(((1, io.BytesIO(b"owned media")), {}), protocol=5)
+        with queue.connection:
+            parent_id = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,1,'send_document',?,0)", (payload,),
+            ).lastrowid
+    store = queue._store_media_stream
+    contender = """
+import sys
+from efb_telegram_master.outbound import OutboundQueue, QueuePersistenceError
+try:
+    queue = OutboundQueue(sys.argv[1])
+except QueuePersistenceError as error:
+    assert 'already in use' in str(error), error
+    print('excluded')
+else:
+    queue.close()
+    raise AssertionError('Concurrent queue owner was admitted')
+"""
+
+    def prepare(*args, **kwargs):
+        snapshot = store(*args, **kwargs)
+        result = subprocess.run(
+            [sys.executable, "-c", contender, str(tmp_path)],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        assert result.stdout.strip() == "excluded"
+        return snapshot
+
+    monkeypatch.setattr(queue, "_store_media_stream", prepare)
+    request = QueueRequest("send_document", (1, b"owned media"), {})
+    try:
+        if publication == "enqueue":
+            row_id, _ = queue.enqueue_many([request], lambda _: media_operation)
+        elif publication == "supplement":
+            queue.record_telegram_completion(parent_id, b"receipt", supplement=request, operation_resolver=lambda _: media_operation)
+            row_id = queue.heads()[0].id
+        else:
+            row_id = parent_id
+            queue.recover_legacy_media_payload(row_id)
+    finally:
+        queue.close()
+    # The next owner must acquire the lock and retain the committed media.
+    queue = OutboundQueue(tmp_path)
+    try:
+        args, kwargs = queue.decode_payload(queue.load_queued(row_id).payload)
+        try:
+            assert media_bytes(args[1]) == b"owned media"
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+        queue.delete(row_id)
+        assert list(queue.media_dir.iterdir()) == []
+    finally:
+        queue.close()
+
+
+def test_shutdown_waits_for_preparation_and_rejects_publication_after_close(tmp_path, monkeypatch):
+    from concurrent.futures import TimeoutError
+    from efb_telegram_master.bot_manager import TelegramBotManager
+    from efb_telegram_master.outbound import QueuePersistenceError
+
+    queue = OutboundQueue(tmp_path)
+    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager.logger = Mock()
+    manager._outbound_queue = queue
+    manager._outbound_finalization_lock = threading.Lock()
+    manager._outbound_resources_finalized = False
+    manager._send_executor = ThreadPoolExecutor(max_workers=1)
+    prepared = threading.Event()
+    release = threading.Event()
+    closing = threading.Event()
+    store = queue._store_media_stream
+
+    def prepare(*args, **kwargs):
+        snapshot = store(*args, **kwargs)
+        prepared.set()
+        assert release.wait(5)
+        return snapshot
+
+    def close():
+        closing.set()
+        manager.stop_queued_worker()
+
+    monkeypatch.setattr(queue, "_store_media_stream", prepare)
+    request = QueueRequest("send_document", (1, b"shutdown media"), {})
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publication = executor.submit(queue.enqueue_many, [request], lambda _: media_operation)
+        try:
+            assert prepared.wait(5)
+            shutdown = executor.submit(close)
+            assert closing.wait(5)
+            with pytest.raises(TimeoutError):
+                shutdown.result(timeout=0.05)
+        finally:
+            release.set()
+        row_id, _ = publication.result(timeout=5)
+        shutdown.result(timeout=5)
+    queue.close()  # Repeated shutdown must not affect a later owner.
+    with pytest.raises(QueuePersistenceError, match="closed"):
+        queue.enqueue_many([request], lambda _: media_operation)
+    with pytest.raises(QueuePersistenceError, match="closed"):
+        queue.record_telegram_completion(row_id, b"receipt", supplement=request, operation_resolver=lambda _: media_operation)
+    restarted = OutboundQueue(tmp_path)
+    try:
+        args, kwargs = restarted.decode_payload(restarted.load_queued(row_id).payload)
+        try:
+            assert media_bytes(args[1]) == b"shutdown media"
+        finally:
+            restarted.close_payload_resources(restarted.payload_closeables(args, kwargs))
+    finally:
+        restarted.close()
+
+
+def test_constructor_failure_releases_queue_ownership(tmp_path, monkeypatch):
+    with monkeypatch.context() as patcher:
+        patcher.setattr(OutboundQueue, "_migrate_schema", Mock(side_effect=RuntimeError("schema failure")))
+        with pytest.raises(RuntimeError, match="schema failure"):
+            OutboundQueue(tmp_path)
+    queue = OutboundQueue(tmp_path)
+    try:
+        row_id, _ = enqueue(queue, QueueRequest("send_message", (1, "after failed startup"), {}))
+        assert queue.load_queued(row_id).operation == "send_message"
+    finally:
+        queue.close()

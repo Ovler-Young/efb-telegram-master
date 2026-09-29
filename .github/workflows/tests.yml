@@ -6,34 +6,42 @@ on:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
-  pull_request:
+      - '.github/workflows/tests.yml'
+      - 'pytest.ini'
+  pull_request_target:
     paths:
       - 'efb_telegram_master/**.py'
       - 'tests/**.py'
       - 'setup.py'
+      - '.github/workflows/tests.yml'
+      - 'pytest.ini'
   workflow_dispatch:
     inputs:
-      run_postgres_tests:
-        description: "Run optional PostgreSQL-backed test job"
-        required: false
-        default: false
+      restart_regression:
+        description: Queue/restart unit regressions plus focused live Telegram integration
         type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 jobs:
-  tests:
+  unit:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+    environment: ${{ github.event_name == 'pull_request_target' && 'telegram-integration' || 'ci' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       max-parallel: 1
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ${{ fromJSON(inputs.restart_regression && '["3.12"]' || '["3.10", "3.11", "3.12", "3.13", "3.14"]') }}
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
       with:
@@ -50,8 +58,7 @@ jobs:
     - name: Check with mypy
       run: |
         mypy -p efb_telegram_master --ignore-missing-imports
-    - name: Test with pytest on commits
-      if: ${{ github.event_name == 'push' }}
+    - name: Test unit suite
       env:
         TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
@@ -59,32 +66,112 @@ jobs:
         CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
         TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
         AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
-        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
+        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN2 }}
         USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
         API_ID: ${{ secrets.TELEGRAM_API_ID }}
         API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       run: |
-        pytest -vv -r a -l --color=yes
-    - name: Test with pytest on pull requests
-      if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
-      env:
-        TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
-        GROUPS: ${{ secrets.TELEGRAM_GROUPS }}
-        CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
-        TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
-        AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
-        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN_2 }}
-        USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
-        API_ID: ${{ secrets.TELEGRAM_API_ID }}
-        API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      run: |
-        pytest -vv -r a -l --color=yes --mode=both
+        if [ "${{ inputs.restart_regression }}" = "true" ]; then
+          pytest -vv -r a --color=yes --mode=unit tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_restart_memory.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py tests/unit/test_bot_manager.py tests/unit/test_outbound_adapter.py tests/unit/test_backfill.py tests/unit/test_database_safety.py tests/unit/test_database_performance.py
+        else
+          pytest -vv -r a -l --color=yes --mode=unit
+        fi
 
-  postgres-tests:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_postgres_tests }}
+  database:
+    # Database acceptance must run without Telegram secrets and must not be
+    # skipped by the unit/integration selector or missing PostgreSQL variables.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.10"
+            peewee: "3.19.0"
+          - python-version: "3.14"
+            peewee: "4.5.1"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: efb_telegram
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d efb_telegram"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    - uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install database test dependencies
+      run: |
+        python -m pip install '.[tests,tgs,postgresql]' 'peewee==${{ matrix.peewee }}'
+    - name: Verify migration, recovery, pool lifecycle and performance
+      env:
+        TEST_POSTGRES_HOST: 127.0.0.1
+        TEST_POSTGRES_PORT: "5432"
+        TEST_POSTGRES_DB: efb_telegram
+        TEST_POSTGRES_USER: postgres
+        TEST_POSTGRES_PASSWORD: postgres
+      run: |
+        pytest --mode=unit -v tests/unit/test_database_safety.py tests/unit/test_database_performance.py tests/unit/test_restart_memory.py tests/unit/test_db_migrations.py tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py tests/unit/test_bot_manager.py tests/unit/test_outbound_adapter.py
+    - name: Verify SQLite 3.31.1 compatibility
+      if: matrix.python-version == '3.10'
+      timeout-minutes: 8
+      env:
+        TEST_POSTGRES_HOST: 127.0.0.1
+        TEST_POSTGRES_PORT: "5432"
+        TEST_POSTGRES_DB: efb_telegram
+        TEST_POSTGRES_USER: postgres
+        TEST_POSTGRES_PASSWORD: postgres
+      run: |
+        set -euo pipefail
+        sqlite_build_dir=$(mktemp -d "$RUNNER_TEMP/etm-sqlite331.XXXXXX")
+        sqlite_prefix="$sqlite_build_dir/install"
+        curl --fail --location --retry 2 --connect-timeout 20 --max-time 120 \
+          https://www.sqlite.org/2020/sqlite-autoconf-3310100.tar.gz \
+          --output "$sqlite_build_dir/sqlite.tar.gz"
+        tar -xzf "$sqlite_build_dir/sqlite.tar.gz" -C "$sqlite_build_dir"
+        cd "$sqlite_build_dir/sqlite-autoconf-3310100"
+        CFLAGS="-O2 -DSQLITE_ENABLE_DESERIALIZE" ./configure \
+          --prefix="$sqlite_prefix" --enable-shared --disable-static --disable-readline
+        make -j2 libsqlite3.la
+        make install-libLTLIBRARIES
+        cd "$GITHUB_WORKSPACE"
+        export LD_LIBRARY_PATH="$sqlite_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        export LD_PRELOAD="$sqlite_prefix/lib/libsqlite3.so.0${LD_PRELOAD:+:$LD_PRELOAD}"
+        python - <<'PY'
+        import sqlite3
+        assert sqlite3.sqlite_version == "3.31.1", sqlite3.sqlite_version
+        with sqlite3.connect(":memory:") as connection:
+            actual = connection.execute("SELECT sqlite_version()").fetchone()[0]
+        assert actual == "3.31.1", actual
+        print(f"Verified Python sqlite3 and SQL engine: {actual}")
+        PY
+        python -m pytest --mode=unit -v \
+          tests/unit/test_database_safety.py tests/unit/test_database_performance.py \
+          tests/unit/test_restart_memory.py tests/unit/test_outbound.py \
+          tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_history_replay.py \
+          tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py
+
+  integration:
+    if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'
+    needs: [unit, database]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+    environment: telegram-integration
     services:
       postgres:
         image: postgres:16
@@ -100,7 +187,9 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
     - name: Set up Python 3.12
       uses: actions/setup-python@v6
       with:
@@ -108,17 +197,33 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install '.[tests,tgs]'
+        pip install '.[tests,tgs,postgresql]'
     - name: Install binary dependencies
       run: |
         sudo apt update
         sudo apt install -y ffmpeg libmagic-dev libwebp-dev
-    - name: Run PostgreSQL-focused tests
+    - name: Test integration suite
       env:
+        RESTART_REGRESSION: ${{ inputs.restart_regression }}
+        TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        ADMINS: ${{ secrets.TELEGRAM_ADMINS }}
+        GROUPS: ${{ secrets.TELEGRAM_GROUPS }}
+        CHANNELS: ${{ secrets.TELEGRAM_CHANNELS }}
+        TOPIC_GROUP: ${{ secrets.TELEGRAM_TOPIC_GROUP }}
+        AUX_BOT_TOKEN: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN }}
+        AUX_BOT_TOKEN_2: ${{ secrets.TELEGRAM_AUX_BOT_TOKEN2 }}
+        USER_SESSION: ${{ secrets.TELEGRAM_USER_SESSION }}
+        API_ID: ${{ secrets.TELEGRAM_API_ID }}
+        API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         TEST_POSTGRES_HOST: 127.0.0.1
         TEST_POSTGRES_PORT: "5432"
         TEST_POSTGRES_DB: efb_telegram
         TEST_POSTGRES_USER: postgres
         TEST_POSTGRES_PASSWORD: postgres
       run: |
-        pytest -vv -r a -l --color=yes --mode=unit tests/unit/test_db_migrations.py
+        python -c 'import os; required = ("TOKEN", "ADMINS", "GROUPS", "USER_SESSION", "API_ID", "API_HASH"); missing = [name for name in required if not os.getenv(name)]; assert not missing, "Missing live-test credentials: " + ", ".join(missing)'
+        if [ "$RESTART_REGRESSION" = "true" ]; then
+          pytest -vv -r a --color=yes --mode=integration tests/integration/test_simple.py tests/integration/test_react.py tests/integration/test_backfill.py tests/integration/test_slave_message.py tests/integration/test_slave_message_file.py tests/integration/test_delivery_uncertainty.py tests/integration/test_relink_history_media.py tests/integration/test_relink_original_sender.py
+        else
+          pytest -vv -r a -l --color=yes --mode=integration
+        fi

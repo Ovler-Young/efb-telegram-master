@@ -5,18 +5,24 @@ from __future__ import annotations
 from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass
 import io
+import httpx
 from pathlib import Path
 import sqlite3
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from prometheus_client import generate_latest
 from telegram import InputMediaDocument
-from telegram.error import NetworkError, RetryAfter, TelegramError
+from telegram.error import ChatMigrated, NetworkError, RetryAfter, TelegramError
 
 import efb_telegram_master.outbound as outbound
-from efb_telegram_master.bot_manager import TelegramBotManager
+from efb_telegram_master.bot_manager import (
+    QueuedChatMigrationRetry,
+    QueuedDbLogContext,
+    TelegramBotManager,
+)
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
@@ -26,10 +32,12 @@ from efb_telegram_master.outbound import (
     OutboundQueueScheduler,
     QueuePersistenceError,
     QueueRequest,
+    RequiredSenderUnavailableError,
     SchedulerStoppedError,
     SenderSelection,
     SenderSelectionResult,
 )
+from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
 def send_message(chat_id: int, text: str) -> tuple[int, str]:
@@ -46,6 +54,14 @@ def send_video(chat_id: int, video: object, **kwargs) -> tuple[int, object, dict
 
 def send_media_group(chat_id: int, media: object) -> tuple[int, object]:
     return chat_id, media
+
+
+def edit_message_media(media: object, chat_id: int, message_id: int) -> tuple[object, int, int]:
+    return media, chat_id, message_id
+
+
+def edit_message_text(chat_id: int, message_id: int, text: str) -> tuple[int, int, str]:
+    return chat_id, message_id, text
 
 
 def enqueue(queue: OutboundQueue, chat_id: int, text: str = "message") -> tuple[int, Future]:
@@ -74,6 +90,7 @@ class ControlledExecutor:
 class CompletionDecision:
     kind: str
     retry_at: float | None = None
+    retry_reason: str | None = None
 
 
 class AlwaysAvailableLimiter:
@@ -92,6 +109,7 @@ def auxiliary_probe_publishing_non_membership(bot_id: int, chat_id: int) -> Auxi
     )
     auxiliary._runtime = None
     auxiliary._membership_cache = {}
+    auxiliary._membership_generation = {}
     auxiliary._membership_lock = threading.Lock()
     auxiliary._pending_probes = {chat_id}
     auxiliary._metrics = None
@@ -105,7 +123,6 @@ def manager_adapter() -> TelegramBotManager:
     manager._bot = object()
     manager._rate_limiter = AlwaysAvailableLimiter()
     manager._bot_chat_disabled_until = {}
-    manager._bot_chat_retry_failures = {}
     manager.bot_pool = None
     return manager
 
@@ -225,13 +242,14 @@ class RecordingAdapter:
         self.failures: list[tuple[object, BaseException]] = []
         self.successes: list[tuple[object, object]] = []
         self.executed: list[int] = []
+        self.selection = SenderSelection(object(), None)
 
     def select_sender(self, row, now: float) -> SenderSelectionResult:
         if self.terminal:
             return SenderSelectionResult(terminal_error_class="required_sender_unavailable")
         if self.retry_at is not None and now < self.retry_at:
             return SenderSelectionResult(retry_at=self.retry_at)
-        return SenderSelectionResult(selection=SenderSelection(object(), None))
+        return SenderSelectionResult(selection=self.selection)
 
     def acquire_sender_limits(self, _selection: SenderSelection, _chat_id: int) -> bool:
         return True
@@ -245,6 +263,11 @@ class RecordingAdapter:
     ) -> CompletionDecision:
         self.failures.append((row, error))
         return self.failure_decision
+
+    def record_queued_retry_after(
+        self, row, error: RetryAfter, _selection: SenderSelection
+    ) -> None:
+        self.failures.append((row, error))
 
     def record_queued_success(
         self, row, result: object, _selection: SenderSelection
@@ -293,6 +316,7 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
 
     retry_after = RetryAfter(10)
     executor.submissions[0][2].set_exception(retry_after)
+    assert first_media.closed
     scheduler.harvest_completed()
     assert scheduler.wake_event.is_set()
     assert not first_waiter.done()
@@ -306,10 +330,10 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     # The original row remains the same-priority destination head during cooldown.
     scheduler.dispatch_once()
     assert len(executor.submissions) == 1
-    assert scheduler.next_deadline == 115.0
+    assert scheduler.next_deadline == 110.0
     assert [row.id for row in retained_queue.heads()] == [first_id]
 
-    clock["now"] = 115.0
+    clock["now"] = 110.0
     scheduler.dispatch_once()
     assert len(executor.submissions) == 2
     assert executor.submissions[1][1][0].id == first_id
@@ -320,6 +344,7 @@ def test_eventual_retry_after_retains_original_row_waiter_and_same_priority_fifo
     assert [row.id for row in retained_queue.heads()] == [first_id]
 
     executor.submissions[1][2].set_result("sent")
+    assert retry_media.closed
     scheduler.harvest_completed()
     assert first_waiter.result() == "sent"
     assert [row.id for row in retained_queue.heads()] == [second_id]
@@ -431,6 +456,498 @@ def test_blocking_retry_after_is_terminal(retained_queue: OutboundQueue) -> None
     assert row_id not in {row.id for row in retained_queue.heads()}
 
 
+def _enqueue_blocking_media_edit(
+    queue: OutboundQueue, source: io.BufferedReader, required_sender_bot_id: str = "auxiliary"
+) -> tuple[int, Future]:
+    return queue.enqueue_many(
+        [QueueRequest(
+            "edit_message_media", (InputMediaDocument(source), 67, 4),
+            {"_send_mode": "blocking", "_required_sender_bot_id": required_sender_bot_id},
+        )],
+        lambda _operation: edit_message_media,
+    )
+
+
+def _required_auxiliary(bot: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        bot_id=10,
+        bot=bot,
+        disabled=False,
+        check_membership_tri=lambda _chat_id: True,
+        peek_delay=lambda _chat_id: 0.0,
+        try_acquire_limits=lambda _chat_id: True,
+    )
+
+
+def _manager_with_required_auxiliary(auxiliary: SimpleNamespace) -> TelegramBotManager:
+    manager = manager_adapter()
+    manager._queued_db_log_contexts = {}
+    manager._queued_db_log_context_lock = threading.Lock()
+    manager.bot_pool = BotPool([auxiliary], manager)
+    return manager
+
+
+def test_blocking_media_edit_retries_at_telegram_deadline_with_rewound_payload(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    source = io.BufferedReader(io.BytesIO(b"edited media"))
+    row_id, waiter = _enqueue_blocking_media_edit(retained_queue, source)
+    source.close()
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    first_media = executor.submissions[0][1][1][0].media
+    first_content = first_media.input_file_content
+    if isinstance(first_content, bytes):
+        assert first_content == b"edited media"
+    else:
+        assert first_content.tell() == 0
+        assert first_content.read() == b"edited media"
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+
+    assert not waiter.done()
+    assert row_id in scheduler.blocking_media_retries
+    assert scheduler.next_deadline == 221.0
+    clock["monotonic"] = 221.0
+    clock["wall"] = 1121.0
+    scheduler.dispatch_once()
+    retry_media = executor.submissions[1][1][1][0].media
+    assert retry_media is not first_media
+    retry_content = retry_media.input_file_content
+    if isinstance(retry_content, bytes):
+        assert retry_content == b"edited media"
+    else:
+        assert retry_content.tell() == 0
+        assert retry_content.read() == b"edited media"
+    executor.submissions[1][2].set_result("edited")
+    scheduler.harvest_completed()
+    assert waiter.result() == "edited"
+
+
+def test_blocking_media_edit_retry_uses_migrated_destination_after_retry_after(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    old_chat_id = 67
+    new_chat_id = 68
+    manager = manager_adapter()
+    manager._bot = Mock()
+    manager._bot.edit_message_media.side_effect = [
+        ChatMigrated(new_chat_id),
+        RetryAfter(121),
+        "edited",
+    ]
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    manager._outbound_queue = retained_queue
+    row_id, waiter = _enqueue_blocking_media_edit(
+        retained_queue, io.BufferedReader(io.BytesIO(b"media")), "__main__"
+    )
+    later_id, later_waiter = retained_queue.enqueue_many(
+        [QueueRequest(
+            "send_message",
+            (),
+            {"chat_id": new_chat_id, "text": "later", "_send_mode": "blocking"},
+        )],
+        lambda _operation: send_message,
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    first_function, first_args, first_future = executor.submissions[0]
+    with pytest.raises(RetryAfter) as raised:
+        first_function(*first_args)
+    first_future.set_exception(raised.value)
+    scheduler.harvest_completed()
+
+    retry = scheduler.blocking_media_retries[row_id]
+    retry_args, _retry_kwargs = retained_queue.decode_payload(retry.row.payload)
+    assert retry.row.telegram_chat_id == new_chat_id
+    assert retry_args[1] == new_chat_id
+    assert manager._bot_chat_disabled_until == {(None, new_chat_id): 221.0}
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+    retry_function, retry_submission_args, retry_future = executor.submissions[1]
+    assert retry_submission_args[0].telegram_chat_id == new_chat_id
+    assert retry_submission_args[1][1] == new_chat_id
+    retry_future.set_result(retry_function(*retry_submission_args))
+    scheduler.harvest_completed()
+    assert waiter.result() == "edited"
+    assert [entry.args[1] for entry in manager._bot.edit_message_media.call_args_list] == [
+        old_chat_id,
+        new_chat_id,
+        new_chat_id,
+    ]
+
+    scheduler.dispatch_once()
+    assert executor.submissions[2][1][0].id == later_id
+    executor.submissions[2][2].set_result("later")
+    scheduler.harvest_completed()
+    assert later_waiter.result() == "later"
+
+
+def test_blocking_media_retry_preserves_database_context_until_real_manager_success(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    manager = manager_adapter()
+    manager._queued_db_log_contexts = {}
+    manager._queued_db_log_context_lock = threading.Lock()
+    manager._write_database_update = Mock()
+    completed = Mock()
+    row_id, waiter = retained_queue.enqueue_many(
+        [QueueRequest(
+            "edit_message_media", (InputMediaDocument(b"media"), 67, 4),
+            {"_send_mode": "blocking", "_required_sender_bot_id": "__main__"},
+        )],
+        lambda _operation: edit_message_media,
+    )
+    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+
+    assert manager._queued_db_log_contexts.keys() == {row_id}
+    completed.assert_not_called()
+    assert manager._bot_chat_disabled_until == {(None, 67): 221.0}
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+    result = Mock()
+    executor.submissions[1][2].set_result(result)
+    scheduler.harvest_completed()
+
+    assert waiter.result() is result
+    assert manager._queued_db_log_contexts == {}
+    manager._write_database_update.assert_called_once()
+    completed.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("terminal_path", "expected_error"),
+    [
+        ("deadline", RetryAfter),
+        ("submit", RuntimeError),
+        ("stop", SchedulerStoppedError),
+    ],
+)
+def test_blocking_media_retry_terminal_paths_finish_real_manager_database_context(
+    retained_queue: OutboundQueue,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_path: str,
+    expected_error: type[BaseException],
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    manager = manager_adapter()
+    manager._queued_db_log_contexts = {}
+    manager._queued_db_log_context_lock = threading.Lock()
+    manager._write_database_update = Mock()
+    completed = Mock()
+    row_id, waiter = _enqueue_blocking_media_edit(
+        retained_queue, io.BufferedReader(io.BytesIO(b"media")), "__main__"
+    )
+    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+
+    if terminal_path == "deadline":
+        clock.update(monotonic=400.0, wall=1300.0)
+        scheduler.dispatch_once()
+    elif terminal_path == "submit":
+        executor.submit_error = RuntimeError("executor unavailable")
+        clock.update(monotonic=221.0, wall=1121.0)
+        scheduler.dispatch_once()
+    else:
+        scheduler.stop_and_drain(timeout=0.0)
+
+    with pytest.raises(expected_error):
+        waiter.result()
+    scheduler.stop_and_drain(timeout=0.0)
+    assert manager._queued_db_log_contexts == {}
+    completed.assert_called_once_with()
+    manager._write_database_update.assert_not_called()
+
+
+def test_blocking_media_retry_caps_required_sender_wait_at_original_deadline(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    adapter = RecordingAdapter()
+    _row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+    adapter.retry_at = 500.0
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+
+    assert scheduler.next_deadline == 400.0
+    clock.update(monotonic=400.0, wall=1300.0)
+    scheduler.dispatch_once()
+    with pytest.raises(RetryAfter):
+        waiter.result()
+    assert len(executor.submissions) == 1
+
+
+def test_blocking_media_retry_caps_limiter_wait_at_original_deadline(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    adapter = RecordingAdapter()
+    _row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+    monkeypatch.setattr(adapter, "acquire_sender_limits", lambda _selection, _chat_id: False)
+    clock.update(monotonic=221.0, wall=1299.9)
+    scheduler.dispatch_once()
+
+    assert scheduler.next_deadline == pytest.approx(221.1)
+    clock.update(monotonic=221.1, wall=1300.0)
+    scheduler.dispatch_once()
+    with pytest.raises(RetryAfter):
+        waiter.result()
+    assert len(executor.submissions) == 1
+
+
+def test_blocking_media_retry_keeps_required_auxiliary_sender(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    auxiliary = _required_auxiliary(object())
+    manager = _manager_with_required_auxiliary(auxiliary)
+    executor = ControlledExecutor()
+    _row_id, waiter = _enqueue_blocking_media_edit(
+        retained_queue, io.BufferedReader(io.BytesIO(b"media")), "10"
+    )
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    assert executor.submissions[0][1][3].sender is auxiliary.bot
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+
+    assert executor.submissions[1][1][3].sender is auxiliary.bot
+    executor.submissions[1][2].set_result(Mock())
+    scheduler.harvest_completed()
+    assert waiter.done()
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_error"),
+    [("disabled", RequiredSenderUnavailableError), ("replaced", RetryAfter)],
+)
+def test_blocking_media_retry_fails_when_required_auxiliary_changes(
+    retained_queue: OutboundQueue,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    expected_error: type[BaseException],
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    auxiliary = _required_auxiliary(object())
+    manager = _manager_with_required_auxiliary(auxiliary)
+    completed = Mock()
+    executor = ControlledExecutor()
+    row_id, waiter = _enqueue_blocking_media_edit(
+        retained_queue, io.BufferedReader(io.BytesIO(b"media")), "10"
+    )
+    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+    if change == "disabled":
+        auxiliary.disabled = True
+    else:
+        auxiliary.bot = object()
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+
+    with pytest.raises(expected_error):
+        waiter.result()
+    assert len(executor.submissions) == 1
+    assert manager._bot is not auxiliary.bot
+    assert manager._queued_db_log_contexts == {}
+    completed.assert_called_once_with()
+
+
+def test_blocking_media_edit_retry_exceeding_original_deadline_is_terminal(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    metrics = Metrics()
+    retained_queue.metrics = metrics
+    row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(301))
+    scheduler.harvest_completed()
+
+    with pytest.raises(RetryAfter):
+        waiter.result()
+    assert row_id not in scheduler.blocking_media_retries
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="edit_message_media",outcome="failure",priority="blocking",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="edit_message_media",outcome="failure",priority="blocking"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="edit_message_media",outcome="failure",priority="blocking"} 1.0' in rendered
+
+
+def test_repeated_blocking_media_edit_retry_cannot_extend_original_deadline(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    _row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+    executor.submissions[1][2].set_exception(RetryAfter(180))
+    scheduler.harvest_completed()
+
+    with pytest.raises(RetryAfter):
+        waiter.result()
+    assert not scheduler.blocking_media_retries
+
+
+def test_blocking_media_edit_retry_keeps_same_chat_fifo_barrier(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
+    later_id, later_waiter = retained_queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": 67, "text": "later", "_send_mode": "blocking"})],
+        lambda _operation: send_message,
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+    assert executor.submissions[1][1][0].id == row_id
+    executor.submissions[1][2].set_result("edited")
+    scheduler.harvest_completed()
+    assert waiter.result() == "edited"
+    scheduler.dispatch_once()
+    assert executor.submissions[2][1][0].id == later_id
+    executor.submissions[2][2].set_result("later")
+    scheduler.harvest_completed()
+    assert later_waiter.result() == "later"
+
+
+def test_stop_and_drain_fails_delayed_blocking_media_edit_without_retrying(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    _row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+    scheduler.stop_and_drain(timeout=0.0)
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+
+    with pytest.raises(SchedulerStoppedError):
+        waiter.result()
+    assert len(executor.submissions) == 1
+
+
+def test_blocking_media_edit_non_retry_after_failure_is_terminal(retained_queue: OutboundQueue) -> None:
+    _row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(TelegramError("terminal"))
+    scheduler.harvest_completed()
+
+    with pytest.raises(TelegramError, match="terminal"):
+        waiter.result()
+    assert not scheduler.blocking_media_retries
+
+
+def test_blocking_text_edit_retry_after_remains_terminal(retained_queue: OutboundQueue) -> None:
+    row_id, waiter = retained_queue.enqueue_many(
+        [QueueRequest(
+            "edit_message_text", (), {
+                "chat_id": 67, "message_id": 4, "text": "updated", "_send_mode": "blocking",
+                "_required_sender_bot_id": "auxiliary",
+            },
+        )],
+        lambda _operation: edit_message_text,
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(121))
+    scheduler.harvest_completed()
+
+    with pytest.raises(RetryAfter):
+        waiter.result()
+    assert row_id not in scheduler.blocking_media_retries
+
+
 def test_later_blocking_row_overtakes_retained_normal_row_after_cooldown(
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -531,11 +1048,314 @@ def test_scheduler_publishes_metrics_for_actual_dequeue_and_completion(tmp_path:
     assert 'etm_outbound_dequeued_total{operation="send_message",priority="normal"} 1.0' in rendered
     assert 'etm_outbound_in_flight{operation="send_message",priority="normal",sender_kind="main"} 0.0' in rendered
     assert 'etm_outbound_completions_total{operation="send_message",outcome="success",priority="normal",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_queue_dispatches_total{outcome="submitted"} 1.0' in rendered
+    assert 'etm_outbound_queue_wait_seconds_count{operation="send_message",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
     assert row_id not in scheduler.in_flight
     queue.close()
 
 
-def test_queue_metrics_start_from_retained_rows_and_publish_terminal_discard(tmp_path: Path) -> None:
+def test_scheduler_records_attempt_failure_and_only_terminal_success_after_retry(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    _row_id, waiter = enqueue(queue, 49, "retry metrics")
+    adapter = RecordingAdapter(failure_decision=CompletionDecision("retry_eventual", retry_at=10.0))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(1))
+    scheduler.harvest_completed()
+
+    assert not waiter.done()
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="failure",priority="normal",sender_kind="main"}' not in rendered
+    assert 'etm_outbound_retries_total{operation="send_message",priority="normal",reason="rate_limit"} 1.0' in rendered
+    assert 'etm_outbound_failures_total{operation="send_message",priority="normal",stage="execution"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="failure",priority="normal"} 1.0' in rendered
+
+    scheduler.dispatch_once()
+    executor.submissions[1][2].set_result("sent")
+    scheduler.harvest_completed()
+
+    assert waiter.result() == "sent"
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="success",priority="normal",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="failure",priority="normal",sender_kind="main"}' not in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="failure",priority="normal"}' not in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    queue.close()
+
+
+def test_scheduler_records_transport_retry_reason(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    enqueue(queue, 50, "transport retry")
+    adapter = RecordingAdapter(
+        failure_decision=CompletionDecision("retry_eventual", retry_at=10.0)
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    connect_error = NetworkError("connection failed before request")
+    connect_error.__cause__ = httpx.ConnectError("connection refused")
+    executor.submissions[0][2].set_exception(connect_error)
+    scheduler.harvest_completed()
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="transport"} 1.0' in rendered
+    )
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="membership"}' not in rendered
+    )
+    queue.close()
+
+
+def test_transport_retry_deadline_blocks_only_its_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    first_id, _first_waiter = enqueue(queue, 50, "first")
+    manager = manager_adapter()
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=2)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    connect_error = NetworkError("connection failed before request")
+    connect_error.__cause__ = httpx.ConnectError("connection refused")
+    executor.submissions[0][2].set_exception(connect_error)
+    scheduler.harvest_completed()
+    second_id, _second_waiter = enqueue(queue, 50, "second")
+    other_id, _other_waiter = enqueue(queue, 51, "other")
+
+    scheduler.dispatch_once()
+
+    assert scheduler.next_deadline == 101.0
+    assert [submission[1][0].id for submission in executor.submissions] == [first_id, other_id]
+
+    clock["now"] = 101.0
+    scheduler.dispatch_once()
+
+    assert [submission[1][0].id for submission in executor.submissions] == [
+        first_id,
+        other_id,
+        first_id,
+    ]
+    assert second_id not in [submission[1][0].id for submission in executor.submissions]
+    queue.close()
+
+
+def test_chat_migration_redispatches_retained_row_only_after_harvest(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    first_id, _waiter = enqueue(queue, 61, "first")
+    sender = Mock()
+    sender.send_message.side_effect = [ChatMigrated(62), "sent"]
+    manager = manager_adapter()
+    manager._bot = sender
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=2)
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    function, arguments, first_future = executor.submissions[0]
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        function(*arguments)
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    first_future.set_exception(caught.value)
+    scheduler.harvest_completed()
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="migration"} 1.0'
+        in generate_latest(metrics.registry).decode()
+    )
+    scheduler.dispatch_once()
+
+    assert len(executor.submissions) == 2
+    retried_row = executor.submissions[1][1][0]
+    assert retried_row.id == first_id
+    assert retried_row.telegram_chat_id == 62
+    assert queue.decode_payload(retried_row.payload)[1]["chat_id"] == 62
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(61, 62)
+    queue.close()
+
+
+def test_chat_migration_binding_failure_retains_original_row(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, 61, "first")
+    row = queue.heads()[0]
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(
+            chat_migration_by_id=Mock(side_effect=RuntimeError("database unavailable"))
+        )
+    )
+    selection = SenderSelection(sender=sender, sender_bot_id=None)
+
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        manager.execute_queued_call(row, *queue.decode_payload(row.payload), selection)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 50.0)
+        decision = manager.record_queued_failure(row, caught.value, selection)
+    assert decision.kind.name == "RETRY_EVENTUAL"
+    assert decision.retry_reason == "migration"
+    assert decision.retry_at == 51.0
+    retained = queue.heads()[0]
+    assert retained.id == row_id
+    assert retained.telegram_chat_id == 61
+    assert queue.decode_payload(retained.payload)[1]["chat_id"] == 61
+    queue.close()
+
+
+def test_chat_migration_binding_failure_observes_retry_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, 61, "first")
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._bot = sender
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(
+            chat_migration_by_id=Mock(side_effect=RuntimeError("database unavailable"))
+        )
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
+    clock = {"now": 50.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    function, arguments, future = executor.submissions[0]
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        function(*arguments)
+    future.set_exception(caught.value)
+    scheduler.harvest_completed()
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    assert scheduler.next_deadline == 51.0
+
+    clock["now"] = 51.0
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 2
+    assert executor.submissions[1][1][0].id == row_id
+    queue.close()
+
+
+def test_chat_migration_retarget_failure_stops_scheduler_and_retains_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, 61, "first")
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._bot = sender
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    persistence_error = QueuePersistenceError("injected retarget failure")
+    monkeypatch.setattr(queue, "retarget", Mock(side_effect=persistence_error))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    function, arguments, future = executor.submissions[0]
+    with pytest.raises(QueuePersistenceError) as caught:
+        function(*arguments)
+    future.set_exception(caught.value)
+    scheduler.harvest_completed()
+
+    assert scheduler.stopping
+    assert scheduler.failure is not persistence_error
+    assert str(scheduler.failure) == str(persistence_error)
+    assert scheduler.failure.__traceback__ is None
+    with pytest.raises(QueuePersistenceError):
+        waiter.result()
+    retained = queue.heads()[0]
+    assert retained.id == row_id
+    assert retained.telegram_chat_id == 61
+    assert queue.decode_payload(retained.payload)[1]["chat_id"] == 61
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(61, 62)
+    queue.close()
+
+
+def test_retarget_updates_only_current_row_and_ignores_corrupt_sibling(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    first_id, _waiter = enqueue(queue, 61, "first")
+    second_id, _second_waiter = enqueue(queue, 61, "second")
+    queue.connection.execute(
+        "UPDATE outbound_queue SET payload = X'02' WHERE id = ?", (second_id,)
+    )
+    queue.connection.commit()
+
+    queue.retarget(first_id, 62, (), {"chat_id": 62, "text": "first"})
+
+    stored_rows = queue.connection.execute(
+        "SELECT id, telegram_chat_id, payload FROM outbound_queue ORDER BY id"
+    ).fetchall()
+    assert [(stored_rows[0][0], stored_rows[0][1])] == [(first_id, 62)]
+    assert queue.decode_payload(stored_rows[0][2])[1]["chat_id"] == 62
+    assert (stored_rows[1][0], stored_rows[1][1], stored_rows[1][2]) == (
+        second_id,
+        61,
+        b"\x02",
+    )
+    queue.close()
+
+
+def test_manager_registers_runtime_snapshot_collectors_with_configured_destination_cap(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    enqueue(queue, 61, "first")
+    enqueue(queue, 61, "second")
+    enqueue(queue, 62, "third")
+    metrics = Metrics()
+    manager = object.__new__(TelegramBotManager)
+    manager._metrics = metrics
+    manager._outbound_queue = queue
+    manager._outbound_scheduler = SimpleNamespace(in_flight_count=lambda: 3)
+    manager._send_worker_thread = SimpleNamespace(is_alive=lambda: True)
+    manager._bot_chat_disabled_until = {(None, 61): outbound.time.monotonic() + 1.0}
+    manager._rate_limiter = SlidingWindowRateLimiter()
+    manager.bot_pool = None
+
+    manager._register_runtime_metric_collectors(top_n=1)
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_destination_queue_depth{destination="rank_1"} 2.0' in rendered
+    assert 'etm_outbound_destination_queue_depth{destination="rank_2"}' not in rendered
+    assert "etm_outbound_worker_healthy 1.0" in rendered
+    assert "etm_outbound_worker_in_flight 3.0" in rendered
+    assert 'etm_outbound_cooldown_seconds{sender_kind="main"}' in rendered
+    assert 'etm_auxiliary_bots{state="enabled"} 0.0' in rendered
+    assert 'etm_auxiliary_membership_cache_entries{state="member"} 0.0' in rendered
+    assert 'etm_rate_limit_occupancy{scope="global"} 0.0' in rendered
+    queue.close()
+
+
+def test_queue_metrics_include_corrupt_retained_rows_without_removal(tmp_path: Path) -> None:
     retained = OutboundQueue(tmp_path)
     enqueue(retained, 53, "retained")
     retained.close()
@@ -553,9 +1373,10 @@ def test_queue_metrics_start_from_retained_rows_and_publish_terminal_discard(tmp
     scheduler.dispatch_once()
 
     rendered = generate_latest(metrics.registry).decode()
-    assert "etm_outbound_queue_depth 1.0" in rendered
-    assert 'etm_outbound_queue_removals_total{operation="send_message",outcome="terminal_discard",priority="blocking"} 1.0' in rendered
-    assert 'etm_outbound_queue_residence_seconds_count{operation="send_message",outcome="terminal_discard",priority="blocking"} 1.0' in rendered
+    assert "etm_outbound_queue_depth 2.0" in rendered
+    assert 'outcome="terminal_discard"' not in rendered
+    assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone() == (2,)
+    assert not scheduler.stopping
     queue.close()
 
 
@@ -709,7 +1530,7 @@ def test_startup_wakes_recompute_deadline_without_dequeue_when_worker_permit_is_
     scheduler._permits.release()
 
 
-def test_invalid_payload_is_terminally_discarded_without_worker_or_sender_acquisition(
+def test_invalid_payload_is_retained_without_upload_and_later_traffic_runs(
     retained_queue: OutboundQueue,
 ) -> None:
     retained_queue.connection.execute(
@@ -728,11 +1549,28 @@ def test_invalid_payload_is_terminally_discarded_without_worker_or_sender_acquis
     scheduler.dispatch_once()
 
     with pytest.raises(InvalidQueuedPayloadError):
-        waiter.result()
-    assert retained_queue.heads() == []
+        waiter.result(timeout=1)
+    assert row_id not in retained_queue.waiters
+    assert retained_queue.load_queued(row_id).payload == b"\x02"
+    assert retained_queue.heads(ready_only=True) == []
     assert executor.submissions == []
+    assert adapter.executed == []
     assert adapter.failures == []
     assert scheduler.in_flight == {}
+    assert not scheduler.stopping
+
+    valid_id, valid_waiter = enqueue(retained_queue, 151, "later valid message")
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    function, arguments, future = executor.submissions[0]
+    future.set_result(function(*arguments))
+    scheduler.harvest_completed()
+    assert valid_waiter.result(timeout=1) == valid_id
+    assert adapter.executed == [valid_id]
+    assert retained_queue.load_queued(row_id).payload == b"\x02"
+    assert retained_queue.heads(ready_only=True) == []
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
 
 
 def test_shutdown_final_snapshot_keeps_retained_eventual_rows(
@@ -804,6 +1642,7 @@ def test_shutdown_resolves_retained_eventual_retry_after_waiter(
     assert row_id not in retained_queue.waiters
     assert scheduler.in_flight == {}
     assert 174 not in scheduler.in_flight_destinations
+    assert len(executor.submissions) == 1
 
 
 class InitializationFailureConnection(sqlite3.Connection):

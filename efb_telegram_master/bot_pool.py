@@ -131,6 +131,27 @@ class BotPool:
             while bot.has_pending_probes() and time.monotonic() < deadline:
                 time.sleep(0.1)
 
+    def auxiliary_count_snapshot(self) -> dict[str, int]:
+        """Return configured auxiliary counts grouped by enabled state."""
+        enabled = sum(1 for bot in self._bots if not bot.disabled)
+        return {"enabled": enabled, "disabled": len(self._bots) - enabled}
+
+    def membership_cache_snapshot(self) -> dict[str, int]:
+        """Combine auxiliary membership-cache counts without retaining identities."""
+        totals = {"member": 0, "not_member": 0, "unknown_probe_pending": 0}
+        for bot in self._bots:
+            for state, count in bot.get_membership_cache_snapshot().items():
+                totals[state] += count
+        return totals
+
+    def rate_limit_occupancy_snapshot(self) -> dict[str, float]:
+        """Return the highest current auxiliary occupancy for each limiter scope."""
+        occupancy = {"global": 0.0, "chat": 0.0}
+        for bot in self._bots:
+            for scope, value in bot.rate_limit_occupancy_snapshot().items():
+                occupancy[scope] = max(occupancy[scope], value)
+        return occupancy
+
     def __bool__(self) -> bool:
         return bool(self._bots)
 

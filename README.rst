@@ -136,6 +136,7 @@ A sample config file can be as follows:
     #   user: postgres
     #   password: ""
     #   max_connections: 8
+    #   pool_timeout: 5
     #   stale_timeout: 300
 
     # [Experimental Flags]
@@ -167,30 +168,78 @@ sample above) and install the optional dependency set:
 
     pip install "efb-telegram-master[postgresql]"
 
-On first startup with PostgreSQL enabled, ETM can automatically import data
-from an existing SQLite database (if present) and rename the old SQLite file
-to ``tgdata.db.migrated`` as a backup.
+Existing SQLite data must be imported explicitly while the bot and all other
+writers are stopped. Startup never imports or renames a database automatically.
+Use a private YAML file containing the target ``database`` mapping:
+
+.. code:: shell
+
+    python -m efb_telegram_master.migrate_db \
+        --data-dir /absolute/path/to/channel-data \
+        --config /private/path/postgresql.yaml
+
+The importer snapshots both SQLite stores, streams and verifies every supported
+row, and records a recoverable cutover before PostgreSQL startup is permitted.
+The original SQLite files and older backups are retained. The outbound queue
+continues to use ``outbound-queue.sqlite3`` together with ``outbound-media/``;
+keep both in the same data directory. Migration archives also copy referenced
+external attachments into portable queue-owned media files.
+Read the `migration and rollback guide <docs/database-migration.md>`_ before
+changing production configuration.
 
 Database migrations (what to expect)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-ETM performs basic database migrations automatically on startup.
-Notable additions in this branch include:
+ETM upgrades missing historical columns and query indexes automatically on
+startup in a schema transaction; this is separate from the offline cross-backend
+import above. Missing MsgLog lookup/history indexes and history-generation
+indexes are built on first startup; existing indexes are reused. SQLite holds
+a writer reservation for this schema transaction, so a large first build delays
+startup and other writers. The outbound queue separately adds missing metadata
+columns, its ownership table and scheduling/reconciliation indexes. Startup also
+reclaims inactive history staging rows and inspects queue media. These costs
+depend on the existing schema and retained data; there is no fixed startup-time
+estimate. Database operation scopes return pooled connections even on errors,
+and the data directory is protected against a second runtime/importer.
+
+The stored data includes:
 
 - **Forum topics associations** (for ``topic_group``): ETM stores a mapping
   between a forum group's chat ID + a topic thread ID (``message_thread_id``)
   and the linked remote chat.
 - **`sender_bot_id` in message logs**: when auxiliary bots are enabled, ETM
-  records which bot token sent each Telegram message so future edits/deletes
-  can be routed to the correct bot.
+  records which bot user ID authored each Telegram message so future edits/deletes
+  can be routed to the correct bot. File-ID issuer provenance is stored
+  separately when it differs, including confirmations received through another
+  bot. Older misrecorded ownership is not reconstructed automatically.
+- **Historical thread IDs and caches**: the importer preserves
+  ``master_message_thread_id`` and supported schemas of ``topiciconcache`` and
+  ``useremojicache``.
+- **History replay generations**: preparation uses a disk spool and short write
+  transactions, then publishes the complete generation. Durable ownership keys
+  make the handoff to the outbound queue idempotent across restarts.
+
+Normal sends and history text batching use ordinary sender selection, never
+an original-bot constraint. Only saved-file acquisition uses the file-ID issuer.
+See the `history replay guide <docs/history-replay.md>`_ and
+`delivery recovery guide <docs/delivery-recovery.md>`_ for recovery boundaries.
+
+Runtime queue recovery streams oversized legacy media into sidecars while
+retaining filenames. Failed preparation and decoding preserve existing media;
+corrupt queued payloads are held for repair. The encoded queue budget is not a
+total-process memory limit; see the migration guide for the runtime and offline
+import boundaries.
+
+New code reads older completion receipts, but older code cannot read new receipts
+that include a separate file-ID issuer; this is not rollback compatibility.
 
 Optional: Auxiliary bots (higher throughput)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If you run ETM in high-volume groups, you can configure ``auxiliary_bots`` to
 increase outbound throughput under Telegram rate limits. Auxiliary bots are
-used for sending only; edits/deletes will be routed to the bot that sent the
-original message.
+used for ordinary outbound sending and acquisition of their own saved file IDs;
+edits/deletes are routed to the bot that authored the original message.
 
 Notes:
 

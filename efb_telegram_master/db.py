@@ -4,10 +4,12 @@ import datetime
 import logging
 import pickle
 import time
-from contextlib import suppress
-from functools import partial
-from typing import Collection, Dict, List, Optional, Tuple, TYPE_CHECKING, cast
-from pathlib import Path
+import tempfile
+import uuid
+from contextlib import nullcontext, suppress
+from enum import Enum
+from functools import wraps
+from typing import Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING, Union
 
 from peewee import (
     AutoField,
@@ -16,12 +18,20 @@ from peewee import (
     DatabaseProxy,
     DateTimeField,
     DoesNotExist,
+    EnclosedNodeList,
     IntegerField,
     Model,
+    PostgresqlDatabase,
     TextField,
+    Tuple as SQLTuple,
     fn,
+    chunked,
 )
 from playhouse.migrate import migrate
+
+from .db_runtime import (
+    SCHEMA_LOCK, DataDirectoryLock, connection_scope, current_schema, postgresql_database, sqlite_database,
+)
 from telegram import Message
 from typing_extensions import TypedDict
 
@@ -41,7 +51,47 @@ if TYPE_CHECKING:
 
 database = DatabaseProxy()
 
+
+class _SenderDefault(Enum):
+    INHERIT = 0
+
+
+class DatabaseMetrics(Protocol):
+    """Metrics interface injected by the bot manager after construction."""
+
+    def record_database_method_call(self, method: str, seconds: float, outcome: str) -> None:
+        ...
+
+
+def observe_database_method(method: str):
+    """Measure one public database operation with a statically bounded method label."""
+    def decorate(call: Callable):
+        @wraps(call)
+        def wrapped(manager: 'DatabaseManager', *args, **kwargs):
+            started = time.perf_counter()
+            outcome = "success"
+            try:
+                managed_db = getattr(manager, "_managed_database", None)
+                scope = connection_scope(managed_db) if managed_db is not None and method != "stop_worker" else nullcontext()
+                with scope:
+                    return call(manager, *args, **kwargs)
+            except Exception:
+                outcome = "failure"
+                raise
+            finally:
+                metrics = getattr(manager, "_metrics", None)
+                if metrics is not None:
+                    try:
+                        metrics.record_database_method_call(method, time.perf_counter() - started, outcome)
+                    except Exception:
+                        manager.logger.exception("Unable to record database method metric: %s", method)
+
+        return wrapped
+
+    return decorate
+
 PickledDict = TypedDict('PickledDict', {
+    "file_bot_id": str,
     "target": TgChatMsgIDStr,
     "is_system": bool,
     "attributes": MessageAttribute,
@@ -114,10 +164,18 @@ class MsgLog(BaseModel):
     """
     sent_to = TextField()
     """Module ID of the message sent to."""
+    master_message_thread_id = TextField(null=True)
+    """Telegram topic ID retained from historical message logs."""
     sender_bot_id = TextField(null=True)
     """Telegram bot user ID that sent this message. NULL means the main bot."""
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
+
+    @property
+    def file_bot_id(self) -> Optional[str]:
+        """Bot that can acquire file_id, including legacy author-owned IDs."""
+        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
+        return misc.get("file_bot_id", self.sender_bot_id)
 
     def build_etm_msg(self, chat_manager: ChatObjectCacheManager,
                       recur: bool = True) -> ETMMsg:
@@ -152,8 +210,10 @@ class MsgLog(BaseModel):
             pickle_data = bytes(self.pickle) if isinstance(self.pickle, memoryview) else self.pickle
             misc_data: PickledDict = pickle.loads(pickle_data)
 
+            msg.file_bot_id = misc_data.get('file_bot_id')
             if 'target' in misc_data and recur:
-                target_row = self.get_or_none(MsgLog.master_msg_id == misc_data['target'])
+                with connection_scope(self._meta.database):
+                    target_row = self.get_or_none(MsgLog.master_msg_id == misc_data['target'])
                 if target_row:
                     msg.target = target_row.build_etm_msg(chat_manager, recur=False)
             if 'is_system' in misc_data:
@@ -193,10 +253,26 @@ class HistoryMigrationEntry(BaseModel):
     source_time = DateTimeField(null=True)
     position = IntegerField()
     created_at = DateTimeField(default=datetime.datetime.now)
+    generation = TextField(null=True)
+
+    @property
+    def ownership_key(self) -> str:
+        return f"{self.generation or 'legacy'}:{self.id}"
+
     class Meta:
         indexes = (
             (("slave_chat_id", "target_chat_id", "message_thread_id", "position"), False),
         )
+
+
+class HistoryMigrationTarget(BaseModel):
+    slave_chat_id = TextField()
+    target_chat_id = TextField()
+    message_thread_id = TextField(default="")
+    generation = TextField()
+
+    class Meta:
+        indexes = ((("slave_chat_id", "target_chat_id", "message_thread_id"), True),)
 
 
 class SlaveChatInfo(BaseModel):
@@ -226,6 +302,7 @@ class DatabaseManager:
     )
 
     def __init__(self, channel: 'TelegramChannel'):
+        self._metrics: Optional[DatabaseMetrics] = None
         base_path = utils.get_data_path(channel.channel_id)
         self._base_path = base_path
 
@@ -234,66 +311,59 @@ class DatabaseManager:
         db_type = db_config.get('type', 'sqlite')
 
         if db_type == 'postgresql':
-            from playhouse.pool import PooledPostgresqlExtDatabase
             from playhouse.migrate import PostgresqlMigrator
-            actual_db = PooledPostgresqlExtDatabase(
-                db_config.get('database', 'efb_telegram'),
-                host=db_config.get('host', 'localhost'),
-                port=db_config.get('port', 5432),
-                user=db_config.get('user', 'postgres'),
-                password=db_config.get('password', ''),
-                max_connections=db_config.get('max_connections', 8),
-                stale_timeout=db_config.get('stale_timeout', 300),
-                options=db_config.get('options', '-c timezone=UTC'),
-            )
+            actual_db = postgresql_database(db_config)
             self._migrator_cls = PostgresqlMigrator
             self._is_sqlite = False
-        else:
-            from peewee import SqliteDatabase
+        elif db_type == 'sqlite':
             from playhouse.migrate import SqliteMigrator
-            actual_db = SqliteDatabase(
-                str(base_path / 'tgdata.db'),
-                pragmas={
-                    "journal_mode": "wal",
-                    "foreign_keys": 1,
-                    "busy_timeout": 5000,
-                },
-                check_same_thread=False,
-            )
+            actual_db = sqlite_database(base_path / 'tgdata.db', db_config)
             self._migrator_cls = SqliteMigrator
             self._is_sqlite = True
-
-        database.initialize(actual_db)
-        database.connect()
-        self.logger.debug("Database loaded.")
-
-        self.logger.debug("Checking database migration...")
-        if not self._is_sqlite:
-            # PostgreSQL backend
-            if not ChatAssoc.table_exists():
-                sqlite_path = Path(base_path / 'tgdata.db')
-                if sqlite_path.exists():
-                    self._migrate_from_sqlite(sqlite_path)
-                else:
-                    self._create()
-            else:
-                self._create_missing_tables()
-                self._check_and_run_migrations()
         else:
-            # SQLite backend: original logic
-            if not ChatAssoc.table_exists():
-                self._create()
-            else:
-                self._create_missing_tables()
-                self._check_and_run_migrations()
-        self.logger.debug("Database migration finished...")
-        self._observe_legacy_outbound_rows()
+            raise ValueError(f"Unknown database type: {db_type!r}")
 
+        self._data_lock = DataDirectoryLock(base_path)
+        self._managed_database = actual_db
+        database.initialize(actual_db)
+        try:
+            from .migrate_db import validate_runtime_cutover
+
+            # SQLite must be checked before opening it (opening can create a new file).
+            if self._is_sqlite:
+                validate_runtime_cutover(base_path, None)
+            with connection_scope(actual_db):
+                with actual_db.atomic(*(("IMMEDIATE",) if self._is_sqlite else ())):
+                    if not self._is_sqlite:
+                        actual_db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
+                        validate_runtime_cutover(base_path, actual_db)
+                    self._create_missing_tables()
+                    self._check_and_run_migrations()
+                self._reclaim_inactive_history_at_startup()
+                self._observe_legacy_outbound_rows()
+        except BaseException:
+            actual_db.close_all()
+            self._data_lock.close()
+            raise
+        self.logger.debug("Database schema ready; startup never imports SQLite data.")
+
+    def set_metrics(self, metrics: DatabaseMetrics) -> None:
+        """Attach the metrics recorder created after the database manager."""
+        self._metrics = metrics
+
+    @observe_database_method("stop_worker")
     def stop_worker(self):
-        stop = getattr(database.obj, "stop", None)
-        if callable(stop):
-            stop()
-        database.close()
+        current_db = getattr(self, "_managed_database", database.obj)
+        try:
+            close_all = getattr(current_db, "close_all", None)
+            if callable(close_all):
+                close_all()
+            else:
+                current_db.close()
+        finally:
+            data_lock = getattr(self, "_data_lock", None)
+            if data_lock is not None:
+                data_lock.close()
 
     @staticmethod
     def _create():
@@ -301,169 +371,53 @@ class DatabaseManager:
         Initializing tables.
         """
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
         ])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry,
+            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
         ], safe=True)
 
-    @staticmethod
-    def _select_existing_columns(model, table_name: str, requested_fields: List):
-        columns = {i.name for i in model._meta.database.get_columns(table_name)}
-        fields = [
-            field
-            for field in requested_fields
-            if field.column_name in columns
-        ]
-        rows = list(model.select(*fields).dicts())
-        for row in rows:
-            for field in requested_fields:
-                row.setdefault(field.column_name, None)
-        return rows
-
-    def _migrate_from_sqlite(self, sqlite_path: Path):
-        """Migrate data from existing SQLite database to PostgreSQL on first use."""
-        from playhouse.sqliteq import SqliteQueueDatabase
-        from peewee import chunked
-
-        self.logger.info("Detected existing SQLite database. Migrating to PostgreSQL...")
-
-        sqlite_db = SqliteQueueDatabase(str(sqlite_path), autostart=False)
-        sqlite_db.start()
-        sqlite_db.connect()
-
-        models = [
-            ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry,
-        ]
-        with sqlite_db.bind_ctx(models):
-            chat_assocs = cast(List[Dict[str, object]], list(ChatAssoc.select(
-                ChatAssoc.master_uid, ChatAssoc.slave_uid
-            ).dicts()))
-            if TopicAssoc.table_exists():
-                topic_assocs = cast(List[Dict[str, object]], list(TopicAssoc.select(
-                    TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id, TopicAssoc.slave_uid
-                ).dicts()))
-            else:
-                topic_assocs = []
-            slave_chat_infos: List[Dict[str, object]] = self._select_existing_columns(SlaveChatInfo, "slavechatinfo", [
-                SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_channel_emoji,
-                SlaveChatInfo.slave_chat_uid, SlaveChatInfo.slave_chat_group_id,
-                SlaveChatInfo.slave_chat_name, SlaveChatInfo.slave_chat_alias,
-                SlaveChatInfo.slave_chat_type, SlaveChatInfo.pickle
-            ])
-            msg_logs: List[Dict[str, object]] = self._select_existing_columns(MsgLog, "msglog", [
-                MsgLog.master_msg_id, MsgLog.master_msg_id_alt, MsgLog.slave_message_id,
-                MsgLog.text, MsgLog.slave_origin_uid, MsgLog.slave_origin_display_name,
-                MsgLog.slave_member_uid, MsgLog.slave_member_display_name, MsgLog.media_type,
-                MsgLog.file_id, MsgLog.file_unique_id, MsgLog.mime, MsgLog.msg_type,
-                MsgLog.sent_to, MsgLog.pickle, MsgLog.sender_bot_id,
-                MsgLog.time,
-            ])
-            if HistoryMigrationEntry.table_exists():
-                history_migration_entries = self._select_existing_columns(HistoryMigrationEntry, "historymigrationentry", [
-                    HistoryMigrationEntry.slave_chat_id, HistoryMigrationEntry.target_chat_id,
-                    HistoryMigrationEntry.message_thread_id, HistoryMigrationEntry.source_master_msg_id,
-                    HistoryMigrationEntry.formatted_text, HistoryMigrationEntry.media_type,
-                    HistoryMigrationEntry.source_time, HistoryMigrationEntry.position,
-                    HistoryMigrationEntry.created_at,
-                ])
-            else:
-                history_migration_entries = []
-
-        sqlite_db.stop()
-        sqlite_db.close()
-
-        with database.atomic():
-            self._create()
-            for chat_assoc_batch in chunked(chat_assocs, 500):
-                ChatAssoc.insert_many(chat_assoc_batch).execute()
-            for topic_assoc_batch in chunked(topic_assocs, 500):
-                TopicAssoc.insert_many(topic_assoc_batch).execute()
-            for slave_chat_info_batch in chunked(slave_chat_infos, 500):
-                SlaveChatInfo.insert_many(slave_chat_info_batch).execute()
-            for msg_log_batch in chunked(msg_logs, 500):
-                MsgLog.insert_many(msg_log_batch).execute()
-            for history_migration_entry_batch in chunked(history_migration_entries, 500):
-                HistoryMigrationEntry.insert_many(history_migration_entry_batch).execute()
-
-        migrated_path = sqlite_path.with_suffix('.db.migrated')
-        sqlite_path.rename(migrated_path)
-
-        self.logger.info(
-            "Migration complete. %d chat assocs, %d topic assocs, "
-            "%d chat infos, %d messages migrated. "
-            "%d pending history entries migrated. Original SQLite file renamed to %s",
-            len(chat_assocs), len(topic_assocs),
-            len(slave_chat_infos), len(msg_logs),
-            len(history_migration_entries),
-            migrated_path
-        )
-
     def _check_and_run_migrations(self):
-        """Check schema and run pending migrations."""
-        msg_log_columns = {i.name for i in database.get_columns("msglog")}
-        slave_chat_info_columns = {i.name for i in database.get_columns("slavechatinfo")}
-        if "file_id" not in msg_log_columns:
-            self._migrate(0)
-        elif "pickle" not in msg_log_columns:
-            self._migrate(1)
-        elif "slave_chat_group_id" not in slave_chat_info_columns:
-            self._migrate(2)
-        elif "file_unique_id" not in msg_log_columns:
-            self._migrate(3)
-        elif "sender_bot_id" not in msg_log_columns:
-            self._migrate(4)
+        """Upgrade missing nullable columns independently, then add lookup indexes.
 
-    def _migrate(self, i: int):
-        """
-        Run migrations.
-
-        Args:
-            i: Migration ID
+        The caller holds the schema transaction. Unlike a version cascade, this
+        also handles partially upgraded historic databases without duplicate DDL.
         """
         migrator = self._migrator_cls(database.obj)
+        schema = current_schema(database.obj)
+        for model in (MsgLog, SlaveChatInfo, HistoryMigrationEntry):
+            columns = {column.name for column in database.get_columns(model._meta.table_name, schema=schema)}
+            for field in model._meta.sorted_fields:
+                if field.null and field.column_name not in columns:
+                    migrate(migrator.add_column(model._meta.table_name, field.column_name, field))
+        self._create_lookup_indexes(database.obj)
 
-        if i <= 0:
-            # Migration 0: Add media file ID and editable message ID
-            # 2019JAN08
-            migrate(
-                migrator.add_column("msglog", "file_id", MsgLog.file_id),
-                migrator.add_column("msglog", "media_type", MsgLog.media_type),
-                migrator.add_column("msglog", "mime", MsgLog.mime),
-                migrator.add_column("msglog", "master_msg_id_alt", MsgLog.master_msg_id_alt)
-            )
-        if i <= 1:
-            # Migration 1: Add pickle objects to MsgLog and SlaveChatInfo
-            # 2019JUL24
-            migrate(
-                migrator.add_column("msglog", "pickle", MsgLog.pickle),
-                migrator.add_column("slavechatinfo", "pickle", SlaveChatInfo.pickle)
-            )
-        if i <= 2:
-            # Migration 2: Add column for group ID to slave chat info table
-            # 2019NOV18
-            migrate(
-                migrator.add_column("slavechatinfo", "slave_chat_group_id", SlaveChatInfo.slave_chat_group_id)
-            )
-        if i <= 3:
-            # Migration 3: Add column for unique file ID to message log table
-            # 2019NOV18
-            migrate(
-                migrator.add_column("msglog", "file_unique_id", MsgLog.file_unique_id)
-            )
-        if i <= 4:
-            # Migration 4: Add column for sender bot ID (multi-bot pool support)
-            migrate(
-                migrator.add_column("msglog", "sender_bot_id", MsgLog.sender_bot_id)
-            )
+    @staticmethod
+    def _create_lookup_indexes(db):
+        time_order = "time DESC NULLS LAST" if isinstance(db, PostgresqlDatabase) else "time DESC"
+        for name, table, columns in (
+            ("msglog_slave_lookup", "msglog", f"slave_origin_uid, slave_message_id, {time_order}"),
+            ("msglog_chat_time", "msglog", f"slave_origin_uid, {time_order}"),
+            ("msglog_history_seek", "msglog", "slave_origin_uid, time, master_msg_id"),
+            ("history_generation_id", "historymigrationentry", "generation, id"),
+            ("history_target_generation_position", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, generation, position, id"),
+            ("history_target_cleanup", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, id"),
+            ("msglog_master_alt", "msglog", "master_msg_id_alt"),
+            ("chatassoc_slave_lookup", "chatassoc", "slave_uid"),
+            ("chatassoc_master_lookup", "chatassoc", "master_uid"),
+            ("topicassoc_slave_lookup", "topicassoc", "slave_uid, topic_chat_id"),
+            ("topicassoc_topic_lookup", "topicassoc", "topic_chat_id, message_thread_id"),
+            ("slavechatinfo_identity_lookup", "slavechatinfo", "slave_channel_id, slave_chat_uid, slave_chat_group_id"),
+        ):
+            db.execute_sql(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})")
 
     def _observe_legacy_outbound_rows(self) -> None:
         """Report retained workflow rows without loading or changing them."""
-        table_names = set(database.get_tables())
+        table_names = set(database.get_tables(schema=current_schema(database.obj)))
         workflow_table, task_table = self._LEGACY_OUTBOUND_TABLES
         workflow_count = 0
         task_count = 0
@@ -493,6 +447,7 @@ class DatabaseManager:
                 state_summary,
             )
 
+    @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,
                        slave_uid: EFBChannelChatIDStr,
                        multiple_slave: bool = False):
@@ -510,8 +465,8 @@ class DatabaseManager:
         self.remove_chat_assoc(slave_uid=slave_uid)
         return ChatAssoc.create(master_uid=master_uid, slave_uid=slave_uid)
 
-    @staticmethod
-    def remove_chat_assoc(master_uid: Optional[EFBChannelChatIDStr] = None,
+    @observe_database_method("remove_chat_assoc")
+    def remove_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None,
                           slave_uid: Optional[EFBChannelChatIDStr] = None):
         """
         Remove chat associations (chat links).
@@ -540,8 +495,8 @@ class DatabaseManager:
         except DoesNotExist:
             return 0
 
-    @staticmethod
-    def get_master_msg_id(message: EFBMessage) -> Optional[TgChatMsgIDStr]:
+    @observe_database_method("get_master_msg_id")
+    def get_master_msg_id(self, message: EFBMessage) -> Optional[TgChatMsgIDStr]:
         """Get master message ID from a message object."""
         log: Optional[MsgLog] = MsgLog.get_or_none(
             MsgLog.slave_origin_uid == chat_id_to_str(chat=message.chat),
@@ -566,6 +521,9 @@ class DatabaseManager:
         """
 
         data: PickledDict = {}
+        file_bot_id = getattr(message, "file_bot_id", None)
+        if file_bot_id is not None:
+            data["file_bot_id"] = file_bot_id
         if message.is_system:
             data['is_system'] = message.is_system
         if message.attributes:
@@ -591,8 +549,8 @@ class DatabaseManager:
             return pickle.dumps(data)
         return None
 
-    @staticmethod
-    def get_chat_assoc(master_uid: Optional[EFBChannelChatIDStr] = None,
+    @observe_database_method("get_chat_assoc")
+    def get_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None,
                        slave_uid: Optional[EFBChannelChatIDStr] = None
                        ) -> List[EFBChannelChatIDStr]:
         """
@@ -626,6 +584,7 @@ class DatabaseManager:
         except DoesNotExist:
             return []
 
+    @observe_database_method("add_topic_assoc")
     def add_topic_assoc(self, topic_chat_id: TelegramChatID,
                        message_thread_id: TelegramTopicID,
                        slave_uid: EFBChannelChatIDStr, ):
@@ -642,8 +601,8 @@ class DatabaseManager:
         self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
         return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
 
-    @staticmethod
-    def get_topic_thread_id(slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
+    @observe_database_method("get_topic_thread_id")
+    def get_topic_thread_id(self, slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
         """
         Get topic association (topic link) information.
         Only one parameter is to be provided.
@@ -670,8 +629,8 @@ class DatabaseManager:
             pass
         return None
 
-    @staticmethod
-    def get_topic_slave(topic_chat_id: TelegramChatID,
+    @observe_database_method("get_topic_slave")
+    def get_topic_slave(self, topic_chat_id: TelegramChatID,
                         message_thread_id: Optional[TelegramTopicID] = None,
                         ) -> Optional[EFBChannelChatIDStr]:
         """
@@ -697,8 +656,8 @@ class DatabaseManager:
         except AttributeError:
             return None
 
-    @staticmethod
-    def get_topic_slaves(topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
+    @observe_database_method("get_topic_slaves")
+    def get_topic_slaves(self, topic_chat_id: TelegramChatID) -> Optional[List[Tuple[EFBChannelChatIDStr, TelegramTopicID]]]:
         """
         Get topic association (topic link) information.
         Only one parameter is to be provided.
@@ -718,8 +677,8 @@ class DatabaseManager:
         except AttributeError:
             return None
 
-    @staticmethod
-    def remove_topic_assoc(topic_chat_id: Optional[TelegramChatID] = None,
+    @observe_database_method("remove_topic_assoc")
+    def remove_topic_assoc(self, topic_chat_id: Optional[TelegramChatID] = None,
                            message_thread_id: Optional[TelegramTopicID] = None,
                            slave_uid: Optional[EFBChannelChatIDStr] = None):
         """
@@ -743,12 +702,15 @@ class DatabaseManager:
         except DoesNotExist:
             return 0
 
+    @observe_database_method("add_or_update_message_log")
     def add_or_update_message_log(self,
                                   msg: ETMMsg,
                                   master_message: Message,
                                   old_message_id: Optional[OldMsgID] = None,
-                                  sender_bot_id: Optional[str] = None):
-        """Add or update a message into the database."""
+                                  sender_bot_id: Union[str, None, _SenderDefault] = _SenderDefault.INHERIT):
+        """Inherit an omitted sender from msg; explicit None identifies main."""
+        if sender_bot_id is _SenderDefault.INHERIT:
+            sender_bot_id = msg.sender_bot_id
         sent_message_id = message_id_to_str(
             TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)
         )
@@ -774,35 +736,49 @@ class DatabaseManager:
 
         if row is None:
             row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
-        if row is not None:
-            save = row.save
+        existing = row is not None
+        if existing:
             self.logger.debug("[%s] Message record is found in database, update it", master_msg_id)
         else:
             row = MsgLog()
-            save = partial(row.save, force_insert=True)
             self.logger.debug("[%s] Message record is not found in database, insert it", master_msg_id)
 
-        row.master_msg_id = master_msg_id
-        row.master_msg_id_alt = master_msg_id_alt
-        row.text = msg.text
-        row.slave_origin_uid = chat_id_to_str(chat=msg.chat)
-        row.slave_member_uid = chat_id_to_str(chat=msg.author)
-        row.msg_type = msg.type.name
-        row.sent_to = msg.deliver_to.channel_id
-        row.slave_message_id = msg.uid or f"{self.FAIL_FLAG}.{time.time()}"
-        row.media_type = msg.type_telegram.value
-        row.file_id = msg.file_id
-        row.file_unique_id = msg.file_unique_id
-        row.mime = msg.mime
-        row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
-        pickle_data = self.pickle_misc_msg(msg)
-        row.pickle = pickle_data
-
-        result = save()
+        assert row is not None
+        values = {
+            "master_msg_id": master_msg_id,
+            "master_msg_id_alt": master_msg_id_alt,
+            "text": msg.text,
+            "slave_origin_uid": chat_id_to_str(chat=msg.chat),
+            "slave_member_uid": chat_id_to_str(chat=msg.author),
+            "msg_type": msg.type.name,
+            "sent_to": msg.deliver_to.channel_id,
+            "slave_message_id": msg.uid or f"{self.FAIL_FLAG}.{time.time()}",
+            "media_type": msg.type_telegram.value,
+            "file_id": msg.file_id,
+            "file_unique_id": msg.file_unique_id,
+            "mime": msg.mime,
+            "sender_bot_id": sender_bot_id,
+            "pickle": self.pickle_misc_msg(msg),
+        }
+        if existing:
+            changed = {
+                name: value for name, value in values.items()
+                if getattr(row, name) != value
+            }
+            for name, value in changed.items():
+                setattr(row, name, value)
+            if changed:
+                result = row.save(only=[MsgLog._meta.fields[name] for name in changed])
+            else:
+                result = 0
+        else:
+            for name, value in values.items():
+                setattr(row, name, value)
+            result = row.save(force_insert=True)
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
 
-    @staticmethod
-    def get_msg_log(master_msg_id: Optional[TgChatMsgIDStr] = None,
+    @observe_database_method("get_msg_log")
+    def get_msg_log(self, master_msg_id: Optional[TgChatMsgIDStr] = None,
                     slave_msg_id: Optional[MessageID] = None,
                     slave_origin_uid: Optional[EFBChannelChatIDStr] = None) -> Optional[MsgLog]:
         """Get message log by message ID.
@@ -823,16 +799,16 @@ class DatabaseManager:
         try:
             if master_msg_id:
                 return MsgLog.select().where(MsgLog.master_msg_id == master_msg_id) \
-                    .order_by(MsgLog.time.desc()).first()
+                    .order_by(MsgLog.time.desc(nulls="LAST")).first()
             else:
                 return MsgLog.select().where((MsgLog.slave_message_id == slave_msg_id) &
                                              (MsgLog.slave_origin_uid == slave_origin_uid)
-                                             ).order_by(MsgLog.time.desc()).first()
+                                             ).order_by(MsgLog.time.desc(nulls="LAST")).first()
         except DoesNotExist:
             return None
 
-    @staticmethod
-    def delete_msg_log(master_msg_id: Optional[TgChatMsgIDStr] = None,
+    @observe_database_method("delete_msg_log")
+    def delete_msg_log(self, master_msg_id: Optional[TgChatMsgIDStr] = None,
                        slave_msg_id: Optional[EFBChannelChatIDStr] = None,
                        slave_origin_uid: Optional[EFBChannelChatIDStr] = None):
         """Remove a message log by message ID.
@@ -857,8 +833,8 @@ class DatabaseManager:
         except DoesNotExist:
             return
 
-    @staticmethod
-    def get_slave_chat_info(slave_channel_id: Optional[ModuleID] = None,
+    @observe_database_method("get_slave_chat_info")
+    def get_slave_chat_info(self, slave_channel_id: Optional[ModuleID] = None,
                             slave_chat_uid: Optional[ChatID] = None,
                             slave_chat_group_id: Optional[ChatID] = None
                             ) -> Optional[SlaveChatInfo]:
@@ -878,6 +854,7 @@ class DatabaseManager:
         except DoesNotExist:
             return None
 
+    @observe_database_method("set_slave_chat_info")
     def set_slave_chat_info(self, chat_object: 'ETMChatType') -> SlaveChatInfo:
         """
         Insert or update slave chat info entry
@@ -922,35 +899,36 @@ class DatabaseManager:
                                         slave_chat_type=slave_chat_type,
                                         pickle=chat_object.pickle)
 
-    @staticmethod
-    def delete_slave_chat_info(slave_channel_id: ModuleID, slave_chat_uid: ChatID, slave_chat_group_id: Optional[ChatID] = None):
+    @observe_database_method("delete_slave_chat_info")
+    def delete_slave_chat_info(self, slave_channel_id: ModuleID, slave_chat_uid: ChatID, slave_chat_group_id: Optional[ChatID] = None):
         return SlaveChatInfo.delete() \
             .where((SlaveChatInfo.slave_channel_id == slave_channel_id) &
                    (SlaveChatInfo.slave_chat_uid == slave_chat_uid) &
                    (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id)).execute()
 
-    @staticmethod
-    def get_recent_slave_chats(master_chat_id: TelegramChatID, limit=5) -> List[EFBChannelChatIDStr]:
+    @observe_database_method("get_recent_slave_chats")
+    def get_recent_slave_chats(self, master_chat_id: TelegramChatID, limit=5) -> List[EFBChannelChatIDStr]:
         query = MsgLog \
             .select(MsgLog.slave_origin_uid, fn.MAX(MsgLog.time)) \
             .where(MsgLog.master_msg_id.startswith("{}.".format(master_chat_id))) \
             .group_by(MsgLog.slave_origin_uid) \
-            .order_by(fn.MAX(MsgLog.time).desc()) \
+            .order_by(fn.MAX(MsgLog.time).desc(nulls="LAST")) \
             .limit(limit)
 
         return [EFBChannelChatIDStr(i.slave_origin_uid) for i in query]
 
-    @staticmethod
-    def get_last_message(slave_chat_id: EFBChannelChatIDStr) -> Optional[MsgLog]:
+    @observe_database_method("get_last_message")
+    def get_last_message(self, slave_chat_id: EFBChannelChatIDStr) -> Optional[MsgLog]:
         try:
             return MsgLog.select().where(
                 MsgLog.slave_origin_uid == slave_chat_id
-            ).order_by(MsgLog.time.desc()).limit(1).first()
+            ).order_by(MsgLog.time.desc(nulls="LAST")).limit(1).first()
         except DoesNotExist:
             return None
 
-    @staticmethod
-    def get_recent_messages(slave_chat_id: EFBChannelChatIDStr, limit: int = 1000) -> List[MsgLog]:
+    @observe_database_method("get_recent_messages")
+    def get_recent_messages(self, slave_chat_id: EFBChannelChatIDStr, limit: int = 1000,
+                            after: Optional[Tuple[Optional[datetime.datetime], str]] = None) -> List[MsgLog]:
         """Get recent messages from a specific slave chat for migration purposes.
 
         Args:
@@ -960,17 +938,25 @@ class DatabaseManager:
         Returns:
             List[MsgLog]: List of recent message logs, ordered by time (oldest first)
         """
-        try:
-            query = MsgLog.select().where(
-                MsgLog.slave_origin_uid == slave_chat_id
-            ).order_by(MsgLog.time.asc())
-
+        base = MsgLog.select().where(MsgLog.slave_origin_uid == slave_chat_id)
+        pages = []
+        if after is None or after[0] is None:
+            unknown = base.where(MsgLog.time.is_null(True)).order_by(MsgLog.master_msg_id)
+            if after is not None:
+                unknown = unknown.where(MsgLog.master_msg_id > after[1])
+            pages.append(unknown)
+        known = base.where(MsgLog.time.is_null(False)).order_by(MsgLog.time, MsgLog.master_msg_id)
+        if after is not None and after[0] is not None:
+            known = known.where(SQLTuple(MsgLog.time, MsgLog.master_msg_id) > after)
+        pages.append(known)
+        rows: List[MsgLog] = []
+        for query in pages:
             if limit > 0:
-                query = query.limit(limit)
-
-            return list(query)
-        except DoesNotExist:
-            return []
+                query = query.limit(limit - len(rows))
+            rows.extend(query)
+            if limit > 0 and len(rows) == limit:
+                break
+        return rows
 
     @staticmethod
     def _history_migration_target_filter(
@@ -987,55 +973,183 @@ class DatabaseManager:
             return base_filter & HistoryMigrationEntry.message_thread_id.is_null(True)
         return base_filter & (HistoryMigrationEntry.message_thread_id == thread_value)
 
-    @staticmethod
+    @observe_database_method("replace_history_migration_entries")
     def replace_history_migration_entries(
+        self,
         slave_chat_id: EFBChannelChatIDStr,
         target_chat_id: int,
         message_thread_id: Optional[TelegramTopicID],
-        entries: List[Dict[str, object]],
+        entries: Iterable[Dict[str, object]],
     ) -> int:
-        target_filter = DatabaseManager._history_migration_target_filter(
+        target_filter = self._history_migration_target_filter(
             slave_chat_id,
             target_chat_id,
             message_thread_id,
         )
-        with database.atomic():
-            HistoryMigrationEntry.delete().where(target_filter).execute()
-            if entries:
-                HistoryMigrationEntry.insert_many(entries).execute()
-        return len(entries)
+        generation = uuid.uuid4().hex
+        count = 0
+        # Finish the finite read snapshot before taking any main-database write
+        # lock. The temporary stream bounds RAM even for million-message chats.
+        with tempfile.TemporaryFile() as spool:
+            with database.atomic():
+                if isinstance(database.obj, PostgresqlDatabase):
+                    database.execute_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                for entry in entries:
+                    pickle.dump(dict(entry, generation=generation), spool)
+                    count += 1
+            spool.seek(0)
+
+            def prepared():
+                for _ in range(count):
+                    yield pickle.load(spool)
+
+            for batch in chunked(prepared(), 32):
+                with database.atomic():
+                    HistoryMigrationEntry.insert_many(batch).execute()
+            # Publishing one pointer makes the entire replacement visible.
+            with database.atomic():
+                HistoryMigrationTarget.insert(
+                    slave_chat_id=str(slave_chat_id), target_chat_id=str(target_chat_id),
+                    message_thread_id=str(message_thread_id) if message_thread_id is not None else "",
+                    generation=generation,
+                ).on_conflict(
+                    conflict_target=[HistoryMigrationTarget.slave_chat_id,
+                                     HistoryMigrationTarget.target_chat_id,
+                                     HistoryMigrationTarget.message_thread_id],
+                    update={HistoryMigrationTarget.generation: generation},
+                ).execute()
+        obsolete = target_filter & (
+            HistoryMigrationEntry.generation.is_null(True) | (HistoryMigrationEntry.generation != generation)
+        )
+        after_id = 0
+        while True:
+            ids = [row.id for row in HistoryMigrationEntry.select(HistoryMigrationEntry.id)
+                   .where(obsolete & (HistoryMigrationEntry.id > after_id))
+                   .order_by(HistoryMigrationEntry.id).limit(32)]
+            if not ids:
+                break
+            HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(ids)).execute()
+            after_id = ids[-1]
+        return count
 
     @staticmethod
-    def has_pending_history_migrations() -> bool:
-        return HistoryMigrationEntry.select().exists()
-
-    @staticmethod
-    def get_next_history_migration_target() -> Optional[HistoryMigrationEntry]:
-        return (
-            HistoryMigrationEntry.select()
-            .order_by(HistoryMigrationEntry.id.asc())
-            .first()
+    def _history_entry_target():
+        return HistoryMigrationTarget.select(HistoryMigrationTarget.generation).where(
+            (HistoryMigrationTarget.slave_chat_id == HistoryMigrationEntry.slave_chat_id) &
+            (HistoryMigrationTarget.target_chat_id == HistoryMigrationEntry.target_chat_id) &
+            (HistoryMigrationTarget.message_thread_id == fn.COALESCE(HistoryMigrationEntry.message_thread_id, ""))
         )
 
-    @staticmethod
+    def _reclaim_inactive_history_at_startup(self):
+        # The data-directory lock is held and this manager has not been exposed
+        # to preparation workers yet. Never run this sweep during preparation.
+        after_id = 0
+        while True:
+            rows = list(HistoryMigrationEntry.select(
+                HistoryMigrationEntry.id, HistoryMigrationEntry.generation,
+                self._history_entry_target().alias("published_generation"),
+            ).where(HistoryMigrationEntry.id > after_id).order_by(HistoryMigrationEntry.id).limit(256).dicts())
+            if not rows:
+                return
+            obsolete = [row["id"] for row in rows if row["generation"] != row["published_generation"]]
+            if obsolete:
+                HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(obsolete)).execute()
+            after_id = rows[-1]["id"]
+
+    @observe_database_method("has_pending_history_migrations")
+    def has_pending_history_migrations(self) -> bool:
+        return self.get_next_history_migration_target() is not None
+
+    @observe_database_method("get_next_history_migration_target")
+    def get_next_history_migration_target(
+        self, target_chat_id: Optional[int] = None,
+    ) -> Optional[HistoryMigrationEntry]:
+        # Seek one head per published generation; ORDER BY id over a combined
+        # visibility predicate can instead scan every unpublished staging row.
+        target_filter = (
+            HistoryMigrationTarget.target_chat_id == str(target_chat_id)
+            if target_chat_id is not None else True
+        )
+        head = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
+            HistoryMigrationEntry.generation == HistoryMigrationTarget.generation,
+        ).order_by(HistoryMigrationEntry.id).limit(1)
+        published_id = HistoryMigrationTarget.select(fn.MIN(EnclosedNodeList([head]))).where(target_filter).scalar()
+        legacy_filter = HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
+        if target_chat_id is not None:
+            legacy_filter &= HistoryMigrationEntry.target_chat_id == str(target_chat_id)
+        legacy_id = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
+            legacy_filter
+        ).order_by(HistoryMigrationEntry.id).limit(1).scalar()
+        ids = [identifier for identifier in (published_id, legacy_id) if identifier is not None]
+        return HistoryMigrationEntry.get_by_id(min(ids)) if ids else None
+
+    @observe_database_method("get_pending_history_migration_target_ids")
+    def get_pending_history_migration_target_ids(self) -> List[int]:
+        published = HistoryMigrationTarget.select(HistoryMigrationTarget.target_chat_id)
+        legacy = HistoryMigrationEntry.select(HistoryMigrationEntry.target_chat_id).where(
+            HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
+        )
+        target_ids = {int(row.target_chat_id) for row in published}
+        target_ids.update(int(row.target_chat_id) for row in legacy)
+        return [target_id for target_id in sorted(target_ids)
+                if self.get_next_history_migration_target(target_id) is not None]
+
+    @observe_database_method("get_history_migration_entries")
     def get_history_migration_entries(
+        self,
         slave_chat_id: EFBChannelChatIDStr,
         target_chat_id: int,
         message_thread_id: Optional[TelegramTopicID] = None,
+        limit: Optional[int] = None,
+        after: Optional[Tuple[int, int]] = None,
     ) -> List[HistoryMigrationEntry]:
-        target_filter = DatabaseManager._history_migration_target_filter(
+        target_filter = self._history_migration_target_filter(
             slave_chat_id,
             target_chat_id,
             message_thread_id,
         )
-        return list(
+        generation = HistoryMigrationTarget.select(HistoryMigrationTarget.generation).where(
+            (HistoryMigrationTarget.slave_chat_id == str(slave_chat_id)) &
+            (HistoryMigrationTarget.target_chat_id == str(target_chat_id)) &
+            (HistoryMigrationTarget.message_thread_id == (str(message_thread_id) if message_thread_id is not None else ""))
+        ).scalar()
+        generation_filter = (
+            (HistoryMigrationEntry.generation == generation) if generation is not None
+            else HistoryMigrationEntry.generation.is_null(True)
+        )
+        query = (
             HistoryMigrationEntry.select()
-            .where(target_filter)
+            .where(target_filter & generation_filter)
             .order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
         )
+        if after is not None:
+            position, identifier = after
+            query = query.where(
+                SQLTuple(HistoryMigrationEntry.position, HistoryMigrationEntry.id) > (position, identifier)
+            )
+        if limit is not None:
+            query = query.limit(limit)
+        return list(query)
 
-    @staticmethod
-    def delete_history_migration_entry(entry_id: int) -> int:
+    def get_history_migration_ownership_keys(self, entry_ids: Collection[int]) -> List[str]:
+        keys = {}
+        with connection_scope(self._managed_database):
+            for batch in chunked(entry_ids, 100):
+                for entry in HistoryMigrationEntry.select(
+                    HistoryMigrationEntry.id, HistoryMigrationEntry.generation,
+                ).where(HistoryMigrationEntry.id.in_(batch)):
+                    keys[entry.id] = entry.ownership_key
+        return [keys[identifier] for identifier in entry_ids]
+
+    def existing_history_ownership(self, keys: Collection[str]) -> set[str]:
+        ids = [int(key.rsplit(":", 1)[1]) for key in keys]
+        with connection_scope(self._managed_database):
+            return {entry.ownership_key for entry in HistoryMigrationEntry.select(
+                HistoryMigrationEntry.id, HistoryMigrationEntry.generation,
+            ).where(HistoryMigrationEntry.id.in_(ids))} & set(keys)
+
+    @observe_database_method("delete_history_migration_entry")
+    def delete_history_migration_entry(self, entry_id: int) -> int:
         return int(
             HistoryMigrationEntry.delete()
             .where(HistoryMigrationEntry.id == entry_id)

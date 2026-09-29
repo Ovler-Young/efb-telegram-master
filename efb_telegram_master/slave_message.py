@@ -11,6 +11,7 @@ import traceback
 import urllib.parse
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Tuple, Optional, TYPE_CHECKING, List, IO, Union, cast
 
@@ -58,6 +59,7 @@ class SlaveMessageProcessor(LocaleMixin):
     REMOTE_IMAGE_URL_VENDOR_KEY = "blueset.telegram.image_url"
     FORUM_CHAT_CACHE_TTL = 3600
     _NO_DB_CALLBACK = object()
+    _database_log_target: ContextVar[Optional[OldMsgID]] = ContextVar("etm_database_log_target", default=None)
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
@@ -261,6 +263,26 @@ class SlaveMessageProcessor(LocaleMixin):
                          dedupe_key: Optional[Tuple[str, str]] = None,
                          database_old_msg_id: Optional[OldMsgID] = None,
                          target_msg_id_override: Optional[TelegramMessageID] = None):
+        # A new bot reply can still update an existing canonical database row.
+        # Keep that ID distinct from the Telegram edit ID, across all media
+        # helpers, without sharing mutable state between concurrent callbacks.
+        token = self._database_log_target.set(database_old_msg_id)
+        try:
+            return self._dispatch_message(
+                msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
+                dedupe_key, database_old_msg_id, target_msg_id_override,
+            )
+        finally:
+            self._database_log_target.reset(token)
+
+    def _dispatch_message(self, msg: Message, msg_template: str,
+                          old_msg_id: Optional[OldMsgID],
+                          tg_dest: TelegramChatID,
+                          thread_id: Optional[TelegramTopicID],
+                          silent: bool = False,
+                          dedupe_key: Optional[Tuple[str, str]] = None,
+                          database_old_msg_id: Optional[OldMsgID] = None,
+                          target_msg_id_override: Optional[TelegramMessageID] = None):
         """Dispatch with header, destination and Telegram message ID and destinations."""
 
         xid = msg.uid
@@ -517,7 +539,7 @@ class SlaveMessageProcessor(LocaleMixin):
             db_on_complete = cast(Optional[Callable[[], None]], on_complete)
             kwargs['_queued_db_log_context'] = QueuedDbLogContext(
                 ETMMsg.from_efbmsg(msg, self.chat_manager),
-                old_msg_id,
+                self._database_log_target.get() or old_msg_id,
                 db_on_complete,
             )
         return kwargs
@@ -560,6 +582,8 @@ class SlaveMessageProcessor(LocaleMixin):
                                        reply_markup: Optional[ReplyMarkup],
                                        silent: bool,
                                        *,
+                                       msg: Message,
+                                       on_db_complete: Optional[Callable[[], None]] = None,
                                        as_document: bool = False) -> telegram.Message:
         placeholder = self._remote_image_placeholder()
         filename = "remote-image-placeholder.png"
@@ -572,14 +596,18 @@ class SlaveMessageProcessor(LocaleMixin):
                                               message_thread_id=thread_id,
                                               reply_markup=reply_markup,
                                               disable_notification=silent,
-                                              _send_mode="blocking")
+                                              **self._make_send_kwargs(
+                                                  msg, mode='blocking', on_complete=on_db_complete,
+                                              ))
             return self.bot.send_photo(tg_dest, file, prefix=msg_template, suffix=reactions,
                                        caption=text, parse_mode="HTML",
                                        reply_to_message_id=target_msg_id,
                                        message_thread_id=thread_id,
                                        reply_markup=reply_markup,
                                        disable_notification=silent,
-                                       _send_mode="blocking")
+                                       **self._make_send_kwargs(
+                                           msg, mode='blocking', on_complete=on_db_complete,
+                                       ))
         finally:
             placeholder.close()
             self._cleanup_pending_local_api_files()
@@ -755,7 +783,8 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.logger.warning('[%s] Failed to send remote image URL, sending editable placeholder. Reason: %s',
                                     msg.uid, e)
                 return self._send_remote_image_placeholder(tg_dest, thread_id, msg_template, reactions, text,
-                                                           target_msg_id, reply_markup, silent)
+                                                           target_msg_id, reply_markup, silent,
+                                                           msg=msg, on_db_complete=on_db_complete)
 
         msg_file = msg.file
         assert msg_file is not None
@@ -1120,7 +1149,8 @@ class SlaveMessageProcessor(LocaleMixin):
                     self.logger.warning('[%s] Failed to send remote image URL as document, sending editable placeholder. '
                                         'Reason: %s', msg.uid, e)
                     return self._send_remote_image_placeholder(tg_dest, thread_id, msg_template, reactions, text,
-                                                               target_msg_id, reply_markup, silent, as_document=True)
+                                                               target_msg_id, reply_markup, silent, as_document=True,
+                                                               msg=msg, on_db_complete=on_db_complete)
 
             file_too_large = self.check_file_size(msg.file)
             edit_media = msg.edit_media

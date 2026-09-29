@@ -54,7 +54,7 @@ setup(
         "python-telegram-bot~=22.7",
         "python-magic",
         "ffmpeg-python",
-        "peewee",
+        "peewee>=3.19,<5",
         "requests",
         "pydub",
         "audioop-lts; python_version >= '3.13'",
@@ -67,6 +67,7 @@ setup(
         "humanize",
         "typing-extensions>=3.7.4.1",
         "prometheus_client",
+        "psutil>=5.9,<8",
         "pyrate-limiter>=3.9.0",
     ],
     extras_require={

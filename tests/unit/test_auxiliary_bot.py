@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 from unittest.mock import Mock, patch
 
 import pytest
@@ -154,3 +155,40 @@ def test_probe_membership_forbidden_marks_non_member_without_disabling():
 
     assert aux_bot.check_membership_tri(4000) is False
     assert aux_bot.disabled is False
+
+
+def test_transient_membership_probe_failure_remains_unknown():
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
+        bot_cls.return_value.get_chat_member.side_effect = telegram.error.TimedOut("temporary")
+        aux_bot = AuxiliaryBot("123:token")
+        aux_bot.bot_id = 123
+
+    aux_bot._probe_membership(4000)
+
+    with patch.object(aux_bot, "_start_membership_probe"):
+        assert aux_bot.check_membership_tri(4000) is None
+
+
+def test_in_flight_membership_probe_cannot_overwrite_explicit_update():
+    probe_started = threading.Event()
+    finish_probe = threading.Event()
+
+    def delayed_non_member(*_args):
+        probe_started.set()
+        assert finish_probe.wait(timeout=1)
+        return SimpleNamespace(status="left")
+
+    with patch("efb_telegram_master.auxiliary_bot.telegram.Bot") as bot_cls:
+        bot_cls.return_value.get_chat_member.side_effect = delayed_non_member
+        aux_bot = AuxiliaryBot("123:token")
+        aux_bot.bot_id = 123
+
+    probe = threading.Thread(target=aux_bot._probe_membership, args=(4000, 0))
+    probe.start()
+    assert probe_started.wait(timeout=1)
+    aux_bot.update_membership(4000, True)
+    finish_probe.set()
+    probe.join(timeout=1)
+
+    assert not probe.is_alive()
+    assert aux_bot.check_membership_tri(4000) is True

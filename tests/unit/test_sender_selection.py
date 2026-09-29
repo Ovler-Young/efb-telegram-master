@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -8,7 +7,7 @@ import telegram.error
 
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.bot_pool import BotPool
-from efb_telegram_master.outbound import SenderSelection
+from efb_telegram_master.outbound import OutboundQueue, QueuedCall, SenderSelection
 
 
 class Limiter:
@@ -40,7 +39,6 @@ def _manager(*auxiliaries: Mock) -> TelegramBotManager:
     manager._bot = object()
     manager._rate_limiter = Limiter()
     manager._bot_chat_disabled_until = {}
-    manager._bot_chat_retry_failures = {}
     manager.bot_pool = BotPool(list(auxiliaries), manager) if auxiliaries else None
     return manager
 
@@ -51,8 +49,15 @@ def _task(
     slave_id: str | None = None,
     chat_id: int = 100,
     priority: int = 0,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> QueuedCall:
+    return QueuedCall(
+        id=1,
+        operation='edit_message_text',
+        payload=OutboundQueue.encode_payload((), {"chat_id": chat_id, "message_id": 101, "text": "test"}),
+        created_at=0.0,
+        log_context=None,
+        delivery_state="queued",
+        completion_receipt=None,
         telegram_chat_id=chat_id,
         required_sender_bot_id=required_sender_bot_id,
         slave_id=slave_id,
@@ -171,7 +176,10 @@ def test_confirmed_non_member_removes_only_the_triggering_affinity() -> None:
     manager.bot_pool.record_successful_auxiliary_send("slave-b", 10)
 
     task = _task(slave_id="slave-a")
-    manager.record_queued_failure(task, Exception("membership probe pending"), SenderSelection(first.bot, "10"))
+    manager.record_queued_failure(
+        task, telegram.error.Forbidden("Bot is not a member of the chat"), SenderSelection(first.bot, "10")
+    )
+    assert manager.bot_pool.preferred_sender("slave-a") is first
     manager.remove_confirmed_non_member_affinity_for_sender_chat("10", task.telegram_chat_id)
 
     assert manager.bot_pool.preferred_sender("slave-a") is None
@@ -190,12 +198,11 @@ def test_eventual_retry_after_uses_exact_sender_chat_backoff(monkeypatch: pytest
     capped = manager.record_queued_failure(task, telegram.error.RetryAfter(1_000), selection)
 
     assert [decision.retry_at for decision in (first, second, third, capped)] == [
-        1_025.0,
-        1_060.0,
-        1_120.0,
-        1_900.0,
+        1_020.0,
+        1_020.0,
+        1_020.0,
+        2_000.0,
     ]
-    assert manager._bot_chat_retry_failures == {("10", 100): 4}
 
 
 def test_retry_after_cooldown_leaves_another_sender_for_the_same_chat_selectable(
@@ -211,18 +218,5 @@ def test_retry_after_cooldown_leaves_another_sender_for_the_same_chat_selectable
     manager.record_queued_failure(task, telegram.error.RetryAfter(20), SenderSelection(first.bot, "10"))
     selection = manager.select_sender(task, _now())
 
-    assert manager._bot_chat_retry_failures == {("10", 100): 1}
     assert selection.selection is not None
     assert selection.selection.sender_bot_id == "20"
-
-
-def test_eventual_success_resets_only_its_sender_chat_retry_streak() -> None:
-    manager = _manager()
-    first = _task(chat_id=100)
-    second = _task(chat_id=200)
-    manager._bot_chat_retry_failures = {("10", 100): 3, ("10", 200): 2}
-
-    decision = manager.record_queued_success(first, object(), SenderSelection(object(), "10"))
-
-    assert decision.kind.name == "SUCCESS"
-    assert manager._bot_chat_retry_failures == {("10", 200): 2}
