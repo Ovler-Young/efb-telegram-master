@@ -1593,15 +1593,16 @@ class ChatBindingManager(LocaleMixin):
                 )
                 return False
 
-            self.db.delete_history_migration_entry(entry.id)
             try:
                 waiter.result()
             except BaseException as error:
                 self.logger.warning(
-                    "History migration entry %d failed after durable enqueue: %s",
+                    "History migration entry %d retained after durable enqueue failed: %s",
                     entry.id,
                     error,
                 )
+                return False
+            self.db.delete_history_migration_entry(entry.id)
         return True
 
     @staticmethod
