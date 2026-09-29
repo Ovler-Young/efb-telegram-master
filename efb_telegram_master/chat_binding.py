@@ -176,6 +176,14 @@ class ChatBindingManager(LocaleMixin):
         conversations = cast(ConversationDict, conversations)
         conversations[key] = state
 
+    @staticmethod
+    def _clear_conversation_state(handler: ConversationHandler, key: Tuple[int, ...]) -> None:
+        conversations = getattr(handler, "_conversations", None)
+        if conversations is None:
+            conversations = getattr(handler, "conversations")
+        conversations = cast(ConversationDict, conversations)
+        conversations.pop(key, None)
+
     def _get_bot_user(self) -> telegram.User:
         bot_user = self.bot.me
         if bot_user is None:
@@ -686,6 +694,7 @@ class ChatBindingManager(LocaleMixin):
         if backfill_override is not None:
             backfill_mode = backfill_override
         self.msg_storage.pop(storage_key, None)
+        self._clear_conversation_state(self.link_handler, storage_key)
 
         # migrate history
         # auto:   backfill on first link, send history link on relink
