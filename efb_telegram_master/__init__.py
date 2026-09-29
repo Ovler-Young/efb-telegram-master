@@ -447,7 +447,10 @@ class TelegramChannel(MasterChannel):
                             "Reply to the already delivered bot message with /confirm_send <queue-row-id>. This does not resend it.")
             return
         try:
-            complete = self.bot_manager.confirm_queued_delivery(int(args[0]), message.reply_to_message)
+            # Nested reply file IDs belong to this main bot receiving the update.
+            complete = self.bot_manager.confirm_queued_delivery(
+                int(args[0]), message.reply_to_message, file_bot_id="__main__",
+            )
         except ValueError as error:
             sync_reply_text(self.bot_manager, message, str(error))
             return
