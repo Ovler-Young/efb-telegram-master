@@ -1721,7 +1721,7 @@ class ChatBindingManager(LocaleMixin):
             # the sender. Recovered bytes use the ordinary outbound selection.
             kwargs[HISTORY_REPLAY_KEY] = {
                 'fallback_operation': operation, 'fallback_kwargs': fallback,
-                'source_sender_bot_id': source.sender_bot_id,
+                'source_sender_bot_id': source.file_bot_id,
             }
         return 'copy_message', kwargs
 

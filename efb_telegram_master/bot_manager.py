@@ -1623,23 +1623,29 @@ class TelegramBotManager(LocaleMixin):
             raise QueuePersistenceError("Queued database log context cannot be decoded.") from error
 
     @staticmethod
-    def encode_queued_completion_receipt(result: object, selection: SenderSelection) -> bytes:
+    def encode_queued_completion_receipt(
+        result: object, selection: SenderSelection, *, file_bot_id: Optional[str] = None,
+    ) -> bytes:
         try:
-            return b"\x01" + pickle.dumps((result, selection.sender_bot_id), protocol=5)
+            value = ((result, selection.sender_bot_id) if file_bot_id is None else
+                     (result, selection.sender_bot_id, file_bot_id))
+            return b"\x01" + pickle.dumps(value, protocol=5)
         except Exception as error:
             raise QueuePersistenceError("Unable to serialize queued Telegram completion receipt.") from error
 
     @staticmethod
-    def _decode_queued_completion_receipt(payload: object) -> tuple[TelegramMessage, Optional[str]]:
+    def _decode_queued_completion_receipt(payload: object) -> tuple[TelegramMessage, Optional[str], Optional[str]]:
         if not isinstance(payload, bytes) or not payload or payload[0] != 1:
             raise QueuePersistenceError("Queued Telegram completion receipt has an unknown version.")
         try:
             value = pickle.loads(payload[1:])
         except Exception as error:
             raise QueuePersistenceError("Queued Telegram completion receipt cannot be decoded.") from error
-        if not isinstance(value, tuple) or len(value) != 2 or not isinstance(value[1], (str, type(None))):
+        if not isinstance(value, tuple) or len(value) not in (2, 3) or not isinstance(value[1], (str, type(None))):
             raise QueuePersistenceError("Queued Telegram completion receipt has an invalid shape.")
-        return cast(TelegramMessage, value[0]), value[1]
+        if len(value) == 3 and not isinstance(value[2], str):
+            raise QueuePersistenceError("Queued Telegram completion receipt has an invalid file owner.")
+        return cast(TelegramMessage, value[0]), value[1], value[2] if len(value) == 3 else None
 
     def _pop_queued_db_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
         if not isinstance(row_id, int):
@@ -1690,11 +1696,13 @@ class TelegramBotManager(LocaleMixin):
             return True
         try:
             etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
-            real_tg_msg, sender_bot_id = self._decode_queued_completion_receipt(
+            real_tg_msg, sender_bot_id, file_bot_id = self._decode_queued_completion_receipt(
                 row.completion_receipt
             )
             etm_msg.type_telegram = get_msg_type(real_tg_msg)
             etm_msg.put_telegram_file(real_tg_msg)
+            etm_msg.sender_bot_id = sender_bot_id
+            etm_msg.file_bot_id = file_bot_id
             self.channel.db.add_or_update_message_log(
                 etm_msg,
                 real_tg_msg,
@@ -1709,11 +1717,15 @@ class TelegramBotManager(LocaleMixin):
         self._run_database_update_callback(self._pop_queued_completion_callback(row.id))
         return True
 
-    def confirm_queued_delivery(self, row_id: int, message: TelegramMessage) -> bool:
+    def confirm_queued_delivery(
+        self, row_id: int, message: TelegramMessage, *, file_bot_id: Optional[str] = None,
+    ) -> bool:
         """Resolve a held send using an admin-selected, actual Telegram reply message.
 
         Never sends the original payload. Receipt persistence precedes MsgLog,
         so a failed database write can be retried without another Telegram send.
+        file_bot_id identifies the observer of a nested reply; direct send
+        responses omit it and inherit the recorded author.
         """
         with self._outbound_scheduler._lock:
             if row_id in self._outbound_scheduler.in_flight:
@@ -1756,13 +1768,14 @@ class TelegramBotManager(LocaleMixin):
             if row.operation == "send_document" and message.document is None:
                 raise ValueError("This queue row requires the original document message.")
             completion = self._queued_completion_result(row, args, kwargs, message, selection)
+            receipt = self.encode_queued_completion_receipt(message, selection, file_bot_id=file_bot_id)
             if isinstance(completion, QueuedDeliveryResult):
                 queue.record_telegram_completion(
-                    row_id, completion.receipt, supplement=completion.supplement,
+                    row_id, receipt, supplement=completion.supplement,
                     operation_resolver=self._queue_operation,
                 )
             else:
-                queue.record_telegram_completion(row_id, self.encode_queued_completion_receipt(message, selection))
+                queue.record_telegram_completion(row_id, receipt)
             if has_log:
                 completed = row_id in self._outbound_scheduler.reconcile_sent_pending(row_id)
             else:
@@ -1951,6 +1964,8 @@ class TelegramBotManager(LocaleMixin):
         try:
             etm_msg.type_telegram = get_msg_type(real_tg_msg)
             etm_msg.put_telegram_file(real_tg_msg)
+            etm_msg.sender_bot_id = sender_bot_id
+            etm_msg.file_bot_id = None
             self.channel.db.add_or_update_message_log(
                 etm_msg,
                 real_tg_msg,
