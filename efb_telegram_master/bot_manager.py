@@ -27,7 +27,7 @@ from unittest.mock import Mock, patch
 import httpx
 import telegram.constants
 import telegram.error
-from telegram import File, ForumTopic, InlineKeyboardMarkup, Update, User
+from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, InputMedia, Update, User
 from telegram import Message as TelegramMessage
 from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
 from telegram.ext import _applicationbuilder as ptb_applicationbuilder
@@ -1416,10 +1416,36 @@ class TelegramBotManager(LocaleMixin):
 
     @staticmethod
     def _rewind_queued_files(args: tuple, kwargs: Mapping[str, object]) -> None:
-        for value in (*args, *kwargs.values()):
+        seen: set[int] = set()
+
+        def rewind(value: object) -> None:
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            if isinstance(value, InputFile):
+                rewind(value.input_file_content)
+                return
+            if isinstance(value, InputMedia):
+                rewind(value.media)
+                for field in ("thumbnail", "cover", "photo"):
+                    attachment = getattr(value, field, None)
+                    if attachment is not None:
+                        rewind(attachment)
+                return
+            if isinstance(value, Mapping):
+                for item in value.values():
+                    rewind(item)
+                return
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    rewind(item)
+                return
             seek = getattr(value, "seek", None)
             if callable(seek):
                 seek(0)
+
+        rewind(args)
+        rewind(kwargs)
 
     @staticmethod
     def _queued_content_argument(

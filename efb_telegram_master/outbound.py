@@ -716,7 +716,7 @@ class OutboundQueue:
         source,
         filename: Optional[str],
         *,
-        input_file: bool = False,
+        input_file: bool = True,
         attach_name: Optional[str] = None,
         mimetype: Optional[str] = None,
         created_media: Optional[set[str]] = None,
@@ -972,7 +972,13 @@ class OutboundQueue:
         if not self._needs_media_snapshot(thumbnail):
             return kwargs
         normalized_kwargs = dict(kwargs)
-        normalized_kwargs["thumbnail"] = self._snapshot_media_value(thumbnail, cleanup_files, created_media)
+        snapshot = self._snapshot_media_value(thumbnail, cleanup_files, created_media)
+        if isinstance(snapshot, _StoredMediaSnapshot) and not snapshot.input_file:
+            attachment = InputFile(b"", attach=True)
+            snapshot = replace(
+                snapshot, input_file=True, attach_name=attachment.attach_name
+            )
+        normalized_kwargs["thumbnail"] = snapshot
         return normalized_kwargs
 
     def _normalize_keyword_media(
@@ -1026,7 +1032,7 @@ class OutboundQueue:
                 return stream
             input_file = InputFile(
                 stream,
-                filename=value.filename,
+                filename=value.filename or "file",
                 attach=value.attach_name is not None,
                 read_file_handle=False,
             )
@@ -1641,7 +1647,7 @@ class OutboundQueue:
                     if expecting_bytesio_content and name in {
                         "SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8",
                     }:
-                        snapshot = self._store_media_stream(_BlobSlice(source, size), None)
+                        snapshot = self._store_media_stream(_BlobSlice(source, size), None, input_file=False)
                         assert snapshot.storage_name is not None
                         created.add(snapshot.storage_name)
                         output[-1:] = self._legacy_marker_pickle(snapshot.storage_name)
