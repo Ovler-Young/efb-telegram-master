@@ -28,11 +28,24 @@ from ehforwarderbot import Chat
 from ehforwarderbot import Message as EFBMessage
 from ehforwarderbot.chat import SelfChatMember
 from ehforwarderbot.message import LinkAttribute, LocationAttribute, MsgType
-from tests.integration.helper.filters import in_chats, edited, reply_to
+from tests.integration.helper.filters import BaseFilter, in_chats, edited, reply_to
 from tests.integration.utils import link_chats
 from tests.mocks.slave import MockSlaveChannel
 
 pytestmark = mark.asyncio
+
+
+class SourceMessage(BaseFilter):
+    """Do not mistake delayed control sends or another test's media for ours."""
+
+    def __init__(self, uid):
+        self.uid = str(uid)
+
+    def filter(self, event):
+        message = event.message
+        if self.uid in (message.raw_text or ""):
+            return True
+        return any(self.uid in button.text for row in message.buttons or () for button in row)
 
 
 class MessageFactory(ABC):
@@ -415,13 +428,13 @@ async def test_slave_message(helper, client, bot_group, slave, channel, factory:
     with link_chats(channel, (chat,), bot_group):
         message_ids = []
         efb_msg = factory.send_message(slave, chat)
-        tg_msg = await helper.wait_for_message(in_chats(bot_group))
+        tg_msg = await helper.wait_for_message(in_chats(bot_group) & SourceMessage(efb_msg.uid))
         message_ids.append(tg_msg.id)
         factory.compare_message(tg_msg, efb_msg)
 
         edited_efb_msg = factory.edit_message(slave, efb_msg)
         if edited_efb_msg is not None:
-            filters = in_chats(bot_group)
+            filters = in_chats(bot_group) & SourceMessage(edited_efb_msg.uid)
             if factory.content_editable:
                 filters &= edited(*message_ids)
             tg_msg = await helper.wait_for_message(filters)
@@ -431,7 +444,7 @@ async def test_slave_message(helper, client, bot_group, slave, channel, factory:
 
         edited_media_efb_msg = factory.edit_message_media(slave, efb_msg)
         if edited_media_efb_msg is not None:
-            filters = in_chats(bot_group)
+            filters = in_chats(bot_group) & SourceMessage(edited_media_efb_msg.uid)
             if factory.media_editable:
                 filters &= edited(*message_ids)
             tg_msg = await helper.wait_for_message(filters)
@@ -448,5 +461,7 @@ async def test_slave_message(helper, client, bot_group, slave, channel, factory:
             factory.compare_message(tg_msg, edited_media_efb_msg)
 
         targeted_message = factory.send_message(slave, chat, target=efb_msg)
-        targeted_tg_msg = await helper.wait_for_message(in_chats(bot_group) & reply_to(*message_ids))
+        targeted_tg_msg = await helper.wait_for_message(
+            in_chats(bot_group) & reply_to(*message_ids) & SourceMessage(targeted_message.uid)
+        )
         factory.compare_message(targeted_tg_msg, targeted_message)

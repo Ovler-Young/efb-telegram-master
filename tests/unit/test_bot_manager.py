@@ -6,7 +6,6 @@ import logging
 import string
 import random
 import threading
-from datetime import timedelta
 from typing import Iterator, BinaryIO
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -24,16 +23,13 @@ from efb_telegram_master.bot_manager import (
 )
 from efb_telegram_master.bot_manager import AsyncTelegramRuntime
 from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.outbound import OutboundQueue, QueueEnqueueError, QueueRequest, SenderSelection
+from efb_telegram_master.outbound import (
+    OutboundQueue, QueueEnqueueError, QueuePersistenceError, QueueRequest, SenderSelection,
+)
 
 
-class DurableMessage:
-    def __init__(self) -> None:
-        self.type_telegram = None
-        self.receipt = None
-
-    def put_telegram_file(self, receipt) -> None:
-        self.receipt = receipt
+from efb_telegram_master.message import ETMMsg
+from tests.unit.test_restart_memory import message_with_group
 
 
 def _bind_blocking_enqueue_helper(manager):
@@ -260,12 +256,17 @@ def test_queued_document_filename_precedence(tmp_path, kind, expected_filename):
     args, decoded_kwargs = queue.decode_payload(queue.heads()[0].payload)
     delivered = args[1]
     if isinstance(delivered, InputFile):
-        assert delivered.input_file_content == b"media"
+        content = delivered.input_file_content
+        if isinstance(content, bytes):
+            assert content == b"media"
+        else:
+            assert content.tell() == 0
+            assert content.read() == b"media"
     else:
         assert delivered.tell() == 0
         assert delivered.read() == b"media"
     if expected_filename is None:
-        assert not hasattr(delivered, "name")
+        assert getattr(delivered, "name", None) is None
         assert "filename" not in decoded_kwargs
     else:
         actual_filename = delivered.filename if isinstance(delivered, InputFile) else delivered.name
@@ -290,7 +291,7 @@ def test_prechange_version_one_payloads_decode_and_execute_without_reencoding(
     assert payload[0] == 1
     encoder = Mock(side_effect=AssertionError("legacy payload must not be re-encoded"))
     monkeypatch.setattr(OutboundQueue, "encode_payload", encoder)
-    args, kwargs = OutboundQueue.decode_payload(payload)
+    args, kwargs = OutboundQueue.decode_payload_raw(payload)
     manager = object.__new__(TelegramBotManager)
     sender = Mock()
 
@@ -800,7 +801,7 @@ def test_queued_success_writes_deferred_db_mapping_once():
 
 def test_enqueue_registers_deferred_mapping_before_waking_worker():
     manager = object.__new__(TelegramBotManager)
-    db_context = QueuedDbLogContext(DurableMessage(), None, Mock())
+    db_context = QueuedDbLogContext(message_with_group(), None, Mock())
     manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
     wake_event = Mock()
@@ -818,7 +819,8 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
         stored_msg, stored_old_msg_id = TelegramBotManager._decode_queued_log_context(
             requests[0].log_context
         )
-        assert isinstance(stored_msg, DurableMessage)
+        assert isinstance(stored_msg, ETMMsg)
+        assert stored_msg.uid == db_context.etm_msg.uid
         assert stored_old_msg_id is None
 
     wake_event.set.side_effect = assert_context_registered
@@ -830,6 +832,27 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
 
     assert row_id == "7"
     wake_event.set.assert_called_once_with()
+
+
+def test_stopped_scheduler_raises_fresh_failures_without_growing_stored_traceback():
+    manager = object.__new__(TelegramBotManager)
+    stored_failure = QueuePersistenceError("oversized legacy row")
+    manager._outbound_scheduler = SimpleNamespace(
+        _lock=threading.RLock(), stopping=True, failure=stored_failure,
+    )
+    errors = []
+
+    for _ in range(50):
+        with pytest.raises(QueuePersistenceError) as raised:
+            TelegramBotManager._enqueue_requests(
+                manager,
+                [QueueRequest("send_message", (), {"chat_id": 1, "text": "x"})],
+            )
+        errors.append(raised.value)
+
+    assert all(error is not stored_failure for error in errors)
+    assert len({id(error) for error in errors}) == 50
+    assert stored_failure.__traceback__ is None
 
 
 def test_terminal_queued_failure_releases_deferred_mapping_callback():
@@ -857,7 +880,7 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
 
 def test_durable_reconciliation_retries_db_write_and_preserves_sender(monkeypatch):
     manager = object.__new__(TelegramBotManager)
-    etm_msg = DurableMessage()
+    etm_msg = message_with_group()
     real_tg_msg = SimpleNamespace(chat_id=123, message_id=9)
     db_write = Mock(side_effect=RuntimeError("database unavailable"))
     manager.channel = SimpleNamespace(
@@ -885,7 +908,8 @@ def test_durable_reconciliation_retries_db_write_and_preserves_sender(monkeypatc
     db_write.side_effect = None
     assert TelegramBotManager.reconcile_queued_delivery(manager, row)
     persisted_msg, persisted_receipt, old_msg_id = db_write.call_args.args
-    assert isinstance(persisted_msg, DurableMessage)
+    assert isinstance(persisted_msg, ETMMsg)
+    assert persisted_msg.uid == etm_msg.uid
     assert (persisted_receipt.chat_id, persisted_receipt.message_id) == (123, 9)
     assert old_msg_id is None
     assert db_write.call_args.kwargs == {"sender_bot_id": "10"}
@@ -1461,6 +1485,7 @@ def test_worker_finalizes_resources_once_after_stop_join_timeout():
     manager._send_worker_stop = threading.Event()
     manager._outbound_scheduler = SimpleNamespace(
         stopping=True,
+        failure=None,
         stop_and_drain=Mock(),
         wake_event=threading.Event(),
     )
@@ -1493,6 +1518,7 @@ def test_queued_worker_finalizes_resources_after_stop_timeout():
     manager._send_worker_stop = threading.Event()
     manager._outbound_scheduler = SimpleNamespace(
         stopping=True,
+        failure=None,
         stop_and_drain=Mock(),
     )
     manager._send_executor = Mock()

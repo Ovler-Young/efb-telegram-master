@@ -5,8 +5,8 @@ import logging
 import pickle
 import time
 from contextlib import nullcontext, suppress
-from functools import partial, wraps
-from typing import Callable, Collection, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING
+from functools import wraps
+from typing import Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING
 
 from peewee import (
     AutoField,
@@ -20,6 +20,7 @@ from peewee import (
     PostgresqlDatabase,
     TextField,
     fn,
+    chunked,
 )
 from playhouse.migrate import migrate
 
@@ -690,31 +691,45 @@ class DatabaseManager:
 
         if row is None:
             row = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
-        if row is not None:
-            save = row.save
+        existing = row is not None
+        if existing:
             self.logger.debug("[%s] Message record is found in database, update it", master_msg_id)
         else:
             row = MsgLog()
-            save = partial(row.save, force_insert=True)
             self.logger.debug("[%s] Message record is not found in database, insert it", master_msg_id)
 
-        row.master_msg_id = master_msg_id
-        row.master_msg_id_alt = master_msg_id_alt
-        row.text = msg.text
-        row.slave_origin_uid = chat_id_to_str(chat=msg.chat)
-        row.slave_member_uid = chat_id_to_str(chat=msg.author)
-        row.msg_type = msg.type.name
-        row.sent_to = msg.deliver_to.channel_id
-        row.slave_message_id = msg.uid or f"{self.FAIL_FLAG}.{time.time()}"
-        row.media_type = msg.type_telegram.value
-        row.file_id = msg.file_id
-        row.file_unique_id = msg.file_unique_id
-        row.mime = msg.mime
-        row.sender_bot_id = sender_bot_id or getattr(msg, 'sender_bot_id', None)
-        pickle_data = self.pickle_misc_msg(msg)
-        row.pickle = pickle_data
-
-        result = save()
+        assert row is not None
+        values = {
+            "master_msg_id": master_msg_id,
+            "master_msg_id_alt": master_msg_id_alt,
+            "text": msg.text,
+            "slave_origin_uid": chat_id_to_str(chat=msg.chat),
+            "slave_member_uid": chat_id_to_str(chat=msg.author),
+            "msg_type": msg.type.name,
+            "sent_to": msg.deliver_to.channel_id,
+            "slave_message_id": msg.uid or f"{self.FAIL_FLAG}.{time.time()}",
+            "media_type": msg.type_telegram.value,
+            "file_id": msg.file_id,
+            "file_unique_id": msg.file_unique_id,
+            "mime": msg.mime,
+            "sender_bot_id": sender_bot_id or getattr(msg, 'sender_bot_id', None),
+            "pickle": self.pickle_misc_msg(msg),
+        }
+        if existing:
+            changed = {
+                name: value for name, value in values.items()
+                if getattr(row, name) != value
+            }
+            for name, value in changed.items():
+                setattr(row, name, value)
+            if changed:
+                result = row.save(only=[MsgLog._meta.fields[name] for name in changed])
+            else:
+                result = 0
+        else:
+            for name, value in values.items():
+                setattr(row, name, value)
+            result = row.save(force_insert=True)
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
 
     @observe_database_method("get_msg_log")
@@ -867,7 +882,8 @@ class DatabaseManager:
             return None
 
     @observe_database_method("get_recent_messages")
-    def get_recent_messages(self, slave_chat_id: EFBChannelChatIDStr, limit: int = 1000) -> List[MsgLog]:
+    def get_recent_messages(self, slave_chat_id: EFBChannelChatIDStr, limit: int = 1000,
+                            after: Optional[Tuple[Optional[datetime.datetime], str]] = None) -> List[MsgLog]:
         """Get recent messages from a specific slave chat for migration purposes.
 
         Args:
@@ -880,7 +896,18 @@ class DatabaseManager:
         try:
             query = MsgLog.select().where(
                 MsgLog.slave_origin_uid == slave_chat_id
-            ).order_by(MsgLog.time.asc(nulls="FIRST"))
+            ).order_by(MsgLog.time.asc(nulls="FIRST"), MsgLog.master_msg_id.asc())
+            if after is not None:
+                timestamp, identifier = after
+                if timestamp is None:
+                    page_filter = MsgLog.time.is_null(False) | (
+                        MsgLog.time.is_null(True) & (MsgLog.master_msg_id > identifier)
+                    )
+                else:
+                    page_filter = (MsgLog.time > timestamp) | (
+                        (MsgLog.time == timestamp) & (MsgLog.master_msg_id > identifier)
+                    )
+                query = query.where(page_filter)
 
             if limit > 0:
                 query = query.limit(limit)
@@ -910,18 +937,20 @@ class DatabaseManager:
         slave_chat_id: EFBChannelChatIDStr,
         target_chat_id: int,
         message_thread_id: Optional[TelegramTopicID],
-        entries: List[Dict[str, object]],
+        entries: Iterable[Dict[str, object]],
     ) -> int:
         target_filter = self._history_migration_target_filter(
             slave_chat_id,
             target_chat_id,
             message_thread_id,
         )
+        count = 0
         with database.atomic():
             HistoryMigrationEntry.delete().where(target_filter).execute()
-            if entries:
-                HistoryMigrationEntry.insert_many(entries).execute()
-        return len(entries)
+            for batch in chunked(entries, 32):
+                HistoryMigrationEntry.insert_many(batch).execute()
+                count += len(batch)
+        return count
 
     @observe_database_method("has_pending_history_migrations")
     def has_pending_history_migrations(self) -> bool:
@@ -941,17 +970,21 @@ class DatabaseManager:
         slave_chat_id: EFBChannelChatIDStr,
         target_chat_id: int,
         message_thread_id: Optional[TelegramTopicID] = None,
+        limit: Optional[int] = None,
     ) -> List[HistoryMigrationEntry]:
         target_filter = self._history_migration_target_filter(
             slave_chat_id,
             target_chat_id,
             message_thread_id,
         )
-        return list(
+        query = (
             HistoryMigrationEntry.select()
             .where(target_filter)
             .order_by(HistoryMigrationEntry.position.asc(), HistoryMigrationEntry.id.asc())
         )
+        if limit is not None:
+            query = query.limit(limit)
+        return list(query)
 
     @observe_database_method("delete_history_migration_entry")
     def delete_history_migration_entry(self, entry_id: int) -> int:
