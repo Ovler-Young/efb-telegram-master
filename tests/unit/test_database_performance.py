@@ -277,7 +277,10 @@ def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager)
         future.set_result(None)
         return future
 
-    binding.bot = SimpleNamespace(enqueue_history_operation=enqueue)
+    binding.bot = SimpleNamespace(
+        enqueue_history_operation=enqueue, history_ownership_page=lambda **kwargs: [],
+        owned_history_entries=lambda keys: set(), forget_history_entries=lambda keys: None,
+    )
     tracemalloc.start()
     try:
         binding._process_pending_history_migrations()
