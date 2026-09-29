@@ -14,10 +14,14 @@ from unittest.mock import Mock
 import pytest
 from prometheus_client import generate_latest
 from telegram import InputMediaDocument
-from telegram.error import NetworkError, RetryAfter, TelegramError
+from telegram.error import ChatMigrated, NetworkError, RetryAfter, TelegramError
 
 import efb_telegram_master.outbound as outbound
-from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
+from efb_telegram_master.bot_manager import (
+    QueuedChatMigrationRetry,
+    QueuedDbLogContext,
+    TelegramBotManager,
+)
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.auxiliary_bot import AuxiliaryBot
@@ -32,6 +36,7 @@ from efb_telegram_master.outbound import (
     SenderSelection,
     SenderSelectionResult,
 )
+from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
 
 
 def send_message(chat_id: int, text: str) -> tuple[int, str]:
@@ -84,6 +89,7 @@ class ControlledExecutor:
 class CompletionDecision:
     kind: str
     retry_at: float | None = None
+    retry_reason: str | None = None
 
 
 class AlwaysAvailableLimiter:
@@ -102,6 +108,7 @@ def auxiliary_probe_publishing_non_membership(bot_id: int, chat_id: int) -> Auxi
     )
     auxiliary._runtime = None
     auxiliary._membership_cache = {}
+    auxiliary._membership_generation = {}
     auxiliary._membership_lock = threading.Lock()
     auxiliary._pending_probes = {chat_id}
     auxiliary._metrics = None
@@ -509,6 +516,75 @@ def test_blocking_media_edit_retries_at_telegram_deadline_with_rewound_payload(
     assert waiter.result() == "edited"
 
 
+def test_blocking_media_edit_retry_uses_migrated_destination_after_retry_after(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    old_chat_id = 67
+    new_chat_id = 68
+    manager = manager_adapter()
+    manager._bot = Mock()
+    manager._bot.edit_message_media.side_effect = [
+        ChatMigrated(new_chat_id),
+        RetryAfter(121),
+        "edited",
+    ]
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    manager._outbound_queue = retained_queue
+    row_id, waiter = _enqueue_blocking_media_edit(
+        retained_queue, io.BufferedReader(io.BytesIO(b"media")), "__main__"
+    )
+    later_id, later_waiter = retained_queue.enqueue_many(
+        [QueueRequest(
+            "send_message",
+            (),
+            {"chat_id": new_chat_id, "text": "later", "_send_mode": "blocking"},
+        )],
+        lambda _operation: send_message,
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    first_function, first_args, first_future = executor.submissions[0]
+    with pytest.raises(RetryAfter) as raised:
+        first_function(*first_args)
+    first_future.set_exception(raised.value)
+    scheduler.harvest_completed()
+
+    retry = scheduler.blocking_media_retries[row_id]
+    retry_args, _retry_kwargs = retained_queue.decode_payload(retry.row.payload)
+    assert retry.row.telegram_chat_id == new_chat_id
+    assert retry_args[1] == new_chat_id
+    assert manager._bot_chat_disabled_until == {(None, new_chat_id): 221.0}
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+
+    clock.update(monotonic=221.0, wall=1121.0)
+    scheduler.dispatch_once()
+    retry_function, retry_submission_args, retry_future = executor.submissions[1]
+    assert retry_submission_args[0].telegram_chat_id == new_chat_id
+    assert retry_submission_args[1][1] == new_chat_id
+    retry_future.set_result(retry_function(*retry_submission_args))
+    scheduler.harvest_completed()
+    assert waiter.result() == "edited"
+    assert [entry.args[1] for entry in manager._bot.edit_message_media.call_args_list] == [
+        old_chat_id,
+        new_chat_id,
+        new_chat_id,
+    ]
+
+    scheduler.dispatch_once()
+    assert executor.submissions[2][1][0].id == later_id
+    executor.submissions[2][2].set_result("later")
+    scheduler.harvest_completed()
+    assert later_waiter.result() == "later"
+
+
 def test_blocking_media_retry_preserves_database_context_until_real_manager_success(
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -727,6 +803,8 @@ def test_blocking_media_edit_retry_exceeding_original_deadline_is_terminal(
     clock = {"monotonic": 100.0, "wall": 1000.0}
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    metrics = Metrics()
+    retained_queue.metrics = metrics
     row_id, waiter = _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(retained_queue, RecordingAdapter(), executor, worker_count=1)
@@ -738,6 +816,10 @@ def test_blocking_media_edit_retry_exceeding_original_deadline_is_terminal(
     with pytest.raises(RetryAfter):
         waiter.result()
     assert row_id not in scheduler.blocking_media_retries
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="edit_message_media",outcome="failure",priority="blocking",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="edit_message_media",outcome="failure",priority="blocking"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="edit_message_media",outcome="failure",priority="blocking"} 1.0' in rendered
 
 
 def test_repeated_blocking_media_edit_retry_cannot_extend_original_deadline(
@@ -953,7 +1035,304 @@ def test_scheduler_publishes_metrics_for_actual_dequeue_and_completion(tmp_path:
     assert 'etm_outbound_dequeued_total{operation="send_message",priority="normal"} 1.0' in rendered
     assert 'etm_outbound_in_flight{operation="send_message",priority="normal",sender_kind="main"} 0.0' in rendered
     assert 'etm_outbound_completions_total{operation="send_message",outcome="success",priority="normal",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_queue_dispatches_total{outcome="submitted"} 1.0' in rendered
+    assert 'etm_outbound_queue_wait_seconds_count{operation="send_message",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
     assert row_id not in scheduler.in_flight
+    queue.close()
+
+
+def test_scheduler_records_attempt_failure_and_only_terminal_success_after_retry(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    _row_id, waiter = enqueue(queue, 49, "retry metrics")
+    adapter = RecordingAdapter(failure_decision=CompletionDecision("retry_eventual", retry_at=10.0))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(1))
+    scheduler.harvest_completed()
+
+    assert not waiter.done()
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="failure",priority="normal",sender_kind="main"}' not in rendered
+    assert 'etm_outbound_retries_total{operation="send_message",priority="normal",reason="rate_limit"} 1.0' in rendered
+    assert 'etm_outbound_failures_total{operation="send_message",priority="normal",stage="execution"} 1.0' in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="failure",priority="normal"} 1.0' in rendered
+
+    scheduler.dispatch_once()
+    executor.submissions[1][2].set_result("sent")
+    scheduler.harvest_completed()
+
+    assert waiter.result() == "sent"
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="success",priority="normal",sender_kind="main"} 1.0' in rendered
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="failure",priority="normal",sender_kind="main"}' not in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="failure",priority="normal"}' not in rendered
+    assert 'etm_outbound_executor_attempt_duration_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
+    queue.close()
+
+
+def test_scheduler_records_transport_retry_reason(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    enqueue(queue, 50, "transport retry")
+    adapter = RecordingAdapter(
+        failure_decision=CompletionDecision("retry_eventual", retry_at=10.0)
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(NetworkError("connection lost"))
+    scheduler.harvest_completed()
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="transport"} 1.0' in rendered
+    )
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="membership"}' not in rendered
+    )
+    queue.close()
+
+
+def test_transport_retry_deadline_blocks_only_its_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    first_id, _first_waiter = enqueue(queue, 50, "first")
+    manager = manager_adapter()
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=2)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(NetworkError("connection lost"))
+    scheduler.harvest_completed()
+    second_id, _second_waiter = enqueue(queue, 50, "second")
+    other_id, _other_waiter = enqueue(queue, 51, "other")
+
+    scheduler.dispatch_once()
+
+    assert scheduler.next_deadline == 101.0
+    assert [submission[1][0].id for submission in executor.submissions] == [first_id, other_id]
+
+    clock["now"] = 101.0
+    scheduler.dispatch_once()
+
+    assert [submission[1][0].id for submission in executor.submissions] == [
+        first_id,
+        other_id,
+        first_id,
+    ]
+    assert second_id not in [submission[1][0].id for submission in executor.submissions]
+    queue.close()
+
+
+def test_chat_migration_redispatches_retained_row_only_after_harvest(tmp_path: Path) -> None:
+    metrics = Metrics()
+    queue = OutboundQueue(tmp_path, metrics=metrics)
+    first_id, _waiter = enqueue(queue, 61, "first")
+    sender = Mock()
+    sender.send_message.side_effect = [ChatMigrated(62), "sent"]
+    manager = manager_adapter()
+    manager._bot = sender
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=2)
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    function, arguments, first_future = executor.submissions[0]
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        function(*arguments)
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    first_future.set_exception(caught.value)
+    scheduler.harvest_completed()
+    assert (
+        'etm_outbound_retries_total{operation="send_message",priority="normal",'
+        'reason="migration"} 1.0'
+        in generate_latest(metrics.registry).decode()
+    )
+    scheduler.dispatch_once()
+
+    assert len(executor.submissions) == 2
+    retried_row = executor.submissions[1][1][0]
+    assert retried_row.id == first_id
+    assert retried_row.telegram_chat_id == 62
+    assert queue.decode_payload(retried_row.payload)[1]["chat_id"] == 62
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(61, 62)
+    queue.close()
+
+
+def test_chat_migration_binding_failure_retains_original_row(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, 61, "first")
+    row = queue.heads()[0]
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(
+            chat_migration_by_id=Mock(side_effect=RuntimeError("database unavailable"))
+        )
+    )
+    selection = SenderSelection(sender=sender, sender_bot_id=None)
+
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        manager.execute_queued_call(row, *queue.decode_payload(row.payload), selection)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 50.0)
+        decision = manager.record_queued_failure(row, caught.value, selection)
+    assert decision.kind.name == "RETRY_EVENTUAL"
+    assert decision.retry_reason == "migration"
+    assert decision.retry_at == 51.0
+    retained = queue.heads()[0]
+    assert retained.id == row_id
+    assert retained.telegram_chat_id == 61
+    assert queue.decode_payload(retained.payload)[1]["chat_id"] == 61
+    queue.close()
+
+
+def test_chat_migration_binding_failure_observes_retry_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, _waiter = enqueue(queue, 61, "first")
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._bot = sender
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(
+            chat_migration_by_id=Mock(side_effect=RuntimeError("database unavailable"))
+        )
+    )
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
+    clock = {"now": 50.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["now"])
+
+    scheduler.dispatch_once()
+    function, arguments, future = executor.submissions[0]
+    with pytest.raises(QueuedChatMigrationRetry) as caught:
+        function(*arguments)
+    future.set_exception(caught.value)
+    scheduler.harvest_completed()
+
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 1
+    assert scheduler.next_deadline == 51.0
+
+    clock["now"] = 51.0
+    scheduler.dispatch_once()
+    assert len(executor.submissions) == 2
+    assert executor.submissions[1][1][0].id == row_id
+    queue.close()
+
+
+def test_chat_migration_retarget_failure_stops_scheduler_and_retains_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = OutboundQueue(tmp_path)
+    row_id, waiter = enqueue(queue, 61, "first")
+    sender = Mock()
+    sender.send_message.side_effect = ChatMigrated(62)
+    manager = manager_adapter()
+    manager._bot = sender
+    manager._outbound_queue = queue
+    manager.channel = SimpleNamespace(
+        chat_binding=SimpleNamespace(chat_migration_by_id=Mock())
+    )
+    persistence_error = QueuePersistenceError("injected retarget failure")
+    monkeypatch.setattr(queue, "retarget", Mock(side_effect=persistence_error))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(queue, manager, executor, worker_count=1)
+
+    scheduler.dispatch_once()
+    function, arguments, future = executor.submissions[0]
+    with pytest.raises(QueuePersistenceError) as caught:
+        function(*arguments)
+    future.set_exception(caught.value)
+    scheduler.harvest_completed()
+
+    assert scheduler.stopping
+    assert scheduler.failure is persistence_error
+    with pytest.raises(QueuePersistenceError):
+        waiter.result()
+    retained = queue.heads()[0]
+    assert retained.id == row_id
+    assert retained.telegram_chat_id == 61
+    assert queue.decode_payload(retained.payload)[1]["chat_id"] == 61
+    manager.channel.chat_binding.chat_migration_by_id.assert_called_once_with(61, 62)
+    queue.close()
+
+
+def test_retarget_updates_only_current_row_and_ignores_corrupt_sibling(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    first_id, _waiter = enqueue(queue, 61, "first")
+    second_id, _second_waiter = enqueue(queue, 61, "second")
+    queue.connection.execute(
+        "UPDATE outbound_queue SET payload = X'02' WHERE id = ?", (second_id,)
+    )
+    queue.connection.commit()
+
+    queue.retarget(first_id, 62, (), {"chat_id": 62, "text": "first"})
+
+    stored_rows = queue.connection.execute(
+        "SELECT id, telegram_chat_id, payload FROM outbound_queue ORDER BY id"
+    ).fetchall()
+    assert [(stored_rows[0][0], stored_rows[0][1])] == [(first_id, 62)]
+    assert queue.decode_payload(stored_rows[0][2])[1]["chat_id"] == 62
+    assert (stored_rows[1][0], stored_rows[1][1], stored_rows[1][2]) == (
+        second_id,
+        61,
+        b"\x02",
+    )
+    queue.close()
+
+
+def test_manager_registers_runtime_snapshot_collectors_with_configured_destination_cap(tmp_path: Path) -> None:
+    queue = OutboundQueue(tmp_path)
+    enqueue(queue, 61, "first")
+    enqueue(queue, 61, "second")
+    enqueue(queue, 62, "third")
+    metrics = Metrics()
+    manager = object.__new__(TelegramBotManager)
+    manager._metrics = metrics
+    manager._outbound_queue = queue
+    manager._outbound_scheduler = SimpleNamespace(in_flight_count=lambda: 3)
+    manager._send_worker_thread = SimpleNamespace(is_alive=lambda: True)
+    manager._bot_chat_disabled_until = {(None, 61): outbound.time.monotonic() + 1.0}
+    manager._rate_limiter = SlidingWindowRateLimiter()
+    manager.bot_pool = None
+
+    manager._register_runtime_metric_collectors(top_n=1)
+
+    rendered = generate_latest(metrics.registry).decode()
+    assert 'etm_outbound_destination_queue_depth{destination="rank_1"} 2.0' in rendered
+    assert 'etm_outbound_destination_queue_depth{destination="rank_2"}' not in rendered
+    assert "etm_outbound_worker_healthy 1.0" in rendered
+    assert "etm_outbound_worker_in_flight 3.0" in rendered
+    assert 'etm_outbound_cooldown_seconds{sender_kind="main"}' in rendered
+    assert 'etm_auxiliary_bots{state="enabled"} 0.0' in rendered
+    assert 'etm_auxiliary_membership_cache_entries{state="member"} 0.0' in rendered
+    assert 'etm_rate_limit_occupancy{scope="global"} 0.0' in rendered
     queue.close()
 
 
