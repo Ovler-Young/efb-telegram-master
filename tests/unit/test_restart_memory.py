@@ -1,8 +1,14 @@
 """Restart regressions with real message objects and large unrelated state."""
 
 import io
+import json
+import os
 import pickle
+import subprocess
+import sys
+import textwrap
 import tracemalloc
+from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 import threading
 import time
@@ -287,3 +293,388 @@ def test_worker_waits_for_events_or_deadline_without_scanning_four_times_per_sec
         assert observed[0] is None
     else:
         assert observed[0] > 59.0
+
+
+
+def _queue_subprocess(script: str, *arguments: object) -> dict:
+    environment = dict(os.environ)
+    project_root = str(Path(__file__).resolve().parents[2])
+    environment["PYTHONPATH"] = project_root + os.pathsep + environment.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script), *(str(argument) for argument in arguments)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    return json.loads(result.stdout)
+
+
+def _outbound_import_rss() -> int:
+    return _queue_subprocess(
+        """
+        import json, resource
+        from efb_telegram_master.outbound import OutboundQueue
+        print(json.dumps({"rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+        """
+    )["rss_kib"]
+
+
+def test_startup_cleanup_does_not_materialize_a_nonmatching_128_mib_payload(tmp_path):
+    size = 128 * 1024 * 1024
+    baseline_rss = _outbound_import_rss()
+    _queue_subprocess(
+        """
+        import sqlite3, sys
+        from pathlib import Path
+        from efb_telegram_master.outbound import OutboundQueue
+        root = sys.argv[1]
+        queue = OutboundQueue(root)
+        queue.close()
+        connection = sqlite3.connect(str(Path(root) / OutboundQueue.filename))
+        connection.execute(
+            "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at) "
+            "VALUES(0, 1, 'send_message', zeroblob(?), 0)", (int(sys.argv[2]),)
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+        print("{}")
+        """,
+        tmp_path,
+        size,
+    )
+    report = _queue_subprocess(
+        """
+        import json, resource, sys
+        from efb_telegram_master.outbound import OutboundQueue
+        queue = OutboundQueue(sys.argv[1])
+        print(json.dumps({"rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+        queue.close()
+        """,
+        tmp_path,
+    )
+    assert report["rss_kib"] - baseline_rss < 32 * 1024, {"baseline_rss": baseline_rss, **report}
+
+
+def test_recovery_streams_an_exact_381320453_byte_v1_payload_and_survives_restart(tmp_path):
+    total_size = 381_320_453
+    baseline_rss = _outbound_import_rss()
+    prepared = _queue_subprocess(
+        """
+        import io, json, pickle, sqlite3, sys
+        from pathlib import Path
+        from efb_telegram_master.outbound import OutboundQueue
+        root, total = sys.argv[1], int(sys.argv[2])
+        sample_content = b"x" * 1024
+        body = pickle.dumps(((1, io.BytesIO(sample_content)), {}), protocol=5)
+        marker = b"B" + len(sample_content).to_bytes(4, "little") + sample_content
+        offset = body.index(marker)
+        content_length = total - 1 - offset - 5 - (len(body) - offset - len(marker))
+        assert content_length > 0
+        head = b"\x01" + body[:offset] + b"B" + content_length.to_bytes(4, "little")
+        # Keep the source pickle valid; recovery removes FRAME before unpickling.
+        head = head[:4] + (total - 1 - 11).to_bytes(8, "little") + head[12:]
+        tail = body[offset + len(marker):]
+        assert len(head) + content_length + len(tail) == total
+        queue = OutboundQueue(root)
+        queue.close()
+        connection = sqlite3.connect(str(Path(root) / OutboundQueue.filename))
+        connection.execute(
+            "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at) "
+            "VALUES(0, 1, 'send_document', zeroblob(?), 0)", (total,)
+        )
+        row_id = connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+        connection.execute(
+            "UPDATE outbound_queue SET payload = CAST(? || zeroblob(?) || ? AS BLOB) WHERE id = ?",
+            (head, content_length, tail, row_id),
+        )
+        stored_size = connection.execute(
+            "SELECT length(CAST(payload AS BLOB)) FROM outbound_queue WHERE id = ?", (row_id,)
+        ).fetchone()[0]
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+        print(json.dumps({"row_id": row_id, "stored_size": stored_size, "media_size": content_length}))
+        """,
+        tmp_path,
+        total_size,
+    )
+    assert prepared["stored_size"] == total_size
+
+    recovered = _queue_subprocess(
+        """
+        import json, resource, sys
+        import efb_telegram_master.outbound as outbound
+        from efb_telegram_master.outbound import OutboundQueue
+        requests = []
+        stages = {}
+        rss = lambda: resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        read_blob = outbound._SQLiteBlobReader.read
+        def measured_read(self, size=-1):
+            value = read_blob(self, size)
+            requests.append(len(value))
+            return value
+        outbound._SQLiteBlobReader.read = measured_read
+        queue = OutboundQueue(sys.argv[1])
+        stages["opened"] = rss()
+        stream = queue._stream_legacy_pickle
+        def measured_stream(source, **kwargs):
+            stages["before_stream"] = rss()
+            value = stream(source, **kwargs)
+            stages["after_stream"] = rss()
+            return value
+        queue._stream_legacy_pickle = measured_stream
+        load = outbound._LegacyRecoveryUnpickler.load
+        def measured_load(self):
+            stages["before_unpickle"] = rss()
+            value = load(self)
+            stages["after_unpickle"] = rss()
+            return value
+        outbound._LegacyRecoveryUnpickler.load = measured_load
+        queue.connection.set_trace_callback(
+            lambda sql: stages.setdefault("before_update", rss())
+            if sql.startswith("UPDATE outbound_queue SET payload") else None
+        )
+        row = queue.recover_legacy_media_payload(int(sys.argv[2]))
+        stages["after_update"] = rss()
+        args, _kwargs = queue.decode_payload(row.payload)
+        media = args[1]
+        media.seek(0)
+        first = media.read(1)
+        media.seek(-1, 2)
+        last = media.read(1)
+        size = media.seek(0, 2)
+        media.close()
+        print(json.dumps({
+            "payload_version": row.payload[0], "payload_size": len(row.payload),
+            "media_size": size, "first": first.hex(), "last": last.hex(),
+            "rss_kib": rss(), "stages": stages,
+            "helper_rss_kib": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+            "max_blob_read": max(requests),
+        }))
+        queue.close()
+        """,
+        tmp_path,
+        prepared["row_id"],
+    )
+    assert recovered["payload_version"] == 2
+    assert recovered["payload_size"] < 4096
+    assert recovered["media_size"] == prepared["media_size"]
+    assert recovered["first"] == recovered["last"] == "00"
+    assert recovered["max_blob_read"] <= 1024 * 1024
+    report = {"baseline_rss": baseline_rss, **recovered}
+    assert recovered["rss_kib"] - baseline_rss < 32 * 1024, report
+    assert recovered["helper_rss_kib"] - baseline_rss < 32 * 1024, report
+    assert all(value - baseline_rss < 32 * 1024 for value in recovered["stages"].values()), report
+
+    restarted = _queue_subprocess(
+        """
+        import asyncio, json, resource, sys
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        import httpx
+        from telegram import Bot
+        from telegram.request import BaseRequest
+        from efb_telegram_master.outbound import (
+            OutboundQueue, OutboundQueueScheduler, SenderSelection, SenderSelectionResult,
+        )
+
+        class UploadSink(BaseRequest):
+            @property
+            def read_timeout(self):
+                return None
+            async def initialize(self):
+                pass
+            async def shutdown(self):
+                pass
+            async def do_request(self, url, method, request_data=None, **kwargs):
+                request = httpx.Request(method, url, data=request_data.json_parameters,
+                                        files=request_data.multipart_data)
+                self.uploaded = 0
+                self.largest_chunk = 0
+                for chunk in request.stream:
+                    self.uploaded += len(chunk)
+                    self.largest_chunk = max(self.largest_chunk, len(chunk))
+                return 200, json.dumps({"ok": True, "result": {
+                    "message_id": 1, "date": 0, "chat": {"id": 1, "type": "private"},
+                }}).encode()
+
+        sink = UploadSink()
+        bot = Bot("123:test", request=sink)
+        class Adapter:
+            def select_sender(self, row, now):
+                return SenderSelectionResult(selection=SenderSelection(bot, None))
+            def acquire_sender_limits(self, selection, chat_id):
+                return True
+            def execute_queued_call(self, row, args, kwargs, selection):
+                args = OutboundQueue.streaming_uploads(args)
+                kwargs = OutboundQueue.streaming_uploads(kwargs)
+                return asyncio.run(bot.send_document(*args, **kwargs))
+            def record_queued_success(self, *args):
+                return SimpleNamespace(kind="success")
+
+        queue = OutboundQueue(sys.argv[1])
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            scheduler = OutboundQueueScheduler(queue, Adapter(), executor, worker_count=1)
+            scheduler.dispatch_once()
+            submitted = scheduler.in_flight[int(sys.argv[2])]
+            assert submitted.future.result(timeout=30).message_id == 1
+            scheduler.harvest_completed()
+            assert not scheduler.stopping
+            assert queue.heads() == []
+            assert list(queue.media_dir.iterdir()) == []
+            assert all(stream.closed for stream in submitted.closeables)
+        print(json.dumps({"uploaded": sink.uploaded, "largest_chunk": sink.largest_chunk,
+                          "rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+        queue.close()
+        """,
+        tmp_path,
+        prepared["row_id"],
+    )
+    assert prepared["media_size"] < restarted["uploaded"] < prepared["media_size"] + 4096
+    assert restarted["largest_chunk"] <= 64 * 1024
+    assert restarted["rss_kib"] - baseline_rss < 32 * 1024, {"baseline_rss": baseline_rss, **restarted}
+
+
+def test_oversized_legacy_opaque_bytes_are_retained_without_sidecar_leaks(tmp_path):
+    opaque_size = 32 * 1024 * 1024
+    baseline_rss = _outbound_import_rss()
+    prepared = _queue_subprocess(
+        """
+        import io, json, pickle, sqlite3, sys
+        from pathlib import Path
+        from efb_telegram_master.outbound import OutboundQueue
+        root, opaque_size = sys.argv[1], int(sys.argv[2])
+        queue = OutboundQueue(root)
+        payload = b"\\x01" + pickle.dumps(
+            ((1, io.BytesIO(b"small media")), {"opaque": b"x" * opaque_size}), protocol=5,
+        )
+        with queue.connection:
+            cursor = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,1,'send_document',?,0)", (payload,),
+            )
+        print(json.dumps({"row_id": cursor.lastrowid, "stored_size": len(payload)}))
+        queue.close()
+        """,
+        tmp_path, opaque_size,
+    )
+    report = _queue_subprocess(
+        """
+        import json, resource, sys
+        import efb_telegram_master.outbound as outbound
+        from efb_telegram_master.outbound import OutboundQueue, OversizedQueuedPayloadError
+        requested = []
+        read_blob = outbound._SQLiteBlobReader.read
+        def measured_read(self, size=-1):
+            value = read_blob(self, size)
+            requested.append(len(value))
+            return value
+        outbound._SQLiteBlobReader.read = measured_read
+        queue = OutboundQueue(sys.argv[1])
+        queue.MAX_REPLAY_BYTES = 1024 * 1024
+        try:
+            queue.recover_legacy_media_payload(int(sys.argv[2]))
+        except OversizedQueuedPayloadError as error:
+            retained = "Row retained" in str(error)
+        else:
+            retained = False
+        with outbound._SQLiteBlobReader(queue.path, int(sys.argv[2])) as blob:
+            version = blob.read(1)[0]
+        print(json.dumps({
+            "retained": retained, "version": version,
+            "sidecars": [path.name for path in queue.media_dir.iterdir()],
+            "rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            "max_blob_read": max(requested),
+        }))
+        queue.close()
+        """,
+        tmp_path, prepared["row_id"],
+    )
+    assert report["retained"] and report["version"] == 1
+    assert report["sidecars"] == []
+    assert report["max_blob_read"] <= 64 * 1024
+    assert report["rss_kib"] - baseline_rss < 16 * 1024, {"baseline_rss": baseline_rss, **report}
+
+
+def test_startup_cleanup_retains_sidecars_for_oversized_matching_v2_payload(tmp_path):
+    size = 128 * 1024 * 1024
+    baseline_rss = _outbound_import_rss()
+    _queue_subprocess(
+        """
+        import pickle, sqlite3, sys
+        from pathlib import Path
+        from efb_telegram_master.outbound import OutboundQueue, _StoredMediaSnapshot
+        root = Path(sys.argv[1])
+        queue = OutboundQueue(root)
+        (queue.media_dir / "media-live.bin").write_bytes(b"live")
+        (queue.media_dir / "media-orphan.bin").write_bytes(b"orphan")
+        payload = b"\\x02" + pickle.dumps(((), {
+            "media": _StoredMediaSnapshot("media-live.bin", None),
+            "opaque": b"x" * int(sys.argv[2]),
+        }), protocol=5)
+        with queue.connection:
+            queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,1,'send_document',?,0)", (payload,),
+            )
+        queue.close()
+        print("{}")
+        """,
+        tmp_path, size,
+    )
+    report = _queue_subprocess(
+        """
+        import json, resource, sys
+        from efb_telegram_master.outbound import OutboundQueue
+        queue = OutboundQueue(sys.argv[1])
+        print(json.dumps({
+            "rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            "sidecars": sorted(path.name for path in queue.media_dir.iterdir()),
+        }))
+        queue.close()
+        """,
+        tmp_path,
+    )
+    assert report["sidecars"] == ["media-live.bin", "media-orphan.bin"]
+    assert report["rss_kib"] - baseline_rss < 32 * 1024, {"baseline_rss": baseline_rss, **report}
+
+
+def test_interrupted_legacy_stream_rolls_back_and_reclaims_crash_sidecar(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    payload = b"\x01" + pickle.dumps(((1, io.BytesIO(b"legacy media")), {}), protocol=5)
+    with queue.connection:
+        cursor = queue.connection.execute(
+            "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+            "VALUES(0,1,'send_document',?,0)", (payload,),
+        )
+    row_id = cursor.lastrowid
+    queue.close()
+    result = subprocess.run([
+        sys.executable, "-c", textwrap.dedent("""
+            import os, sys
+            from efb_telegram_master.outbound import OutboundQueue
+            queue = OutboundQueue(sys.argv[1])
+            store = queue._store_media_stream
+            def interrupted(*args, **kwargs):
+                store(*args, **kwargs)
+                os._exit(17)
+            queue._store_media_stream = interrupted
+            queue.recover_legacy_media_payload(int(sys.argv[2]))
+        """), str(tmp_path), str(row_id),
+    ], check=False)
+    assert result.returncode == 17
+    assert len(list((tmp_path / "outbound-media").iterdir())) == 1
+    queue = OutboundQueue(tmp_path)
+    try:
+        assert list(queue.media_dir.iterdir()) == []
+        assert queue.load_queued(row_id).payload == payload
+        row = queue.recover_legacy_media_payload(row_id)
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            assert args[1].read() == b"legacy media"
+        finally:
+            queue.close_payload_resources(queue.payload_closeables(args, kwargs))
+    finally:
+        queue.close()
