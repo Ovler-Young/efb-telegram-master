@@ -1,180 +1,48 @@
+import pytest
+from prometheus_client import generate_latest
+
 from efb_telegram_master.etm_metrics import Metrics
 
 
-def test_topn_queue_collector_caps_rows_and_omits_zero_depths():
-    rows = [(f"slave.{i}", i, i) for i in range(25)]
-    rows.append(("slave.zero", 999, 0))
-    metrics = Metrics(top_n=3)
-    metrics.register_topn(lambda: rows)
-
-    rendered = metrics.render().decode()
-
-    assert 'slave_id="slave.24"' in rendered
-    assert 'chat_id="24"' in rendered
-    assert 'slave_id="slave.23"' in rendered
-    assert 'slave_id="slave.22"' in rendered
-    assert 'slave_id="slave.21"' not in rendered
-    assert "slave.zero" not in rendered
+def _render(metrics: Metrics) -> str:
+    return generate_latest(metrics.registry).decode()
 
 
-def test_topn_queue_collector_returns_empty_family_on_snapshot_error():
-    metrics = Metrics(top_n=20)
-
-    def broken_snapshot():
-        raise RuntimeError("snapshot failed")
-
-    metrics.register_topn(broken_snapshot)
-
-    rendered = metrics.render().decode()
-
-    assert "etm_send_queue_target_depth" in rendered
-    assert "slave_id=" not in rendered
-
-
-def test_topn_queue_collector_recomputes_each_scrape_without_stale_labels():
-    rows = [("slave.a", 1, 10), ("slave.b", 2, 5)]
-    metrics = Metrics(top_n=20)
-    metrics.register_topn(lambda: rows)
-
-    first = metrics.render().decode()
-    rows[:] = [("slave.c", 3, 7)]
-    second = metrics.render().decode()
-
-    assert 'slave_id="slave.a"' in first
-    assert 'slave_id="slave.a"' not in second
-    assert 'slave_id="slave.c"' in second
-
-
-def test_topn_queue_age_collector_caps_rows_and_omits_zero_ages():
-    rows = [(f"slave.{i}", i, float(i)) for i in range(25)]
-    rows.append(("slave.zero", 999, 0.0))
-    metrics = Metrics(top_n=2)
-    metrics.register_queue_oldest_age_topn(lambda: rows)
-
-    rendered = metrics.render().decode()
-
-    assert "etm_send_queue_target_oldest_age_seconds" in rendered
-    assert 'slave_id="slave.24"' in rendered
-    assert 'slave_id="slave.23"' in rendered
-    assert 'slave_id="slave.22"' not in rendered
-    assert "slave.zero" not in rendered
-
-
-def test_bot_chat_occupancy_collector_renders_distribution_rows():
-    metrics = Metrics()
-    metrics.register_bot_chat_occupancy(
-        lambda: [
-            ("aux", 123, "botA", 0, 18, "available", 112),
-            ("aux", 123, "botA", 1, 18, "available", 12),
-            ("aux", 123, "botA", 18, 18, "cooling", 4),
-            ("aux", 456, "botB", 0, 18, "available", 0),
-        ]
-    )
-
-    rendered = metrics.render().decode()
-
-    assert "etm_bot_chat_rate_limit_occupancy_chats" in rendered
-    assert 'bot_id="123"' in rendered
-    assert 'username="botA"' in rendered
-    assert 'used="0"' in rendered
-    assert 'state="cooling"' in rendered
-    assert 'bot_id="456"' not in rendered
-
-
-def test_bot_chat_occupancy_collector_recomputes_each_scrape_without_stale_labels():
-    rows = [("aux", 123, "botA", 1, 18, "available", 2)]
-    metrics = Metrics()
-    metrics.register_bot_chat_occupancy(lambda: rows)
-
-    first = metrics.render().decode()
-    rows[:] = [("aux", 456, "botB", 2, 18, "available", 3)]
-    second = metrics.render().decode()
-
-    assert 'bot_id="123"' in first
-    assert 'bot_id="123"' not in second
-    assert 'bot_id="456"' in second
-
-
-def test_bot_chat_occupancy_collector_returns_empty_family_on_snapshot_error():
+def test_queue_metrics_render_every_closed_matrix_event():
     metrics = Metrics()
 
-    def broken_snapshot():
-        raise RuntimeError("snapshot failed")
+    metrics.record_enqueued("blocking", "send_message")
+    metrics.set_queue_depth(3)
+    metrics.record_removal("normal", "delete_message", "terminal_discard", 1.25)
+    metrics.record_dequeued("normal", "delete_message")
+    metrics.record_dispatch_failure("normal", "delete_message")
+    metrics.increment_in_flight("blocking", "send_message", "main")
+    metrics.decrement_in_flight("blocking", "send_message", "main")
+    metrics.record_completion("blocking", "send_message", "main", "failure")
 
-    metrics.register_bot_chat_occupancy(broken_snapshot)
+    rendered = _render(metrics)
 
-    rendered = metrics.render().decode()
-
-    assert "etm_bot_chat_rate_limit_occupancy_chats" in rendered
-    assert "bot_id=" not in rendered
-
-
-def test_debug_event_metrics_render_bounded_labels():
-    metrics = Metrics()
-
-    metrics.dispatch_blocked("local_rate_limit")
-    metrics.sender_selection("aux", "skipped", "no_aux_member")
-    metrics.send_failure("main", "bad_request", "send_message")
-    metrics.bad_request("send_message", "invalid_markup")
-    metrics.membership_probe(123, "botA", "ok_member")
-
-    rendered = metrics.render().decode()
-
-    assert 'etm_send_dispatch_blocked_total{reason="local_rate_limit"} 1.0' in rendered
-    assert 'etm_sender_selection_total{reason="no_aux_member",result="skipped",sender="aux"} 1.0' in rendered
-    assert 'etm_telegram_send_failures_total{error_type="bad_request",method="send_message",sender="main"} 1.0' in rendered
-    assert 'etm_bad_request_total{method="send_message",reason_class="invalid_markup"} 1.0' in rendered
-    assert 'etm_membership_probe_total{bot_id="123",outcome="ok_member",username="botA"} 1.0' in rendered
+    assert 'etm_outbound_enqueued_total{operation="send_message",priority="blocking"} 1.0' in rendered
+    assert "etm_outbound_queue_depth 3.0" in rendered
+    assert 'etm_outbound_queue_residence_seconds_count{operation="delete_message",outcome="terminal_discard",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_queue_removals_total{operation="delete_message",outcome="terminal_discard",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_dequeued_total{operation="delete_message",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_dispatch_failures_total{operation="delete_message",priority="normal"} 1.0' in rendered
+    assert 'etm_outbound_in_flight{operation="send_message",priority="blocking",sender_kind="main"} 0.0' in rendered
+    assert 'etm_outbound_completions_total{operation="send_message",outcome="failure",priority="blocking",sender_kind="main"} 1.0' in rendered
 
 
-def test_state_collectors_render_current_rows_without_zero_membership_or_cooldown_rows():
-    metrics = Metrics()
-    metrics.register_bot_cooldowns(
-        lambda: [
-            ("aux", 123, "botA", 2, 15.5),
-            ("aux", 456, "botB", 0, 0.0),
-        ]
-    )
-    metrics.register_membership_cache(
-        lambda: [
-            (123, "botA", "member", 5),
-            (123, "botA", "not_member", 0),
-            (123, "botA", "unknown_probe_pending", 1),
-        ]
-    )
-    metrics.register_reserved_slots(
-        lambda: [
-            ("main", "main", "", 3),
-            ("aux", 123, "botA", 7),
-        ]
-    )
-
-    rendered = metrics.render().decode()
-
-    assert 'etm_bot_chat_cooldown_chats{bot_id="123",sender="aux",username="botA"} 2.0' in rendered
-    assert 'etm_bot_chat_cooldown_max_seconds{bot_id="123",sender="aux",username="botA"} 15.5' in rendered
-    assert 'bot_id="456"' not in rendered
-    assert 'etm_membership_cache_chats{bot_id="123",status="member",username="botA"} 5.0' in rendered
-    assert 'status="not_member"' not in rendered
-    assert 'status="unknown_probe_pending"' in rendered
-    assert 'etm_reserved_slots{bot_id="main",sender="main",username=""} 3.0' in rendered
-    assert 'etm_reserved_slots{bot_id="123",sender="aux",username="botA"} 7.0' in rendered
-
-
-def test_snapshot_updates_queue_oldest_age_gauge():
-    metrics = Metrics()
-
-    metrics.snapshot(
-        queued_tasks=2,
-        queued_targets=1,
-        max_target_depth=2,
-        queue_oldest_age=12.5,
-        in_flight=0,
-        disabled_bot_chats=0,
-        retry_targets=0,
-        worker_alive=True,
-    )
-
-    rendered = metrics.render().decode()
-
-    assert "etm_send_queue_oldest_age_seconds 12.5" in rendered
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda metrics: metrics.record_enqueued("urgent", "send_message"),
+        lambda metrics: metrics.record_enqueued("normal", "get_me"),
+        lambda metrics: metrics.record_removal("normal", "send_message", "requeued", 0.0),
+        lambda metrics: metrics.increment_in_flight("normal", "send_message", "bot-42"),
+        lambda metrics: metrics.record_completion("normal", "send_message", "main", "cancelled"),
+        lambda metrics: metrics.set_queue_depth(-1),
+    ],
+)
+def test_queue_metrics_reject_unbounded_or_invalid_values(call):
+    with pytest.raises(ValueError):
+        call(Metrics())

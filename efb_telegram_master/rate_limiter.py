@@ -1,163 +1,117 @@
 # coding=utf-8
-"""Shared sliding-window rate limiter for Telegram bot send slots.
+"""Monotonic outbound acquisition limits for one Telegram bot."""
 
-Both the main bot (TelegramBotManager) and each AuxiliaryBot maintain
-independent rate-limit state, but the *algorithm* is identical:
+from __future__ import annotations
 
-* Global limit:  N sends per W-second window across all chats.
-* Per-chat limit: M sends per V-second window for a single chat.
-
-This module provides a single, tested implementation so the logic is
-not duplicated.
-
-Thread-safety: every public method acquires ``_lock`` internally.
-"""
-
-import bisect
 import threading
 import time
-from collections import defaultdict, deque
-from typing import Dict, Tuple
+from collections.abc import Callable
+
+from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate, SingleBucketFactory
+from pyrate_limiter.clocks import AbstractClock
+
+
+GLOBAL_LIMIT = 28
+GLOBAL_WINDOW_SECONDS = 1.0
+CHAT_LIMIT = 18
+CHAT_WINDOW_SECONDS = 60.0
+
+
+class _CallableMonotonicClock(AbstractClock):
+    """Adapt a monotonic seconds callable to pyrate-limiter milliseconds."""
+
+    def __init__(self, now: Callable[[], float]) -> None:
+        self._now = now
+
+    def now(self) -> int:
+        # Truncation cannot advance the current rate-limit window. Rounding
+        # would make a time just below a millisecond boundary appear later.
+        return int(self._now() * 1000)
 
 
 class SlidingWindowRateLimiter:
-    """Two-dimensional (global + per-chat) sliding-window rate limiter.
+    """Per-bot global and bot-chat limits consumed by non-blocking acquisition."""
 
-    Parameters
-    ----------
-    global_limit : int
-        Max sends within *global_window* (across all chats).
-    global_window : float
-        Length of the global window in seconds.
-    chat_limit : int
-        Max sends within *chat_window* for a single chat.
-    chat_window : float
-        Length of the per-chat window in seconds.
-    safety_margin : int
-        Subtracted from both limits to leave headroom for Telegram's own
-        accounting (which may differ from ours by one or two).  Default 2.
-    """
-
-    def __init__(
-        self,
-        global_limit: int = 30,
-        global_window: float = 1.0,
-        chat_limit: int = 20,
-        chat_window: float = 60.0,
-        safety_margin: int = 2,
-    ):
-        self.global_limit = global_limit
-        self.global_window = global_window
-        self.chat_limit = chat_limit
-        self.chat_window = chat_window
-        self._margin = safety_margin
-
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = _CallableMonotonicClock(clock)
         self._lock = threading.Lock()
-        self._global_timestamps: list[float] = []
-        self._chat_timestamps: Dict[int, deque] = defaultdict(deque)
+        self._global_bucket = self._new_bucket(GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS)
+        self._global_limiter = self._new_limiter(self._global_bucket)
+        self._chat_buckets: dict[int, InMemoryBucket] = {}
+        self._chat_limiters: dict[int, Limiter] = {}
 
-    # Public API
+    def _new_bucket(self, limit: int, seconds: float) -> InMemoryBucket:
+        bucket = InMemoryBucket([Rate(limit, int(seconds * Duration.SECOND))])
+        bucket._clock = self._clock
+        return bucket
+
+    @staticmethod
+    def _new_limiter(bucket: InMemoryBucket) -> Limiter:
+        return Limiter(SingleBucketFactory(bucket, schedule_leak=False), buffer_ms=0)
+
+    def _chat_limiter(self, chat_id: int) -> tuple[InMemoryBucket, Limiter]:
+        limiter = self._chat_limiters.get(chat_id)
+        if limiter is None:
+            bucket = self._new_bucket(CHAT_LIMIT, CHAT_WINDOW_SECONDS)
+            limiter = self._new_limiter(bucket)
+            self._chat_buckets[chat_id] = bucket
+            self._chat_limiters[chat_id] = limiter
+        return self._chat_buckets[chat_id], limiter
+
+    def global_delay(self) -> float:
+        """Return the non-consuming delay before this bot's global key is free."""
+        with self._lock:
+            return self._delay(self._global_bucket, GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS)
+
+    def chat_delay(self, chat_id: int) -> float:
+        """Return the non-consuming delay before this bot-chat key is free."""
+        with self._lock:
+            bucket, _limiter = self._chat_limiter(chat_id)
+            return self._delay(bucket, CHAT_LIMIT, CHAT_WINDOW_SECONDS)
 
     def peek_delay(self, chat_id: int) -> float:
-        """Return the delay (seconds) before a send to *chat_id* is allowed.
-
-        Does **not** reserve a slot – the caller can use this to compare
-        multiple bots and pick the fastest one.
-        """
+        """Return the later of the global and bot-chat availability times."""
         with self._lock:
-            return self._compute_delay(chat_id)
-
-    def reserve_slot(self, chat_id: int) -> float:
-        """Reserve a send slot for *chat_id* and return the delay.
-
-        The slot is recorded at ``now + delay`` in both the global and
-        per-chat timestamp lists.
-        """
-        with self._lock:
-            delay = self._compute_delay(chat_id)
-            candidate_time = time.time() + delay
-            bisect.insort(self._global_timestamps, candidate_time)
-            self._chat_timestamps[chat_id].append(candidate_time)
-            return delay
-
-    def release_slot(self, chat_id: int) -> None:
-        """Undo the latest reservation for *chat_id* when no send happened."""
-        with self._lock:
-            chat_ts = self._chat_timestamps.get(chat_id)
-            if not chat_ts:
-                self._cleanup()
-                return
-            candidate_time = chat_ts.pop()
-            idx = bisect.bisect_left(self._global_timestamps, candidate_time)
-            if idx < len(self._global_timestamps) and self._global_timestamps[idx] == candidate_time:
-                self._global_timestamps.pop(idx)
-            self._cleanup()
-
-    def get_counts(self, chat_id: int) -> Tuple[int, int]:
-        """Return ``(chat_count, global_count)`` for diagnostics."""
-        with self._lock:
-            self._cleanup()
-            return len(self._chat_timestamps.get(chat_id, ())), len(self._global_timestamps)
-
-    def get_chat_count_snapshot(self) -> Tuple[Dict[int, int], int]:
-        """Return current per-chat occupancy and the effective per-chat limit."""
-        with self._lock:
-            self._cleanup()
-            return (
-                {chat_id: len(timestamps) for chat_id, timestamps in self._chat_timestamps.items() if timestamps},
-                max(0, self.chat_limit - self._margin),
+            bucket, _limiter = self._chat_limiter(chat_id)
+            return max(
+                self._delay(self._global_bucket, GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS),
+                self._delay(bucket, CHAT_LIMIT, CHAT_WINDOW_SECONDS),
             )
 
-    def get_reserved_slot_count(self) -> int:
-        """Return current global sliding-window reservations for diagnostics."""
+    def try_acquire_global(self) -> bool:
+        """Consume one global acquisition without waiting for capacity."""
         with self._lock:
-            self._cleanup()
-            return len(self._global_timestamps)
+            return bool(self._global_limiter.try_acquire("global", blocking=False))
 
-    # Internals
+    def try_acquire_chat(self, chat_id: int) -> bool:
+        """Consume one bot-chat acquisition without waiting for capacity."""
+        with self._lock:
+            _bucket, limiter = self._chat_limiter(chat_id)
+            return bool(limiter.try_acquire(str(chat_id), blocking=False))
 
-    def _compute_delay(self, chat_id: int) -> float:
-        """Delay computation shared by peek / reserve (caller holds lock)."""
-        current_time = time.time()
-        self._cleanup()
+    def try_acquire(self, chat_id: int) -> bool:
+        """Acquire global capacity before bot-chat capacity without rollback."""
+        if not self.try_acquire_global():
+            return False
+        return self.try_acquire_chat(chat_id)
 
-        effective_chat_limit = self.chat_limit - self._margin
-        effective_global_limit = self.global_limit - self._margin
+    def get_counts(self, chat_id: int) -> tuple[int, int]:
+        """Return active bot-chat and global acquisition counts for diagnostics."""
+        with self._lock:
+            chat_bucket, _limiter = self._chat_limiter(chat_id)
+            self._leak(self._global_bucket)
+            self._leak(chat_bucket)
+            return chat_bucket.count(), self._global_bucket.count()
 
-        # Per-chat window
-        chat_delay = 0.0
-        chat_ts = self._chat_timestamps.get(chat_id)
-        if chat_ts and len(chat_ts) >= effective_chat_limit:
-            safe_index = len(chat_ts) - effective_chat_limit
-            chat_delay = max(0.0, (chat_ts[safe_index] + self.chat_window) - current_time)
+    def _delay(self, bucket: InMemoryBucket, limit: int, seconds: float) -> float:
+        self._leak(bucket)
+        if bucket.count() < limit:
+            return 0.0
+        boundary_item = bucket.peek(limit - 1)
+        if boundary_item is None:
+            return 0.0
+        available_at_ms = boundary_item.timestamp + int(seconds * Duration.SECOND) + 1
+        return max(0.0, (available_at_ms - self._clock.now()) / 1000)
 
-        candidate_time = current_time + chat_delay
-
-        # Global window
-        while True:
-            left_bound = candidate_time - self.global_window
-            idx = bisect.bisect_right(self._global_timestamps, left_bound)
-            right_idx = bisect.bisect_right(self._global_timestamps, candidate_time)
-            in_window = right_idx - idx
-            if in_window < effective_global_limit:
-                break
-            candidate_time = self._global_timestamps[idx] + self.global_window
-
-        return max(0.0, candidate_time - current_time)
-
-    def _cleanup(self):
-        """Remove timestamps older than their respective windows."""
-        current_time = time.time()
-        global_cutoff = current_time - self.global_window
-        while self._global_timestamps and self._global_timestamps[0] <= global_cutoff:
-            self._global_timestamps.pop(0)
-
-        chat_cutoff = current_time - self.chat_window
-        empty_chat_ids = []
-        for cid, ts in self._chat_timestamps.items():
-            while ts and ts[0] <= chat_cutoff:
-                ts.popleft()
-            if not ts:
-                empty_chat_ids.append(cid)
-        for cid in empty_chat_ids:
-            del self._chat_timestamps[cid]
+    def _leak(self, bucket: InMemoryBucket) -> None:
+        bucket.leak(self._clock.now())
