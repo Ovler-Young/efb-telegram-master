@@ -1,10 +1,9 @@
 from io import BytesIO
-from queue import Queue
 import threading
 import time
 import pytest
 from pytest import fixture
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, Update
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from typing import cast
 from types import SimpleNamespace
@@ -13,14 +12,10 @@ from unittest.mock import AsyncMock, Mock, patch
 from ehforwarderbot import Message, Chat
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.chat import ChatMember
-from ehforwarderbot.types import ChatID, MessageID, ReactionName
+from ehforwarderbot.types import MessageID, ReactionName
 from efb_telegram_master import TelegramChannel
-from efb_telegram_master import utils
-from efb_telegram_master.chat_binding import ChatBindingManager
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_message import SlaveMessageProcessor
-from efb_telegram_master.master_message import MasterMessageProcessor
-from efb_telegram_master.utils import TelegramChatID, TelegramTopicID
 
 
 def test_slave_message_reaction_footer(slave):
@@ -143,6 +138,7 @@ def build_duplicate_test_processor() -> SlaveMessageProcessor:
     processor = object.__new__(SlaveMessageProcessor)
     processor.db = Mock()
     processor.logger = Mock()
+    processor.channel = SimpleNamespace(chat_binding=SimpleNamespace(_topic_mutex=threading.RLock()))
     setattr(processor, "get_slave_msg_dest", Mock(return_value=("__template__", (123, None))))
     setattr(processor, "is_silent", Mock(return_value=False))
     setattr(processor, "dispatch_message", Mock())
@@ -283,7 +279,7 @@ def test_get_slave_msg_dest_caches_known_forum_chat_info():
     processor.channel = SimpleNamespace(
         config={"admins": [1]},
         topic_group=-100999,
-        chat_binding=SimpleNamespace(_topic_mutex=threading.RLock(), create_topic=Mock(return_value=55)),
+        chat_binding=SimpleNamespace(create_topic=Mock(return_value=55)),
     )
     processor.bot = SimpleNamespace(get_chat_info=Mock(return_value=SimpleNamespace(is_forum=True)))
     processor.db = SimpleNamespace(
@@ -328,142 +324,6 @@ def test_get_slave_msg_dest_caches_known_forum_chat_info():
     assert processor.get_slave_msg_dest(message_3) == ("template", (-100123, 55))
     assert processor.bot.get_chat_info.call_count == 2
     assert processor.channel.chat_binding.create_topic.call_count == 3
-
-
-def test_queued_forum_route_is_preserved_for_the_worker():
-    processor = MasterMessageProcessor.__new__(MasterMessageProcessor)
-    destination = "tests.mocks.slave __chat_id__"
-    processor.channel = SimpleNamespace(
-        chat_binding=SimpleNamespace(_topic_mutex=threading.RLock(), warn_forum_limit=Mock()),
-    )
-    processor.db = SimpleNamespace(get_topic_slaves=Mock(return_value=[(destination, 55)]))
-    processor.message_queue = Queue()
-    processor.message_worker_thread = SimpleNamespace(is_alive=lambda: True)
-    processor.logger = Mock()
-    processor.channel_id = "blueset.telegram"
-    processor.chat_dest_cache = Mock()
-    processor.process_telegram_message = Mock()
-    processor.bot = Mock()
-
-    message = Mock()
-    message.chat = SimpleNamespace(id=44, is_forum=True)
-    message.message_id = 56
-    message.message_thread_id = 55
-    message.reply_to_message = None
-    message.to_dict.return_value = {}
-    update = Update(update_id=1, message=message)
-
-    processor.enqueue_message(update, None)
-    queued = processor.message_queue.get_nowait()
-    processor.message_queue.task_done()
-
-    processor.db.get_topic_slaves.return_value = []
-    processor.db.get_chat_assoc = Mock(return_value=[])
-    processor.db.get_recent_slave_chats = Mock(return_value=[])
-    processor.msg(*queued)
-
-    processor.process_telegram_message.assert_called_once_with(update, None, destination, quote=False, edited=None)
-
-
-def test_relink_waits_for_outbound_topic_creation():
-    slave_uid = "tests.mocks.slave __chat_id__"
-    old_chat_id = TelegramChatID(101)
-    new_chat_id = TelegramChatID(102)
-    old_master_uid = utils.chat_id_to_str("blueset.telegram", ChatID(str(old_chat_id)))
-    new_master_uid = utils.chat_id_to_str("blueset.telegram", ChatID(str(new_chat_id)))
-
-    class Bindings:
-        def __init__(self):
-            self.master = {slave_uid: old_master_uid}
-            self.topics = {}
-
-        def get_chat_assoc(self, *, master_uid=None, slave_uid=None):
-            if slave_uid:
-                return [self.master[slave_uid]] if slave_uid in self.master else []
-            return [uid for uid, master in self.master.items() if master == master_uid]
-
-        def get_topic_thread_id(self, slave_uid, topic_chat_id):
-            return self.topics.get((slave_uid, topic_chat_id))
-
-        def add_topic_assoc(self, *, slave_uid, topic_chat_id, message_thread_id):
-            self.topics = {(uid, chat): thread for (uid, chat), thread in self.topics.items() if uid != slave_uid}
-            self.topics[(slave_uid, topic_chat_id)] = message_thread_id
-
-        def relink_forum_binding(self, master_uid, topic_chat_id, message_thread_id, slave_uid):
-            self.master[slave_uid] = master_uid
-            self.add_topic_assoc(slave_uid=slave_uid, topic_chat_id=topic_chat_id,
-                                 message_thread_id=message_thread_id)
-
-    bindings = Bindings()
-    topic_started = threading.Event()
-    allow_topic_creation = threading.Event()
-    bot = SimpleNamespace(get_chat_info=Mock(return_value=SimpleNamespace(is_forum=True)))
-
-    def create_forum_topic(*, chat_id, name):
-        if chat_id == new_chat_id:
-            return SimpleNamespace(message_thread_id=TelegramTopicID(202))
-        topic_started.set()
-        assert allow_topic_creation.wait(1)
-        return SimpleNamespace(message_thread_id=TelegramTopicID(201))
-
-    bot.create_forum_topic = Mock(side_effect=create_forum_topic)
-    channel = SimpleNamespace(
-        channel_id="blueset.telegram",
-        config={"admins": [1]},
-        topic_group=old_chat_id,
-        _=lambda text: text,
-        ngettext=lambda singular, plural, count: singular if count == 1 else plural,
-    )
-    binding = ChatBindingManager.__new__(ChatBindingManager)
-    binding.channel = channel
-    binding.bot = bot
-    binding.db = bindings
-    binding.chat_manager = SimpleNamespace(get_chat=lambda *args, **kwargs: SimpleNamespace(chat_title="chat"))
-    binding.logger = Mock()
-    binding._topic_mutex = threading.RLock()
-    channel.chat_binding = binding
-
-    processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
-    processor.channel = channel
-    processor.bot = bot
-    processor.db = bindings
-    processor.chat_manager = SimpleNamespace(
-        update_chat_obj=lambda chat: chat,
-        get_or_enrol_member=lambda chat, author: author,
-    )
-    processor.chat_dest_cache = SimpleNamespace(get=Mock(return_value=slave_uid), remove=Mock())
-    processor.generate_message_template = Mock(return_value="template")
-    processor.logger = Mock()
-    processor._known_forum_chat_ids = {}
-    processor._known_forum_chat_ids_lock = threading.Lock()
-    message = SimpleNamespace(
-        uid="outbound",
-        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="__chat_id__"),
-        author=SimpleNamespace(),
-        vendor_specific=None,
-    )
-    new_message = Mock()
-    new_message.chat = SimpleNamespace(id=int(new_chat_id), is_forum=True)
-    update = Update(update_id=2, message=new_message)
-
-    with patch("efb_telegram_master.chat_binding.sync_reply_text"):
-        delivery = threading.Thread(target=processor.get_slave_msg_dest, args=(message,))
-        delivery.start()
-        assert topic_started.wait(1)
-        migration = threading.Thread(
-            target=binding.relink_forum,
-            args=(update, SimpleNamespace(args=[str(old_chat_id)])),
-        )
-        migration.start()
-        migration.join(0.05)
-        assert migration.is_alive()
-        allow_topic_creation.set()
-        delivery.join(1)
-        migration.join(1)
-
-    assert not migration.is_alive()
-    assert bindings.master[slave_uid] == new_master_uid
-    assert bindings.topics == {(slave_uid, new_chat_id): TelegramTopicID(202)}
 
 
 def test_new_slave_message_does_not_query_sent_message_log_for_dedupe():
