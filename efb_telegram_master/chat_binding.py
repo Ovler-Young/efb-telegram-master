@@ -826,7 +826,11 @@ class ChatBindingManager(LocaleMixin):
         moved = 0
         for slave_uid in slave_uids:
             old_thread_id = self.db.get_topic_thread_id(slave_uid, old_chat_id)
-            channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
+            try:
+                channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
+            except Exception as e:
+                self.logger.warning("Failed to create relink topic for %s: %s", slave_uid, e)
+                continue
             try:
                 chat = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
                 topic_name = chat.chat_title
