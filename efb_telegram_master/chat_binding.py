@@ -106,7 +106,7 @@ class ChatBindingManager(LocaleMixin):
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
-        self._topic_mutex = threading.Lock()
+        self._topic_mutex = threading.RLock()
         self._forum_limit_warned: set[int] = set()
         self._forum_limit_warned_lock = threading.Lock()
         self._history_migration_locks_lock = threading.Lock()
@@ -836,7 +836,8 @@ class ChatBindingManager(LocaleMixin):
                 continue
 
             try:
-                self.db.relink_forum_binding(new_master_uid, new_chat_id, new_thread_id, slave_uid)
+                with self._topic_mutex:
+                    self.db.relink_forum_binding(new_master_uid, new_chat_id, new_thread_id, slave_uid)
             except Exception as e:
                 self.logger.warning("Failed to switch relink binding for %s: %s", slave_uid, e)
                 continue
@@ -1488,26 +1489,24 @@ class ChatBindingManager(LocaleMixin):
             self.create_topic(slave_uid=i, telegram_chat_id=TelegramChatID(message.chat.id))
 
     def create_topic(self, slave_uid: EFBChannelChatIDStr, telegram_chat_id: TelegramChatID) -> Optional[TelegramTopicID]:
-        thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
-        if not thread_id:
-            with self._topic_mutex:
-                thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
-                if not thread_id:
-                    channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
-                    chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
-                    try:
-                        topic = self.bot.create_forum_topic(
-                            chat_id=telegram_chat_id,
-                            name=chat.chat_title
-                        )
-                        thread_id = TelegramTopicID(topic.message_thread_id)
-                        self.db.add_topic_assoc(
-                            topic_chat_id=telegram_chat_id,
-                            message_thread_id=thread_id,
-                            slave_uid=slave_uid,
-                        )
-                    except Exception as e:
-                        self.logger.info('Failed to create topic, Reason: %s', e)
+        with self._topic_mutex:
+            thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
+            if not thread_id:
+                channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
+                chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
+                try:
+                    topic = self.bot.create_forum_topic(
+                        chat_id=telegram_chat_id,
+                        name=chat.chat_title
+                    )
+                    thread_id = TelegramTopicID(topic.message_thread_id)
+                    self.db.add_topic_assoc(
+                        topic_chat_id=telegram_chat_id,
+                        message_thread_id=thread_id,
+                        slave_uid=slave_uid,
+                    )
+                except Exception as e:
+                    self.logger.info('Failed to create topic, Reason: %s', e)
         return thread_id
 
     def chat_migration(self, update: Update, context: CallbackContext):

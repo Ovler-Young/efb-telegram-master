@@ -28,6 +28,9 @@ from .msg_type import TGMsgType, get_msg_type
 from .ptb_compat import Filters, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
 
+ForumRoute = Tuple[Optional[EFBChannelChatIDStr]]
+QueuedMessage = Tuple[Update, CallbackContext, Optional[ForumRoute]]
+
 if TYPE_CHECKING:
     from . import TelegramChannel
     from .bot_manager import TelegramBotManager
@@ -96,7 +99,7 @@ class MasterMessageProcessor(LocaleMixin):
         if self.channel.flag("animated_stickers"):
             self.TYPE_DICT[TGMsgType.AnimatedSticker] = MsgType.Animation
 
-        self.message_queue: 'Queue[Optional[Tuple[Update, CallbackContext]]]' = Queue()
+        self.message_queue: 'Queue[Optional[QueuedMessage]]' = Queue()
         self.message_worker_thread = Thread(target=self.message_worker, name="ETM master messages worker thread")
         self.message_worker_thread.start()
 
@@ -107,9 +110,9 @@ class MasterMessageProcessor(LocaleMixin):
             if content is None:
                 self.message_queue.task_done()
                 return
-            update, context = content
+            update, context, forum_route = content
             try:
-                self.msg(update, context)
+                self.msg(update, context, forum_route)
             except Exception as e:
                 self.logger.exception(
                     "Error [%r] occurred while processing update %s.", e, update)
@@ -148,7 +151,18 @@ class MasterMessageProcessor(LocaleMixin):
     def enqueue_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
 
-        self.message_queue.put((update, context))
+        forum_route: Optional[ForumRoute] = None
+        message = update.effective_message
+        if message and message.chat.is_forum and message.message_thread_id:
+            with self.channel.chat_binding._topic_mutex:
+                topic_destinations = self.db.get_topic_slaves(TelegramChatID(message.chat.id))
+            if topic_destinations:
+                destination = next(
+                    (dest for dest, topic_id in topic_destinations if topic_id == message.message_thread_id),
+                    None,
+                )
+                forum_route = (destination,)
+        self.message_queue.put((update, context, forum_route))
         if not self.message_worker_thread.is_alive():
             if update.effective_message:
                 sync_reply_text(
@@ -158,7 +172,8 @@ class MasterMessageProcessor(LocaleMixin):
                         "ETM message worker is not running due to unforeseen reason. This might be a bug. Please see log for details."),
                 )
 
-    def msg(self, update: Update, context: CallbackContext):
+    def msg(self, update: Update, context: CallbackContext,
+            forum_route: Optional[ForumRoute] = None):
         """
         Process, wrap and dispatch messages from user.
         """
@@ -196,6 +211,17 @@ class MasterMessageProcessor(LocaleMixin):
             destination = EFBChannelChatIDStr(msg_log.slave_origin_uid)
             edited = msg_log
             quote = msg_log.build_etm_msg(self.chat_manager).target is not None
+
+        elif forum_route is not None:
+            destination, = forum_route
+            if destination is None:
+                self.logger.debug("[%s] Ignored message as it's a topic which wasn't created by this bot", mid)
+                return
+            reply_to_message = message.reply_to_message
+            quote = (
+                reply_to_message is not None
+                and reply_to_message.message_id != reply_to_message.message_thread_id
+            )
 
         if destination is None:
             chats = get_linked_slave_chats()

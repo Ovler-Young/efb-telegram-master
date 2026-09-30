@@ -420,61 +420,62 @@ class SlaveMessageProcessor(LocaleMixin):
         msg.author = self.chat_manager.get_or_enrol_member(msg.chat, msg.author)
 
         chat_uid = utils.chat_id_to_str(chat=msg.chat)
-        with self._timed_phase(xid, "Destination chat association lookup"):
-            tg_chats = self.db.get_chat_assoc(slave_uid=chat_uid)
-        tg_chat = None
-        tg_dest: Optional[TelegramChatID] = None
-        thread_id: Optional[TelegramTopicID] = None
+        with self.channel.chat_binding._topic_mutex:
+            with self._timed_phase(xid, "Destination chat association lookup"):
+                tg_chats = self.db.get_chat_assoc(slave_uid=chat_uid)
+            tg_chat = None
+            tg_dest: Optional[TelegramChatID] = None
+            thread_id: Optional[TelegramTopicID] = None
 
-        if tg_chats:
-            tg_chat = tg_chats[0]
-        self.logger.debug("[%s] The message should deliver to %s", xid, tg_chat)
+            if tg_chats:
+                tg_chat = tg_chats[0]
+            self.logger.debug("[%s] The message should deliver to %s", xid, tg_chat)
 
-        singly_linked = True
-        if tg_chat:
-            slaves = self.db.get_chat_assoc(master_uid=tg_chat)
-            if slaves and len(slaves) > 1:
-                singly_linked = False
-                self.logger.debug("[%s] Sender is linked with other chats in a Telegram group.", xid)
-        self.logger.debug("[%s] Message is in chat %s", xid, msg.chat)
+            singly_linked = True
+            if tg_chat:
+                slaves = self.db.get_chat_assoc(master_uid=tg_chat)
+                if slaves and len(slaves) > 1:
+                    singly_linked = False
+                    self.logger.debug("[%s] Sender is linked with other chats in a Telegram group.", xid)
+            self.logger.debug("[%s] Message is in chat %s", xid, msg.chat)
 
-        # Generate chat text template & Decide type target
-        tg_dest = TelegramChatID(self.channel.config['admins'][0])
+            # Generate chat text template & Decide type target
+            tg_dest = TelegramChatID(self.channel.config['admins'][0])
 
-        if tg_chat:
-            tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
-        if self.channel.topic_group:
-            if not isinstance(chat, SystemChat):
-                if tg_chat:
-                    tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
-                else:
-                    tg_dest = TelegramChatID(self.channel.topic_group)
-                if self._get_master_chat_is_forum(xid, tg_dest):
-                    with self._timed_phase(xid, f"Topic thread lookup for Telegram chat {tg_dest}"):
-                        existing_thread_id = self.db.get_topic_thread_id(
-                            slave_uid=chat_uid,
-                            topic_chat_id=tg_dest,
+            if tg_chat:
+                tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
+            if self.channel.topic_group:
+                if not isinstance(chat, SystemChat):
+                    if tg_chat:
+                        tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
+                    else:
+                        tg_dest = TelegramChatID(self.channel.topic_group)
+                    if self._get_master_chat_is_forum(xid, tg_dest):
+                        with self._timed_phase(xid, f"Topic thread lookup for Telegram chat {tg_dest}"):
+                            existing_thread_id = self.db.get_topic_thread_id(
+                                slave_uid=chat_uid,
+                                topic_chat_id=tg_dest,
+                            )
+                        self.logger.debug(
+                            "[%s] Topic thread lookup for Telegram chat %s returned existing_thread_id=%s.",
+                            xid,
+                            tg_dest,
+                            existing_thread_id,
                         )
-                    self.logger.debug(
-                        "[%s] Topic thread lookup for Telegram chat %s returned existing_thread_id=%s.",
-                        xid,
-                        tg_dest,
-                        existing_thread_id,
-                    )
-                    with self._timed_phase(xid, f"Topic creation/resolution for Telegram chat {tg_dest}"):
-                        thread_id = self.channel.chat_binding.create_topic(
-                            slave_uid=chat_uid,
-                            telegram_chat_id=tg_dest,
+                        with self._timed_phase(xid, f"Topic creation/resolution for Telegram chat {tg_dest}"):
+                            thread_id = self.channel.chat_binding.create_topic(
+                                slave_uid=chat_uid,
+                                telegram_chat_id=tg_dest,
+                            )
+                        self.logger.debug(
+                            "[%s] Topic creation/resolution for Telegram chat %s returned thread_id=%s.",
+                            xid,
+                            tg_dest,
+                            thread_id,
                         )
-                    self.logger.debug(
-                        "[%s] Topic creation/resolution for Telegram chat %s returned thread_id=%s.",
-                        xid,
-                        tg_dest,
-                        thread_id,
-                    )
-                    if thread_id is not None and existing_thread_id is None:
-                        msg.vendor_specific = msg.vendor_specific or {}
-                        msg.vendor_specific['_force_send_mode'] = 'blocking'
+                        if thread_id is not None and existing_thread_id is None:
+                            msg.vendor_specific = msg.vendor_specific or {}
+                            msg.vendor_specific['_force_send_mode'] = 'blocking'
 
         if not tg_chat:
             singly_linked = False
