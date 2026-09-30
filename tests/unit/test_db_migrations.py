@@ -565,3 +565,64 @@ def test_postgresql_startup_observes_raw_legacy_rows_without_mutating_them(
         )
         admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
         admin_db.close()
+
+
+def test_relink_repair_posts_previous_history_links_and_reports_missing_topics():
+    from telegram import Update
+    from peewee import SqliteDatabase
+    from efb_telegram_master import chat_binding as chat_binding_module
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    test_db.create_tables([TopicAssoc, MsgLog])
+    db_manager = object.__new__(DatabaseManager)
+    channel_id = ModuleID("tests.repair")
+    slave_with_history = utils.chat_id_to_str(channel_id, ChatID("chat-a"))
+    slave_without_history = utils.chat_id_to_str(channel_id, ChatID("chat-b"))
+    new_chat_id = TelegramChatID(-10090002)
+    TopicAssoc.create(topic_chat_id=new_chat_id, message_thread_id="11", slave_uid=slave_with_history)
+    TopicAssoc.create(topic_chat_id=new_chat_id, message_thread_id="22", slave_uid=slave_without_history)
+    base_time = datetime(2026, 1, 1)
+    for master_msg_id, timestamp in (
+        ("-10090001.42", base_time),
+        (f"{new_chat_id}.99", base_time.replace(day=3)),
+        ("12345.100", base_time.replace(day=4)),
+    ):
+        MsgLog.create(
+            master_msg_id=master_msg_id,
+            slave_message_id=master_msg_id,
+            text="history",
+            slave_origin_uid=slave_with_history,
+            msg_type="Text",
+            sent_to=channel_id,
+            time=timestamp,
+        )
+    bot = Mock()
+    binding = object.__new__(ChatBindingManager)
+    binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text)
+    binding.bot = bot
+    binding.db = db_manager
+    binding.logger = Mock()
+    message = Mock()
+    message.chat = SimpleNamespace(id=int(new_chat_id), is_forum=True)
+    update = Update(update_id=5, message=message)
+
+    try:
+        with patch.object(chat_binding_module, "sync_reply_text") as reply:
+            binding.relink_forum(update, SimpleNamespace(args=["repair"]))
+
+        bot.get_chat_info.assert_not_called()
+        bot.send_message.assert_called_once_with(
+            chat_id=new_chat_id,
+            text=("This chat was previously linked. History messages are not migrated. "
+                  "You can view previous messages here: https://t.me/c/90001/42"),
+            message_thread_id=TelegramTopicID(11),
+            disable_notification=True,
+        )
+        assert "posted 1 previous-message link" in reply.call_args.args[2]
+        assert "topic IDs: 22" in reply.call_args.args[2]
+    finally:
+        test_db.close()
+        database.initialize(original_database)

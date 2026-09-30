@@ -762,9 +762,11 @@ class ChatBindingManager(LocaleMixin):
             if thread_id:
                 kwargs['message_thread_id'] = thread_id
             self.bot.send_message(**kwargs)
+            return True
 
         except Exception as e:
             self.logger.warning("Failed to send history link for %s: %s", slave_chat_id, e)
+            return False
 
     def warn_forum_limit(self, chat_id: int, message_id: int) -> None:
         """Privately remind the primary admin once when a linked forum approaches the limit."""
@@ -802,13 +804,15 @@ class ChatBindingManager(LocaleMixin):
         assert update.effective_chat
         if not update.effective_chat.is_forum:
             return self.bot.reply_error(update, self._('Run /relink inside the new forum group.'))
+        new_chat_id = TelegramChatID(update.effective_chat.id)
+        if context.args == ["repair"]:
+            return self.repair_forum_history(update, new_chat_id)
         if not context.args or len(context.args) != 1:
-            return self.bot.reply_error(update, self._('Usage: /relink <old_forum_id>'))
+            return self.bot.reply_error(update, self._('Usage: /relink <old_forum_id> or /relink repair'))
         try:
             old_chat_id = TelegramChatID(int(context.args[0]))
         except ValueError:
             return self.bot.reply_error(update, self._('The old forum ID must be a number.'))
-        new_chat_id = TelegramChatID(update.effective_chat.id)
         if old_chat_id == new_chat_id:
             return self.bot.reply_error(update, self._('The old and new forum must be different.'))
         try:
@@ -870,6 +874,44 @@ class ChatBindingManager(LocaleMixin):
                                           'Relinked {count} remote chats without copying history.', moved).format(count=moved))
         else:
             self.bot.reply_error(update, self._('No remote chats were relinked.'))
+
+    def repair_forum_history(self, update: Update, new_chat_id: TelegramChatID):
+        """Post available previous-message links for the forum's current topics."""
+        assert update.effective_message
+        topic_slaves = self.db.get_topic_slaves(new_chat_id) or []
+        if not topic_slaves:
+            return self.bot.reply_error(update, self._('No remote chats are linked to this forum.'))
+
+        sent = 0
+        missing: List[str] = []
+        failed: List[str] = []
+        for slave_uid, thread_id in topic_slaves:
+            previous = self.db.get_previous_forum_message(slave_uid, new_chat_id)
+            topic = str(thread_id)
+            if not previous:
+                missing.append(topic)
+                continue
+            try:
+                old_chat_id, old_message_id = previous.master_msg_id.split(".", 1)
+                storage_key = (TelegramChatID(int(old_chat_id)), TelegramMessageID(int(old_message_id)))
+            except (TypeError, ValueError):
+                self.logger.warning("Invalid previous forum message ID for %s: %s", slave_uid,
+                                    previous.master_msg_id)
+                missing.append(topic)
+                continue
+            if self.send_history_link(slave_uid, new_chat_id, storage_key, thread_id):
+                sent += 1
+            else:
+                failed.append(topic)
+
+        summary = self._('Repair complete: posted {count} previous-message link(s).').format(count=sent)
+        if missing:
+            summary += self._(' No stored previous message for topic IDs: {topics}.').format(
+                topics=', '.join(missing))
+        if failed:
+            summary += self._(' Failed to post previous-message links for topic IDs: {topics}.').format(
+                topics=', '.join(failed))
+        sync_reply_text(self.bot, update.effective_message, summary)
 
     def unlink_all(self, update: Update, context: CallbackContext):
         """

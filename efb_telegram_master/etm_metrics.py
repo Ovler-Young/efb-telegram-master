@@ -47,6 +47,7 @@ _DATABASE_METHODS = frozenset({
     "delete_slave_chat_info",
     "get_recent_slave_chats",
     "get_last_message",
+    "get_previous_forum_message",
     "get_recent_messages",
     "replace_history_migration_entries",
     "has_pending_history_migrations",
