@@ -184,7 +184,8 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
     ("cached_pickle", "cached_name", "cached_alias", "expected_title"),
     [
         (None, "Cached QQ group", None, "Cached QQ group"),
-        (b"unreadable cache", "Cached QQ group", "Saved QQ alias", "Saved QQ alias"),
+        (b"unreadable cache", "Cached QQ group", "Saved QQ alias " * 9,
+         "Saved QQ alias " * 8 + "Saved Q…"),
     ],
 )
 def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum(

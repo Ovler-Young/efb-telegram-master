@@ -847,7 +847,7 @@ class ChatBindingManager(LocaleMixin):
                 cached_name = chat_info and (chat_info.slave_chat_alias or chat_info.slave_chat_name)
                 topic_name = cached_name if cached_name and str(cached_name) != str(chat_uid) else str(chat_uid)
             try:
-                topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=topic_name)
+                topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=self.truncate_ellipsis(topic_name, 128))
                 new_thread_id = TelegramTopicID(topic.message_thread_id)
             except Exception as e:
                 self.logger.warning("Failed to create relink topic for %s: %s", slave_uid, e)
