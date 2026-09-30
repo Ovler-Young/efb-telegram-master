@@ -393,7 +393,6 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.logger.warning("[%s] Queued message missing task_id, cannot track database update", xid)
                 self._release_pending_slave_message(dedupe_key)
         elif not getattr(tg_msg, 'durable_db_logged', False):
-            self.channel.chat_binding.warn_forum_limit(tg_msg.chat.id, tg_msg.message_id)
             # Normal (blocking) execution: send already succeeded, then
             # write the DB mapping once. DB failures are logged only.
             self.logger.debug("[%s] Message is sent to the user with telegram message id %s.%s.",

@@ -766,36 +766,33 @@ class ChatBindingManager(LocaleMixin):
         except Exception as e:
             self.logger.warning("Failed to send history link for %s: %s", slave_chat_id, e)
 
-    def warn_forum_limit(self, chat_id: int, message_id: int) -> None:
+    def warn_forum_limit(self, chat_id: int, message_id: int, is_forum: bool) -> None:
         """Privately remind the primary admin once when a linked forum approaches the limit."""
-        if message_id < self.FORUM_RELINK_THRESHOLD:
-            return
-        with self._forum_limit_warned_lock:
-            if chat_id in self._forum_limit_warned:
-                return
-        master_uid = utils.chat_id_to_str(self.channel.channel_id, ChatID(str(chat_id)))
-        if not self.db.get_chat_assoc(master_uid=master_uid):
-            return
         try:
-            if not self.bot.get_chat_info(chat_id).is_forum:
+            if not is_forum or message_id < self.FORUM_RELINK_THRESHOLD:
                 return
-        except Exception as e:
-            self.logger.warning("Could not check forum status for %s: %s", chat_id, e)
-            return
-        with self._forum_limit_warned_lock:
-            if chat_id in self._forum_limit_warned:
-                return
-            self._forum_limit_warned.add(chat_id)
-        try:
-            self.bot.send_main_notification(
-                self.channel.config['admins'][0],
-                self._("Forum {chat_id} has reached message ID {message_id}. "
-                       "Create a new forum and run /relink {chat_id} there.").format(
-                    chat_id=chat_id, message_id=message_id),
-            )
-        except Exception as e:
             with self._forum_limit_warned_lock:
-                self._forum_limit_warned.discard(chat_id)
+                if chat_id in self._forum_limit_warned:
+                    return
+            master_uid = utils.chat_id_to_str(self.channel.channel_id, ChatID(str(chat_id)))
+            if not self.db.get_chat_assoc(master_uid=master_uid):
+                return
+            with self._forum_limit_warned_lock:
+                if chat_id in self._forum_limit_warned:
+                    return
+                self._forum_limit_warned.add(chat_id)
+            try:
+                self.bot.send_main_notification(
+                    self.channel.config['admins'][0],
+                    self._("Forum {chat_id} has reached message ID {message_id}. "
+                           "Create a new forum and run /relink {chat_id} there.").format(
+                        chat_id=chat_id, message_id=message_id),
+                )
+            except Exception:
+                with self._forum_limit_warned_lock:
+                    self._forum_limit_warned.discard(chat_id)
+                raise
+        except Exception as e:
             self.logger.warning("Could not send forum relink warning for %s: %s", chat_id, e)
 
     def relink_forum(self, update: Update, context: CallbackContext):
