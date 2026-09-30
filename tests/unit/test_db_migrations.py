@@ -17,11 +17,13 @@ from ehforwarderbot.types import ChatID, MessageID, ModuleID
 from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
 from efb_telegram_master.chat_binding import ChatBindingManager
+from efb_telegram_master.chat_object_cache import ChatObjectCacheManager
 from efb_telegram_master.db import (
     ChatAssoc,
     DatabaseManager,
     HistoryMigrationEntry,
     MsgLog,
+    SlaveChatInfo,
     TopicAssoc,
     database,
 )
@@ -178,7 +180,15 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
         database.initialize(original_database)
 
 
-def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum():
+@pytest.mark.parametrize(
+    ("cached_pickle", "cached_name", "cached_alias", "expected_title"),
+    [
+        (None, "Cached QQ group", None, "Cached QQ group"),
+        (b"unreadable cache", "Cached QQ group", "Saved QQ alias", "Saved QQ alias"),
+    ],
+)
+def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum(
+        cached_pickle, cached_name, cached_alias, expected_title):
     from telegram import Update
     from peewee import SqliteDatabase
     from efb_telegram_master import chat_binding as chat_binding_module
@@ -187,7 +197,7 @@ def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum():
     test_db = SqliteDatabase(":memory:")
     database.initialize(test_db)
     test_db.connect()
-    test_db.create_tables([ChatAssoc, TopicAssoc])
+    test_db.create_tables([ChatAssoc, SlaveChatInfo, TopicAssoc])
     db_manager = object.__new__(DatabaseManager)
     channel_id = ModuleID("tests.unavailable")
     chat_uid = ChatID("qq-group")
@@ -197,6 +207,9 @@ def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum():
     old_master_uid = utils.chat_id_to_str(channel_id, ChatID(str(old_chat_id)))
     new_master_uid = utils.chat_id_to_str(channel_id, ChatID(str(new_chat_id)))
     db_manager.add_chat_assoc(old_master_uid, slave_uid, multiple_slave=True)
+    SlaveChatInfo.create(slave_channel_id=channel_id, slave_channel_emoji="👥", slave_chat_uid=chat_uid,
+                         slave_chat_name=cached_name, slave_chat_alias=cached_alias,
+                         slave_chat_type="Group", pickle=cached_pickle)
 
     unavailable = RuntimeError("retcode=100")
     bot = Mock()
@@ -207,7 +220,10 @@ def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum():
                                       ngettext=lambda singular, plural, count: singular if count == 1 else plural)
     binding.bot = bot
     binding.db = db_manager
-    binding.chat_manager = SimpleNamespace(get_chat=Mock(side_effect=unavailable))
+    cache_manager = object.__new__(ChatObjectCacheManager)
+    cache_manager.db = db_manager
+    cache_manager.cache = {}
+    binding.chat_manager = cache_manager
     binding._topic_mutex = threading.RLock()
     binding.logger = Mock()
     message = Mock()
@@ -222,7 +238,7 @@ def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum():
 
         assert db_manager.get_chat_assoc(master_uid=new_master_uid) == [slave_uid]
         assert db_manager.get_topic_thread_id(slave_uid, new_chat_id) == TelegramTopicID(90003)
-        bot.create_forum_topic.assert_called_once_with(chat_id=new_chat_id, name=str(chat_uid))
+        bot.create_forum_topic.assert_called_once_with(chat_id=new_chat_id, name=expected_title)
         assert "https://t.me/c/90001" in bot.send_message.call_args.args[1]
     finally:
         test_db.close()

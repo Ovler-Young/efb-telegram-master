@@ -835,12 +835,17 @@ class ChatBindingManager(LocaleMixin):
             except Exception as e:
                 self.logger.warning("Failed to create relink topic for %s: %s", slave_uid, e)
                 continue
+            topic_name = None
             try:
                 chat = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
-                topic_name = chat.chat_title
+                if chat.alias or str(chat.name) != str(chat_uid):
+                    topic_name = chat.chat_title
             except Exception as e:
                 self.logger.warning("Could not retrieve relink topic title for %s: %s", slave_uid, e)
-                topic_name = str(chat_uid)
+            if topic_name is None:
+                chat_info = self.db.get_slave_chat_info(channel_id, chat_uid)
+                cached_name = chat_info and (chat_info.slave_chat_alias or chat_info.slave_chat_name)
+                topic_name = cached_name if cached_name and str(cached_name) != str(chat_uid) else str(chat_uid)
             try:
                 topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=topic_name)
                 new_thread_id = TelegramTopicID(topic.message_thread_id)
