@@ -826,10 +826,15 @@ class ChatBindingManager(LocaleMixin):
         moved = 0
         for slave_uid in slave_uids:
             old_thread_id = self.db.get_topic_thread_id(slave_uid, old_chat_id)
+            channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
             try:
-                channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
                 chat = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
-                topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=chat.chat_title)
+                topic_name = chat.chat_title
+            except Exception as e:
+                self.logger.warning("Could not retrieve relink topic title for %s: %s", slave_uid, e)
+                topic_name = str(chat_uid)
+            try:
+                topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=topic_name)
                 new_thread_id = TelegramTopicID(topic.message_thread_id)
             except Exception as e:
                 self.logger.warning("Failed to create relink topic for %s: %s", slave_uid, e)
@@ -843,16 +848,17 @@ class ChatBindingManager(LocaleMixin):
                 continue
             moved += 1
             try:
+                link = f"https://t.me/c/{str(old_chat_id)[4:]}"
+                if old_thread_id:
+                    link = f"{link}/{old_thread_id}"
+                self.bot.send_message(new_chat_id, self._('Previous forum topic: {link}').format(link=link),
+                                      message_thread_id=new_thread_id, disable_notification=True)
+            except Exception as e:
+                self.logger.warning("Failed to link previous topic for %s: %s", slave_uid, e)
+            try:
                 self._update_single_topic_info(new_chat_id, new_thread_id, slave_uid)
             except Exception as e:
                 self.logger.warning("Failed to update relinked topic for %s: %s", slave_uid, e)
-            if old_thread_id:
-                try:
-                    link = f"https://t.me/c/{str(old_chat_id)[4:]}/{old_thread_id}"
-                    self.bot.send_message(new_chat_id, self._('Previous forum topic: {link}').format(link=link),
-                                          message_thread_id=new_thread_id, disable_notification=True)
-                except Exception as e:
-                    self.logger.warning("Failed to link previous topic for %s: %s", slave_uid, e)
 
         if moved:
             sync_reply_text(self.bot, update.effective_message,

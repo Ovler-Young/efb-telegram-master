@@ -6,6 +6,7 @@ from telegram import Update
 from ehforwarderbot import Message
 from ehforwarderbot.types import ChatID
 
+import efb_telegram_master.chat_binding as chat_binding_module
 from efb_telegram_master import utils
 from efb_telegram_master.chat_binding import ChatListStorage
 from efb_telegram_master.ptb_compat import sync_reply_text
@@ -82,7 +83,6 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(50005)
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
-
     forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(60006))
     with patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
         first = channel.chat_binding.create_topic(slave_uid, topic_chat_id)
@@ -94,6 +94,37 @@ def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(60006)
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.group)
+    old_chat_id = TelegramChatID(-10090001)
+    new_chat_id = TelegramChatID(-10090002)
+    old_master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(old_chat_id)))
+    new_master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(new_chat_id)))
+    channel.db.remove_chat_assoc(slave_uid=slave_uid)
+    channel.db.add_chat_assoc(old_master_uid, slave_uid, multiple_slave=True)
+
+    message = Mock()
+    message.chat = SimpleNamespace(id=int(new_chat_id), is_forum=True)
+    update = Update(update_id=4, message=message)
+    context = SimpleNamespace(args=[str(old_chat_id)])
+    forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(90003))
+    try:
+        with patch.object(channel.bot_manager, "get_chat_info", return_value=SimpleNamespace(is_forum=True)), \
+             patch.object(channel.chat_manager, "get_chat", side_effect=RuntimeError("QQ group unavailable")), \
+             patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_topic, \
+             patch.object(channel.bot_manager, "send_message") as send_message, \
+             patch.object(channel.chat_binding, "_update_single_topic_info", return_value=False), \
+             patch.object(chat_binding_module, "sync_reply_text"):
+            channel.chat_binding.relink_forum(update, context)
+
+        assert channel.db.get_chat_assoc(master_uid=new_master_uid) == [slave_uid]
+        assert channel.db.get_topic_thread_id(slave_uid, new_chat_id) == TelegramTopicID(90003)
+        create_topic.assert_called_once_with(chat_id=new_chat_id, name=str(slave.group.uid))
+        assert "https://t.me/c/90001" in send_message.call_args.args[1]
+    finally:
+        channel.db.remove_chat_assoc(slave_uid=slave_uid)
 
 
 def test_master_message_routes_forum_thread_to_slave(channel, slave):
