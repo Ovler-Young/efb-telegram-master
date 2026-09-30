@@ -1489,24 +1489,26 @@ class ChatBindingManager(LocaleMixin):
             self.create_topic(slave_uid=i, telegram_chat_id=TelegramChatID(message.chat.id))
 
     def create_topic(self, slave_uid: EFBChannelChatIDStr, telegram_chat_id: TelegramChatID) -> Optional[TelegramTopicID]:
-        with self._topic_mutex:
-            thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
-            if not thread_id:
-                channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
-                chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
-                try:
-                    topic = self.bot.create_forum_topic(
-                        chat_id=telegram_chat_id,
-                        name=chat.chat_title
-                    )
-                    thread_id = TelegramTopicID(topic.message_thread_id)
-                    self.db.add_topic_assoc(
-                        topic_chat_id=telegram_chat_id,
-                        message_thread_id=thread_id,
-                        slave_uid=slave_uid,
-                    )
-                except Exception as e:
-                    self.logger.info('Failed to create topic, Reason: %s', e)
+        thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
+        if not thread_id:
+            with self._topic_mutex:
+                thread_id = self.db.get_topic_thread_id(slave_uid=slave_uid, topic_chat_id=telegram_chat_id)
+                if not thread_id:
+                    channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
+                    chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
+                    try:
+                        topic = self.bot.create_forum_topic(
+                            chat_id=telegram_chat_id,
+                            name=chat.chat_title
+                        )
+                        thread_id = TelegramTopicID(topic.message_thread_id)
+                        self.db.add_topic_assoc(
+                            topic_chat_id=telegram_chat_id,
+                            message_thread_id=thread_id,
+                            slave_uid=slave_uid,
+                        )
+                    except Exception as e:
+                        self.logger.info('Failed to create topic, Reason: %s', e)
         return thread_id
 
     def chat_migration(self, update: Update, context: CallbackContext):

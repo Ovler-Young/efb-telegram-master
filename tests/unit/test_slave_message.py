@@ -138,7 +138,6 @@ def build_duplicate_test_processor() -> SlaveMessageProcessor:
     processor = object.__new__(SlaveMessageProcessor)
     processor.db = Mock()
     processor.logger = Mock()
-    processor.channel = SimpleNamespace(chat_binding=SimpleNamespace(_topic_mutex=threading.RLock()))
     setattr(processor, "get_slave_msg_dest", Mock(return_value=("__template__", (123, None))))
     setattr(processor, "is_silent", Mock(return_value=False))
     setattr(processor, "dispatch_message", Mock())
