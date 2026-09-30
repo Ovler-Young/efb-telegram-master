@@ -1825,10 +1825,8 @@ class TelegramBotManager(LocaleMixin):
             )
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
-        if isinstance(result, TelegramMessage):
-            self.channel.chat_binding.warn_forum_limit(
-                result.chat.id, result.message_id, result.chat.is_forum
-            )
+        if isinstance(result, TelegramMessage) and result.chat.is_forum:
+            self.channel.chat_binding.warn_forum_limit(result.chat.id, result.message_id)
         return QueuedCompletionDecision(QueuedCompletionKind.SUCCESS)
 
     def record_queued_failure(

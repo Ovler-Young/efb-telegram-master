@@ -766,10 +766,10 @@ class ChatBindingManager(LocaleMixin):
         except Exception as e:
             self.logger.warning("Failed to send history link for %s: %s", slave_chat_id, e)
 
-    def warn_forum_limit(self, chat_id: int, message_id: int, is_forum: bool) -> None:
+    def warn_forum_limit(self, chat_id: int, message_id: int) -> None:
         """Privately remind the primary admin once when a linked forum approaches the limit."""
         try:
-            if not is_forum or message_id < self.FORUM_RELINK_THRESHOLD:
+            if message_id < self.FORUM_RELINK_THRESHOLD:
                 return
             with self._forum_limit_warned_lock:
                 if chat_id in self._forum_limit_warned:
