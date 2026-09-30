@@ -408,6 +408,10 @@ class SlaveMessageProcessor(LocaleMixin):
             )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
+        with self.channel.chat_binding._topic_mutex:
+            return self._get_slave_msg_dest(msg)
+
+    def _get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
         """Get the Telegram destination of a message with its header.
 
         Returns:

@@ -99,13 +99,16 @@ class ChatBindingManager(LocaleMixin):
     TELEGRAM_MIN_PROFILE_PICTURE_SIZE = 256
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
+    FORUM_RELINK_THRESHOLD = 960_000
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
-        self._topic_mutex = threading.Lock()
+        self._topic_mutex = threading.RLock()
+        self._forum_limit_warned: set[int] = set()
+        self._forum_limit_warned_lock = threading.Lock()
         self._history_migration_locks_lock = threading.Lock()
         self._history_migration_locks: Dict[int, threading.Lock] = {}
         self._history_migration_thread: Optional[threading.Thread] = None
@@ -161,6 +164,7 @@ class ChatBindingManager(LocaleMixin):
         # Update group title and profile picture
         self.bot.dispatcher.add_handler(CommandHandler('update_info', self.bot.as_async_callback(self.update_group_info)))
         self.bot.dispatcher.add_handler(CommandHandler('init_topics', self.bot.as_async_callback(self.topic_migration)))
+        self.bot.dispatcher.add_handler(CommandHandler('relink', self.bot.as_async_callback(self.relink_forum)))
 
         self.bot.dispatcher.add_handler(
             MessageHandler(Filters.status_update.migrate, self.bot.as_async_callback(self.chat_migration)))
@@ -761,6 +765,101 @@ class ChatBindingManager(LocaleMixin):
 
         except Exception as e:
             self.logger.warning("Failed to send history link for %s: %s", slave_chat_id, e)
+
+    def warn_forum_limit(self, chat_id: int, message_id: int) -> None:
+        """Privately remind the primary admin once when a linked forum approaches the limit."""
+        try:
+            if message_id < self.FORUM_RELINK_THRESHOLD:
+                return
+            with self._forum_limit_warned_lock:
+                if chat_id in self._forum_limit_warned:
+                    return
+            master_uid = utils.chat_id_to_str(self.channel.channel_id, ChatID(str(chat_id)))
+            if not self.db.get_chat_assoc(master_uid=master_uid):
+                return
+            with self._forum_limit_warned_lock:
+                if chat_id in self._forum_limit_warned:
+                    return
+                self._forum_limit_warned.add(chat_id)
+            try:
+                self.bot.send_main_notification(
+                    self.channel.config['admins'][0],
+                    self._("Forum {chat_id} has reached message ID {message_id}. "
+                           "Create a new forum and run /relink {chat_id} there.").format(
+                        chat_id=chat_id, message_id=message_id),
+                )
+            except Exception:
+                with self._forum_limit_warned_lock:
+                    self._forum_limit_warned.discard(chat_id)
+                raise
+        except Exception as e:
+            self.logger.warning("Could not send forum relink warning for %s: %s", chat_id, e)
+
+    def relink_forum(self, update: Update, context: CallbackContext):
+        """Move a forum's remote-chat bindings into this new forum without history backfill."""
+        assert isinstance(update, Update)
+        assert update.effective_message
+        assert update.effective_chat
+        if not update.effective_chat.is_forum:
+            return self.bot.reply_error(update, self._('Run /relink inside the new forum group.'))
+        if not context.args or len(context.args) != 1:
+            return self.bot.reply_error(update, self._('Usage: /relink <old_forum_id>'))
+        try:
+            old_chat_id = TelegramChatID(int(context.args[0]))
+        except ValueError:
+            return self.bot.reply_error(update, self._('The old forum ID must be a number.'))
+        new_chat_id = TelegramChatID(update.effective_chat.id)
+        if old_chat_id == new_chat_id:
+            return self.bot.reply_error(update, self._('The old and new forum must be different.'))
+        try:
+            if not self.bot.get_chat_info(old_chat_id).is_forum:
+                return self.bot.reply_error(update, self._('The old group is not a forum.'))
+        except TelegramError as e:
+            return self.bot.reply_error(update, self._('Unable to access the old forum: {error}').format(error=e))
+
+        old_master_uid = utils.chat_id_to_str(self.channel.channel_id, ChatID(str(old_chat_id)))
+        new_master_uid = utils.chat_id_to_str(self.channel.channel_id, ChatID(str(new_chat_id)))
+        slave_uids = self.db.get_chat_assoc(master_uid=old_master_uid)
+        if not slave_uids:
+            return self.bot.reply_error(update, self._('No remote chats are linked to the old forum.'))
+
+        moved = 0
+        for slave_uid in slave_uids:
+            old_thread_id = self.db.get_topic_thread_id(slave_uid, old_chat_id)
+            try:
+                channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
+                chat = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
+                topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=chat.chat_title)
+                new_thread_id = TelegramTopicID(topic.message_thread_id)
+            except Exception as e:
+                self.logger.warning("Failed to create relink topic for %s: %s", slave_uid, e)
+                continue
+
+            try:
+                with self._topic_mutex:
+                    self.db.relink_forum_binding(new_master_uid, new_chat_id, new_thread_id, slave_uid)
+            except Exception as e:
+                self.logger.warning("Failed to switch relink binding for %s: %s", slave_uid, e)
+                continue
+            moved += 1
+            try:
+                self._update_single_topic_info(new_chat_id, new_thread_id, slave_uid)
+            except Exception as e:
+                self.logger.warning("Failed to update relinked topic for %s: %s", slave_uid, e)
+            if old_thread_id:
+                try:
+                    link = f"https://t.me/c/{str(old_chat_id)[4:]}/{old_thread_id}"
+                    self.bot.send_message(new_chat_id, self._('Previous forum topic: {link}').format(link=link),
+                                          message_thread_id=new_thread_id, disable_notification=True)
+                except Exception as e:
+                    self.logger.warning("Failed to link previous topic for %s: %s", slave_uid, e)
+
+        if moved:
+            sync_reply_text(self.bot, update.effective_message,
+                            self.ngettext('Relinked {count} remote chat without copying history.',
+                                          'Relinked {count} remote chats without copying history.', moved).format(count=moved))
+        else:
+            self.bot.reply_error(update, self._('No remote chats were relinked.'))
 
     def unlink_all(self, update: Update, context: CallbackContext):
         """

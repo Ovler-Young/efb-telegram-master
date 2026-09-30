@@ -1825,6 +1825,8 @@ class TelegramBotManager(LocaleMixin):
             )
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
+        if isinstance(result, TelegramMessage) and result.chat.is_forum:
+            self.channel.chat_binding.warn_forum_limit(result.chat.id, result.message_id)
         return QueuedCompletionDecision(QueuedCompletionKind.SUCCESS)
 
     def record_queued_failure(
@@ -2059,6 +2061,12 @@ class TelegramBotManager(LocaleMixin):
                 self._send_executor.shutdown(wait=False)
             finally:
                 self._outbound_queue.close()
+
+    def send_main_notification(self, chat_id: int, text: str) -> None:
+        """Enqueue a fire-and-forget notification from the main bot."""
+        self._enqueue_requests([QueueRequest("send_message", (chat_id, text), {
+            "_send_mode": "eventual", "_required_sender_bot_id": "__main__",
+        })])
 
     @Decorators.retry_on_chat_migration
     def send_message(self, *args, prefix: str = '', suffix: str = '', **kwargs):

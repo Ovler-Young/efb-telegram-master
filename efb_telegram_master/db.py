@@ -465,6 +465,15 @@ class DatabaseManager:
         self.remove_chat_assoc(slave_uid=slave_uid)
         return ChatAssoc.create(master_uid=master_uid, slave_uid=slave_uid)
 
+    @observe_database_method("relink_forum_binding")
+    def relink_forum_binding(self, master_uid: EFBChannelChatIDStr,
+                              topic_chat_id: TelegramChatID, message_thread_id: TelegramTopicID,
+                              slave_uid: EFBChannelChatIDStr):
+        """Atomically move one remote chat into a newly-created forum topic."""
+        with database.atomic():
+            self.add_chat_assoc(master_uid, slave_uid, multiple_slave=True)
+            self.add_topic_assoc(topic_chat_id, message_thread_id, slave_uid)
+
     @observe_database_method("remove_chat_assoc")
     def remove_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None,
                           slave_uid: Optional[EFBChannelChatIDStr] = None):
