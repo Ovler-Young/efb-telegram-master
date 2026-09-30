@@ -25,7 +25,7 @@ from ehforwarderbot.chat import SystemChatMember
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBOperationNotSupported
 from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
-from .chat import ETMChatType, ETMGroupChat
+from .chat import ETMChatType, ETMGroupChat, unpickle
 from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
@@ -843,9 +843,7 @@ class ChatBindingManager(LocaleMixin):
             except Exception as e:
                 self.logger.warning("Could not retrieve relink topic title for %s: %s", slave_uid, e)
             if topic_name is None:
-                chat_info = self.db.get_slave_chat_info(channel_id, chat_uid)
-                cached_name = chat_info and (chat_info.slave_chat_alias or chat_info.slave_chat_name)
-                topic_name = cached_name if cached_name and str(cached_name) != str(chat_uid) else str(chat_uid)
+                topic_name = self._get_cached_topic_title(channel_id, chat_uid) or str(chat_uid)
             try:
                 topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=self.truncate_ellipsis(topic_name, 128))
                 new_thread_id = TelegramTopicID(topic.message_thread_id)
@@ -880,19 +878,66 @@ class ChatBindingManager(LocaleMixin):
         else:
             self.bot.reply_error(update, self._('No remote chats were relinked.'))
 
+    def _get_cached_topic_title(self, channel_id: ModuleID, chat_uid: ChatID) -> Optional[str]:
+        """Return a stored chat title without asking the slave channel."""
+        cached_chat = getattr(getattr(self, "chat_manager", None), "cache", {}).get((channel_id, chat_uid))
+        if cached_chat and (cached_chat.alias or str(cached_chat.name) != str(chat_uid)):
+            return cached_chat.chat_title
+
+        chat_info = self.db.get_slave_chat_info(channel_id, chat_uid)
+        if not chat_info:
+            return None
+        if chat_info.pickle:
+            try:
+                cached_chat = unpickle(chat_info.pickle, self.db)
+                if cached_chat.alias or str(cached_chat.name) != str(chat_uid):
+                    return cached_chat.chat_title
+            except Exception as e:
+                self.logger.warning("Could not read cached topic title for %s: %s", chat_uid, e)
+        cached_name = chat_info.slave_chat_alias or chat_info.slave_chat_name
+        return cached_name if cached_name and str(cached_name) != str(chat_uid) else None
+
     def repair_forum_history(self, update: Update, new_chat_id: TelegramChatID):
-        """Post available previous-message links for the forum's current topics."""
+        """Restore cached topic names and post available previous-message links."""
         assert update.effective_message
         topic_slaves = self.db.get_topic_slaves(new_chat_id) or []
         if not topic_slaves:
             return self.bot.reply_error(update, self._('No remote chats are linked to this forum.'))
 
-        sent = 0
+        sent = restored = 0
         missing: List[str] = []
         failed: List[str] = []
+        title_missing: List[str] = []
+        title_failed: List[str] = []
         for slave_uid, thread_id in topic_slaves:
-            previous = self.db.get_previous_forum_message(slave_uid, new_chat_id)
             topic = str(thread_id)
+            try:
+                channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
+                topic_name = self._get_cached_topic_title(channel_id, chat_uid)
+            except Exception as e:
+                self.logger.warning("Could not retrieve cached topic title for %s: %s", slave_uid, e)
+                topic_name = None
+            if topic_name is None:
+                title_missing.append(topic)
+            else:
+                try:
+                    self.bot.edit_forum_topic(
+                        chat_id=new_chat_id,
+                        message_thread_id=thread_id,
+                        name=self.truncate_ellipsis(topic_name, 128),
+                    )
+                    restored += 1
+                except TelegramError as e:
+                    if e.message.replace("_", " ").casefold() == "topic not modified":
+                        restored += 1
+                    else:
+                        self.logger.warning("Failed to restore topic title for %s: %s", slave_uid, e)
+                        title_failed.append(topic)
+                except Exception as e:
+                    self.logger.warning("Failed to restore topic title for %s: %s", slave_uid, e)
+                    title_failed.append(topic)
+
+            previous = self.db.get_previous_forum_message(slave_uid, new_chat_id)
             if not previous:
                 missing.append(topic)
                 continue
@@ -909,7 +954,13 @@ class ChatBindingManager(LocaleMixin):
             else:
                 failed.append(topic)
 
-        summary = self._('Repair complete: posted {count} previous-message link(s).').format(count=sent)
+        summary = self._('Repair complete: restored or confirmed {count} cached topic title(s) and posted '
+                         '{links} previous-message link(s).').format(count=restored, links=sent)
+        if title_missing:
+            summary += self._(' No cached title for topic IDs: {topics}.').format(topics=', '.join(title_missing))
+        if title_failed:
+            summary += self._(' Failed to restore cached titles for topic IDs: {topics}.').format(
+                topics=', '.join(title_failed))
         if missing:
             summary += self._(' No stored previous message for topic IDs: {topics}.').format(
                 topics=', '.join(missing))
