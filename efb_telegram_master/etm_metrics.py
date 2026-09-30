@@ -30,6 +30,7 @@ _RATE_LIMIT_SCOPES = frozenset({"global", "chat"})
 _DATABASE_METHODS = frozenset({
     "stop_worker",
     "add_chat_assoc",
+    "relink_forum_binding",
     "remove_chat_assoc",
     "get_master_msg_id",
     "get_chat_assoc",

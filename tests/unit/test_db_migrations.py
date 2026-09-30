@@ -151,6 +151,8 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
     test_db.connect()
     test_db.create_tables([ChatAssoc, TopicAssoc])
     manager = object.__new__(DatabaseManager)
+    metrics = Metrics()
+    manager.set_metrics(metrics)
     try:
         ChatAssoc.create(master_uid="old", slave_uid="slave-a")
         TopicAssoc.create(topic_chat_id="old-forum", message_thread_id="1", slave_uid="slave-a")
@@ -158,6 +160,9 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
         TopicAssoc.create(topic_chat_id="new-forum", message_thread_id="2", slave_uid="slave-b")
 
         manager.relink_forum_binding("new", TelegramChatID(-100123), TelegramTopicID(3), "slave-a")
+
+        rendered = generate_latest(metrics.registry).decode()
+        assert 'etm_database_method_duration_seconds_count{method="relink_forum_binding"} 1.0' in rendered
 
         assert [(row.master_uid, row.slave_uid) for row in ChatAssoc.select().order_by(ChatAssoc.slave_uid)] == [
             ("new", "slave-a"), ("new", "slave-b"),
