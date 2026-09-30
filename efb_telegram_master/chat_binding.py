@@ -880,9 +880,12 @@ class ChatBindingManager(LocaleMixin):
 
     def _get_cached_topic_title(self, channel_id: ModuleID, chat_uid: ChatID) -> Optional[str]:
         """Return a stored chat title without asking the slave channel."""
-        cached_chat = getattr(getattr(self, "chat_manager", None), "cache", {}).get((channel_id, chat_uid))
-        if cached_chat and (cached_chat.alias or str(cached_chat.name) != str(chat_uid)):
-            return cached_chat.chat_title
+        try:
+            cached_chat = self.chat_manager.cache.get((channel_id, chat_uid))
+            if cached_chat and (cached_chat.alias or str(cached_chat.name) != str(chat_uid)):
+                return cached_chat.chat_title
+        except Exception as e:
+            self.logger.warning("Could not read in-memory topic title for %s: %s", chat_uid, e)
 
         chat_info = self.db.get_slave_chat_info(channel_id, chat_uid)
         if not chat_info:
@@ -895,7 +898,14 @@ class ChatBindingManager(LocaleMixin):
             except Exception as e:
                 self.logger.warning("Could not read cached topic title for %s: %s", chat_uid, e)
         cached_name = chat_info.slave_chat_alias or chat_info.slave_chat_name
-        return cached_name if cached_name and str(cached_name) != str(chat_uid) else None
+        if not cached_name or str(cached_name) == str(chat_uid):
+            return None
+        type_emoji = {
+            "Private": Emoji.USER, "PrivateChat": Emoji.USER,
+            "System": Emoji.SYSTEM, "SystemChat": Emoji.SYSTEM,
+            "Group": Emoji.GROUP, "GroupChat": Emoji.GROUP,
+        }.get(chat_info.slave_chat_type, Emoji.UNKNOWN)
+        return f"{'*' if '#' in channel_id else ''}{chat_info.slave_channel_emoji}{type_emoji} {cached_name}"
 
     def repair_forum_history(self, update: Update, new_chat_id: TelegramChatID):
         """Restore cached topic names and post available previous-message links."""

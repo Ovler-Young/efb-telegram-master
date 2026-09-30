@@ -183,9 +183,9 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
 @pytest.mark.parametrize(
     ("cached_pickle", "cached_name", "cached_alias", "expected_title"),
     [
-        (None, "Cached QQ group", None, "Cached QQ group"),
+        (None, "Cached QQ group", None, "👥👥 Cached QQ group"),
         (b"unreadable cache", "Cached QQ group", "Saved QQ alias " * 9,
-         "Saved QQ alias " * 8 + "Saved Q…"),
+         "👥👥 " + "Saved QQ alias " * 8 + "Save…"),
     ],
 )
 def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum(
@@ -633,10 +633,19 @@ def test_relink_repair_posts_previous_history_links_and_reports_missing_topics()
             raise TelegramError("Topic_not_modified")
 
     bot.edit_forum_topic.side_effect = fail_history_title
+
+    class UnreadableCachedChat:
+        @property
+        def alias(self):
+            raise RuntimeError("cache object unreadable")
+
     binding = object.__new__(ChatBindingManager)
     binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text)
     binding.bot = bot
     binding.db = db_manager
+    binding.chat_manager = SimpleNamespace(cache={
+        (channel_id, ChatID("chat-b")): UnreadableCachedChat(),
+    })
     binding.logger = Mock()
     message = Mock()
     message.chat = SimpleNamespace(id=int(new_chat_id), is_forum=True)
@@ -655,8 +664,8 @@ def test_relink_repair_posts_previous_history_links_and_reports_missing_topics()
             disable_notification=True,
         )
         bot.edit_forum_topic.assert_has_calls([
-            call(chat_id=new_chat_id, message_thread_id=TelegramTopicID(11), name="History title"),
-            call(chat_id=new_chat_id, message_thread_id=TelegramTopicID(22), name="Recovered title"),
+            call(chat_id=new_chat_id, message_thread_id=TelegramTopicID(11), name="👥👥 History title"),
+            call(chat_id=new_chat_id, message_thread_id=TelegramTopicID(22), name="👥👥 Recovered title"),
         ], any_order=True)
         assert "posted 1 previous-message link" in reply.call_args.args[2]
         assert "restored or confirmed 1 cached topic title" in reply.call_args.args[2]
