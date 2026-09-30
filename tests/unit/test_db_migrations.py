@@ -142,6 +142,35 @@ def test_startup_observes_raw_legacy_rows_without_mutating_them(tmp_path, monkey
         assert f"{state}=1" in warnings[0]
 
 
+def test_relink_forum_binding_moves_chat_and_topic_atomically():
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    test_db.create_tables([ChatAssoc, TopicAssoc])
+    manager = object.__new__(DatabaseManager)
+    try:
+        ChatAssoc.create(master_uid="old", slave_uid="slave-a")
+        TopicAssoc.create(topic_chat_id="old-forum", message_thread_id="1", slave_uid="slave-a")
+        ChatAssoc.create(master_uid="new", slave_uid="slave-b")
+        TopicAssoc.create(topic_chat_id="new-forum", message_thread_id="2", slave_uid="slave-b")
+
+        manager.relink_forum_binding("new", TelegramChatID(-100123), TelegramTopicID(3), "slave-a")
+
+        assert [(row.master_uid, row.slave_uid) for row in ChatAssoc.select().order_by(ChatAssoc.slave_uid)] == [
+            ("new", "slave-a"), ("new", "slave-b"),
+        ]
+        assert [(row.topic_chat_id, row.message_thread_id, row.slave_uid)
+                for row in TopicAssoc.select().order_by(TopicAssoc.slave_uid)] == [
+            ("-100123", "3", "slave-a"), ("new-forum", "2", "slave-b"),
+        ]
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+
 def test_topic_assoc_table_exists_and_round_trips(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(11111)

@@ -169,6 +169,8 @@ class MasterMessageProcessor(LocaleMixin):
         message: Message = update.effective_message
         mid = utils.message_id_to_str(update=update)
         master_chat_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id)))
+        if message.chat.is_forum:
+            self.channel.chat_binding.warn_forum_limit(message.chat.id, message.message_id)
         linked_slave_chats: Optional[list[EFBChannelChatIDStr]] = None
 
         def get_linked_slave_chats() -> list[EFBChannelChatIDStr]:
