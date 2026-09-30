@@ -279,7 +279,7 @@ def test_get_slave_msg_dest_caches_known_forum_chat_info():
     processor.channel = SimpleNamespace(
         config={"admins": [1]},
         topic_group=-100999,
-        chat_binding=SimpleNamespace(create_topic=Mock(return_value=55)),
+        chat_binding=SimpleNamespace(_topic_mutex=threading.RLock(), create_topic=Mock(return_value=55)),
     )
     processor.bot = SimpleNamespace(get_chat_info=Mock(return_value=SimpleNamespace(is_forum=True)))
     processor.db = SimpleNamespace(

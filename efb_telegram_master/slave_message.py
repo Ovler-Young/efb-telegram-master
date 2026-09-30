@@ -195,9 +195,8 @@ class SlaveMessageProcessor(LocaleMixin):
                     return msg
                 pending_claimed = True
 
-            with self.channel.chat_binding._topic_mutex:
-                with self._timed_phase(xid, "Destination resolution"):
-                    msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(msg)
+            with self._timed_phase(xid, "Destination resolution"):
+                msg_template, (tg_dest, thread_id) = self.get_slave_msg_dest(msg)
 
             silent = self.is_silent(msg)
             if silent is None:
@@ -409,6 +408,10 @@ class SlaveMessageProcessor(LocaleMixin):
             )
 
     def get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
+        with self.channel.chat_binding._topic_mutex:
+            return self._get_slave_msg_dest(msg)
+
+    def _get_slave_msg_dest(self, msg: Message) -> Tuple[str, Tuple[Optional[TelegramChatID], Optional[TelegramTopicID]]]:
         """Get the Telegram destination of a message with its header.
 
         Returns:
