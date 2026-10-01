@@ -25,7 +25,7 @@ from ehforwarderbot.chat import SystemChatMember
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBOperationNotSupported
 from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
-from .chat import ETMChatType, ETMGroupChat
+from .chat import ETMChatType, ETMGroupChat, unpickle
 from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
@@ -762,9 +762,11 @@ class ChatBindingManager(LocaleMixin):
             if thread_id:
                 kwargs['message_thread_id'] = thread_id
             self.bot.send_message(**kwargs)
+            return True
 
         except Exception as e:
             self.logger.warning("Failed to send history link for %s: %s", slave_chat_id, e)
+            return False
 
     def warn_forum_limit(self, chat_id: int, message_id: int) -> None:
         """Privately remind the primary admin once when a linked forum approaches the limit."""
@@ -802,13 +804,15 @@ class ChatBindingManager(LocaleMixin):
         assert update.effective_chat
         if not update.effective_chat.is_forum:
             return self.bot.reply_error(update, self._('Run /relink inside the new forum group.'))
+        new_chat_id = TelegramChatID(update.effective_chat.id)
+        if context.args == ["repair"]:
+            return self.repair_forum_history(update, new_chat_id)
         if not context.args or len(context.args) != 1:
-            return self.bot.reply_error(update, self._('Usage: /relink <old_forum_id>'))
+            return self.bot.reply_error(update, self._('Usage: /relink <old_forum_id> or /relink repair'))
         try:
             old_chat_id = TelegramChatID(int(context.args[0]))
         except ValueError:
             return self.bot.reply_error(update, self._('The old forum ID must be a number.'))
-        new_chat_id = TelegramChatID(update.effective_chat.id)
         if old_chat_id == new_chat_id:
             return self.bot.reply_error(update, self._('The old and new forum must be different.'))
         try:
@@ -828,8 +832,20 @@ class ChatBindingManager(LocaleMixin):
             old_thread_id = self.db.get_topic_thread_id(slave_uid, old_chat_id)
             try:
                 channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
+            except Exception as e:
+                self.logger.warning("Failed to create relink topic for %s: %s", slave_uid, e)
+                continue
+            topic_name = None
+            try:
                 chat = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
-                topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=chat.chat_title)
+                if chat.alias or str(chat.name) != str(chat_uid):
+                    topic_name = chat.chat_title
+            except Exception as e:
+                self.logger.warning("Could not retrieve relink topic title for %s: %s", slave_uid, e)
+            if topic_name is None:
+                topic_name = self._get_cached_topic_title(channel_id, chat_uid) or str(chat_uid)
+            try:
+                topic = self.bot.create_forum_topic(chat_id=new_chat_id, name=self.truncate_ellipsis(topic_name, 128))
                 new_thread_id = TelegramTopicID(topic.message_thread_id)
             except Exception as e:
                 self.logger.warning("Failed to create relink topic for %s: %s", slave_uid, e)
@@ -843,16 +859,17 @@ class ChatBindingManager(LocaleMixin):
                 continue
             moved += 1
             try:
+                link = f"https://t.me/c/{str(old_chat_id)[4:]}"
+                if old_thread_id:
+                    link = f"{link}/{old_thread_id}"
+                self.bot.send_message(new_chat_id, self._('Previous forum topic: {link}').format(link=link),
+                                      message_thread_id=new_thread_id, disable_notification=True)
+            except Exception as e:
+                self.logger.warning("Failed to link previous topic for %s: %s", slave_uid, e)
+            try:
                 self._update_single_topic_info(new_chat_id, new_thread_id, slave_uid)
             except Exception as e:
                 self.logger.warning("Failed to update relinked topic for %s: %s", slave_uid, e)
-            if old_thread_id:
-                try:
-                    link = f"https://t.me/c/{str(old_chat_id)[4:]}/{old_thread_id}"
-                    self.bot.send_message(new_chat_id, self._('Previous forum topic: {link}').format(link=link),
-                                          message_thread_id=new_thread_id, disable_notification=True)
-                except Exception as e:
-                    self.logger.warning("Failed to link previous topic for %s: %s", slave_uid, e)
 
         if moved:
             sync_reply_text(self.bot, update.effective_message,
@@ -860,6 +877,107 @@ class ChatBindingManager(LocaleMixin):
                                           'Relinked {count} remote chats without copying history.', moved).format(count=moved))
         else:
             self.bot.reply_error(update, self._('No remote chats were relinked.'))
+
+    def _get_cached_topic_title(self, channel_id: ModuleID, chat_uid: ChatID) -> Optional[str]:
+        """Return a stored chat title without asking the slave channel."""
+        try:
+            cached_chat = self.chat_manager.cache.get((channel_id, chat_uid))
+            if cached_chat and (cached_chat.alias or str(cached_chat.name) != str(chat_uid)):
+                return cached_chat.chat_title
+        except Exception as e:
+            self.logger.warning("Could not read in-memory topic title for %s: %s", chat_uid, e)
+
+        chat_info = self.db.get_slave_chat_info(channel_id, chat_uid)
+        if not chat_info:
+            return None
+        if chat_info.pickle:
+            try:
+                cached_chat = unpickle(chat_info.pickle, self.db)
+                if cached_chat.alias or str(cached_chat.name) != str(chat_uid):
+                    return cached_chat.chat_title
+            except Exception as e:
+                self.logger.warning("Could not read cached topic title for %s: %s", chat_uid, e)
+        cached_name = chat_info.slave_chat_alias or chat_info.slave_chat_name
+        if not cached_name or str(cached_name) == str(chat_uid):
+            return None
+        type_emoji = {
+            "Private": Emoji.USER, "PrivateChat": Emoji.USER,
+            "System": Emoji.SYSTEM, "SystemChat": Emoji.SYSTEM,
+            "Group": Emoji.GROUP, "GroupChat": Emoji.GROUP,
+        }.get(chat_info.slave_chat_type, Emoji.UNKNOWN)
+        return f"{'*' if '#' in channel_id else ''}{chat_info.slave_channel_emoji}{type_emoji} {cached_name}"
+
+    def repair_forum_history(self, update: Update, new_chat_id: TelegramChatID):
+        """Restore cached topic names and post available previous-message links."""
+        assert update.effective_message
+        topic_slaves = self.db.get_topic_slaves(new_chat_id) or []
+        if not topic_slaves:
+            return self.bot.reply_error(update, self._('No remote chats are linked to this forum.'))
+
+        sent = restored = 0
+        missing: List[str] = []
+        failed: List[str] = []
+        title_missing: List[str] = []
+        title_failed: List[str] = []
+        for slave_uid, thread_id in topic_slaves:
+            topic = str(thread_id)
+            try:
+                channel_id, chat_uid, _ = utils.chat_id_str_to_id(slave_uid)
+                topic_name = self._get_cached_topic_title(channel_id, chat_uid)
+            except Exception as e:
+                self.logger.warning("Could not retrieve cached topic title for %s: %s", slave_uid, e)
+                topic_name = None
+            if topic_name is None:
+                title_missing.append(topic)
+            else:
+                try:
+                    self.bot.edit_forum_topic(
+                        chat_id=new_chat_id,
+                        message_thread_id=thread_id,
+                        name=self.truncate_ellipsis(topic_name, 128),
+                    )
+                    restored += 1
+                except TelegramError as e:
+                    if e.message.replace("_", " ").casefold() == "topic not modified":
+                        restored += 1
+                    else:
+                        self.logger.warning("Failed to restore topic title for %s: %s", slave_uid, e)
+                        title_failed.append(topic)
+                except Exception as e:
+                    self.logger.warning("Failed to restore topic title for %s: %s", slave_uid, e)
+                    title_failed.append(topic)
+
+            previous = self.db.get_previous_forum_message(slave_uid, new_chat_id)
+            if not previous:
+                missing.append(topic)
+                continue
+            try:
+                old_chat_id, old_message_id = previous.master_msg_id.split(".", 1)
+                storage_key = (TelegramChatID(int(old_chat_id)), TelegramMessageID(int(old_message_id)))
+            except (TypeError, ValueError):
+                self.logger.warning("Invalid previous forum message ID for %s: %s", slave_uid,
+                                    previous.master_msg_id)
+                missing.append(topic)
+                continue
+            if self.send_history_link(slave_uid, new_chat_id, storage_key, thread_id):
+                sent += 1
+            else:
+                failed.append(topic)
+
+        summary = self._('Repair complete: restored or confirmed {count} cached topic title(s) and posted '
+                         '{links} previous-message link(s).').format(count=restored, links=sent)
+        if title_missing:
+            summary += self._(' No cached title for topic IDs: {topics}.').format(topics=', '.join(title_missing))
+        if title_failed:
+            summary += self._(' Failed to restore cached titles for topic IDs: {topics}.').format(
+                topics=', '.join(title_failed))
+        if missing:
+            summary += self._(' No stored previous message for topic IDs: {topics}.').format(
+                topics=', '.join(missing))
+        if failed:
+            summary += self._(' Failed to post previous-message links for topic IDs: {topics}.').format(
+                topics=', '.join(failed))
+        sync_reply_text(self.bot, update.effective_message, summary)
 
     def unlink_all(self, update: Update, context: CallbackContext):
         """

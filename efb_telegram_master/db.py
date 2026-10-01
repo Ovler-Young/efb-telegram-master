@@ -935,6 +935,16 @@ class DatabaseManager:
         except DoesNotExist:
             return None
 
+    @observe_database_method("get_previous_forum_message")
+    def get_previous_forum_message(self, slave_chat_id: EFBChannelChatIDStr,
+                                   current_chat_id: TelegramChatID) -> Optional[MsgLog]:
+        """Find the latest canonical message from a previous Telegram supergroup."""
+        return MsgLog.select().where(
+            MsgLog.slave_origin_uid == slave_chat_id,
+            MsgLog.master_msg_id.startswith("-100"),
+            ~MsgLog.master_msg_id.startswith(f"{current_chat_id}."),
+        ).order_by(MsgLog.time.desc(nulls="LAST"), MsgLog.master_msg_id.desc()).limit(1).first()
+
     @observe_database_method("get_recent_messages")
     def get_recent_messages(self, slave_chat_id: EFBChannelChatIDStr, limit: int = 1000,
                             after: Optional[Tuple[Optional[datetime.datetime], str]] = None) -> List[MsgLog]:

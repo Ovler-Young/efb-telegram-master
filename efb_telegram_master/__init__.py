@@ -566,6 +566,8 @@ class TelegramChannel(MasterChannel):
                      "    Unlink all remote chats in this chat.\n"
                      "/relink <old_forum_id>\n"
                      "    Move linked remote chats from an old forum without copying history.\n"
+                     "/relink repair\n"
+                     "    Restore cached titles and add available previous-message links to current forum topics.\n"
                      "/info\n"
                      "    Show information of the current Telegram chat.\n"
                      "/react [emoji]\n"

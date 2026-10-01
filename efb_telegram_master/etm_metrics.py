@@ -30,6 +30,7 @@ _RATE_LIMIT_SCOPES = frozenset({"global", "chat"})
 _DATABASE_METHODS = frozenset({
     "stop_worker",
     "add_chat_assoc",
+    "relink_forum_binding",
     "remove_chat_assoc",
     "get_master_msg_id",
     "get_chat_assoc",
@@ -46,6 +47,7 @@ _DATABASE_METHODS = frozenset({
     "delete_slave_chat_info",
     "get_recent_slave_chats",
     "get_last_message",
+    "get_previous_forum_message",
     "get_recent_messages",
     "replace_history_migration_entries",
     "has_pending_history_migrations",

@@ -1,25 +1,29 @@
 import os
 import logging
 import pickle
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 from prometheus_client import generate_latest
 
 from ehforwarderbot import Message, MsgType
-from ehforwarderbot.types import MessageID
+from ehforwarderbot.types import ChatID, MessageID, ModuleID
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
+from efb_telegram_master.chat_binding import ChatBindingManager
+from efb_telegram_master.chat_object_cache import ChatObjectCacheManager
 from efb_telegram_master.db import (
     ChatAssoc,
     DatabaseManager,
     HistoryMigrationEntry,
     MsgLog,
+    SlaveChatInfo,
     TopicAssoc,
     database,
 )
@@ -151,6 +155,8 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
     test_db.connect()
     test_db.create_tables([ChatAssoc, TopicAssoc])
     manager = object.__new__(DatabaseManager)
+    metrics = Metrics()
+    manager.set_metrics(metrics)
     try:
         ChatAssoc.create(master_uid="old", slave_uid="slave-a")
         TopicAssoc.create(topic_chat_id="old-forum", message_thread_id="1", slave_uid="slave-a")
@@ -159,6 +165,9 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
 
         manager.relink_forum_binding("new", TelegramChatID(-100123), TelegramTopicID(3), "slave-a")
 
+        rendered = generate_latest(metrics.registry).decode()
+        assert 'etm_database_method_duration_seconds_count{method="relink_forum_binding"} 1.0' in rendered
+
         assert [(row.master_uid, row.slave_uid) for row in ChatAssoc.select().order_by(ChatAssoc.slave_uid)] == [
             ("new", "slave-a"), ("new", "slave-b"),
         ]
@@ -166,6 +175,72 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
                 for row in TopicAssoc.select().order_by(TopicAssoc.slave_uid)] == [
             ("-100123", "3", "slave-a"), ("new-forum", "2", "slave-b"),
         ]
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+
+@pytest.mark.parametrize(
+    ("cached_pickle", "cached_name", "cached_alias", "expected_title"),
+    [
+        (None, "Cached QQ group", None, "👥👥 Cached QQ group"),
+        (b"unreadable cache", "Cached QQ group", "Saved QQ alias " * 9,
+         "👥👥 " + "Saved QQ alias " * 8 + "Save…"),
+    ],
+)
+def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum(
+        cached_pickle, cached_name, cached_alias, expected_title):
+    from telegram import Update
+    from peewee import SqliteDatabase
+    from efb_telegram_master import chat_binding as chat_binding_module
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    test_db.create_tables([ChatAssoc, SlaveChatInfo, TopicAssoc])
+    db_manager = object.__new__(DatabaseManager)
+    channel_id = ModuleID("tests.unavailable")
+    chat_uid = ChatID("qq-group")
+    slave_uid = utils.chat_id_to_str(channel_id, chat_uid)
+    old_chat_id = TelegramChatID(-10090001)
+    new_chat_id = TelegramChatID(-10090002)
+    old_master_uid = utils.chat_id_to_str(channel_id, ChatID(str(old_chat_id)))
+    new_master_uid = utils.chat_id_to_str(channel_id, ChatID(str(new_chat_id)))
+    db_manager.add_chat_assoc(old_master_uid, slave_uid, multiple_slave=True)
+    SlaveChatInfo.create(slave_channel_id=channel_id, slave_channel_emoji="👥", slave_chat_uid=chat_uid,
+                         slave_chat_name=cached_name, slave_chat_alias=cached_alias,
+                         slave_chat_type="Group", pickle=cached_pickle)
+
+    unavailable = RuntimeError("retcode=100")
+    bot = Mock()
+    bot.get_chat_info.return_value = SimpleNamespace(is_forum=True)
+    bot.create_forum_topic.return_value = SimpleNamespace(message_thread_id=TelegramTopicID(90003))
+    binding = object.__new__(ChatBindingManager)
+    binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text,
+                                      ngettext=lambda singular, plural, count: singular if count == 1 else plural)
+    binding.bot = bot
+    binding.db = db_manager
+    cache_manager = object.__new__(ChatObjectCacheManager)
+    cache_manager.db = db_manager
+    cache_manager.cache = {}
+    binding.chat_manager = cache_manager
+    binding._topic_mutex = threading.RLock()
+    binding.logger = Mock()
+    message = Mock()
+    message.chat = SimpleNamespace(id=int(new_chat_id), is_forum=True)
+    update = Update(update_id=4, message=message)
+
+    try:
+        with patch.object(chat_binding_module.coordinator, "slaves", {
+            channel_id: SimpleNamespace(get_chat=Mock(side_effect=unavailable)),
+        }), patch.object(chat_binding_module, "sync_reply_text"):
+            binding.relink_forum(update, SimpleNamespace(args=[str(old_chat_id)]))
+
+        assert db_manager.get_chat_assoc(master_uid=new_master_uid) == [slave_uid]
+        assert db_manager.get_topic_thread_id(slave_uid, new_chat_id) == TelegramTopicID(90003)
+        bot.create_forum_topic.assert_called_once_with(chat_id=new_chat_id, name=expected_title)
+        assert "https://t.me/c/90001" in bot.send_message.call_args.args[1]
     finally:
         test_db.close()
         database.initialize(original_database)
@@ -507,3 +582,96 @@ def test_postgresql_startup_observes_raw_legacy_rows_without_mutating_them(
         )
         admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
         admin_db.close()
+
+
+def test_relink_repair_posts_previous_history_links_and_reports_missing_topics():
+    from telegram import Update
+    from telegram.error import TelegramError
+    from peewee import SqliteDatabase
+    from efb_telegram_master import chat_binding as chat_binding_module
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    test_db.create_tables([TopicAssoc, SlaveChatInfo, MsgLog])
+    db_manager = object.__new__(DatabaseManager)
+    channel_id = ModuleID("tests.repair")
+    slave_with_history = utils.chat_id_to_str(channel_id, ChatID("chat-a"))
+    slave_without_history = utils.chat_id_to_str(channel_id, ChatID("chat-b"))
+    slave_without_title = utils.chat_id_to_str(channel_id, ChatID("chat-c"))
+    new_chat_id = TelegramChatID(-10090002)
+    TopicAssoc.create(topic_chat_id=new_chat_id, message_thread_id="11", slave_uid=slave_with_history)
+    TopicAssoc.create(topic_chat_id=new_chat_id, message_thread_id="22", slave_uid=slave_without_history)
+    TopicAssoc.create(topic_chat_id=new_chat_id, message_thread_id="33", slave_uid=slave_without_title)
+    SlaveChatInfo.create(slave_channel_id=channel_id, slave_channel_emoji="👥", slave_chat_uid="chat-a",
+                         slave_chat_name="History chat", slave_chat_alias="History title",
+                         slave_chat_type="Group")
+    SlaveChatInfo.create(slave_channel_id=channel_id, slave_channel_emoji="👥", slave_chat_uid="chat-b",
+                         slave_chat_name="Title-only chat", slave_chat_alias="Recovered title",
+                         slave_chat_type="Group")
+    base_time = datetime(2026, 1, 1)
+    for master_msg_id, timestamp in (
+        ("-10090001.42", base_time),
+        (f"{new_chat_id}.99", base_time.replace(day=3)),
+        ("12345.100", base_time.replace(day=4)),
+    ):
+        MsgLog.create(
+            master_msg_id=master_msg_id,
+            slave_message_id=master_msg_id,
+            text="history",
+            slave_origin_uid=slave_with_history,
+            msg_type="Text",
+            sent_to=channel_id,
+            time=timestamp,
+        )
+    bot = Mock()
+    def fail_history_title(**kwargs):
+        if kwargs["message_thread_id"] == TelegramTopicID(11):
+            raise TelegramError("topic edit failed")
+        if kwargs["message_thread_id"] == TelegramTopicID(22):
+            raise TelegramError("Topic_not_modified")
+
+    bot.edit_forum_topic.side_effect = fail_history_title
+
+    class UnreadableCachedChat:
+        @property
+        def alias(self):
+            raise RuntimeError("cache object unreadable")
+
+    binding = object.__new__(ChatBindingManager)
+    binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text)
+    binding.bot = bot
+    binding.db = db_manager
+    binding.chat_manager = SimpleNamespace(cache={
+        (channel_id, ChatID("chat-b")): UnreadableCachedChat(),
+    })
+    binding.logger = Mock()
+    message = Mock()
+    message.chat = SimpleNamespace(id=int(new_chat_id), is_forum=True)
+    update = Update(update_id=5, message=message)
+
+    try:
+        with patch.object(chat_binding_module, "sync_reply_text") as reply:
+            binding.relink_forum(update, SimpleNamespace(args=["repair"]))
+
+        bot.get_chat_info.assert_not_called()
+        bot.send_message.assert_called_once_with(
+            chat_id=new_chat_id,
+            text=("This chat was previously linked. History messages are not migrated. "
+                  "You can view previous messages here: https://t.me/c/90001/42"),
+            message_thread_id=TelegramTopicID(11),
+            disable_notification=True,
+        )
+        bot.edit_forum_topic.assert_has_calls([
+            call(chat_id=new_chat_id, message_thread_id=TelegramTopicID(11), name="👥👥 History title"),
+            call(chat_id=new_chat_id, message_thread_id=TelegramTopicID(22), name="👥👥 Recovered title"),
+        ], any_order=True)
+        assert "posted 1 previous-message link" in reply.call_args.args[2]
+        assert "restored or confirmed 1 cached topic title" in reply.call_args.args[2]
+        assert "No cached title for topic IDs: 33" in reply.call_args.args[2]
+        assert "Failed to restore cached titles for topic IDs: 11" in reply.call_args.args[2]
+        assert "topic IDs: 33, 22" in reply.call_args.args[2]
+    finally:
+        test_db.close()
+        database.initialize(original_database)
