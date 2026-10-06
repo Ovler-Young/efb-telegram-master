@@ -1353,7 +1353,7 @@ class OutboundQueue:
 
     def enqueue_many(
         self, requests: Iterable[QueueRequest], operation_resolver: Callable[[str], Callable[..., object]],
-        *, history_keys: Iterable[str] = (),
+        *, history_keys: Iterable[str] = (), logical_split: Optional[dict] = None,
     ) -> tuple[int, Future]:
         request_list = list(requests)
         if not request_list:
@@ -1362,6 +1362,12 @@ class OutboundQueue:
             self.connection  # Reject closed queues before creating sidecars.
             prepared = []
             try:
+                if logical_split and logical_split.get("after"):
+                    from .queued_log import encode_aggregation
+                    after = logical_split["after"]
+                    request_list.append(QueueRequest("send_message", (),
+                        {"chat_id": after["key"][1], "text": "", "_slave_id": after["key"][0], "_send_mode": "eventual"},
+                        encode_aggregation(after)))
                 for request in request_list:
                     prepared.append(self._prepare(request, operation_resolver(request.operation)))
             except Exception:
@@ -1375,6 +1381,17 @@ class OutboundQueue:
                 raise QueueEnqueueError("Queued request sequence must share chat_id and priority.")
             try:
                 self.connection.execute("BEGIN")
+                if logical_split:
+                    from .queued_log import decode_aggregation, encode_aggregation
+                    original = self.connection.execute("SELECT predecessor_id, log_context FROM outbound_queue WHERE "
+                        "id=? AND delivery_state='queued' AND delivery_hold IS NULL", (logical_split["row_id"],)).fetchone()
+                    if original is None or decode_aggregation(original[1])["kind"] != "logical":
+                        raise QueuePersistenceError("Source batch was submitted before its split.")
+                    before = logical_split.get("before")
+                    predecessor = logical_split["row_id"] if before else original[0]
+                    if before:
+                        self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                                (encode_aggregation(before), logical_split["row_id"]))
                 # Receipts outlive queue-row completion until the source staging
                 # records have been durably removed from either main DB backend.
                 self.connection.executemany(
@@ -1389,12 +1406,20 @@ class OutboundQueue:
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
                         "created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (priority, chat_id, operation, payload, slave_id, required_sender, now, log_context, request.predecessor_id),
+                        (priority, chat_id, operation, payload, slave_id, required_sender, now, log_context,
+                         predecessor if logical_split else request.predecessor_id),
                     )
                     identifier = cursor.lastrowid
                     if identifier is None:
                         raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
                     identifiers.append(identifier)
+                    if logical_split:
+                        predecessor = identifier
+                if logical_split:
+                    self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=? AND id NOT IN (" +
+                        ",".join("?" for _ in identifiers) + ")", (identifiers[-1], logical_split["row_id"], *identifiers))
+                    if not before:
+                        self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (logical_split["row_id"],))
                 self.connection.commit()
             except Exception as error:
                 try:
@@ -1462,19 +1487,51 @@ class OutboundQueue:
         return self.load_queued(row_id)
 
     def handoff_aggregation(self, row_id: int, parent_context: bytes,
-                            update_successor: Callable[[bytes], bytes]) -> None:
+                            update_successor: Callable[[bytes], bytes], *,
+                            requests: Iterable[QueueRequest] = (), operation_resolver=None) -> list[int]:
         """Publish the confirmed base and parent handoff in one queue transaction."""
+        from .queued_log import decode_aggregation
         with self._lock, self.connection:
+            previous = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
+            if previous and decode_aggregation(previous[0]).get("handoff"):
+                return []
+            identifiers = []
+            for request in requests:
+                item = self._prepare(request, operation_resolver(request.operation))
+                operation, _, _, chat_id, priority, slave_id, required_sender, payload, context, _ = item
+                cursor = self.connection.execute(
+                    "INSERT INTO outbound_queue (priority, telegram_chat_id, operation, payload, slave_id, "
+                    "required_sender_bot_id, created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), context, request.predecessor_id))
+                identifiers.append(cursor.lastrowid)
+            parent = decode_aggregation(parent_context)
             rows = self.connection.execute(
-                "SELECT id, log_context FROM outbound_queue WHERE predecessor_id=?", (row_id,),
+                "SELECT id, log_context FROM outbound_queue WHERE predecessor_id=? OR predecessor_id=?",
+                (row_id, parent.get("supplement_id")),
             ).fetchall()
             for identifier, context in rows:
                 if context and context[:1] == b"\x03":
+                    updated = update_successor(context)
+                    owner = decode_aggregation(updated).get("required_sender")
                     self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
-                                            (update_successor(context), identifier))
+                                            (updated, identifier))
+                    if owner is not None:
+                        self.connection.execute("UPDATE outbound_queue SET required_sender_bot_id=? WHERE id=?", (owner, identifier))
             self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
                                     (parent_context, row_id))
             self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
+        return identifiers
+
+    def cancel_logical_aggregation(self, row_id: int) -> Optional[int]:
+        """Remove an unsubmitted empty batch while retaining its predecessor barrier."""
+        with self._lock, self.connection:
+            row = self.connection.execute("SELECT predecessor_id FROM outbound_queue WHERE id=? AND "
+                                          "delivery_state='queued' AND delivery_hold IS NULL", (row_id,)).fetchone()
+            if row is None:
+                raise QueuePersistenceError("The logical batch was already submitted.")
+            self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (row[0], row_id))
+            self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
+        return row[0]
 
     def release_dependents(self, row_id: int) -> None:
         with self._lock, self.connection:
@@ -2122,12 +2179,25 @@ class OutboundQueue:
                 self.connection.execute("BEGIN")
                 if prepared is not None:
                     operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media = prepared
-                    self.connection.execute(
+                    from .queued_log import decode_aggregation, encode_aggregation
+                    parent_context = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0]
+                    parent = decode_aggregation(parent_context) if parent_context else None
+                    if parent is not None:
+                        log_context = encode_aggregation(dict(format_version=1, kind="boundary", key=parent["key"],
+                            generation=parent.get("generation", 0), recent=parent.get("recent", []),
+                            last_new=parent.get("last_new", 0), members=[], legacy_context=log_context))
+                    supplement_cursor = self.connection.execute(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
-                        "created_at, log_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), log_context),
+                        "created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), log_context,
+                         row_id if parent is not None else None),
                     )
+                    if parent is not None:
+                        parent["supplement_id"] = supplement_cursor.lastrowid
+                        self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=? AND id!=?",
+                            (supplement_cursor.lastrowid, row_id, supplement_cursor.lastrowid))
+                        self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?", (encode_aggregation(parent), row_id))
                 cursor = self.connection.execute(
                     "UPDATE outbound_queue SET delivery_state = 'sent_pending', completion_receipt = ?, delivery_hold = NULL, "
                     "reconcile_after=0, reconcile_attempts=0 "

@@ -35,7 +35,7 @@ class Transport:
         message_id = len(self.messages) + 1
         return self._save(chat_id, message_id, text, kwargs.get("message_thread_id"))
 
-    def edit_message_text(self, text, chat_id, message_id, parse_mode=None):
+    def edit_message_text(self, text, chat_id, message_id, parse_mode=None, **kwargs):
         self.calls.append(("edit_message_text", chat_id, text, {"message_id": message_id}))
         if self.error:
             raise self.error

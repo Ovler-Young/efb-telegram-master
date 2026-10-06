@@ -96,6 +96,7 @@ def observe_database_method(method: str):
 PickledDict = TypedDict('PickledDict', {
     "file_bot_id": str,
     "target": TgChatMsgIDStr,
+    "target_source": Tuple[str, str],
     "is_system": bool,
     "attributes": MessageAttribute,
     "commands": MessageCommands,
@@ -253,7 +254,14 @@ class MsgLog(BaseModel):
                 with connection_scope(self._meta.database):
                     target_row = self.get_or_none(MsgLog.master_msg_id == misc_data['target'])
                 if target_row:
-                    msg.target = target_row.build_etm_msg(chat_manager, recur=False)
+                    if target_row.aggregate:
+                        target_identity = misc_data.get("target_source")
+                        member = next((child for child in target_row.aggregate["children"]
+                                       if member_identity(child) == target_identity), None)
+                        if member is not None:
+                            msg.target = target_row.build_source_member(member, chat_manager)
+                    else:
+                        msg.target = target_row.build_etm_msg(chat_manager, recur=False)
             if 'is_system' in misc_data:
                 msg.is_system = misc_data['is_system']
             if 'attributes' in misc_data:
@@ -553,8 +561,12 @@ class DatabaseManager:
             return 0
 
     @observe_database_method("get_master_msg_id")
-    def get_master_msg_id(self, message: EFBMessage) -> Optional[TgChatMsgIDStr]:
+    def get_master_msg_id(self, message: EFBMessage, target_chat_id=None, topic=None) -> Optional[TgChatMsgIDStr]:
         """Get master message ID from a message object."""
+        if target_chat_id is not None:
+            resolved = self.resolve_source_member(str(chat_id_to_str(chat=message.chat)), str(message.uid),
+                                                  str(target_chat_id), str(topic) if topic is not None else None)
+            return TgChatMsgIDStr(resolved[0].master_msg_id) if resolved else None
         log: Optional[MsgLog] = MsgLog.get_or_none(
             MsgLog.slave_origin_uid == chat_id_to_str(chat=message.chat),
             MsgLog.slave_message_id == message.uid
@@ -563,7 +575,7 @@ class DatabaseManager:
             return TgChatMsgIDStr(log.master_msg_id)
         return None
 
-    def pickle_misc_msg(self, message: EFBMessage) -> Optional[bytes]:
+    def pickle_misc_msg(self, message: EFBMessage, target_chat_id=None, topic=None) -> Optional[bytes]:
         """Pickle miscellaneous information of a message.
 
         Since 2.0.0b34, this would be a dict that reflects the following
@@ -598,9 +610,10 @@ class DatabaseManager:
                 for k, v in message.reactions.items()
             }
         if message.target:
-            target_id = self.get_master_msg_id(message.target)
+            target_id = self.get_master_msg_id(message.target, target_chat_id, topic)
             if target_id:
                 data['target'] = target_id
+                data['target_source'] = (str(chat_id_to_str(chat=message.target.chat)), str(message.target.uid))
 
         if data:
             return pickle.dumps(data)
@@ -817,7 +830,7 @@ class DatabaseManager:
             "file_unique_id": msg.file_unique_id,
             "mime": msg.mime,
             "sender_bot_id": sender_bot_id,
-            "pickle": self.pickle_misc_msg(msg),
+            "pickle": self.pickle_misc_msg(msg, master_message.chat_id, getattr(master_message, "message_thread_id", None)),
         }
         if existing:
             changed = {
@@ -979,6 +992,15 @@ class DatabaseManager:
         if row.aggregate:
             return row.aggregate["children"]
         return [row.source_member] if row.source_member else []
+
+    @observe_database_method("get_source_message_logs")
+    def get_source_message_logs(self, origin_uid: str, source_id: str) -> List[MsgLog]:
+        """Read saved source snapshots so status-only events can resolve their current destination."""
+        mappings = MsgLogMember.select(MsgLogMember.master_msg_id).where(
+            (MsgLogMember.slave_origin_uid == origin_uid) & (MsgLogMember.slave_message_id == source_id))
+        return list(MsgLog.select().where(MsgLog.master_msg_id.in_(mappings) |
+            ((MsgLog.slave_origin_uid == origin_uid) & (MsgLog.slave_message_id == source_id)))
+            .order_by(MsgLog.time.desc(nulls="LAST")))
 
     @observe_database_method("resolve_source_member")
     def resolve_source_member(self, slave_origin_uid: str, slave_msg_id: str, target_chat_id: str,

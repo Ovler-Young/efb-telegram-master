@@ -77,6 +77,12 @@ def test_member_roundtrip_mapping_and_legacy_restoration(manager):
     assert legacy_member is None
     assert legacy_row.build_etm_msg(SourceCache()).text == "original"
 
+    reply = source("reply", "reply body")
+    reply.target = messages[1]
+    manager.add_or_update_message_log(reply, receipt(3, topic=3))
+    restored_reply = manager.get_msg_log(master_msg_id="-100.3").build_etm_msg(SourceCache())
+    assert (restored_reply.target.uid, restored_reply.target.author.uid) == ("two", "bob")
+
 
 def test_finalization_is_idempotent_and_preserves_newer_removed_source(manager):
     member = make_source_member(source())

@@ -922,6 +922,18 @@ class TelegramBotManager(LocaleMixin):
 
         function = self._queued_operation_callable(operation)
         function_args = (self,) + args
+        aggregation = getattr(self, "live_aggregation", None)
+        if aggregation is not None and aggregation._source_delivery.get() is not None:
+            # Source receipts register buttons after durable finalization.
+            slave_id = slave_id or aggregation._source_delivery.get()["key"][0]
+            if sender_bot_id and not eventual_capable:
+                queued_kwargs["_required_sender_bot_id"] = str(sender_bot_id)
+            elif not eventual_capable or has_callback or force_main_bot:
+                queued_kwargs["_required_sender_bot_id"] = "__main__"
+            return self._enqueue_eventual_send(str(slave_id), normalized_chat_id,
+                function, function_args, queued_kwargs, cleanup_files=cleanup_files,
+                db_log_context=db_log_context)
+
         if eventual_capable and send_mode == "eventual" and slave_id and not has_callback:
             return self._enqueue_eventual_send(
                 str(slave_id),
@@ -1153,7 +1165,8 @@ class TelegramBotManager(LocaleMixin):
             if aggregation is not None:
                 durable_requests = aggregation.bind_independent_requests(durable_requests)
             row_id, waiter = self._outbound_queue.enqueue_many(
-                durable_requests, self._queue_operation, history_keys=history_keys
+                durable_requests, self._queue_operation, history_keys=history_keys,
+                logical_split=aggregation.source_split() if aggregation is not None else None,
             )
             if aggregation is not None:
                 aggregation.note_independent_enqueued(row_id)
@@ -1760,10 +1773,14 @@ class TelegramBotManager(LocaleMixin):
             return True
         try:
             from .queued_log import decode_aggregation
-            if decode_aggregation(row.log_context) is not None:
-                real_tg_msg, sender_bot_id, _ = self._decode_queued_completion_receipt(row.completion_receipt)
-                return self.live_aggregation.reconcile(row, real_tg_msg, sender_bot_id)
-            etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
+            context = decode_aggregation(row.log_context)
+            if context is not None and context["kind"] != "boundary":
+                real_tg_msg, sender_bot_id, file_bot_id = self._decode_queued_completion_receipt(row.completion_receipt)
+                return self.live_aggregation.reconcile(row, real_tg_msg, sender_bot_id, file_bot_id)
+            legacy_context = context["legacy_context"] if context else row.log_context
+            if legacy_context is None:
+                return True
+            etm_msg, old_msg_id = self._decode_queued_log_context(legacy_context)
             real_tg_msg, sender_bot_id, file_bot_id = self._decode_queued_completion_receipt(
                 row.completion_receipt
             )
