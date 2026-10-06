@@ -45,8 +45,8 @@ V1_COLUMNS = {
     "historymigrationentry": ["id", "slave_chat_id", "target_chat_id", "message_thread_id",
                               "source_master_msg_id", "formatted_text", "media_type", "source_time",
                               "position", "created_at"],
-    "msglogmember": ["master_msg_id", "slave_origin_uid", "slave_message_id"],
 }
+V1_OPTIONAL_COLUMNS = {"msglogmember": ["master_msg_id", "slave_origin_uid", "slave_message_id"]}
 CACHE_TABLES = {"topiciconcache", "useremojicache"}
 IMPORT_TABLE = "etm_sqlite_import"
 RECEIPT_FILE = ".postgresql-cutover.json"
@@ -561,7 +561,8 @@ def _recovery_columns(models, manifest):
     available = {model._meta.table_name: model for model in models}
     if not set(manifest["tables"]).issubset(available):
         raise RuntimeError("Source tables changed since the committed import.")
-    columns = ({table: V1_COLUMNS[table] for table in manifest["tables"] if table in V1_COLUMNS}
+    v1_columns = V1_COLUMNS | V1_OPTIONAL_COLUMNS
+    columns = ({table: v1_columns[table] for table in manifest["tables"] if table in v1_columns}
                if manifest["version"] == 1 else manifest["columns"])
     if set(columns) != set(manifest["tables"]):
         raise RuntimeError("Unsupported column projection in committed import.")

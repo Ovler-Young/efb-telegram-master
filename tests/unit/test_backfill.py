@@ -368,12 +368,16 @@ def test_queue_history_migration_entries_persists_pending_rows():
     text_log.text = "hello"
     text_log.media_type = "Text"
     text_log.time = base_time
+    text_log.aggregate = None
+    text_log.source_member = None
     text_log.build_etm_msg.return_value = SimpleNamespace(author=SimpleNamespace(display_name="author"))
     media_log = Mock()
     media_log.master_msg_id = "10.21"
     media_log.text = ""
     media_log.media_type = "Photo"
     media_log.time = base_time + timedelta(seconds=1)
+    media_log.aggregate = None
+    media_log.source_member = None
     manager.db.get_recent_messages.return_value = [text_log, media_log]
     manager.db.replace_history_migration_entries.return_value = 2
 
