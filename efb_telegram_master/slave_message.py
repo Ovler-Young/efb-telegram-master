@@ -1549,6 +1549,9 @@ class SlaveMessageProcessor(LocaleMixin):
                             break
                 if restored is not None:
                     message = restored
+                else:
+                    self.logger.info("Source removal has no saved message: %s", identity)
+                    return
             _, (target, topic) = self.get_slave_msg_dest(message)
             key = (identity[0], int(target), str(topic) if topic is not None else None) if target is not None else None
             if aggregation is not None and key is not None and aggregation.remove_source_member(key, identity):
