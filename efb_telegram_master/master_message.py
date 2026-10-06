@@ -204,7 +204,7 @@ class MasterMessageProcessor(LocaleMixin):
 
         if update.edited_message or update.edited_channel_post:
             self.logger.debug('[%s] Message is edited: %s', mid, message.edit_date)
-            msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update))
+            msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update), include_managed_alt=True)
             if not msg_log or msg_log.aggregate or msg_log.slave_message_id == self.db.FAIL_FLAG:
                 sync_reply_text(self.bot, message,
                                 self._("Error: This message cannot be edited, and thus is not sent. (ME01)"),
@@ -276,7 +276,7 @@ class MasterMessageProcessor(LocaleMixin):
                     master_msg_id=utils.message_id_to_str(
                         TelegramChatID(reply_to.chat.id),
                         TelegramMessageID(reply_to.message_id)
-                    )
+                    ), include_managed_alt=True
                 )
                 if dest_msg:
                     if dest_msg.aggregate:
@@ -287,6 +287,8 @@ class MasterMessageProcessor(LocaleMixin):
                         quote = True
                     else:
                         destination = EFBChannelChatIDStr(dest_msg.slave_origin_uid)
+                        if dest_msg.source_member:
+                            quote = True
                     self.chat_dest_cache.set(str(message.chat.id), destination)
                     self.logger.debug("[%s] Quoted message is found in database with destination: %s", mid, destination)
             elif cached_dest:
@@ -346,8 +348,8 @@ class MasterMessageProcessor(LocaleMixin):
         if quote and message.reply_to_message:
             target_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(
                 TelegramChatID(message.reply_to_message.chat_id),
-                TelegramMessageID(message.reply_to_message.message_id)))
-            if target_log and target_log.aggregate:
+                TelegramMessageID(message.reply_to_message.message_id)), include_managed_alt=True)
+            if target_log and (target_log.aggregate or target_log.source_member):
                 selected_target = self.members.select(update, context, target_log, destination, 'reply', selected_identity)
                 if selected_target is None:
                     return
@@ -553,7 +555,7 @@ class MasterMessageProcessor(LocaleMixin):
 
         target_log = self.db.get_msg_log(
             master_msg_id=utils.message_id_to_str(
-                TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)))
+                TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)), include_managed_alt=True)
         if not target_log or not target_log.slave_origin_uid:
             self.logger.error("[%s] Quoted message not found in database, give up quoting.",
                               tg_msg.message_id)
@@ -566,7 +568,13 @@ class MasterMessageProcessor(LocaleMixin):
         if target_log.aggregate:
             # Aggregate targets are selected before processing the Telegram body.
             return etm_msg
-        target_msg: ETMMsg = target_log.build_etm_msg(self.chat_manager, recur=False)
+        if target_log.source_member:
+            member = target_log.source_member
+            target_msg = self.members.resolve(target_log, (member['origin_uid'], member['source_id']))
+            if target_msg is None:
+                return etm_msg
+        else:
+            target_msg = target_log.build_etm_msg(self.chat_manager, recur=False)
         target_msg.target = None
         etm_msg.target = target_msg
 
@@ -646,7 +654,7 @@ class MasterMessageProcessor(LocaleMixin):
         msg_log = self.db.get_msg_log(
             master_msg_id=utils.message_id_to_str(
                 chat_id=TelegramChatID(reply.chat_id),
-                message_id=TelegramMessageID(reply.message_id)))
+                message_id=TelegramMessageID(reply.message_id)), include_managed_alt=True)
         if not msg_log or msg_log.slave_member_uid == self.db.FAIL_FLAG:
             return self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."

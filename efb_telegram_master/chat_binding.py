@@ -259,7 +259,7 @@ class ChatBindingManager(LocaleMixin):
                 master_msg_id=utils.message_id_to_str(
                     chat_id=TelegramChatID(rtm.chat_id),
                     message_id=TelegramMessageID(rtm.message_id)
-                )
+                ), include_managed_alt=True
             )
             if msg_log:
                 if msg_log.aggregate:

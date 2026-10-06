@@ -13,6 +13,7 @@ from efb_telegram_master.chat_destination_cache import ChatDestinationCache
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.master_message import MasterMessageProcessor
 from efb_telegram_master.member_selection import SourceMemberSelector
+from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import chat_id_to_str
 from tests.unit.test_live_aggregate import source, SourceCache, receipt
 from tests.unit.test_live_aggregate_runtime import runtime, append, complete
@@ -235,3 +236,43 @@ def test_single_message_paths_and_deferred_aggregate_reactions(handler, monkeypa
     TelegramChannel.react(handler.channel, incoming(aggregate, '/react 👍'), SimpleNamespace())
     assert len(statuses) == 1
     assert 'not supported yet' in handler.notices[-1].text
+
+
+def test_managed_alternate_output_reply_and_rm_use_effective_member_state(handler, monkeypatch):
+    container(handler)
+    changed = source('source-1', 'independent first version')
+    member = make_source_member(changed, source_revision=2)
+    handler.db.finalize_member_redirect('-100.1', member, changed, receipt(2))
+    changed.type = MsgType.File
+    changed.type_telegram = TGMsgType.Document
+    changed.text = 'current independent attachment'
+    changed.file_id = 'alternate-file'
+    changed.mime = 'text/plain'
+    latest = make_source_member(changed, source_revision=3)
+    handler.db.finalize_source_message(changed, receipt(3), latest, old_message_id=(-100, 2))
+    row = handler.db.get_msg_log(master_msg_id='-100.2')
+    assert row.master_msg_id_alt == '-100.3'
+    assert handler.db.get_msg_log(master_msg_id='-100.3') is None
+    handler.db.add_chat_assoc(chat_id_to_str('tests.master', '-100'),
+                              chat_id_to_str('tests.source', 'other'), multiple_slave=True)
+    document = Document('alternate-file', 'alternate-unique', file_name='updated.txt', mime_type='text/plain')
+    actual = Message(3, datetime.datetime.now(datetime.timezone.utc), Chat(-100, 'supergroup'),
+                     document=document, caption=changed.text)
+    handler.msg(incoming(actual), SimpleNamespace())
+    assert (handler.sent[-1].target.uid, handler.sent[-1].target.text, handler.sent[-1].target.type) == (
+        'source-1', changed.text, MsgType.File)
+    statuses = []
+    monkeypatch.setattr(coordinator, 'send_status', statuses.append)
+    handler.bot.transport.delete_message = lambda chat_id, message_id, **kwargs: True
+    handler.delete_message(incoming(actual, '/rm'), SimpleNamespace())
+    assert statuses[-1].message.uid == 'source-1'
+    key = (member['origin_uid'], -100, None)
+    assert handler.bot.live_aggregation.source_state(key, (member['origin_uid'], 'source-1'))[1]['status'] == 'removed'
+    assert handler.db.get_msg_log(master_msg_id='-100.1').aggregate['children'][0]['status'] == 'active'
+    # The withdrawal is durable but the original Telegram file is still visible.
+    # A reply to either output ID must reject the pending removed source.
+    handler.msg(incoming(actual), SimpleNamespace())
+    canonical = Message(2, actual.date, actual.chat, text='independent first version')
+    handler.msg(incoming(canonical), SimpleNamespace())
+    assert len(handler.sent) == 1
+    assert 'no longer available' in handler.notices[-1].text

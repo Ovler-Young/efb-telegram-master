@@ -480,7 +480,8 @@ class TelegramChannel(MasterChannel):
 
         target: Message = message.reply_to_message
         msg_log = self.db.get_msg_log(master_msg_id=etm_utils.message_id_to_str(chat_id=TelegramChatID(target.chat_id),
-                                                                                message_id=TelegramMessageID(target.message_id)))
+                                                                                message_id=TelegramMessageID(target.message_id)),
+                                     include_managed_alt=True)
         if msg_log is None:
             sync_reply_text(self.bot_manager, message,
                             self._("The message you replied to is not recorded in ETM database. "

@@ -1041,13 +1041,16 @@ class DatabaseManager:
     @observe_database_method("get_msg_log")
     def get_msg_log(self, master_msg_id: Optional[TgChatMsgIDStr] = None,
                     slave_msg_id: Optional[MessageID] = None,
-                    slave_origin_uid: Optional[EFBChannelChatIDStr] = None) -> Optional[MsgLog]:
+                    slave_origin_uid: Optional[EFBChannelChatIDStr] = None,
+                    *, include_managed_alt: bool = False) -> Optional[MsgLog]:
         """Get message log by message ID.
 
         Args:
             master_msg_id: Telegram message ID in string
             slave_msg_id: Slave message identifier in string
             slave_origin_uid: Slave chat identifier in string
+            include_managed_alt: Resolve an independent source output's actual
+                alternate Telegram ID when its canonical ID does not match.
 
         Returns:
             Optional[MsgLog]: The queried entry, None if not exist.
@@ -1059,8 +1062,15 @@ class DatabaseManager:
             raise ValueError('slave_msg_id and slave_origin_uid must exists together.')
         try:
             if master_msg_id:
-                return MsgLog.select().where(MsgLog.master_msg_id == master_msg_id) \
+                row = MsgLog.select().where(MsgLog.master_msg_id == master_msg_id) \
                     .order_by(MsgLog.time.desc(nulls="LAST")).first()
+                if row is not None or not include_managed_alt:
+                    return row
+                for alternate in MsgLog.select().where(MsgLog.master_msg_id_alt == master_msg_id) \
+                        .order_by(MsgLog.time.desc(nulls="LAST")):
+                    if alternate.source_member is not None:
+                        return alternate
+                return None
             else:
                 return MsgLog.select().where((MsgLog.slave_message_id == slave_msg_id) &
                                              (MsgLog.slave_origin_uid == slave_origin_uid)

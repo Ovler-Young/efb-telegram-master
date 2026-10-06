@@ -109,6 +109,8 @@ class SourceMemberSelector:
 
     def select(self, update: Update, context: CallbackContext, target: 'MsgLog', destination: str,
                method: str, selected_identity: Optional[SourceIdentity] = None) -> Optional['ETMMsg']:
+        if selected_identity is None and target.source_member:
+            selected_identity = member_identity(target.source_member)
         if selected_identity is not None:
             result = self.resolve(target, selected_identity)
             if result is None or selected_identity[0] != destination:
