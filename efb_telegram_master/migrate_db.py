@@ -28,11 +28,11 @@ from peewee import (
 )
 from ruamel.yaml import YAML
 
-from .db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, HistoryMigrationTarget, MsgLog, SlaveChatInfo, TopicAssoc
+from .db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, HistoryMigrationTarget, MsgLog, MsgLogMember, SlaveChatInfo, TopicAssoc
 from .db_runtime import SCHEMA_LOCK, DataDirectoryLock, connection_scope, current_schema, postgresql_database
 
 CORE_MODELS = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
-MODELS = CORE_MODELS + (HistoryMigrationTarget,)
+MODELS = CORE_MODELS + (HistoryMigrationTarget, MsgLogMember)
 # Version 1 did not record its column projections in the manifest.
 V1_COLUMNS = {
     "chatassoc": ["id", "master_uid", "slave_uid"],
