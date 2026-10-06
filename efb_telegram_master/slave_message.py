@@ -212,6 +212,10 @@ class SlaveMessageProcessor(LocaleMixin):
             from .live_aggregate import LiveTextAggregation
             aggregation = getattr(getattr(self, "bot", None), "live_aggregation", None)
             key = (slave_origin_uid, int(tg_dest), str(thread_id) if thread_id is not None else None)
+            if (isinstance(aggregation, LiveTextAggregation) and not msg.edit
+                    and aggregation.queue.cancelled_source((slave_origin_uid, str(msg.uid)))):
+                self._release_pending_slave_message(dedupe_key)
+                return msg
             if isinstance(aggregation, LiveTextAggregation) and msg.edit:
                 if self._aggregate_source_edit(aggregation, key, msg, msg_template, silent):
                     return msg
@@ -443,12 +447,13 @@ class SlaveMessageProcessor(LocaleMixin):
                                            .format(msg.type.name),
                                            **self._make_send_kwargs(msg, old_msg_id, on_complete=on_db_complete))
 
-        aggregation = getattr(self.bot, "live_aggregation", None)
-        source_delivery = aggregation is not None and aggregation._source_delivery.get() is not None
-        if tg_msg and commands and not source_delivery:
-            self.channel.commands.register_command(tg_msg, ETMCommandMsgStorage(
-                commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
-            ))
+        if tg_msg and commands:
+            aggregation = getattr(self.bot, "live_aggregation", None)
+            source_delivery = aggregation is not None and aggregation._source_delivery.get() is not None
+            if not source_delivery:
+                self.channel.commands.register_command(tg_msg, ETMCommandMsgStorage(
+                    commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
+                ))
 
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. "
@@ -1537,10 +1542,15 @@ class SlaveMessageProcessor(LocaleMixin):
                     break
                 if restored is None and aggregation is not None:
                     from .aggregate import member_identity, member_message
+                    cancellation = aggregation.queue.cancelled_source(identity)
+                    if cancellation:
+                        restored = member_message(cancellation["member"])
                     for row in aggregation.queue.aggregation_rows():
                         from .queued_log import decode_aggregation
                         saved = decode_aggregation(row.log_context)
                         members = saved.get("members", []) + saved.get("updates", [])
+                        if saved.get("member"):
+                            members.append(saved["member"])
                         if saved.get("aggregate"):
                             members += saved["aggregate"]["children"]
                         member = next((child for child in members if member_identity(child) == identity), None)

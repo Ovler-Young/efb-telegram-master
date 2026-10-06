@@ -22,7 +22,7 @@ import time
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, IO, Iterable, Mapping, Optional, Protocol
+from typing import Callable, IO, Iterable, Mapping, Optional, Protocol, TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 from telegram import (
@@ -32,6 +32,9 @@ from telegram import (
 )
 from telegram.error import NetworkError, RetryAfter
 import httpx
+
+if TYPE_CHECKING:
+    from .aggregate import SourceMember
 
 
 @dataclass(frozen=True)
@@ -201,6 +204,7 @@ class QueuedCall:
     completion_receipt: Optional[bytes]
     stored_bytes: int = 0
     retry_after: float = 0
+    predecessor_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -614,6 +618,11 @@ class OutboundQueue:
             self._migrate_schema(connection)
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS history_ownership (entry_key TEXT PRIMARY KEY)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS source_cancellations ("
+                "origin_uid TEXT NOT NULL, source_id TEXT NOT NULL, source_revision INTEGER NOT NULL, "
+                "log_context BLOB NOT NULL, PRIMARY KEY (origin_uid, source_id))"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS outbound_queue_destination_priority_id "
@@ -1454,12 +1463,32 @@ class OutboundQueue:
         with self._lock:
             rows = self.connection.execute(
                 "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
-                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
+                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, predecessor_id "
                 "FROM outbound_queue WHERE substr(log_context, 1, 1)=? ORDER BY id", (b"\x03",),
             ).fetchall()
-        return [QueuedCall(*row) for row in rows]
+        return [QueuedCall(*row[:11], 0, 0, row[11]) for row in rows]
 
-    def replace_logical_aggregation(self, row_id: int, context: bytes) -> bool:
+    def cancelled_source(self, identity: tuple[str, str]) -> Optional[dict]:
+        """Read a confirmed unpublished withdrawal independently of destination."""
+        from .queued_log import decode_aggregation
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT log_context FROM source_cancellations WHERE origin_uid=? AND source_id=?", identity,
+            ).fetchone()
+        return decode_aggregation(row[0]) if row else None
+
+    def _record_source_cancellation(self, key: tuple, member: SourceMember) -> None:
+        from .queued_log import encode_aggregation
+        context = encode_aggregation(dict(format_version=1, kind="cancellation", key=tuple(key), member=member))
+        self.connection.execute(
+            "INSERT INTO source_cancellations (origin_uid, source_id, source_revision, log_context) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (origin_uid, source_id) DO UPDATE SET "
+            "source_revision=excluded.source_revision, log_context=excluded.log_context "
+            "WHERE excluded.source_revision > source_cancellations.source_revision",
+            (member["origin_uid"], member["source_id"], member["source_revision"], context),
+        )
+
+    def replace_logical_aggregation(self, row_id: int, context: bytes, *, cancelled_member=None) -> bool:
         from .queued_log import decode_aggregation
         with self._lock, self.connection:
             row = self.connection.execute(
@@ -1468,6 +1497,8 @@ class OutboundQueue:
             ).fetchone()
             if row is None or decode_aggregation(row[0]).get("kind") not in {"logical", "member_update"}:
                 return False
+            if cancelled_member is not None:
+                self._record_source_cancellation(tuple(decode_aggregation(row[0])["key"]), cancelled_member)
             self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?", (context, row_id))
             return True
 
@@ -1503,7 +1534,10 @@ class OutboundQueue:
                     "INSERT INTO outbound_queue (priority, telegram_chat_id, operation, payload, slave_id, "
                     "required_sender_bot_id, created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), context, request.predecessor_id))
-                identifiers.append(cursor.lastrowid)
+                identifier = cursor.lastrowid
+                if identifier is None:
+                    raise QueuePersistenceError("SQLite did not return the aggregation successor ID.")
+                identifiers.append(identifier)
             parent = decode_aggregation(parent_context)
             rows = self.connection.execute(
                 "SELECT id, log_context FROM outbound_queue WHERE predecessor_id=? OR predecessor_id=?",
@@ -1522,16 +1556,50 @@ class OutboundQueue:
             self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
         return identifiers
 
-    def cancel_logical_aggregation(self, row_id: int) -> Optional[int]:
+    def cancel_logical_aggregation(self, row_id: int, *, cancelled_member=None) -> Optional[int]:
         """Remove an unsubmitted empty batch while retaining its predecessor barrier."""
         with self._lock, self.connection:
-            row = self.connection.execute("SELECT predecessor_id FROM outbound_queue WHERE id=? AND "
+            row = self.connection.execute("SELECT predecessor_id, log_context FROM outbound_queue WHERE id=? AND "
                                           "delivery_state='queued' AND delivery_hold IS NULL", (row_id,)).fetchone()
             if row is None:
                 raise QueuePersistenceError("The logical batch was already submitted.")
+            if cancelled_member is not None:
+                from .queued_log import decode_aggregation
+                self._record_source_cancellation(tuple(decode_aggregation(row[1])["key"]), cancelled_member)
             self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (row[0], row_id))
             self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
         return row[0]
+
+    def cancel_pending_source(self, key: tuple, member: SourceMember) -> dict[int, Optional[int]]:
+        """Withdraw unsubmitted standalone versions and preserve successor ordering."""
+        from .aggregate import member_identity
+        from .queued_log import decode_aggregation
+        with self._lock, self.connection:
+            rows = self.connection.execute(
+                "SELECT id, log_context, delivery_state, delivery_hold, attempt_started_at "
+                "FROM outbound_queue WHERE substr(log_context, 1, 1)=? ORDER BY id", (b"\x03",),
+            ).fetchall()
+            matching = []
+            for row in rows:
+                context = decode_aggregation(row[1])
+                if (tuple(context["key"]) == tuple(key) and context["kind"] in {"source", "redirect"}
+                        and member_identity(context["member"]) == member_identity(member)):
+                    if row[2] != "queued" or row[3] is not None or row[4] is not None:
+                        return {}
+                    matching.append(row[0])
+            if not matching:
+                return {}
+            self._record_source_cancellation(tuple(key), member)
+            predecessors = {}
+            for row_id in matching:
+                predecessor = self.connection.execute(
+                    "SELECT predecessor_id FROM outbound_queue WHERE id=?", (row_id,),
+                ).fetchone()[0]
+                self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (predecessor, row_id))
+                self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
+                predecessors[row_id] = predecessor
+        self.refresh_depth()
+        return predecessors
 
     def release_dependents(self, row_id: int) -> None:
         with self._lock, self.connection:

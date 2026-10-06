@@ -36,27 +36,39 @@ class LiveTextAggregation:
         self.container_tails: dict[str, int] = {}
         self._source_delivery = ContextVar("aggregate_source_delivery", default=None)
         self._independent: ContextVar[Optional[tuple]] = ContextVar("aggregate_independent", default=None)
-        for row in self.queue.aggregation_rows():
+        rows = self.queue.aggregation_rows()
+        publication_rows = {}
+        predecessors = {}
+        for row in rows:
             context = decode_aggregation(row.log_context)
             logical = context.get("retry_context") or context
             if context.get("routing_hint"):
                 self.container_tails[context["container_id"]] = row.id
                 continue
             key = tuple(logical["key"])
+            publication_rows.setdefault(key, []).append((row, logical))
+            if row.predecessor_id is not None:
+                predecessors.setdefault(key, set()).add(row.predecessor_id)
             stream = self.streams.setdefault(key, _Stream())
-            stream.tail = row.id
-            stream.base = logical.get("base")
-            stream.recent = logical.get("recent", [])
-            stream.last_new = logical.get("last_new", row.created_at)
             stream.generation = max(stream.generation, logical.get("generation", 0))
-            if logical["kind"] in {"boundary", "source", "redirect"}:
-                stream.base = None
-                stream.generation = max(stream.generation, logical.get("generation", 0))
             container_id = context.get("container_id") or logical.get("container_id")
             if container_id:
                 self.container_tails[container_id] = row.id
             for member in logical.get("members", []):
                 self.pending_sources[member_identity(member)] = row.id
+        # Splitting an older batch inserts rows ahead of already queued media.
+        # The terminal dependency, rather than its insertion ID, ends the stream.
+        for key, candidates in publication_rows.items():
+            terminal = [(row, context) for row, context in candidates if row.id not in predecessors.get(key, set())]
+            row, logical = max(terminal or candidates, key=lambda item: item[0].id)
+            stream = self.streams[key]
+            stream.tail = row.id
+            stream.base = logical.get("base") if logical["kind"] not in {"boundary", "source", "redirect"} else None
+            stream.recent = logical.get("recent", [])
+            stream.last_new = logical.get("last_new", row.created_at)
+            if logical["kind"] in {"boundary", "source", "redirect"} and logical.get("generation", 0) < stream.generation:
+                # Earlier split rows cannot reopen a container beyond this boundary.
+                stream.generation += 1
 
     @property
     def admin_id(self):
@@ -92,6 +104,8 @@ class LiveTextAggregation:
             if self.scheduler.stopping:
                 from .outbound import SchedulerStoppedError
                 raise SchedulerStoppedError("Outbound scheduler stopped.")
+            if self.queue.cancelled_source(identity):
+                return True
             if identity in self.pending_sources:
                 pending = self.queue.aggregation_context(self.pending_sources[identity])
                 if pending and tuple(decode_aggregation(pending)["key"]) == key:
@@ -203,6 +217,9 @@ class LiveTextAggregation:
                     self.streams[key].tail = max(row.id for row in self.queue.aggregation_rows() if tuple(decode_aggregation(row.log_context)["key"]) == key)
                 else:
                     self.streams[key].tail = split["tail"]
+                    tail = self._tail_context(self.streams[key])
+                    if tail and tail["kind"] in {"boundary", "source", "redirect"}:
+                        self.close(key)
             else:
                 self.streams[key].tail = int(row_id)
             if source is not None:
@@ -415,6 +432,14 @@ class LiveTextAggregation:
             payload = self.queue.aggregation_context(predecessor) if predecessor else None
             pending = decode_aggregation(payload) if payload else None
             independent_pending = pending and pending["kind"] in {"source", "redirect"}
+            if independent_pending and log is None:
+                cancelled = self.queue.cancel_pending_source(tuple(key), member)
+                if cancelled:
+                    for stream in self.streams.values():
+                        if stream.tail in cancelled:
+                            stream.tail = cancelled[stream.tail]
+                    self.scheduler.wake_event.set()
+                    return True
             if independent_pending:
                 context = dict(format_version=1, kind="source", key=tuple(key), member=member,
                                message=member_message(member), old_message_id=None, old_container_id=None,
@@ -445,6 +470,9 @@ class LiveTextAggregation:
         key = tuple(key)
         resolved = self.manager.channel.db.resolve_source_member(*identity, str(key[1]), key[2])
         log, member = resolved if resolved else (None, None)
+        cancellation = self.queue.cancelled_source(identity)
+        if cancellation and (member is None or cancellation["member"]["source_revision"] > member["source_revision"]):
+            member = cancellation["member"]
         predecessor = None
         for row in self.queue.aggregation_rows():
             context = decode_aggregation(row.log_context)
@@ -564,7 +592,7 @@ class LiveTextAggregation:
                         context["members"].pop(position)
                         self.pending_sources.pop(member_identity(member), None)
                         if not context["members"]:
-                            predecessor = self.queue.cancel_logical_aggregation(row_id)
+                            predecessor = self.queue.cancel_logical_aggregation(row_id, cancelled_member=member)
                             for stream in self.streams.values():
                                 if stream.tail == row_id:
                                     stream.tail = predecessor
@@ -574,7 +602,8 @@ class LiveTextAggregation:
                         context["members"][position] = member
                     if not self.fits(context["members"]):
                         return False
-                    return self.queue.replace_logical_aggregation(row_id, encode_aggregation(context))
+                    return self.queue.replace_logical_aggregation(row_id, encode_aggregation(context),
+                        cancelled_member=member if member["status"] == "removed" else None)
             return False
 
     def queue_container_update(self, container_id, updates, *, key=None):

@@ -200,6 +200,79 @@ def test_pending_qualification_split_preserves_source_order(runtime):
     assert [child["source_id"] for row in MsgLog.select() if row.aggregate for child in row.aggregate["children"]] == ["before", "after"]
 
 
+@pytest.mark.parametrize("late_after_confirmation", [False, True])
+def test_split_recovery_keeps_preexisting_media_after_split_members(runtime, late_after_confirmation):
+    manager = runtime
+    handler = processor(manager)
+    append(manager, "before", 1)
+    key, _ = append(manager, "split", 1.1)
+    append(manager, "after", 1.2, "after body")
+    with manager.live_aggregation.independent(key):
+        manager._enqueue_requests([QueueRequest("send_message", (), {"chat_id": -100, "text": "media"})])
+    changed = source("split", "independent body")
+    changed.chat.members.append(changed.author)
+    changed.edit = True
+    changed.commands = MessageCommands([MessageCommand(name="Action", callable_name="action")])
+    handler.send_message(changed)
+    restart(manager)
+    manager.channel.commands = SimpleNamespace(register_command=lambda *a: None)
+    with patch("ehforwarderbot.coordinator.get_module_by_id", return_value=SimpleNamespace()):
+        if late_after_confirmation:
+            for _ in range(3):
+                complete(manager)
+        append(manager, "late", 1.3, "late text")
+        for _ in range(2 if late_after_confirmation else 5):
+            complete(manager)
+    assert [call[2] for call in manager.transport.calls] == [
+        "Alice:\nbody", "Alice:\nindependent body", "Alice:\nafter body", "media", "Alice:\nlate text",
+    ]
+
+
+def test_minimum_removal_resolves_pending_independent_source(runtime):
+    manager = runtime
+    handler = processor(manager)
+    key, _ = append(manager, "split", 1)
+    changed = source("split", "independent body")
+    changed.chat.members.append(changed.author)
+    changed.edit = True
+    changed.commands = MessageCommands([MessageCommand(name="Action", callable_name="action")])
+    handler.send_message(changed)
+    remove(handler, "split")
+    restart(manager)
+    _, member, _ = manager.live_aggregation.source_state(key, (key[0], "split"))
+    assert member["status"] == "removed"
+    assert member_message(member).text == "independent body"
+    manager._outbound_scheduler.dispatch_once()
+    assert not manager.transport.calls
+
+
+def test_pending_withdrawal_survives_restart_binding_change_and_explicit_edit(runtime):
+    manager = runtime
+    manager.channel.flag.config["text_aggregation"] = True
+    handler = processor(manager)
+    key, _ = append(manager, "withdrawn", 1, "saved withdrawn body")
+    remove(handler, "withdrawn")
+    restart(manager)
+    _, member, predecessor = manager.live_aggregation.source_state(key, (key[0], "withdrawn"))
+    assert member["status"] == "removed" and member["source_revision"] == 2
+    assert member_message(member).text == "saved withdrawn body" and predecessor is None
+    append(manager, "withdrawn", 10, "stale duplicate")
+    manager.channel.flag.config["text_aggregation"] = False
+    handler.get_slave_msg_dest = lambda msg: ("Alice:", (-101, 4))
+    handler.send_message(source("withdrawn", "redelivered after binding change"))
+    manager._outbound_scheduler.dispatch_once()
+    assert not manager.transport.calls and MsgLog.select().count() == 0
+    # An explicit newer source update is accepted durably before publication.
+    handler.get_slave_msg_dest = lambda msg: ("Alice:", (-100, None))
+    edit(handler, "withdrawn", "explicitly restored body")
+    restart(manager)
+    _, newer, _ = manager.live_aggregation.source_state(key, (key[0], "withdrawn"))
+    assert newer["status"] == "active" and newer["source_revision"] == 3
+    complete(manager)
+    assert manager.transport.calls[-1][2] == "Alice:\nexplicitly restored body"
+    assert manager.channel.db.resolve_source_member(key[0], "withdrawn", "-100")[1]["source_revision"] == 3
+
+
 def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtime):
     manager = runtime
     handler = processor(manager)
