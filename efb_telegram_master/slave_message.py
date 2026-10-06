@@ -255,6 +255,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 if (isinstance(aggregation, LiveTextAggregation) and not msg.edit
                         and (self.flag("text_aggregation") or key in aggregation.streams)):
                     with aggregation.independent(key):
+                        aggregation.close_source_routes(key)
                         self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
                                               dedupe_key=dedupe_key)
                 else:

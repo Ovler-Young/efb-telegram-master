@@ -96,6 +96,16 @@ class LiveTextAggregation:
             stream.base = None
             stream.generation += 1
 
+    def close_source_routes(self, key):
+        """End former target chats/topics when normal source delivery changes route."""
+        key = tuple(key)
+        prior_tail = None
+        for old_key, old_stream in self.streams.items():
+            if old_key[0] == key[0] and old_key != key:
+                prior_tail = self._existing_tail(old_stream) or prior_tail
+                self.close(old_key)
+        return prior_tail
+
     def append(self, key, member, *, silent=False):
         """Return False only when this single source needs independent delivery."""
         key = tuple(key)
@@ -115,12 +125,7 @@ class LiveTextAggregation:
             if not self.fits([member]):
                 return False
             now = member["received_time"].timestamp()
-            # A destination change ends the former source stream.
-            prior_tail = None
-            for old_key, old_stream in self.streams.items():
-                if old_key[0] == key[0] and old_key != key and old_key[1] != key[1]:
-                    prior_tail = self._existing_tail(old_stream) or prior_tail
-                    self.close(old_key)
+            prior_tail = self.close_source_routes(key)
             stream = self.streams.setdefault(key, _Stream())
             if stream.last_new and now - stream.last_new >= float(self.manager.channel.flag("text_aggregation_idle_seconds")):
                 self.close(key)

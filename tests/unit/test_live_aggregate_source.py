@@ -9,14 +9,15 @@ from telegram.error import NetworkError
 from telegram import Document, Message, Chat
 from ehforwarderbot import MsgType, Channel
 from ehforwarderbot.status import MessageRemoval
-from ehforwarderbot.message import MessageCommand, MessageCommands
+from ehforwarderbot.message import LinkAttribute, MessageCommand, MessageCommands
 
-from efb_telegram_master.aggregate import member_message
+from efb_telegram_master.aggregate import make_source_member, member_message
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.live_aggregate import LiveTextAggregation
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest
 from efb_telegram_master.queued_log import decode_aggregation
 from efb_telegram_master.slave_message import SlaveMessageProcessor
+from efb_telegram_master.utils import chat_id_to_str
 from tests.unit.test_live_aggregate import source, SourceCache
 from tests.unit.test_live_aggregate_runtime import runtime, append, complete
 
@@ -104,6 +105,41 @@ def test_independent_boundary_survives_restart(runtime):
     complete(manager)
     assert [call[2] for call in manager.transport.calls] == ["Alice:\nbody", "media", "Alice:\nbody"]
     assert [row.aggregate["children"][0]["source_id"] for row in MsgLog.select().order_by(MsgLog.master_msg_id)] == ["one", "three"]
+
+
+@pytest.mark.parametrize("middle_type", [MsgType.Text, MsgType.Link])
+def test_topic_association_change_closes_the_former_source_stream(runtime, monkeypatch, middle_type):
+    manager = runtime
+    manager.channel.flag.config["text_aggregation"] = True
+    handler = processor(manager)
+    handler.get_slave_msg_dest = lambda msg: ("Alice:", (-100, manager.channel.db.get_topic_thread_id(
+        chat_id_to_str(chat=msg.chat), -100)))
+    arrivals = {"one": 1, "other": 2, "one-follow": 3, "two": 5, "three": 9}
+    monkeypatch.setattr("efb_telegram_master.aggregate.make_source_member", lambda msg, **kwargs:
+                        make_source_member(msg, received_time=datetime.datetime.fromtimestamp(arrivals[str(msg.uid)]),
+                                           **kwargs))
+    for uid, topic in (("one", 7), ("other", 9), ("one-follow", 7), ("two", 8), ("three", 7)):
+        message = source(uid)
+        if uid == "other":
+            message.chat.uid = "other-group"
+        if uid == "two" and middle_type == MsgType.Link:
+            message.type = MsgType.Link
+            message.attributes = LinkAttribute("Link", url="https://example.com/")
+        message.chat.members.append(message.author)
+        manager.channel.db.add_topic_assoc(-100, topic, chat_id_to_str(chat=message.chat))
+        handler.send_message(message)
+        complete(manager)
+
+    rows = list(MsgLog.select().order_by(MsgLog.master_msg_id))
+    expected = [("7", ["one", "one-follow"]), ("9", ["other"])]
+    if middle_type == MsgType.Text:
+        expected.append(("8", ["two"]))
+    expected.append(("7", ["three"]))
+    assert [
+        (row.master_message_thread_id, [member["source_id"] for member in row.aggregate["children"]])
+        for row in rows if row.aggregate
+    ] == expected
+    assert manager.transport.messages[3].message_thread_id == 8
 
 
 def test_fixed_owner_update_uncertainty_survives_restart(runtime):
