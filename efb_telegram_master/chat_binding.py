@@ -259,10 +259,17 @@ class ChatBindingManager(LocaleMixin):
                 master_msg_id=utils.message_id_to_str(
                     chat_id=TelegramChatID(rtm.chat_id),
                     message_id=TelegramMessageID(rtm.message_id)
-                )
+                ), include_managed_alt=True
             )
             if msg_log:
-                channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(msg_log.slave_origin_uid))
+                if msg_log.aggregate:
+                    origins = {child['origin_uid'] for child in msg_log.aggregate['children']}
+                    if len(origins) != 1:
+                        return self.bot.reply_error(update, self._('Cannot determine the source chat of this container.'))
+                    origin_uid = origins.pop()
+                else:
+                    origin_uid = msg_log.slave_origin_uid
+                channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(origin_uid))
                 chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(
