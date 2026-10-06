@@ -885,6 +885,10 @@ class DatabaseManager:
                                 (old["source_revision"] == member["source_revision"] and
                                  old["status"] != "active")):
                         saved["children"][index] = copy.deepcopy(old)
+                    elif old and old["status"] == "redirected":
+                        # Confirmed replacement routing survives every container receipt.
+                        member["status"] = "redirected"
+                        member["replacement_master_msg_id"] = old["replacement_master_msg_id"]
             first = saved["children"][0]
             if row is None:
                 self.add_or_update_message_log(member_message(first), master_message, sender_bot_id=sender_bot_id)
@@ -917,6 +921,8 @@ class DatabaseManager:
                 row = self._locked_message_log(str(message_id_to_str(*old_message_id)), include_alt=True)
             if row and row.source_member and row.source_member["source_revision"] >= member["source_revision"]:
                 return row
+            if row is not None:
+                old_message_id = tuple(int(value) for value in row.master_msg_id.rsplit(".", 1))
             self.add_or_update_message_log(msg, master_message, old_message_id, sender_bot_id)
             row = self._locked_message_log(master_id, include_alt=True)
             if row is None and old_message_id:

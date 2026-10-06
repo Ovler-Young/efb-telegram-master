@@ -57,6 +57,7 @@ def test_member_roundtrip_mapping_and_legacy_restoration(manager):
 
     assert len(manager.get_container_members(row.master_msg_id)) == 2
     assert MsgLogMember.select().count() == 2
+
     with sqlite3.connect(str(manager._base_path / "tgdata.db")) as exported:
         migrate_db._validate_source(exported)
         assert MsgLogMember in migrate_db.MODELS
@@ -140,6 +141,18 @@ def test_redirect_is_atomic_and_preserves_confirmed_presentation_and_commands(ma
         "latest standalone source", "-100.3", 3)
     assert MsgLogMember.select().count() == 2
 
+    latest = source(text="updated through alternate receipt")
+    latest_member = make_source_member(latest, source_revision=4)
+    manager.finalize_source_message(latest, receipt(3), latest_member, "800")
+    assert MsgLog.select().count() == 2
+    assert manager.get_msg_log(master_msg_id="-100.2").source_member["source_revision"] == 4
+
+    active_snapshot = copy.deepcopy(latest_member)
+    manager.finalize_aggregate_message(receipt(), make_aggregate([active_snapshot], 2), "700")
+    old = manager.get_msg_log(master_msg_id="-100.1")
+    assert old.aggregate["children"][0]["status"] == "redirected"
+    assert old.aggregate["children"][0]["replacement_master_msg_id"] == "-100.2"
+    assert manager.resolve_source_member(member["origin_uid"], "one", "-100")[0].master_msg_id == "-100.2"
 
 def test_rendering_preserves_identities_reply_and_utf16_ranges():
     first = source("one", "😀 <same>", "A & B")
