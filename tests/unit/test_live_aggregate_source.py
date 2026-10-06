@@ -338,7 +338,7 @@ def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtim
         manager.transport.messages[number] = receipt
         return receipt
     manager.transport.send_document = send_document
-    long_body = "full source body " * 16875  # 270,000 characters exceed the saved-payload limit.
+    long_body = "x" * 270000
     edit(handler, "one", long_body)
     append(manager, "after", 10, "next text")
     complete(manager)
