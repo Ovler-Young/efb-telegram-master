@@ -151,8 +151,6 @@ class TelegramChannel(MasterChannel):
         self.bot_manager.dispatcher.add_handler(
             CallbackQueryHandler(self.bot_manager.as_async_callback(self.void_callback_handler), pattern="void"))
         self.bot_manager.dispatcher.add_handler(
-            CallbackQueryHandler(self.bot_manager.as_async_callback(self.bot_manager.session_expired)))
-        self.bot_manager.dispatcher.add_handler(
             CommandHandler("react", self.bot_manager.as_async_callback(self.react), filters=non_edit_filter)
         )
 
@@ -163,6 +161,8 @@ class TelegramChannel(MasterChannel):
         # Register master message handlers after commands to prevent commands
         # commands to be delivered as messages
         self.master_messages: MasterMessageProcessor = MasterMessageProcessor(self)
+        self.bot_manager.dispatcher.add_handler(
+            CallbackQueryHandler(self.bot_manager.as_async_callback(self.bot_manager.session_expired)))
 
         self.bot_manager.dispatcher.add_error_handler(self.bot_manager.as_async_callback(self.error))
 
@@ -487,6 +487,11 @@ class TelegramChannel(MasterChannel):
                                    "You cannot react to this message."))
             return
 
+        if msg_log.aggregate:
+            sync_reply_text(self.bot_manager, message,
+                            self._("Reactions to aggregated messages are not supported yet."))
+            return
+
         if not reaction:
             msg_log_obj: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
             reactors = msg_log_obj.reactions
@@ -713,14 +718,25 @@ class TelegramChannel(MasterChannel):
 
     def get_message_by_id(self, chat: Chat,
                           msg_id: MessageID) -> Optional[EFBMessage]:
+        from .member_selection import current_source_route
+
         origin_uid = etm_utils.chat_id_to_str(chat=chat)
-        msg_log = self.db.get_msg_log(slave_origin_uid=origin_uid,
-                                      slave_msg_id=msg_id)
-        if msg_log is not None:
-            return msg_log.build_etm_msg(self.chat_manager)
-        else:
-            # Message is not found.
+        target_chat, topic = current_source_route(self, str(origin_uid))
+        try:
+            resolved = self.db.resolve_source_member(str(origin_uid), str(msg_id), str(target_chat), topic)
+        except ValueError:
             return None
+        if resolved:
+            msg_log, member = resolved
+            if member is not None:
+                return msg_log.build_source_member(member, self.chat_manager)
+            return msg_log.build_etm_msg(self.chat_manager)
+        # Preserve legacy independent lookups when their original target was
+        # changed; indexed members require an effective current association.
+        msg_log = self.db.get_msg_log(slave_origin_uid=origin_uid, slave_msg_id=msg_id)
+        if msg_log is not None and not msg_log.aggregate and not msg_log.source_member:
+            return msg_log.build_etm_msg(self.chat_manager)
+        return None
 
     def void_callback_handler(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
