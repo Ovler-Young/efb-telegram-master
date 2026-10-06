@@ -1592,13 +1592,17 @@ class OutboundQueue:
                 return {}
             self._record_source_cancellation(tuple(key), member)
             predecessors = {}
+            payloads = []
             for row_id in matching:
-                predecessor = self.connection.execute(
-                    "SELECT predecessor_id FROM outbound_queue WHERE id=?", (row_id,),
-                ).fetchone()[0]
+                predecessor, payload = self.connection.execute(
+                    "SELECT predecessor_id, payload FROM outbound_queue WHERE id=?", (row_id,),
+                ).fetchone()
                 self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (predecessor, row_id))
                 self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
                 predecessors[row_id] = predecessor
+                payloads.append(payload)
+        for payload in payloads:
+            self.cleanup_payload_media(payload)
         self.refresh_depth()
         return predecessors
 

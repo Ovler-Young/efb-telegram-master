@@ -228,16 +228,26 @@ def test_split_recovery_keeps_preexisting_media_after_split_members(runtime, lat
     ]
 
 
-def test_minimum_removal_resolves_pending_independent_source(runtime):
+def test_minimum_removal_resolves_pending_independent_source(runtime, tmp_path):
     manager = runtime
     handler = processor(manager)
     key, _ = append(manager, "split", 1)
+    manager.transport.send_document = lambda chat_id, document, caption=None, **kwargs: None
+    path = tmp_path / "source.txt"
+    path.write_bytes(b"complete attachment content")
     changed = source("split", "independent body")
     changed.chat.members.append(changed.author)
     changed.edit = True
-    changed.commands = MessageCommands([MessageCommand(name="Action", callable_name="action")])
+    changed.type = MsgType.File
+    changed.file = path.open("rb")
+    changed.path = path
+    changed.filename = "source.txt"
+    changed.mime = "text/plain"
     handler.send_message(changed)
+    assert list(manager._outbound_queue.media_dir.iterdir())
     remove(handler, "split")
+    assert not list(manager._outbound_queue.media_dir.iterdir())
+    assert path.read_bytes() == b"complete attachment content"
     restart(manager)
     _, member, _ = manager.live_aggregation.source_state(key, (key[0], "split"))
     assert member["status"] == "removed"
