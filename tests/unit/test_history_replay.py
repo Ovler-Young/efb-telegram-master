@@ -1,6 +1,8 @@
 """History replay contracts: real SQLite state, bounded batching, sender-owned media."""
 
+import sqlite3
 from concurrent.futures import Future
+from contextlib import closing
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -251,19 +253,28 @@ def test_global_history_order_and_cursor_use_final_position_without_changing_own
     assert history.calls[0]['kwargs']['text'] == ''.join(entry.formatted_text for entry in pages)
 
 
-def test_old_pending_history_gains_nullable_received_time_and_keeps_its_replay(history):
-    target = populate(history, ['legacy pending\n'])
-    key = target.ownership_key
-    with connection_scope(history.db._managed_database):
-        history.db._managed_database.execute_sql('ALTER TABLE historymigrationentry DROP COLUMN received_time')
-    history.db.stop_worker()
-    reopened = DatabaseManager(SimpleNamespace(channel_id='history-test', config={}))
-    history.db = reopened
-    history.binding.db = reopened
-    restored = reopened.get_next_history_migration_target()
-    assert restored.received_time is None and restored.ownership_key == key
+def test_old_pending_history_gains_nullable_received_time_and_keeps_its_replay(tmp_path, request):
+    with closing(sqlite3.connect(tmp_path / 'tgdata.db')) as legacy:
+        legacy.execute(
+            'CREATE TABLE historymigrationentry ('
+            'id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, '
+            'message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, '
+            'media_type TEXT, source_time DATETIME, position INTEGER NOT NULL, created_at DATETIME NOT NULL)'
+        )
+        legacy.execute(
+            'INSERT INTO historymigrationentry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (7, 'slave chat', '-1002', '42', '-1001.1', 'legacy pending\n', 'Text',
+             datetime(2026, 1, 1), 12, datetime(2026, 1, 1)),
+        )
+        legacy.commit()
+    # Start the existing fixture only after the historical database is on disk.
+    history = request.getfixturevalue('history')
+    restored = history.db.get_next_history_migration_target()
+    assert restored.received_time is None and restored.ownership_key == 'legacy:7'
+    assert restored.position == 12
     assert history.binding._process_history_migration_target(restored)
     assert history.calls[0]['kwargs']['text'] == 'legacy pending\n'
+    assert history.db.get_next_history_migration_target() is None
 
 
 class Sender:

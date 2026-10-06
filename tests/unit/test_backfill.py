@@ -15,6 +15,9 @@ from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
+from tests.unit.test_history_replay import history as history
+
+
 def _build_link_update(chat_id, *, is_forum=False):
     effective_chat = SimpleNamespace(id=chat_id, is_forum=is_forum, type="group")
     message = Mock()
@@ -314,26 +317,23 @@ def test_start_uses_raw_message_args_for_link_chat(channel):
     link_chat.assert_called_once_with(update, ["token", "true"])
 
 
-def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channel):
-    HistoryMigrationEntry.delete().execute()
+def test_migrate_chat_history_enqueues_ordered_batches_and_clears_pending_entries(history):
+    manager = history.binding
+    manager._history_migration_locks_lock = threading.Lock()
+    manager._history_migration_locks = {}
+    manager.bot.history_ownership_page = Mock(return_value=[])
     msg_logs = []
     base_time = datetime.now()
     for idx in range(3):
-        msg_log = Mock()
-        msg_log.master_msg_id = f"1.{idx}"
         # Each source exceeds half the batch limit, so these stay separate.
-        msg_log.text = "x" * 2500
-        msg_log.media_type = "Text"
-        msg_log.time = base_time + timedelta(seconds=idx)
+        msg_log = MsgLog(master_msg_id=f"1.{idx}", text="x" * 2500,
+                         media_type="Text", time=base_time + timedelta(seconds=idx))
         etm_msg = SimpleNamespace(author=SimpleNamespace(display_name=f"author-{idx}"))
-        msg_log.build_etm_msg.return_value = etm_msg
+        msg_log.build_etm_msg = Mock(return_value=etm_msg)
         msg_logs.append(msg_log)
 
-    media_log = Mock()
-    media_log.text = ""
-    media_log.media_type = "Photo"
-    media_log.master_msg_id = "1.2"
-    media_log.time = base_time + timedelta(seconds=10)
+    media_log = MsgLog(master_msg_id="1.2", text="", media_type="Photo",
+                       time=base_time + timedelta(seconds=10))
     msg_logs.append(media_log)
 
     waiters = []
@@ -342,10 +342,10 @@ def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channe
         waiter.set_result(None)
         waiters.append(waiter)
     source = SimpleNamespace(sender_bot_id=None, master_msg_id_alt=None, media_type=None, file_id=None)
-    with patch.object(channel.db, "get_recent_messages", return_value=msg_logs), \
-         patch.object(channel.db, "get_msg_log", return_value=source), \
-         patch.object(channel.bot_manager, "enqueue_history_operation", side_effect=waiters) as enqueue:
-        channel.chat_binding._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
+    with patch.object(manager.db, "get_recent_messages", return_value=msg_logs), \
+         patch.object(manager.db, "get_msg_log", return_value=source), \
+         patch.object(manager.bot, "enqueue_history_operation", side_effect=waiters) as enqueue:
+        manager._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
 
     assert enqueue.call_count == 4
     assert [call.kwargs["operation"] for call in enqueue.call_args_list] == [
