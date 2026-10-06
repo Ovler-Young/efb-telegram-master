@@ -411,7 +411,7 @@ class LiveTextAggregation:
                 successor["old_message_id"] = tuple(int(value) for value in saved.master_msg_id.rsplit(".", 1))
                 successor["required_sender"] = sender_bot_id or "__main__"
             return encode_aggregation(successor)
-        identifiers = self.queue.handoff_aggregation(row.id, encode_aggregation(context), update_successor,
+        identifiers, _ = self.queue.handoff_aggregation(row.id, encode_aggregation(context), update_successor,
                 requests=requests, operation_resolver=self.manager._queue_operation)
         if identifiers:
             self.container_tails[context["old_container_id"]] = identifiers[-1]

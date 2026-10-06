@@ -703,10 +703,23 @@ class OutboundQueue:
                 self._ownership_file.close()
                 self._ownership_file = None
 
-    def refresh_depth(self) -> None:
+    def observe_metrics(self, observation: Callable[[QueueMetrics], None]) -> None:
+        """Keep telemetry failures outside committed queue and delivery work."""
         if self.metrics is not None:
-            depth = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
-            self.metrics.set_queue_depth(int(depth))
+            try:
+                observation(self.metrics)
+            except Exception:
+                logging.getLogger(__name__).exception("Unable to observe outbound metrics.")
+
+    def refresh_depth(self) -> None:
+        with self._lock:
+            if self.metrics is not None:
+                depth = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
+                self.observe_metrics(lambda metrics: metrics.set_queue_depth(int(depth)))
+
+    def _observe_removed(self, priority: int, operation: str, created_at: float, outcome: str) -> None:
+        residence = max(0.0, time.time() - created_at)
+        self.observe_metrics(lambda metrics: metrics.record_removal(priority, operation, outcome, residence))
 
     def has_queued_calls(self) -> bool:
         """Return whether a durable call is waiting without loading its payload."""
@@ -716,9 +729,7 @@ class OutboundQueue:
             ).fetchone() is not None
 
     def record_removal(self, row: QueuedCall, outcome: str) -> None:
-        if self.metrics is not None:
-            residence_seconds = max(0.0, time.time() - row.created_at)
-            self.metrics.record_removal(row.priority, row.operation, outcome, residence_seconds)
+        self._observe_removed(row.priority, row.operation, row.created_at, outcome)
         self.refresh_depth()
 
     def _store_media_stream(
@@ -1392,7 +1403,7 @@ class OutboundQueue:
                 self.connection.execute("BEGIN")
                 if logical_split:
                     from .queued_log import decode_aggregation, encode_aggregation
-                    original = self.connection.execute("SELECT predecessor_id, log_context FROM outbound_queue WHERE "
+                    original = self.connection.execute("SELECT predecessor_id, log_context, priority, operation, created_at FROM outbound_queue WHERE "
                         "id=? AND delivery_state='queued' AND delivery_hold IS NULL", (logical_split["row_id"],)).fetchone()
                     if original is None or decode_aggregation(original[1])["kind"] != "logical":
                         raise QueuePersistenceError("Source batch was submitted before its split.")
@@ -1440,7 +1451,9 @@ class OutboundQueue:
                 raise QueueEnqueueError("Unable to commit queued Telegram call.") from error
             if self.metrics is not None:
                 for operation, _args, _kwargs, _chat_id, priority, _slave_id, _required_sender, _payload, _log_context, _created_media in prepared:
-                    self.metrics.record_enqueued(priority, operation)
+                    self.observe_metrics(lambda metrics: metrics.record_enqueued(priority, operation))
+            if logical_split and not before:
+                self._observe_removed(original[2], original[3], original[4], "replaced")
             self.refresh_depth()
             waiter: Future = Future()
             self.waiters[identifiers[0]] = waiter
@@ -1520,55 +1533,64 @@ class OutboundQueue:
 
     def handoff_aggregation(self, row_id: int, parent_context: bytes,
                             update_successor: Callable[[bytes], bytes], *,
-                            requests: Iterable[QueueRequest] = (), operation_resolver=None) -> list[int]:
+                            requests: Iterable[QueueRequest] = (), operation_resolver=None) -> tuple[list[int], bool]:
         """Publish the confirmed base and parent handoff in one queue transaction."""
         from .queued_log import decode_aggregation
-        with self._lock, self.connection:
-            previous = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
-            if previous and decode_aggregation(previous[0]).get("handoff"):
-                return []
-            identifiers = []
-            for request in requests:
-                item = self._prepare(request, operation_resolver(request.operation))
-                operation, _, _, chat_id, priority, slave_id, required_sender, payload, context, _ = item
-                cursor = self.connection.execute(
-                    "INSERT INTO outbound_queue (priority, telegram_chat_id, operation, payload, slave_id, "
-                    "required_sender_bot_id, created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), context, request.predecessor_id))
-                identifier = cursor.lastrowid
-                if identifier is None:
-                    raise QueuePersistenceError("SQLite did not return the aggregation successor ID.")
-                identifiers.append(identifier)
-            parent = decode_aggregation(parent_context)
-            rows = self.connection.execute(
-                "SELECT id, log_context FROM outbound_queue WHERE predecessor_id=? OR predecessor_id=?",
-                (row_id, parent.get("supplement_id")),
-            ).fetchall()
-            for identifier, context in rows:
-                if context and context[:1] == b"\x03":
-                    updated = update_successor(context)
-                    owner = decode_aggregation(updated).get("required_sender")
-                    self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
-                                            (updated, identifier))
-                    if owner is not None:
-                        self.connection.execute("UPDATE outbound_queue SET required_sender_bot_id=? WHERE id=?", (owner, identifier))
-            self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
-                                    (parent_context, row_id))
-            self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
-        return identifiers
+        with self._lock:
+            with self.connection:
+                previous = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
+                if previous is None or decode_aggregation(previous[0]).get("handoff"):
+                    return [], False
+                identifiers = []
+                inserted = []
+                for request in requests:
+                    item = self._prepare(request, operation_resolver(request.operation))
+                    operation, _, _, chat_id, priority, slave_id, required_sender, payload, context, _ = item
+                    cursor = self.connection.execute(
+                        "INSERT INTO outbound_queue (priority, telegram_chat_id, operation, payload, slave_id, "
+                        "required_sender_bot_id, created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), context, request.predecessor_id))
+                    identifier = cursor.lastrowid
+                    if identifier is None:
+                        raise QueuePersistenceError("SQLite did not return the aggregation successor ID.")
+                    identifiers.append(identifier)
+                    inserted.append((priority, operation))
+                parent = decode_aggregation(parent_context)
+                rows = self.connection.execute(
+                    "SELECT id, log_context FROM outbound_queue WHERE predecessor_id=? OR predecessor_id=?",
+                    (row_id, parent.get("supplement_id")),
+                ).fetchall()
+                for identifier, context in rows:
+                    if context and context[:1] == b"\x03":
+                        updated = update_successor(context)
+                        owner = decode_aggregation(updated).get("required_sender")
+                        self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                                (updated, identifier))
+                        if owner is not None:
+                            self.connection.execute("UPDATE outbound_queue SET required_sender_bot_id=? WHERE id=?", (owner, identifier))
+                self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                        (parent_context, row_id))
+                self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
+            for priority, operation in inserted:
+                self.observe_metrics(lambda metrics: metrics.record_enqueued(priority, operation))
+            self.refresh_depth()
+        return identifiers, True
 
     def cancel_logical_aggregation(self, row_id: int, *, cancelled_member=None) -> Optional[int]:
         """Remove an unsubmitted empty batch while retaining its predecessor barrier."""
-        with self._lock, self.connection:
-            row = self.connection.execute("SELECT predecessor_id, log_context FROM outbound_queue WHERE id=? AND "
-                                          "delivery_state='queued' AND delivery_hold IS NULL", (row_id,)).fetchone()
-            if row is None:
-                raise QueuePersistenceError("The logical batch was already submitted.")
-            if cancelled_member is not None:
-                from .queued_log import decode_aggregation
-                self._record_source_cancellation(tuple(decode_aggregation(row[1])["key"]), cancelled_member)
-            self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (row[0], row_id))
-            self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
+        with self._lock:
+            with self.connection:
+                row = self.connection.execute("SELECT predecessor_id, log_context, priority, operation, created_at FROM outbound_queue WHERE id=? AND "
+                                              "delivery_state='queued' AND delivery_hold IS NULL", (row_id,)).fetchone()
+                if row is None:
+                    raise QueuePersistenceError("The logical batch was already submitted.")
+                if cancelled_member is not None:
+                    from .queued_log import decode_aggregation
+                    self._record_source_cancellation(tuple(decode_aggregation(row[1])["key"]), cancelled_member)
+                self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (row[0], row_id))
+                self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
+            self._observe_removed(row[2], row[3], row[4], "cancelled")
+            self.refresh_depth()
         return row[0]
 
     def cancel_pending_source(self, key: tuple, member: SourceMember) -> dict[int, Optional[int]]:
@@ -1593,14 +1615,18 @@ class OutboundQueue:
             self._record_source_cancellation(tuple(key), member)
             predecessors = {}
             payloads = []
+            removed = []
             for row_id in matching:
-                predecessor, payload = self.connection.execute(
-                    "SELECT predecessor_id, payload FROM outbound_queue WHERE id=?", (row_id,),
+                predecessor, payload, priority, operation, created_at = self.connection.execute(
+                    "SELECT predecessor_id, payload, priority, operation, created_at FROM outbound_queue WHERE id=?", (row_id,),
                 ).fetchone()
                 self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (predecessor, row_id))
                 self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
                 predecessors[row_id] = predecessor
                 payloads.append(payload)
+                removed.append((priority, operation, created_at))
+        for priority, operation, created_at in removed:
+            self._observe_removed(priority, operation, created_at, "cancelled")
         for payload in payloads:
             self.cleanup_payload_media(payload)
         self.refresh_depth()

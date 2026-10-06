@@ -16,7 +16,7 @@ from .outbound import QUEUED_OPERATIONS
 
 _PRIORITIES = frozenset({"blocking", "normal"})
 _SENDER_KINDS = frozenset({"main", "auxiliary"})
-_REMOVAL_OUTCOMES = frozenset({"submitted", "terminal_discard"})
+_REMOVAL_OUTCOMES = frozenset({"submitted", "terminal_discard", "cancelled", "replaced"})
 _COMPLETION_OUTCOMES = frozenset({"success", "failure"})
 _DISPATCH_OUTCOMES = frozenset({"submitted", "deferred", "failed"})
 _RETRY_REASONS = frozenset(
@@ -44,6 +44,7 @@ _DATABASE_METHODS = frozenset({
     "finalize_source_message",
     "finalize_member_redirect",
     "get_container_members",
+    "get_source_message_logs",
     "resolve_source_member",
     "get_msg_log",
     "delete_msg_log",
