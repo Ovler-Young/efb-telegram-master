@@ -62,6 +62,7 @@ _DATABASE_METHODS = frozenset({
     "get_history_migration_entries",
     "delete_history_migration_entry",
 })
+_AGGREGATION_PURPOSES = frozenset({"aggregate", "routing_hint", "source", "redirect", "boundary"})
 _DATABASE_OUTCOMES = frozenset({"success", "failure"})
 
 
@@ -226,6 +227,36 @@ class Metrics:
             ["method"],
             registry=self.registry,
         )
+        self.aggregation_sources = Counter(
+            f"{namespace}_aggregation_sources_total",
+            "New source-to-destination members durably admitted to live aggregation.",
+            registry=self.registry,
+        )
+        self.aggregation_containers = Counter(
+            f"{namespace}_aggregation_containers_total",
+            "New live aggregate containers whose first handoff committed.",
+            registry=self.registry,
+        )
+        self.aggregation_rpc_requests = Counter(
+            f"{namespace}_aggregation_rpc_requests_total",
+            "Telegram SDK method invocations for tagged aggregation workflow rows, including retries.",
+            ["operation", "purpose", "sender_kind"], registry=self.registry,
+        )
+        self.aggregation_published_batch_members = Histogram(
+            f"{namespace}_aggregation_published_batch_members",
+            "New members in each nonempty confirmed aggregate append batch.",
+            buckets=(1, 2, 5, 10, 20, 50, 100, 200), registry=self.registry,
+        )
+        self.aggregation_member_confirmation = Histogram(
+            f"{namespace}_aggregation_member_confirmation_seconds",
+            "Seconds from member reception to first committed aggregate handoff, including reconciliation.",
+            buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 300, 1800), registry=self.registry,
+        )
+        self.aggregation_payload = Histogram(
+            f"{namespace}_aggregation_payload_bytes",
+            "Full protocol-5 pickle bytes of the saved member list per confirmed aggregate publication or update.",
+            buckets=(1024, 4096, 16384, 65536, 131072, 262144, 1048576), registry=self.registry,
+        )
         self.register_process_collector(process_factory, network_io_counters)
 
     @staticmethod
@@ -358,6 +389,27 @@ class Metrics:
         )
         if self._bounded(outcome, _DATABASE_OUTCOMES, "database method outcome") == "failure":
             self.database_method_failures.labels(*labels).inc()
+
+    def record_aggregation_source(self) -> None:
+        self.aggregation_sources.inc()
+
+    def record_aggregation_container(self) -> None:
+        self.aggregation_containers.inc()
+
+    def record_aggregation_rpc(self, operation: str, purpose: str, sender_kind: str) -> None:
+        self.aggregation_rpc_requests.labels(
+            self._operation(operation), self._bounded(purpose, _AGGREGATION_PURPOSES, "aggregation purpose"),
+            self._sender_kind(sender_kind),
+        ).inc()
+
+    def record_aggregation_batch(self, members: int) -> None:
+        self.aggregation_published_batch_members.observe(self._count(members, "published batch members"))
+
+    def record_aggregation_confirmation(self, seconds: float) -> None:
+        self.aggregation_member_confirmation.observe(self._non_negative(seconds, "member confirmation"))
+
+    def record_aggregation_payload(self, size_bytes: int) -> None:
+        self.aggregation_payload.observe(self._count(size_bytes, "aggregation payload bytes"))
 
     def membership_probe(self, _bot_id: object, _username: object, outcome: str) -> None:
         """Compatibility entry point for auxiliary probes; bot identity is intentionally unlabelled."""

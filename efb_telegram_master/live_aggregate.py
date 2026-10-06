@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import pickle
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -141,6 +142,7 @@ class LiveTextAggregation:
                                        + float(self.manager.channel.flag("text_aggregation_window_seconds")))
                     if self.queue.replace_logical_aggregation(stream.tail, encode_aggregation(context)):
                         self.pending_sources[identity] = stream.tail
+                        self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_source())
                         self.scheduler.wake_event.set()
                         return True
                 # Pending capacity becomes a publication boundary.
@@ -159,6 +161,7 @@ class LiveTextAggregation:
             row_id, _ = self.queue.enqueue_many([request], self.manager._queue_operation)
             stream.tail = row_id
             self.pending_sources[identity] = row_id
+            self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_source())
             self.scheduler.wake_event.set()
             return True
 
@@ -355,7 +358,19 @@ class LiveTextAggregation:
             return encode_aggregation(successor)
 
         context["handoff"] = True
-        self.queue.handoff_aggregation(row.id, encode_aggregation(context), update_successor)
+        _, changed = self.queue.handoff_aggregation(row.id, encode_aggregation(context), update_successor)
+        if changed:
+            if row.operation == "send_message":
+                self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_container())
+            members = context.get("members", [])
+            if members:
+                self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_batch(len(members)))
+                confirmed_at = time.time()
+                for member in members:
+                    self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_confirmation(
+                        max(0.0, confirmed_at - member["received_time"].timestamp())))
+            self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_payload(
+                len(pickle.dumps(saved.aggregate["children"], protocol=5))))
         stream = self.streams.get(tuple(context["key"]))
         if stream and context.get("appendable", True) and stream.generation == context["generation"]:
             stream.base = base

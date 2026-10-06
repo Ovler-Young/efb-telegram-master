@@ -1568,10 +1568,18 @@ class TelegramBotManager(LocaleMixin):
         if row.operation == "copy_message" and isinstance(replay, dict) and replay.get("attempted_fallback"):
             self._outbound_queue.record_history_fallback(row.id, None)
 
+        def invoke_method() -> object:
+            if aggregation_context:
+                purpose = "routing_hint" if aggregation_context.get("routing_hint") else aggregation_context["kind"]
+                sender_kind = "auxiliary" if selection.sender_bot_id is not None else "main"
+                self._outbound_queue.observe_metrics(
+                    lambda metrics: metrics.record_aggregation_rpc(row.operation, purpose, sender_kind))
+            return method(*telegram_args, **telegram_kwargs)
+
         def call_method() -> object:
             nonlocal migration_retried, telegram_args, telegram_kwargs
             try:
-                return method(*telegram_args, **telegram_kwargs)
+                return invoke_method()
             except telegram.error.ChatMigrated as error:
                 if migration_retried:
                     raise
@@ -1603,7 +1611,7 @@ class TelegramBotManager(LocaleMixin):
                         f"Telegram chat migrated to {error.new_chat_id}."
                     ) from error
                 try:
-                    return method(*telegram_args, **telegram_kwargs)
+                    return invoke_method()
                 except (telegram.error.RetryAfter, telegram.error.NetworkError) as retry_error:
                     setattr(retry_error, "_etm_telegram_chat_id", error.new_chat_id)
                     raise

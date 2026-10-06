@@ -519,6 +519,24 @@ class QueueAdapter(Protocol):
 
 
 class QueueMetrics(Protocol):
+    def record_aggregation_source(self) -> None:
+        ...
+
+    def record_aggregation_container(self) -> None:
+        ...
+
+    def record_aggregation_rpc(self, operation: str, purpose: str, sender_kind: str) -> None:
+        ...
+
+    def record_aggregation_batch(self, members: int) -> None:
+        ...
+
+    def record_aggregation_confirmation(self, seconds: float) -> None:
+        ...
+
+    def record_aggregation_payload(self, size_bytes: int) -> None:
+        ...
+
     def record_enqueued(self, priority: int, operation: str) -> None:
         ...
 
@@ -2305,9 +2323,6 @@ class OutboundQueue:
                 )
                 if cursor.rowcount != 1:
                     raise QueuePersistenceError(f"Queued row {row_id} cannot record Telegram completion.")
-                depth = 0
-                if prepared is not None and self.metrics is not None:
-                    depth = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
                 self.connection.commit()
             except Exception:
                 try:
@@ -2317,9 +2332,9 @@ class OutboundQueue:
                 if prepared is not None:
                     self._cleanup_created_media(prepared[9])
                 raise
-        if prepared is not None and self.metrics is not None:
-            self.metrics.record_enqueued(prepared[4], prepared[0])
-            self.metrics.set_queue_depth(depth)
+            if prepared is not None:
+                self.observe_metrics(lambda metrics: metrics.record_enqueued(prepared[4], prepared[0]))
+                self.refresh_depth()
 
     def record_history_fallback(self, row_id: int, operation: Optional[str]) -> None:
         """Record which history RPC may have been accepted, before making that RPC."""
