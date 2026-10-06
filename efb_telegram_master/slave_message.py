@@ -1649,8 +1649,8 @@ class SlaveMessageProcessor(LocaleMixin):
                            if (child["origin_uid"], child["source_id"]) == (slave_origin_uid, str(status.msg_id))), None)
             if member is None:
                 return
-            old_msg = old_msg_db.build_source_member(member, self.chat_manager)
-            _, (target, topic) = self.get_slave_msg_dest(old_msg)
+            source_msg = old_msg_db.build_source_member(member, self.chat_manager)
+            _, (target, topic) = self.get_slave_msg_dest(source_msg)
             resolved = self.db.resolve_source_member(slave_origin_uid, str(status.msg_id), str(target),
                                                      str(topic) if topic is not None else None)
             if resolved is None or resolved[0].aggregate:

@@ -1466,7 +1466,8 @@ class OutboundQueue:
                 "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, predecessor_id "
                 "FROM outbound_queue WHERE substr(log_context, 1, 1)=? ORDER BY id", (b"\x03",),
             ).fetchall()
-        return [QueuedCall(*row[:11], 0, 0, row[11]) for row in rows]
+        return [QueuedCall(row[0], row[1], row[2], row[3], row[4], row[5], row[6],
+                           row[7], row[8], row[9], row[10], predecessor_id=row[11]) for row in rows]
 
     def cancelled_source(self, identity: tuple[str, str]) -> Optional[dict]:
         """Read a confirmed unpublished withdrawal independently of destination."""

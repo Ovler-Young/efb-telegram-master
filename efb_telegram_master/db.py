@@ -46,7 +46,7 @@ from .message import ETMMsg
 from .msg_type import TGMsgType
 from .aggregate import AggregatePayload, SourceMember, member_identity, member_message
 from .utils import TelegramChatID, EFBChannelChatIDStr, TgChatMsgIDStr, message_id_to_str, \
-    chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID
+    chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID, message_id_str_to_id
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -877,13 +877,14 @@ class DatabaseManager:
         identities = [member_identity(member) for member in aggregate["children"]]
         if len(set(identities)) != len(identities):
             raise ValueError("A source may occur only once in a live aggregate.")
-        master_id = str(message_id_to_str(master_message.chat_id, master_message.message_id))
+        master_id = str(message_id_to_str(
+            TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)))
         with database.atomic(*(() if isinstance(database.obj, PostgresqlDatabase) else ("IMMEDIATE",))):
             row = self._locked_message_log(master_id)
             previous = row.aggregate if row else None
             if row and previous is None:
                 raise ValueError("Cannot replace an independent message with a live aggregate.")
-            if previous and previous["revision"] >= aggregate["revision"]:
+            if row is not None and previous and previous["revision"] >= aggregate["revision"]:
                 return row
             if row and row.sender_bot_id != sender_bot_id:
                 raise ValueError("A live aggregate retains its sending Bot.")
@@ -927,7 +928,8 @@ class DatabaseManager:
         """Finalize an independent source version while keeping normal command metadata."""
         if member_identity(member) != (str(chat_id_to_str(chat=msg.chat)), str(msg.uid)):
             raise ValueError("The output and saved source member must have the same identity.")
-        master_id = str(message_id_to_str(master_message.chat_id, master_message.message_id))
+        master_id = str(message_id_to_str(
+            TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)))
         with database.atomic(*(() if isinstance(database.obj, PostgresqlDatabase) else ("IMMEDIATE",))):
             row = self._locked_message_log(master_id, include_alt=True)
             if row is None and old_message_id:
@@ -935,7 +937,7 @@ class DatabaseManager:
             if row and row.source_member and row.source_member["source_revision"] >= member["source_revision"]:
                 return row
             if row is not None:
-                old_message_id = tuple(int(value) for value in row.master_msg_id.rsplit(".", 1))
+                old_message_id = message_id_str_to_id(TgChatMsgIDStr(row.master_msg_id))
             self.add_or_update_message_log(msg, master_message, old_message_id, sender_bot_id)
             row = self._locked_message_log(master_id, include_alt=True)
             if row is None and old_message_id:
@@ -978,6 +980,7 @@ class DatabaseManager:
             redirected["replacement_master_msg_id"] = replacement.master_msg_id
             aggregate["children"] = [redirected if member_identity(child) == member_identity(member) else child
                                      for child in aggregate["children"]]
+            assert old.pickle is not None
             misc = pickle.loads(bytes(old.pickle))
             misc["aggregate"] = aggregate
             old.pickle = pickle.dumps(misc, protocol=5)

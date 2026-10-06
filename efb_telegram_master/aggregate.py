@@ -117,7 +117,9 @@ def _body_html(message: ETMMsg, admin_id: Optional[int], self_mentions: List[Tup
 def render_members(members: List[SourceMember], *, admin_id: Optional[int] = None,
                    history: bool = False, _compact_status: bool = False) -> RenderedAggregate:
     """Render every real source separately; ranges refer to parsed UTF-16 text."""
-    html_parts, text_parts, ranges = [], [], []
+    html_parts: List[str] = []
+    text_parts: List[str] = []
+    ranges: List[MemberRange] = []
     offset = 0
     for member in members:
         if history and member["status"] == "redirected":
