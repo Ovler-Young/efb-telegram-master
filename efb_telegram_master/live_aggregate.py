@@ -75,11 +75,11 @@ class LiveTextAggregation:
         admins = self.manager.channel.config.get("admins", [])
         return admins[0] if admins else None
 
-    def fits(self, members):
+    def fits(self, members, *, updating=False):
         flag = self.manager.channel.flag
         return aggregate_fits(members, max_members=int(flag("text_aggregation_max_members")),
                               max_payload_bytes=int(flag("text_aggregation_max_payload_bytes")),
-                              admin_id=self.admin_id)
+                              admin_id=self.admin_id, include_redirected_payload=not updating)
 
     def _tail_context(self, stream):
         if stream.tail is None:
@@ -294,7 +294,7 @@ class LiveTextAggregation:
                     if previous["status"] == "redirected":
                         children[index]["status"] = "redirected"
                         children[index]["replacement_master_msg_id"] = previous["replacement_master_msg_id"]
-            if not self.fits(children):
+            if not self.fits(children, updating=True):
                 raise ValueError("Source changes require independent output before container update.")
             base = dict(message_id=int(log.master_msg_id.rsplit(".", 1)[1]), owner=log.sender_bot_id,
                         aggregate=log.aggregate)
@@ -305,7 +305,8 @@ class LiveTextAggregation:
             children = None
         owner = base and base["owner"]
         can_edit = (base is not None and owner == selection.sender_bot_id
-                    and self.fits(base["aggregate"]["children"] + members))
+                    and (context["kind"] == "member_update"
+                         or self.fits(base["aggregate"]["children"] + members)))
         if context["kind"] == "member_update" and not can_edit:
             raise ValueError("Existing aggregate updates require the original owner.")
         if children is None:

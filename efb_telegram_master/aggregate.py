@@ -171,8 +171,15 @@ def make_aggregate(members: List[SourceMember], revision: int, *,
 
 
 def aggregate_fits(members: List[SourceMember], *, max_members: int = 200,
-                   max_payload_bytes: int = 256 * 1024, admin_id: Optional[int] = None) -> bool:
-    """Count parsed characters and the complete saved member payload."""
+                   max_payload_bytes: int = 256 * 1024, admin_id: Optional[int] = None,
+                   include_redirected_payload: bool = True) -> bool:
+    """Enforce display/member limits and saved payload capacity.
+
+    Redirected members retain their full snapshots after replacement confirmation;
+    fixed-container updates can omit them from payload capacity.
+    """
+    payload_members = members if include_redirected_payload else [
+        member for member in members if member["status"] != "redirected"]
     return (len(members) <= max_members and
             len(render_members(members, admin_id=admin_id).text) <= int(MessageLimit.MAX_TEXT_LENGTH) and
-            len(pickle.dumps(members, protocol=5)) <= max_payload_bytes)
+            len(pickle.dumps(payload_members, protocol=5)) <= max_payload_bytes)

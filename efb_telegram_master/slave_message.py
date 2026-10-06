@@ -302,7 +302,7 @@ class SlaveMessageProcessor(LocaleMixin):
             if log and log.aggregate and not independent_pending:
                 children = [member if member_identity(child) == member_identity(member) else child
                             for child in aggregation.prospective_members(log.master_msg_id, key)]
-                if qualifying and aggregation.fits(children):
+                if qualifying and aggregation.fits(children, updating=True):
                     aggregation.queue_container_update(log.master_msg_id, [member], key=key)
                     return True
             elif not log and not independent_pending and qualifying:

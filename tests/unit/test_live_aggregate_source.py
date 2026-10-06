@@ -338,7 +338,7 @@ def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtim
         manager.transport.messages[number] = receipt
         return receipt
     manager.transport.send_document = send_document
-    long_body = "full source body " * 400
+    long_body = "full source body " * 16875  # 270,000 characters exceed the saved-payload limit.
     edit(handler, "one", long_body)
     append(manager, "after", 10, "next text")
     complete(manager)
@@ -349,10 +349,29 @@ def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtim
     complete(manager)
     assert manager.transport.calls[-1][0] == "send_document"
     assert long_body.encode() in documents[0]
+    old = MsgLog.get_by_id("-100.1")
+    assert member_message(old.aggregate["children"][0]).text == long_body
+    assert old.text == "Alice:\nbody\n\nAlice:\nother body"
+    assert any(decode_aggregation(row.log_context).get("routing_hint")
+               for row in manager._outbound_queue.aggregation_rows())
+    restart(manager)
     complete(manager)
     assert manager.transport.calls[-1][2] == "Alice:\nnext text"
     complete(manager)
-    assert [child["status"] for child in MsgLog.get_by_id("-100.1").aggregate["children"]] == ["redirected", "active"]
+    old = MsgLog.get_by_id("-100.1")
+    assert [child["status"] for child in old.aggregate["children"]] == ["redirected", "active"]
+    assert old.text == "Alice:\n[message moved]\n\nAlice:\nother body"
+    assert len(documents) == 1
+    assert [call[0] for call in manager.transport.calls].count("send_message") == 3
+    # Other members continue to update the original container.
+    edit(handler, "two", "edited survivor")
+    complete(manager)
+    assert manager.channel.db.resolve_source_member(key[0], "two", "-100")[0].master_msg_id == "-100.1"
+    assert MsgLog.get_by_id("-100.1").text == "Alice:\n[message moved]\n\nAlice:\nedited survivor"
+    append(manager, "unrelated", 20, "other topic still schedules", topic=7)
+    complete(manager)
+    assert manager.transport.messages[5].text == "Alice:\nother topic still schedules"
+    assert not manager._outbound_queue.aggregation_rows()
 
 
 def test_file_redirect_persists_source_type_and_actual_file_owner(runtime, tmp_path):

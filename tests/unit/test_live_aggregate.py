@@ -182,10 +182,18 @@ def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones
     assert len(render_members([member]).html) > 4096
     assert aggregate_fits([member])
     assert not aggregate_fits([member], max_payload_bytes=10)
+    assert not aggregate_fits([member], max_payload_bytes=10, include_redirected_payload=False)
     assert not aggregate_fits([member], max_members=0)
     long_member = make_source_member(source(text="body" * 1100))
     assert not aggregate_fits([long_member])
+    assert not aggregate_fits([long_member], include_redirected_payload=False)
     assert member_message(long_member).text == "body" * 1100
+
+    redirected = make_source_member(source(text="x" * 270000))
+    redirected["status"] = "redirected"
+    assert not aggregate_fits([redirected])
+    assert aggregate_fits([redirected], include_redirected_payload=False)
+    assert not aggregate_fits([redirected], max_members=0, include_redirected_payload=False)
 
     removed = [make_source_member(source(str(index), "saved", "name" * 40)) for index in range(200)]
     for member in removed:
