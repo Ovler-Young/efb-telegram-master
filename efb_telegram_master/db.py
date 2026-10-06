@@ -15,6 +15,7 @@ from typing import Callable, Collection, Dict, Iterable, List, Optional, Protoco
 from peewee import (
     AutoField,
     BlobField,
+    Case,
     CharField,
     CompositeKey,
     DatabaseProxy,
@@ -307,6 +308,7 @@ class HistoryMigrationEntry(BaseModel):
     formatted_text = TextField(null=True)
     media_type = TextField(null=True)
     source_time = DateTimeField(null=True)
+    received_time = DateTimeField(null=True)
     position = IntegerField()
     created_at = DateTimeField(default=datetime.datetime.now)
     generation = TextField(null=True)
@@ -460,6 +462,7 @@ class DatabaseManager:
             ("msglog_chat_time", "msglog", f"slave_origin_uid, {time_order}"),
             ("msglog_history_seek", "msglog", "slave_origin_uid, time, master_msg_id"),
             ("history_generation_id", "historymigrationentry", "generation, id"),
+            ("history_generation_position", "historymigrationentry", "generation, position, id"),
             ("history_target_generation_position", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, generation, position, id"),
             ("history_target_cleanup", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, id"),
             ("msglog_master_alt", "msglog", "master_msg_id_alt"),
@@ -1290,6 +1293,43 @@ class DatabaseManager:
             for batch in chunked(prepared(), 32):
                 with database.atomic():
                     HistoryMigrationEntry.insert_many(batch).execute()
+            # Sorting the unpublished generation cannot change a replay already
+            # in progress. Keep only a cursor page in RAM, then renumber in short
+            # writer transactions after the ordering cursor has closed.
+            spool.seek(0)
+            spool.truncate()
+            ordered = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
+                HistoryMigrationEntry.generation == generation,
+            ).order_by(
+                fn.COALESCE(HistoryMigrationEntry.source_time,
+                            HistoryMigrationEntry.received_time).asc(nulls="FIRST"),
+                HistoryMigrationEntry.received_time.asc(nulls="FIRST"),
+                HistoryMigrationEntry.position, HistoryMigrationEntry.id,
+            )
+            with database.atomic():
+                sql, params = ordered.sql()
+                if isinstance(database.obj, PostgresqlDatabase):
+                    # Peewee uses explicit BEGIN with driver autocommit enabled.
+                    cursor = database.connection().cursor(name=f"history_sort_{generation}", withhold=True)
+                    cursor.execute(sql, params)
+                else:
+                    cursor = database.execute_sql(sql, params)
+                try:
+                    while True:
+                        identifiers = cursor.fetchmany(32)
+                        if not identifiers:
+                            break
+                        for (identifier,) in identifiers:
+                            pickle.dump(identifier, spool)
+                finally:
+                    cursor.close()
+            spool.seek(0)
+            positions = ((pickle.load(spool), position) for position in range(count))
+            for batch in chunked(positions, 32):
+                with database.atomic():
+                    HistoryMigrationEntry.update(position=Case(HistoryMigrationEntry.id, batch)).where(
+                        HistoryMigrationEntry.id.in_([identifier for identifier, _ in batch]),
+                    ).execute()
             # Publishing one pointer makes the entire replacement visible.
             with database.atomic():
                 HistoryMigrationTarget.insert(
@@ -1348,7 +1388,7 @@ class DatabaseManager:
     def get_next_history_migration_target(
         self, target_chat_id: Optional[int] = None,
     ) -> Optional[HistoryMigrationEntry]:
-        # Seek one head per published generation; ORDER BY id over a combined
+        # Seek one head per published generation; ordering a combined
         # visibility predicate can instead scan every unpublished staging row.
         target_filter = (
             HistoryMigrationTarget.target_chat_id == str(target_chat_id)
@@ -1356,14 +1396,14 @@ class DatabaseManager:
         )
         head = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             HistoryMigrationEntry.generation == HistoryMigrationTarget.generation,
-        ).order_by(HistoryMigrationEntry.id).limit(1)
+        ).order_by(HistoryMigrationEntry.position, HistoryMigrationEntry.id).limit(1)
         published_id = HistoryMigrationTarget.select(fn.MIN(EnclosedNodeList([head]))).where(target_filter).scalar()
         legacy_filter = HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
         if target_chat_id is not None:
             legacy_filter &= HistoryMigrationEntry.target_chat_id == str(target_chat_id)
         legacy_id = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             legacy_filter
-        ).order_by(HistoryMigrationEntry.id).limit(1).scalar()
+        ).order_by(HistoryMigrationEntry.position, HistoryMigrationEntry.id).limit(1).scalar()
         ids = [identifier for identifier in (published_id, legacy_id) if identifier is not None]
         return HistoryMigrationEntry.get_by_id(min(ids)) if ids else None
 
