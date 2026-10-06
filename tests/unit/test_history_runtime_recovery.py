@@ -1,6 +1,7 @@
 """History snapshot, seek cost, and cross-database ownership recovery."""
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -8,6 +9,8 @@ import pytest
 
 from efb_telegram_master.db import HistoryMigrationEntry, HistoryMigrationTarget, MsgLog
 from efb_telegram_master.db_runtime import connection_scope
+from efb_telegram_master.aggregate import make_aggregate, make_source_member
+from tests.unit.test_live_aggregate import source, receipt, SourceCache
 from tests.unit.test_database_safety import (
     postgres_config as postgres_config,
     postgres_server_config as postgres_server_config,
@@ -55,6 +58,52 @@ def test_snapshot_is_finite_and_formatting_does_not_block_live_writes(history):
     assert len(seen) == len(set(seen)) == 70
     with connection_scope(history.db._managed_database):
         assert MsgLog.select().count() == 76
+
+
+@pytest.mark.parametrize('history', ['sqlite', 'postgresql'], indirect=True)
+def test_redirect_confirmed_during_history_read_keeps_one_frozen_source_view(history, monkeypatch):
+    start = datetime(2026, 1, 1)
+    message = source('moving', 'body before confirmation')
+    member = make_source_member(message, source_time=start.replace(hour=1), received_time=start.replace(hour=1))
+    old = history.db.finalize_aggregate_message(receipt(100), make_aggregate([member], 1))
+    origin = member['origin_uid']
+    with connection_scope(history.db._managed_database):
+        MsgLog.insert_many([
+            dict(master_msg_id=f'-100.{index}', slave_message_id=f'legacy-{index}', text='legacy',
+                 slave_origin_uid=origin, slave_member_uid='tests.source group alice',
+                 media_type='Text', msg_type='Text', sent_to='test', time=start.replace(second=index))
+            for index in range(32)
+        ]).execute()
+    replacement = source('moving', 'body after confirmation')
+    newer = make_source_member(replacement, source_revision=2,
+                               source_time=member['source_time'], received_time=member['received_time'])
+    read = history.db.get_recent_messages
+    changed = False
+
+    def read_and_confirm(*args, **kwargs):
+        nonlocal changed
+        page = read(*args, **kwargs)
+        if not changed:
+            changed = True
+            # The redirect and its replacement commit on another connection
+            # while history retains its original finite read snapshot.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                executor.submit(history.db.finalize_member_redirect,
+                                old.master_msg_id, newer, replacement, receipt(101)).result(timeout=5)
+        return page
+
+    monkeypatch.setattr(history.db, 'get_recent_messages', read_and_confirm)
+    history.binding.chat_manager = SourceCache()
+    assert history.binding._queue_history_migration_entries(origin, -1002, 42) == 33
+    staged = history.db.get_history_migration_entries(origin, -1002, 42)
+    assert staged[-1].source_master_msg_id == old.master_msg_id
+    assert staged[-1].formatted_text.endswith('body before confirmation\n\n')
+    assert history.db.get_msg_log(master_msg_id=old.master_msg_id).aggregate['children'][0]['status'] == 'redirected'
+    # The next replay sees the confirmed replacement exactly once.
+    assert history.binding._queue_history_migration_entries(origin, -1002, 42) == 33
+    staged = history.db.get_history_migration_entries(origin, -1002, 42)
+    assert staged[-1].source_master_msg_id == '-100.101'
+    assert staged[-1].formatted_text.endswith('body after confirmation\n\n')
 
 
 @pytest.mark.parametrize('boundary', ['format', 'stage', 'publish', 'cleanup'])
@@ -283,7 +332,7 @@ def test_interrupted_generation_is_reclaimed_on_reopen_without_hidden_history_sc
             assert steps < 3000, steps
             plans = [row[3] for sql in statements if sql.lstrip().upper().startswith('SELECT')
                      for row in connection.execute('EXPLAIN QUERY PLAN ' + sql)]
-            assert any('history_generation_id' in plan for plan in plans)
+            assert any('history_generation_position' in plan for plan in plans)
             assert any('history_target_generation_position' in plan for plan in plans)
 
     check_visibility([])

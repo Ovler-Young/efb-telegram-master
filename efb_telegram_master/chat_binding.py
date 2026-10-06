@@ -16,6 +16,7 @@ from PIL import Image
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
+from telegram.helpers import escape_markdown
 from telegram.ext import ConversationHandler, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler
 from telegram.ext._utils.types import ConversationDict
 
@@ -25,6 +26,7 @@ from ehforwarderbot.chat import SystemChatMember
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBOperationNotSupported
 from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
+from .aggregate import render_members
 from .chat import ETMChatType, ETMGroupChat, unpickle
 from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
@@ -1751,24 +1753,45 @@ class ChatBindingManager(LocaleMixin):
             while True:
                 page = self.db.get_recent_messages(slave_chat_id, limit=32, after=after)
                 for msg_log in page:
-                    message_text = msg_log.text or ""
-                    formatted_text = None
-                    if message_text.strip() and not (msg_log.media_type and msg_log.media_type != 'Text'):
-                        etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
-                        timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
-                        author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
-                        formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
-                    yield {
-                        "slave_chat_id": str(slave_chat_id),
-                        "target_chat_id": str(tg_chat_id),
-                        "message_thread_id": str(thread_id) if thread_id is not None else None,
-                        "source_master_msg_id": msg_log.master_msg_id,
-                        "formatted_text": formatted_text,
-                        "media_type": msg_log.media_type,
-                        "source_time": msg_log.time,
-                        "position": position,
-                    }
-                    position += 1
+                    aggregate = msg_log.aggregate
+                    members = aggregate["children"] if aggregate is not None else [msg_log.source_member]
+                    for member in members:
+                        if member is not None and member["status"] == "redirected":
+                            continue
+                        source_time = member["source_time"] if member is not None else msg_log.time
+                        received_time = member["received_time"] if member is not None else None
+                        media_type = 'Text' if aggregate is not None else msg_log.media_type
+                        formatted_text = None
+                        if member is not None and not (media_type and media_type != 'Text'):
+                            # History has its own author/timestamp header. Render
+                            # only the saved body/reply here, never the live hint
+                            # or destination display prefix.
+                            message_text = render_members(
+                                [dict(member, display_prefix="")], history=True,
+                            ).text
+                            author_name = escape_markdown(member["author_name"] or "Unknown")
+                            message_text = escape_markdown(message_text)
+                        else:
+                            message_text = msg_log.text or ""
+                            if message_text.strip() and not (media_type and media_type != 'Text'):
+                                etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
+                                author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
+                        if (member is not None or message_text.strip()) and not (media_type and media_type != 'Text'):
+                            display_time = source_time or received_time
+                            timestamp = display_time.strftime("%Y-%m-%d %H:%M") if display_time else "Unknown"
+                            formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
+                        yield {
+                            "slave_chat_id": str(slave_chat_id),
+                            "target_chat_id": str(tg_chat_id),
+                            "message_thread_id": str(thread_id) if thread_id is not None else None,
+                            "source_master_msg_id": msg_log.master_msg_id,
+                            "formatted_text": formatted_text,
+                            "media_type": media_type,
+                            "source_time": source_time,
+                            "received_time": received_time,
+                            "position": position,
+                        }
+                        position += 1
                 if len(page) < 32:
                     return
                 after = page[-1].time, page[-1].master_msg_id
