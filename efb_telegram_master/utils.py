@@ -57,6 +57,11 @@ class ExperimentalFlagsManager(LocaleMixin):
         "api_base_file_url": None,
         "local_tdlib_api": False,
         "topic_group": None,
+        "text_aggregation": False,
+        "text_aggregation_window_seconds": 3,
+        "text_aggregation_idle_seconds": 1800,
+        "text_aggregation_max_members": 200,
+        "text_aggregation_max_payload_bytes": 256 * 1024,
     }
 
     @staticmethod

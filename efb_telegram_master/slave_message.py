@@ -209,6 +209,17 @@ class SlaveMessageProcessor(LocaleMixin):
                 self._release_pending_slave_message(dedupe_key)
                 return msg
 
+            from .live_aggregate import LiveTextAggregation
+            aggregation = getattr(getattr(self, "bot", None), "live_aggregation", None)
+            if (isinstance(aggregation, LiveTextAggregation) and self.flag("text_aggregation")
+                    and not msg.edit and msg.type == MsgType.Text and not msg.commands):
+                from .aggregate import make_source_member
+                source = ETMMsg.from_efbmsg(msg, self.chat_manager)
+                key = (slave_origin_uid, int(tg_dest), str(thread_id) if thread_id is not None else None)
+                if aggregation.append(key, make_source_member(source, display_prefix=msg_template.removesuffix(":")), silent=silent):
+                    self._release_pending_slave_message(dedupe_key)
+                    return msg
+
             # When editing message
             old_msg_id: Optional[OldMsgID] = None
             _edit_sender_bot_id: Optional[str] = None
@@ -232,8 +243,15 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.vendor_specific['_sender_bot_id'] = _edit_sender_bot_id
 
             with self._timed_phase(xid, "Dispatch"):
-                self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
-                                      dedupe_key=dedupe_key)
+                key = (slave_origin_uid, int(tg_dest), str(thread_id) if thread_id is not None else None)
+                if (isinstance(aggregation, LiveTextAggregation) and not msg.edit
+                        and (self.flag("text_aggregation") or key in aggregation.streams)):
+                    with aggregation.independent(key):
+                        self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
+                                              dedupe_key=dedupe_key)
+                else:
+                    self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
+                                          dedupe_key=dedupe_key)
         except Exception as e:
             if pending_claimed:
                 self._release_pending_slave_message(dedupe_key)

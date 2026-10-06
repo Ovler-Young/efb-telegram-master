@@ -174,6 +174,7 @@ class QueueRequest:
     kwargs: dict
     log_context: Optional[bytes] = None
     cleanup_files: tuple[str, ...] = ()
+    predecessor_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -665,7 +666,7 @@ class OutboundQueue:
             )
         # Additive metadata: do not rebuild the large queue or change its legacy CHECK.
         for name, kind in (("delivery_hold", "TEXT"), ("attempt_sender_bot_id", "TEXT"),
-                           ("attempt_started_at", "REAL")):
+                           ("attempt_started_at", "REAL"), ("predecessor_id", "INTEGER")):
             if name not in columns:
                 connection.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL")
         # Undo only pre-submission holds caused by the removed history sender
@@ -1382,12 +1383,13 @@ class OutboundQueue:
                 )
                 identifiers: list[int] = []
                 now = time.time()
-                for operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media in prepared:
+                for request, item in zip(request_list, prepared):
+                    operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media = item
                     cursor = self.connection.execute(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
-                        "created_at, log_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (priority, chat_id, operation, payload, slave_id, required_sender, now, log_context),
+                        "created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (priority, chat_id, operation, payload, slave_id, required_sender, now, log_context, request.predecessor_id),
                     )
                     identifier = cursor.lastrowid
                     if identifier is None:
@@ -1409,6 +1411,83 @@ class OutboundQueue:
             waiter: Future = Future()
             self.waiters[identifiers[0]] = waiter
             return identifiers[0], waiter
+
+    def contains(self, row_id: int) -> bool:
+        with self._lock:
+            return self.connection.execute("SELECT 1 FROM outbound_queue WHERE id=?", (row_id,)).fetchone() is not None
+
+    def aggregation_context(self, row_id: int) -> Optional[bytes]:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT log_context FROM outbound_queue WHERE id=? AND substr(log_context, 1, 1)=?",
+                (row_id, b"\x03"),
+            ).fetchone()
+        return row[0] if row else None
+
+    def aggregation_rows(self) -> list[QueuedCall]:
+        """Read only unfinished logical/frozen aggregation rows on recovery."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
+                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
+                "FROM outbound_queue WHERE substr(log_context, 1, 1)=? ORDER BY id", (b"\x03",),
+            ).fetchall()
+        return [QueuedCall(*row) for row in rows]
+
+    def replace_logical_aggregation(self, row_id: int, context: bytes) -> bool:
+        from .queued_log import decode_aggregation
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                "SELECT log_context FROM outbound_queue WHERE id=? AND delivery_state='queued' "
+                "AND delivery_hold IS NULL", (row_id,),
+            ).fetchone()
+            if row is None or decode_aggregation(row[0]).get("kind") not in {"logical", "member_update"}:
+                return False
+            self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?", (context, row_id))
+            return True
+
+    def materialize_aggregation(self, row_id: int, operation: str, kwargs: dict,
+                                context: bytes, selection: SenderSelection) -> QueuedCall:
+        """Freeze the selected operation and sender before executor submission."""
+        payload = self.encode_payload((), kwargs)
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET operation=?, payload=?, log_context=?, required_sender_bot_id=?, "
+                "attempt_sender_bot_id=?, delivery_hold='in_flight', attempt_started_at=? "
+                "WHERE id=? AND delivery_state='queued' AND delivery_hold IS NULL",
+                (operation, payload, context, selection.sender_bot_id or "__main__", selection.sender_bot_id, time.time(), row_id),
+            )
+            if cursor.rowcount != 1:
+                raise QueuePersistenceError("Aggregation batch is no longer available for dispatch.")
+        return self.load_queued(row_id)
+
+    def handoff_aggregation(self, row_id: int, parent_context: bytes,
+                            update_successor: Callable[[bytes], bytes]) -> None:
+        """Publish the confirmed base and parent handoff in one queue transaction."""
+        with self._lock, self.connection:
+            rows = self.connection.execute(
+                "SELECT id, log_context FROM outbound_queue WHERE predecessor_id=?", (row_id,),
+            ).fetchall()
+            for identifier, context in rows:
+                if context and context[:1] == b"\x03":
+                    self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                            (update_successor(context), identifier))
+            self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                    (parent_context, row_id))
+            self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
+
+    def release_dependents(self, row_id: int) -> None:
+        with self._lock, self.connection:
+            self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
+
+    def hold_failed_aggregation(self, row_id: int, error: BaseException) -> bool:
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold=? WHERE id=? AND (substr(log_context, 1, 1)=? "
+                "OR EXISTS (SELECT 1 FROM outbound_queue child WHERE child.predecessor_id=outbound_queue.id))",
+                ("aggregation_failed:" + type(error).__name__, row_id, b"\x03"),
+            )
+            return cursor.rowcount == 1
 
     def history_ownership_page(self, after: str = "", limit: int = 100) -> list[str]:
         with self._lock:
@@ -1442,7 +1521,7 @@ class OutboundQueue:
         context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
         receipt = "q.completion_receipt" if include_payload else "NULL"
         excluded = tuple(excluded_ids)
-        exclusion_sql = " AND delivery_hold IS NULL" if ready_only else ""
+        exclusion_sql = " AND delivery_hold IS NULL AND predecessor_id IS NULL" if ready_only else ""
         parameters: tuple[object, ...] = ()
         if excluded:
             exclusion_sql += " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
@@ -1948,6 +2027,12 @@ class OutboundQueue:
     def begin_delivery_attempt(self, row_id: int, selection: SenderSelection) -> None:
         """Persist before submission: an interrupted send is not safe to replay."""
         with self._lock, self.connection:
+            frozen = self.connection.execute(
+                "SELECT 1 FROM outbound_queue WHERE id=? AND delivery_hold='in_flight' "
+                "AND substr(log_context, 1, 1)=?", (row_id, b"\x03"),
+            ).fetchone()
+            if frozen is not None:
+                return
             cursor = self.connection.execute(
                 "UPDATE outbound_queue SET delivery_hold='in_flight', attempt_sender_bot_id=?, "
                 "attempt_started_at=? WHERE id=? AND delivery_state='queued' AND delivery_hold IS NULL",
@@ -1958,7 +2043,18 @@ class OutboundQueue:
 
     def release_delivery_attempt(self, row_id: int) -> None:
         """Use only when submission failed or Telegram definitely rejected the call."""
+        from .queued_log import decode_aggregation, encode_aggregation
         with self._lock, self.connection:
+            row = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
+            context = decode_aggregation(row[0]) if row and row[0] else None
+            if context and context.get("retry_context"):
+                logical = context["retry_context"]
+                self.connection.execute(
+                    "UPDATE outbound_queue SET operation='send_message', payload=?, log_context=?, "
+                    "required_sender_bot_id=NULL WHERE id=?",
+                    (self.encode_payload((), {"chat_id": logical["key"][1], "text": ""}),
+                     encode_aggregation(logical), row_id),
+                )
             self.connection.execute(
                 "UPDATE outbound_queue SET delivery_hold=NULL WHERE id=? AND delivery_state='queued'",
                 (row_id,),
@@ -2112,7 +2208,7 @@ class OutboundQueue:
                     f"Queued row {row_id} retarget persistence failed."
                 ) from error
 
-    def delete(self, row_id: int, *, cleanup_media: bool = True) -> None:
+    def delete(self, row_id: int, *, cleanup_media: bool = True, successful: bool = False) -> None:
         payload: Optional[bytes] = None
         with self._lock:
             try:
@@ -2129,6 +2225,8 @@ class OutboundQueue:
                             "SELECT payload FROM outbound_queue WHERE id = ?", (row_id,)
                         ).fetchone()[0]
                 self.connection.execute("BEGIN")
+                if successful:
+                    self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
                 cursor = self.connection.execute("DELETE FROM outbound_queue WHERE id = ?", (row_id,))
                 if cursor.rowcount != 1:
                     raise QueuePersistenceError(f"Queued row {row_id} disappeared before deletion.")
@@ -2437,7 +2535,7 @@ class OutboundQueueScheduler:
                     if not reconciler(row):
                         failed.append(row.id)
                         continue
-                    self.queue.delete(row.id)
+                    self.queue.delete(row.id, successful=True)
                 except Exception:
                     failed.append(row.id)
                     continue
@@ -2525,6 +2623,11 @@ class OutboundQueueScheduler:
                 if row.retry_after > time.time():
                     self._schedule_retry(now + row.retry_after - time.time())
                     continue
+                readiness = getattr(self.adapter, "queued_aggregation_deadline", None)
+                deadline = readiness(row) if callable(readiness) else None
+                if deadline is not None and deadline > time.time():
+                    self._schedule_retry(now + deadline - time.time())
+                    continue
                 not_before = self._row_not_before.get(row.id)
                 if not_before is not None:
                     if now < not_before:
@@ -2541,6 +2644,10 @@ class OutboundQueueScheduler:
                     self._permits.release()
                     unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
                     try:
+                        if self.queue.hold_failed_aggregation(row.id, unavailable_error):
+                            self.queue.fail_waiter(row.id, unavailable_error)
+                            self._record_terminal_completion(row, None, "failure")
+                            continue
                         if self._retain_failed_history(row, unavailable_error):
                             self._record_terminal_completion(row, None, "failure")
                             continue
@@ -2576,6 +2683,9 @@ class OutboundQueueScheduler:
                         self.queue.check_replay_size(row.id, row.stored_bytes)
                     else:
                         row = self.queue.load_queued(row.id)
+                    materialize = getattr(self.adapter, "materialize_queued_aggregation", None)
+                    if callable(materialize):
+                        row = materialize(row, decision.selection)
                     args, kwargs = self.queue.decode_payload(row.payload)
                 except MissingQueuedExternalMediaError as error:
                     self._permits.release()
@@ -2797,6 +2907,10 @@ class OutboundQueueScheduler:
                     if (submitted.row.priority == 0 or submitted.row.log_context is not None
                             or submitted.row.operation in RETAINED_OPERATIONS):
                         try:
+                            if self.queue.hold_failed_aggregation(row_id, error):
+                                self.queue.fail_waiter(row_id, error)
+                                self._record_terminal_completion(submitted.row, submitted.selection, "failure")
+                                continue
                             if self._retain_failed_history(submitted.row, error):
                                 self._record_terminal_completion(submitted.row, submitted.selection, "failure")
                                 continue
@@ -2840,10 +2954,13 @@ class OutboundQueueScheduler:
                         self.reconcile_sent_pending(row_id)
                         if self.failure is not None:
                             return
+                    if (submitted.row.log_context is None and submitted.row.priority == 1
+                            and submitted.row.operation not in RETAINED_OPERATIONS):
+                        self.queue.release_dependents(row_id)
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
                     if (submitted.row.priority == 0 or submitted.row.operation in RETAINED_OPERATIONS) and submitted.row.log_context is None:
                         try:
-                            self.queue.delete(row_id)
+                            self.queue.delete(row_id, successful=True)
                         except Exception as delete_error:
                             self._stop_for_persistence_error(delete_error)
                             return

@@ -26,6 +26,7 @@ class SourceMember(TypedDict):
     source_id: str
     author_uid: str
     author_name: str
+    display_prefix: Optional[str]
     snapshot: bytes
     self_mentions: List[Tuple[int, int]]
     source_time: Optional[datetime.datetime]
@@ -68,7 +69,7 @@ def utf16_length(text: str) -> int:
 
 def make_source_member(message: ETMMsg, *, received_time: Optional[datetime.datetime] = None,
                        source_time: Optional[datetime.datetime] = None,
-                       source_revision: int = 1) -> SourceMember:
+                       source_revision: int = 1, display_prefix: Optional[str] = None) -> SourceMember:
     """Capture full source content without media handles or recursive replies."""
     if not message.uid:
         raise ValueError("A source member requires a source message ID.")
@@ -83,7 +84,7 @@ def make_source_member(message: ETMMsg, *, received_time: Optional[datetime.date
     return SourceMember(
         origin_uid=str(chat_id_to_str(chat=message.chat)), source_id=str(message.uid),
         author_uid=str(chat_id_to_str(chat=message.author)), author_name=message.author.long_name,
-        snapshot=queued_log.encode(message, None), source_time=source_time,
+        snapshot=queued_log.encode(message, None), source_time=source_time, display_prefix=display_prefix,
         self_mentions=[key for key, chat in (message.substitutions or {}).items()
                        if isinstance(chat, SelfChatMember) or (isinstance(chat, Chat) and chat.has_self)],
         received_time=received_time or datetime.datetime.now(), reply=reply,
@@ -121,7 +122,9 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
     for member in members:
         if history and member["status"] == "redirected":
             continue
-        name = member["author_name"]
+        name = member.get("display_prefix")
+        if name is None:
+            name = member["author_name"]
         # Status displays remain bounded even after many source edits.
         if not history and member["status"] != "active":
             name = name[:80]

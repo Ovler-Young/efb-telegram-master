@@ -116,6 +116,7 @@ _INTERNAL_KWARGS = frozenset({
     '_force_main_bot',
     '_required_sender_bot_id',
     '_queued_db_log_context',
+    '_live_aggregate',
     HISTORY_REPLAY_KEY,
     SUPPLEMENTAL_KEY,
 })
@@ -541,6 +542,8 @@ class TelegramBotManager(LocaleMixin):
             executor=self._send_executor,
             worker_count=self._send_worker_count,
         )
+        from .live_aggregate import LiveTextAggregation
+        self.live_aggregation = LiveTextAggregation(self)
         self._register_runtime_metric_collectors(metrics_top_n)
 
         if metrics_endpoint is not None:
@@ -1142,12 +1145,18 @@ class TelegramBotManager(LocaleMixin):
                         request.kwargs,
                         encoded_context,
                         request.cleanup_files,
+                        request.predecessor_id,
                     )
                     for request in requests
                 ]
+            aggregation = getattr(self, "live_aggregation", None)
+            if aggregation is not None:
+                durable_requests = aggregation.bind_independent_requests(durable_requests)
             row_id, waiter = self._outbound_queue.enqueue_many(
                 durable_requests, self._queue_operation, history_keys=history_keys
             )
+            if aggregation is not None:
+                aggregation.note_independent_enqueued(row_id)
             if db_log_context is not None:
                 with self._queued_db_log_context_lock:
                     self._queued_completion_callbacks[row_id] = db_log_context.on_complete
@@ -1329,6 +1338,19 @@ class TelegramBotManager(LocaleMixin):
             sender_id is not None and me is not None and sender_id == str(me.id)
         )
 
+    def queued_aggregation_deadline(self, row):
+        aggregation = getattr(self, "live_aggregation", None)
+        return aggregation.deadline(row) if aggregation is not None else None
+
+    def materialize_queued_aggregation(self, row, selection):
+        aggregation = getattr(self, "live_aggregation", None)
+        if aggregation is not None:
+            return aggregation.materialize(row, selection)
+        from .queued_log import decode_aggregation
+        if row.log_context and decode_aggregation(row.log_context):
+            raise QueuePersistenceError("Live aggregation runtime is unavailable.")
+        return row
+
     def select_sender(self, row, now: float) -> SenderSelectionResult:
         chat_id = row.telegram_chat_id
         required = row.required_sender_bot_id
@@ -1487,7 +1509,7 @@ class TelegramBotManager(LocaleMixin):
     def _queued_completion_result(
         self, row, args: tuple, kwargs: dict, result: object, selection: SenderSelection,
     ) -> object:
-        content = self._queued_full_content(row.operation, args, kwargs)
+        content = None if kwargs.get("_live_aggregate") else self._queued_full_content(row.operation, args, kwargs)
         if content is None:
             return result
         content_key, _index, full_content, _positional = content
@@ -1520,6 +1542,10 @@ class TelegramBotManager(LocaleMixin):
         }), receipt)
 
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
+        from .queued_log import decode_aggregation
+        aggregation_context = decode_aggregation(row.log_context) if row.log_context else None
+        if aggregation_context and aggregation_context["kind"] in {"logical", "member_update"}:
+            raise QueuePersistenceError("Aggregation must be materialized before Telegram execution.")
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
         telegram_kwargs = cast(dict, OutboundQueue.streaming_uploads(self._strip_private_queue_metadata(kwargs)))
@@ -1570,7 +1596,7 @@ class TelegramBotManager(LocaleMixin):
                     raise
 
         full_args, full_kwargs = telegram_args, dict(telegram_kwargs)
-        content = self._queued_full_content(row.operation, telegram_args, telegram_kwargs)
+        content = None if kwargs.get("_live_aggregate") else self._queued_full_content(row.operation, telegram_args, telegram_kwargs)
         if content is not None:
             content_key, content_index, full_content, is_positional = content
             truncated = full_content[:100] + "\n...\n" + full_content[-100:]
@@ -1583,6 +1609,17 @@ class TelegramBotManager(LocaleMixin):
         try:
             result = call_method()
         except telegram.error.BadRequest as error:
+            if (kwargs.get("_live_aggregate") and row.operation == "edit_message_text"
+                    and "message is not modified" in str(error).lower()):
+                from datetime import datetime, timezone
+                from .queued_log import decode_aggregation
+                context = decode_aggregation(row.log_context)
+                key = context["key"]
+                return TelegramMessage(message_id=telegram_kwargs["message_id"],
+                                       date=datetime.now(timezone.utc),
+                                       chat=telegram.Chat(key[1], "supergroup"),
+                                       text=context["aggregate"]["confirmed_text"],
+                                       message_thread_id=int(key[2]) if key[2] is not None else None)
             replay = kwargs.get(HISTORY_REPLAY_KEY)
             # Only an explicit negative acknowledgment permits a second send.
             # A missing response or timeout must keep using delivery uncertainty.
@@ -1722,6 +1759,10 @@ class TelegramBotManager(LocaleMixin):
         if row.log_context is None:
             return True
         try:
+            from .queued_log import decode_aggregation
+            if decode_aggregation(row.log_context) is not None:
+                real_tg_msg, sender_bot_id, _ = self._decode_queued_completion_receipt(row.completion_receipt)
+                return self.live_aggregation.reconcile(row, real_tg_msg, sender_bot_id)
             etm_msg, old_msg_id = self._decode_queued_log_context(row.log_context)
             real_tg_msg, sender_bot_id, file_bot_id = self._decode_queued_completion_receipt(
                 row.completion_receipt
