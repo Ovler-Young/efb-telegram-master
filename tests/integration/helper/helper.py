@@ -218,6 +218,7 @@ class TelegramIntegrationTestHelper:
             message_box = self.client._message_box
             for channel_id in list(message_box.map):
                 if (isinstance(channel_id, int)
+                        and channel_id not in self.chats
                         and abs(get_peer_id(PeerChannel(channel_id))) not in self.chats
                         and channel_id not in message_box.getting_diff_for
                         and channel_id not in message_box.possible_gaps):

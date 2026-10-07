@@ -57,7 +57,10 @@ def build_event_helper() -> helper_module.TelegramIntegrationTestHelper:
 
 
 @pytest.mark.asyncio
-async def test_helper_receives_watched_message_when_other_dialogs_expire(monkeypatch) -> None:
+@pytest.mark.parametrize("bare_channel_id", [False, True], ids=["marked", "bare"])
+async def test_helper_recovers_watched_message_when_other_dialogs_expire(
+        monkeypatch, bare_channel_id,
+) -> None:
     loop = asyncio.get_running_loop()
     now = datetime.now(timezone.utc)
     bot = types.User(id=101, access_hash=1, first_name="Bot", bot=True)
@@ -68,7 +71,8 @@ async def test_helper_receives_watched_message_when_other_dialogs_expire(monkeyp
                  for index in range(54)]
     chat_id = get_peer_id(watched)
     test_helper = helper_module.TelegramIntegrationTestHelper(
-        "", 123, "offline", loop, bot.id, chats=[bot.id, chat_id],
+        "", 123, "offline", loop, bot.id,
+        chats=[bot.id, watched.id if bare_channel_id else chat_id],
     )
     client = test_helper.client
     client._mb_entity_cache.set_self_user(999, False, 9)
@@ -84,21 +88,26 @@ async def test_helper_receives_watched_message_when_other_dialogs_expire(monkeyp
                 client._message_box.map[channel.id].deadline = loop.time() - 1
         client._message_box.next_deadline = unrelated[0].id
 
-    async def unexpected_request(*args, **kwargs):
-        raise AssertionError("Unrelated channel catch-up delayed the watched message")
+    async def channel_difference(request_client, request, **kwargs):
+        if request.channel.channel_id != watched.id:
+            raise AssertionError("Unrelated channel catch-up delayed the watched message")
+        return types.updates.ChannelDifference(
+            pts=2, new_messages=[incoming], other_updates=[],
+            chats=[watched], users=[bot], final=True,
+        )
 
     monkeypatch.setattr(client, "connect", AsyncMock())
     monkeypatch.setattr(client, "get_me", AsyncMock(return_value=types.User(id=999)))
     monkeypatch.setattr(client, "get_dialogs", discover_dialogs)
     monkeypatch.setattr(client, "disconnect", AsyncMock())
     monkeypatch.setattr(client, "is_connected", lambda: True)
-    monkeypatch.setattr(type(client), "__call__", unexpected_request)
+    monkeypatch.setattr(type(client), "__call__", channel_difference)
     await test_helper.__aenter__()
     incoming = types.Message(id=7, peer_id=types.PeerChannel(watched.id),
                              from_id=types.PeerUser(bot.id), date=now,
                              message="Animation caption", out=False)
     await client._updates_queue.put(types.Updates(
-        updates=[types.UpdateNewChannelMessage(incoming, pts=2, pts_count=1)],
+        updates=[types.UpdateChannelTooLong(watched.id)],
         users=[bot], chats=[watched], date=now, seq=0,
     ))
     update_loop = asyncio.create_task(client._update_loop())
