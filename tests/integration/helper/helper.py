@@ -11,7 +11,8 @@ from telethon.events import NewMessage, UserUpdate, MessageDeleted, MessageEdite
 from telethon.events.common import EventCommon
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
-from telethon.tl.types import TypeInputPeer
+from telethon.tl.types import PeerChannel, TypeInputPeer
+from telethon.utils import get_peer_id
 
 from . import filters
 from .filters import BaseFilter
@@ -212,6 +213,18 @@ class TelegramIntegrationTestHelper:
             await self._startup_step("client get_me", self.client.get_me())
             # Fill the entity cache
             await self._startup_step("client get_dialogs", self.client.get_dialogs())
+            # get_dialogs also tracks every account channel. Their 15-minute
+            # idle catch-up runs before live updates and can exhaust test waits.
+            message_box = self.client._message_box
+            for channel_id in list(message_box.map):
+                if (isinstance(channel_id, int)
+                        and abs(get_peer_id(PeerChannel(channel_id))) not in self.chats
+                        and channel_id not in message_box.getting_diff_for
+                        and channel_id not in message_box.possible_gaps):
+                    del message_box.map[channel_id]
+            message_box.next_deadline = min(
+                message_box.map, key=lambda entry: message_box.map[entry].deadline, default=None,
+            )
         except BaseException:
             try:
                 await self._disconnect_client()
