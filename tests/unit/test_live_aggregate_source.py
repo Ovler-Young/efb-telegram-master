@@ -106,7 +106,7 @@ def test_independent_boundary_survives_restart(runtime):
     complete(manager)
     complete(manager)
     complete(manager)
-    assert [call[2] for call in manager.transport.calls] == ["<b>Alice:</b> <code>08:00:01</code>\nbody", "media", "<b>Alice:</b> <code>08:00:01</code>\nbody"]
+    assert [call[2] for call in manager.transport.calls] == ["Alice: <code>08:00:01</code>\nbody", "media", "Alice: <code>08:00:01</code>\nbody"]
     assert [row.aggregate["children"][0]["source_id"] for row in MsgLog.select().order_by(MsgLog.master_msg_id)] == ["one", "three"]
 
 
@@ -234,7 +234,7 @@ def test_pending_qualification_split_preserves_source_order(runtime):
         complete(manager)
         complete(manager)
         complete(manager)
-    assert [call[2] for call in manager.transport.calls] == ["<b>Alice:</b> <code>08:00:01</code>\nbody", "Alice:\nindependent body", "<b>Alice:</b> <code>08:00:01</code>\nafter body"]
+    assert [call[2] for call in manager.transport.calls] == ["Alice: <code>08:00:01</code>\nbody", "Alice:\nindependent body", "Alice: <code>08:00:01</code>\nafter body"]
     assert manager.channel.db.resolve_source_member(key[0], "split", "-100")[1]["source_revision"] == 2
     assert [child["source_id"] for row in MsgLog.select() if row.aggregate for child in row.aggregate["children"]] == ["before", "after"]
 
@@ -263,7 +263,7 @@ def test_split_recovery_keeps_preexisting_media_after_split_members(runtime, lat
         for _ in range(2 if late_after_confirmation else 5):
             complete(manager)
     assert [call[2] for call in manager.transport.calls] == [
-        "<b>Alice:</b> <code>08:00:01</code>\nbody", "Alice:\nindependent body", "<b>Alice:</b> <code>08:00:01</code>\nafter body", "media", "<b>Alice:</b> <code>08:00:01</code>\nlate text",
+        "Alice: <code>08:00:01</code>\nbody", "Alice:\nindependent body", "Alice: <code>08:00:01</code>\nafter body", "media", "Alice: <code>08:00:01</code>\nlate text",
     ]
 
 
@@ -359,7 +359,7 @@ def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtim
                for row in manager._outbound_queue.aggregation_rows())
     restart(manager)
     complete(manager)
-    assert manager.transport.calls[-1][2] == "<b>Alice:</b> <code>08:00:10</code>\nnext text"
+    assert manager.transport.calls[-1][2] == "Alice: <code>08:00:10</code>\nnext text"
     complete(manager)
     old = MsgLog.get_by_id("-100.1")
     assert [child["status"] for child in old.aggregate["children"]] == ["redirected", "active"]

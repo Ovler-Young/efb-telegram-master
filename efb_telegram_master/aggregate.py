@@ -159,7 +159,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
             else:
                 author_prefix = name if name.endswith(":") else f"{name}:"
                 prefix = f"{author_prefix} {timestamp}\n" if name else f"{timestamp}\n"
-                author_html = f"<b>{html.escape(author_prefix)}</b> " if name else ""
+                author_html = f"{html.escape(author_prefix)} " if name else ""
                 prefix_html = author_html + f"<code>{timestamp}</code>\n"
         visible = prefix + reply_text + body
         if text_parts:

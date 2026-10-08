@@ -171,7 +171,7 @@ def test_rendering_preserves_identities_reply_and_utf16_ranges():
     members = [make_source_member(first, source_time=source_time, received_time=received_time),
                make_source_member(second, received_time=received_time, display_prefix="Bob:")]
     rendered = render_members(members, admin_id=123)
-    assert '<b>A &amp; B:</b> <code>12:34:56</code>\n' in rendered.html
+    assert 'A &amp; B: <code>12:34:56</code>\n' in rendered.html
     assert '<a href="tg://user?id=123">&lt;same&gt;</a>' in rendered.html
     assert rendered.text.count("😀 <same>") == 3
     assert "tests.source group/one" in rendered.text
@@ -179,7 +179,7 @@ def test_rendering_preserves_identities_reply_and_utf16_ranges():
     assert rendered.ranges[0]["end"] == utf16_length("A & B: 12:34:56\n😀 <same>")
     assert rendered.ranges[1]["start"] == rendered.ranges[0]["end"] + 2
     assert "Bob: 12:34:58\n" in rendered.text
-    assert "<b>Bob:</b> <code>12:34:58</code>\n" in rendered.html
+    assert "Bob: <code>12:34:58</code>\n" in rendered.html
     assert member_message(members[1]).target.uid == "one"
 
 
