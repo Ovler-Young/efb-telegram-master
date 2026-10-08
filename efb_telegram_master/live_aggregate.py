@@ -30,6 +30,7 @@ class LiveTextAggregation:
 
     def __init__(self, manager):
         self.manager = manager
+        self.display_timezone = manager.channel.flag.timezone
         self.queue = manager._outbound_queue
         self.scheduler = manager._outbound_scheduler
         self.streams: dict[tuple, _Stream] = {}
@@ -80,7 +81,8 @@ class LiveTextAggregation:
         flag = self.manager.channel.flag
         return aggregate_fits(members, max_members=int(flag("text_aggregation_max_members")),
                               max_payload_bytes=int(flag("text_aggregation_max_payload_bytes")),
-                              admin_id=self.admin_id, include_redirected_payload=not updating)
+                              admin_id=self.admin_id, include_redirected_payload=not updating,
+                              display_timezone=self.display_timezone)
 
     def _tail_context(self, stream):
         if stream.tail is None:
@@ -315,8 +317,8 @@ class LiveTextAggregation:
         if children is None:
             children = base["aggregate"]["children"] + members if can_edit else members
         revision = base["aggregate"]["revision"] + 1 if can_edit else 1
-        aggregate = make_aggregate(children, revision, admin_id=self.admin_id)
-        kwargs = dict(chat_id=context["key"][1], text=render_members(children, admin_id=self.admin_id).html,
+        aggregate = make_aggregate(children, revision, admin_id=self.admin_id, display_timezone=self.display_timezone)
+        kwargs = dict(chat_id=context["key"][1], text=render_members(children, admin_id=self.admin_id, display_timezone=self.display_timezone).html,
                       parse_mode="HTML", disable_notification=context["silent"], _live_aggregate=True)
         operation = "send_message"
         if can_edit:

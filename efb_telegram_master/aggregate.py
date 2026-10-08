@@ -4,6 +4,7 @@ import datetime
 import html
 import pickle
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 from typing import List, Optional, Tuple, TypedDict
 
 from ehforwarderbot.chat import Chat, SelfChatMember
@@ -11,7 +12,7 @@ from telegram.constants import MessageLimit
 
 from . import queued_log
 from .message import ETMMsg
-from .utils import chat_id_to_str
+from .utils import DEFAULT_TIMEZONE, chat_id_to_str, format_message_time
 
 
 class SourceReply(TypedDict):
@@ -115,13 +116,13 @@ def _body_html(message: ETMMsg, admin_id: Optional[int], self_mentions: List[Tup
 
 
 def render_members(members: List[SourceMember], *, admin_id: Optional[int] = None,
-                   history: bool = False, _compact_status: bool = False) -> RenderedAggregate:
+                   history: bool = False, display_timezone: ZoneInfo = DEFAULT_TIMEZONE,
+                   _compact_status: bool = False) -> RenderedAggregate:
     """Render every real source separately; ranges refer to parsed UTF-16 text."""
     html_parts: List[str] = []
     text_parts: List[str] = []
     ranges: List[MemberRange] = []
     offset = 0
-    previous_date = None
     for member in members:
         if history and member["status"] == "redirected":
             continue
@@ -151,20 +152,15 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
             prefix_html = html.escape(prefix)
         else:
             display_time = member["source_time"] or member["received_time"]
-            date = display_time.strftime("%Y-%m-%d")
+            timestamp = format_message_time(display_time, display_timezone)
             if _compact_status and member["status"] != "active":
-                date_header = f"{date}\n" if date != previous_date else ""
-                timestamp = display_time.strftime("%H:%M:%S")
-                prefix = date_header + timestamp + " "
-                date_html = f"<code>{date}</code>\n" if date_header else ""
-                prefix_html = date_html + f"<code>{timestamp}</code> "
+                prefix = timestamp + " "
+                prefix_html = f"<code>{timestamp}</code> "
             else:
-                timestamp = display_time.strftime("%Y-%m-%d %H:%M:%S")
                 author_prefix = name if name.endswith(":") else f"{name}:"
                 prefix = f"{author_prefix} {timestamp}\n" if name else f"{timestamp}\n"
                 author_html = f"<b>{html.escape(author_prefix)}</b> " if name else ""
                 prefix_html = author_html + f"<code>{timestamp}</code>\n"
-            previous_date = date
         visible = prefix + reply_text + body
         if text_parts:
             offset += 2
@@ -178,20 +174,20 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
     if (not history and not _compact_status and
             len("\n\n".join(text_parts)) > int(MessageLimit.MAX_TEXT_LENGTH) and
             any(member["status"] != "active" for member in members)):
-        return render_members(members, admin_id=admin_id, _compact_status=True)
+        return render_members(members, admin_id=admin_id, display_timezone=display_timezone, _compact_status=True)
     return RenderedAggregate("\n\n".join(html_parts), "\n\n".join(text_parts), ranges)
 
 
 def make_aggregate(members: List[SourceMember], revision: int, *,
-                   admin_id: Optional[int] = None) -> AggregatePayload:
-    rendered = render_members(members, admin_id=admin_id)
+                   admin_id: Optional[int] = None, display_timezone: ZoneInfo = DEFAULT_TIMEZONE) -> AggregatePayload:
+    rendered = render_members(members, admin_id=admin_id, display_timezone=display_timezone)
     return AggregatePayload(format_version=1, revision=revision, children=members,
                             confirmed_text=rendered.text, confirmed_ranges=rendered.ranges)
 
 
 def aggregate_fits(members: List[SourceMember], *, max_members: int = 200,
                    max_payload_bytes: int = 256 * 1024, admin_id: Optional[int] = None,
-                   include_redirected_payload: bool = True) -> bool:
+                   include_redirected_payload: bool = True, display_timezone: ZoneInfo = DEFAULT_TIMEZONE) -> bool:
     """Enforce display/member limits and saved payload capacity.
 
     Redirected members retain their full snapshots after replacement confirmation;
@@ -200,5 +196,5 @@ def aggregate_fits(members: List[SourceMember], *, max_members: int = 200,
     payload_members = members if include_redirected_payload else [
         member for member in members if member["status"] != "redirected"]
     return (len(members) <= max_members and
-            len(render_members(members, admin_id=admin_id).text) <= int(MessageLimit.MAX_TEXT_LENGTH) and
+            len(render_members(members, admin_id=admin_id, display_timezone=display_timezone).text) <= int(MessageLimit.MAX_TEXT_LENGTH) and
             len(pickle.dumps(payload_members, protocol=5)) <= max_payload_bytes)

@@ -27,6 +27,7 @@ from ehforwarderbot.exceptions import EFBChatNotFound, EFBOperationNotSupported
 from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
 from .aggregate import render_members
+from .utils import DEFAULT_TIMEZONE, format_message_time
 from .chat import ETMChatType, ETMGroupChat, unpickle
 from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
@@ -102,9 +103,11 @@ class ChatBindingManager(LocaleMixin):
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
     FORUM_RELINK_THRESHOLD = 960_000
+    display_timezone = DEFAULT_TIMEZONE
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
+        self.display_timezone = channel.flag.timezone
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
@@ -1785,7 +1788,7 @@ class ChatBindingManager(LocaleMixin):
                                 author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
                         if (member is not None or message_text.strip()) and not (media_type and media_type != 'Text'):
                             display_time = source_time or received_time
-                            timestamp = display_time.strftime("%Y-%m-%d %H:%M:%S") if display_time else "Unknown"
+                            timestamp = format_message_time(display_time, self.display_timezone) if display_time else "Unknown"
                             formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
                         yield {
                             "slave_chat_id": str(slave_chat_id),

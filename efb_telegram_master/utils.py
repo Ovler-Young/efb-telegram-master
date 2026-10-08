@@ -1,11 +1,13 @@
 # coding=utf-8
 
 import base64
+import datetime
 import json
 import logging
 import os
 import subprocess
 from io import BytesIO
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
 
@@ -24,6 +26,14 @@ if TYPE_CHECKING:
     from . import TelegramChannel
 
 FFMPEG_TIMEOUT = 60
+DEFAULT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def format_message_time(value: datetime.datetime, display_timezone: ZoneInfo = DEFAULT_TIMEZONE) -> str:
+    """Display saved timestamps, interpreting naive values in the host local zone."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.astimezone()
+    return value.astimezone(display_timezone).strftime("%I:%M:%S")
 
 
 TelegramChatID = NewType('TelegramChatID', int)
@@ -57,6 +67,7 @@ class ExperimentalFlagsManager(LocaleMixin):
         "api_base_file_url": None,
         "local_tdlib_api": False,
         "topic_group": None,
+        "timezone": DEFAULT_TIMEZONE.key,
         "text_aggregation": False,
         "text_aggregation_window_seconds": 3,
         "text_aggregation_idle_seconds": 1800,
@@ -89,6 +100,13 @@ class ExperimentalFlagsManager(LocaleMixin):
         self.channel = channel
         self.config: Dict[str, Any] = ExperimentalFlagsManager.DEFAULT_VALUES.copy()
         self.config.update(channel.config.get('flags', dict()) or dict())
+        try:
+            timezone_name = self.config["timezone"]
+            if not isinstance(timezone_name, str):
+                raise ValueError("Timezone name must be a string")
+            self.timezone = ZoneInfo(timezone_name)
+        except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("flags.timezone must be a valid IANA time zone, such as Asia/Shanghai") from exc
         if self.config.get("topic_group") is None and channel.config.get("topic_group") is not None:
             self.config["topic_group"] = channel.config["topic_group"]
 

@@ -18,7 +18,7 @@ from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.live_aggregate import LiveTextAggregation
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest, SenderSelection, SenderSelectionResult
 from efb_telegram_master.queued_log import decode_aggregation
-from efb_telegram_master.utils import ExperimentalFlagsManager
+from efb_telegram_master.utils import ExperimentalFlagsManager, format_message_time
 from tests.unit.test_live_aggregate import source
 
 
@@ -262,7 +262,9 @@ def test_ordinary_ingestion_snapshots_before_formatting_and_preserves_prefix(run
     from efb_telegram_master.slave_message import SlaveMessageProcessor
     from unittest.mock import Mock
     manager = runtime
-    manager.channel.flag.config["text_aggregation"] = True
+    manager.channel.config["flags"] = {"text_aggregation": True, "timezone": "UTC"}
+    manager.channel.flag = ExperimentalFlagsManager(manager.channel)
+    manager.live_aggregation = LiveTextAggregation(manager)
     processor = SlaveMessageProcessor.__new__(SlaveMessageProcessor)
     processor.bot = manager
     processor.flag = manager.channel.flag
@@ -281,7 +283,7 @@ def test_ordinary_ingestion_snapshots_before_formatting_and_preserves_prefix(run
     assert msg.text == "literal <body>"
     row = MsgLog.get()
     assert row.master_message_thread_id == "7"
-    timestamp = row.aggregate["children"][0]["received_time"].strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = format_message_time(row.aggregate["children"][0]["received_time"], manager.channel.flag.timezone)
     assert row.text == f"Source Group Alice: {timestamp}\nliteral <body>"
     assert row.aggregate["children"][0]["author_name"] == "Alice"
     assert not processor._pending_slave_messages
