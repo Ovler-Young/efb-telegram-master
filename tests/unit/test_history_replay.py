@@ -184,7 +184,7 @@ def test_live_members_expand_saved_content_and_interleave_with_legacy_media(hist
                                                      for second in [10, 20, 30, 35, 40, 50]]
     assert [entry.source_master_msg_id for entry in staged] == ['-100.1', '-100.1', '-100.3',
                                                               '-100.4', '-100.1', '-100.2']
-    assert staged[0].formatted_text == ('*Alice* `2026-01-01 00:00`\n'
+    assert staged[0].formatted_text == ('*Alice* `2026-01-01 00:00:10`\n'
                                         f'↪ Eve \\[{origin}/quoted]: quoted\\_body\nsame\\_<&\n\n')
     assert '*Carol*' in staged[1].formatted_text and 'saved before withdrawal' in staged[1].formatted_text
     assert staged[4].formatted_text.startswith('*Bob*') and staged[4].formatted_text.endswith('same\\_<&\n\n')

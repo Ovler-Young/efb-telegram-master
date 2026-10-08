@@ -281,7 +281,8 @@ def test_ordinary_ingestion_snapshots_before_formatting_and_preserves_prefix(run
     assert msg.text == "literal <body>"
     row = MsgLog.get()
     assert row.master_message_thread_id == "7"
-    assert row.text == "Source Group Alice:\nliteral <body>"
+    timestamp = row.aggregate["children"][0]["received_time"].strftime("%Y-%m-%d %H:%M:%S")
+    assert row.text == f"Source Group Alice {timestamp}:\nliteral <body>"
     assert row.aggregate["children"][0]["author_name"] == "Alice"
     assert not processor._pending_slave_messages
     processor.dispatch_message.assert_not_called()

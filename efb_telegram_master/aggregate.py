@@ -121,6 +121,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
     text_parts: List[str] = []
     ranges: List[MemberRange] = []
     offset = 0
+    previous_date = None
     for member in members:
         if history and member["status"] == "redirected":
             continue
@@ -145,7 +146,18 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
             if reply:
                 identity = f'{reply["origin_uid"]}/{reply["source_id"]}'
                 reply_text = f'↪ {reply["author_name"][:60]} [{identity[:100]}]: {reply["excerpt"][:120]}\n'
-        prefix = f"{name}:\n" if name else ""
+        if history:
+            prefix = f"{name}:\n" if name else ""
+        else:
+            display_time = member["source_time"] or member["received_time"]
+            date = display_time.strftime("%Y-%m-%d")
+            if _compact_status and member["status"] != "active":
+                date_header = f"{date}\n" if date != previous_date else ""
+                prefix = date_header + display_time.strftime("%H:%M:%S ")
+            else:
+                timestamp = display_time.strftime("%Y-%m-%d %H:%M:%S")
+                prefix = f"{name} {timestamp}:\n" if name else f"{timestamp}:\n"
+            previous_date = date
         visible = prefix + reply_text + body
         if text_parts:
             offset += 2

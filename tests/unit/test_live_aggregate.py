@@ -1,4 +1,5 @@
 import copy
+import datetime
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -100,7 +101,7 @@ def test_finalization_is_idempotent_and_preserves_newer_removed_source(manager):
     # it does not reverse a newer logical source status.
     manager.finalize_aggregate_message(receipt(), make_aggregate([member], 3))
     row = MsgLog.get()
-    assert row.text == "Alice:\nbody"
+    assert row.text == render_members([member]).text
     assert row.aggregate["children"][0]["status"] == "removed"
 
 
@@ -165,15 +166,19 @@ def test_rendering_preserves_identities_reply_and_utf16_ranges():
     first.substitutions = Substitutions({(2, 8): first.chat.self})
     second = source("two", first.text, "Bob")
     second.target = first
-    members = [make_source_member(first), make_source_member(second)]
+    source_time = datetime.datetime(2026, 10, 8, 12, 34, 56)
+    received_time = source_time + datetime.timedelta(seconds=2)
+    members = [make_source_member(first, source_time=source_time, received_time=received_time),
+               make_source_member(second, received_time=received_time)]
     rendered = render_members(members, admin_id=123)
     assert 'A &amp; B' in rendered.html
     assert '<a href="tg://user?id=123">&lt;same&gt;</a>' in rendered.html
     assert rendered.text.count("😀 <same>") == 3
     assert "tests.source group/one" in rendered.text
     assert [item["source_id"] for item in rendered.ranges] == ["one", "two"]
-    assert rendered.ranges[0]["end"] == utf16_length("A & B:\n😀 <same>")
+    assert rendered.ranges[0]["end"] == utf16_length("A & B 2026-10-08 12:34:56:\n😀 <same>")
     assert rendered.ranges[1]["start"] == rendered.ranges[0]["end"] + 2
+    assert "Bob 2026-10-08 12:34:58:\n" in rendered.text
     assert member_message(members[1]).target.uid == "one"
 
 
@@ -195,10 +200,17 @@ def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones
     assert aggregate_fits([redirected], include_redirected_payload=False)
     assert not aggregate_fits([redirected], max_members=0, include_redirected_payload=False)
 
-    removed = [make_source_member(source(str(index), "saved", "name" * 40)) for index in range(200)]
+    received_time = datetime.datetime(2026, 10, 8, 12, 34, 56)
+    removed = [make_source_member(source(str(index), "saved", "name" * 40), received_time=received_time)
+               for index in range(200)]
     for member in removed:
         member["status"] = "removed"
+    for member in removed[100:]:
+        member["received_time"] += datetime.timedelta(days=1)
     rendered = render_members(removed)
     assert 0 < len(rendered.text) <= 4096
     assert len(rendered.ranges) == 200
+    assert rendered.text.count("12:34:56") == 200
+    assert "2026-10-08" in rendered.text and "2026-10-09" in rendered.text
+    assert aggregate_fits(removed)
     assert render_members(removed, history=True).text.count("saved") == 200

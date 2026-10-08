@@ -114,7 +114,7 @@ def test_confirmed_utf16_quote_is_unique_and_ambiguities_choose(handler):
     handler.msg(update, SimpleNamespace())
     assert handler.sent[-1].target.uid == 'source-1'
     sent_count = len(handler.sent)
-    for quote in (TextQuote('Alice', 0), TextQuote('first\n\nAlice', utf16_length('Alice:\nemoji 😀 ')),
+    for quote in (TextQuote('Alice', 0), TextQuote('first\n\nAlice', utf16_length(target.text[:target.text.index('first')])),
                   TextQuote('uniquely', position - 1)):
         handler.msg(incoming(target, quote=quote), SimpleNamespace())
         assert len(handler.sent) == sent_count
@@ -197,7 +197,7 @@ def test_old_display_quote_resolves_redirect_and_known_source_lookup(handler):
 def test_pagination_preserves_duplicate_members_and_revalidates_topic(handler):
     target = container(handler, tuple(['duplicate'] * 10))
     # Equal text cannot identify a source using its location alone.
-    update = incoming(target, quote=TextQuote('duplicate', utf16_length('Alice:\n')))
+    update = incoming(target, quote=TextQuote('duplicate', utf16_length(target.text[:target.text.index('duplicate')])))
     handler.msg(update, SimpleNamespace())
     assert not handler.sent
     notice = handler.notices[-1]

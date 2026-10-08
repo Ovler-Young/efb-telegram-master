@@ -78,12 +78,15 @@ def test_pending_and_inflight_source_edit_removal_recover(runtime):
     complete(manager)
     row = MsgLog.get()
     assert len(row.aggregate["children"]) == 1
-    assert row.text == "Alice:\nedited during first send"
+    assert row.text == "Alice 1970-01-01 00:00:01:\nedited during first send"
+    assert row.aggregate["children"][0]["received_time"] == first["received_time"]
+    assert row.aggregate["children"][0]["source_time"] == first["source_time"]
     assert row.aggregate["children"][0]["source_revision"] == 3
     remove(handler, "one")
     complete(manager)
     removed = MsgLog.get().aggregate["children"][0]
     assert removed["status"] == "removed"
+    assert MsgLog.get().text == "Alice 1970-01-01 00:00:01:\n[message removed]"
     assert member_message(removed).text == "edited during first send"
     append(manager, "empty", 10)
     assert manager.live_aggregation.remove_source_member(key, (key[0], "empty"))
@@ -103,7 +106,7 @@ def test_independent_boundary_survives_restart(runtime):
     complete(manager)
     complete(manager)
     complete(manager)
-    assert [call[2] for call in manager.transport.calls] == ["Alice:\nbody", "media", "Alice:\nbody"]
+    assert [call[2] for call in manager.transport.calls] == ["Alice 1970-01-01 00:00:01:\nbody", "media", "Alice 1970-01-01 00:00:01:\nbody"]
     assert [row.aggregate["children"][0]["source_id"] for row in MsgLog.select().order_by(MsgLog.master_msg_id)] == ["one", "three"]
 
 
@@ -231,7 +234,7 @@ def test_pending_qualification_split_preserves_source_order(runtime):
         complete(manager)
         complete(manager)
         complete(manager)
-    assert [call[2] for call in manager.transport.calls] == ["Alice:\nbody", "Alice:\nindependent body", "Alice:\nafter body"]
+    assert [call[2] for call in manager.transport.calls] == ["Alice 1970-01-01 00:00:01:\nbody", "Alice:\nindependent body", "Alice 1970-01-01 00:00:01:\nafter body"]
     assert manager.channel.db.resolve_source_member(key[0], "split", "-100")[1]["source_revision"] == 2
     assert [child["source_id"] for row in MsgLog.select() if row.aggregate for child in row.aggregate["children"]] == ["before", "after"]
 
@@ -260,7 +263,7 @@ def test_split_recovery_keeps_preexisting_media_after_split_members(runtime, lat
         for _ in range(2 if late_after_confirmation else 5):
             complete(manager)
     assert [call[2] for call in manager.transport.calls] == [
-        "Alice:\nbody", "Alice:\nindependent body", "Alice:\nafter body", "media", "Alice:\nlate text",
+        "Alice 1970-01-01 00:00:01:\nbody", "Alice:\nindependent body", "Alice 1970-01-01 00:00:01:\nafter body", "media", "Alice 1970-01-01 00:00:01:\nlate text",
     ]
 
 
@@ -351,26 +354,26 @@ def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtim
     assert long_body.encode() in documents[0]
     old = MsgLog.get_by_id("-100.1")
     assert member_message(old.aggregate["children"][0]).text == long_body
-    assert old.text == "Alice:\nbody\n\nAlice:\nother body"
+    assert old.text == "Alice 1970-01-01 00:00:01:\nbody\n\nAlice 1970-01-01 00:00:01:\nother body"
     assert any(decode_aggregation(row.log_context).get("routing_hint")
                for row in manager._outbound_queue.aggregation_rows())
     restart(manager)
     complete(manager)
-    assert manager.transport.calls[-1][2] == "Alice:\nnext text"
+    assert manager.transport.calls[-1][2] == "Alice 1970-01-01 00:00:10:\nnext text"
     complete(manager)
     old = MsgLog.get_by_id("-100.1")
     assert [child["status"] for child in old.aggregate["children"]] == ["redirected", "active"]
-    assert old.text == "Alice:\n[message moved]\n\nAlice:\nother body"
+    assert old.text == "Alice 1970-01-01 00:00:01:\n[message moved]\n\nAlice 1970-01-01 00:00:01:\nother body"
     assert len(documents) == 1
     assert [call[0] for call in manager.transport.calls].count("send_message") == 3
     # Other members continue to update the original container.
     edit(handler, "two", "edited survivor")
     complete(manager)
     assert manager.channel.db.resolve_source_member(key[0], "two", "-100")[0].master_msg_id == "-100.1"
-    assert MsgLog.get_by_id("-100.1").text == "Alice:\n[message moved]\n\nAlice:\nedited survivor"
+    assert MsgLog.get_by_id("-100.1").text == "Alice 1970-01-01 00:00:01:\n[message moved]\n\nAlice 1970-01-01 00:00:01:\nedited survivor"
     append(manager, "unrelated", 20, "other topic still schedules", topic=7)
     complete(manager)
-    assert manager.transport.messages[5].text == "Alice:\nother topic still schedules"
+    assert manager.transport.messages[5].text == "Alice 1970-01-01 00:00:20:\nother topic still schedules"
     assert not manager._outbound_queue.aggregation_rows()
 
 

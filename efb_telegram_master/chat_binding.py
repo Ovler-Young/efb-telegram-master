@@ -1785,7 +1785,7 @@ class ChatBindingManager(LocaleMixin):
                                 author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
                         if (member is not None or message_text.strip()) and not (media_type and media_type != 'Text'):
                             display_time = source_time or received_time
-                            timestamp = display_time.strftime("%Y-%m-%d %H:%M") if display_time else "Unknown"
+                            timestamp = display_time.strftime("%Y-%m-%d %H:%M:%S") if display_time else "Unknown"
                             formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
                         yield {
                             "slave_chat_id": str(slave_chat_id),
