@@ -303,3 +303,84 @@ def test_pending_capacity_boundary_and_idle_close_preserve_members(runtime):
     complete(manager)
     assert [call[0] for call in manager.transport.calls] == ["send_message"] * 3
     assert [row.aggregate["children"][0]["source_id"] for row in MsgLog.select().order_by(MsgLog.master_msg_id)] == ["one", "two", "three"]
+
+
+def observe_incoming(manager, *, topic=None, author_id=50, edited=False):
+    from telegram import Update, User
+    from efb_telegram_master import TelegramChannel
+    manager.me = SimpleNamespace(id=700)
+    manager.bot_pool = SimpleNamespace(bots=[SimpleNamespace(bot_id=701)])
+    message = Message(900, datetime.datetime.now(datetime.timezone.utc), Chat(-100, "supergroup"),
+                      from_user=User(author_id, "User", author_id in {700, 701}),
+                      text="/help", message_thread_id=topic)
+    update = Update(99, edited_message=message) if edited else Update(99, message=message)
+    TelegramChannel.observe_aggregation_boundary(SimpleNamespace(bot_manager=manager), update, None)
+
+
+def test_incoming_command_closes_all_origins_and_durable_pending_appends(runtime):
+    manager = runtime
+    append(manager, "first", 1, topic=3)
+    complete(manager)
+    second = make_source_member(source("second"), received_time=datetime.datetime.fromtimestamp(5))
+    second["origin_uid"] = "tests.source other-group"
+    second_key = (second["origin_uid"], -100, "3")
+    manager.live_aggregation.append(second_key, second)
+    complete(manager)
+    append(manager, "other-topic", 9, topic=4)
+    complete(manager)
+    append(manager, "waiting-first", 13, topic=3)
+    pending = copy.deepcopy(second)
+    pending.update(source_id="waiting-second", received_time=datetime.datetime.fromtimestamp(17))
+    manager.live_aggregation.append(second_key, pending)
+    observe_incoming(manager, topic=3)
+    # Recovery must not restore either pending row's former edit target.
+    manager.live_aggregation = LiveTextAggregation(manager)
+    append(manager, "after-boundary", 21, topic=3)
+    append(manager, "other-topic-next", 25, topic=4)
+    while manager._outbound_queue.aggregation_rows():
+        complete(manager)
+    calls = manager.transport.calls
+    assert [call[0] for call in calls[:3]] == ["send_message"] * 3
+    assert all(call[0] == "send_message" for call in calls[3:])
+    rows = list(MsgLog.select())
+    assert [child["source_id"] for child in manager.channel.db.get_msg_log(master_msg_id="-100.1").aggregate["children"]] == ["first"]
+    assert [child["source_id"] for child in manager.channel.db.get_msg_log(master_msg_id="-100.2").aggregate["children"]] == ["second"]
+    assert sum(len(row.aggregate["children"]) for row in rows) == 7
+
+
+def test_incoming_boundary_ignores_edits_own_bots_and_other_topics(runtime):
+    manager = runtime
+    append(manager, "first", 1, topic=3)
+    complete(manager)
+    observe_incoming(manager, topic=3, edited=True)
+    from telegram import CallbackQuery, Update, User
+    from efb_telegram_master import TelegramChannel
+    callback = Update(100, callback_query=CallbackQuery("selection", User(50, "User", False), "chat", data="1"))
+    TelegramChannel.observe_aggregation_boundary(SimpleNamespace(bot_manager=manager), callback, None)
+    observe_incoming(manager, topic=3, author_id=701)
+    observe_incoming(manager, topic=4)
+    append(manager, "second", 5, topic=3)
+    complete(manager)
+    assert [call[0] for call in manager.transport.calls] == ["send_message", "edit_message_text"]
+    # A new incoming message in the same topic closes it regardless of text kind.
+    observe_incoming(manager, topic=3)
+    append(manager, "third", 9, topic=3)
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "send_message"
+
+
+def test_incoming_boundary_while_first_send_in_flight_cannot_reopen(runtime):
+    manager = runtime
+    append(manager, "first", 1)
+    scheduler = manager._outbound_scheduler
+    scheduler.dispatch_once()
+    for submitted in scheduler.in_flight.values():
+        submitted.future.result(timeout=2)
+    append(manager, "second", 5)
+    observe_incoming(manager)
+    scheduler.harvest_completed()
+    manager.live_aggregation = LiveTextAggregation(manager)
+    complete(manager)
+    append(manager, "third", 9)
+    complete(manager)
+    assert [call[0] for call in manager.transport.calls] == ["send_message"] * 3

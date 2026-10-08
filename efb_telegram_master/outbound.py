@@ -1520,6 +1520,32 @@ class OutboundQueue:
             (member["origin_uid"], member["source_id"], member["source_revision"], context),
         )
 
+    def close_aggregation_destination(self, chat_id: int, topic: Optional[str]) -> None:
+        """Persist an incoming-message boundary without changing attempted requests."""
+        from .queued_log import decode_aggregation, encode_aggregation
+        with self._lock, self.connection:
+            rows = self.connection.execute(
+                "SELECT id, log_context FROM outbound_queue WHERE telegram_chat_id=? "
+                "AND substr(log_context, 1, 1)=?",
+                (chat_id, b"\x03"),
+            ).fetchall()
+            for row_id, payload in rows:
+                context = decode_aggregation(payload)
+                key = context.get("key")
+                if not key or int(key[1]) != chat_id or key[2] != topic:
+                    continue
+                if context["kind"] == "logical":
+                    context.update(base=None, inherit=False, appendable=False, incoming_boundary=True)
+                elif context["kind"] in {"aggregate", "member_update"}:
+                    context.update(appendable=False, incoming_boundary=True)
+                    retry = context.get("retry_context")
+                    if retry:
+                        retry.update(base=None, inherit=False, appendable=False, incoming_boundary=True)
+                else:
+                    continue
+                self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                        (encode_aggregation(context), row_id))
+
     def replace_logical_aggregation(self, row_id: int, context: bytes, *, cancelled_member=None) -> bool:
         from .queued_log import decode_aggregation
         with self._lock, self.connection:

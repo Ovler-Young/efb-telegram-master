@@ -65,7 +65,7 @@ class LiveTextAggregation:
             row, logical = max(terminal or candidates, key=lambda item: item[0].id)
             stream = self.streams[key]
             stream.tail = row.id
-            stream.base = logical.get("base") if logical["kind"] not in {"boundary", "source", "redirect"} else None
+            stream.base = logical.get("base") if logical.get("appendable", True) and logical["kind"] not in {"boundary", "source", "redirect"} else None
             stream.recent = logical.get("recent", [])
             stream.last_new = logical.get("last_new", row.created_at)
             if logical["kind"] in {"boundary", "source", "redirect"} and logical.get("generation", 0) < stream.generation:
@@ -98,6 +98,15 @@ class LiveTextAggregation:
         if stream is not None:
             stream.base = None
             stream.generation += 1
+
+    def close_destination(self, chat_id, topic):
+        """New Telegram messages end every source stream in their destination."""
+        with self.scheduler._lock:
+            self.queue.close_aggregation_destination(chat_id, topic)
+            for key in self.streams:
+                if int(key[1]) == chat_id and key[2] == topic:
+                    self.close(key)
+            self.scheduler.wake_event.set()
 
     def close_source_routes(self, key):
         """End former target chats/topics when normal source delivery changes route."""
@@ -135,7 +144,7 @@ class LiveTextAggregation:
             stream.recent = [stamp for stamp in stream.recent if now - stamp < 3][-2:] + [now]
             stream.last_new = now
             context = self._tail_context(stream)
-            if context and context["kind"] == "logical" and context["generation"] == stream.generation:
+            if context and context["kind"] == "logical" and context["generation"] == stream.generation and not context.get("incoming_boundary"):
                 members = context["members"] + [member]
                 if self.fits(members):
                     context.update(members=members, recent=stream.recent, last_new=now)
@@ -150,7 +159,7 @@ class LiveTextAggregation:
                 # Pending capacity becomes a publication boundary.
                 self.close(key)
             predecessor = self._existing_tail(stream) or prior_tail
-            inherit = bool(predecessor and context and context.get("generation") == stream.generation)
+            inherit = bool(predecessor and context and context.get("generation") == stream.generation and not context.get("incoming_boundary"))
             waiting = len(stream.recent) > 2
             context = dict(format_version=1, kind="logical", key=key, members=[member],
                            base=stream.base, inherit=inherit, generation=stream.generation,
@@ -351,7 +360,7 @@ class LiveTextAggregation:
 
         def update_successor(payload):
             successor = decode_aggregation(payload)
-            if successor.get("inherit") and tuple(successor["key"]) == tuple(context["key"]):
+            if successor.get("inherit") and not successor.get("incoming_boundary") and tuple(successor["key"]) == tuple(context["key"]):
                 successor["base"] = base
                 successor["inherit"] = False
             if successor["kind"] == "member_update" and not successor.get("container_id"):
@@ -359,6 +368,10 @@ class LiveTextAggregation:
                 successor["required_sender"] = sender_bot_id or "__main__"
             return encode_aggregation(successor)
 
+        current_payload = self.queue.aggregation_context(row.id)
+        current = decode_aggregation(current_payload) if current_payload else None
+        if current and current.get("incoming_boundary"):
+            context.update(appendable=False, incoming_boundary=True)
         context["handoff"] = True
         _, changed = self.queue.handoff_aggregation(row.id, encode_aggregation(context), update_successor)
         if changed:

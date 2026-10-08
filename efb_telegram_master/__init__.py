@@ -19,7 +19,7 @@ from PIL import Image, WebPImagePlugin
 from ruamel.yaml import YAML
 from telegram import Update, Message
 from telegram.constants import ChatType
-from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext
+from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext, TypeHandler
 
 import ehforwarderbot  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, coordinator
@@ -140,6 +140,10 @@ class TelegramChannel(MasterChannel):
                                           os.fspath(LOCALE_DIR),
                                           fallback=True)
 
+        # Observe new messages before commands or the incoming message worker.
+        self.bot_manager.dispatcher.add_handler(
+            TypeHandler(Update, self.bot_manager.as_async_callback(self.observe_aggregation_boundary)), group=-2)
+
         # Basic message handlers
         non_edit_filter = Filters.update.message | Filters.update.channel_post
         self.bot_manager.dispatcher.add_handler(
@@ -167,6 +171,21 @@ class TelegramChannel(MasterChannel):
         self.bot_manager.dispatcher.add_error_handler(self.bot_manager.as_async_callback(self.error))
 
         self.rpc_utilities = RPCUtilities(self)
+
+    def observe_aggregation_boundary(self, update: Update, context: CallbackContext):
+        """Close text append eligibility when a new Telegram message arrives."""
+        message = update.message or update.channel_post
+        if message is None:
+            return
+        manager = self.bot_manager
+        author = message.from_user
+        own_ids = {manager.me.id} if manager.me is not None else set()
+        if manager.bot_pool:
+            own_ids.update(bot.bot_id for bot in manager.bot_pool.bots)
+        if author is not None and author.id in own_ids:
+            return
+        topic = str(message.message_thread_id) if message.message_thread_id is not None else None
+        manager.live_aggregation.close_destination(message.chat_id, topic)
 
     @property
     def _(self) -> Callable[[str], str]:
