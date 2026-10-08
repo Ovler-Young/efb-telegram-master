@@ -148,15 +148,22 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
                 reply_text = f'↪ {reply["author_name"][:60]} [{identity[:100]}]: {reply["excerpt"][:120]}\n'
         if history:
             prefix = f"{name}:\n" if name else ""
+            prefix_html = html.escape(prefix)
         else:
             display_time = member["source_time"] or member["received_time"]
             date = display_time.strftime("%Y-%m-%d")
             if _compact_status and member["status"] != "active":
                 date_header = f"{date}\n" if date != previous_date else ""
-                prefix = date_header + display_time.strftime("%H:%M:%S ")
+                timestamp = display_time.strftime("%H:%M:%S")
+                prefix = date_header + timestamp + " "
+                date_html = f"<code>{date}</code>\n" if date_header else ""
+                prefix_html = date_html + f"<code>{timestamp}</code> "
             else:
                 timestamp = display_time.strftime("%Y-%m-%d %H:%M:%S")
-                prefix = f"{name} {timestamp}:\n" if name else f"{timestamp}:\n"
+                author_prefix = name if name.endswith(":") else f"{name}:"
+                prefix = f"{author_prefix} {timestamp}\n" if name else f"{timestamp}\n"
+                author_html = f"<b>{html.escape(author_prefix)}</b> " if name else ""
+                prefix_html = author_html + f"<code>{timestamp}</code>\n"
             previous_date = date
         visible = prefix + reply_text + body
         if text_parts:
@@ -165,7 +172,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
                                   start=offset, end=offset + utf16_length(visible)))
         offset += utf16_length(visible)
         text_parts.append(visible)
-        html_parts.append(html.escape(prefix + reply_text) + body_html)
+        html_parts.append(prefix_html + html.escape(reply_text) + body_html)
     if not text_parts:
         return RenderedAggregate("[message removed]", "[message removed]", [])
     if (not history and not _compact_status and
