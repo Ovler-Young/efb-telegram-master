@@ -94,9 +94,26 @@ def test_aggregation_origin_configuration():
 
 def test_aggregation_chat_type_configuration():
     assert ExperimentalFlagsManager(SimpleNamespace(config={}))("text_aggregation_chat_types") is None
-    for allowed in (None, [], ["group"], ["group", "private", "system"]):
+    for allowed in (None, [], ["group"], ["group", "private", "system", "official_account"]):
         flags = ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_chat_types": allowed}}))
         assert flags("text_aggregation_chat_types") == allowed
     for invalid in ("group", [1], [""], ["GroupChat"], ["unknown"]):
         with raises(ValueError, match="flags.text_aggregation_chat_types"):
             ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_chat_types": invalid}}))
+
+
+def test_aggregation_rule_configuration():
+    assert ExperimentalFlagsManager(SimpleNamespace(config={}))("text_aggregation_rules") is None
+    for allowed in (None, [], [{"origins": ["tests.qq"], "chat_types": ["group"]}]):
+        flags = ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_rules": allowed}}))
+        assert flags("text_aggregation_rules") == allowed
+    for invalid in (
+        "group", [None], [{"origins": ["tests.qq"]}],
+        [{"origins": [], "chat_types": ["group"]}],
+        [{"origins": [1], "chat_types": ["group"]}],
+        [{"origins": ["tests.qq"], "chat_types": []}],
+        [{"origins": ["tests.qq"], "chat_types": ["unknown"]}],
+        [{"origins": ["tests.qq"], "chat_types": ["group"], "extra": True}],
+    ):
+        with raises(ValueError, match="flags.text_aggregation_rules"):
+            ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_rules": invalid}}))

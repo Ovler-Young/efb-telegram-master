@@ -470,10 +470,11 @@ def test_excluding_source_closes_append_but_keeps_source_edit(runtime, filter_fl
 
 
 @pytest.mark.parametrize("chat_types, expected", [
-    (None, {"group", "private", "system"}),
+    (None, {"group", "private", "system", "official_account"}),
     ([], set()),
     (["group"], {"group"}),
     (["private", "system"], {"private", "system"}),
+    (["official_account"], {"official_account"}),
 ])
 def test_origin_and_chat_type_intersection(runtime, chat_types, expected):
     manager = runtime
@@ -486,10 +487,12 @@ def test_origin_and_chat_type_intersection(runtime, chat_types, expected):
         ("group", GroupChat, "tests.source"),
         ("private", PrivateChat, "tests.source"),
         ("system", SystemChat, "tests.source"),
+        ("official_account", PrivateChat, "tests.source"),
         ("other-origin", GroupChat, "tests.other"),
     ):
         message = source(uid)
-        message.chat = chat_class(module_id=module_id, uid=uid, name=uid, with_self=True)
+        message.chat = chat_class(module_id=module_id, uid=uid, name=uid, with_self=True,
+                                  vendor_specific={"is_mp": uid == "official_account"})
         message.author = ChatMember(message.chat, uid="alice", name="Alice")
         message.chat.members.append(message.author)
         handler.send_message(message)
@@ -498,4 +501,41 @@ def test_origin_and_chat_type_intersection(runtime, chat_types, expected):
     assert {member["source_id"] for row in rows if row.aggregate
             for member in row.aggregate["children"]} == expected
     assert {row.slave_message_id for row in rows if not row.aggregate} == (
-        {"group", "private", "system", "other-origin"} - expected)
+        {"group", "private", "system", "official_account", "other-origin"} - expected)
+
+
+@pytest.mark.parametrize("rules, expected", [
+    (None, {"qq-group"}),
+    ([], set()),
+    ([{"origins": ["tests.qq"], "chat_types": ["group"]},
+      {"origins": ["tests.wechat", "tests.other"], "chat_types": ["official_account"]}],
+     {"qq-group", "wechat-mp", "other-mp"}),
+])
+def test_combination_rules_route_platform_and_type_independently(runtime, rules, expected):
+    manager = runtime
+    manager.channel.flag.config.update(
+        text_aggregation=True, text_aggregation_origins=["tests.qq"],
+        text_aggregation_chat_types=["group"], text_aggregation_rules=rules,
+    )
+    handler = processor(manager)
+    cases = (
+        ("qq-group", GroupChat, "tests.qq", False),
+        ("qq-private", PrivateChat, "tests.qq", False),
+        ("wechat-mp", PrivateChat, "tests.wechat", True),
+        ("wechat-private", PrivateChat, "tests.wechat", False),
+        ("other-mp", PrivateChat, "tests.other", True),
+        ("other-group", GroupChat, "tests.other", False),
+        ("wechat-system", SystemChat, "tests.wechat", False),
+    )
+    for uid, chat_class, module_id, is_mp in cases:
+        message = source(uid)
+        message.chat = chat_class(module_id=module_id, uid=uid, name=uid, with_self=True,
+                                  vendor_specific={"is_mp": is_mp})
+        message.author = ChatMember(message.chat, uid="alice", name="Alice")
+        message.chat.members.append(message.author)
+        handler.send_message(message)
+        complete(manager)
+    rows = list(MsgLog.select())
+    assert {member["source_id"] for row in rows if row.aggregate
+            for member in row.aggregate["children"]} == expected
+    assert {row.slave_message_id for row in rows if not row.aggregate} == {case[0] for case in cases} - expected
