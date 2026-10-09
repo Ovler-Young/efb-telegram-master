@@ -83,3 +83,10 @@ def test_convert_tgs_to_gif():
     with open('tests/mocks/AnimatedSticker.tgs', 'rb') as f:
         assert convert_tgs_to_gif(f, out), "conversion outcome"
     assert out.seek(0, 2), "converted TGS file should not be empty"
+
+
+def test_aggregation_origin_configuration():
+    assert ExperimentalFlagsManager(SimpleNamespace(config={}))("text_aggregation_origins") is None
+    for invalid in ("tests.source", [1], [""]):
+        with raises(ValueError, match="flags.text_aggregation_origins"):
+            ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_origins": invalid}}))

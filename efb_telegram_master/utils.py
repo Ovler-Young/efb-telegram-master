@@ -69,6 +69,7 @@ class ExperimentalFlagsManager(LocaleMixin):
         "topic_group": None,
         "timezone": DEFAULT_TIMEZONE.key,
         "text_aggregation": False,
+        "text_aggregation_origins": None,
         "text_aggregation_window_seconds": 3,
         "text_aggregation_idle_seconds": 1800,
         "text_aggregation_max_members": 200,
@@ -100,6 +101,11 @@ class ExperimentalFlagsManager(LocaleMixin):
         self.channel = channel
         self.config: Dict[str, Any] = ExperimentalFlagsManager.DEFAULT_VALUES.copy()
         self.config.update(channel.config.get('flags', dict()) or dict())
+        aggregation_origins = self.config["text_aggregation_origins"]
+        if aggregation_origins is not None and (
+                not isinstance(aggregation_origins, list)
+                or any(not isinstance(origin, str) or not origin.strip() for origin in aggregation_origins)):
+            raise ValueError("flags.text_aggregation_origins must be null or a list of non-empty source IDs")
         try:
             timezone_name = self.config["timezone"]
             if not isinstance(timezone_name, str):

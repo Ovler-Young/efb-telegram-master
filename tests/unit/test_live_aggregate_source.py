@@ -413,3 +413,55 @@ def test_file_redirect_persists_source_type_and_actual_file_owner(runtime, tmp_p
     restored = member_message(member)
     assert (restored.type, restored.text, restored.file_id, restored.file_bot_id) == (
         MsgType.File, "file body", "real-file", "700")
+
+
+@pytest.mark.parametrize("origins, expected", [
+    (None, ["included", "other-group", "other-module"]),
+    ([], []),
+    (["tests.source"], ["included", "other-group"]),
+    (["tests.source group"], ["included"]),
+])
+def test_origin_allowlist_routes_new_messages(runtime, origins, expected):
+    manager = runtime
+    manager.channel.flag.config.update(text_aggregation=True, text_aggregation_origins=origins)
+    handler = processor(manager)
+    for uid in ("included", "other-group", "other-module"):
+        message = source(uid)
+        if uid == "other-group":
+            message.chat.uid = "another-group"
+        if uid == "other-module":
+            message.chat.module_id = "tests.other"
+        message.chat.members.append(message.author)
+        handler.send_message(message)
+        complete(manager)
+    rows = list(MsgLog.select())
+    assert len(manager.transport.calls) == 3
+    assert sorted(member["source_id"] for row in rows if row.aggregate
+                  for member in row.aggregate["children"]) == sorted(expected)
+    assert sorted(row.slave_message_id for row in rows if not row.aggregate) == sorted(
+        {"included", "other-group", "other-module"} - set(expected))
+
+
+def test_excluding_origin_closes_append_but_keeps_source_edit(runtime):
+    manager = runtime
+    manager.channel.flag.config["text_aggregation"] = True
+    handler = processor(manager)
+    for uid in ("one", "two"):
+        message = source(uid)
+        message.chat.members.append(message.author)
+        handler.send_message(message)
+        complete(manager)
+        if uid == "one":
+            manager.channel.flag.config["text_aggregation_origins"] = []
+    edit(handler, "one", "edited after exclusion")
+    complete(manager)
+    manager.channel.flag.config["text_aggregation_origins"] = None
+    message = source("three")
+    message.chat.members.append(message.author)
+    handler.send_message(message)
+    complete(manager)
+    rows = list(MsgLog.select().order_by(MsgLog.master_msg_id))
+    assert len(rows) == 3
+    assert member_message(rows[0].aggregate["children"][0]).text == "edited after exclusion"
+    assert rows[1].slave_message_id == "two" and not rows[1].aggregate
+    assert [member["source_id"] for member in rows[2].aggregate["children"]] == ["three"]
