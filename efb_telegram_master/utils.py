@@ -70,6 +70,7 @@ class ExperimentalFlagsManager(LocaleMixin):
         "timezone": DEFAULT_TIMEZONE.key,
         "text_aggregation": False,
         "text_aggregation_origins": None,
+        "text_aggregation_chat_types": None,
         "text_aggregation_window_seconds": 3,
         "text_aggregation_idle_seconds": 1800,
         "text_aggregation_max_members": 200,
@@ -106,6 +107,12 @@ class ExperimentalFlagsManager(LocaleMixin):
                 not isinstance(aggregation_origins, list)
                 or any(not isinstance(origin, str) or not origin.strip() for origin in aggregation_origins)):
             raise ValueError("flags.text_aggregation_origins must be null or a list of non-empty source IDs")
+        aggregation_chat_types = self.config["text_aggregation_chat_types"]
+        if aggregation_chat_types is not None and (
+                not isinstance(aggregation_chat_types, list)
+                or any(not isinstance(chat_type, str) or chat_type not in ("group", "private", "system")
+                       for chat_type in aggregation_chat_types)):
+            raise ValueError("flags.text_aggregation_chat_types must be null or a list of group, private, system")
         try:
             timezone_name = self.config["timezone"]
             if not isinstance(timezone_name, str):

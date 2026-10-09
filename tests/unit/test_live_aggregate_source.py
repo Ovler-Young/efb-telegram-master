@@ -8,6 +8,7 @@ import pytest
 from telegram.error import NetworkError
 from telegram import Document, Message, Chat
 from ehforwarderbot import MsgType, Channel
+from ehforwarderbot.chat import ChatMember, GroupChat, PrivateChat, SystemChat
 from ehforwarderbot.status import MessageRemoval
 from ehforwarderbot.message import LinkAttribute, MessageCommand, MessageCommands
 
@@ -442,7 +443,8 @@ def test_origin_allowlist_routes_new_messages(runtime, origins, expected):
         {"included", "other-group", "other-module"} - set(expected))
 
 
-def test_excluding_origin_closes_append_but_keeps_source_edit(runtime):
+@pytest.mark.parametrize("filter_flag", ["text_aggregation_origins", "text_aggregation_chat_types"])
+def test_excluding_source_closes_append_but_keeps_source_edit(runtime, filter_flag):
     manager = runtime
     manager.channel.flag.config["text_aggregation"] = True
     handler = processor(manager)
@@ -452,10 +454,10 @@ def test_excluding_origin_closes_append_but_keeps_source_edit(runtime):
         handler.send_message(message)
         complete(manager)
         if uid == "one":
-            manager.channel.flag.config["text_aggregation_origins"] = []
+            manager.channel.flag.config[filter_flag] = []
     edit(handler, "one", "edited after exclusion")
     complete(manager)
-    manager.channel.flag.config["text_aggregation_origins"] = None
+    manager.channel.flag.config[filter_flag] = None
     message = source("three")
     message.chat.members.append(message.author)
     handler.send_message(message)
@@ -465,3 +467,35 @@ def test_excluding_origin_closes_append_but_keeps_source_edit(runtime):
     assert member_message(rows[0].aggregate["children"][0]).text == "edited after exclusion"
     assert rows[1].slave_message_id == "two" and not rows[1].aggregate
     assert [member["source_id"] for member in rows[2].aggregate["children"]] == ["three"]
+
+
+@pytest.mark.parametrize("chat_types, expected", [
+    (None, {"group", "private", "system"}),
+    ([], set()),
+    (["group"], {"group"}),
+    (["private", "system"], {"private", "system"}),
+])
+def test_origin_and_chat_type_intersection(runtime, chat_types, expected):
+    manager = runtime
+    manager.channel.flag.config.update(
+        text_aggregation=True, text_aggregation_origins=["tests.source"],
+        text_aggregation_chat_types=chat_types,
+    )
+    handler = processor(manager)
+    for uid, chat_class, module_id in (
+        ("group", GroupChat, "tests.source"),
+        ("private", PrivateChat, "tests.source"),
+        ("system", SystemChat, "tests.source"),
+        ("other-origin", GroupChat, "tests.other"),
+    ):
+        message = source(uid)
+        message.chat = chat_class(module_id=module_id, uid=uid, name=uid, with_self=True)
+        message.author = ChatMember(message.chat, uid="alice", name="Alice")
+        message.chat.members.append(message.author)
+        handler.send_message(message)
+        complete(manager)
+    rows = list(MsgLog.select())
+    assert {member["source_id"] for row in rows if row.aggregate
+            for member in row.aggregate["children"]} == expected
+    assert {row.slave_message_id for row in rows if not row.aggregate} == (
+        {"group", "private", "system", "other-origin"} - expected)

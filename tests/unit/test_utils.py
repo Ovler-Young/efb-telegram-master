@@ -90,3 +90,13 @@ def test_aggregation_origin_configuration():
     for invalid in ("tests.source", [1], [""]):
         with raises(ValueError, match="flags.text_aggregation_origins"):
             ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_origins": invalid}}))
+
+
+def test_aggregation_chat_type_configuration():
+    assert ExperimentalFlagsManager(SimpleNamespace(config={}))("text_aggregation_chat_types") is None
+    for allowed in (None, [], ["group"], ["group", "private", "system"]):
+        flags = ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_chat_types": allowed}}))
+        assert flags("text_aggregation_chat_types") == allowed
+    for invalid in ("group", [1], [""], ["GroupChat"], ["unknown"]):
+        with raises(ValueError, match="flags.text_aggregation_chat_types"):
+            ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_chat_types": invalid}}))
