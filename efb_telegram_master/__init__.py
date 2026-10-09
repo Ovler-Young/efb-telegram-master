@@ -19,7 +19,7 @@ from PIL import Image, WebPImagePlugin
 from ruamel.yaml import YAML
 from telegram import Update, Message
 from telegram.constants import ChatType
-from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext
+from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext, TypeHandler
 
 import ehforwarderbot  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, coordinator
@@ -140,6 +140,10 @@ class TelegramChannel(MasterChannel):
                                           os.fspath(LOCALE_DIR),
                                           fallback=True)
 
+        # Observe new messages before commands or the incoming message worker.
+        self.bot_manager.dispatcher.add_handler(
+            TypeHandler(Update, self.bot_manager.as_async_callback(self.observe_aggregation_boundary)), group=-2)
+
         # Basic message handlers
         non_edit_filter = Filters.update.message | Filters.update.channel_post
         self.bot_manager.dispatcher.add_handler(
@@ -151,8 +155,6 @@ class TelegramChannel(MasterChannel):
         self.bot_manager.dispatcher.add_handler(
             CallbackQueryHandler(self.bot_manager.as_async_callback(self.void_callback_handler), pattern="void"))
         self.bot_manager.dispatcher.add_handler(
-            CallbackQueryHandler(self.bot_manager.as_async_callback(self.bot_manager.session_expired)))
-        self.bot_manager.dispatcher.add_handler(
             CommandHandler("react", self.bot_manager.as_async_callback(self.react), filters=non_edit_filter)
         )
 
@@ -163,10 +165,27 @@ class TelegramChannel(MasterChannel):
         # Register master message handlers after commands to prevent commands
         # commands to be delivered as messages
         self.master_messages: MasterMessageProcessor = MasterMessageProcessor(self)
+        self.bot_manager.dispatcher.add_handler(
+            CallbackQueryHandler(self.bot_manager.as_async_callback(self.bot_manager.session_expired)))
 
         self.bot_manager.dispatcher.add_error_handler(self.bot_manager.as_async_callback(self.error))
 
         self.rpc_utilities = RPCUtilities(self)
+
+    def observe_aggregation_boundary(self, update: Update, context: CallbackContext):
+        """Close text append eligibility when a new Telegram message arrives."""
+        message = update.message or update.channel_post
+        if message is None:
+            return
+        manager = self.bot_manager
+        author = message.from_user
+        own_ids = {manager.me.id} if manager.me is not None else set()
+        if manager.bot_pool:
+            own_ids.update(bot.bot_id for bot in manager.bot_pool.bots)
+        if author is not None and author.id in own_ids:
+            return
+        topic = str(message.message_thread_id) if message.message_thread_id is not None else None
+        manager.live_aggregation.close_destination(message.chat_id, topic)
 
     @property
     def _(self) -> Callable[[str], str]:
@@ -480,11 +499,17 @@ class TelegramChannel(MasterChannel):
 
         target: Message = message.reply_to_message
         msg_log = self.db.get_msg_log(master_msg_id=etm_utils.message_id_to_str(chat_id=TelegramChatID(target.chat_id),
-                                                                                message_id=TelegramMessageID(target.message_id)))
+                                                                                message_id=TelegramMessageID(target.message_id)),
+                                     include_managed_alt=True)
         if msg_log is None:
             sync_reply_text(self.bot_manager, message,
                             self._("The message you replied to is not recorded in ETM database. "
                                    "You cannot react to this message."))
+            return
+
+        if msg_log.aggregate:
+            sync_reply_text(self.bot_manager, message,
+                            self._("Reactions to aggregated messages are not supported yet."))
             return
 
         if not reaction:
@@ -713,14 +738,25 @@ class TelegramChannel(MasterChannel):
 
     def get_message_by_id(self, chat: Chat,
                           msg_id: MessageID) -> Optional[EFBMessage]:
+        from .member_selection import current_source_route
+
         origin_uid = etm_utils.chat_id_to_str(chat=chat)
-        msg_log = self.db.get_msg_log(slave_origin_uid=origin_uid,
-                                      slave_msg_id=msg_id)
-        if msg_log is not None:
-            return msg_log.build_etm_msg(self.chat_manager)
-        else:
-            # Message is not found.
+        target_chat, topic = current_source_route(self, str(origin_uid))
+        try:
+            resolved = self.db.resolve_source_member(str(origin_uid), str(msg_id), str(target_chat), topic)
+        except ValueError:
             return None
+        if resolved:
+            msg_log, member = resolved
+            if member is not None:
+                return msg_log.build_source_member(member, self.chat_manager)
+            return msg_log.build_etm_msg(self.chat_manager)
+        # Preserve legacy independent lookups when their original target was
+        # changed; indexed members require an effective current association.
+        msg_log = self.db.get_msg_log(slave_origin_uid=origin_uid, slave_msg_id=msg_id)
+        if msg_log is not None and not msg_log.aggregate and not msg_log.source_member:
+            return msg_log.build_etm_msg(self.chat_manager)
+        return None
 
     def void_callback_handler(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)

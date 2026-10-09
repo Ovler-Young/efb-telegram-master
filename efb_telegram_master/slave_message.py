@@ -209,12 +209,32 @@ class SlaveMessageProcessor(LocaleMixin):
                 self._release_pending_slave_message(dedupe_key)
                 return msg
 
+            from .live_aggregate import LiveTextAggregation
+            aggregation = getattr(getattr(self, "bot", None), "live_aggregation", None)
+            key = (slave_origin_uid, int(tg_dest), str(thread_id) if thread_id is not None else None)
+            if (isinstance(aggregation, LiveTextAggregation) and not msg.edit
+                    and aggregation.queue.cancelled_source((slave_origin_uid, str(msg.uid)))):
+                self._release_pending_slave_message(dedupe_key)
+                return msg
+            if isinstance(aggregation, LiveTextAggregation) and msg.edit:
+                if self._aggregate_source_edit(aggregation, key, msg, msg_template, silent):
+                    return msg
+            if (isinstance(aggregation, LiveTextAggregation) and self.flag("text_aggregation")
+                    and self.flag.allows_text_aggregation(msg.chat, slave_origin_uid)
+                    and not msg.edit and msg.type == MsgType.Text and not msg.commands):
+                from .aggregate import make_source_member
+                source = ETMMsg.from_efbmsg(msg, self.chat_manager)
+                key = (slave_origin_uid, int(tg_dest), str(thread_id) if thread_id is not None else None)
+                if aggregation.append(key, make_source_member(source, display_prefix=msg_template.removesuffix(":")), silent=silent):
+                    self._release_pending_slave_message(dedupe_key)
+                    return msg
+
             # When editing message
             old_msg_id: Optional[OldMsgID] = None
             _edit_sender_bot_id: Optional[str] = None
             if msg.edit:
-                old_msg = self.db.get_msg_log(slave_msg_id=msg.uid,
-                                              slave_origin_uid=utils.chat_id_to_str(chat=msg.chat))
+                resolved = self.db.resolve_source_member(slave_origin_uid, str(msg.uid), str(tg_dest), key[2])
+                old_msg = resolved[0] if resolved else None
                 if old_msg:
                     _edit_sender_bot_id = old_msg.sender_bot_id
 
@@ -232,8 +252,16 @@ class SlaveMessageProcessor(LocaleMixin):
                 msg.vendor_specific['_sender_bot_id'] = _edit_sender_bot_id
 
             with self._timed_phase(xid, "Dispatch"):
-                self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
-                                      dedupe_key=dedupe_key)
+                key = (slave_origin_uid, int(tg_dest), str(thread_id) if thread_id is not None else None)
+                if (isinstance(aggregation, LiveTextAggregation) and not msg.edit
+                        and (self.flag("text_aggregation") or key in aggregation.streams)):
+                    with aggregation.independent(key):
+                        aggregation.close_source_routes(key)
+                        self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
+                                              dedupe_key=dedupe_key)
+                else:
+                    self.dispatch_message(msg, msg_template, old_msg_id, tg_dest, thread_id, silent,
+                                          dedupe_key=dedupe_key)
         except Exception as e:
             if pending_claimed:
                 self._release_pending_slave_message(dedupe_key)
@@ -254,6 +282,54 @@ class SlaveMessageProcessor(LocaleMixin):
                 self.logger.error("Error occurred while processing message from slave channel.\nMessage: %s\n%s\n%s",
                               repr(msg), repr(e), traceback.format_exc())
         return msg
+
+    def _aggregate_source_edit(self, aggregation, key, msg, msg_template, silent):
+        from .aggregate import make_source_member, member_identity
+        with aggregation.scheduler._lock:
+            log, previous, predecessor = aggregation.source_state(key, (key[0], str(msg.uid)))
+            if previous is None:
+                return False
+            source = ETMMsg.from_efbmsg(msg, self.chat_manager)
+            member = make_source_member(source, source_revision=previous["source_revision"] + 1,
+                                        received_time=previous["received_time"], source_time=previous["source_time"],
+                                        display_prefix=msg_template.removesuffix(":"))
+            qualifying = msg.type == MsgType.Text and not msg.commands
+            from .queued_log import decode_aggregation
+            payload = aggregation.queue.aggregation_context(predecessor) if predecessor else None
+            pending = decode_aggregation(payload) if payload else None
+            independent_pending = pending and pending["kind"] in {"source", "redirect"}
+            if qualifying and aggregation.update_pending_member(key, member):
+                return True
+            if log and log.aggregate and not independent_pending:
+                children = [member if member_identity(child) == member_identity(member) else child
+                            for child in aggregation.prospective_members(log.master_msg_id, key)]
+                if qualifying and aggregation.fits(children, updating=True):
+                    aggregation.queue_container_update(log.master_msg_id, [member], key=key)
+                    return True
+            elif not log and not independent_pending and qualifying:
+                pending_id = aggregation.pending_sources.get(member_identity(member))
+                initial_payload = aggregation.queue.aggregation_context(pending_id) if pending_id else None
+                initial = decode_aggregation(initial_payload) if initial_payload else None
+                if initial and initial["kind"] == "aggregate":
+                    children = [member if member_identity(child) == member_identity(member) else child
+                                for child in initial["aggregate"]["children"]]
+                    if aggregation.fits(children):
+                        aggregation.queue_deferred_update(key, member, predecessor)
+                        return True
+            old_id = None
+            canonical_old_id = None
+            if log and not log.aggregate:
+                canonical_old_id = utils.message_id_str_to_id(utils.TgChatMsgIDStr(log.master_msg_id))
+                if log.msg_type == msg.type.name:
+                    old_id = utils.message_id_str_to_id(utils.TgChatMsgIDStr(log.master_msg_id_alt or log.master_msg_id))
+                msg.vendor_specific = msg.vendor_specific or {}
+                msg.vendor_specific['_sender_bot_id'] = log.sender_bot_id
+            with aggregation.source_delivery(key, member,
+                    old_container_id=log.master_msg_id if log and log.aggregate else None,
+                    old_message_id=canonical_old_id, predecessor=predecessor):
+                self.dispatch_message(msg, msg_template, old_id, key[1],
+                                      int(key[2]) if key[2] is not None else None, silent)
+            return True
 
     def dispatch_message(self, msg: Message, msg_template: str,
                          old_msg_id: Optional[OldMsgID],
@@ -291,10 +367,9 @@ class SlaveMessageProcessor(LocaleMixin):
         target_msg_id = target_msg_id_override
         if target_msg_id is None and isinstance(msg.target, Message):
             self.logger.debug("[%s] Message is replying to %s.", msg.uid, msg.target)
-            log = self.db.get_msg_log(
-                slave_msg_id=msg.target.uid,
-                slave_origin_uid=utils.chat_id_to_str(chat=msg.target.chat)
-            )
+            resolved = self.db.resolve_source_member(str(utils.chat_id_to_str(chat=msg.target.chat)),
+                str(msg.target.uid), str(tg_dest), str(thread_id) if thread_id is not None else None)
+            log = resolved[0] if resolved else None
             if not log:
                 self.logger.debug("[%s] Target message %s is not found in database.", msg.uid, msg.target)
             else:
@@ -375,9 +450,12 @@ class SlaveMessageProcessor(LocaleMixin):
                                            **self._make_send_kwargs(msg, old_msg_id, on_complete=on_db_complete))
 
         if tg_msg and commands:
-            self.channel.commands.register_command(tg_msg, ETMCommandMsgStorage(
-                commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
-            ))
+            aggregation = getattr(self.bot, "live_aggregation", None)
+            source_delivery = aggregation is not None and aggregation._source_delivery.get() is not None
+            if not source_delivery:
+                self.channel.commands.register_command(tg_msg, ETMCommandMsgStorage(
+                    commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
+                ))
 
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. "
@@ -1454,9 +1532,44 @@ class SlaveMessageProcessor(LocaleMixin):
         elif isinstance(status, MessageRemoval):
             self.logger.debug("Received message removal request from channel %s on message %s",
                               status.source_channel, status.message)
-            old_msg = self.db.get_msg_log(
-                slave_msg_id=status.message.uid,
-                slave_origin_uid=utils.chat_id_to_str(chat=status.message.chat))
+            aggregation = getattr(self.bot, "live_aggregation", None)
+            identity = (str(utils.chat_id_to_str(chat=status.message.chat)), str(status.message.uid))
+            message = status.message
+            if message.author is None:
+                restored = None
+                for row in self.db.get_source_message_logs(*identity):
+                    members = self.db.get_container_members(row.master_msg_id)
+                    member = next((child for child in members if (child["origin_uid"], child["source_id"]) == identity), None)
+                    restored = row.build_source_member(member, self.chat_manager) if member else row.build_etm_msg(self.chat_manager)
+                    break
+                if restored is None and aggregation is not None:
+                    from .aggregate import member_identity, member_message
+                    cancellation = aggregation.queue.cancelled_source(identity)
+                    if cancellation:
+                        restored = member_message(cancellation["member"])
+                    for row in aggregation.queue.aggregation_rows():
+                        from .queued_log import decode_aggregation
+                        saved = decode_aggregation(row.log_context)
+                        members = saved.get("members", []) + saved.get("updates", [])
+                        if saved.get("member"):
+                            members.append(saved["member"])
+                        if saved.get("aggregate"):
+                            members += saved["aggregate"]["children"]
+                        member = next((child for child in members if member_identity(child) == identity), None)
+                        if member:
+                            restored = member_message(member)
+                            break
+                if restored is not None:
+                    message = restored
+                else:
+                    self.logger.info("Source removal has no saved message: %s", identity)
+                    return
+            _, (target, topic) = self.get_slave_msg_dest(message)
+            key = (identity[0], int(target), str(topic) if topic is not None else None) if target is not None else None
+            if aggregation is not None and key is not None and aggregation.remove_source_member(key, identity):
+                return
+            resolved = self.db.resolve_source_member(*identity, str(target), key[2]) if key else None
+            old_msg = resolved[0] if resolved else None
             if old_msg:
                 old_msg_id: OldMsgID = utils.message_id_str_to_id(
                     utils.TgChatMsgIDStr(old_msg.master_msg_id_alt or old_msg.master_msg_id)
@@ -1532,6 +1645,20 @@ class SlaveMessageProcessor(LocaleMixin):
                               'Message ID %s from %s, status: %s.', status.msg_id, status.chat, status.reactions)
             return
 
+        aggregate = getattr(old_msg_db, "aggregate", None)
+        if aggregate:
+            member = next((child for child in aggregate["children"]
+                           if (child["origin_uid"], child["source_id"]) == (slave_origin_uid, str(status.msg_id))), None)
+            if member is None:
+                return
+            source_msg = old_msg_db.build_source_member(member, self.chat_manager)
+            _, (target, topic) = self.get_slave_msg_dest(source_msg)
+            resolved = self.db.resolve_source_member(slave_origin_uid, str(status.msg_id), str(target),
+                                                     str(topic) if topic is not None else None)
+            if resolved is None or resolved[0].aggregate:
+                # Container reactions have no single source author; member sync is deferred.
+                return
+            old_msg_db = resolved[0]
         old_msg: ETMMsg = old_msg_db.build_etm_msg(chat_manager=self.chat_manager)
         old_msg.reactions = status.reactions
         old_msg.edit = True
@@ -1545,6 +1672,12 @@ class SlaveMessageProcessor(LocaleMixin):
         if tg_dest is None:
             self.logger.error('Cannot update reactions for message %s from %s: destination not found.',
                               status.msg_id, status.chat)
+            return
+
+        aggregation = getattr(getattr(self, "bot", None), "live_aggregation", None)
+        if aggregation is not None and isinstance(getattr(old_msg_db, "source_member", None), dict):
+            key = (str(slave_origin_uid), int(tg_dest), str(thread_id) if thread_id is not None else None)
+            self._aggregate_source_edit(aggregation, key, old_msg, msg_template, False)
             return
 
         effective_msg = self._reaction_target_message_id(old_msg, old_msg_db)

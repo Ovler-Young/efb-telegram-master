@@ -22,7 +22,7 @@ import time
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, IO, Iterable, Mapping, Optional, Protocol
+from typing import Callable, IO, Iterable, Mapping, Optional, Protocol, TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 from telegram import (
@@ -32,6 +32,9 @@ from telegram import (
 )
 from telegram.error import NetworkError, RetryAfter
 import httpx
+
+if TYPE_CHECKING:
+    from .aggregate import SourceMember
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,7 @@ class QueueRequest:
     kwargs: dict
     log_context: Optional[bytes] = None
     cleanup_files: tuple[str, ...] = ()
+    predecessor_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +204,7 @@ class QueuedCall:
     completion_receipt: Optional[bytes]
     stored_bytes: int = 0
     retry_after: float = 0
+    predecessor_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -514,6 +519,24 @@ class QueueAdapter(Protocol):
 
 
 class QueueMetrics(Protocol):
+    def record_aggregation_source(self) -> None:
+        ...
+
+    def record_aggregation_container(self) -> None:
+        ...
+
+    def record_aggregation_rpc(self, operation: str, purpose: str, sender_kind: str) -> None:
+        ...
+
+    def record_aggregation_batch(self, members: int) -> None:
+        ...
+
+    def record_aggregation_confirmation(self, seconds: float) -> None:
+        ...
+
+    def record_aggregation_payload(self, size_bytes: int) -> None:
+        ...
+
     def record_enqueued(self, priority: int, operation: str) -> None:
         ...
 
@@ -615,6 +638,11 @@ class OutboundQueue:
                 "CREATE TABLE IF NOT EXISTS history_ownership (entry_key TEXT PRIMARY KEY)"
             )
             connection.execute(
+                "CREATE TABLE IF NOT EXISTS source_cancellations ("
+                "origin_uid TEXT NOT NULL, source_id TEXT NOT NULL, source_revision INTEGER NOT NULL, "
+                "log_context BLOB NOT NULL, PRIMARY KEY (origin_uid, source_id))"
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS outbound_queue_destination_priority_id "
                 "ON outbound_queue (telegram_chat_id, priority DESC, id ASC)"
             )
@@ -665,7 +693,7 @@ class OutboundQueue:
             )
         # Additive metadata: do not rebuild the large queue or change its legacy CHECK.
         for name, kind in (("delivery_hold", "TEXT"), ("attempt_sender_bot_id", "TEXT"),
-                           ("attempt_started_at", "REAL")):
+                           ("attempt_started_at", "REAL"), ("predecessor_id", "INTEGER")):
             if name not in columns:
                 connection.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL")
         # Undo only pre-submission holds caused by the removed history sender
@@ -693,10 +721,23 @@ class OutboundQueue:
                 self._ownership_file.close()
                 self._ownership_file = None
 
-    def refresh_depth(self) -> None:
+    def observe_metrics(self, observation: Callable[[QueueMetrics], None]) -> None:
+        """Keep telemetry failures outside committed queue and delivery work."""
         if self.metrics is not None:
-            depth = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
-            self.metrics.set_queue_depth(int(depth))
+            try:
+                observation(self.metrics)
+            except Exception:
+                logging.getLogger(__name__).exception("Unable to observe outbound metrics.")
+
+    def refresh_depth(self) -> None:
+        with self._lock:
+            if self.metrics is not None:
+                depth = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
+                self.observe_metrics(lambda metrics: metrics.set_queue_depth(int(depth)))
+
+    def _observe_removed(self, priority: int, operation: str, created_at: float, outcome: str) -> None:
+        residence = max(0.0, time.time() - created_at)
+        self.observe_metrics(lambda metrics: metrics.record_removal(priority, operation, outcome, residence))
 
     def has_queued_calls(self) -> bool:
         """Return whether a durable call is waiting without loading its payload."""
@@ -706,9 +747,7 @@ class OutboundQueue:
             ).fetchone() is not None
 
     def record_removal(self, row: QueuedCall, outcome: str) -> None:
-        if self.metrics is not None:
-            residence_seconds = max(0.0, time.time() - row.created_at)
-            self.metrics.record_removal(row.priority, row.operation, outcome, residence_seconds)
+        self._observe_removed(row.priority, row.operation, row.created_at, outcome)
         self.refresh_depth()
 
     def _store_media_stream(
@@ -1352,7 +1391,7 @@ class OutboundQueue:
 
     def enqueue_many(
         self, requests: Iterable[QueueRequest], operation_resolver: Callable[[str], Callable[..., object]],
-        *, history_keys: Iterable[str] = (),
+        *, history_keys: Iterable[str] = (), logical_split: Optional[dict] = None,
     ) -> tuple[int, Future]:
         request_list = list(requests)
         if not request_list:
@@ -1361,6 +1400,12 @@ class OutboundQueue:
             self.connection  # Reject closed queues before creating sidecars.
             prepared = []
             try:
+                if logical_split and logical_split.get("after"):
+                    from .queued_log import encode_aggregation
+                    after = logical_split["after"]
+                    request_list.append(QueueRequest("send_message", (),
+                        {"chat_id": after["key"][1], "text": "", "_slave_id": after["key"][0], "_send_mode": "eventual"},
+                        encode_aggregation(after)))
                 for request in request_list:
                     prepared.append(self._prepare(request, operation_resolver(request.operation)))
             except Exception:
@@ -1374,6 +1419,17 @@ class OutboundQueue:
                 raise QueueEnqueueError("Queued request sequence must share chat_id and priority.")
             try:
                 self.connection.execute("BEGIN")
+                if logical_split:
+                    from .queued_log import decode_aggregation, encode_aggregation
+                    original = self.connection.execute("SELECT predecessor_id, log_context, priority, operation, created_at FROM outbound_queue WHERE "
+                        "id=? AND delivery_state='queued' AND delivery_hold IS NULL", (logical_split["row_id"],)).fetchone()
+                    if original is None or decode_aggregation(original[1])["kind"] != "logical":
+                        raise QueuePersistenceError("Source batch was submitted before its split.")
+                    before = logical_split.get("before")
+                    predecessor = logical_split["row_id"] if before else original[0]
+                    if before:
+                        self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                                (encode_aggregation(before), logical_split["row_id"]))
                 # Receipts outlive queue-row completion until the source staging
                 # records have been durably removed from either main DB backend.
                 self.connection.executemany(
@@ -1382,17 +1438,26 @@ class OutboundQueue:
                 )
                 identifiers: list[int] = []
                 now = time.time()
-                for operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media in prepared:
+                for request, item in zip(request_list, prepared):
+                    operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media = item
                     cursor = self.connection.execute(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
-                        "created_at, log_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (priority, chat_id, operation, payload, slave_id, required_sender, now, log_context),
+                        "created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (priority, chat_id, operation, payload, slave_id, required_sender, now, log_context,
+                         predecessor if logical_split else request.predecessor_id),
                     )
                     identifier = cursor.lastrowid
                     if identifier is None:
                         raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
                     identifiers.append(identifier)
+                    if logical_split:
+                        predecessor = identifier
+                if logical_split:
+                    self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=? AND id NOT IN (" +
+                        ",".join("?" for _ in identifiers) + ")", (identifiers[-1], logical_split["row_id"], *identifiers))
+                    if not before:
+                        self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (logical_split["row_id"],))
                 self.connection.commit()
             except Exception as error:
                 try:
@@ -1404,11 +1469,225 @@ class OutboundQueue:
                 raise QueueEnqueueError("Unable to commit queued Telegram call.") from error
             if self.metrics is not None:
                 for operation, _args, _kwargs, _chat_id, priority, _slave_id, _required_sender, _payload, _log_context, _created_media in prepared:
-                    self.metrics.record_enqueued(priority, operation)
+                    self.observe_metrics(lambda metrics: metrics.record_enqueued(priority, operation))
+            if logical_split and not before:
+                self._observe_removed(original[2], original[3], original[4], "replaced")
             self.refresh_depth()
             waiter: Future = Future()
             self.waiters[identifiers[0]] = waiter
             return identifiers[0], waiter
+
+    def contains(self, row_id: int) -> bool:
+        with self._lock:
+            return self.connection.execute("SELECT 1 FROM outbound_queue WHERE id=?", (row_id,)).fetchone() is not None
+
+    def aggregation_context(self, row_id: int) -> Optional[bytes]:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT log_context FROM outbound_queue WHERE id=? AND substr(log_context, 1, 1)=?",
+                (row_id, b"\x03"),
+            ).fetchone()
+        return row[0] if row else None
+
+    def aggregation_rows(self) -> list[QueuedCall]:
+        """Read only unfinished logical/frozen aggregation rows on recovery."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
+                "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, predecessor_id "
+                "FROM outbound_queue WHERE substr(log_context, 1, 1)=? ORDER BY id", (b"\x03",),
+            ).fetchall()
+        return [QueuedCall(row[0], row[1], row[2], row[3], row[4], row[5], row[6],
+                           row[7], row[8], row[9], row[10], predecessor_id=row[11]) for row in rows]
+
+    def cancelled_source(self, identity: tuple[str, str]) -> Optional[dict]:
+        """Read a confirmed unpublished withdrawal independently of destination."""
+        from .queued_log import decode_aggregation
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT log_context FROM source_cancellations WHERE origin_uid=? AND source_id=?", identity,
+            ).fetchone()
+        return decode_aggregation(row[0]) if row else None
+
+    def _record_source_cancellation(self, key: tuple, member: SourceMember) -> None:
+        from .queued_log import encode_aggregation
+        context = encode_aggregation(dict(format_version=1, kind="cancellation", key=tuple(key), member=member))
+        self.connection.execute(
+            "INSERT INTO source_cancellations (origin_uid, source_id, source_revision, log_context) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (origin_uid, source_id) DO UPDATE SET "
+            "source_revision=excluded.source_revision, log_context=excluded.log_context "
+            "WHERE excluded.source_revision > source_cancellations.source_revision",
+            (member["origin_uid"], member["source_id"], member["source_revision"], context),
+        )
+
+    def close_aggregation_destination(self, chat_id: int, topic: Optional[str]) -> None:
+        """Persist an incoming-message boundary without changing attempted requests."""
+        from .queued_log import decode_aggregation, encode_aggregation
+        with self._lock, self.connection:
+            rows = self.connection.execute(
+                "SELECT id, log_context FROM outbound_queue WHERE telegram_chat_id=? "
+                "AND substr(log_context, 1, 1)=?",
+                (chat_id, b"\x03"),
+            ).fetchall()
+            for row_id, payload in rows:
+                context = decode_aggregation(payload)
+                key = context.get("key")
+                if not key or int(key[1]) != chat_id or key[2] != topic:
+                    continue
+                if context["kind"] == "logical":
+                    context.update(base=None, inherit=False, appendable=False, incoming_boundary=True)
+                elif context["kind"] in {"aggregate", "member_update"}:
+                    context.update(appendable=False, incoming_boundary=True)
+                    retry = context.get("retry_context")
+                    if retry:
+                        retry.update(base=None, inherit=False, appendable=False, incoming_boundary=True)
+                else:
+                    continue
+                self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                        (encode_aggregation(context), row_id))
+
+    def replace_logical_aggregation(self, row_id: int, context: bytes, *, cancelled_member=None) -> bool:
+        from .queued_log import decode_aggregation
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                "SELECT log_context FROM outbound_queue WHERE id=? AND delivery_state='queued' "
+                "AND delivery_hold IS NULL", (row_id,),
+            ).fetchone()
+            if row is None or decode_aggregation(row[0]).get("kind") not in {"logical", "member_update"}:
+                return False
+            if cancelled_member is not None:
+                self._record_source_cancellation(tuple(decode_aggregation(row[0])["key"]), cancelled_member)
+            self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?", (context, row_id))
+            return True
+
+    def materialize_aggregation(self, row_id: int, operation: str, kwargs: dict,
+                                context: bytes, selection: SenderSelection) -> QueuedCall:
+        """Freeze the selected operation and sender before executor submission."""
+        payload = self.encode_payload((), kwargs)
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET operation=?, payload=?, log_context=?, required_sender_bot_id=?, "
+                "attempt_sender_bot_id=?, delivery_hold='in_flight', attempt_started_at=? "
+                "WHERE id=? AND delivery_state='queued' AND delivery_hold IS NULL",
+                (operation, payload, context, selection.sender_bot_id or "__main__", selection.sender_bot_id, time.time(), row_id),
+            )
+            if cursor.rowcount != 1:
+                raise QueuePersistenceError("Aggregation batch is no longer available for dispatch.")
+        return self.load_queued(row_id)
+
+    def handoff_aggregation(self, row_id: int, parent_context: bytes,
+                            update_successor: Callable[[bytes], bytes], *,
+                            requests: Iterable[QueueRequest] = (), operation_resolver=None) -> tuple[list[int], bool]:
+        """Publish the confirmed base and parent handoff in one queue transaction."""
+        from .queued_log import decode_aggregation
+        with self._lock:
+            with self.connection:
+                previous = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
+                if previous is None or decode_aggregation(previous[0]).get("handoff"):
+                    return [], False
+                identifiers = []
+                inserted = []
+                for request in requests:
+                    item = self._prepare(request, operation_resolver(request.operation))
+                    operation, _, _, chat_id, priority, slave_id, required_sender, payload, context, _ = item
+                    cursor = self.connection.execute(
+                        "INSERT INTO outbound_queue (priority, telegram_chat_id, operation, payload, slave_id, "
+                        "required_sender_bot_id, created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), context, request.predecessor_id))
+                    identifier = cursor.lastrowid
+                    if identifier is None:
+                        raise QueuePersistenceError("SQLite did not return the aggregation successor ID.")
+                    identifiers.append(identifier)
+                    inserted.append((priority, operation))
+                parent = decode_aggregation(parent_context)
+                rows = self.connection.execute(
+                    "SELECT id, log_context FROM outbound_queue WHERE predecessor_id=? OR predecessor_id=?",
+                    (row_id, parent.get("supplement_id")),
+                ).fetchall()
+                for identifier, context in rows:
+                    if context and context[:1] == b"\x03":
+                        updated = update_successor(context)
+                        owner = decode_aggregation(updated).get("required_sender")
+                        self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                                (updated, identifier))
+                        if owner is not None:
+                            self.connection.execute("UPDATE outbound_queue SET required_sender_bot_id=? WHERE id=?", (owner, identifier))
+                self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                                        (parent_context, row_id))
+                self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
+            for priority, operation in inserted:
+                self.observe_metrics(lambda metrics: metrics.record_enqueued(priority, operation))
+            self.refresh_depth()
+        return identifiers, True
+
+    def cancel_logical_aggregation(self, row_id: int, *, cancelled_member=None) -> Optional[int]:
+        """Remove an unsubmitted empty batch while retaining its predecessor barrier."""
+        with self._lock:
+            with self.connection:
+                row = self.connection.execute("SELECT predecessor_id, log_context, priority, operation, created_at FROM outbound_queue WHERE id=? AND "
+                                              "delivery_state='queued' AND delivery_hold IS NULL", (row_id,)).fetchone()
+                if row is None:
+                    raise QueuePersistenceError("The logical batch was already submitted.")
+                if cancelled_member is not None:
+                    from .queued_log import decode_aggregation
+                    self._record_source_cancellation(tuple(decode_aggregation(row[1])["key"]), cancelled_member)
+                self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (row[0], row_id))
+                self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
+            self._observe_removed(row[2], row[3], row[4], "cancelled")
+            self.refresh_depth()
+        return row[0]
+
+    def cancel_pending_source(self, key: tuple, member: SourceMember) -> dict[int, Optional[int]]:
+        """Withdraw unsubmitted standalone versions and preserve successor ordering."""
+        from .aggregate import member_identity
+        from .queued_log import decode_aggregation
+        with self._lock, self.connection:
+            rows = self.connection.execute(
+                "SELECT id, log_context, delivery_state, delivery_hold, attempt_started_at "
+                "FROM outbound_queue WHERE substr(log_context, 1, 1)=? ORDER BY id", (b"\x03",),
+            ).fetchall()
+            matching = []
+            for row in rows:
+                context = decode_aggregation(row[1])
+                if (tuple(context["key"]) == tuple(key) and context["kind"] in {"source", "redirect"}
+                        and member_identity(context["member"]) == member_identity(member)):
+                    if row[2] != "queued" or row[3] is not None or row[4] is not None:
+                        return {}
+                    matching.append(row[0])
+            if not matching:
+                return {}
+            self._record_source_cancellation(tuple(key), member)
+            predecessors = {}
+            payloads = []
+            removed = []
+            for row_id in matching:
+                predecessor, payload, priority, operation, created_at = self.connection.execute(
+                    "SELECT predecessor_id, payload, priority, operation, created_at FROM outbound_queue WHERE id=?", (row_id,),
+                ).fetchone()
+                self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (predecessor, row_id))
+                self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
+                predecessors[row_id] = predecessor
+                payloads.append(payload)
+                removed.append((priority, operation, created_at))
+        for priority, operation, created_at in removed:
+            self._observe_removed(priority, operation, created_at, "cancelled")
+        for payload in payloads:
+            self.cleanup_payload_media(payload)
+        self.refresh_depth()
+        return predecessors
+
+    def release_dependents(self, row_id: int) -> None:
+        with self._lock, self.connection:
+            self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
+
+    def hold_failed_aggregation(self, row_id: int, error: BaseException) -> bool:
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold=? WHERE id=? AND (substr(log_context, 1, 1)=? "
+                "OR EXISTS (SELECT 1 FROM outbound_queue child WHERE child.predecessor_id=outbound_queue.id))",
+                ("aggregation_failed:" + type(error).__name__, row_id, b"\x03"),
+            )
+            return cursor.rowcount == 1
 
     def history_ownership_page(self, after: str = "", limit: int = 100) -> list[str]:
         with self._lock:
@@ -1442,7 +1721,7 @@ class OutboundQueue:
         context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
         receipt = "q.completion_receipt" if include_payload else "NULL"
         excluded = tuple(excluded_ids)
-        exclusion_sql = " AND delivery_hold IS NULL" if ready_only else ""
+        exclusion_sql = " AND delivery_hold IS NULL AND predecessor_id IS NULL" if ready_only else ""
         parameters: tuple[object, ...] = ()
         if excluded:
             exclusion_sql += " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
@@ -1948,6 +2227,12 @@ class OutboundQueue:
     def begin_delivery_attempt(self, row_id: int, selection: SenderSelection) -> None:
         """Persist before submission: an interrupted send is not safe to replay."""
         with self._lock, self.connection:
+            frozen = self.connection.execute(
+                "SELECT 1 FROM outbound_queue WHERE id=? AND delivery_hold='in_flight' "
+                "AND substr(log_context, 1, 1)=?", (row_id, b"\x03"),
+            ).fetchone()
+            if frozen is not None:
+                return
             cursor = self.connection.execute(
                 "UPDATE outbound_queue SET delivery_hold='in_flight', attempt_sender_bot_id=?, "
                 "attempt_started_at=? WHERE id=? AND delivery_state='queued' AND delivery_hold IS NULL",
@@ -1958,7 +2243,18 @@ class OutboundQueue:
 
     def release_delivery_attempt(self, row_id: int) -> None:
         """Use only when submission failed or Telegram definitely rejected the call."""
+        from .queued_log import decode_aggregation, encode_aggregation
         with self._lock, self.connection:
+            row = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
+            context = decode_aggregation(row[0]) if row and row[0] else None
+            if context and context.get("retry_context"):
+                logical = context["retry_context"]
+                self.connection.execute(
+                    "UPDATE outbound_queue SET operation='send_message', payload=?, log_context=?, "
+                    "required_sender_bot_id=NULL WHERE id=?",
+                    (self.encode_payload((), {"chat_id": logical["key"][1], "text": ""}),
+                     encode_aggregation(logical), row_id),
+                )
             self.connection.execute(
                 "UPDATE outbound_queue SET delivery_hold=NULL WHERE id=? AND delivery_state='queued'",
                 (row_id,),
@@ -2026,12 +2322,25 @@ class OutboundQueue:
                 self.connection.execute("BEGIN")
                 if prepared is not None:
                     operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media = prepared
-                    self.connection.execute(
+                    from .queued_log import decode_aggregation, encode_aggregation
+                    parent_context = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0]
+                    parent = decode_aggregation(parent_context) if parent_context else None
+                    if parent is not None:
+                        log_context = encode_aggregation(dict(format_version=1, kind="boundary", key=parent["key"],
+                            generation=parent.get("generation", 0), recent=parent.get("recent", []),
+                            last_new=parent.get("last_new", 0), members=[], legacy_context=log_context))
+                    supplement_cursor = self.connection.execute(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
-                        "created_at, log_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), log_context),
+                        "created_at, log_context, predecessor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), log_context,
+                         row_id if parent is not None else None),
                     )
+                    if parent is not None:
+                        parent["supplement_id"] = supplement_cursor.lastrowid
+                        self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=? AND id!=?",
+                            (supplement_cursor.lastrowid, row_id, supplement_cursor.lastrowid))
+                        self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?", (encode_aggregation(parent), row_id))
                 cursor = self.connection.execute(
                     "UPDATE outbound_queue SET delivery_state = 'sent_pending', completion_receipt = ?, delivery_hold = NULL, "
                     "reconcile_after=0, reconcile_attempts=0 "
@@ -2040,9 +2349,6 @@ class OutboundQueue:
                 )
                 if cursor.rowcount != 1:
                     raise QueuePersistenceError(f"Queued row {row_id} cannot record Telegram completion.")
-                depth = 0
-                if prepared is not None and self.metrics is not None:
-                    depth = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
                 self.connection.commit()
             except Exception:
                 try:
@@ -2052,9 +2358,9 @@ class OutboundQueue:
                 if prepared is not None:
                     self._cleanup_created_media(prepared[9])
                 raise
-        if prepared is not None and self.metrics is not None:
-            self.metrics.record_enqueued(prepared[4], prepared[0])
-            self.metrics.set_queue_depth(depth)
+            if prepared is not None:
+                self.observe_metrics(lambda metrics: metrics.record_enqueued(prepared[4], prepared[0]))
+                self.refresh_depth()
 
     def record_history_fallback(self, row_id: int, operation: Optional[str]) -> None:
         """Record which history RPC may have been accepted, before making that RPC."""
@@ -2112,7 +2418,7 @@ class OutboundQueue:
                     f"Queued row {row_id} retarget persistence failed."
                 ) from error
 
-    def delete(self, row_id: int, *, cleanup_media: bool = True) -> None:
+    def delete(self, row_id: int, *, cleanup_media: bool = True, successful: bool = False) -> None:
         payload: Optional[bytes] = None
         with self._lock:
             try:
@@ -2129,6 +2435,8 @@ class OutboundQueue:
                             "SELECT payload FROM outbound_queue WHERE id = ?", (row_id,)
                         ).fetchone()[0]
                 self.connection.execute("BEGIN")
+                if successful:
+                    self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
                 cursor = self.connection.execute("DELETE FROM outbound_queue WHERE id = ?", (row_id,))
                 if cursor.rowcount != 1:
                     raise QueuePersistenceError(f"Queued row {row_id} disappeared before deletion.")
@@ -2188,8 +2496,9 @@ class OutboundQueueScheduler:
 
     def _record_submitted_removal(self, row: QueuedCall) -> None:
         self.queue.record_removal(row, "submitted")
-        if self.queue.metrics is not None:
-            self.queue.metrics.record_dequeued(row.priority, row.operation)
+        self.queue.observe_metrics(
+            lambda metrics: metrics.record_dequeued(row.priority, row.operation)
+        )
 
     def _retain_failed_history(self, row: QueuedCall, error: BaseException) -> bool:
         history = row.slave_id is not None and row.slave_id.startswith(HISTORY_SOURCE_PREFIX)
@@ -2212,41 +2521,45 @@ class OutboundQueueScheduler:
         self.wake_event.set()  # A new head at this destination may now be runnable.
 
     def _record_dispatch(self, outcome: str) -> None:
-        if self.queue.metrics is not None:
-            self.queue.metrics.record_queue_dispatch(outcome)
+        self.queue.observe_metrics(
+            lambda metrics: metrics.record_queue_dispatch(outcome)
+        )
 
     def _record_dispatch_attempt(self, row: QueuedCall) -> float:
         dispatched_at = time.monotonic()
-        if self.queue.metrics is not None:
-            self.queue.metrics.record_queue_wait(
+        self.queue.observe_metrics(
+            lambda metrics: metrics.record_queue_wait(
                 row.priority, row.operation, max(0.0, time.time() - row.created_at)
             )
+        )
         return dispatched_at
 
     def _record_executor_attempt_duration(self, submitted: SubmittedCall, outcome: str) -> None:
-        if self.queue.metrics is None:
-            return
-        self.queue.metrics.record_executor_attempt_duration(
-            submitted.row.priority,
-            submitted.row.operation,
-            outcome,
-            max(0.0, time.monotonic() - submitted.dispatched_at),
+        self.queue.observe_metrics(
+            lambda metrics: metrics.record_executor_attempt_duration(
+                submitted.row.priority,
+                submitted.row.operation,
+                outcome,
+                max(0.0, time.monotonic() - submitted.dispatched_at),
+            )
         )
 
     def _record_terminal_completion(
         self, row: QueuedCall, selection: SenderSelection | None, outcome: str
     ) -> None:
-        if self.queue.metrics is None:
-            return
         sender_kind = self._sender_kind(selection) if selection is not None else self._expected_sender_kind(row)
-        self.queue.metrics.record_completion(
-            row.priority,
-            row.operation,
-            sender_kind,
-            outcome,
+        self.queue.observe_metrics(
+            lambda metrics: metrics.record_completion(
+                row.priority,
+                row.operation,
+                sender_kind,
+                outcome,
+            )
         )
-        self.queue.metrics.record_queue_lifetime(
-            row.priority, row.operation, outcome, max(0.0, time.time() - row.created_at)
+        self.queue.observe_metrics(
+            lambda metrics: metrics.record_queue_lifetime(
+                row.priority, row.operation, outcome, max(0.0, time.time() - row.created_at)
+            )
         )
 
     def in_flight_count(self) -> int:
@@ -2308,8 +2621,9 @@ class OutboundQueueScheduler:
         else:
             self.queue.cleanup_payload_media(retry.row.payload)
         self.queue.fail_waiter(retry.row.id, error)
-        if self.queue.metrics is not None:
-            self.queue.metrics.record_failure(retry.row.priority, retry.row.operation, "terminal")
+        self.queue.observe_metrics(
+            lambda metrics: metrics.record_failure(retry.row.priority, retry.row.operation, "terminal")
+        )
         self._record_terminal_completion(retry.row, retry.selection, "failure")
 
     def _schedule_blocking_retry_before_deadline(
@@ -2338,8 +2652,9 @@ class OutboundQueueScheduler:
                 continue
             if not self._permits.acquire(blocking=False):
                 self._record_dispatch("deferred")
-                if self.queue.metrics is not None:
-                    self.queue.metrics.record_retry(retry.row.priority, retry.row.operation, "worker_capacity")
+                self.queue.observe_metrics(
+                    lambda metrics: metrics.record_retry(retry.row.priority, retry.row.operation, "worker_capacity")
+                )
                 self._schedule_blocking_retry_before_deadline(retry)
                 continue
             decision = self.adapter.select_sender(retry.row, now)
@@ -2367,8 +2682,9 @@ class OutboundQueueScheduler:
             if not self.adapter.acquire_sender_limits(retry.selection, retry.row.telegram_chat_id):
                 self._permits.release()
                 self._record_dispatch("deferred")
-                if self.queue.metrics is not None:
-                    self.queue.metrics.record_retry(retry.row.priority, retry.row.operation, "rate_limit")
+                self.queue.observe_metrics(
+                    lambda metrics: metrics.record_retry(retry.row.priority, retry.row.operation, "rate_limit")
+                )
                 self._schedule_blocking_retry_before_deadline(retry, now + 0.25)
                 continue
             closeables: tuple[object, ...] = ()
@@ -2383,8 +2699,9 @@ class OutboundQueueScheduler:
                 self.queue.close_payload_resources(closeables)
                 self._permits.release()
                 self._record_dispatch("failed")
-                if self.queue.metrics is not None:
-                    self.queue.metrics.record_failure(retry.row.priority, retry.row.operation, "dispatch")
+                self.queue.observe_metrics(
+                    lambda metrics: metrics.record_failure(retry.row.priority, retry.row.operation, "dispatch")
+                )
                 self._fail_blocking_retry(retry, error)
                 continue
             self.blocking_media_retries.pop(row_id, None)
@@ -2397,10 +2714,11 @@ class OutboundQueueScheduler:
                 retry.row, retry.selection, future, dispatched_at, closeables
             )
             self.in_flight_destinations.add(retry.row.telegram_chat_id)
-            if self.queue.metrics is not None:
-                self.queue.metrics.increment_in_flight(
+            self.queue.observe_metrics(
+                lambda metrics: metrics.increment_in_flight(
                     retry.row.priority, retry.row.operation, self._sender_kind(retry.selection)
                 )
+            )
 
     def _stop_for_persistence_error(self, error: Exception) -> None:
         if self.failure is None:
@@ -2437,7 +2755,7 @@ class OutboundQueueScheduler:
                     if not reconciler(row):
                         failed.append(row.id)
                         continue
-                    self.queue.delete(row.id)
+                    self.queue.delete(row.id, successful=True)
                 except Exception:
                     failed.append(row.id)
                     continue
@@ -2525,6 +2843,11 @@ class OutboundQueueScheduler:
                 if row.retry_after > time.time():
                     self._schedule_retry(now + row.retry_after - time.time())
                     continue
+                readiness = getattr(self.adapter, "queued_aggregation_deadline", None)
+                deadline = readiness(row) if callable(readiness) else None
+                if deadline is not None and deadline > time.time():
+                    self._schedule_retry(now + deadline - time.time())
+                    continue
                 not_before = self._row_not_before.get(row.id)
                 if not_before is not None:
                     if now < not_before:
@@ -2533,14 +2856,19 @@ class OutboundQueueScheduler:
                     self._row_not_before.pop(row.id, None)
                 if not self._permits.acquire(blocking=False):
                     self._record_dispatch("deferred")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_retry(row.priority, row.operation, "worker_capacity")
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_retry(row.priority, row.operation, "worker_capacity")
+                    )
                     continue
                 decision = self.adapter.select_sender(row, now)
                 if decision.terminal_error_class is not None:
                     self._permits.release()
                     unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
                     try:
+                        if self.queue.hold_failed_aggregation(row.id, unavailable_error):
+                            self.queue.fail_waiter(row.id, unavailable_error)
+                            self._record_terminal_completion(row, None, "failure")
+                            continue
                         if self._retain_failed_history(row, unavailable_error):
                             self._record_terminal_completion(row, None, "failure")
                             continue
@@ -2551,8 +2879,9 @@ class OutboundQueueScheduler:
                     self._record_terminal_discard(row)
                     self._row_not_before.pop(row.id, None)
                     self._record_dispatch("failed")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_failure(row.priority, row.operation, "terminal")
+                    )
                     unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
                     self._record_terminal_completion(row, None, "failure")
                     self.queue.fail_waiter(row.id, unavailable_error)
@@ -2566,8 +2895,9 @@ class OutboundQueueScheduler:
                 if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
                     self._permits.release()
                     self._record_dispatch("deferred")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_retry(row.priority, row.operation, "rate_limit")
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_retry(row.priority, row.operation, "rate_limit")
+                    )
                     self._schedule_retry(now + 0.25)
                     continue
                 try:
@@ -2576,6 +2906,9 @@ class OutboundQueueScheduler:
                         self.queue.check_replay_size(row.id, row.stored_bytes)
                     else:
                         row = self.queue.load_queued(row.id)
+                    materialize = getattr(self.adapter, "materialize_queued_aggregation", None)
+                    if callable(materialize):
+                        row = materialize(row, decision.selection)
                     args, kwargs = self.queue.decode_payload(row.payload)
                 except MissingQueuedExternalMediaError as error:
                     self._permits.release()
@@ -2587,8 +2920,9 @@ class OutboundQueueScheduler:
                     self._record_terminal_discard(row)
                     self._row_not_before.pop(row.id, None)
                     self._record_dispatch("failed")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_failure(row.priority, row.operation, "terminal")
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_failure(row.priority, row.operation, "terminal")
+                    )
                     self.queue.fail_waiter(row.id, error)
                     continue
                 except InvalidQueuedPayloadError as error:
@@ -2650,9 +2984,12 @@ class OutboundQueueScheduler:
                             self._stop_for_persistence_error(persistence_error)
                             return
                     self._record_dispatch("failed")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_dispatch_failure(row.priority, row.operation)
-                        self.queue.metrics.record_failure(row.priority, row.operation, "dispatch")
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_dispatch_failure(row.priority, row.operation)
+                    )
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_failure(row.priority, row.operation, "dispatch")
+                    )
                     if retained:
                         self._schedule_retry(now + 0.25)
                     else:
@@ -2671,10 +3008,12 @@ class OutboundQueueScheduler:
                     row, decision.selection, future, dispatched_at, closeables
                 )
                 self.in_flight_destinations.add(row.telegram_chat_id)
-                if self.queue.metrics is not None:
-                    self.queue.metrics.increment_in_flight(
-                        row.priority, row.operation, self._sender_kind(decision.selection)
+                sender_kind = self._sender_kind(decision.selection)
+                self.queue.observe_metrics(
+                    lambda metrics: metrics.increment_in_flight(
+                        row.priority, row.operation, sender_kind
                     )
+                )
 
     def harvest_completed(self) -> None:
         with self._lock:
@@ -2709,18 +3048,20 @@ class OutboundQueueScheduler:
                 self.in_flight.pop(row_id)
                 self.in_flight_destinations.remove(submitted.row.telegram_chat_id)
                 self._permits.release()
-                if self.queue.metrics is not None:
-                    self.queue.metrics.decrement_in_flight(
+                self.queue.observe_metrics(
+                    lambda metrics: metrics.decrement_in_flight(
                         submitted.row.priority, submitted.row.operation, self._sender_kind(submitted.selection)
                     )
+                )
                 try:
                     result = submitted.future.result()
                 except BaseException as error:
                     self._record_executor_attempt_duration(submitted, "failure")
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_failure(
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_failure(
                             submitted.row.priority, submitted.row.operation, "execution"
                         )
+                    )
                     if isinstance(error, QueuePersistenceError):
                         self._stop_for_persistence_error(error)
                         return
@@ -2738,10 +3079,11 @@ class OutboundQueueScheduler:
                                 retry_row, submitted.selection, retry_at, deadline, error
                             )
                             self._schedule_retry(retry_at)
-                            if self.queue.metrics is not None:
-                                self.queue.metrics.record_retry(
+                            self.queue.observe_metrics(
+                                lambda metrics: metrics.record_retry(
                                     submitted.row.priority, submitted.row.operation, "rate_limit"
                                 )
+                            )
                             continue
                     decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
                     if getattr(decision, "retry_reason", None) == "acquisition":
@@ -2752,6 +3094,11 @@ class OutboundQueueScheduler:
                         except Exception as persistence_error:
                             self._stop_for_persistence_error(persistence_error)
                             return
+                        self.queue.observe_metrics(
+                            lambda metrics: metrics.record_retry(
+                                submitted.row.priority, submitted.row.operation, "acquisition"
+                            )
+                        )
                         self._schedule_retry(time.monotonic() + delay)
                         continue
                     if decision.kind == "delivery_uncertain":
@@ -2763,8 +3110,9 @@ class OutboundQueueScheduler:
                         self.queue.fail_waiter(row_id, DeliveryUncertainError(
                             f"Queue row {row_id}: Telegram delivery is unconfirmed; automatic resend disabled."
                         ))
-                        if self.queue.metrics is not None:
-                            self.queue.metrics.record_failure(submitted.row.priority, submitted.row.operation, "uncertain")
+                        self.queue.observe_metrics(
+                            lambda metrics: metrics.record_failure(submitted.row.priority, submitted.row.operation, "uncertain")
+                        )
                         continue
                     if decision.kind == "retry_eventual" and submitted.row.priority == 0:
                         if submitted.row.operation in RETAINED_OPERATIONS:
@@ -2789,14 +3137,20 @@ class OutboundQueueScheduler:
                                     retry_reason = "transport"
                                 else:
                                     retry_reason = "membership"
-                            self.queue.metrics.record_retry(
-                                submitted.row.priority, submitted.row.operation,
-                                retry_reason,
+                            self.queue.observe_metrics(
+                                lambda metrics: metrics.record_retry(
+                                    submitted.row.priority, submitted.row.operation,
+                                    retry_reason,
+                                )
                             )
                         continue
                     if (submitted.row.priority == 0 or submitted.row.log_context is not None
                             or submitted.row.operation in RETAINED_OPERATIONS):
                         try:
+                            if self.queue.hold_failed_aggregation(row_id, error):
+                                self.queue.fail_waiter(row_id, error)
+                                self._record_terminal_completion(submitted.row, submitted.selection, "failure")
+                                continue
                             if self._retain_failed_history(submitted.row, error):
                                 self._record_terminal_completion(submitted.row, submitted.selection, "failure")
                                 continue
@@ -2809,10 +3163,11 @@ class OutboundQueueScheduler:
                     else:
                         self.queue.cleanup_payload_media(submitted.row.payload)
                     self.queue.fail_waiter(row_id, error)
-                    if self.queue.metrics is not None:
-                        self.queue.metrics.record_failure(
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_failure(
                             submitted.row.priority, submitted.row.operation, "terminal"
                         )
+                    )
                     self._record_terminal_completion(submitted.row, submitted.selection, "failure")
                 else:
                     self._row_not_before.pop(row_id, None)
@@ -2840,10 +3195,13 @@ class OutboundQueueScheduler:
                         self.reconcile_sent_pending(row_id)
                         if self.failure is not None:
                             return
+                    if (submitted.row.log_context is None and submitted.row.priority == 1
+                            and submitted.row.operation not in RETAINED_OPERATIONS):
+                        self.queue.release_dependents(row_id)
                     self.adapter.record_queued_success(submitted.row, result, submitted.selection)
                     if (submitted.row.priority == 0 or submitted.row.operation in RETAINED_OPERATIONS) and submitted.row.log_context is None:
                         try:
-                            self.queue.delete(row_id)
+                            self.queue.delete(row_id, successful=True)
                         except Exception as delete_error:
                             self._stop_for_persistence_error(delete_error)
                             return
@@ -2879,8 +3237,9 @@ class OutboundQueueScheduler:
                 self.in_flight.pop(row_id)
                 self.in_flight_destinations.discard(submitted.row.telegram_chat_id)
                 self._permits.release()
-                if self.queue.metrics is not None:
-                    self.queue.metrics.decrement_in_flight(
+                self.queue.observe_metrics(
+                    lambda metrics: metrics.decrement_in_flight(
                         submitted.row.priority, submitted.row.operation, self._sender_kind(submitted.selection)
                     )
+                )
                 self.queue.fail_waiter(row_id, SchedulerStoppedError("Outbound scheduler stopped."))

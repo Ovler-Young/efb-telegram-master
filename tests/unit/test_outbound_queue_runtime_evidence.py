@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import CancelledError, Future
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import io
 import httpx
@@ -1093,6 +1093,53 @@ def test_scheduler_publishes_metrics_for_actual_dequeue_and_completion(tmp_path:
     assert 'etm_outbound_queue_lifetime_seconds_count{operation="send_message",outcome="success",priority="normal"} 1.0' in rendered
     assert row_id not in scheduler.in_flight
     queue.close()
+
+
+@pytest.mark.parametrize("failed_metric", ["record_queue_dispatch", "decrement_in_flight"])
+def test_scheduler_telemetry_failure_preserves_delivery_and_worker_capacity(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch, caplog, failed_metric: str
+) -> None:
+    metrics = Metrics()
+    retained_queue.metrics = metrics
+    calls = []
+
+    def sdk_send_message(chat_id, text):
+        calls.append((chat_id, text))
+        return chat_id, text
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("telemetry unavailable")
+
+    monkeypatch.setattr(metrics, failed_metric, unavailable)
+    manager = manager_adapter()
+    manager._bot = SimpleNamespace(send_message=sdk_send_message)
+    manager._outbound_queue = retained_queue
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
+
+        for text in ("first", "subsequent"):
+            row_id, waiter = enqueue(retained_queue, 48, text)
+            scheduler.dispatch_once()
+            scheduler.in_flight[row_id].future.result(timeout=1)
+            scheduler.harvest_completed()
+            scheduler.harvest_completed()
+
+            assert waiter.result(timeout=1) == (48, text)
+            assert retained_queue.connection.execute("SELECT id FROM outbound_queue").fetchall() == []
+            assert not retained_queue.waiters
+            assert not scheduler.in_flight
+            assert not scheduler.in_flight_destinations
+            assert scheduler._permits.acquire(blocking=False)
+            scheduler._permits.release()
+
+    assert calls == [(48, "first"), (48, "subsequent")]
+    assert scheduler.failure is None
+    assert not scheduler.stopping
+    assert "Unable to observe outbound metrics." in caplog.text
+    assert metrics.registry.get_sample_value(
+        "etm_outbound_completions_total",
+        dict(operation="send_message", priority="normal", sender_kind="main", outcome="success"),
+    ) == 2
 
 
 def test_scheduler_records_attempt_failure_and_only_terminal_success_after_retry(tmp_path: Path) -> None:

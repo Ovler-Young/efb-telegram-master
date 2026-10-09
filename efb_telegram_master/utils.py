@@ -1,11 +1,13 @@
 # coding=utf-8
 
 import base64
+import datetime
 import json
 import logging
 import os
 import subprocess
 from io import BytesIO
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
 
@@ -16,7 +18,7 @@ from ffmpeg._utils import convert_kwargs_to_cmd_line_args
 from typing_extensions import NewType
 
 from ehforwarderbot import Channel
-from ehforwarderbot.chat import BaseChat, ChatMember
+from ehforwarderbot.chat import BaseChat, ChatMember, GroupChat, PrivateChat, SystemChat
 from ehforwarderbot.types import ChatID, ModuleID
 from .locale_mixin import LocaleMixin
 
@@ -24,6 +26,15 @@ if TYPE_CHECKING:
     from . import TelegramChannel
 
 FFMPEG_TIMEOUT = 60
+DEFAULT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+AGGREGATION_CHAT_TYPES = ("group", "private", "system", "official_account")
+
+
+def format_message_time(value: datetime.datetime, display_timezone: ZoneInfo = DEFAULT_TIMEZONE) -> str:
+    """Display saved timestamps, interpreting naive values in the host local zone."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.astimezone()
+    return value.astimezone(display_timezone).strftime("%I:%M:%S")
 
 
 TelegramChatID = NewType('TelegramChatID', int)
@@ -57,6 +68,15 @@ class ExperimentalFlagsManager(LocaleMixin):
         "api_base_file_url": None,
         "local_tdlib_api": False,
         "topic_group": None,
+        "timezone": DEFAULT_TIMEZONE.key,
+        "text_aggregation": False,
+        "text_aggregation_origins": None,
+        "text_aggregation_chat_types": None,
+        "text_aggregation_rules": None,
+        "text_aggregation_window_seconds": 3,
+        "text_aggregation_idle_seconds": 1800,
+        "text_aggregation_max_members": 200,
+        "text_aggregation_max_payload_bytes": 256 * 1024,
     }
 
     @staticmethod
@@ -84,6 +104,37 @@ class ExperimentalFlagsManager(LocaleMixin):
         self.channel = channel
         self.config: Dict[str, Any] = ExperimentalFlagsManager.DEFAULT_VALUES.copy()
         self.config.update(channel.config.get('flags', dict()) or dict())
+        aggregation_origins = self.config["text_aggregation_origins"]
+        if aggregation_origins is not None and (
+                not isinstance(aggregation_origins, list)
+                or any(not isinstance(origin, str) or not origin.strip() for origin in aggregation_origins)):
+            raise ValueError("flags.text_aggregation_origins must be null or a list of non-empty source IDs")
+        aggregation_chat_types = self.config["text_aggregation_chat_types"]
+        if aggregation_chat_types is not None and (
+                not isinstance(aggregation_chat_types, list)
+                or any(not isinstance(chat_type, str) or chat_type not in AGGREGATION_CHAT_TYPES
+                       for chat_type in aggregation_chat_types)):
+            raise ValueError("flags.text_aggregation_chat_types must be null or a list of group, private, system, official_account")
+        aggregation_rules = self.config["text_aggregation_rules"]
+        if aggregation_rules is not None:
+            if not isinstance(aggregation_rules, list):
+                raise ValueError("flags.text_aggregation_rules must be null or a list of rules")
+            for rule in aggregation_rules:
+                if (not isinstance(rule, dict) or set(rule) != {"origins", "chat_types"}
+                        or not isinstance(rule["origins"], list) or not rule["origins"]
+                        or any(not isinstance(origin, str) or not origin.strip() for origin in rule["origins"])
+                        or not isinstance(rule["chat_types"], list) or not rule["chat_types"]
+                        or any(not isinstance(chat_type, str) or chat_type not in AGGREGATION_CHAT_TYPES
+                               for chat_type in rule["chat_types"])):
+                    raise ValueError("flags.text_aggregation_rules rules require non-empty origins and chat_types lists; "
+                                     "chat_types supports group, private, system, official_account")
+        try:
+            timezone_name = self.config["timezone"]
+            if not isinstance(timezone_name, str):
+                raise ValueError("Timezone name must be a string")
+            self.timezone = ZoneInfo(timezone_name)
+        except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("flags.timezone must be a valid IANA time zone, such as Asia/Shanghai") from exc
         if self.config.get("topic_group") is None and channel.config.get("topic_group") is not None:
             self.config["topic_group"] = channel.config["topic_group"]
 
@@ -91,6 +142,24 @@ class ExperimentalFlagsManager(LocaleMixin):
         if flag_key not in self.config:
             raise ValueError(self._("{0} is not a valid experimental flag").format(flag_key))
         return self.config[flag_key]
+
+    def allows_text_aggregation(self, chat: BaseChat, origin: str) -> bool:
+        if isinstance(chat, PrivateChat):
+            chat_type = "official_account" if (chat.vendor_specific or {}).get("is_mp") is True else "private"
+        elif isinstance(chat, GroupChat):
+            chat_type = "group"
+        elif isinstance(chat, SystemChat):
+            chat_type = "system"
+        else:
+            chat_type = None
+        rules = self.config["text_aggregation_rules"]
+        if rules is not None:
+            return any((chat.module_id in rule["origins"] or origin in rule["origins"])
+                       and chat_type in rule["chat_types"] for rule in rules)
+        origins = self.config["text_aggregation_origins"]
+        chat_types = self.config["text_aggregation_chat_types"]
+        return ((origins is None or chat.module_id in origins or origin in origins)
+                and (chat_types is None or chat_type in chat_types))
 
 
 def b64en(s: str) -> str:

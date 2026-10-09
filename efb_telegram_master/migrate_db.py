@@ -28,11 +28,11 @@ from peewee import (
 )
 from ruamel.yaml import YAML
 
-from .db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, HistoryMigrationTarget, MsgLog, SlaveChatInfo, TopicAssoc
+from .db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, HistoryMigrationTarget, MsgLog, MsgLogMember, SlaveChatInfo, TopicAssoc
 from .db_runtime import SCHEMA_LOCK, DataDirectoryLock, connection_scope, current_schema, postgresql_database
 
 CORE_MODELS = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
-MODELS = CORE_MODELS + (HistoryMigrationTarget,)
+MODELS = CORE_MODELS + (HistoryMigrationTarget, MsgLogMember)
 # Version 1 did not record its column projections in the manifest.
 V1_COLUMNS = {
     "chatassoc": ["id", "master_uid", "slave_uid"],
@@ -46,6 +46,7 @@ V1_COLUMNS = {
                               "source_master_msg_id", "formatted_text", "media_type", "source_time",
                               "position", "created_at"],
 }
+V1_OPTIONAL_COLUMNS = {"msglogmember": ["master_msg_id", "slave_origin_uid", "slave_message_id"]}
 CACHE_TABLES = {"topiciconcache", "useremojicache"}
 IMPORT_TABLE = "etm_sqlite_import"
 RECEIPT_FILE = ".postgresql-cutover.json"
@@ -560,7 +561,9 @@ def _recovery_columns(models, manifest):
     available = {model._meta.table_name: model for model in models}
     if not set(manifest["tables"]).issubset(available):
         raise RuntimeError("Source tables changed since the committed import.")
-    columns = V1_COLUMNS if manifest["version"] == 1 else manifest["columns"]
+    v1_columns = V1_COLUMNS | V1_OPTIONAL_COLUMNS
+    columns = ({table: v1_columns[table] for table in manifest["tables"] if table in v1_columns}
+               if manifest["version"] == 1 else manifest["columns"])
     if set(columns) != set(manifest["tables"]):
         raise RuntimeError("Unsupported column projection in committed import.")
     for table, names in columns.items():

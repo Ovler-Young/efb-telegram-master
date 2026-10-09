@@ -6,6 +6,7 @@ import pickle
 import time
 import tempfile
 import uuid
+import copy
 from contextlib import nullcontext, suppress
 from enum import Enum
 from functools import wraps
@@ -14,7 +15,9 @@ from typing import Callable, Collection, Dict, Iterable, List, Optional, Protoco
 from peewee import (
     AutoField,
     BlobField,
+    Case,
     CharField,
+    CompositeKey,
     DatabaseProxy,
     DateTimeField,
     DoesNotExist,
@@ -42,8 +45,9 @@ from ehforwarderbot.types import ModuleID, ChatID, MessageID, ReactionName
 from .chat_object_cache import ChatObjectCacheManager
 from .message import ETMMsg
 from .msg_type import TGMsgType
+from .aggregate import AggregatePayload, SourceMember, member_identity, member_message
 from .utils import TelegramChatID, EFBChannelChatIDStr, TgChatMsgIDStr, message_id_to_str, \
-    chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID
+    chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID, message_id_str_to_id
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -93,6 +97,7 @@ def observe_database_method(method: str):
 PickledDict = TypedDict('PickledDict', {
     "file_bot_id": str,
     "target": TgChatMsgIDStr,
+    "target_source": Tuple[str, str],
     "is_system": bool,
     "attributes": MessageAttribute,
     "commands": MessageCommands,
@@ -177,8 +182,43 @@ class MsgLog(BaseModel):
         misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
         return misc.get("file_bot_id", self.sender_bot_id)
 
+    @property
+    def aggregate(self) -> Optional[AggregatePayload]:
+        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
+        aggregate = misc.get("aggregate")
+        if aggregate is not None and aggregate.get("format_version") != 1:
+            raise ValueError("Unsupported live aggregate format.")
+        return aggregate
+
+    @property
+    def source_member(self) -> Optional[SourceMember]:
+        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
+        return misc.get("source_member")
+
+    def build_source_member(self, member: SourceMember, chat_manager: ChatObjectCacheManager) -> ETMMsg:
+        """Restore a selected real source without treating the container as a source."""
+        def restore_chat(identity):
+            module_id, chat_id, group_id = chat_id_str_to_id(chat_id_to_str(chat=identity))
+            if group_id:
+                return chat_manager.get_chat_member(module_id, group_id, chat_id, build_dummy=True)
+            return chat_manager.get_chat(module_id, chat_id, build_dummy=True)
+
+        msg = member_message(member)
+        msg.chat = restore_chat(msg.chat)
+        msg.author = restore_chat(msg.author)
+        msg.sender_bot_id = self.sender_bot_id
+        if msg.target:
+            msg.target.chat = restore_chat(msg.target.chat)
+        if msg.substitutions:
+            msg.substitutions = Substitutions({key: restore_chat(chat) for key, chat in msg.substitutions.items()})
+        if msg.reactions:
+            msg.reactions = {key: [restore_chat(chat) for chat in chats] for key, chats in msg.reactions.items()}
+        return msg
+
     def build_etm_msg(self, chat_manager: ChatObjectCacheManager,
                       recur: bool = True) -> ETMMsg:
+        if self.aggregate is not None:
+            raise ValueError("Select a source member before restoring a live aggregate.")
         c_module, c_id, _ = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_origin_uid))
         assert self.slave_member_uid is not None
         a_module, a_id, a_grp = chat_id_str_to_id(EFBChannelChatIDStr(self.slave_member_uid))
@@ -215,7 +255,14 @@ class MsgLog(BaseModel):
                 with connection_scope(self._meta.database):
                     target_row = self.get_or_none(MsgLog.master_msg_id == misc_data['target'])
                 if target_row:
-                    msg.target = target_row.build_etm_msg(chat_manager, recur=False)
+                    if target_row.aggregate:
+                        target_identity = misc_data.get("target_source")
+                        member = next((child for child in target_row.aggregate["children"]
+                                       if member_identity(child) == target_identity), None)
+                        if member is not None:
+                            msg.target = target_row.build_source_member(member, chat_manager)
+                    else:
+                        msg.target = target_row.build_etm_msg(chat_manager, recur=False)
             if 'is_system' in misc_data:
                 msg.is_system = misc_data['is_system']
             if 'attributes' in misc_data:
@@ -242,6 +289,16 @@ class MsgLog(BaseModel):
         return msg
 
 
+class MsgLogMember(BaseModel):
+    master_msg_id = TextField()
+    slave_origin_uid = TextField()
+    slave_message_id = TextField()
+
+    class Meta:
+        primary_key = CompositeKey("master_msg_id", "slave_origin_uid", "slave_message_id")
+        indexes = ((("slave_origin_uid", "slave_message_id"), False),)
+
+
 class HistoryMigrationEntry(BaseModel):
     id = AutoField()
     slave_chat_id = TextField()
@@ -251,6 +308,7 @@ class HistoryMigrationEntry(BaseModel):
     formatted_text = TextField(null=True)
     media_type = TextField(null=True)
     source_time = DateTimeField(null=True)
+    received_time = DateTimeField(null=True)
     position = IntegerField()
     created_at = DateTimeField(default=datetime.datetime.now)
     generation = TextField(null=True)
@@ -371,14 +429,14 @@ class DatabaseManager:
         Initializing tables.
         """
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
+            ChatAssoc, MsgLog, MsgLogMember, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
         ])
 
     @staticmethod
     def _create_missing_tables():
         """Create tables introduced after the original schema without touching existing data."""
         database.create_tables([
-            ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
+            ChatAssoc, MsgLog, MsgLogMember, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
         ], safe=True)
 
     def _check_and_run_migrations(self):
@@ -404,6 +462,7 @@ class DatabaseManager:
             ("msglog_chat_time", "msglog", f"slave_origin_uid, {time_order}"),
             ("msglog_history_seek", "msglog", "slave_origin_uid, time, master_msg_id"),
             ("history_generation_id", "historymigrationentry", "generation, id"),
+            ("history_generation_position", "historymigrationentry", "generation, position, id"),
             ("history_target_generation_position", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, generation, position, id"),
             ("history_target_cleanup", "historymigrationentry", "slave_chat_id, target_chat_id, message_thread_id, id"),
             ("msglog_master_alt", "msglog", "master_msg_id_alt"),
@@ -505,8 +564,12 @@ class DatabaseManager:
             return 0
 
     @observe_database_method("get_master_msg_id")
-    def get_master_msg_id(self, message: EFBMessage) -> Optional[TgChatMsgIDStr]:
+    def get_master_msg_id(self, message: EFBMessage, target_chat_id=None, topic=None) -> Optional[TgChatMsgIDStr]:
         """Get master message ID from a message object."""
+        if target_chat_id is not None:
+            resolved = self.resolve_source_member(str(chat_id_to_str(chat=message.chat)), str(message.uid),
+                                                  str(target_chat_id), str(topic) if topic is not None else None)
+            return TgChatMsgIDStr(resolved[0].master_msg_id) if resolved else None
         log: Optional[MsgLog] = MsgLog.get_or_none(
             MsgLog.slave_origin_uid == chat_id_to_str(chat=message.chat),
             MsgLog.slave_message_id == message.uid
@@ -515,7 +578,7 @@ class DatabaseManager:
             return TgChatMsgIDStr(log.master_msg_id)
         return None
 
-    def pickle_misc_msg(self, message: EFBMessage) -> Optional[bytes]:
+    def pickle_misc_msg(self, message: EFBMessage, target_chat_id=None, topic=None) -> Optional[bytes]:
         """Pickle miscellaneous information of a message.
 
         Since 2.0.0b34, this would be a dict that reflects the following
@@ -550,9 +613,10 @@ class DatabaseManager:
                 for k, v in message.reactions.items()
             }
         if message.target:
-            target_id = self.get_master_msg_id(message.target)
+            target_id = self.get_master_msg_id(message.target, target_chat_id, topic)
             if target_id:
                 data['target'] = target_id
+                data['target_source'] = (str(chat_id_to_str(chat=message.target.chat)), str(message.target.uid))
 
         if data:
             return pickle.dumps(data)
@@ -753,6 +817,8 @@ class DatabaseManager:
             self.logger.debug("[%s] Message record is not found in database, insert it", master_msg_id)
 
         assert row is not None
+        if existing and row.aggregate is not None:
+            raise ValueError("Live aggregates must be finalized with their source members.")
         values = {
             "master_msg_id": master_msg_id,
             "master_msg_id_alt": master_msg_id_alt,
@@ -767,7 +833,7 @@ class DatabaseManager:
             "file_unique_id": msg.file_unique_id,
             "mime": msg.mime,
             "sender_bot_id": sender_bot_id,
-            "pickle": self.pickle_misc_msg(msg),
+            "pickle": self.pickle_misc_msg(msg, master_message.chat_id, getattr(master_message, "message_thread_id", None)),
         }
         if existing:
             changed = {
@@ -786,16 +852,211 @@ class DatabaseManager:
             result = row.save(force_insert=True)
         self.logger.debug("[%s] Database insert/update outcome: %s", master_msg_id, result)
 
+    @staticmethod
+    def _locked_message_log(master_msg_id: str, *, include_alt: bool = False) -> Optional[MsgLog]:
+        condition = MsgLog.master_msg_id == master_msg_id
+        if include_alt:
+            condition |= MsgLog.master_msg_id_alt == master_msg_id
+        query = MsgLog.select().where(condition)
+        if isinstance(database.obj, PostgresqlDatabase):
+            query = query.for_update()
+        return query.first()
+
+    @staticmethod
+    def _add_member_mapping(master_msg_id: str, member: SourceMember) -> None:
+        MsgLogMember.insert(master_msg_id=master_msg_id, slave_origin_uid=member["origin_uid"],
+                            slave_message_id=member["source_id"]).on_conflict_ignore().execute()
+
+    @observe_database_method("finalize_aggregate_message")
+    def finalize_aggregate_message(self, master_message: Message, aggregate: AggregatePayload,
+                                   sender_bot_id: Optional[str] = None) -> MsgLog:
+        """Apply a durable receipt and its member mappings in one transaction.
+
+        Presentation is the confirmed request snapshot. Newer source routing
+        survives an older snapshot, including a replacement confirmed elsewhere.
+        """
+        if aggregate["format_version"] != 1 or not aggregate["children"]:
+            raise ValueError("A live aggregate requires format 1 and real source members.")
+        identities = [member_identity(member) for member in aggregate["children"]]
+        if len(set(identities)) != len(identities):
+            raise ValueError("A source may occur only once in a live aggregate.")
+        master_id = str(message_id_to_str(
+            TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)))
+        with database.atomic(*(() if isinstance(database.obj, PostgresqlDatabase) else ("IMMEDIATE",))):
+            row = self._locked_message_log(master_id)
+            previous = row.aggregate if row else None
+            if row and previous is None:
+                raise ValueError("Cannot replace an independent message with a live aggregate.")
+            if row is not None and previous and previous["revision"] >= aggregate["revision"]:
+                return row
+            if row and row.sender_bot_id != sender_bot_id:
+                raise ValueError("A live aggregate retains its sending Bot.")
+            saved = copy.deepcopy(aggregate)
+            if previous:
+                previous_members = {member_identity(member): member for member in previous["children"]}
+                if not set(previous_members).issubset(identities):
+                    raise ValueError("Confirmed live members cannot disappear from a container.")
+                for index, member in enumerate(saved["children"]):
+                    old = previous_members.get(member_identity(member))
+                    if old and (old["source_revision"] > member["source_revision"] or
+                                (old["source_revision"] == member["source_revision"] and
+                                 old["status"] != "active")):
+                        saved["children"][index] = copy.deepcopy(old)
+                    elif old and old["status"] == "redirected":
+                        # Confirmed replacement routing survives every container receipt.
+                        member["status"] = "redirected"
+                        member["replacement_master_msg_id"] = old["replacement_master_msg_id"]
+            first = saved["children"][0]
+            if row is None:
+                self.add_or_update_message_log(member_message(first), master_message, sender_bot_id=sender_bot_id)
+                row = self._locked_message_log(master_id)
+                assert row is not None
+                row.time = first["source_time"] or first["received_time"]
+            misc = pickle.loads(bytes(row.pickle)) if row.pickle else {}
+            misc["aggregate"] = saved
+            row.pickle = pickle.dumps(misc, protocol=5)
+            row.text = aggregate["confirmed_text"]
+            topic = getattr(master_message, "message_thread_id", None)
+            if topic is not None:
+                row.master_message_thread_id = str(topic)
+            row.save()
+            for member in saved["children"]:
+                self._add_member_mapping(master_id, member)
+            return row
+
+    @observe_database_method("finalize_source_message")
+    def finalize_source_message(self, msg: ETMMsg, master_message: Message, member: SourceMember,
+                                sender_bot_id: Optional[str] = None,
+                                old_message_id: Optional[OldMsgID] = None) -> MsgLog:
+        """Finalize an independent source version while keeping normal command metadata."""
+        if member_identity(member) != (str(chat_id_to_str(chat=msg.chat)), str(msg.uid)):
+            raise ValueError("The output and saved source member must have the same identity.")
+        master_id = str(message_id_to_str(
+            TelegramChatID(master_message.chat_id), TelegramMessageID(master_message.message_id)))
+        with database.atomic(*(() if isinstance(database.obj, PostgresqlDatabase) else ("IMMEDIATE",))):
+            row = self._locked_message_log(master_id, include_alt=True)
+            if row is None and old_message_id:
+                row = self._locked_message_log(str(message_id_to_str(*old_message_id)), include_alt=True)
+            if row and row.source_member and row.source_member["source_revision"] >= member["source_revision"]:
+                return row
+            if row is not None:
+                old_message_id = message_id_str_to_id(TgChatMsgIDStr(row.master_msg_id))
+            self.add_or_update_message_log(msg, master_message, old_message_id, sender_bot_id)
+            row = self._locked_message_log(master_id, include_alt=True)
+            if row is None and old_message_id:
+                row = self._locked_message_log(str(message_id_to_str(*old_message_id)), include_alt=True)
+            assert row is not None
+            misc = pickle.loads(bytes(row.pickle)) if row.pickle else {}
+            misc["source_member"] = copy.deepcopy(member)
+            row.pickle = pickle.dumps(misc, protocol=5)
+            topic = getattr(master_message, "message_thread_id", None)
+            if topic is not None:
+                row.master_message_thread_id = str(topic)
+            row.save()
+            self._add_member_mapping(row.master_msg_id, member)
+            return row
+
+    @observe_database_method("finalize_member_redirect")
+    def finalize_member_redirect(self, old_container_id: str, member: SourceMember, msg: ETMMsg,
+                                 master_message: Message, sender_bot_id: Optional[str] = None) -> MsgLog:
+        """Confirm replacement and routing together; old presentation changes on its own receipt."""
+        with database.atomic(*(() if isinstance(database.obj, PostgresqlDatabase) else ("IMMEDIATE",))):
+            old = self._locked_message_log(old_container_id)
+            if not old or old.aggregate is None:
+                raise ValueError("A member redirect requires its original live container.")
+            aggregate = old.aggregate
+            previous = next((child for child in aggregate["children"]
+                             if member_identity(child) == member_identity(member)), None)
+            if previous is None:
+                raise ValueError("The source member does not belong to this container.")
+            if previous["source_revision"] > member["source_revision"] or (
+                    previous["source_revision"] == member["source_revision"] and previous["status"] == "removed"):
+                raise ValueError("A stale receipt cannot redirect a newer source version.")
+            if previous["status"] == "redirected" and previous["source_revision"] >= member["source_revision"]:
+                replacement = self.get_msg_log(master_msg_id=previous["replacement_master_msg_id"])
+                if replacement is None:
+                    raise ValueError("The confirmed replacement is missing.")
+                return replacement
+            replacement = self.finalize_source_message(msg, master_message, member, sender_bot_id)
+            redirected = copy.deepcopy(member)
+            redirected["status"] = "redirected"
+            redirected["replacement_master_msg_id"] = replacement.master_msg_id
+            aggregate["children"] = [redirected if member_identity(child) == member_identity(member) else child
+                                     for child in aggregate["children"]]
+            assert old.pickle is not None
+            misc = pickle.loads(bytes(old.pickle))
+            misc["aggregate"] = aggregate
+            old.pickle = pickle.dumps(misc, protocol=5)
+            old.save(only=[MsgLog.pickle])
+            return replacement
+
+    @observe_database_method("get_container_members")
+    def get_container_members(self, master_msg_id: str) -> List[SourceMember]:
+        row = self.get_msg_log(master_msg_id=master_msg_id)
+        if row is None:
+            return []
+        if row.aggregate:
+            return row.aggregate["children"]
+        return [row.source_member] if row.source_member else []
+
+    @observe_database_method("get_source_message_logs")
+    def get_source_message_logs(self, origin_uid: str, source_id: str) -> List[MsgLog]:
+        """Read saved source snapshots so status-only events can resolve their current destination."""
+        mappings = MsgLogMember.select(MsgLogMember.master_msg_id).where(
+            (MsgLogMember.slave_origin_uid == origin_uid) & (MsgLogMember.slave_message_id == source_id))
+        return list(MsgLog.select().where(MsgLog.master_msg_id.in_(mappings) |
+            ((MsgLog.slave_origin_uid == origin_uid) & (MsgLog.slave_message_id == source_id)))
+            .order_by(MsgLog.time.desc(nulls="LAST")))
+
+    @observe_database_method("resolve_source_member")
+    def resolve_source_member(self, slave_origin_uid: str, slave_msg_id: str, target_chat_id: str,
+                              message_thread_id: Optional[str] = None) -> Optional[Tuple[MsgLog, Optional[SourceMember]]]:
+        """Resolve the effective source in the current destination, never a replay output.
+
+        Legacy independent messages return a None member and keep their ordinary
+        restoration path. Ambiguous active mappings require explicit selection.
+        """
+        mappings = MsgLogMember.select(MsgLogMember.master_msg_id).where(
+            (MsgLogMember.slave_origin_uid == slave_origin_uid) & (MsgLogMember.slave_message_id == slave_msg_id))
+        rows = MsgLog.select().where(
+            MsgLog.master_msg_id.in_(mappings) |
+            ((MsgLog.slave_origin_uid == slave_origin_uid) & (MsgLog.slave_message_id == slave_msg_id)))
+        candidates = []
+        topic = str(message_thread_id) if message_thread_id is not None else None
+        for row in rows:
+            if row.master_msg_id.rsplit(".", 1)[0] != str(target_chat_id) or row.master_message_thread_id != topic:
+                continue
+            aggregate = row.aggregate
+            if aggregate:
+                member = next((child for child in aggregate["children"]
+                               if member_identity(child) == (slave_origin_uid, slave_msg_id)), None)
+                if member is None or member["status"] == "redirected":
+                    continue
+            else:
+                member = row.source_member
+            candidates.append((row, member))
+        if not candidates:
+            return None
+        newest_revision = max(member["source_revision"] if member else 0 for _, member in candidates)
+        latest = [(row, member) for row, member in candidates
+                  if (member["source_revision"] if member else 0) == newest_revision]
+        if len(latest) > 1 and newest_revision:
+            raise ValueError("Multiple effective outputs exist for this source and destination.")
+        return max(latest, key=lambda pair: (pair[0].time or datetime.datetime.min, pair[0].master_msg_id))
+
     @observe_database_method("get_msg_log")
     def get_msg_log(self, master_msg_id: Optional[TgChatMsgIDStr] = None,
                     slave_msg_id: Optional[MessageID] = None,
-                    slave_origin_uid: Optional[EFBChannelChatIDStr] = None) -> Optional[MsgLog]:
+                    slave_origin_uid: Optional[EFBChannelChatIDStr] = None,
+                    *, include_managed_alt: bool = False) -> Optional[MsgLog]:
         """Get message log by message ID.
 
         Args:
             master_msg_id: Telegram message ID in string
             slave_msg_id: Slave message identifier in string
             slave_origin_uid: Slave chat identifier in string
+            include_managed_alt: Resolve an independent source output's actual
+                alternate Telegram ID when its canonical ID does not match.
 
         Returns:
             Optional[MsgLog]: The queried entry, None if not exist.
@@ -807,8 +1068,15 @@ class DatabaseManager:
             raise ValueError('slave_msg_id and slave_origin_uid must exists together.')
         try:
             if master_msg_id:
-                return MsgLog.select().where(MsgLog.master_msg_id == master_msg_id) \
+                row = MsgLog.select().where(MsgLog.master_msg_id == master_msg_id) \
                     .order_by(MsgLog.time.desc(nulls="LAST")).first()
+                if row is not None or not include_managed_alt:
+                    return row
+                for alternate in MsgLog.select().where(MsgLog.master_msg_id_alt == master_msg_id) \
+                        .order_by(MsgLog.time.desc(nulls="LAST")):
+                    if alternate.source_member is not None:
+                        return alternate
+                return None
             else:
                 return MsgLog.select().where((MsgLog.slave_message_id == slave_msg_id) &
                                              (MsgLog.slave_origin_uid == slave_origin_uid)
@@ -1025,6 +1293,43 @@ class DatabaseManager:
             for batch in chunked(prepared(), 32):
                 with database.atomic():
                     HistoryMigrationEntry.insert_many(batch).execute()
+            # Sorting the unpublished generation cannot change a replay already
+            # in progress. Keep only a cursor page in RAM, then renumber in short
+            # writer transactions after the ordering cursor has closed.
+            spool.seek(0)
+            spool.truncate()
+            ordered = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
+                HistoryMigrationEntry.generation == generation,
+            ).order_by(
+                fn.COALESCE(HistoryMigrationEntry.source_time,
+                            HistoryMigrationEntry.received_time).asc(nulls="FIRST"),
+                HistoryMigrationEntry.received_time.asc(nulls="FIRST"),
+                HistoryMigrationEntry.position, HistoryMigrationEntry.id,
+            )
+            with database.atomic():
+                sql, params = ordered.sql()
+                if isinstance(database.obj, PostgresqlDatabase):
+                    # Peewee uses explicit BEGIN with driver autocommit enabled.
+                    cursor = database.connection().cursor(name=f"history_sort_{generation}", withhold=True)
+                    cursor.execute(sql, params)
+                else:
+                    cursor = database.execute_sql(sql, params)
+                try:
+                    while True:
+                        identifiers = cursor.fetchmany(32)
+                        if not identifiers:
+                            break
+                        for (identifier,) in identifiers:
+                            pickle.dump(identifier, spool)
+                finally:
+                    cursor.close()
+            spool.seek(0)
+            positions = ((pickle.load(spool), position) for position in range(count))
+            for batch in chunked(positions, 32):
+                with database.atomic():
+                    HistoryMigrationEntry.update(position=Case(HistoryMigrationEntry.id, batch)).where(
+                        HistoryMigrationEntry.id.in_([identifier for identifier, _ in batch]),
+                    ).execute()
             # Publishing one pointer makes the entire replacement visible.
             with database.atomic():
                 HistoryMigrationTarget.insert(
@@ -1083,7 +1388,7 @@ class DatabaseManager:
     def get_next_history_migration_target(
         self, target_chat_id: Optional[int] = None,
     ) -> Optional[HistoryMigrationEntry]:
-        # Seek one head per published generation; ORDER BY id over a combined
+        # Seek one head per published generation; ordering a combined
         # visibility predicate can instead scan every unpublished staging row.
         target_filter = (
             HistoryMigrationTarget.target_chat_id == str(target_chat_id)
@@ -1091,14 +1396,14 @@ class DatabaseManager:
         )
         head = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             HistoryMigrationEntry.generation == HistoryMigrationTarget.generation,
-        ).order_by(HistoryMigrationEntry.id).limit(1)
+        ).order_by(HistoryMigrationEntry.position, HistoryMigrationEntry.id).limit(1)
         published_id = HistoryMigrationTarget.select(fn.MIN(EnclosedNodeList([head]))).where(target_filter).scalar()
         legacy_filter = HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
         if target_chat_id is not None:
             legacy_filter &= HistoryMigrationEntry.target_chat_id == str(target_chat_id)
         legacy_id = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             legacy_filter
-        ).order_by(HistoryMigrationEntry.id).limit(1).scalar()
+        ).order_by(HistoryMigrationEntry.position, HistoryMigrationEntry.id).limit(1).scalar()
         ids = [identifier for identifier in (published_id, legacy_id) if identifier is not None]
         return HistoryMigrationEntry.get_by_id(min(ids)) if ids else None
 

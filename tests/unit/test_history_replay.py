@@ -1,6 +1,8 @@
 """History replay contracts: real SQLite state, bounded batching, sender-owned media."""
 
+import sqlite3
 from concurrent.futures import Future
+from contextlib import closing
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,11 +13,16 @@ from telegram import InputFile
 from telegram.error import BadRequest, TimedOut
 
 from efb_telegram_master import db as db_module
+from efb_telegram_master.aggregate import make_aggregate, make_source_member
 from efb_telegram_master.chat_binding import ChatBindingManager
-from efb_telegram_master.db import DatabaseManager, HistoryMigrationEntry, MsgLog, database
+from efb_telegram_master.db import DatabaseManager, HistoryMigrationEntry, MsgLog, MsgLogMember, database
 from efb_telegram_master.db_runtime import connection_scope
 from efb_telegram_master.outbound import HISTORY_REPLAY_KEY, OutboundQueue, OutboundQueueScheduler
 from tests.unit.test_outbound_queue_runtime_evidence import ControlledExecutor, manager_adapter
+from tests.unit.test_live_aggregate import source, receipt, SourceCache
+from tests.unit.test_database_safety import (
+    postgres_config as postgres_config, postgres_server_config as postgres_server_config,
+)
 
 
 @pytest.fixture
@@ -140,6 +147,134 @@ def test_failed_batch_enqueue_preserves_all_source_entries(history):
     with connection_scope(history.db._managed_database):
         assert HistoryMigrationEntry.select().count() == 2
         assert MsgLog.select().count() == 2
+
+
+@pytest.mark.parametrize('history', ['sqlite', 'postgresql'], indirect=True)
+def test_live_members_expand_saved_content_and_interleave_with_legacy_media(history):
+    start = datetime(2026, 1, 1)
+    messages = [source('one', 'same_<&', 'Alice'), source('two', 'same_<&', 'Bob'),
+                source('removed', 'saved before withdrawal', 'Carol'),
+                source('moved', 'old moved body', 'Dave')]
+    messages[0].target = source('quoted', 'quoted_body', 'Eve')
+    members = [make_source_member(message, source_time=start + timedelta(seconds=second),
+                                  received_time=start + timedelta(seconds=second + 1),
+                                  display_prefix='live destination prefix')
+               for message, second in zip(messages, [10, 40, 20, 50])]
+    members[2].update(status='removed', source_revision=2)
+    history.db.finalize_aggregate_message(receipt(), make_aggregate(members, 1))
+    replacement = source('moved', 'new moved body', 'Dave')
+    replacement_member = make_source_member(replacement, source_revision=2,
+                                           source_time=start + timedelta(seconds=50),
+                                           received_time=start + timedelta(seconds=51))
+    history.db.finalize_member_redirect('-100.1', replacement_member, replacement, receipt(2))
+    origin = members[0]['origin_uid']
+    legacy = source('legacy', 'legacy body', 'Frank')
+    history.db.add_or_update_message_log(legacy, receipt(3))
+    with connection_scope(history.db._managed_database):
+        MsgLog.update(time=start + timedelta(seconds=30)).where(MsgLog.master_msg_id == '-100.3').execute()
+        MsgLog.create(master_msg_id='-100.4', slave_message_id='video', text='video caption',
+                      slave_origin_uid=origin, media_type='Video', msg_type='Video', sent_to='test',
+                      time=start + timedelta(seconds=35))
+        original_count = MsgLog.select().count()
+        original_mappings = MsgLogMember.select().count()
+    history.binding.chat_manager = SourceCache()
+    assert history.binding._queue_history_migration_entries(origin, -1002, 42) == 6
+    staged = history.db.get_history_migration_entries(origin, -1002, 42)
+    assert [entry.source_time for entry in staged] == [start + timedelta(seconds=second)
+                                                     for second in [10, 20, 30, 35, 40, 50]]
+    assert [entry.source_master_msg_id for entry in staged] == ['-100.1', '-100.1', '-100.3',
+                                                              '-100.4', '-100.1', '-100.2']
+    assert staged[0].formatted_text == ('*Alice* `08:00:10`\n'
+                                        f'↪ Eve \\[{origin}/quoted]: quoted\\_body\nsame\\_<&\n\n')
+    assert '*Carol*' in staged[1].formatted_text and 'saved before withdrawal' in staged[1].formatted_text
+    assert staged[4].formatted_text.startswith('*Bob*') and staged[4].formatted_text.endswith('same\\_<&\n\n')
+    assert staged[5].formatted_text.endswith('new moved body\n\n')
+    assert all('live destination prefix' not in (entry.formatted_text or '') for entry in staged)
+    sender = Sender()
+    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager.channel = SimpleNamespace(db=history.db)
+
+    def enqueue_and_complete(**kwargs):
+        history.calls.append(kwargs)
+        waiter = manager.enqueue_history_operation(**kwargs)
+        scheduler.dispatch_once()
+        finish_attempt(executor, scheduler)
+        return waiter
+
+    history.binding.bot = SimpleNamespace(enqueue_history_operation=enqueue_and_complete,
+                                         owned_history_entries=manager.owned_history_entries,
+                                         forget_history_entries=manager.forget_history_entries)
+    try:
+        assert history.binding._process_history_migration_target(history.db.get_next_history_migration_target())
+        assert not manager._outbound_queue.heads()
+    finally:
+        manager._outbound_queue.close()
+    assert [call['operation'] for call in history.calls] == ['send_message', 'copy_message', 'send_message']
+    assert [kind for kind, _ in sender.calls] == ['send_message', 'copy_message', 'send_message']
+    assert all('log_context' not in call and 'log_context' not in call['kwargs'] for call in history.calls)
+    with connection_scope(history.db._managed_database):
+        assert MsgLog.select().count() == original_count
+        assert MsgLogMember.select().count() == original_mappings
+        assert history.db.get_msg_log(master_msg_id='-100.1').aggregate['children'][2]['status'] == 'removed'
+
+
+@pytest.mark.parametrize('history', ['sqlite', 'postgresql'], indirect=True)
+def test_global_history_order_and_cursor_use_final_position_without_changing_ownership(history):
+    start = datetime(2026, 1, 1)
+    # Deliberately reverse the insertion/source-container order and include
+    # tied source times whose receive times determine their publication order.
+    entries = [dict(slave_chat_id='slave chat', target_chat_id='-1002', message_thread_id='42',
+                    source_master_msg_id=f'-100.{index}', formatted_text=f'{index}\n', position=64 - index,
+                    source_time=start + timedelta(seconds=index // 2),
+                    received_time=start + timedelta(seconds=index)) for index in reversed(range(65))]
+    entries.extend([
+        dict(slave_chat_id='slave chat', target_chat_id='-1002', message_thread_id='42',
+             source_master_msg_id='unknown', formatted_text='unknown\n', position=65),
+        dict(slave_chat_id='slave chat', target_chat_id='-1002', message_thread_id='42',
+             source_master_msg_id='received', formatted_text='received\n', position=66,
+             received_time=start + timedelta(seconds=40)),
+    ])
+    assert history.db.replace_history_migration_entries('slave chat', -1002, 42, entries) == 67
+    head = history.db.get_next_history_migration_target()
+    assert head.formatted_text == 'unknown\n' and head.position == 0
+    assert head.id != min(entry.id for entry in history.db.get_history_migration_entries('slave chat', -1002, 42))
+    pages, after = [], None
+    while True:
+        page = history.db.get_history_migration_entries('slave chat', -1002, 42, limit=32, after=after)
+        pages.extend(page)
+        if len(page) < 32:
+            break
+        after = page[-1].position, page[-1].id
+    assert [entry.formatted_text for entry in pages] == ['unknown\n'] + [f'{i}\n' for i in range(65)] + ['received\n']
+    assert [entry.position for entry in pages] == list(range(67))
+    assert len({entry.ownership_key for entry in pages}) == 67
+    assert history.db.get_history_migration_ownership_keys([entry.id for entry in pages]) == [entry.ownership_key for entry in pages]
+    assert history.binding._process_history_migration_target(head)
+    assert history.calls[0]['kwargs']['text'] == ''.join(entry.formatted_text for entry in pages)
+
+
+def test_old_pending_history_gains_nullable_received_time_and_keeps_its_replay(tmp_path, request):
+    with closing(sqlite3.connect(tmp_path / 'tgdata.db')) as legacy:
+        legacy.execute(
+            'CREATE TABLE historymigrationentry ('
+            'id INTEGER PRIMARY KEY, slave_chat_id TEXT NOT NULL, target_chat_id TEXT NOT NULL, '
+            'message_thread_id TEXT, source_master_msg_id TEXT NOT NULL, formatted_text TEXT, '
+            'media_type TEXT, source_time DATETIME, position INTEGER NOT NULL, created_at DATETIME NOT NULL)'
+        )
+        legacy.execute(
+            'INSERT INTO historymigrationentry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (7, 'slave chat', '-1002', '42', '-1001.1', 'legacy pending\n', 'Text',
+             datetime(2026, 1, 1), 12, datetime(2026, 1, 1)),
+        )
+        legacy.commit()
+    # Start the existing fixture only after the historical database is on disk.
+    history = request.getfixturevalue('history')
+    restored = history.db.get_next_history_migration_target()
+    assert restored.received_time is None and restored.ownership_key == 'legacy:7'
+    assert restored.position == 12
+    assert history.binding._process_history_migration_target(restored)
+    assert history.calls[0]['kwargs']['text'] == 'legacy pending\n'
+    assert history.db.get_next_history_migration_target() is None
 
 
 class Sender:
