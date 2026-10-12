@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from peewee import (
-    AutoField, BigIntegerField, BlobField, CharField, CompositeKey, DateTimeField, DoubleField, FloatField,
+    AutoField, BigIntegerField, BlobField, BooleanField, CharField, CompositeKey, DateTimeField, DoubleField, FloatField,
     IntegerField, Model, TextField, chunked,
 )
 from ruamel.yaml import YAML
@@ -249,6 +249,10 @@ def _value(field, value):
         if not isinstance(value, (int, float)):
             raise ValueError(f"Invalid real value in {field.name}")
         return float(value)
+    if isinstance(field, BooleanField):
+        if not isinstance(value, (bool, int)) or value not in (0, 1):
+            raise ValueError(f"Invalid boolean value in {field.name}")
+        return bool(value)
     if isinstance(field, IntegerField):
         converted = int(value)
         if isinstance(value, float) and value != converted:

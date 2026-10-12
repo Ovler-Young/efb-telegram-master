@@ -154,6 +154,8 @@ def manager_factory(monkeypatch):
 
 
 def test_real_postgresql_import_preserves_every_field_id_queue_and_next_sequence(sqlite_source, postgres_config, manager_factory):
+    with sqlite3.connect(sqlite_source / "tgdata.db") as source:
+        source.execute("UPDATE slavechatinfo SET text_aggregation_enabled = 1 WHERE id = 63")
     before = source_rows(sqlite_source)
     queue_before = migrate_db._queue_digest(sqlite_source / "outbound-queue.sqlite3")
     older_archive = sqlite_source / "tgdata.db.migrated"
@@ -177,6 +179,7 @@ def test_real_postgresql_import_preserves_every_field_id_queue_and_next_sequence
         assert TopicAssoc.create(topic_chat_id="next", message_thread_id="next", slave_uid="next").id == 53
         assert SlaveChatInfo.create(slave_channel_id="next", slave_channel_emoji="", slave_chat_uid="next", slave_chat_name="next", slave_chat_type="PrivateChat").id == 64
         assert HistoryMigrationEntry.create(slave_chat_id="next", target_chat_id="next", source_master_msg_id="next", position=1).id == 75
+    assert manager.get_text_aggregation_override("slave", "chat") is True
     assert manager.get_msg_log(master_msg_id="ä.2").time is None
     assert manager.get_msg_log(master_msg_id="z.1").time == datetime(2020, 1, 2, 3, 4, 5, 123456)
 

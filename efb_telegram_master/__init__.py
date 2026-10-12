@@ -32,6 +32,7 @@ from ehforwarderbot.exceptions import EFBException, EFBOperationNotSupported, EF
     EFBMessageReactionNotPossible
 from ehforwarderbot.status import ReactToMessage
 from ehforwarderbot.types import ModuleID, InstanceID, MessageID, ReactionName, ChatID
+from .aggregation_settings import AggregationSettings
 from . import utils as etm_utils
 from .__version__ import __version__
 from .bot_manager import TelegramBotManager
@@ -131,6 +132,7 @@ class TelegramChannel(MasterChannel):
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
         self.bot_manager: TelegramBotManager = TelegramBotManager(self)
         self.commands: CommandsManager = CommandsManager(self)
+        self.aggregation_settings = AggregationSettings(self)
         self.chat_binding: ChatBindingManager = ChatBindingManager(self)
         self.slave_messages: SlaveMessageProcessor = SlaveMessageProcessor(self)
         self.topic_group: Optional[TelegramChatID] = TelegramChatID(self.flag('topic_group'))
@@ -595,6 +597,8 @@ class TelegramChannel(MasterChannel):
                      "    Restore cached titles and add available previous-message links to current forum topics.\n"
                      "/info\n"
                      "    Show information of the current Telegram chat.\n"
+                     "/aggregation [on|off|reset]\n"
+                     "    Show or set text aggregation for a linked source chat.\n"
                      "/react [emoji]\n"
                      "    React to a message with an emoji, or show a list of members reacted.\n"
                      "/update_info\n"

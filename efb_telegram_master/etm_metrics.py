@@ -50,6 +50,7 @@ _DATABASE_METHODS = frozenset({
     "delete_msg_log",
     "get_slave_chat_info",
     "set_slave_chat_info",
+    "set_text_aggregation_override",
     "delete_slave_chat_info",
     "get_recent_slave_chats",
     "get_last_message",

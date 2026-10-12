@@ -220,7 +220,9 @@ class SlaveMessageProcessor(LocaleMixin):
                 if self._aggregate_source_edit(aggregation, key, msg, msg_template, silent):
                     return msg
             if (isinstance(aggregation, LiveTextAggregation) and self.flag("text_aggregation")
-                    and self.flag.allows_text_aggregation(msg.chat, slave_origin_uid)
+                    and self.flag.allows_text_aggregation(
+                        msg.chat, slave_origin_uid,
+                        self.db.get_text_aggregation_override(msg.chat.module_id, msg.chat.uid))
                     and not msg.edit and msg.type == MsgType.Text and not msg.commands):
                 from .aggregate import make_source_member
                 source = ETMMsg.from_efbmsg(msg, self.chat_manager)
