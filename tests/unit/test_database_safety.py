@@ -702,6 +702,12 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
     ]
     with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
         legacy["tables"]["msglog"] = migrate_db._digest(migrate_db._source_rows(source, MsgLog, columns))
+        legacy["tables"]["slavechatinfo"] = migrate_db._digest(migrate_db._source_rows(
+            source, SlaveChatInfo, [
+                "id", "slave_channel_id", "slave_channel_emoji", "slave_chat_uid", "slave_chat_group_id",
+                "slave_chat_name", "slave_chat_alias", "slave_chat_type", "pickle",
+            ],
+        ))
         legacy["tables"].pop("historymigrationtarget")
         legacy["tables"]["historymigrationentry"] = migrate_db._digest(migrate_db._source_rows(
             source, HistoryMigrationEntry, migrate_db.V1_COLUMNS["historymigrationentry"],
@@ -710,6 +716,7 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
         source.execute("CREATE TABLE useremojicache (user_id TEXT, emoji TEXT)")
     with connection_scope(target):
         target.execute_sql("ALTER TABLE msglog DROP COLUMN master_message_thread_id")
+        target.execute_sql("ALTER TABLE slavechatinfo DROP COLUMN text_aggregation_enabled")
         target.execute_sql("ALTER TABLE historymigrationentry DROP COLUMN generation")
         target.execute_sql("DROP TABLE historymigrationtarget")
         target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s", (json.dumps(legacy),))
