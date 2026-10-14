@@ -143,7 +143,9 @@ class ExperimentalFlagsManager(LocaleMixin):
             raise ValueError(self._("{0} is not a valid experimental flag").format(flag_key))
         return self.config[flag_key]
 
-    def allows_text_aggregation(self, chat: BaseChat, origin: str) -> bool:
+    def allows_text_aggregation(self, chat: BaseChat, origin: str, override: Optional[bool] = None) -> bool:
+        if override is not None:
+            return override
         if isinstance(chat, PrivateChat):
             chat_type = "official_account" if (chat.vendor_specific or {}).get("is_mp") is True else "private"
         elif isinstance(chat, GroupChat):

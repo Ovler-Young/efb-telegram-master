@@ -7,6 +7,7 @@ import time
 import tempfile
 import uuid
 import copy
+import threading
 from contextlib import nullcontext, suppress
 from enum import Enum
 from functools import wraps
@@ -15,6 +16,7 @@ from typing import Callable, Collection, Dict, Iterable, List, Optional, Protoco
 from peewee import (
     AutoField,
     BlobField,
+    BooleanField,
     Case,
     CharField,
     CompositeKey,
@@ -341,6 +343,7 @@ class SlaveChatInfo(BaseModel):
     slave_chat_name = TextField()
     slave_chat_alias = TextField(null=True)
     slave_chat_type = CharField()
+    text_aggregation_enabled = BooleanField(null=True)
     pickle = BlobField(null=True)
 
 
@@ -361,6 +364,8 @@ class DatabaseManager:
 
     def __init__(self, channel: 'TelegramChannel'):
         self._metrics: Optional[DatabaseMetrics] = None
+        self._chat_settings_lock = threading.RLock()
+        self._text_aggregation_overrides: Dict[Tuple[str, str], bool] = {}
         base_path = utils.get_data_path(channel.channel_id)
         self._base_path = base_path
 
@@ -397,6 +402,14 @@ class DatabaseManager:
                         validate_runtime_cutover(base_path, actual_db)
                     self._create_missing_tables()
                     self._check_and_run_migrations()
+                self._text_aggregation_overrides = {
+                    (row.slave_channel_id, row.slave_chat_uid): bool(row.text_aggregation_enabled)
+                    for row in SlaveChatInfo.select(
+                        SlaveChatInfo.slave_channel_id, SlaveChatInfo.slave_chat_uid,
+                        SlaveChatInfo.text_aggregation_enabled
+                    ).where(SlaveChatInfo.slave_chat_group_id.is_null() &
+                            SlaveChatInfo.text_aggregation_enabled.is_null(False))
+                }
                 self._reclaim_inactive_history_at_startup()
                 self._observe_legacy_outbound_rows()
         except BaseException:
@@ -1142,46 +1155,73 @@ class DatabaseManager:
         Returns:
             SlaveChatInfo: The inserted or updated row
         """
-        slave_channel_id = chat_object.module_id
-        slave_channel_emoji = chat_object.channel_emoji
-        slave_chat_uid = chat_object.uid
-        slave_chat_name = chat_object.name
-        slave_chat_alias = chat_object.alias
-        slave_chat_type = chat_object.chat_type_name
-        parent_chat: Optional['ETMChatType'] = getattr(chat_object, 'chat', None)
-        slave_chat_group_id: Optional[ChatID]
-        if parent_chat:
-            slave_chat_group_id = parent_chat.uid
-        else:
-            slave_chat_group_id = None
+        with self._chat_settings_lock:
+            slave_channel_id = chat_object.module_id
+            slave_channel_emoji = chat_object.channel_emoji
+            slave_chat_uid = chat_object.uid
+            slave_chat_name = chat_object.name
+            slave_chat_alias = chat_object.alias
+            slave_chat_type = chat_object.chat_type_name
+            parent_chat: Optional['ETMChatType'] = getattr(chat_object, 'chat', None)
+            slave_chat_group_id: Optional[ChatID]
+            if parent_chat:
+                slave_chat_group_id = parent_chat.uid
+            else:
+                slave_chat_group_id = None
 
-        chat_info = self.get_slave_chat_info(slave_channel_id=slave_channel_id,
-                                             slave_chat_uid=slave_chat_uid,
-                                             slave_chat_group_id=slave_chat_group_id)
-        if chat_info is not None:
-            chat_info.slave_channel_emoji = slave_channel_emoji
-            chat_info.slave_chat_name = slave_chat_name
-            chat_info.slave_chat_alias = slave_chat_alias
-            chat_info.slave_chat_type = slave_chat_type
-            chat_info.pickle = chat_object.pickle
-            chat_info.save()
-            return chat_info
-        else:
-            return SlaveChatInfo.create(slave_channel_id=slave_channel_id,
-                                        slave_channel_emoji=slave_channel_emoji,
-                                        slave_chat_uid=slave_chat_uid,
-                                        slave_chat_group_id=slave_chat_group_id,
-                                        slave_chat_name=slave_chat_name,
-                                        slave_chat_alias=slave_chat_alias,
-                                        slave_chat_type=slave_chat_type,
-                                        pickle=chat_object.pickle)
+            chat_info = self.get_slave_chat_info(slave_channel_id=slave_channel_id,
+                                                 slave_chat_uid=slave_chat_uid,
+                                                 slave_chat_group_id=slave_chat_group_id)
+            if chat_info is not None:
+                chat_info.slave_channel_emoji = slave_channel_emoji
+                chat_info.slave_chat_name = slave_chat_name
+                chat_info.slave_chat_alias = slave_chat_alias
+                chat_info.slave_chat_type = slave_chat_type
+                chat_info.pickle = chat_object.pickle
+                chat_info.save(only=[SlaveChatInfo.slave_channel_emoji, SlaveChatInfo.slave_chat_name,
+                                     SlaveChatInfo.slave_chat_alias, SlaveChatInfo.slave_chat_type, SlaveChatInfo.pickle])
+                return chat_info
+            else:
+                return SlaveChatInfo.create(slave_channel_id=slave_channel_id,
+                                            slave_channel_emoji=slave_channel_emoji,
+                                            slave_chat_uid=slave_chat_uid,
+                                            slave_chat_group_id=slave_chat_group_id,
+                                            slave_chat_name=slave_chat_name,
+                                            slave_chat_alias=slave_chat_alias,
+                                            slave_chat_type=slave_chat_type,
+                                            pickle=chat_object.pickle)
 
     @observe_database_method("delete_slave_chat_info")
     def delete_slave_chat_info(self, slave_channel_id: ModuleID, slave_chat_uid: ChatID, slave_chat_group_id: Optional[ChatID] = None):
-        return SlaveChatInfo.delete() \
-            .where((SlaveChatInfo.slave_channel_id == slave_channel_id) &
-                   (SlaveChatInfo.slave_chat_uid == slave_chat_uid) &
-                   (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id)).execute()
+        with self._chat_settings_lock:
+            deleted = SlaveChatInfo.delete() \
+                .where((SlaveChatInfo.slave_channel_id == slave_channel_id) &
+                       (SlaveChatInfo.slave_chat_uid == slave_chat_uid) &
+                       (SlaveChatInfo.slave_chat_group_id == slave_chat_group_id)).execute()
+            if slave_chat_group_id is None:
+                self._text_aggregation_overrides.pop((slave_channel_id, slave_chat_uid), None)
+            return deleted
+
+    def get_text_aggregation_override(self, channel_id: ModuleID, chat_id: ChatID) -> Optional[bool]:
+        """Read the startup-loaded chat preference without a database query."""
+        return self._text_aggregation_overrides.get((channel_id, chat_id))
+
+    @observe_database_method("set_text_aggregation_override")
+    def set_text_aggregation_override(self, chat: 'ETMChatType', enabled: Optional[bool]) -> None:
+        """Persist a top-level chat preference before publishing it to message workers."""
+        with self._chat_settings_lock:
+            if self.get_slave_chat_info(chat.module_id, chat.uid) is None:
+                self.set_slave_chat_info(chat)
+            SlaveChatInfo.update(text_aggregation_enabled=enabled).where(
+                (SlaveChatInfo.slave_channel_id == chat.module_id) &
+                (SlaveChatInfo.slave_chat_uid == chat.uid) &
+                SlaveChatInfo.slave_chat_group_id.is_null()
+            ).execute()
+            key = (chat.module_id, chat.uid)
+            if enabled is None:
+                self._text_aggregation_overrides.pop(key, None)
+            else:
+                self._text_aggregation_overrides[key] = enabled
 
     @observe_database_method("get_recent_slave_chats")
     def get_recent_slave_chats(self, master_chat_id: TelegramChatID, limit=5) -> List[EFBChannelChatIDStr]:

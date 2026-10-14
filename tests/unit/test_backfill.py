@@ -1,6 +1,6 @@
 import threading
 from concurrent.futures import Future
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -362,7 +362,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
     manager.db = Mock()
     manager.chat_manager = Mock()
     manager.logger = Mock()
-    base_time = datetime.now()
+    base_time = datetime(2026, 10, 9, 11, 33, 31, tzinfo=timezone.utc)
     text_log = Mock()
     text_log.master_msg_id = "10.20"
     text_log.text = "hello"
@@ -391,7 +391,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
     assert queued_count == 2
     assert len(entries) == 2
     assert entries[0]["source_master_msg_id"] == "10.20"
-    assert entries[0]["formatted_text"] == f"*author* `{base_time.strftime('%Y-%m-%d %H:%M')}`\nhello\n\n"
+    assert entries[0]["formatted_text"] == "*author* `07:33:31`\nhello\n\n"
     assert entries[1]["source_master_msg_id"] == "10.21"
     assert entries[1]["formatted_text"] is None
 

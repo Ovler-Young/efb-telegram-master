@@ -539,3 +539,32 @@ def test_combination_rules_route_platform_and_type_independently(runtime, rules,
     assert {member["source_id"] for row in rows if row.aggregate
             for member in row.aggregate["children"]} == expected
     assert {row.slave_message_id for row in rows if not row.aggregate} == {case[0] for case in cases} - expected
+
+
+def test_chat_override_precedence_and_master_switch(runtime):
+    from efb_telegram_master.chat import convert_chat
+
+    manager = runtime
+    handler = processor(manager)
+    flags = manager.channel.flag.config
+    flags.update(text_aggregation=True, text_aggregation_rules=[])
+    chat = convert_chat(manager.channel.db, source().chat)
+    for uid, override, global_enabled in (
+        ('inherited-exclusion', None, True),
+        ('explicit-on', True, True),
+        ('explicit-off', False, True),
+        ('reset', None, True),
+        ('global-disabled', True, False),
+    ):
+        flags['text_aggregation'] = global_enabled
+        manager.channel.db.set_text_aggregation_override(chat, override)
+        message = source(uid)
+        message.chat.members.append(message.author)
+        handler.send_message(message)
+        complete(manager)
+    rows = list(MsgLog.select())
+    assert {member['source_id'] for row in rows if row.aggregate
+            for member in row.aggregate['children']} == {'explicit-on'}
+    assert {row.slave_message_id for row in rows if not row.aggregate} == {
+        'inherited-exclusion', 'explicit-off', 'reset', 'global-disabled',
+    }
