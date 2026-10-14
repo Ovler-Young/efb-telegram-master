@@ -38,7 +38,7 @@ def _bind_blocking_enqueue_helper(manager):
                                             db_log_context=None):
             queued_args = args[1:] if args and args[0] is manager else args
             result = manager.execute_queued_call(
-                SimpleNamespace(operation=fn.__name__, slave_id=slave_id),
+                SimpleNamespace(operation=fn.__name__, slave_id=slave_id, log_context=None),
                 queued_args,
                 kwargs,
                 SenderSelection(sender=manager._bot, sender_bot_id=None),
@@ -46,7 +46,7 @@ def _bind_blocking_enqueue_helper(manager):
             if isinstance(result, QueuedDeliveryResult):
                 supplement = result.supplement
                 manager.execute_queued_call(
-                    SimpleNamespace(operation=supplement.operation, slave_id=slave_id),
+                    SimpleNamespace(operation=supplement.operation, slave_id=slave_id, log_context=None),
                     supplement.args, supplement.kwargs,
                     SenderSelection(sender=manager._bot, sender_bot_id=None),
                 )
@@ -304,7 +304,7 @@ def test_prechange_version_one_payloads_decode_and_execute_without_reencoding(
     sender = Mock()
 
     manager.execute_queued_call(
-        SimpleNamespace(operation=operation), args, kwargs,
+        SimpleNamespace(operation=operation, log_context=None), args, kwargs,
         SenderSelection(sender=sender, sender_bot_id=None),
     )
 
@@ -447,7 +447,7 @@ def test_queued_routes_apply_affixes_without_passing_manager_kwargs_to_sender(
 
     sender = Mock()
     selection = SimpleNamespace(sender=sender)
-    manager.execute_queued_call(SimpleNamespace(operation=operation), queued_args, queued_kwargs, selection)
+    manager.execute_queued_call(SimpleNamespace(operation=operation, log_context=None), queued_args, queued_kwargs, selection)
 
     sender_call = getattr(sender, operation).call_args
     if content_key in sender_call.kwargs:
@@ -504,7 +504,7 @@ def test_queued_execution_sends_full_oversized_content_as_attachment_for_positio
     sender.send_photo.return_value = SimpleNamespace(message_id=7)
 
     result = manager.execute_queued_call(
-        SimpleNamespace(operation=operation, slave_id="slave.chat"),
+        SimpleNamespace(operation=operation, slave_id="slave.chat", log_context=None),
         queued_args,
         queued_kwargs,
         SenderSelection(sender=sender, sender_bot_id=None),
@@ -548,7 +548,7 @@ def test_queued_execution_retries_entity_parse_failure_once_without_parse_mode(
     ]
 
     result = manager.execute_queued_call(
-        SimpleNamespace(operation=operation),
+        SimpleNamespace(operation=operation, log_context=None),
         args,
         {
             **kwargs,
@@ -614,7 +614,7 @@ def test_queued_edits_apply_affixes_for_positional_and_keyword_content(
         )
         queued_args, queued_kwargs = _blocking_queued_payload(manager)
         manager.execute_queued_call(
-            SimpleNamespace(operation=operation),
+            SimpleNamespace(operation=operation, log_context=None),
             queued_args,
             queued_kwargs,
             SimpleNamespace(sender=sender),
@@ -671,7 +671,7 @@ def test_queued_edit_overflow_attaches_the_actual_prepared_content(
     getattr(sender, operation).return_value = SimpleNamespace(message_id=789)
 
     result = manager.execute_queued_call(
-        SimpleNamespace(operation=operation, slave_id=None),
+        SimpleNamespace(operation=operation, slave_id=None, log_context=None),
         queued_args,
         queued_kwargs,
         SenderSelection(sender=sender, sender_bot_id=None),
@@ -722,7 +722,7 @@ def test_queued_edits_retry_malformed_entities_once_without_parse_mode(
     ]
 
     manager.execute_queued_call(
-        SimpleNamespace(operation=operation),
+        SimpleNamespace(operation=operation, log_context=None),
         queued_args,
         queued_kwargs,
         SimpleNamespace(sender=sender),
@@ -1140,7 +1140,7 @@ def test_queued_positional_media_edit_retries_chat_migration_with_new_chat_id():
     )
 
     result = manager.execute_queued_call(
-        SimpleNamespace(operation="edit_message_media"),
+        SimpleNamespace(operation="edit_message_media", log_context=None),
         (media, old_chat_id, 789, "inline-id"),
         {"reply_markup": "keyboard"},
         SenderSelection(sender=sender, sender_bot_id=None),

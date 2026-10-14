@@ -32,7 +32,9 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    environment: ${{ github.event_name == 'pull_request_target' && 'telegram-integration' || 'ci' }}
+    environment:
+      name: ${{ github.event_name == 'pull_request_target' && 'telegram-integration' || 'ci' }}
+      deployment: false
     strategy:
       fail-fast: true
       max-parallel: 1
