@@ -34,7 +34,7 @@ def format_message_time(value: datetime.datetime, display_timezone: ZoneInfo = D
     """Display saved timestamps, interpreting naive values in the host local zone."""
     if value.tzinfo is None or value.utcoffset() is None:
         value = value.astimezone()
-    return value.astimezone(display_timezone).strftime("%I:%M:%S")
+    return value.astimezone(display_timezone).strftime("%H:%M:%S")
 
 
 TelegramChatID = NewType('TelegramChatID', int)

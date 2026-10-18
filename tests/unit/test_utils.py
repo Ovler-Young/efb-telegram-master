@@ -25,7 +25,7 @@ def test_message_timezone_configuration_and_saved_timestamp_display(monkeypatch)
     configured = ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"timezone": "America/Los_Angeles"}}))
     assert default("timezone") == "Asia/Shanghai"
     aware = datetime.datetime(2026, 10, 8, 14, 39, 38, tzinfo=datetime.timezone.utc)
-    assert format_message_time(aware, default.timezone) == "10:39:38"
+    assert format_message_time(aware, default.timezone) == "22:39:38"
     assert format_message_time(aware, configured.timezone) == "07:39:38"
     assert format_message_time(aware - datetime.timedelta(hours=12), default.timezone) == "10:39:38"
     with raises(ValueError, match="flags.timezone.*IANA"):

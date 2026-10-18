@@ -391,7 +391,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
     assert queued_count == 2
     assert len(entries) == 2
     assert entries[0]["source_master_msg_id"] == "10.20"
-    assert entries[0]["formatted_text"] == "*author* `07:33:31`\nhello\n\n"
+    assert entries[0]["formatted_text"] == "*author* `19:33:31`\nhello\n\n"
     assert entries[1]["source_master_msg_id"] == "10.21"
     assert entries[1]["formatted_text"] is None
 

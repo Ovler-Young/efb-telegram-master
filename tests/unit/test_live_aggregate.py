@@ -211,6 +211,6 @@ def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones
     rendered = render_members(removed)
     assert 0 < len(rendered.text) <= 4096
     assert len(rendered.ranges) == 200
-    assert rendered.text.count("08:34:56") == 200
+    assert rendered.text.count("20:34:56") == 200
     assert aggregate_fits(removed)
     assert render_members(removed, history=True).text.count("saved") == 200
