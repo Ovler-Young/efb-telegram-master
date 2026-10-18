@@ -32,7 +32,9 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    environment: ${{ github.event_name == 'pull_request_target' && 'telegram-integration' || 'ci' }}
+    environment:
+      name: ${{ github.event_name == 'pull_request_target' && 'telegram-integration' || 'ci' }}
+      deployment: false
     strategy:
       fail-fast: true
       max-parallel: 1
@@ -172,6 +174,11 @@ jobs:
     permissions:
       contents: read
     environment: telegram-integration
+    # Telethon invalidates a session when it is used from two IP addresses at
+    # once. Serialize every live integration job across all pull requests.
+    concurrency:
+      group: telegram-live-integration
+      cancel-in-progress: false
     services:
       postgres:
         image: postgres:16

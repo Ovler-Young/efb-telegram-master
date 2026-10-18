@@ -16,6 +16,7 @@ from PIL import Image
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
+from telegram.helpers import escape_markdown
 from telegram.ext import ConversationHandler, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler
 from telegram.ext._utils.types import ConversationDict
 
@@ -25,6 +26,8 @@ from ehforwarderbot.chat import SystemChatMember
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBOperationNotSupported
 from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
+from .aggregate import render_members
+from .utils import DEFAULT_TIMEZONE, format_message_time
 from .chat import ETMChatType, ETMGroupChat, unpickle
 from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
@@ -100,9 +103,11 @@ class ChatBindingManager(LocaleMixin):
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
     FORUM_RELINK_THRESHOLD = 960_000
+    display_timezone = DEFAULT_TIMEZONE
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
+        self.display_timezone = channel.flag.timezone
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
@@ -259,10 +264,17 @@ class ChatBindingManager(LocaleMixin):
                 master_msg_id=utils.message_id_to_str(
                     chat_id=TelegramChatID(rtm.chat_id),
                     message_id=TelegramMessageID(rtm.message_id)
-                )
+                ), include_managed_alt=True
             )
             if msg_log:
-                channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(msg_log.slave_origin_uid))
+                if msg_log.aggregate:
+                    origins = {child['origin_uid'] for child in msg_log.aggregate['children']}
+                    if len(origins) != 1:
+                        return self.bot.reply_error(update, self._('Cannot determine the source chat of this container.'))
+                    origin_uid = origins.pop()
+                else:
+                    origin_uid = msg_log.slave_origin_uid
+                channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(origin_uid))
                 chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(
@@ -1190,12 +1202,12 @@ class ChatBindingManager(LocaleMixin):
             return
         # chat_list: Optional[ChatListStorage] = self.msg_storage.get(storage_id, None)
         self.msg_storage[storage_id].set_chat_suggestion(update)
+        self._set_conversation_state(self.suggestion_handler, storage_id, Flags.SUGGEST_RECIPIENTS)
         self.bot.edit_message_text(text=self._("Error: No recipient specified.\n"
                                                "Please reply to a previous message, "
                                                "or choose a recipient:\n\nLegend:\n") + "\n".join(legends),
                                    chat_id=chat_id, message_id=message_id,
                                    reply_markup=InlineKeyboardMarkup(buttons))
-        self._set_conversation_state(self.suggestion_handler, storage_id, Flags.SUGGEST_RECIPIENTS)
 
     def suggested_recipient(self, update: Update, context: CallbackContext):
         """Send the message to selected recipient among all suggested when a
@@ -1751,24 +1763,45 @@ class ChatBindingManager(LocaleMixin):
             while True:
                 page = self.db.get_recent_messages(slave_chat_id, limit=32, after=after)
                 for msg_log in page:
-                    message_text = msg_log.text or ""
-                    formatted_text = None
-                    if message_text.strip() and not (msg_log.media_type and msg_log.media_type != 'Text'):
-                        etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
-                        timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
-                        author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
-                        formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
-                    yield {
-                        "slave_chat_id": str(slave_chat_id),
-                        "target_chat_id": str(tg_chat_id),
-                        "message_thread_id": str(thread_id) if thread_id is not None else None,
-                        "source_master_msg_id": msg_log.master_msg_id,
-                        "formatted_text": formatted_text,
-                        "media_type": msg_log.media_type,
-                        "source_time": msg_log.time,
-                        "position": position,
-                    }
-                    position += 1
+                    aggregate = msg_log.aggregate
+                    members = aggregate["children"] if aggregate is not None else [msg_log.source_member]
+                    for member in members:
+                        if member is not None and member["status"] == "redirected":
+                            continue
+                        source_time = member["source_time"] if member is not None else msg_log.time
+                        received_time = member["received_time"] if member is not None else None
+                        media_type = 'Text' if aggregate is not None else msg_log.media_type
+                        formatted_text = None
+                        if member is not None and not (media_type and media_type != 'Text'):
+                            # History has its own author/timestamp header. Render
+                            # only the saved body/reply here, never the live hint
+                            # or destination display prefix.
+                            message_text = render_members(
+                                [dict(member, display_prefix="")], history=True,
+                            ).text
+                            author_name = escape_markdown(member["author_name"] or "Unknown")
+                            message_text = escape_markdown(message_text)
+                        else:
+                            message_text = msg_log.text or ""
+                            if message_text.strip() and not (media_type and media_type != 'Text'):
+                                etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
+                                author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
+                        if (member is not None or message_text.strip()) and not (media_type and media_type != 'Text'):
+                            display_time = source_time or received_time
+                            timestamp = format_message_time(display_time, self.display_timezone) if display_time else "Unknown"
+                            formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
+                        yield {
+                            "slave_chat_id": str(slave_chat_id),
+                            "target_chat_id": str(tg_chat_id),
+                            "message_thread_id": str(thread_id) if thread_id is not None else None,
+                            "source_master_msg_id": msg_log.master_msg_id,
+                            "formatted_text": formatted_text,
+                            "media_type": media_type,
+                            "source_time": source_time,
+                            "received_time": received_time,
+                            "position": position,
+                        }
+                        position += 1
                 if len(page) < 32:
                     return
                 after = page[-1].time, page[-1].master_msg_id

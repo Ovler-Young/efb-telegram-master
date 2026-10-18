@@ -24,6 +24,7 @@ from . import utils
 from .chat_destination_cache import ChatDestinationCache
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
+from .member_selection import SourceMemberSelector, SourceIdentity
 from .msg_type import TGMsgType, get_msg_type
 from .ptb_compat import Filters, sync_reply_text
 from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
@@ -71,6 +72,7 @@ class MasterMessageProcessor(LocaleMixin):
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
 
+        self.members = SourceMemberSelector(self)
         self.bot.dispatcher.add_handler(CommandHandler("rm", self.bot.as_async_callback(self.delete_message)))
 
         message_update_filter = (
@@ -202,8 +204,8 @@ class MasterMessageProcessor(LocaleMixin):
 
         if update.edited_message or update.edited_channel_post:
             self.logger.debug('[%s] Message is edited: %s', mid, message.edit_date)
-            msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update))
-            if not msg_log or msg_log.slave_message_id == self.db.FAIL_FLAG:
+            msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update), include_managed_alt=True)
+            if not msg_log or msg_log.aggregate or msg_log.slave_message_id == self.db.FAIL_FLAG:
                 sync_reply_text(self.bot, message,
                                 self._("Error: This message cannot be edited, and thus is not sent. (ME01)"),
                                 quote=True)
@@ -274,10 +276,19 @@ class MasterMessageProcessor(LocaleMixin):
                     master_msg_id=utils.message_id_to_str(
                         TelegramChatID(reply_to.chat.id),
                         TelegramMessageID(reply_to.message_id)
-                    )
+                    ), include_managed_alt=True
                 )
                 if dest_msg:
-                    destination = EFBChannelChatIDStr(dest_msg.slave_origin_uid)
+                    if dest_msg.aggregate:
+                        origins = {child["origin_uid"] for child in dest_msg.aggregate["children"]}
+                        if len(origins) != 1:
+                            return self.bot.reply_error(update, self._("Cannot determine the source chat of this container."))
+                        destination = EFBChannelChatIDStr(origins.pop())
+                        quote = True
+                    else:
+                        destination = EFBChannelChatIDStr(dest_msg.slave_origin_uid)
+                        if dest_msg.source_member:
+                            quote = True
                     self.chat_dest_cache.set(str(message.chat.id), destination)
                     self.logger.debug("[%s] Quoted message is found in database with destination: %s", mid, destination)
             elif cached_dest:
@@ -313,7 +324,8 @@ class MasterMessageProcessor(LocaleMixin):
 
     def process_telegram_message(self, update: Update, context: CallbackContext,
                                  destination: EFBChannelChatIDStr, quote: bool = False,
-                                 edited: Optional["MsgLog"] = None):
+                                 edited: Optional["MsgLog"] = None,
+                                 selected_identity: Optional[SourceIdentity] = None):
         """
         Process messages came from Telegram.
 
@@ -331,6 +343,19 @@ class MasterMessageProcessor(LocaleMixin):
         message_id = utils.message_id_to_str(update=update)
 
         message: Message = update.effective_message
+
+        selected_target = None
+        if quote and message.reply_to_message:
+            target_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(
+                TelegramChatID(message.reply_to_message.chat_id),
+                TelegramMessageID(message.reply_to_message.message_id)), include_managed_alt=True)
+            if target_log and (target_log.aggregate or target_log.source_member):
+                selected_target = self.members.select(update, context, target_log, destination, 'reply', selected_identity)
+                if selected_target is None:
+                    return
+            elif selected_identity is not None:
+                return self.bot.reply_error(update, self._(
+                    'This selection has expired. Please retry the reply or /rm.'))
 
         channel, uid, gid = utils.chat_id_str_to_id(destination)
         if channel not in coordinator.slaves:
@@ -361,7 +386,9 @@ class MasterMessageProcessor(LocaleMixin):
 
             m.deliver_to = coordinator.slaves[channel]
 
-            if quote:
+            if selected_target is not None:
+                m.target = selected_target
+            elif quote:
                 self.attach_target_message(message, m, channel)
             # Type specific stuff
             self.logger.debug("[%s] Message type from Telegram: %s", message_id, mtype)
@@ -528,7 +555,7 @@ class MasterMessageProcessor(LocaleMixin):
 
         target_log = self.db.get_msg_log(
             master_msg_id=utils.message_id_to_str(
-                TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)))
+                TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)), include_managed_alt=True)
         if not target_log or not target_log.slave_origin_uid:
             self.logger.error("[%s] Quoted message not found in database, give up quoting.",
                               tg_msg.message_id)
@@ -538,7 +565,16 @@ class MasterMessageProcessor(LocaleMixin):
             self.logger.error("[%s] Quoted message is sent to channel %s, but this message is sent to %s, give up quoting.",
                               tg_msg.message_id, target_channel, channel)
             return etm_msg
-        target_msg: ETMMsg = target_log.build_etm_msg(self.chat_manager, recur=False)
+        if target_log.aggregate:
+            # Aggregate targets are selected before processing the Telegram body.
+            return etm_msg
+        if target_log.source_member:
+            member = target_log.source_member
+            target_msg = self.members.resolve(target_log, (member['origin_uid'], member['source_id']))
+            if target_msg is None:
+                return etm_msg
+        else:
+            target_msg = target_log.build_etm_msg(self.chat_manager, recur=False)
         target_msg.target = None
         etm_msg.target = target_msg
 
@@ -601,7 +637,8 @@ class MasterMessageProcessor(LocaleMixin):
                     "Attachment is too large ({size}). Maximum allowed by Telegram Bot API is {max_size}. (AT01)").format(
                     size=size_str, max_size=max_size_str))
 
-    def delete_message(self, update: Update, context: CallbackContext):
+    def delete_message(self, update: Update, context: CallbackContext,
+                       selected_identity: Optional[SourceIdentity] = None):
         """Remove an arbitrary message from its remote chat.
         Triggered by command ``/rm``.
         """
@@ -617,13 +654,31 @@ class MasterMessageProcessor(LocaleMixin):
         msg_log = self.db.get_msg_log(
             master_msg_id=utils.message_id_to_str(
                 chat_id=TelegramChatID(reply.chat_id),
-                message_id=TelegramMessageID(reply.message_id)))
+                message_id=TelegramMessageID(reply.message_id)), include_managed_alt=True)
         if not msg_log or msg_log.slave_member_uid == self.db.FAIL_FLAG:
             return self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."
             ))
+        aggregate = msg_log.aggregate
         try:
-            etm_msg: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
+            if aggregate:
+                origins = {child['origin_uid'] for child in aggregate['children']}
+                if len(origins) != 1:
+                    return self.bot.reply_error(update, self._('Cannot determine the source chat of this container.'))
+                etm_msg = self.members.select(update, context, msg_log, origins.pop(), 'rm', selected_identity)
+                if etm_msg is None:
+                    return
+            elif selected_identity is not None:
+                return self.bot.reply_error(update, self._(
+                    'This selection has expired. Please retry the reply or /rm.'))
+            elif msg_log.source_member:
+                source_member = msg_log.source_member
+                etm_msg = self.members.resolve(msg_log, (source_member['origin_uid'], source_member['source_id']))
+                if etm_msg is None:
+                    return self.bot.reply_error(update, self._(
+                        'This source message is no longer available here. Please retry the reply or /rm.'))
+            else:
+                etm_msg = msg_log.build_etm_msg(self.chat_manager)
         except UnpicklingError:
             return self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."
@@ -648,6 +703,11 @@ class MasterMessageProcessor(LocaleMixin):
             return sync_reply_text(self.bot, reply, self._(
                 "Failed to remove this message from remote chat.\n\n{error!r}"
             ).format(error=e))
+        if aggregate or msg_log.source_member:
+            origin = str(utils.chat_id_to_str(chat=etm_msg.chat))
+            key = (origin, reply.chat_id, msg_log.master_message_thread_id)
+            self.bot.live_aggregation.remove_source_member(key, (origin, str(etm_msg.uid)))
+            return sync_reply_text(self.bot, message, self._("Message is removed in remote chat."))
         if not self.channel.flag('prevent_message_removal'):
             try:
                 self.bot.delete_message(

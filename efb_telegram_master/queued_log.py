@@ -91,3 +91,22 @@ def decode(payload: bytes):
         gc.collect()
         return compact
     return value
+
+
+AGGREGATION_VERSION = b"\x03"
+
+
+def encode_aggregation(context: dict) -> bytes:
+    """Persist a logical batch or frozen aggregate request explicitly."""
+    return AGGREGATION_VERSION + pickle.dumps(context, protocol=5)
+
+
+def decode_aggregation(payload: bytes):
+    if not payload or payload[:1] != AGGREGATION_VERSION:
+        return None
+    with io.BytesIO(payload) as stream:
+        stream.seek(1)
+        value = LogUnpickler(stream).load()
+    if not isinstance(value, dict) or value.get("format_version") != 1:
+        raise ValueError("Unsupported queued aggregation context.")
+    return value

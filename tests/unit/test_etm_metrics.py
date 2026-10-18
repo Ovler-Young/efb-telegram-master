@@ -231,6 +231,12 @@ def test_metrics_server_serves_http_and_thread_stops_after_shutdown():
         lambda metrics: metrics.record_queue_wait("normal", "send_message", -0.1),
         lambda metrics: metrics.record_retry("normal", "send_message", "unbounded"),
         lambda metrics: metrics.record_failure("normal", "send_message", "retry"),
+        lambda metrics: metrics.record_aggregation_rpc("get_me", "aggregate", "main"),
+        lambda metrics: metrics.record_aggregation_rpc("send_message", "chat-42", "main"),
+        lambda metrics: metrics.record_aggregation_rpc("send_message", "source", "bot-42"),
+        lambda metrics: metrics.record_aggregation_batch(-1),
+        lambda metrics: metrics.record_aggregation_confirmation(float("nan")),
+        lambda metrics: metrics.record_aggregation_payload(-1),
     ],
 )
 def test_queue_metrics_reject_unbounded_or_invalid_values(call):
