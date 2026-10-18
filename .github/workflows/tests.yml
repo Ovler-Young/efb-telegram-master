@@ -174,6 +174,11 @@ jobs:
     permissions:
       contents: read
     environment: telegram-integration
+    # Telethon invalidates a session when it is used from two IP addresses at
+    # once. Serialize every live integration job across all pull requests.
+    concurrency:
+      group: telegram-live-integration
+      cancel-in-progress: false
     services:
       postgres:
         image: postgres:16
