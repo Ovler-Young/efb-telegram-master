@@ -86,12 +86,27 @@ original bot. Edit/delete routing continues to use the actual author.
 results. A healthy worker can coexist with held records; queue depth alone does
 not mean that those records are awaiting a safe automatic retry.
 
-A dispatch pass that leaves runnable rows with no retry deadline and nothing in
-flight logs `Outbound scheduler left N runnable row head(s) undispatched` and
-rescans 30 seconds later instead of sleeping until the next message or restart.
-Worker permits held without a submitted call cannot be released by a completion,
-so they are reset and reported the same way. Both messages mean delivery is
-still being attempted, not that rows were dropped.
+A dispatch pass that leaves queued rows with no retry deadline and nothing in
+flight logs `Outbound scheduler left N dispatchable head(s) undispatched ... while
+queued rows remain` and rescans 30 seconds later instead of sleeping until the
+next message or restart. That covers a row waiting behind another row and a row
+whose readiness filter excludes it from every head. Worker permits held without
+a submitted call cannot be released by a completion, so they are reset and
+reported the same way. All of these mean delivery is still being attempted, not
+that rows were dropped.
+
+A dependent row is deferred only while the row it links to still exists. Links
+to a predecessor that was already discarded, held or deleted are ignored, so an
+unlinked dependency cannot strand a queue permanently. A surviving predecessor,
+including a held one, still defers its dependents until an operator resolves it:
+
+```sql
+SELECT q.id, q.predecessor_id, p.id IS NOT NULL AS predecessor_exists
+FROM outbound_queue q LEFT JOIN outbound_queue p ON p.id = q.predecessor_id
+WHERE q.delivery_state = 'queued' AND q.delivery_hold IS NULL
+  AND NOT EXISTS (SELECT 1 FROM outbound_queue p2 WHERE p2.id = q.predecessor_id)
+LIMIT 20;
+```
 
 ```sql
 SELECT id, operation, telegram_chat_id, delivery_state, delivery_hold,

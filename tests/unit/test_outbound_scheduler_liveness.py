@@ -78,3 +78,54 @@ def test_stall_recovery_keeps_every_retained_row(tmp_path, pending_chats):
         assert scheduler.next_deadline is not None
     finally:
         queue.close()
+
+
+def test_link_to_a_predecessor_that_no_longer_exists_does_not_block(tmp_path):
+    """A discarded or failed predecessor must not strand its dependent forever."""
+    queue, scheduler = _scheduler(tmp_path, Adapter())
+    row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "kept"}))
+    with queue.connection:
+        queue.connection.execute(
+            "UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (row_id + 900, row_id)
+        )
+    try:
+        assert [row.id for row in queue.heads(ready_only=True)] == [row_id]
+        scheduler.dispatch_once()
+        assert len(scheduler.in_flight) == 1
+    finally:
+        queue.close()
+
+
+def test_surviving_predecessor_keeps_deferring_its_dependent(tmp_path):
+    """A row that still exists keeps ordering: the dependent waits for it."""
+    queue, scheduler = _scheduler(tmp_path, Adapter())
+    parent, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "parent"}))
+    child, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "child"}))
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (parent, child))
+    try:
+        assert [row.id for row in queue.heads(ready_only=True)] == [parent]
+        queue.hold_uncertain_delivery(parent, RuntimeError("unconfirmed"))
+        assert queue.heads(ready_only=True) == []
+        assert queue.has_waiting_rows()
+    finally:
+        queue.close()
+
+
+def test_rows_that_no_head_can_cover_are_reported(tmp_path, caplog):
+    """Every waiting row blocked by a later row is a stall, not an idle queue."""
+    queue, scheduler = _scheduler(tmp_path, Adapter())
+    first, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "first"}))
+    second, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "second"}))
+    queue.hold_uncertain_delivery(second, RuntimeError("unconfirmed"))
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (second, first))
+    try:
+        with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
+            scheduler.dispatch_once()
+        assert queue.heads(ready_only=True) == []
+        assert scheduler.in_flight == {}
+        assert scheduler.next_deadline is not None
+        assert "dispatchable head(s)" in caplog.records[-1].message
+    finally:
+        queue.close()

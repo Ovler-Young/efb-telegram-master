@@ -1721,7 +1721,19 @@ class OutboundQueue:
         context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
         receipt = "q.completion_receipt" if include_payload else "NULL"
         excluded = tuple(excluded_ids)
-        exclusion_sql = " AND delivery_hold IS NULL AND predecessor_id IS NULL" if ready_only else ""
+        exclusion_sql = ""
+        if ready_only:
+            exclusion_sql = (
+                " AND delivery_hold IS NULL"
+                # A link to a row that no longer exists must not block its dependent
+                # forever: only a surviving predecessor defers delivery. This keeps
+                # the existing ordering contract and releases rows stranded by a
+                # predecessor that was held, discarded or deleted without unlinking.
+                " AND (predecessor_id IS NULL OR NOT EXISTS ("
+                "SELECT 1 FROM outbound_queue AS predecessor "
+                "WHERE predecessor.id = outbound_queue.predecessor_id "
+                "AND predecessor.id != outbound_queue.id))"
+            )
         parameters: tuple[object, ...] = ()
         if excluded:
             exclusion_sql += " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
@@ -1743,6 +1755,14 @@ class OutboundQueue:
                 parameters,
             ).fetchall()
         return [QueuedCall(*row) for row in rows]
+
+    def has_waiting_rows(self) -> bool:
+        """Whether any row is still waiting for delivery, dispatchable or not."""
+        with self._lock:
+            return self.connection.execute(
+                "SELECT 1 FROM outbound_queue "
+                "WHERE delivery_state = 'queued' AND delivery_hold IS NULL LIMIT 1"
+            ).fetchone() is not None
 
     def load_queued(self, row_id: int) -> QueuedCall:
         """Load upload bytes only once a worker and sender can accept this row."""
@@ -3029,16 +3049,18 @@ class OutboundQueueScheduler:
                         row.priority, row.operation, sender_kind
                     )
                 )
-            if heads and self.next_deadline is None and not self.in_flight:
-                # Nothing was dispatched and nothing is in flight, so no completion
-                # will wake this worker: without a deadline these rows would stay
-                # queued until the next message or restart.
-                logging.getLogger(__name__).error(
-                    "Outbound scheduler left %d runnable row head(s) undispatched with no "
-                    "retry deadline and nothing in flight; rescanning in %.0f seconds.",
-                    len(heads), self.STALL_RESCAN_SECONDS,
-                )
-                self._schedule_retry(time.monotonic() + self.STALL_RESCAN_SECONDS)
+            if heads or self.queue.has_waiting_rows():
+                if self.next_deadline is None and not self.in_flight:
+                    # Nothing was dispatched and nothing is in flight, so no
+                    # completion will wake this worker: without a deadline these
+                    # rows would stay queued until the next message or restart.
+                    logging.getLogger(__name__).error(
+                        "Outbound scheduler left %d dispatchable head(s) undispatched with no "
+                        "retry deadline and nothing in flight while queued rows remain; "
+                        "rescanning in %.0f seconds.",
+                        len(heads), self.STALL_RESCAN_SECONDS,
+                    )
+                    self._schedule_retry(time.monotonic() + self.STALL_RESCAN_SECONDS)
 
     def harvest_completed(self) -> None:
         with self._lock:
