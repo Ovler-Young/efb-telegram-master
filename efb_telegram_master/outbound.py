@@ -2469,10 +2469,15 @@ class OutboundQueue:
 class OutboundQueueScheduler:
     """Schedule one in-flight call per chat and retain eventual rows through retries."""
 
+    # A pass that leaves runnable rows behind without a retry deadline reschedules
+    # itself instead of waiting for an event that may never arrive.
+    STALL_RESCAN_SECONDS = 30.0
+
     def __init__(self, queue: OutboundQueue, adapter: QueueAdapter, executor: Executor, worker_count: int):
         self.queue = queue
         self.adapter = adapter
         self.executor = executor
+        self._worker_count = worker_count
         self._permits = threading.BoundedSemaphore(worker_count)
         self._lock = threading.RLock()
         self.wake_event = threading.Event()
@@ -2792,8 +2797,17 @@ class OutboundQueueScheduler:
                 return
             self._dispatch_blocking_media_retries()
             if not self._permits.acquire(blocking=False):
-                return  # A future completion will wake us; do not scan the backlog.
-            self._permits.release()
+                if self.in_flight:
+                    return  # A future completion will wake us; do not scan the backlog.
+                # Nothing is in flight, so no completion can release these permits.
+                # Waiting for one would stop delivery until the next restart.
+                logging.getLogger(__name__).error(
+                    "Outbound worker permits were held without a submitted call; "
+                    "resetting them. Queued rows are retained."
+                )
+                self._permits = threading.BoundedSemaphore(self._worker_count)
+            else:
+                self._permits.release()
             retry_destinations = {
                 retry.row.telegram_chat_id for retry in self.blocking_media_retries.values()
             }
@@ -2811,9 +2825,10 @@ class OutboundQueueScheduler:
                         self.quarantined_rows.pop(row_id, None)
                     continue
                 self.quarantined_rows.pop(row_id, None)
-            for row in self.queue.heads(
+            heads = self.queue.heads(
                 include_payload=False, excluded_ids=self.quarantined_rows, ready_only=True
-            ):
+            )
+            for row in heads:
                 if (
                     row.id in self.in_flight
                     or row.telegram_chat_id in self.in_flight_destinations
@@ -3014,6 +3029,16 @@ class OutboundQueueScheduler:
                         row.priority, row.operation, sender_kind
                     )
                 )
+            if heads and self.next_deadline is None and not self.in_flight:
+                # Nothing was dispatched and nothing is in flight, so no completion
+                # will wake this worker: without a deadline these rows would stay
+                # queued until the next message or restart.
+                logging.getLogger(__name__).error(
+                    "Outbound scheduler left %d runnable row head(s) undispatched with no "
+                    "retry deadline and nothing in flight; rescanning in %.0f seconds.",
+                    len(heads), self.STALL_RESCAN_SECONDS,
+                )
+                self._schedule_retry(time.monotonic() + self.STALL_RESCAN_SECONDS)
 
     def harvest_completed(self) -> None:
         with self._lock:

@@ -86,6 +86,13 @@ original bot. Edit/delete routing continues to use the actual author.
 results. A healthy worker can coexist with held records; queue depth alone does
 not mean that those records are awaiting a safe automatic retry.
 
+A dispatch pass that leaves runnable rows with no retry deadline and nothing in
+flight logs `Outbound scheduler left N runnable row head(s) undispatched` and
+rescans 30 seconds later instead of sleeping until the next message or restart.
+Worker permits held without a submitted call cannot be released by a completion,
+so they are reset and reported the same way. Both messages mean delivery is
+still being attempted, not that rows were dropped.
+
 ```sql
 SELECT id, operation, telegram_chat_id, delivery_state, delivery_hold,
        attempt_sender_bot_id, attempt_started_at,

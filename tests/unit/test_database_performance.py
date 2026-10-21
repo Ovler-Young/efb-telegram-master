@@ -1,8 +1,9 @@
 """Regression checks for query plans, bounded BLOB reads and durable backoff."""
 
 import sqlite3
+import time
 import tracemalloc
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from types import SimpleNamespace
 
@@ -10,7 +11,9 @@ import pytest
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
-from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler
+from efb_telegram_master.outbound import (
+    OutboundQueue, OutboundQueueScheduler, SenderSelection, SubmittedCall,
+)
 from tests.unit.test_database_safety import remove_source_columns
 from tests.unit.test_outbound import DurableAdapter
 
@@ -230,9 +233,17 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
         scheduler.dispatch_once()
         assert loads == []
         scheduler.in_flight_destinations.clear()
+        # The only worker permit belongs to a submitted call for that destination.
+        head = queue.heads(include_payload=False)[0]
         scheduler._permits.acquire()
+        scheduler.in_flight[head.id] = SubmittedCall(
+            head, SenderSelection(adapter, None), Future(), time.monotonic(), ()
+        )
+        scheduler.in_flight_destinations.add(head.telegram_chat_id)
         scheduler.dispatch_once()
         assert loads == []
+        scheduler.in_flight.clear()
+        scheduler.in_flight_destinations.clear()
         scheduler._permits.release()
         with monkeypatch.context() as unavailable:
             unavailable.setattr(adapter, "select_sender", lambda row, now: SenderSelectionResult(retry_at=now + 60))
