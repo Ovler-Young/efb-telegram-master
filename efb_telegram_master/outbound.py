@@ -3293,6 +3293,17 @@ class OutboundQueueScheduler:
                                     retry_reason = "transport"
                                 else:
                                     retry_reason = "membership"
+                            if retry_reason == "rate_limit":
+                                # Nothing else raises RetryAfter, so name the class, the
+                                # requested delay and the sender that produced it.
+                                logging.getLogger(__name__).warning(
+                                    "Queue row %s (%s) deferred as rate limited: error=%s/%s, "
+                                    "retry_after=%s, sender=%s.",
+                                    row_id, submitted.row.operation, type(error).__name__,
+                                    type(error.__cause__).__name__ if error.__cause__ else "none",
+                                    getattr(error, "retry_after", None),
+                                    submitted.selection.sender_bot_id or "main",
+                                )
                             self.queue.observe_metrics(
                                 lambda metrics: metrics.record_retry(
                                     submitted.row.priority, submitted.row.operation,
