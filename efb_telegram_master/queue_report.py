@@ -255,6 +255,86 @@ def lane(db: sqlite3.Connection, chat_id: int, topic: int, limit: int, out) -> N
         print("   " + " | ".join(str(value) for value in row), file=out)
 
 
+def _describe_aggregation(blob) -> str:
+    if not blob or bytes(blob[:1]) != AGGREGATION_MARKER:
+        return "not an aggregation context"
+    context = _decode(bytes(blob[1:]))
+    if not isinstance(context, dict):
+        return "aggregation context cannot be decoded"
+    parts = [f"kind={context.get('kind')!r}", f"key={context.get('key')!r}"]
+    for name in ("container_id", "generation", "frozen", "handoff", "appendable", "incoming_boundary"):
+        if name in context:
+            parts.append(f"{name}={context[name]!r}")
+    if isinstance(context.get("aggregate"), dict):
+        children = context["aggregate"].get("children")
+        if isinstance(children, list):
+            parts.append(f"aggregate_children={len(children)}")
+        parts.append(f"aggregate_revision={context['aggregate'].get('revision')!r}")
+    if isinstance(context.get("members"), list):
+        parts.append(f"members={len(context['members'])}")
+    return " ".join(parts)
+
+
+def _describe_receipt(blob) -> tuple[str, int | None, int | None]:
+    """Return (description, telegram chat id, message id) from a completion receipt."""
+    if not blob or bytes(blob[:1]) != b"\x01":
+        return "no completion receipt", None, None
+    value = _decode(bytes(blob[1:]))
+    if not isinstance(value, tuple) or len(value) not in (2, 3):
+        return "receipt cannot be decoded", None, None
+    message = value[0]
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    file_owner = value[2] if len(value) == 3 else None
+    description = (
+        f"sender_bot_id={value[1]!r} file_owner={file_owner!r} "
+        f"message_id={message_id!r} chat_id={chat_id!r} "
+        f"date={getattr(message, 'date', None)!r}"
+    )
+    return description, (int(chat_id) if isinstance(chat_id, int) else None), (
+        int(message_id) if isinstance(message_id, int) else None)
+
+
+def row_detail(db: sqlite3.Connection, row_id: int, out) -> None:
+    """Everything the queue knows about one row, plus whether MsgLog already has it."""
+    cursor = db.execute(
+        "SELECT id, priority, telegram_chat_id, thread_id, operation, delivery_state,"
+        " COALESCE(delivery_hold, '-'), datetime(created_at, 'unixepoch'),"
+        f" CAST(ROUND(reconcile_after - {NOW_SECONDS}) AS INTEGER) AS retry_in_s,"
+        " reconcile_attempts, length(payload), length(log_context), length(completion_receipt),"
+        " predecessor_id, slave_id, required_sender_bot_id, attempt_sender_bot_id,"
+        " CASE WHEN attempt_started_at IS NULL THEN NULL"
+        f"      ELSE datetime(attempt_started_at, 'unixepoch') END"
+        " FROM outbound_queue WHERE id = ?", (row_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        print(f"   row {row_id} is not in the queue", file=out)
+        return
+    columns = [column[0] for column in cursor.description]
+    for name, value in zip(columns, row):
+        print(f"   {name} = {value}", file=out)
+    blobs = db.execute(
+        "SELECT log_context, completion_receipt FROM outbound_queue WHERE id = ?", (row_id,)
+    ).fetchone()
+    print(f"   log_context: {_describe_aggregation(blobs[0])}", file=out)
+    description, chat_id, message_id = _describe_receipt(blobs[1])
+    print(f"   receipt: {description}", file=out)
+    if chat_id is None or message_id is None:
+        return
+    master = f"{chat_id}.{message_id}"
+    print(f"   MsgLog {master}:", file=out)
+    try:
+        logged = db.execute(
+            "SELECT master_msg_id, slave_message_id, sender_bot_id FROM tg.msglog WHERE master_msg_id = ?",
+            (master,),
+        ).fetchone()
+        print(f"      {logged if logged is not None else 'absent'}", file=out)
+    except sqlite3.Error as error:
+        print(f"      skipped: {error}", file=out)
+
+
 def media_footprint(queue_path: Path, out) -> None:
     """Bytes still owed to Telegram: every upload has to come from these files.
 
@@ -286,7 +366,8 @@ def resolve_data_dir(value) -> Path:
 
 
 def report(queue_path: Path, tg_path: Path | None = None, out=None,
-           lane_target: tuple[int, int] | None = None, limit: int = 25) -> int:
+           lane_target: tuple[int, int] | None = None, limit: int = 25,
+           row_id: int | None = None) -> int:
     if out is None:
         out = sys.stdout
     queue_path = Path(queue_path).resolve()
@@ -312,6 +393,12 @@ def report(queue_path: Path, tg_path: Path | None = None, out=None,
                 print("   " + " | ".join(str(value) for value in row), file=out)
         print("\n== media still to upload", file=out)
         media_footprint(queue_path, out)
+        if row_id is not None:
+            print(f"\n== queue row {row_id}", file=out)
+            try:
+                row_detail(db, row_id, out)
+            except sqlite3.Error as error:
+                print(f"   skipped: {error}", file=out)
         if lane_target is not None:
             print(f"\n== lane {lane_target[0]}:{lane_target[1]} in send order", file=out)
             try:
@@ -352,6 +439,8 @@ def main(argv=None) -> int:
     parser.add_argument("--lane", default=None, metavar="CHAT[:TOPIC]",
                         help="Also list one destination's queued rows in send order")
     parser.add_argument("--limit", type=int, default=25, help="Rows to list for --lane")
+    parser.add_argument("--row", type=int, default=None, metavar="ROW_ID",
+                        help="Also print everything about one queue row")
     args = parser.parse_args(
         _join_negative_lane(list(sys.argv[1:] if argv is None else argv))
     )
@@ -361,9 +450,11 @@ def main(argv=None) -> int:
         lane_target = (int(chat), int(topic) if topic else 0)
     try:
         if args.queue is not None:
-            return report(args.queue, args.tg, lane_target=lane_target, limit=args.limit)
+            return report(args.queue, args.tg, lane_target=lane_target, limit=args.limit,
+                          row_id=args.row)
         directory = resolve_data_dir(args.data_dir)
-        return report(directory / QUEUE_FILENAME, args.tg, lane_target=lane_target, limit=args.limit)
+        return report(directory / QUEUE_FILENAME, args.tg, lane_target=lane_target, limit=args.limit,
+                      row_id=args.row)
     except (OSError, sqlite3.Error) as error:
         parser.exit(1, f"Queue report failed: {error}\n")
     return 0

@@ -1,5 +1,6 @@
 """The read-only queue report must run against a live-shaped queue without writing."""
 import io
+import pickle
 import sqlite3
 
 from efb_telegram_master.outbound import OutboundQueue, QueueRequest
@@ -154,3 +155,42 @@ def test_a_negative_chat_id_is_accepted_as_a_lane(tmp_path, capsys):
     assert main(["--data-dir", str(tmp_path), "--lane", "-1001:0"]) == 0
     printed = capsys.readouterr().out
     assert "lane -1001:0 in send order" in printed
+
+
+def test_row_detail_shows_a_durable_receipt_and_whether_msglog_has_it(tmp_path):
+    from efb_telegram_master.outbound import QueuedCall
+    from efb_telegram_master.queued_log import encode_aggregation
+    from types import SimpleNamespace
+
+    queue = OutboundQueue(tmp_path)
+    context = encode_aggregation(dict(
+        format_version=1, kind="aggregate", key=("slave", -1001, None), container_id=None,
+        generation=1, aggregate={"children": [{"a": 1}, {"b": 2}], "revision": 3}, members=[],
+    ))
+    row_id, _ = queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -1001, "text": "x"},
+                                                 log_context=context)],
+                                   lambda _operation: send_message)
+    receipt = b"\x01" + pickle.dumps((
+        SimpleNamespace(message_id=77, chat=SimpleNamespace(id=-1001), date=None), "aux-1",
+    ), protocol=5)
+    with queue.connection:
+        queue.connection.execute(
+            "UPDATE outbound_queue SET delivery_state='sent_pending', completion_receipt=?, "
+            "reconcile_attempts=7, reconcile_after=0 WHERE id=?", (receipt, row_id))
+    queue.close()
+
+    with sqlite3.connect(tmp_path / TG_FILENAME) as db:
+        db.executescript("""
+            CREATE TABLE msglog (id INTEGER PRIMARY KEY, master_msg_id TEXT, slave_message_id TEXT,
+                sender_bot_id TEXT);
+            INSERT INTO msglog (master_msg_id, slave_message_id, sender_bot_id)
+                VALUES ('-1001.77', 'source.7', 'aux-1');
+        """)
+    out = io.StringIO()
+    assert report(tmp_path / QUEUE_FILENAME, out=out, row_id=row_id) == 0
+    printed = out.getvalue()
+    assert "delivery_state = sent_pending" in printed
+    assert "reconcile_attempts = 7" in printed
+    assert "aggregate_children=2" in printed
+    assert "message_id=77" in printed and "chat_id=-1001" in printed
+    assert "-1001.77" in printed and "source.7" in printed   # MsgLog already has it
