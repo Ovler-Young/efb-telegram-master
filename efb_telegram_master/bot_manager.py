@@ -1979,9 +1979,23 @@ class TelegramBotManager(LocaleMixin):
             )
 
         cooldown_seconds = self._rate_limit_retry_after_seconds(cast(Exception, error))
+        cause_name = type(error.__cause__).__name__ if error.__cause__ else "none"
         if cooldown_seconds is not None:
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
+            # Dropping a retained row and cooling the whole sender/chat down must
+            # never be silent: this is the only place those decisions are made.
+            self.logger.warning(
+                "Queued row %s (%s) discarded after a rate-limit verdict: error=%s/%s, "
+                "cooldown=%.0fs. The row was not retried.",
+                getattr(row, "id", None), operation, type(error).__name__, cause_name,
+                cooldown_seconds,
+            )
+        else:
+            self.logger.warning(
+                "Queued row %s (%s) discarded: error=%s/%s.",
+                getattr(row, "id", None), operation, type(error).__name__, cause_name,
+            )
         self._finish_queued_database_update(getattr(row, "id", None))
         self._run_database_update_callback(
             self._pop_queued_completion_callback(getattr(row, "id", None))
