@@ -1816,11 +1816,13 @@ class OutboundQueue:
             # Select one runnable head per destination before reading media BLOBs.
             # Quarantined historical rows may be skipped explicitly so one
             # unreplayable attachment does not strand all newer traffic for the
-            # same Telegram destination. Short queues are offered head slots
-            # first: a destination only stops competing for a slot once its queue
-            # is empty, so draining the short ones shrinks the set of waiting
-            # destinations fastest and frees slots for the long queues. Equal
-            # depths keep FIFO order by head ID.
+            # same Telegram destination. Queues are then offered head slots one
+            # depth tier at a time: the shallowest waiting destination first, and a
+            # tier only gets a second slot once every destination with waiting rows
+            # has had one. Draining short queues still shrinks the waiting set
+            # fastest, but the whole pass cannot settle on the shallow tiers and
+            # leave a deep destination without a worker. Equal depths keep FIFO
+            # order by head ID.
             rows = self.connection.execute(
                 f"SELECT q.id, q.priority, q.telegram_chat_id, q.operation, {payload}, q.slave_id, "
                 f"q.required_sender_bot_id, q.created_at, {context}, q.delivery_state, {receipt}, "
@@ -1831,7 +1833,9 @@ class OutboundQueue:
                 "COUNT(*) AS waiting "
                 "FROM outbound_queue WHERE delivery_state = 'queued'" + exclusion_sql +
                 " GROUP BY telegram_chat_id, COALESCE(thread_id, 0)"
-                ") AS heads ON q.id = heads.head_id ORDER BY heads.waiting, heads.head_id",
+                ") AS heads ON q.id = heads.head_id "
+                "ORDER BY ROW_NUMBER() OVER (PARTITION BY heads.waiting ORDER BY heads.head_id), "
+                "heads.waiting",
                 parameters,
             ).fetchall()
         return [
