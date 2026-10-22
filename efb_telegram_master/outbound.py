@@ -77,17 +77,29 @@ SUPPLEMENTAL_KEY = "_full_content_attachment"
 HISTORY_SOURCE_PREFIX = "__history__:"
 
 
-def queued_thread_id(kwargs: Mapping[str, object]) -> Optional[int]:
+def queued_thread_id(
+    kwargs: Mapping[str, object], log_context: Optional[bytes] = None
+) -> Optional[int]:
     """The forum topic a queued call targets, if any.
 
     Topic serialization is per topic, not per chat: two topics of one group are
     ordered only within themselves, so they must be allowed to run concurrently.
+    Aggregated containers carry their topic inside the log context instead of the
+    request kwargs, and both must resolve to the same topic or the same topic gets
+    two identities and can be dispatched twice in parallel.
     """
     value = kwargs.get("message_thread_id")
     if value is None:
         api_kwargs = kwargs.get("api_kwargs")
         if isinstance(api_kwargs, Mapping):
             value = api_kwargs.get("message_thread_id")
+    if value is None and log_context and log_context[:1] == b"\x03":
+        from .queued_log import decode_aggregation
+        try:
+            key = decode_aggregation(log_context)["key"]
+        except Exception:
+            return None
+        value = key[2] if len(key) > 2 else None
     if value is None:
         return None
     try:
@@ -1479,7 +1491,7 @@ class OutboundQueue:
                         "created_at, log_context, predecessor_id, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (priority, chat_id, operation, payload, slave_id, required_sender, now, log_context,
                          predecessor if logical_split else request.predecessor_id,
-                         queued_thread_id(_kwargs)),
+                         queued_thread_id(_kwargs, log_context)),
                     )
                     identifier = cursor.lastrowid
                     if identifier is None:
@@ -1636,7 +1648,7 @@ class OutboundQueue:
                         "required_sender_bot_id, created_at, log_context, predecessor_id, thread_id) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), context,
-                         request.predecessor_id, queued_thread_id(kwargs)))
+                         request.predecessor_id, queued_thread_id(kwargs, context)))
                     identifier = cursor.lastrowid
                     if identifier is None:
                         raise QueuePersistenceError("SQLite did not return the aggregation successor ID.")
@@ -2432,7 +2444,8 @@ class OutboundQueue:
                         "created_at, log_context, predecessor_id, thread_id) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), log_context,
-                         row_id if parent is not None else None, queued_thread_id(_kwargs)),
+                         row_id if parent is not None else None,
+                         queued_thread_id(_kwargs, log_context)),
                     )
                     if parent is not None:
                         parent["supplement_id"] = supplement_cursor.lastrowid
