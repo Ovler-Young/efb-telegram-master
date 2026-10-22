@@ -229,7 +229,7 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
     monkeypatch.setattr(queue, "load_queued", load)
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
-        scheduler.in_flight_destinations.update(range(10))
+        scheduler.in_flight_destinations.update((chat, None) for chat in range(10))
         scheduler.dispatch_once()
         assert loads == []
         scheduler.in_flight_destinations.clear()
@@ -239,7 +239,7 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
         scheduler.in_flight[head.id] = SubmittedCall(
             head, SenderSelection(adapter, None), Future(), time.monotonic(), ()
         )
-        scheduler.in_flight_destinations.add(head.telegram_chat_id)
+        scheduler.in_flight_destinations.add((head.telegram_chat_id, head.thread_id))
         scheduler.dispatch_once()
         assert loads == []
         scheduler.in_flight.clear()
@@ -252,7 +252,11 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
         monkeypatch.setattr(adapter, "acquire_sender_limits", lambda selection, chat_id: False)
         for _ in range(3):
             scheduler.dispatch_once()
-        assert loads == []
+        # The row is read before the rate-limit check so an undeliverable row
+        # never spends a token; nothing may be submitted and no permit retained.
+        assert scheduler.in_flight == {}
+        assert scheduler._permits.acquire(blocking=False)
+        scheduler._permits.release()
         assert len(queue.heads(include_payload=False)) == 10
         assert adapter.calls == []
     queue.close()
