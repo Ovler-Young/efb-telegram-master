@@ -318,3 +318,19 @@ def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager)
     assert peak < 8 * 1024 * 1024
     assert len(sent) == count and len(set(sent)) == count
     assert not manager.has_pending_history_migrations()
+
+
+def test_dispatch_head_scan_is_served_by_a_covering_index(tmp_path):
+    """A pass reads every waiting row; it must not also fetch each row's table page."""
+    queue = OutboundQueue(tmp_path)
+    try:
+        fill_queue(queue, 500)
+        indexes = {row[1] for row in queue.connection.execute("PRAGMA index_list(outbound_queue)")}
+        assert "outbound_queue_ready_heads" in indexes
+        plan = " ".join(row[3] for row in queue.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)), "
+            "COUNT(*) FROM outbound_queue WHERE delivery_state = 'queued' AND delivery_hold IS NULL "
+            "GROUP BY telegram_chat_id, COALESCE(thread_id, 0)"))
+        assert "COVERING INDEX outbound_queue_ready_heads" in plan, plan
+    finally:
+        queue.close()

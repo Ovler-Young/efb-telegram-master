@@ -1966,6 +1966,7 @@ class TelegramBotManager(LocaleMixin):
             retry_at = time.monotonic() + retry_after
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = retry_at
+            self._report_retry_after(row, operation, error, retry_after)
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
 
         if (
@@ -2044,6 +2045,28 @@ class TelegramBotManager(LocaleMixin):
             self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
             self._finalize_outbound_resources()
             self.logger.debug("Outbound queue worker stopped")
+
+    RETRY_AFTER_LOG_INTERVAL = 60.0
+
+    def _report_retry_after(self, row, operation, error: BaseException, retry_after: float) -> None:
+        """A silent retry hides why a lane looks idle, so name the verdict once a minute."""
+        cause = type(error.__cause__).__name__ if error.__cause__ else "none"
+        key = (str(operation), type(error).__name__, cause)
+        now = time.monotonic()
+        with self._get_bot_chat_state_lock():
+            reported = getattr(self, "_retry_after_report_at", None)
+            if reported is None:
+                reported = self._retry_after_report_at = {}
+            previous = reported.get(key)
+            if previous is not None and now - previous < self.RETRY_AFTER_LOG_INTERVAL:
+                return
+            reported[key] = now
+        self.logger.warning(
+            "Telegram asked queue row %s (%s) to wait %.0fs before the next attempt "
+            "(error=%s/%s, chat=%s). The row stays queued; this is why a lane can look idle.",
+            getattr(row, "id", None), operation, retry_after, type(error).__name__, cause,
+            getattr(row, "telegram_chat_id", None),
+        )
 
     @staticmethod
     def _retry_after_seconds(error: telegram.error.RetryAfter) -> float:

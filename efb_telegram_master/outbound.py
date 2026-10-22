@@ -633,6 +633,9 @@ class OutboundQueue:
     # oversized row into memory just to learn it. Such rows keep their topic NULL
     # until their own recovery path re-encodes them.
     MAX_TOPIC_REPAIR_BYTES = 1024 * 1024
+    # Deleting a row inspects its payload to release sidecars; above this size the
+    # payload is streamed instead of fetched.
+    MAX_INSPECT_BYTES = 1024 * 1024
     # Legacy v1 rows may contain one complete media file inline. Recover one
     # such row at a time, rewrite it to v2 sidecar storage, then let normal
     # replay budgeting apply to the compact row.
@@ -697,6 +700,14 @@ class OutboundQueue:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS outbound_queue_reconciliation_due "
                 "ON outbound_queue (delivery_state, reconcile_after, id)"
+            )
+            # A dispatch pass elects one head per destination, so it reads every
+            # waiting row's state, hold, destination, topic, priority and
+            # predecessor. Covering them halves that scan on a large backlog.
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS outbound_queue_ready_heads "
+                "ON outbound_queue (delivery_state, delivery_hold, telegram_chat_id, thread_id, "
+                "priority, id, predecessor_id)"
             )
             connection.commit()
             self._connection = connection
@@ -2611,17 +2622,25 @@ class OutboundQueue:
         with self._lock:
             try:
                 if cleanup_media:
-                    exists = self.connection.execute(
-                        "SELECT 1 FROM outbound_queue WHERE id = ?", (row_id,)
+                    # One read answers existence, payload version and media cleanup
+                    # for the ordinary case. Payloads are small: media lives in
+                    # sidecars. Only a row too large to hold in memory falls back to
+                    # the streaming blob read, which costs a second connection.
+                    row = self.connection.execute(
+                        "SELECT payload FROM outbound_queue WHERE id = ? AND length(payload) <= ?",
+                        (row_id, self.MAX_INSPECT_BYTES),
                     ).fetchone()
-                    marker = b""
-                    if exists is not None:
+                    if row is not None:
+                        if bytes(row[0][:1]) == b"\x02":
+                            payload = row[0]
+                    elif self.connection.execute(
+                        "SELECT 1 FROM outbound_queue WHERE id = ?", (row_id,)
+                    ).fetchone() is not None:
                         with _SQLiteBlobReader(self.path, row_id) as blob:
-                            marker = blob.read(1)
-                    if marker == b"\x02":
-                        payload = self.connection.execute(
-                            "SELECT payload FROM outbound_queue WHERE id = ?", (row_id,)
-                        ).fetchone()[0]
+                            if blob.read(1) == b"\x02":
+                                payload = self.connection.execute(
+                                    "SELECT payload FROM outbound_queue WHERE id = ?", (row_id,)
+                                ).fetchone()[0]
                 self.connection.execute("BEGIN")
                 if successful:
                     self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
