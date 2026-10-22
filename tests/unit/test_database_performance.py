@@ -1,8 +1,9 @@
 """Regression checks for query plans, bounded BLOB reads and durable backoff."""
 
 import sqlite3
+import time
 import tracemalloc
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from types import SimpleNamespace
 
@@ -10,7 +11,9 @@ import pytest
 
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
-from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler
+from efb_telegram_master.outbound import (
+    OutboundQueue, OutboundQueueScheduler, SenderSelection, SubmittedCall,
+)
 from tests.unit.test_database_safety import remove_source_columns
 from tests.unit.test_outbound import DurableAdapter
 
@@ -226,13 +229,21 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
     monkeypatch.setattr(queue, "load_queued", load)
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
-        scheduler.in_flight_destinations.update(range(10))
+        scheduler.in_flight_destinations.update((chat, None) for chat in range(10))
         scheduler.dispatch_once()
         assert loads == []
         scheduler.in_flight_destinations.clear()
+        # The only worker permit belongs to a submitted call for that destination.
+        head = queue.heads(include_payload=False)[0]
         scheduler._permits.acquire()
+        scheduler.in_flight[head.id] = SubmittedCall(
+            head, SenderSelection(adapter, None), Future(), time.monotonic(), ()
+        )
+        scheduler.in_flight_destinations.add((head.telegram_chat_id, head.thread_id))
         scheduler.dispatch_once()
         assert loads == []
+        scheduler.in_flight.clear()
+        scheduler.in_flight_destinations.clear()
         scheduler._permits.release()
         with monkeypatch.context() as unavailable:
             unavailable.setattr(adapter, "select_sender", lambda row, now: SenderSelectionResult(retry_at=now + 60))
@@ -241,7 +252,11 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
         monkeypatch.setattr(adapter, "acquire_sender_limits", lambda selection, chat_id: False)
         for _ in range(3):
             scheduler.dispatch_once()
-        assert loads == []
+        # A full bucket must not cost a payload read: the row is deferred before
+        # the blob is touched, and nothing is submitted.
+        assert scheduler.in_flight == {}
+        assert scheduler._permits.acquire(blocking=False)
+        scheduler._permits.release()
         assert len(queue.heads(include_payload=False)) == 10
         assert adapter.calls == []
     queue.close()
@@ -303,3 +318,19 @@ def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager)
     assert peak < 8 * 1024 * 1024
     assert len(sent) == count and len(set(sent)) == count
     assert not manager.has_pending_history_migrations()
+
+
+def test_dispatch_head_scan_is_served_by_a_covering_index(tmp_path):
+    """A pass reads every waiting row; it must not also fetch each row's table page."""
+    queue = OutboundQueue(tmp_path)
+    try:
+        fill_queue(queue, 500)
+        indexes = {row[1] for row in queue.connection.execute("PRAGMA index_list(outbound_queue)")}
+        assert "outbound_queue_ready_heads" in indexes
+        plan = " ".join(row[3] for row in queue.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)), "
+            "COUNT(*) FROM outbound_queue WHERE delivery_state = 'queued' AND delivery_hold IS NULL "
+            "GROUP BY telegram_chat_id, COALESCE(thread_id, 0)"))
+        assert "COVERING INDEX outbound_queue_ready_heads" in plan, plan
+    finally:
+        queue.close()

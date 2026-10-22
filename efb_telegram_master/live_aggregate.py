@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import logging
 import pickle
 import time
 from contextlib import contextmanager
@@ -23,9 +24,13 @@ class _Stream:
     recent: list[float] = field(default_factory=list)
     last_new: float = 0
     generation: int = 0
+    closed: Optional[tuple] = None
 
 
 class LiveTextAggregation:
+    # Members delivered this much later than they arrived are part of a backfill
+    # rather than live traffic; their containers are held so the run can join.
+    BACKFILL_LATENESS_SECONDS = 5.0
     """Keep append eligibility in memory and every unpublished member durable."""
 
     def __init__(self, manager):
@@ -38,6 +43,8 @@ class LiveTextAggregation:
         self.container_tails: dict[str, int] = {}
         self._source_delivery = ContextVar("aggregate_source_delivery", default=None)
         self._independent: ContextVar[Optional[tuple]] = ContextVar("aggregate_independent", default=None)
+        self._close_counts: dict[str, int] = {}
+        self._close_logged_at = 0.0
         rows = self.queue.aggregation_rows()
         publication_rows = {}
         predecessors = {}
@@ -93,11 +100,51 @@ class LiveTextAggregation:
     def _existing_tail(self, stream):
         return stream.tail if stream.tail is not None and self.queue.contains(stream.tail) else None
 
-    def close(self, key):
+    def close(self, key, reason: str = "explicit"):
+        """End the current container for one source.
+
+        Every caller states why: a silently closed container splits the run, and
+        the observable blocks of two or three messages give no clue which rule did
+        it.
+        """
         stream = self.streams.get(tuple(key))
         if stream is not None:
+            stream.closed = (stream.base, stream.generation)
             stream.base = None
             stream.generation += 1
+            # One line a minute, with a tally: every container close splits a run,
+            # and which rule did it is the only way to tell why. Unthrottled, this
+            # would flood an active chat.
+            self._close_counts[reason] = self._close_counts.get(reason, 0) + 1
+            now = time.monotonic()
+            if now - self._close_logged_at >= 60.0:
+                self._close_logged_at = now
+                logging.getLogger(__name__).warning(
+                    "Live aggregation container closes in the last interval: %s (latest %s)",
+                    dict(self._close_counts), reason,
+                )
+                self._close_counts.clear()
+
+    def reopen(self, row):
+        """Rejoin the text run a discarded media row had ended.
+
+        An undeliverable media row is removed without ever reaching Telegram, so
+        the boundary it created was phantom: restore the container it closed
+        instead of starting a new one.
+        """
+        from .queued_log import decode_aggregation
+        context = decode_aggregation(row.log_context) if row.log_context else None
+        if not context:
+            return
+        stream = self.streams.get(tuple(context["key"]))
+        if stream is None or stream.tail != row.id:
+            return
+        predecessor = row.predecessor_id
+        stream.tail = predecessor if predecessor and self.queue.contains(predecessor) else None
+        if stream.closed is not None:
+            stream.base, stream.generation = stream.closed
+            stream.closed = None
+        self.scheduler.wake_event.set()
 
     def close_destination(self, chat_id, topic):
         """New Telegram messages end every source stream in their destination."""
@@ -105,7 +152,7 @@ class LiveTextAggregation:
             self.queue.close_aggregation_destination(chat_id, topic)
             for key in self.streams:
                 if int(key[1]) == chat_id and key[2] == topic:
-                    self.close(key)
+                    self.close(key, "telegram-destination")
             self.scheduler.wake_event.set()
 
     def close_source_routes(self, key):
@@ -115,7 +162,7 @@ class LiveTextAggregation:
         for old_key, old_stream in self.streams.items():
             if old_key[0] == key[0] and old_key != key:
                 prior_tail = self._existing_tail(old_stream) or prior_tail
-                self.close(old_key)
+                self.close(old_key, "route-changed")
         return prior_tail
 
     def append(self, key, member, *, silent=False):
@@ -140,7 +187,7 @@ class LiveTextAggregation:
             prior_tail = self.close_source_routes(key)
             stream = self.streams.setdefault(key, _Stream())
             if stream.last_new and now - stream.last_new >= float(self.manager.channel.flag("text_aggregation_idle_seconds")):
-                self.close(key)
+                self.close(key, "idle")
             stream.recent = [stamp for stamp in stream.recent if now - stamp < 3][-2:] + [now]
             stream.last_new = now
             context = self._tail_context(stream)
@@ -157,14 +204,21 @@ class LiveTextAggregation:
                         self.scheduler.wake_event.set()
                         return True
                 # Pending capacity becomes a publication boundary.
-                self.close(key)
+                self.close(key, "capacity")
             predecessor = self._existing_tail(stream) or prior_tail
             inherit = bool(predecessor and context and context.get("generation") == stream.generation and not context.get("incoming_boundary"))
-            waiting = len(stream.recent) > 2
+            # The window applies from the first member: otherwise the container is
+            # dispatched before it can absorb the run, and every later member starts
+            # a new container instead of joining this one.
+            window = float(self.manager.channel.flag("text_aggregation_window_seconds"))
+            # A member that is already late when it reaches the aggregator belongs
+            # to a backfill: hold its container for the window so the rest of the
+            # run can join it. Fresh traffic still publishes immediately.
+            waiting = (time.time() - now) >= self.BACKFILL_LATENESS_SECONDS
             context = dict(format_version=1, kind="logical", key=key, members=[member],
                            base=stream.base, inherit=inherit, generation=stream.generation,
                            recent=stream.recent, last_new=now, waiting=waiting,
-                           due=now + float(self.manager.channel.flag("text_aggregation_window_seconds")) if waiting else now,
+                           due=(now + window) if waiting else now,
                            silent=silent)
             request = QueueRequest("send_message", (), {"chat_id": key[1], "text": "", "_slave_id": key[0],
                                                          "_send_mode": "eventual"},
@@ -186,7 +240,7 @@ class LiveTextAggregation:
         reserved = [True]
         try:
             stream = self.streams.setdefault(key, _Stream())
-            self.close(key)
+            self.close(key, "independent-delivery")
             token = self._independent.set((key, self._existing_tail(stream), reserved))
             try:
                 yield
@@ -238,7 +292,7 @@ class LiveTextAggregation:
                     self.streams[key].tail = split["tail"]
                     tail = self._tail_context(self.streams[key])
                     if tail and tail["kind"] in {"boundary", "source", "redirect"}:
-                        self.close(key)
+                        self.close(key, "split-tail-" + str(tail["kind"]))
             else:
                 self.streams[key].tail = int(row_id)
             if source is not None:

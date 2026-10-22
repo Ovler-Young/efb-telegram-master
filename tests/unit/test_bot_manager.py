@@ -1784,3 +1784,44 @@ def test_write_db_mapping_logs_failure_and_runs_completion_callback():
 
     mgr.logger.warning.assert_called_once()
     on_complete.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "configured, expected",
+    [(None, 8), (16, 16), ("24", 24), (0, 1), (-5, 1), (4096, 64), ("many", 8), (True, 8)],
+)
+def test_send_worker_count_is_configured_and_bounded(configured, expected):
+    config = {"flags": {}} if configured is None else {"flags": {"send_worker_count": configured}}
+    assert TelegramBotManager._parse_send_worker_count(config) == expected
+
+
+def test_connection_pool_keeps_one_connection_per_worker(monkeypatch):
+    monkeypatch.delenv(TelegramBotManager.HTTPX_POOL_MULTIPLIER_ENV, raising=False)
+    assert TelegramBotManager._default_connection_pool_size({}) == 16
+    assert TelegramBotManager._default_connection_pool_size({"flags": {"send_worker_count": 24}}) == 48
+    monkeypatch.setenv(TelegramBotManager.HTTPX_POOL_MULTIPLIER_ENV, "1")
+    assert TelegramBotManager._default_connection_pool_size({"flags": {"send_worker_count": 24}}) == 24
+
+
+def test_rate_limited_retries_are_reported_once_per_window(monkeypatch, caplog):
+    """A RetryAfter retry is otherwise silent, so a stalled lane has no explanation."""
+    manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_state_lock = threading.Lock()
+    manager._bot_chat_disabled_until = {}
+    manager.bot_pool = None
+    now = [1_000.0]
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: now[0])
+    task = SimpleNamespace(id=7, telegram_chat_id=100, slave_id=None, priority=0)
+    selection = SimpleNamespace(sender_bot_id="10")
+
+    def reported():
+        return [record for record in caplog.records if "wait" in record.getMessage()]
+
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.bot_manager"):
+        manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+        manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+        assert len(reported()) == 1
+        now[0] += 61
+        manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+        assert len(reported()) == 2
+    assert "20" in reported()[-1].getMessage()

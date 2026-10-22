@@ -69,6 +69,8 @@ class ExperimentalFlagsManager(LocaleMixin):
         "local_tdlib_api": False,
         "topic_group": None,
         "timezone": DEFAULT_TIMEZONE.key,
+        # Concurrent outbound sends; also sizes the HTTP connection pool.
+        "send_worker_count": 8,
         "text_aggregation": False,
         "text_aggregation_origins": None,
         "text_aggregation_chat_types": None,

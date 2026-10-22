@@ -435,7 +435,7 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
         ),
     ]
 
-    def get_next_history_migration_target():
+    def get_next_history_migration_target(*_args, **_kwargs):
         return pending_entries[0] if pending_entries else None
 
     def get_history_migration_entries(_slave_chat_id, _tg_chat_id, _thread_id, limit=None):
@@ -512,77 +512,59 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
     assert pending_entries == []
 
 
-def test_history_migrations_run_concurrently_per_target_group():
+def test_history_migration_lanes_serialize_per_topic_not_per_chat():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager._history_migration_locks_lock = threading.Lock()
     manager._history_migration_locks = {}
     manager.logger = Mock()
 
     queued_targets = []
-    manager._queue_history_migration_entries = lambda _source, target, _thread: (
-        queued_targets.append(target) or 1
+    manager._queue_history_migration_entries = lambda _source, target, thread: (
+        queued_targets.append((target, thread)) or 1
     )
 
-    entered = {101: threading.Event(), 202: threading.Event()}
-    second_101_entered = threading.Event()
-    release_first_101 = threading.Event()
-    release_second_101 = threading.Event()
-    release_202 = threading.Event()
-    active_targets = set()
+    entered = {}
+    releases = {}
+    active = set()
     active_lock = threading.Lock()
-    starts = []
 
-    def process_target(target):
+    def process_target(target, thread=None):
+        key = (target, thread)
         with active_lock:
-            assert target not in active_targets
-            active_targets.add(target)
-            starts.append(target)
-            if target == 101:
-                if starts.count(101) == 1:
-                    entered[101].set()
-                    release = release_first_101
-                else:
-                    second_101_entered.set()
-                    release = release_second_101
-            else:
-                entered[202].set()
-                release = release_202
-        assert release.wait(timeout=2)
+            assert key not in active, "one topic must not run two lanes at once"
+            active.add(key)
+            entered.setdefault(key, threading.Event()).set()
+            releases.setdefault(key, threading.Event())
+        assert releases[key].wait(timeout=2)
         with active_lock:
-            active_targets.remove(target)
+            active.discard(key)
 
     manager._process_pending_history_migrations_locked = process_target
 
-    def migrate(target):
-        ChatBindingManager._queue_and_process_history_migration(manager, "source", target)
+    def migrate(target, thread=None):
+        ChatBindingManager._queue_and_process_history_migration(manager, "source", target, thread)
 
-    first_101 = threading.Thread(target=migrate, args=(101,))
-    first_101.start()
-    assert entered[101].wait(timeout=2)
+    # Two topics of one chat are separate lanes and must not block each other.
+    first = threading.Thread(target=migrate, args=(101, 11))
+    first.start()
+    second = threading.Thread(target=migrate, args=(101, 12))
+    second.start()
+    assert entered[(101, 11)].wait(timeout=2)
+    assert entered[(101, 12)].wait(timeout=2)
 
-    worker_202 = threading.Thread(target=migrate, args=(202,))
-    worker_202.start()
-    assert entered[202].wait(timeout=2)
+    # A second run of an already active topic waits for that topic's lane.
+    duplicate_done = threading.Event()
+    duplicate = threading.Thread(target=lambda: (migrate(101, 11), duplicate_done.set()))
+    duplicate.start()
+    assert not duplicate_done.wait(timeout=0.05)
 
-    second_101_finished = threading.Event()
-    second_101 = threading.Thread(target=lambda: (migrate(101), second_101_finished.set()))
-    second_101.start()
-    assert not second_101_finished.wait(timeout=0.05)
-    assert starts == [101, 202]
-
-    release_first_101.set()
-    assert second_101_entered.wait(timeout=2)
-    assert starts.count(101) == 2
-
-    release_second_101.set()
-    release_202.set()
-    first_101.join(timeout=2)
-    second_101.join(timeout=2)
-    worker_202.join(timeout=2)
-    assert not first_101.is_alive()
-    assert not second_101.is_alive()
-    assert not worker_202.is_alive()
-    assert sorted(queued_targets) == [101, 101, 202]
+    for event in tuple(releases.values()):
+        event.set()
+    assert duplicate_done.wait(timeout=2)
+    for worker in (first, second, duplicate):
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert sorted(queued_targets) == [(101, 11), (101, 11), (101, 12)]
 
 
 def test_history_migration_continues_after_terminal_delivery_failure():

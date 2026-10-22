@@ -360,6 +360,8 @@ class TelegramBotManager(LocaleMixin):
     webhook = False
     logger = logging.getLogger(__name__)
     DEFAULT_SEND_WORKER_COUNT = 8
+    MAX_SEND_WORKER_COUNT = 64
+    SEND_WORKER_COUNT_KEY = 'send_worker_count'
     DEFAULT_HTTPX_POOL_MULTIPLIER = 2.0
     HTTPX_POOL_MULTIPLIER_ENV = "ETM_HTTPX_POOL_MULTIPLIER"
     BLOCKING_SEND_TIMEOUT = 300.0
@@ -422,6 +424,17 @@ class TelegramBotManager(LocaleMixin):
             return retry_on_chat_migration_wrap
 
     @classmethod
+    def _parse_send_worker_count(cls, config: Mapping[str, object]) -> int:
+        """Concurrent outbound sends; the queue grants one permit per worker."""
+        flags = config.get('flags')
+        raw = flags.get(cls.SEND_WORKER_COUNT_KEY) if isinstance(flags, collections.abc.Mapping) else None
+        try:
+            parsed = int(str(raw))
+        except (TypeError, ValueError):
+            return cls.DEFAULT_SEND_WORKER_COUNT
+        return max(1, min(cls.MAX_SEND_WORKER_COUNT, parsed))
+
+    @classmethod
     def _default_connection_pool_size(cls, config: Mapping[str, object]) -> int:
         multiplier = cls.DEFAULT_HTTPX_POOL_MULTIPLIER
         multiplier_value = os.getenv(cls.HTTPX_POOL_MULTIPLIER_ENV)
@@ -432,7 +445,9 @@ class TelegramBotManager(LocaleMixin):
                 parsed_multiplier = multiplier
             if parsed_multiplier > 0:
                 multiplier = parsed_multiplier
-        return max(1, int(round(cls.DEFAULT_SEND_WORKER_COUNT * multiplier)))
+        # One connection must stay available per concurrent send; a pool smaller
+        # than the worker count turns extra workers into waiting threads.
+        return max(1, int(round(cls._parse_send_worker_count(config) * multiplier)))
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
@@ -529,7 +544,7 @@ class TelegramBotManager(LocaleMixin):
                 auxiliary.bind_metrics(self._metrics)
         self._metrics_httpd = None
 
-        self._send_worker_count = self.DEFAULT_SEND_WORKER_COUNT
+        self._send_worker_count = self._parse_send_worker_count(config)
         self._outbound_queue = OutboundQueue(channel.db._base_path, metrics=self._metrics)
         self._send_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._send_worker_count, thread_name_prefix="ETM-send",
@@ -1951,6 +1966,7 @@ class TelegramBotManager(LocaleMixin):
             retry_at = time.monotonic() + retry_after
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = retry_at
+            self._report_retry_after(row, operation, error, retry_after)
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
 
         if (
@@ -1964,14 +1980,34 @@ class TelegramBotManager(LocaleMixin):
             )
 
         cooldown_seconds = self._rate_limit_retry_after_seconds(cast(Exception, error))
+        cause_name = type(error.__cause__).__name__ if error.__cause__ else "none"
         if cooldown_seconds is not None:
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = time.monotonic() + cooldown_seconds
+            # Dropping a retained row and cooling the whole sender/chat down must
+            # never be silent: this is the only place those decisions are made.
+            self.logger.warning(
+                "Queued row %s (%s) discarded after a rate-limit verdict: error=%s/%s (%s), "
+                "cooldown=%.0fs. The row was not retried.",
+                getattr(row, "id", None), operation, type(error).__name__, cause_name,
+                str(error)[:200], cooldown_seconds,
+            )
+        else:
+            self.logger.warning(
+                "Queued row %s (%s) discarded: error=%s/%s (%s).",
+                getattr(row, "id", None), operation, type(error).__name__, cause_name,
+                str(error)[:200],
+            )
         self._finish_queued_database_update(getattr(row, "id", None))
         self._run_database_update_callback(
             self._pop_queued_completion_callback(getattr(row, "id", None))
         )
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
+
+    def reopen_aggregation(self, row) -> None:
+        aggregation = getattr(self, "live_aggregation", None)
+        if aggregation is not None:
+            aggregation.reopen(row)
 
     def record_queued_retry_after(
         self, row, error: telegram.error.RetryAfter, selection: SenderSelection
@@ -2009,6 +2045,28 @@ class TelegramBotManager(LocaleMixin):
             self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
             self._finalize_outbound_resources()
             self.logger.debug("Outbound queue worker stopped")
+
+    RETRY_AFTER_LOG_INTERVAL = 60.0
+
+    def _report_retry_after(self, row, operation, error: BaseException, retry_after: float) -> None:
+        """A silent retry hides why a lane looks idle, so name the verdict once a minute."""
+        cause = type(error.__cause__).__name__ if error.__cause__ else "none"
+        key = (str(operation), type(error).__name__, cause)
+        now = time.monotonic()
+        with self._get_bot_chat_state_lock():
+            reported = getattr(self, "_retry_after_report_at", None)
+            if reported is None:
+                reported = self._retry_after_report_at = {}
+            previous = reported.get(key)
+            if previous is not None and now - previous < self.RETRY_AFTER_LOG_INTERVAL:
+                return
+            reported[key] = now
+        self.logger.warning(
+            "Telegram asked queue row %s (%s) to wait %.0fs before the next attempt "
+            "(error=%s/%s, chat=%s). The row stays queued; this is why a lane can look idle.",
+            getattr(row, "id", None), operation, retry_after, type(error).__name__, cause,
+            getattr(row, "telegram_chat_id", None),
+        )
 
     @staticmethod
     def _retry_after_seconds(error: telegram.error.RetryAfter) -> float:

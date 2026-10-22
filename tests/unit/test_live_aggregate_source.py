@@ -162,7 +162,9 @@ def test_fixed_owner_update_uncertainty_survives_restart(runtime):
     restart(manager)
     member["source_revision"] = 3
     child = manager.live_aggregation.queue_container_update("-100.1", [member], key=key)
-    assert child not in [row.id for row in manager._outbound_queue.heads(ready_only=True)]
+    # A permanently held parent must not strand its dependent: the held row stays
+    # retained for confirmation, but delivery continues behind it.
+    assert child in [row.id for row in manager._outbound_queue.heads(ready_only=True)]
     assert manager._outbound_queue.contains(parent)
 
 
