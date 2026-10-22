@@ -176,3 +176,52 @@ def test_a_persistent_stall_is_reported_once_per_interval(tmp_path, monkeypatch,
         assert scheduler.next_deadline is not None
     finally:
         queue.close()
+
+
+def _enqueue_topic(queue, thread_id, text):
+    def send_message(chat_id: int, text: str, message_thread_id: int = 0):
+        return chat_id, thread_id, text
+    return queue.enqueue_many([QueueRequest(
+        "send_message", (), {"chat_id": -1001, "text": text, "message_thread_id": thread_id},
+    )], lambda _operation: send_message)
+
+
+def test_topics_of_one_chat_dispatch_in_parallel(tmp_path):
+    """Two topics of one group are separate ordering units."""
+    queue = OutboundQueue(tmp_path)
+    _enqueue_topic(queue, 11, "a")
+    _enqueue_topic(queue, 12, "b")
+    _enqueue_topic(queue, 11, "c")
+    adapter = Adapter(block=True)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=2)
+        try:
+            scheduler.dispatch_once()
+            assert {
+                (call.row.telegram_chat_id, call.row.thread_id)
+                for call in scheduler.in_flight.values()
+            } == {(-1001, 11), (-1001, 12)}
+            assert scheduler.in_flight_destinations == {(-1001, 11), (-1001, 12)}
+        finally:
+            adapter.release.set()
+            scheduler.stop_and_drain(timeout=2)
+            queue.close()
+
+
+def test_one_topic_keeps_serial_order(tmp_path):
+    """A second row of the same topic waits for the first."""
+    queue = OutboundQueue(tmp_path)
+    first, _ = _enqueue_topic(queue, 11, "a")
+    second, _ = _enqueue_topic(queue, 11, "b")
+    adapter = Adapter(block=True)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=2)
+        try:
+            scheduler.dispatch_once()
+            assert list(scheduler.in_flight) == [first]
+            assert second not in scheduler.in_flight, "same-topic rows must not overlap"
+        finally:
+            adapter.release.set()
+            scheduler.stop_and_drain(timeout=2)
+            queue.close()
+    assert second > first
