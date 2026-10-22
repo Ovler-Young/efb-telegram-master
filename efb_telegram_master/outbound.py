@@ -589,6 +589,10 @@ class OutboundQueue:
     # Protect restart from already-inflated historical rows before reading their
     # BLOBs. Oversized rows are retained and reported, never silently discarded.
     MAX_REPLAY_BYTES = 128 * 1024 * 1024
+    # The orphan sweep opens one blob reader per queued row, so its cost scales
+    # with the backlog rather than with the number of stored media files. It is
+    # housekeeping only: skip it on a large queue and keep the sidecars.
+    MAX_ORPHAN_SCAN_ROWS = 2000
     # Legacy v1 rows may contain one complete media file inline. Recover one
     # such row at a time, rewrite it to v2 sidecar storage, then let normal
     # replay budgeting apply to the compact row.
@@ -1189,6 +1193,14 @@ class OutboundQueue:
     def _cleanup_orphan_media(self) -> None:
         referenced: set[str] = set()
         try:
+            queued = self.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
+            if queued > self.MAX_ORPHAN_SCAN_ROWS:
+                logging.getLogger(__name__).warning(
+                    "Skipping the outbound media sweep for %d queued rows (limit %d); "
+                    "unreferenced sidecar files are retained.",
+                    int(queued), self.MAX_ORPHAN_SCAN_ROWS,
+                )
+                return
             cursor = self.connection.execute("SELECT id FROM outbound_queue")
             for (row_id,) in cursor:
                 with _SQLiteBlobReader(self.path, int(row_id)) as payload:

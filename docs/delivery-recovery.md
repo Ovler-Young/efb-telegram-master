@@ -120,6 +120,12 @@ FROM outbound_queue
 WHERE delivery_hold IS NOT NULL;
 ```
 
+Startup sweeps unreferenced media sidecars only for a queue of at most
+`MAX_ORPHAN_SCAN_ROWS` rows, because the sweep opens one blob reader per
+queued row. A larger queue logs `Skipping the outbound media sweep` and keeps
+every sidecar; the sweep resumes as the queue drains. Delivery never depends
+on it.
+
 Sidecar uploads are wrapped with PTB `InputFile(read_file_handle=False)`, including
 nested input media. Passing a normal file object to PTB would otherwise read the
 whole attachment before the HTTP request, defeating the sidecar memory benefit.
