@@ -19,13 +19,10 @@ import tempfile
 import threading
 from functools import partial
 import time
-import urllib.parse
-import urllib.request
-import uuid
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, IO, Iterable, Mapping, Optional, Protocol, TYPE_CHECKING, cast
+from typing import Callable, IO, Iterable, Mapping, Optional, Protocol, TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 from telegram import (
@@ -186,11 +183,7 @@ class InvalidQueuedPayloadError(QueueError):
 
 
 class MissingQueuedExternalMediaError(InvalidQueuedPayloadError):
-    """A queued row referenced an external file that no longer exists."""
-
-    def __init__(self, message: str, external_uri: Optional[str] = None):
-        super().__init__(message)
-        self.external_uri = external_uri
+    pass
 
 
 class RequiredSenderUnavailableError(QueueError):
@@ -1093,83 +1086,13 @@ class OutboundQueue:
         except Exception as error:
             raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
 
-    def reacquire_external_media(
-        self, row_id: int, external_uri: Optional[str], *, timeout: float = 20.0,
-        max_bytes: int = 32 * 1024 * 1024,
-    ) -> bool:
-        """Fetch a still-reachable external URL into sidecar storage.
-
-        Queued rows hold references to temporary files and to source URLs that
-        expire. When such a reference is missing but the URL still answers, the
-        bytes are stored durably and the row keeps its place in the queue instead
-        of being discarded.
-        """
-        if not external_uri or urlsplit(external_uri).scheme.lower() not in {"http", "https"}:
-            return False
-        try:
-            with urllib.request.urlopen(external_uri, timeout=timeout) as response:
-                payload = response.read(max_bytes + 1)
-        except Exception:
-            return False
-        if len(payload) > max_bytes or not payload:
-            return False
-        storage_name = f"media-{uuid.uuid4().hex}"
-        path = self.media_dir / storage_name
-        try:
-            path.write_bytes(payload)
-        except OSError:
-            return False
-        with self._lock:
-            with self.connection:
-                row = self.connection.execute(
-                    "SELECT payload FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'",
-                    (row_id,),
-                ).fetchone()
-                if row is None or not row[0] or row[0][0] != 2:
-                    return False
-                try:
-                    loaded = pickle.loads(row[0][1:])
-                    args, kwargs = cast(tuple, loaded[0]), cast(dict, loaded[1])
-                except Exception:
-                    return False
-                replacement = _StoredMediaSnapshot(storage_name, Path(path).name)
-                args = self._repoint_media_reference(args, external_uri, replacement)
-                kwargs = self._repoint_media_reference(kwargs, external_uri, replacement)
-                cursor = self.connection.execute(
-                    "UPDATE outbound_queue SET payload = ? WHERE id = ? AND delivery_state = 'queued'",
-                    (self.encode_payload(args, kwargs), row_id),
-                )
-                if cursor.rowcount != 1:
-                    return False
-        return True
-
-    @classmethod
-    def _repoint_media_reference(
-        cls, value: object, external_uri: str, replacement: _StoredMediaSnapshot
-    ) -> object:
-        """Replace every reference to ``external_uri`` inside a queued payload."""
-        if isinstance(value, _StoredMediaSnapshot):
-            return replacement if value.external_uri == external_uri else value
-        if isinstance(value, list):
-            for index, item in enumerate(value):
-                value[index] = cls._repoint_media_reference(item, external_uri, replacement)
-            return value
-        if isinstance(value, tuple):
-            return tuple(cls._repoint_media_reference(item, external_uri, replacement) for item in value)
-        if isinstance(value, dict):
-            for key, item in value.items():
-                value[key] = cls._repoint_media_reference(item, external_uri, replacement)
-            return value
-        return value
-
     def _restore_media_references(self, value: object, opened: list[object]) -> object:
         if isinstance(value, _StoredMediaSnapshot):
             if value.external_uri is not None:
                 external_path = self._local_media_path(value.external_uri)
                 if external_path is None or not external_path.is_file():
                     raise MissingQueuedExternalMediaError(
-                        f"Queued external media file {value.external_uri!r} is missing.",
-                        value.external_uri,
+                        f"Queued external media file {value.external_uri!r} is missing."
                     )
                 return value.external_uri
             if value.storage_name is None:
@@ -3161,9 +3084,6 @@ class OutboundQueueScheduler:
                     args, kwargs = self.queue.decode_payload(row.payload)
                 except MissingQueuedExternalMediaError as error:
                     self._permits.release()
-                    if self.queue.reacquire_external_media(row.id, getattr(error, "external_uri", None)):
-                        self._schedule_retry(time.monotonic())
-                        continue
                     self._reopen_aggregation(row)
                     try:
                         self.queue.delete(row.id)
