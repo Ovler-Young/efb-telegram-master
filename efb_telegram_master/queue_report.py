@@ -35,16 +35,28 @@ QUERIES = (
         GROUP BY 1, 2
         ORDER BY queued DESC
     """),
+    # One Telegram group can carry many chatassoc rows (every relink adds one), so
+    # depth must be aggregated before the name lookup or the count multiplies.
     ("per destination with the bound slave chat", f"""
-        SELECT q.telegram_chat_id AS tg_chat, COALESCE(q.thread_id, 0) AS topic,
-               COUNT(*) AS queued,
-               {NOW_SECONDS} - CAST(MIN(q.created_at) AS INTEGER) AS oldest_age_s,
-               COALESCE(s.slave_chat_name, c.slave_uid, '(unlinked)') AS slave_chat
-        FROM outbound_queue q
-        LEFT JOIN tg.chatassoc c ON c.master_uid LIKE '% ' || q.telegram_chat_id
-        LEFT JOIN tg.slavechatinfo s ON s.slave_chat_uid = c.slave_uid
-        WHERE q.delivery_state = 'queued'
-        GROUP BY 1, 2
+        WITH depth AS (
+            SELECT q.telegram_chat_id AS tg_chat, COALESCE(q.thread_id, 0) AS topic,
+                   COUNT(*) AS queued, MIN(q.created_at) AS oldest_created
+            FROM outbound_queue q
+            WHERE q.delivery_state = 'queued'
+            GROUP BY 1, 2
+        ),
+        names AS (
+            SELECT c.master_uid AS master_uid,
+                   MIN(COALESCE(s.slave_chat_name, c.slave_uid)) AS slave_chat
+            FROM tg.chatassoc c
+            LEFT JOIN tg.slavechatinfo s ON s.slave_chat_uid = c.slave_uid
+            GROUP BY c.master_uid
+        )
+        SELECT d.tg_chat AS tg_chat, d.topic AS topic, d.queued AS queued,
+               {NOW_SECONDS} - CAST(d.oldest_created AS INTEGER) AS oldest_age_s,
+               COALESCE(n.slave_chat, '(unlinked)') AS slave_chat
+        FROM depth d
+        LEFT JOIN names n ON n.master_uid LIKE '% ' || d.tg_chat
         ORDER BY queued DESC
     """),
     ("by source: live traffic, aggregation rows, history backfill", f"""
@@ -71,23 +83,29 @@ QUERIES = (
         GROUP BY bucket
         ORDER BY MIN(age)
     """),
-    ("head per destination: age and position in its lane", f"""
+    # implied_per_min is the lane's own drain rate in steady state: depth divided by
+    # how long its oldest dispatchable row has waited. Far below the bot-chat limit
+    # (18/minute) means the lane is waiting on uploads, not on the rate limiter.
+    ("head per destination: age, position and drain rate", f"""
         WITH heads AS (
-            SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id
+            SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id,
+                   COUNT(*) AS lane_depth
             FROM outbound_queue
             WHERE delivery_state = 'queued' AND delivery_hold IS NULL
             GROUP BY telegram_chat_id, COALESCE(thread_id, 0)
         )
         SELECT q.telegram_chat_id AS tg_chat, COALESCE(q.thread_id, 0) AS topic, q.id AS head_id,
-               q.operation, q.priority,
+               q.operation, q.priority, h.lane_depth AS lane_depth,
                {NOW_SECONDS} - CAST(q.created_at AS INTEGER) AS head_age_s,
                (SELECT COUNT(*) FROM outbound_queue w
                  WHERE w.telegram_chat_id = q.telegram_chat_id
                    AND COALESCE(w.thread_id, 0) = COALESCE(q.thread_id, 0)
                    AND w.delivery_state = 'queued'
-                   AND w.id <= q.id) AS position_in_lane
+                   AND w.id <= q.id) AS position_in_lane,
+               ROUND(h.lane_depth * 60.0 / MAX(1, {NOW_SECONDS} - CAST(q.created_at AS INTEGER)), 2)
+                   AS implied_per_min
         FROM outbound_queue q
-        JOIN heads ON q.id = heads.head_id
+        JOIN heads h ON q.id = h.head_id
         ORDER BY head_age_s DESC
     """),
     ("blocked rows: awaiting reconciliation or held", f"""

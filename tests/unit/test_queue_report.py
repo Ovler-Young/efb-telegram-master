@@ -40,6 +40,9 @@ def test_report_prints_depth_age_and_sources_per_destination(tmp_path):
                 formatted_text TEXT, media_type TEXT, source_time TEXT, received_time TEXT,
                 position INTEGER, created_at TEXT, generation TEXT);
             INSERT INTO chatassoc (master_uid, slave_uid) VALUES ('blueset.telegram -1001', 'slave group A');
+            -- Every relink adds a chatassoc row: depth must not multiply by them.
+            INSERT INTO chatassoc (master_uid, slave_uid) VALUES ('blueset.telegram -1001', 'slave group A');
+            INSERT INTO chatassoc (master_uid, slave_uid) VALUES ('blueset.telegram -1001', 'slave group A');
             INSERT INTO slavechatinfo (slave_channel_id, slave_chat_uid, slave_chat_name, slave_chat_type)
                 VALUES ('tests', 'slave group A', 'A group', 'group');
         """)
@@ -48,7 +51,9 @@ def test_report_prints_depth_age_and_sources_per_destination(tmp_path):
     assert report(tmp_path, out) == 0
     printed = out.getvalue()
     assert "-1001 | 11 | 3" in printed          # depth per (chat, topic)
+    assert "-1001 | 11 | 9" not in printed       # repeated chatassoc rows must not fan out
     assert "A group" in printed                  # bound slave chat name
+    assert "implied_per_min" in printed          # lane drain rate vs the bot-chat limit
     assert "__history__:slave group B" not in printed
     assert "history | slave group B | 1" in printed  # backfill rows are separable
     # Read-only: the queue is untouched and can still be opened exclusively.
