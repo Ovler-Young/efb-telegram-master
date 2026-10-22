@@ -2797,7 +2797,7 @@ class OutboundQueueScheduler:
                 self._permits.release()
                 self._record_dispatch("deferred")
                 self.queue.observe_metrics(
-                    lambda metrics: metrics.record_retry(retry.row.priority, retry.row.operation, "rate_limit")
+                    lambda metrics: metrics.record_retry(retry.row.priority, retry.row.operation, "local_limit")
                 )
                 self._schedule_blocking_retry_before_deadline(retry, now + 0.25)
                 continue
@@ -3083,7 +3083,7 @@ class OutboundQueueScheduler:
                     self._permits.release()
                     self._record_dispatch("deferred")
                     self.queue.observe_metrics(
-                        lambda metrics: metrics.record_retry(row.priority, row.operation, "rate_limit")
+                        lambda metrics: metrics.record_retry(row.priority, row.operation, "local_limit")
                     )
                     self._schedule_retry(now + 0.25)
                     continue
