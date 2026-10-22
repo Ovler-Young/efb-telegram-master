@@ -426,7 +426,8 @@ class TelegramBotManager(LocaleMixin):
     @classmethod
     def _parse_send_worker_count(cls, config: Mapping[str, object]) -> int:
         """Concurrent outbound sends; the queue grants one permit per worker."""
-        raw = config.get(cls.SEND_WORKER_COUNT_KEY)
+        flags = config.get('flags')
+        raw = flags.get(cls.SEND_WORKER_COUNT_KEY) if isinstance(flags, collections.abc.Mapping) else None
         try:
             parsed = int(str(raw))
         except (TypeError, ValueError):
