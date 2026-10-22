@@ -1129,12 +1129,13 @@ class OutboundQueue:
                     return False
                 try:
                     loaded = pickle.loads(row[0][1:])
-                    args, kwargs = cast(tuple, loaded[0]), cast(dict, loaded[1])
+                    args: tuple = cast(tuple, loaded[0])
+                    kwargs: dict = cast(dict, loaded[1])
                 except Exception:
                     return False
                 replacement = _StoredMediaSnapshot(storage_name, Path(path).name)
-                args = self._repoint_media_reference(args, external_uri, replacement)
-                kwargs = self._repoint_media_reference(kwargs, external_uri, replacement)
+                args = cast(tuple, self._repoint_media_reference(args, external_uri, replacement))
+                kwargs = cast(dict, self._repoint_media_reference(kwargs, external_uri, replacement))
                 cursor = self.connection.execute(
                     "UPDATE outbound_queue SET payload = ? WHERE id = ? AND delivery_state = 'queued'",
                     (self.encode_payload(args, kwargs), row_id),
