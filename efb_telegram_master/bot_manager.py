@@ -1986,15 +1986,16 @@ class TelegramBotManager(LocaleMixin):
             # Dropping a retained row and cooling the whole sender/chat down must
             # never be silent: this is the only place those decisions are made.
             self.logger.warning(
-                "Queued row %s (%s) discarded after a rate-limit verdict: error=%s/%s, "
+                "Queued row %s (%s) discarded after a rate-limit verdict: error=%s/%s (%s), "
                 "cooldown=%.0fs. The row was not retried.",
                 getattr(row, "id", None), operation, type(error).__name__, cause_name,
-                cooldown_seconds,
+                str(error)[:200], cooldown_seconds,
             )
         else:
             self.logger.warning(
-                "Queued row %s (%s) discarded: error=%s/%s.",
+                "Queued row %s (%s) discarded: error=%s/%s (%s).",
                 getattr(row, "id", None), operation, type(error).__name__, cause_name,
+                str(error)[:200],
             )
         self._finish_queued_database_update(getattr(row, "id", None))
         self._run_database_update_callback(
