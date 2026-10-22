@@ -2631,20 +2631,6 @@ class OutboundQueueScheduler:
         self._reconciliation_not_before = 0.0
 
     @staticmethod
-    def _alternate_drain_and_age(heads: list[QueuedCall]) -> list[QueuedCall]:
-        """Offer every second head slot to the shortest queue, the rest by age.
-
-        `heads()` already returns destinations shortest-queue-first, which drains
-        the waiting set fastest but would strand a deep destination behind an
-        endless supply of shallow ones. Alternating with the oldest-first order
-        spends half of one pass' permits on each, without per-lane accounting: the
-        two orders coincide while depths agree, and whichever order runs out first
-        simply lets the other continue. Duplicates keep the drain position.
-        """
-        by_age = sorted(heads, key=lambda row: row.id)
-        return list({row.id: row for pair in zip(heads, by_age) for row in pair}.values())
-
-    @staticmethod
     def _destination_key(row: QueuedCall) -> tuple[int, Optional[int]]:
         """Serialization unit: one Telegram topic, not one whole group."""
         return (row.telegram_chat_id, row.thread_id)
@@ -3013,7 +2999,6 @@ class OutboundQueueScheduler:
                         "dispatching the oldest row of %d destination(s) to break the cycle.",
                         len(heads),
                     )
-            heads = self._alternate_drain_and_age(heads)
             for row in heads:
                 if (
                     row.id in self.in_flight
