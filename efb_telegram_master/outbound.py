@@ -19,6 +19,7 @@ import tempfile
 import threading
 from functools import partial
 import time
+import urllib.request
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1091,6 +1092,16 @@ class OutboundQueue:
             if value.external_uri is not None:
                 external_path = self._local_media_path(value.external_uri)
                 if external_path is None or not external_path.is_file():
+                    # Same handling as the first receive: fetch it and let the
+                    # normal media path store it, instead of dropping the row.
+                    if urlsplit(value.external_uri).scheme.lower() in {"http", "https"}:
+                        try:
+                            with urllib.request.urlopen(value.external_uri, timeout=20) as response:
+                                body = response.read(self.MAX_REPLAY_BYTES + 1)
+                        except Exception:
+                            body = b""
+                        if 0 < len(body) <= self.MAX_REPLAY_BYTES:
+                            return self._store_media_stream(io.BytesIO(body), value.filename)
                     raise MissingQueuedExternalMediaError(
                         f"Queued external media file {value.external_uri!r} is missing."
                     )
