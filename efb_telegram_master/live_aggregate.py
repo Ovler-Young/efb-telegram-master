@@ -24,6 +24,7 @@ class _Stream:
     recent: list[float] = field(default_factory=list)
     last_new: float = 0
     generation: int = 0
+    closed: Optional[tuple] = None
 
 
 class LiveTextAggregation:
@@ -103,12 +104,34 @@ class LiveTextAggregation:
         """
         stream = self.streams.get(tuple(key))
         if stream is not None:
+            stream.closed = (stream.base, stream.generation)
             stream.base = None
             stream.generation += 1
-            logging.getLogger(__name__).info(
+            logging.getLogger(__name__).debug(
                 "Live aggregation closed %s after %s (generation %s)", tuple(key), reason,
                 stream.generation,
             )
+
+    def reopen(self, row):
+        """Rejoin the text run a discarded media row had ended.
+
+        An undeliverable media row is removed without ever reaching Telegram, so
+        the boundary it created was phantom: restore the container it closed
+        instead of starting a new one.
+        """
+        from .queued_log import decode_aggregation
+        context = decode_aggregation(row.log_context) if row.log_context else None
+        if not context:
+            return
+        stream = self.streams.get(tuple(context["key"]))
+        if stream is None or stream.tail != row.id:
+            return
+        predecessor = row.predecessor_id
+        stream.tail = predecessor if predecessor and self.queue.contains(predecessor) else None
+        if stream.closed is not None:
+            stream.base, stream.generation = stream.closed
+            stream.closed = None
+        self.scheduler.wake_event.set()
 
     def close_destination(self, chat_id, topic):
         """New Telegram messages end every source stream in their destination."""

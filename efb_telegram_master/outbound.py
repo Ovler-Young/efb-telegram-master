@@ -529,6 +529,9 @@ class QueueAdapter(Protocol):
     def acquire_sender_limits(self, selection: SenderSelection, telegram_chat_id: int) -> bool:
         ...
 
+    def reopen_aggregation(self, row: QueuedCall) -> None:
+        ...
+
     def execute_queued_call(
         self, row: QueuedCall, args: tuple, kwargs: dict, selection: SenderSelection
     ) -> object:
@@ -2696,6 +2699,19 @@ class OutboundQueueScheduler:
         with self._lock:
             return len(self.in_flight)
 
+    def _reopen_aggregation(self, row: QueuedCall) -> None:
+        """Tell the master a retained row will never reach Telegram.
+
+        The media row was removed without being delivered, so the aggregation
+        boundary it created must not split the surrounding text run.
+        """
+        reopen = getattr(self.adapter, "reopen_aggregation", None)
+        if callable(reopen) and row.log_context:
+            try:
+                reopen(row)
+            except Exception:
+                logging.getLogger(__name__).exception("Unable to reopen an aggregation stream.")
+
     def _schedule_retry(self, retry_at: float) -> None:
         self.next_deadline = min(self.next_deadline, retry_at) if self.next_deadline else retry_at
 
@@ -3068,6 +3084,7 @@ class OutboundQueueScheduler:
                     args, kwargs = self.queue.decode_payload(row.payload)
                 except MissingQueuedExternalMediaError as error:
                     self._permits.release()
+                    self._reopen_aggregation(row)
                     try:
                         self.queue.delete(row.id)
                     except Exception as delete_error:
@@ -3340,6 +3357,7 @@ class OutboundQueueScheduler:
                         except Exception as delete_error:
                             self._stop_for_persistence_error(delete_error)
                             return
+                        self._reopen_aggregation(submitted.row)
                         self._record_terminal_discard(submitted.row)
                         self._row_not_before.pop(row_id, None)
                     else:

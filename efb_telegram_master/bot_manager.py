@@ -2002,6 +2002,11 @@ class TelegramBotManager(LocaleMixin):
         )
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
+    def reopen_aggregation(self, row) -> None:
+        aggregation = getattr(self, "live_aggregation", None)
+        if aggregation is not None:
+            aggregation.reopen(row)
+
     def record_queued_retry_after(
         self, row, error: telegram.error.RetryAfter, selection: SenderSelection
     ) -> None:
