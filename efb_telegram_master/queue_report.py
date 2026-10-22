@@ -134,6 +134,48 @@ QUERIES = (
 )
 
 
+def legacy_topic_rows(db: sqlite3.Connection, out) -> None:
+    """Rows whose lane says "main chat" but whose request still names a topic.
+
+    Rows written before the topic column existed kept the topic in the payload (or
+    in an aggregated container's context), so they share the chat's main lane with
+    the traffic that really targets it. Opening the queue repairs them; this only
+    reports how many are waiting for that.
+    """
+    from .outbound import InvalidQueuedPayloadError, OutboundQueue, queued_thread_id
+
+    rows = db.execute(
+        "SELECT id, telegram_chat_id, operation, payload, log_context FROM outbound_queue "
+        "WHERE delivery_state = 'queued' AND thread_id IS NULL ORDER BY id",
+    ).fetchall()
+    recoverable: dict[int, int] = {}
+    unknown = 0
+    samples: list[tuple[int, int, str, int]] = []
+    for row_id, chat_id, operation, payload, log_context in rows:
+        thread_id = None
+        if payload and bytes(payload[:1]) == b"\x02":
+            try:
+                _args, kwargs = OutboundQueue.decode_payload_raw(bytes(payload))
+                thread_id = queued_thread_id(kwargs, log_context)
+            except (InvalidQueuedPayloadError, ValueError):
+                thread_id = None
+        if thread_id is None:
+            unknown += 1
+            continue
+        recoverable[int(chat_id)] = recoverable.get(int(chat_id), 0) + 1
+        if len(samples) < 20:
+            samples.append((int(row_id), int(chat_id), str(operation), thread_id))
+    print(f"   rows with no topic: {len(rows)}", file=out)
+    print(f"   recoverable from the request: {len(rows) - unknown}  "
+          f"genuinely the main chat: {unknown}", file=out)
+    print("   per chat: " + ", ".join(
+        f"{chat_id}={count}" for chat_id, count in
+        sorted(recoverable.items(), key=lambda item: -item[1])[:20]), file=out)
+    print("   sample rows: " + ", ".join(
+        f"#{row_id} {operation} -> topic {thread_id}" for row_id, _chat, operation, thread_id in samples),
+        file=out)
+
+
 def resolve_data_dir(value: Path | None) -> Path:
     if value is not None:
         return Path(value).expanduser().resolve()
@@ -165,6 +207,11 @@ def report(directory: Path, out=sys.stdout) -> int:
             print("   " + " | ".join(column[0] for column in cursor.description), file=out)
             for row in cursor.fetchall():
                 print("   " + " | ".join(str(value) for value in row), file=out)
+        print("\n== rows stuck in the main lane whose request names a topic", file=out)
+        try:
+            legacy_topic_rows(db, out)
+        except sqlite3.Error as error:
+            print(f"   skipped: {error}", file=out)
     return 0
 
 

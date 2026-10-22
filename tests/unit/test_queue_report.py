@@ -65,3 +65,26 @@ def test_data_dir_defaults_to_the_directory_holding_the_queue(tmp_path, monkeypa
     (tmp_path / QUEUE_FILENAME).write_bytes(b"")
     monkeypatch.chdir(tmp_path)
     assert resolve_data_dir(None) == tmp_path
+
+
+def test_report_measures_rows_that_still_carry_a_topic_in_their_request(tmp_path):
+    def send_photo(photo, chat_id, message_thread_id=None):
+        return photo, chat_id, message_thread_id
+
+    queue = OutboundQueue(tmp_path)
+    for _ in range(2):
+        queue.enqueue_many([QueueRequest("send_photo", (b"image",), {
+            "chat_id": -1001, "message_thread_id": 42,
+        })], lambda _operation: send_photo)
+    queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -1001, "text": "main"})],
+                       lambda _operation: send_message)
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET thread_id = NULL")
+    queue.close()
+
+    out = io.StringIO()
+    assert report(tmp_path, out) == 0
+    printed = out.getvalue()
+    assert "rows with no topic: 3" in printed
+    assert "recoverable from the request: 2" in printed   # the two photo sends name topic 42
+    assert "genuinely the main chat: 1" in printed

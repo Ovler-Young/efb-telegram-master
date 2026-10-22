@@ -629,6 +629,10 @@ class OutboundQueue:
     # with the backlog rather than with the number of stored media files. It is
     # housekeeping only: skip it on a large queue and keep the sidecars.
     MAX_ORPHAN_SCAN_ROWS = 2000
+    # Repairing a legacy row's topic means decoding its payload; never pull an
+    # oversized row into memory just to learn it. Such rows keep their topic NULL
+    # until their own recovery path re-encodes them.
+    MAX_TOPIC_REPAIR_BYTES = 1024 * 1024
     # Legacy v1 rows may contain one complete media file inline. Recover one
     # such row at a time, rewrite it to v2 sidecar storage, then let normal
     # replay budgeting apply to the compact row.
@@ -697,6 +701,12 @@ class OutboundQueue:
             connection.commit()
             self._connection = connection
             self._cleanup_orphan_media()
+            repaired = self.repair_legacy_thread_ids()
+            if repaired:
+                logging.getLogger(__name__).info(
+                    "Recovered the forum topic of %d queued row(s) that stored it only in the "
+                    "request; those rows no longer share the chat's main lane.", repaired,
+                )
             self.refresh_depth()
         except BaseException:
             try:
@@ -711,6 +721,50 @@ class OutboundQueue:
                     self._ownership_file.close()
                     self._ownership_file = None
             raise
+
+    def repair_legacy_thread_ids(self, batch: int = 512) -> int:
+        """Fill ``thread_id`` for rows that kept their topic only inside the request.
+
+        Rows written before the topic column existed carry the topic in the payload
+        kwargs, and an aggregated container carries it in its context key. Without
+        this they all look like the chat's main topic and share one lane, so a topic
+        runs at half speed next to its own backlog and its two lanes can be
+        dispatched in parallel. Idempotent: only ``NULL`` topics are written.
+        """
+        repaired = 0
+        after_id = 0
+        while True:
+            with self._lock:
+                rows = self.connection.execute(
+                    "SELECT id, payload, log_context FROM outbound_queue "
+                    "WHERE id > ? AND delivery_state = 'queued' AND thread_id IS NULL "
+                    "AND length(payload) <= ? "
+                    "AND length(COALESCE(log_context, X'')) <= ? "
+                    "ORDER BY id LIMIT ?",
+                    (after_id, self.MAX_TOPIC_REPAIR_BYTES, self.MAX_TOPIC_REPAIR_BYTES, batch),
+                ).fetchall()
+            if not rows:
+                return repaired
+            updates: list[tuple[int, int]] = []
+            for row_id, payload, log_context in rows:
+                after_id = int(row_id)
+                if not payload or bytes(payload[:1]) != b"\x02":
+                    # Legacy inline rows are re-encoded by their own recovery path.
+                    continue
+                try:
+                    _args, kwargs = self.decode_payload_raw(bytes(payload))
+                except InvalidQueuedPayloadError:
+                    continue
+                thread_id = queued_thread_id(kwargs, log_context)
+                if thread_id is not None:
+                    updates.append((thread_id, int(row_id)))
+            if updates:
+                with self._lock, self.connection:
+                    self.connection.executemany(
+                        "UPDATE outbound_queue SET thread_id = ? WHERE id = ? AND thread_id IS NULL",
+                        updates,
+                    )
+                repaired += len(updates)
 
     @staticmethod
     def _migrate_schema(connection: sqlite3.Connection) -> None:
