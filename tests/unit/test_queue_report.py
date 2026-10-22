@@ -142,3 +142,15 @@ def test_lane_listing_shows_why_a_row_is_not_sendable(tmp_path):
     assert "uncertain:TimedOut/ReadTimeout" in printed
     assert f"{second} | 0 | send_message | - |" in printed      # the unheld row is sendable
     assert "sendable" in printed
+
+
+def test_a_negative_chat_id_is_accepted_as_a_lane(tmp_path, capsys):
+    from efb_telegram_master.queue_report import main
+
+    queue = OutboundQueue(tmp_path)
+    queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -1001, "text": "a"})],
+                       lambda _operation: send_message)
+    queue.close()
+    assert main(["--data-dir", str(tmp_path), "--lane", "-1001:0"]) == 0
+    printed = capsys.readouterr().out
+    assert "lane -1001:0 in send order" in printed

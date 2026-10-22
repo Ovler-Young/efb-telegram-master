@@ -286,8 +286,10 @@ def resolve_data_dir(value) -> Path:
     return base / "profiles" / "default" / MODULE_ID
 
 
-def report(queue_path: Path, tg_path: Path | None = None, out=sys.stdout,
+def report(queue_path: Path, tg_path: Path | None = None, out=None,
            lane_target: tuple[int, int] | None = None, limit: int = 25) -> int:
+    if out is None:
+        out = sys.stdout
     queue_path = Path(queue_path).resolve()
     if not queue_path.exists():
         raise FileNotFoundError(f"No outbound queue at {queue_path}")
@@ -325,6 +327,21 @@ def report(queue_path: Path, tg_path: Path | None = None, out=sys.stdout,
     return 0
 
 
+def _join_negative_lane(argv: list[str]) -> list[str]:
+    """Telegram chat ids are negative, so `--lane -1001:40` looks like an option."""
+    joined: list[str] = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--lane" and index + 1 < len(argv) and argv[index + 1].startswith("-"):
+            joined.append(f"--lane={argv[index + 1]}")
+            index += 2
+            continue
+        joined.append(item)
+        index += 1
+    return joined
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -336,7 +353,9 @@ def main(argv=None) -> int:
     parser.add_argument("--lane", default=None, metavar="CHAT[:TOPIC]",
                         help="Also list one destination's queued rows in send order")
     parser.add_argument("--limit", type=int, default=25, help="Rows to list for --lane")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(
+        _join_negative_lane(list(sys.argv[1:] if argv is None else argv))
+    )
     lane_target = None
     if args.lane:
         chat, _, topic = args.lane.partition(":")
