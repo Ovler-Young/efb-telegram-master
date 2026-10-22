@@ -252,8 +252,8 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
         monkeypatch.setattr(adapter, "acquire_sender_limits", lambda selection, chat_id: False)
         for _ in range(3):
             scheduler.dispatch_once()
-        # The row is read before the rate-limit check so an undeliverable row
-        # never spends a token; nothing may be submitted and no permit retained.
+        # A full bucket must not cost a payload read: the row is deferred before
+        # the blob is touched, and nothing is submitted.
         assert scheduler.in_flight == {}
         assert scheduler._permits.acquire(blocking=False)
         scheduler._permits.release()

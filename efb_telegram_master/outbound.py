@@ -3030,6 +3030,16 @@ class OutboundQueueScheduler:
                     if decision.retry_at is not None:
                         self._schedule_retry(decision.retry_at)
                     continue
+                # Take capacity before reading the payload: a rejection here must
+                # stay cheap, because a full bucket re-asks within 250 ms.
+                if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
+                    self._permits.release()
+                    self._record_dispatch("deferred")
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_retry(row.priority, row.operation, "local_limit")
+                    )
+                    self._schedule_retry(now + 0.25)
+                    continue
                 try:
                     if legacy_recovery:
                         row = self.queue.recover_legacy_media_payload(row.id)
@@ -3076,17 +3086,6 @@ class OutboundQueueScheduler:
                     self._permits.release()
                     self._stop_for_persistence_error(error)
                     return
-                # Take rate-limit capacity only once the payload is known to be
-                # deliverable: rows discarded here would otherwise spend a token
-                # without ever calling Telegram.
-                if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
-                    self._permits.release()
-                    self._record_dispatch("deferred")
-                    self.queue.observe_metrics(
-                        lambda metrics: metrics.record_retry(row.priority, row.operation, "local_limit")
-                    )
-                    self._schedule_retry(now + 0.25)
-                    continue
                 # Rows carrying a durable log context are retained until the
                 # MsgLog write is committed, regardless of blocking priority.
                 retained = row.priority == 0 or row.log_context is not None or row.operation in RETAINED_OPERATIONS
