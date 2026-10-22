@@ -40,6 +40,8 @@ class LiveTextAggregation:
         self.container_tails: dict[str, int] = {}
         self._source_delivery = ContextVar("aggregate_source_delivery", default=None)
         self._independent: ContextVar[Optional[tuple]] = ContextVar("aggregate_independent", default=None)
+        self._close_counts: dict[str, int] = {}
+        self._close_logged_at = 0.0
         rows = self.queue.aggregation_rows()
         publication_rows = {}
         predecessors = {}
@@ -107,10 +109,18 @@ class LiveTextAggregation:
             stream.closed = (stream.base, stream.generation)
             stream.base = None
             stream.generation += 1
-            logging.getLogger(__name__).debug(
-                "Live aggregation closed %s after %s (generation %s)", tuple(key), reason,
-                stream.generation,
-            )
+            # One line a minute, with a tally: every container close splits a run,
+            # and which rule did it is the only way to tell why. Unthrottled, this
+            # would flood an active chat.
+            self._close_counts[reason] = self._close_counts.get(reason, 0) + 1
+            now = time.monotonic()
+            if now - self._close_logged_at >= 60.0:
+                self._close_logged_at = now
+                logging.getLogger(__name__).warning(
+                    "Live aggregation container closes in the last interval: %s (latest %s)",
+                    dict(self._close_counts), reason,
+                )
+                self._close_counts.clear()
 
     def reopen(self, row):
         """Rejoin the text run a discarded media row had ended.
