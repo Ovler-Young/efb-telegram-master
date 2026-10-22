@@ -160,6 +160,9 @@ class LiveTextAggregation:
                 self.close(key)
             predecessor = self._existing_tail(stream) or prior_tail
             inherit = bool(predecessor and context and context.get("generation") == stream.generation and not context.get("incoming_boundary"))
+            # The window applies from the first member: otherwise the container is
+            # dispatched before it can absorb the run, and every later member starts
+            # a new container instead of joining this one.
             waiting = len(stream.recent) > 2
             context = dict(format_version=1, kind="logical", key=key, members=[member],
                            base=stream.base, inherit=inherit, generation=stream.generation,

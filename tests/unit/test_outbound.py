@@ -1189,7 +1189,7 @@ def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path
 
     assert [row.id for row in queue.heads()] == [row_id]
     assert not waiter.done()
-    assert scheduler.next_deadline == 10.25
+    assert scheduler.next_deadline == 11.0
     assert adapter.calls == []
 
 

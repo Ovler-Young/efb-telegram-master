@@ -2583,6 +2583,9 @@ class OutboundQueueScheduler:
     # A pass that leaves runnable rows behind without a retry deadline reschedules
     # itself instead of waiting for an event that may never arrive.
     STALL_RESCAN_SECONDS = 30.0
+    # A full sender bucket frees one slot every few seconds; re-asking every
+    # 250 ms only re-scanned the queue four times a second.
+    LOCAL_LIMIT_RETRY_SECONDS = 1.0
     # Enqueues and completions wake the worker; report a persistent stall once a
     # minute instead of once per pass.
     STALL_REPORT_INTERVAL = 60.0
@@ -3051,7 +3054,7 @@ class OutboundQueueScheduler:
                     self.queue.observe_metrics(
                         lambda metrics: metrics.record_retry(row.priority, row.operation, "local_limit")
                     )
-                    self._schedule_retry(now + 0.25)
+                    self._schedule_retry(now + self.LOCAL_LIMIT_RETRY_SECONDS)
                     continue
                 try:
                     if legacy_recovery:
@@ -3144,7 +3147,7 @@ class OutboundQueueScheduler:
                         lambda metrics: metrics.record_failure(row.priority, row.operation, "dispatch")
                     )
                     if retained:
-                        self._schedule_retry(now + 0.25)
+                        self._schedule_retry(now + self.LOCAL_LIMIT_RETRY_SECONDS)
                     else:
                         self.queue.cleanup_payload_media(row.payload)
                         submit_error = ExecutorSubmitError("Unable to submit queued Telegram call.")
