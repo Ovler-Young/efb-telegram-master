@@ -225,3 +225,66 @@ def test_one_topic_keeps_serial_order(tmp_path):
             scheduler.stop_and_drain(timeout=2)
             queue.close()
     assert second > first
+
+
+def test_short_destination_queues_are_offered_head_slots_first(tmp_path):
+    """Emptying short queues shrinks the waiting-destination set fastest."""
+    queue = OutboundQueue(tmp_path)
+    try:
+        def send_message(chat_id: int, text: str):
+            return chat_id, text
+
+        def queue_row(chat_id, text):
+            return queue.enqueue_many(
+                [QueueRequest("send_message", (), {"chat_id": chat_id, "text": text})],
+                lambda _operation: send_message,
+            )[0]
+
+        for index in range(3):          # deepest queue, enqueued first
+            queue_row(11, f"a{index}")
+        short = queue_row(12, "b0")     # one waiting row
+        queue_row(13, "c0")             # two waiting rows
+        queue_row(13, "c1")
+        equally_short = queue_row(14, "d0")
+
+        assert [row.telegram_chat_id for row in queue.heads(ready_only=True)] == [12, 14, 13, 11]
+        heads = queue.heads(ready_only=True)
+        assert [row.id for row in heads if row.telegram_chat_id == 12] == [short]
+        assert [row.id for row in heads if row.telegram_chat_id == 14] == [equally_short]
+        # A deeper queue is still visited, just after the ones that empty sooner.
+        assert queue.heads(ready_only=True)[-1].id < short
+    finally:
+        queue.close()
+
+
+def test_a_deep_queue_keeps_a_slot_beside_shallow_ones(tmp_path):
+    """Half of a pass goes to the shortest queue, half to the longest wait."""
+    queue = OutboundQueue(tmp_path)
+    adapter = Adapter(block=True)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=2)
+        try:
+            for index in range(5):  # deepest destination, and the oldest rows
+                enqueue(queue, QueueRequest("send_message", (), {"chat_id": -2000, "text": f"d{index}"}))
+            enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "a"}))
+            enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1002, "text": "b"}))
+            scheduler.dispatch_once()
+            assert {call.row.telegram_chat_id for call in scheduler.in_flight.values()} == {-2000, -1001}
+        finally:
+            adapter.release.set()
+            scheduler.stop_and_drain(timeout=2)
+            queue.close()
+
+
+def test_equal_depths_keep_the_plain_age_order(tmp_path):
+    """Alternating orders that agree must not reorder anything."""
+    queue = OutboundQueue(tmp_path)
+    try:
+        chats = (-1001, -1002, -1003)
+        rows = [enqueue(queue, QueueRequest("send_message", (), {"chat_id": chat, "text": "x"}))[0]
+                for chat in chats]
+        assert [row.id for row in queue.heads(ready_only=True)] == rows
+        assert [row.id for row in OutboundQueueScheduler._alternate_drain_and_age(
+            queue.heads(ready_only=True))] == rows
+    finally:
+        queue.close()

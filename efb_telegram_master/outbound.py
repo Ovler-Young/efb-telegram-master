@@ -1816,17 +1816,22 @@ class OutboundQueue:
             # Select one runnable head per destination before reading media BLOBs.
             # Quarantined historical rows may be skipped explicitly so one
             # unreplayable attachment does not strand all newer traffic for the
-            # same Telegram destination.
+            # same Telegram destination. Short queues are offered head slots
+            # first: a destination only stops competing for a slot once its queue
+            # is empty, so draining the short ones shrinks the set of waiting
+            # destinations fastest and frees slots for the long queues. Equal
+            # depths keep FIFO order by head ID.
             rows = self.connection.execute(
                 f"SELECT q.id, q.priority, q.telegram_chat_id, q.operation, {payload}, q.slave_id, "
                 f"q.required_sender_bot_id, q.created_at, {context}, q.delivery_state, {receipt}, "
                 "length(q.payload) + COALESCE(length(q.log_context), 0) + COALESCE(length(q.completion_receipt), 0), "
                 "q.reconcile_after, q.thread_id "
                 "FROM outbound_queue AS q JOIN ("
-                "SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id "
+                "SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id, "
+                "COUNT(*) AS waiting "
                 "FROM outbound_queue WHERE delivery_state = 'queued'" + exclusion_sql +
                 " GROUP BY telegram_chat_id, COALESCE(thread_id, 0)"
-                ") AS heads ON q.id = heads.head_id ORDER BY q.telegram_chat_id, q.thread_id",
+                ") AS heads ON q.id = heads.head_id ORDER BY heads.waiting, heads.head_id",
                 parameters,
             ).fetchall()
         return [
@@ -2626,6 +2631,20 @@ class OutboundQueueScheduler:
         self._reconciliation_not_before = 0.0
 
     @staticmethod
+    def _alternate_drain_and_age(heads: list[QueuedCall]) -> list[QueuedCall]:
+        """Offer every second head slot to the shortest queue, the rest by age.
+
+        `heads()` already returns destinations shortest-queue-first, which drains
+        the waiting set fastest but would strand a deep destination behind an
+        endless supply of shallow ones. Alternating with the oldest-first order
+        spends half of one pass' permits on each, without per-lane accounting: the
+        two orders coincide while depths agree, and whichever order runs out first
+        simply lets the other continue. Duplicates keep the drain position.
+        """
+        by_age = sorted(heads, key=lambda row: row.id)
+        return list({row.id: row for pair in zip(heads, by_age) for row in pair}.values())
+
+    @staticmethod
     def _destination_key(row: QueuedCall) -> tuple[int, Optional[int]]:
         """Serialization unit: one Telegram topic, not one whole group."""
         return (row.telegram_chat_id, row.thread_id)
@@ -2994,6 +3013,7 @@ class OutboundQueueScheduler:
                         "dispatching the oldest row of %d destination(s) to break the cycle.",
                         len(heads),
                     )
+            heads = self._alternate_drain_and_age(heads)
             for row in heads:
                 if (
                     row.id in self.in_flight

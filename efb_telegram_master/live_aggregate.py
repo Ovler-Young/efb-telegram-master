@@ -31,8 +31,6 @@ class LiveTextAggregation:
     # Members delivered this much later than they arrived are part of a backfill
     # rather than live traffic; their containers are held so the run can join.
     BACKFILL_LATENESS_SECONDS = 5.0
-    # Ignore absurd lags: a skewed clock must not turn live traffic into backfill.
-    BACKFILL_MAX_LAG_SECONDS = 7 * 24 * 3600.0
     """Keep append eligibility in memory and every unpublished member durable."""
 
     def __init__(self, manager):
@@ -216,8 +214,7 @@ class LiveTextAggregation:
             # A member that is already late when it reaches the aggregator belongs
             # to a backfill: hold its container for the window so the rest of the
             # run can join it. Fresh traffic still publishes immediately.
-            lag = time.time() - now
-            waiting = self.BACKFILL_LATENESS_SECONDS <= lag < self.BACKFILL_MAX_LAG_SECONDS
+            waiting = (time.time() - now) >= self.BACKFILL_LATENESS_SECONDS
             context = dict(format_version=1, kind="logical", key=key, members=[member],
                            base=stream.base, inherit=inherit, generation=stream.generation,
                            recent=stream.recent, last_new=now, waiting=waiting,
