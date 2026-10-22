@@ -2492,6 +2492,9 @@ class OutboundQueueScheduler:
     # A pass that leaves runnable rows behind without a retry deadline reschedules
     # itself instead of waiting for an event that may never arrive.
     STALL_RESCAN_SECONDS = 30.0
+    # Enqueues and completions wake the worker; report a persistent stall once a
+    # minute instead of once per pass.
+    STALL_REPORT_INTERVAL = 60.0
 
     def __init__(self, queue: OutboundQueue, adapter: QueueAdapter, executor: Executor, worker_count: int):
         self.queue = queue
@@ -2500,6 +2503,7 @@ class OutboundQueueScheduler:
         self._worker_count = worker_count
         self._permits = threading.BoundedSemaphore(worker_count)
         self._lock = threading.RLock()
+        self._stall_reported_at = 0.0
         self.wake_event = threading.Event()
         self.stopping = False
         self.failure: Optional[QueuePersistenceError] = None
@@ -3054,13 +3058,16 @@ class OutboundQueueScheduler:
                     # Nothing was dispatched and nothing is in flight, so no
                     # completion will wake this worker: without a deadline these
                     # rows would stay queued until the next message or restart.
-                    logging.getLogger(__name__).error(
-                        "Outbound scheduler left %d dispatchable head(s) undispatched with no "
-                        "retry deadline and nothing in flight while queued rows remain; "
-                        "rescanning in %.0f seconds.",
-                        len(heads), self.STALL_RESCAN_SECONDS,
-                    )
-                    self._schedule_retry(time.monotonic() + self.STALL_RESCAN_SECONDS)
+                    now = time.monotonic()
+                    if now - self._stall_reported_at >= self.STALL_REPORT_INTERVAL:
+                        self._stall_reported_at = now
+                        logging.getLogger(__name__).error(
+                            "Outbound scheduler left %d dispatchable head(s) undispatched with no "
+                            "retry deadline and nothing in flight while queued rows remain; "
+                            "rescanning in %.0f seconds.",
+                            len(heads), self.STALL_RESCAN_SECONDS,
+                        )
+                    self._schedule_retry(now + self.STALL_RESCAN_SECONDS)
 
     def harvest_completed(self) -> None:
         with self._lock:

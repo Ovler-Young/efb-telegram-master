@@ -129,3 +129,26 @@ def test_rows_that_no_head_can_cover_are_reported(tmp_path, caplog):
         assert "dispatchable head(s)" in caplog.records[-1].message
     finally:
         queue.close()
+
+
+def test_a_persistent_stall_is_reported_once_per_interval(tmp_path, monkeypatch, caplog):
+    """Wakes from new traffic must not turn a stall into a log flood."""
+    clock = [1000.0]
+    monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
+    queue, scheduler = _scheduler(tmp_path, Adapter())
+    first, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "first"}))
+    second, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "second"}))
+    queue.hold_uncertain_delivery(second, RuntimeError("unconfirmed"))
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (second, first))
+    try:
+        with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
+            scheduler.dispatch_once()
+            clock[0] += 5
+            scheduler.dispatch_once()
+            clock[0] += OutboundQueueScheduler.STALL_REPORT_INTERVAL + 1
+            scheduler.dispatch_once()
+        assert len([record for record in caplog.records if "dispatchable head(s)" in record.message]) == 2
+        assert scheduler.next_deadline is not None
+    finally:
+        queue.close()
