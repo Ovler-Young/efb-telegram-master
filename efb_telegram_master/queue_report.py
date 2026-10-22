@@ -234,6 +234,27 @@ def legacy_topic_rows(db: sqlite3.Connection, out) -> None:
         for row_id, _chat, operation, thread_id in samples), file=out)
 
 
+def media_footprint(queue_path: Path, out) -> None:
+    """Bytes still owed to Telegram: every upload has to come from these files.
+
+    The directory holds one sidecar per referenced attachment and may still contain
+    orphans, so this is an upper bound, not an exact queue size.
+    """
+    directory = Path(queue_path).parent / "outbound-media"
+    total = 0
+    files = 0
+    if directory.is_dir():
+        with __import__("os").scandir(directory) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file():
+                        total += entry.stat().st_size
+                        files += 1
+                except OSError:
+                    continue
+    print(f"   media sidecars: {files} files, {total} bytes ({total / 1024 ** 2:.0f} MiB)", file=out)
+
+
 def resolve_data_dir(value) -> Path:
     if value is not None:
         return Path(value).expanduser().resolve()
@@ -265,6 +286,8 @@ def report(queue_path: Path, tg_path: Path | None = None, out=sys.stdout) -> int
             print("   " + " | ".join(column[0] for column in cursor.description), file=out)
             for row in cursor.fetchall():
                 print("   " + " | ".join(str(value) for value in row), file=out)
+        print("\n== media still to upload", file=out)
+        media_footprint(queue_path, out)
         print("\n== rows stuck in the main lane whose request names a topic", file=out)
         try:
             legacy_topic_rows(db, out)
