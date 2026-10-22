@@ -482,22 +482,3 @@ def test_replay_lanes_are_per_topic_and_one_topic_never_hides_another(history):
     # The chat-wide selection used to pick one target and drain it before the other.
     assert history.db.get_next_history_migration_target(-1002) is not None
 
-
-def test_replay_lane_yields_between_batches_without_splitting_a_text_run(history):
-    """A turn ends between batches so aggregation finishes before its send."""
-    texts = [f'{"x" * 4000}\n' for _ in range(20)]
-    target = populate(history, texts)
-
-    assert history.binding._process_history_migration_target(target)
-    assert len(history.calls) == 8, "a lane yields after a bounded number of batches"
-    assert all(len(call['kwargs']['text']) <= 4096 - 20 for call in history.calls)
-    assert len(history.db.get_history_migration_entries('slave chat', -1002, 42)) == 12
-
-    assert history.binding._process_history_migration_target(
-        history.db.get_next_history_migration_target(-1002, 42))
-    assert len(history.calls) == 16
-
-    assert history.binding._process_history_migration_target(
-        history.db.get_next_history_migration_target(-1002, 42))
-    assert len(history.calls) == 20
-    assert not history.db.get_history_migration_entries('slave chat', -1002, 42)

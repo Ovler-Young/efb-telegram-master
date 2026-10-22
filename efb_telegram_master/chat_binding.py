@@ -103,12 +103,6 @@ class ChatBindingManager(LocaleMixin):
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
     FORUM_RELINK_THRESHOLD = 960_000
-    # One replay lane owns one topic. A lane yields between batches so a replaced
-    # or withdrawn staging generation is noticed without replaying a whole topic
-    # first. A turn never splits a text run: aggregation finishes before the lane
-    # hands over.
-    HISTORY_MIGRATION_TURN_BATCHES = 8
-    HISTORY_MIGRATION_TURN_SECONDS = 60.0
     # Class-level so a lane built without __init__ still sweeps exactly once.
     _history_ownership_swept = False
     display_timezone = DEFAULT_TIMEZONE
@@ -1883,13 +1877,6 @@ class ChatBindingManager(LocaleMixin):
         entry_ids: List[int] = []
         text_kwargs: dict[str, object] = {}
         text_length = 0
-        # Mutable counters so the nested flush can account for its own batch.
-        batches = [0]
-        turn_deadline = time.monotonic() + self.HISTORY_MIGRATION_TURN_SECONDS
-
-        def turn_over() -> bool:
-            return (batches[0] >= self.HISTORY_MIGRATION_TURN_BATCHES
-                    or time.monotonic() >= turn_deadline)
 
         def flush_text() -> bool:
             if not entry_ids:
@@ -1899,7 +1886,6 @@ class ChatBindingManager(LocaleMixin):
                 return False
             text_parts.clear()
             entry_ids.clear()
-            batches[0] += 1
             return True
 
         for entry in pending_entries():
@@ -1931,8 +1917,6 @@ class ChatBindingManager(LocaleMixin):
                     if not flush_text():
                         return False
                     text_length = 0
-                    if turn_over():
-                        return True
                 text_kwargs = kwargs
                 text_parts.append(text)
                 entry_ids.append(entry.id)
@@ -1943,11 +1927,6 @@ class ChatBindingManager(LocaleMixin):
             text_length = 0
             if not self._enqueue_history_batch(slave_chat_id, tg_chat_id, operation, kwargs, [entry.id]):
                 return False
-            batches[0] += 1
-            if turn_over():
-                # Hand the lane back between batches. A text run is never split,
-                # so aggregation always completes before its batch is sent.
-                return True
         return flush_text()
 
     def _enqueue_history_batch(self, slave_chat_id, tg_chat_id, operation, kwargs, entry_ids) -> bool:
