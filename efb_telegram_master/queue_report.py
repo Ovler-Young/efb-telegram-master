@@ -239,18 +239,21 @@ def legacy_topic_rows(db: sqlite3.Connection, out) -> None:
 def lane(db: sqlite3.Connection, chat_id: int, topic: int, limit: int, out) -> None:
     """Every queued row of one destination, in the order the queue would send them."""
     cursor = db.execute(f"""
-        SELECT id, priority, operation, COALESCE(delivery_hold, '-') AS hold,
+        SELECT id, priority, operation, COALESCE(delivery_hold, '-') AS hold, delivery_state,
                {NOW_SECONDS} - CAST(created_at AS INTEGER) AS age_s,
-               CASE WHEN delivery_hold IS NULL AND (predecessor_id IS NULL OR NOT EXISTS (
+               CASE WHEN delivery_state != 'queued' THEN delivery_state
+                    WHEN delivery_hold IS NOT NULL THEN 'held'
+                    WHEN predecessor_id IS NOT NULL AND EXISTS (
                      SELECT 1 FROM outbound_queue p WHERE p.id = outbound_queue.predecessor_id
-                       AND p.delivery_state = 'queued' AND p.delivery_hold IS NULL))
-                    THEN 'sendable' ELSE 'waiting' END AS election
+                       AND p.delivery_state = 'queued' AND p.delivery_hold IS NULL)
+                    THEN 'behind predecessor'
+                    ELSE 'sendable' END AS election
         FROM outbound_queue
-        WHERE delivery_state = 'queued' AND telegram_chat_id = ? AND COALESCE(thread_id, 0) = ?
+        WHERE telegram_chat_id = ? AND COALESCE(thread_id, 0) = ?
         ORDER BY priority DESC, id
         LIMIT ?
     """, (chat_id, topic, limit))
-    print("   id | priority | operation | hold | age_s | election", file=out)
+    print("   id | priority | operation | hold | state | age_s | election", file=out)
     for row in cursor.fetchall():
         print("   " + " | ".join(str(value) for value in row), file=out)
 
