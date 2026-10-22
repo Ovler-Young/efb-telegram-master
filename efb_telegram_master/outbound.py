@@ -6,6 +6,7 @@ import copy
 import fcntl
 import inspect
 import io
+import itertools
 import logging
 import numbers
 import os
@@ -238,6 +239,7 @@ class QueuedCall:
     retry_after: float = 0
     predecessor_id: Optional[int] = None
     thread_id: Optional[int] = None
+    waiting_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -648,6 +650,9 @@ class OutboundQueue:
         self._ownership_file: Optional[IO[bytes]] = None
         self.metrics = metrics
         self.waiters: dict[int, Future] = {}
+        # Every mutation that can move a destination's head records it here, so a
+        # dispatch pass can re-elect that destination alone instead of the queue.
+        self._dirty_destinations: set[tuple[int, Optional[int]]] = set()
         self._open()
 
     def _open(self) -> None:
@@ -1564,6 +1569,7 @@ class OutboundQueue:
                 now = time.time()
                 for request, item in zip(request_list, prepared):
                     operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media = item
+                    _kwargs_thread = queued_thread_id(_kwargs, log_context)
                     cursor = self.connection.execute(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
@@ -1576,6 +1582,7 @@ class OutboundQueue:
                     if identifier is None:
                         raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
                     identifiers.append(identifier)
+                    self.mark_destination_dirty(chat_id, _kwargs_thread)
                     if logical_split:
                         predecessor = identifier
                 if logical_split:
@@ -1892,7 +1899,7 @@ class OutboundQueue:
                 f"SELECT q.id, q.priority, q.telegram_chat_id, q.operation, {payload}, q.slave_id, "
                 f"q.required_sender_bot_id, q.created_at, {context}, q.delivery_state, {receipt}, "
                 "length(q.payload) + COALESCE(length(q.log_context), 0) + COALESCE(length(q.completion_receipt), 0), "
-                "q.reconcile_after, q.thread_id "
+                "q.reconcile_after, q.thread_id, heads.waiting "
                 "FROM outbound_queue AS q JOIN ("
                 "SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id, "
                 "COUNT(*) AS waiting "
@@ -1907,10 +1914,66 @@ class OutboundQueue:
             QueuedCall(
                 row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8],
                 row[9], row[10], stored_bytes=int(row[11]), retry_after=float(row[12]),
-                thread_id=row[13],
+                thread_id=row[13], waiting_rows=int(row[14]),
             )
             for row in rows
         ]
+
+    def head_for(
+        self, telegram_chat_id: int, thread_id: Optional[int], *,
+        exclude_ids: Iterable[int] = (), ready_only: bool = True,
+    ) -> Optional[QueuedCall]:
+        """One destination's next runnable row, without scanning the whole queue.
+
+        Same election rule as `heads()`: the lowest priority-1 id wins, else the
+        lowest id, among rows that are not held and not waiting for a predecessor.
+        """
+        sql = (
+            "SELECT q.id, q.priority, q.telegram_chat_id, q.operation, X'', q.slave_id, "
+            "q.required_sender_bot_id, q.created_at, "
+            "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END, q.delivery_state, NULL, "
+            "length(q.payload) + COALESCE(length(q.log_context), 0) + COALESCE(length(q.completion_receipt), 0), "
+            "q.reconcile_after, q.thread_id "
+            "FROM outbound_queue AS q "
+            "WHERE q.delivery_state = 'queued' AND q.telegram_chat_id = ? "
+            "AND COALESCE(q.thread_id, 0) = ?"
+        )
+        parameters: list[object] = [int(telegram_chat_id), int(thread_id) if thread_id is not None else 0]
+        if ready_only:
+            sql += (
+                " AND q.delivery_hold IS NULL"
+                " AND (q.predecessor_id IS NULL OR NOT EXISTS ("
+                "SELECT 1 FROM outbound_queue AS predecessor "
+                "WHERE predecessor.id = q.predecessor_id AND predecessor.id != q.id "
+                "AND (predecessor.delivery_state = 'sent_pending' "
+                "OR (predecessor.delivery_state = 'queued' "
+                "AND (predecessor.delivery_hold IS NULL OR predecessor.delivery_hold = 'in_flight')))))"
+            )
+        excluded = tuple(exclude_ids)
+        if excluded:
+            sql += " AND q.id NOT IN (" + ",".join("?" for _ in excluded) + ")"
+            parameters.extend(excluded)
+        sql += " ORDER BY q.priority DESC, q.id ASC LIMIT 1"
+        with self._lock:
+            row = self.connection.execute(sql, parameters).fetchone()
+        if row is None:
+            return None
+        return QueuedCall(
+            row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8],
+            row[9], row[10], stored_bytes=int(row[11]), retry_after=float(row[12]),
+            thread_id=row[13],
+        )
+
+    def take_dirty_destinations(self) -> set[tuple[int, Optional[int]]]:
+        """Destinations whose head election may have changed since the last pass."""
+        with self._lock:
+            dirty, self._dirty_destinations = self._dirty_destinations, set()
+            return dirty
+
+    def mark_destination_dirty(self, telegram_chat_id: int, thread_id: Optional[int]) -> None:
+        self._dirty_destinations.add(
+            (int(telegram_chat_id), int(thread_id) if thread_id is not None else None)
+        )
 
     def has_waiting_rows(self) -> bool:
         """Whether any row is still waiting for delivery, dispatchable or not."""
@@ -2641,12 +2704,17 @@ class OutboundQueue:
                                 payload = self.connection.execute(
                                     "SELECT payload FROM outbound_queue WHERE id = ?", (row_id,)
                                 ).fetchone()[0]
+                destination = self.connection.execute(
+                    "SELECT telegram_chat_id, thread_id FROM outbound_queue WHERE id = ?", (row_id,)
+                ).fetchone()
                 self.connection.execute("BEGIN")
                 if successful:
                     self.connection.execute("UPDATE outbound_queue SET predecessor_id=NULL WHERE predecessor_id=?", (row_id,))
                 cursor = self.connection.execute("DELETE FROM outbound_queue WHERE id = ?", (row_id,))
                 if cursor.rowcount != 1:
                     raise QueuePersistenceError(f"Queued row {row_id} disappeared before deletion.")
+                if destination is not None:
+                    self.mark_destination_dirty(destination[0], destination[1])
                 self.connection.commit()
             except Exception:
                 try:
@@ -2685,6 +2753,10 @@ class OutboundQueueScheduler:
     # Enqueues and completions wake the worker; report a persistent stall once a
     # minute instead of once per pass.
     STALL_REPORT_INTERVAL = 60.0
+    # A completion only moves one destination's head, so re-elect that destination
+    # instead of reading every waiting row. A periodic full scan repairs anything
+    # the incremental path did not see.
+    HEADS_FULL_RESCAN_SECONDS = 30.0
 
     def __init__(self, queue: OutboundQueue, adapter: QueueAdapter, executor: Executor, worker_count: int):
         self.queue = queue
@@ -2706,6 +2778,42 @@ class OutboundQueueScheduler:
         self._row_not_before: dict[int, float] = {}
         self.next_deadline: Optional[float] = None
         self._reconciliation_not_before = 0.0
+        self._head_rows: dict[tuple[int, Optional[int]], QueuedCall] = {}
+        self._heads_scanned_at = 0.0
+        self._heal_heads = True
+
+    def _dispatch_heads(self) -> list[QueuedCall]:
+        """Runnable heads in dispatch order, re-electing only what changed."""
+        now = time.monotonic()
+        excluded = self.quarantined_rows
+        dirty = self.queue.take_dirty_destinations()
+        if (self._heal_heads or not self._head_rows
+                or now - self._heads_scanned_at >= self.HEADS_FULL_RESCAN_SECONDS):
+            heads = self.queue.heads(
+                include_payload=False, excluded_ids=excluded, ready_only=True
+            )
+            self._head_rows = {self._destination_key(row): row for row in heads}
+            self._heads_scanned_at = now
+            self._heal_heads = False
+        else:
+            for key in dirty:
+                previous = self._head_rows.get(key)
+                row = self.queue.head_for(
+                    key[0], key[1], exclude_ids=excluded, ready_only=True
+                )
+                if row is None:
+                    self._head_rows.pop(key, None)
+                    continue
+                depth = max(0, previous.waiting_rows - 1) if previous is not None else row.waiting_rows
+                self._head_rows[key] = replace(row, waiting_rows=depth)
+        # One slot per depth tier before a tier gets a second one, oldest head
+        # first inside a tier: the same order the full scan used to produce in SQL.
+        tiers: dict[int, list[QueuedCall]] = {}
+        for row in sorted(self._head_rows.values(), key=lambda row: (row.waiting_rows, row.id)):
+            tiers.setdefault(row.waiting_rows, []).append(row)
+        return [
+            row for layer in itertools.zip_longest(*tiers.values()) for row in layer if row is not None
+        ]
 
     @staticmethod
     def _destination_key(row: QueuedCall) -> tuple[int, Optional[int]]:
@@ -3059,9 +3167,7 @@ class OutboundQueueScheduler:
                         self.quarantined_rows.pop(row_id, None)
                     continue
                 self.quarantined_rows.pop(row_id, None)
-            heads = self.queue.heads(
-                include_payload=False, excluded_ids=self.quarantined_rows, ready_only=True
-            )
+            heads = self._dispatch_heads()
             if not heads and self.queue.has_unresolvable_dependency():
                 # Deferral links that only point at other waiting rows have no valid
                 # order at all, so deliver the oldest row per destination instead of
@@ -3076,6 +3182,8 @@ class OutboundQueueScheduler:
                         "dispatching the oldest row of %d destination(s) to break the cycle.",
                         len(heads),
                     )
+                    # This bypassed the incremental election; rescan next pass.
+                    self._heal_heads = True
             for row in heads:
                 if (
                     row.id in self.in_flight
@@ -3097,6 +3205,7 @@ class OutboundQueueScheduler:
                         legacy_recovery = True
                     else:
                         self.quarantined_rows[row.id] = str(error)
+                        self._heal_heads = True
                         continue
                 retained_bytes = sum(item.row.stored_bytes for item in self.in_flight.values())
                 retained_bytes += sum(item.row.stored_bytes for item in self.blocking_media_retries.values())
@@ -3205,6 +3314,7 @@ class OutboundQueueScheduler:
                     self._permits.release()
                     if legacy_recovery:
                         self.quarantined_rows[row.id] = str(error)
+                        self._heal_heads = True
                         continue
                     self._stop_for_persistence_error(error)
                     return
@@ -3302,6 +3412,11 @@ class OutboundQueueScheduler:
             for row_id, submitted in tuple(self.in_flight.items()):
                 if not submitted.future.done():
                     continue
+                key = self._destination_key(submitted.row)
+                self.queue.mark_destination_dirty(submitted.row.telegram_chat_id, submitted.row.thread_id)
+                cached = self._head_rows.get(key)
+                if cached is not None and cached.id == submitted.row.id:
+                    self._head_rows[key] = replace(cached, waiting_rows=max(0, cached.waiting_rows - 1))
                 delivery = None
                 if not submitted.future.cancelled() and submitted.future.exception() is None:
                     completed = submitted.future.result()

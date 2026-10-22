@@ -288,3 +288,56 @@ def test_a_deep_queue_is_not_squeezed_out_by_shallow_ones(tmp_path):
             adapter.release.set()
             scheduler.stop_and_drain(timeout=2)
             queue.close()
+
+
+def test_a_completion_re_elects_only_its_own_destination(tmp_path, monkeypatch):
+    """A pass must not re-read every waiting row when one destination moved."""
+    adapter = Adapter()
+    queue = OutboundQueue(tmp_path)
+    scans = []
+    original = queue.heads
+
+    def counting_heads(**kwargs):
+        scans.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(queue, "heads", counting_heads)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        try:
+            first, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "one"}))
+            second, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "two"}))
+            scheduler.dispatch_once()
+            assert list(scheduler.in_flight) == [first]
+            assert len(scans) == 1
+
+            scheduler.in_flight[first].future.result(timeout=2)
+            scheduler.harvest_completed()
+            scheduler.dispatch_once()
+            assert list(scheduler.in_flight) == [second]
+            assert len(scans) == 1, "the completion re-elected its own destination only"
+        finally:
+            scheduler.stop_and_drain(timeout=2)
+            queue.close()
+
+
+def test_one_destination_head_matches_the_full_scan(tmp_path):
+    """The single-destination election must pick exactly what a full scan picks."""
+    queue = OutboundQueue(tmp_path)
+    try:
+        for index in range(3):
+            enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": f"a{index}"}))
+        enqueue(queue, QueueRequest("send_message", (), {"chat_id": 8, "text": "b"}))
+        heads = queue.heads(ready_only=True)
+        # Shallowest tier first; the depth each head reports comes from the scan.
+        assert [(row.telegram_chat_id, row.waiting_rows) for row in heads] == [(8, 1), (7, 3)]
+        for row in heads:
+            single = queue.head_for(row.telegram_chat_id, row.thread_id, ready_only=True)
+            assert single is not None and single.id == row.id
+        # A newer priority-1 row wins that destination's election on its own.
+        enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "urgent", "_send_mode": "blocking"}))
+        urgent = queue.head_for(7, None, ready_only=True)
+        assert urgent.priority == 1 and urgent.operation == "send_message"
+        assert queue.head_for(8, None, ready_only=True).priority == 0
+    finally:
+        queue.close()
