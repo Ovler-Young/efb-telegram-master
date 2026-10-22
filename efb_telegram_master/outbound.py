@@ -1715,7 +1715,7 @@ class OutboundQueue:
 
     def heads(
         self, *, include_payload: bool = True, excluded_ids: Iterable[int] = (),
-        ready_only: bool = False,
+        ready_only: bool = False, respect_predecessors: bool = True,
     ) -> list[QueuedCall]:
         payload = "q.payload" if include_payload else "X''"
         context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
@@ -1723,17 +1723,22 @@ class OutboundQueue:
         excluded = tuple(excluded_ids)
         exclusion_sql = ""
         if ready_only:
-            exclusion_sql = (
-                " AND delivery_hold IS NULL"
-                # A link to a row that no longer exists must not block its dependent
-                # forever: only a surviving predecessor defers delivery. This keeps
-                # the existing ordering contract and releases rows stranded by a
-                # predecessor that was held, discarded or deleted without unlinking.
-                " AND (predecessor_id IS NULL OR NOT EXISTS ("
-                "SELECT 1 FROM outbound_queue AS predecessor "
-                "WHERE predecessor.id = outbound_queue.predecessor_id "
-                "AND predecessor.id != outbound_queue.id))"
-            )
+            # Only a predecessor that is itself still waiting defers delivery. A
+            # missing predecessor or a permanent hold cannot be an ordering
+            # barrier: waiting for it either already happened or can never happen,
+            # so a held row must not strand everything queued behind it.
+            exclusion_sql = " AND delivery_hold IS NULL"
+            if respect_predecessors:
+                exclusion_sql += (
+                    " AND (predecessor_id IS NULL OR NOT EXISTS ("
+                    "SELECT 1 FROM outbound_queue AS predecessor "
+                    "WHERE predecessor.id = outbound_queue.predecessor_id "
+                    "AND predecessor.id != outbound_queue.id "
+                    "AND (predecessor.delivery_state = 'sent_pending' "
+                    "OR (predecessor.delivery_state = 'queued' "
+                    "AND (predecessor.delivery_hold IS NULL "
+                    "OR predecessor.delivery_hold = 'in_flight')))))"
+                )
         parameters: tuple[object, ...] = ()
         if excluded:
             exclusion_sql += " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
@@ -1763,6 +1768,23 @@ class OutboundQueue:
                 "SELECT 1 FROM outbound_queue "
                 "WHERE delivery_state = 'queued' AND delivery_hold IS NULL LIMIT 1"
             ).fetchone() is not None
+
+    def has_unresolvable_dependency(self) -> bool:
+        """Whether every waiting row defers to another waiting row.
+
+        Deferring to a row that is already delivered, held or gone resolves on its
+        own. Deferring only to other waiting rows cannot: it is a cycle, and no
+        dispatch pass can ever pick a head from it.
+        """
+        with self._lock:
+            resolvable = self.connection.execute(
+                "SELECT 1 FROM outbound_queue AS waiting "
+                "JOIN outbound_queue AS predecessor ON predecessor.id = waiting.predecessor_id "
+                "WHERE waiting.delivery_state = 'queued' AND waiting.delivery_hold IS NULL "
+                "AND NOT (predecessor.delivery_state = 'queued' "
+                "AND predecessor.delivery_hold IS NULL) LIMIT 1"
+            ).fetchone()
+        return resolvable is None
 
     def load_queued(self, row_id: int) -> QueuedCall:
         """Load upload bytes only once a worker and sender can accept this row."""
@@ -2852,6 +2874,20 @@ class OutboundQueueScheduler:
             heads = self.queue.heads(
                 include_payload=False, excluded_ids=self.quarantined_rows, ready_only=True
             )
+            if not heads and self.queue.has_unresolvable_dependency():
+                # Deferral links that only point at other waiting rows have no valid
+                # order at all, so deliver the oldest row per destination instead of
+                # leaving the queue idle until the next restart.
+                heads = self.queue.heads(
+                    include_payload=False, excluded_ids=self.quarantined_rows,
+                    ready_only=True, respect_predecessors=False,
+                )
+                if heads:
+                    logging.getLogger(__name__).error(
+                        "Queued rows were deferred by predecessor links that never resolve; "
+                        "dispatching the oldest row of %d destination(s) to break the cycle.",
+                        len(heads),
+                    )
             for row in heads:
                 if (
                     row.id in self.in_flight

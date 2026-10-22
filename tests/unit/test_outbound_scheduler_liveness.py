@@ -96,8 +96,8 @@ def test_link_to_a_predecessor_that_no_longer_exists_does_not_block(tmp_path):
         queue.close()
 
 
-def test_surviving_predecessor_keeps_deferring_its_dependent(tmp_path):
-    """A row that still exists keeps ordering: the dependent waits for it."""
+def test_waiting_predecessor_keeps_deferring_its_dependent(tmp_path):
+    """Ordering is preserved while the predecessor is itself still waiting."""
     queue, scheduler = _scheduler(tmp_path, Adapter())
     parent, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "parent"}))
     child, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "child"}))
@@ -105,28 +105,49 @@ def test_surviving_predecessor_keeps_deferring_its_dependent(tmp_path):
         queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (parent, child))
     try:
         assert [row.id for row in queue.heads(ready_only=True)] == [parent]
+        # A permanent hold keeps the row but must not keep its dependents waiting.
         queue.hold_uncertain_delivery(parent, RuntimeError("unconfirmed"))
-        assert queue.heads(ready_only=True) == []
-        assert queue.has_waiting_rows()
+        assert [row.id for row in queue.heads(ready_only=True)] == [child]
+        assert not queue.has_unresolvable_dependency()
     finally:
         queue.close()
 
 
-def test_rows_that_no_head_can_cover_are_reported(tmp_path, caplog):
-    """Every waiting row blocked by a later row is a stall, not an idle queue."""
+def test_dependency_cycle_is_broken_instead_of_stalling(tmp_path, caplog):
+    """Rows that only defer to each other have no order, so delivery must resume."""
     queue, scheduler = _scheduler(tmp_path, Adapter())
     first, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "first"}))
     second, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "second"}))
-    queue.hold_uncertain_delivery(second, RuntimeError("unconfirmed"))
     with queue.connection:
         queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (second, first))
+        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (first, second))
     try:
+        assert queue.heads(ready_only=True) == []
+        assert queue.has_unresolvable_dependency()
         with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
             scheduler.dispatch_once()
+        assert len(scheduler.in_flight) == 1
+        assert "never resolve" in caplog.records[-1].message
+        assert scheduler.next_deadline is None
+    finally:
+        queue.close()
+
+
+def test_a_delivered_predecessor_still_awaits_reconciliation(tmp_path):
+    """A sent parent keeps its dependent until its MsgLog write commits."""
+    queue, scheduler = _scheduler(tmp_path, Adapter())
+    parent, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "parent"}))
+    child, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "child"}))
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (parent, child))
+        queue.connection.execute(
+            "UPDATE outbound_queue SET delivery_state='sent_pending', completion_receipt=X'00' WHERE id=?",
+            (parent,),
+        )
+    try:
         assert queue.heads(ready_only=True) == []
-        assert scheduler.in_flight == {}
-        assert scheduler.next_deadline is not None
-        assert "dispatchable head(s)" in caplog.records[-1].message
+        # Not a cycle: the parent can resolve, so the dependency is worth waiting for.
+        assert not queue.has_unresolvable_dependency()
     finally:
         queue.close()
 
@@ -136,11 +157,14 @@ def test_a_persistent_stall_is_reported_once_per_interval(tmp_path, monkeypatch,
     clock = [1000.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
     queue, scheduler = _scheduler(tmp_path, Adapter())
-    first, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "first"}))
-    second, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "second"}))
-    queue.hold_uncertain_delivery(second, RuntimeError("unconfirmed"))
+    parent, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "parent"}))
+    child, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "child"}))
     with queue.connection:
-        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (second, first))
+        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (parent, child))
+        queue.connection.execute(
+            "UPDATE outbound_queue SET delivery_state='sent_pending', completion_receipt=X'00' WHERE id=?",
+            (parent,),
+        )
     try:
         with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
             scheduler.dispatch_once()

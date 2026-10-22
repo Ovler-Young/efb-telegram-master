@@ -95,10 +95,14 @@ a submitted call cannot be released by a completion, so they are reset and
 reported the same way. All of these mean delivery is still being attempted, not
 that rows were dropped.
 
-A dependent row is deferred only while the row it links to still exists. Links
-to a predecessor that was already discarded, held or deleted are ignored, so an
-unlinked dependency cannot strand a queue permanently. A surviving predecessor,
-including a held one, still defers its dependents until an operator resolves it:
+A dependent row is deferred only while the row it links to is itself still
+waiting: queued and unheld, in flight, or delivered and awaiting its MsgLog write.
+A predecessor that is gone, permanently held, or linked into a cycle is not an
+ordering barrier — waiting for it either already happened or can never happen —
+so it cannot strand everything queued behind it. Held rows themselves are kept
+and still require an operator. When every waiting row defers to another waiting
+row there is no valid order at all; the scheduler then dispatches the oldest row
+per destination and logs `deferred by predecessor links that never resolve`:
 
 ```sql
 SELECT q.id, q.predecessor_id, p.id IS NOT NULL AS predecessor_exists
