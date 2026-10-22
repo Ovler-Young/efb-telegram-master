@@ -3,7 +3,9 @@ import io
 import sqlite3
 
 from efb_telegram_master.outbound import OutboundQueue, QueueRequest
-from efb_telegram_master.queue_report import QUEUE_FILENAME, TG_FILENAME, report, resolve_data_dir
+from efb_telegram_master.queue_report import (
+    QUEUE_FILENAME, TG_FILENAME, queued_topic, report, resolve_data_dir,
+)
 
 
 def send_message(chat_id, text, message_thread_id=None):
@@ -48,7 +50,7 @@ def test_report_prints_depth_age_and_sources_per_destination(tmp_path):
         """)
 
     out = io.StringIO()
-    assert report(tmp_path, out) == 0
+    assert report(tmp_path / QUEUE_FILENAME, out=out) == 0
     printed = out.getvalue()
     assert "-1001 | 11 | 3" in printed          # depth per (chat, topic)
     assert "-1001 | 11 | 9" not in printed       # repeated chatassoc rows must not fan out
@@ -83,8 +85,41 @@ def test_report_measures_rows_that_still_carry_a_topic_in_their_request(tmp_path
     queue.close()
 
     out = io.StringIO()
-    assert report(tmp_path, out) == 0
+    assert report(tmp_path / QUEUE_FILENAME, out=out) == 0
     printed = out.getvalue()
     assert "rows with no topic: 3" in printed
     assert "recoverable from the request: 2" in printed   # the two photo sends name topic 42
     assert "genuinely the main chat: 1" in printed
+
+
+def test_the_report_runs_as_a_plain_script_without_the_package(tmp_path, monkeypatch):
+    """A host with EFB installed elsewhere can still run this one file."""
+    import subprocess
+    import sys
+    from efb_telegram_master.queue_report import __file__ as module_path
+
+    queue = OutboundQueue(tmp_path)
+    queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -1001, "text": "x"})],
+                       lambda _operation: send_message)
+    queue.close()
+    result = subprocess.run(
+        [sys.executable, module_path, "--queue", str(tmp_path / QUEUE_FILENAME)],
+        capture_output=True, text=True, cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ""},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "per destination: depth, holds, age" in result.stdout
+    assert "-1001 | 0 | 1" in result.stdout
+
+
+def test_queued_topic_reads_the_payload_and_the_aggregation_context():
+    from efb_telegram_master.outbound import OutboundQueue
+    from efb_telegram_master.queued_log import encode_aggregation
+
+    payload = OutboundQueue.encode_payload((), {"chat_id": -1001, "message_thread_id": 42})
+    assert queued_topic(payload, None) == 42
+    api_payload = OutboundQueue.encode_payload((), {"chat_id": -1001, "api_kwargs": {"message_thread_id": "7"}})
+    assert queued_topic(api_payload, None) == 7
+    context = encode_aggregation({"key": ("slave", -1001, "13"), "kind": "logical"})
+    assert queued_topic(b"", context) == 13
+    assert queued_topic(b"", None) is None

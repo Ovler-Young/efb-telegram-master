@@ -1,26 +1,33 @@
 """Read-only report on the outbound queue: depth, age and blockers per destination.
 
-Run it against the channel data directory, which holds both databases:
+Two ways to run it:
 
-    python3 -m efb_telegram_master.queue_report --data-dir ~/.ehforwarderbot/profiles/default/blueset.telegram
+    # anywhere, any python3, no package needed (copy this one file around)
+    python3 queue_report.py --data-dir ~/.ehforwarderbot/profiles/default/blueset.telegram
+    python3 queue_report.py --queue /path/outbound-queue.sqlite3 --tg /path/tgdata.db
+
+    # inside the checkout, with the package importable
+    python3 -m efb_telegram_master.queue_report --data-dir ...
 
 Nothing is written: the queue and ``tgdata.db`` are opened read-only, so this is
 safe while EFB is running. ``payload`` and ``log_context`` are pickled, so row
-contents are not readable here; use ``python -m efb_telegram_master.hold_send``
-for a single row.
+contents are not readable in SQL; only the topic a queued row targets is decoded
+here, and only to report rows that lost their lane. Use
+``python -m efb_telegram_master.hold_send`` to inspect a single row.
 """
 import argparse
+import pickle
 import sqlite3
 import sys
 from contextlib import closing
 from pathlib import Path
 
-from .paths import get_base_path
-
 QUEUE_FILENAME = "outbound-queue.sqlite3"
 TG_FILENAME = "tgdata.db"
 MODULE_ID = "blueset.telegram"
 NOW_SECONDS = "CAST(strftime('%s','now') AS INTEGER)"
+AGGREGATION_MARKER = b"\x03"
+MEDIA_SIDECAR_MARKER = b"\x02"
 
 QUERIES = (
     ("per destination: depth, holds, age", f"""
@@ -133,32 +140,83 @@ QUERIES = (
     """),
 )
 
+MAX_DECODE_BYTES = 1024 * 1024
+
+
+class _Unknown:
+    """Stand-in for pickled classes this report does not need to understand."""
+
+    def __new__(cls, *args, **kwargs):
+        return object.__new__(cls)
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+        elif isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], dict):
+            self.__dict__.update(state[1])
+
+
+class _TopicUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "builtins":
+            return super().find_class(module, name)
+        return type(name, (_Unknown,), {})
+
+
+def _decode(blob: bytes):
+    import io
+
+    try:
+        return _TopicUnpickler(io.BytesIO(blob)).load()
+    except Exception:
+        return None
+
+
+def queued_topic(payload, log_context) -> int | None:
+    """The topic a queued row targets, read from wherever the row stored it."""
+    topic = None
+    if payload and bytes(payload[:1]) == MEDIA_SIDECAR_MARKER:
+        value = _decode(bytes(payload[1:]))
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], dict):
+            kwargs = value[1]
+            topic = kwargs.get("message_thread_id")
+            if topic is None:
+                api_kwargs = kwargs.get("api_kwargs")
+                if isinstance(api_kwargs, dict):
+                    topic = api_kwargs.get("message_thread_id")
+    if topic is None and log_context and bytes(log_context[:1]) == AGGREGATION_MARKER:
+        context = _decode(bytes(log_context[1:]))
+        if isinstance(context, dict):
+            key = context.get("key")
+            if isinstance(key, (tuple, list)) and len(key) > 2:
+                topic = key[2]
+    try:
+        return int(str(topic)) if topic is not None else None
+    except (TypeError, ValueError):
+        return None
+
 
 def legacy_topic_rows(db: sqlite3.Connection, out) -> None:
     """Rows whose lane says "main chat" but whose request still names a topic.
 
-    Rows written before the topic column existed kept the topic in the payload (or
-    in an aggregated container's context), so they share the chat's main lane with
-    the traffic that really targets it. Opening the queue repairs them; this only
-    reports how many are waiting for that.
+    Rows written before the topic column existed kept the topic in the request, so
+    they share the chat's main lane with the traffic that really targets it.
+    Opening the queue repairs them; this only reports how many are waiting for it.
     """
-    from .outbound import InvalidQueuedPayloadError, OutboundQueue, queued_thread_id
-
     rows = db.execute(
         "SELECT id, telegram_chat_id, operation, payload, log_context FROM outbound_queue "
-        "WHERE delivery_state = 'queued' AND thread_id IS NULL ORDER BY id",
+        "WHERE delivery_state = 'queued' AND thread_id IS NULL "
+        "AND length(payload) <= ? ORDER BY id",
+        (MAX_DECODE_BYTES,),
     ).fetchall()
     recoverable: dict[int, int] = {}
     unknown = 0
     samples: list[tuple[int, int, str, int]] = []
     for row_id, chat_id, operation, payload, log_context in rows:
-        thread_id = None
-        if payload and bytes(payload[:1]) == b"\x02":
-            try:
-                _args, kwargs = OutboundQueue.decode_payload_raw(bytes(payload))
-                thread_id = queued_thread_id(kwargs, log_context)
-            except (InvalidQueuedPayloadError, ValueError):
-                thread_id = None
+        thread_id = queued_topic(payload, log_context)
         if thread_id is None:
             unknown += 1
             continue
@@ -169,29 +227,29 @@ def legacy_topic_rows(db: sqlite3.Connection, out) -> None:
     print(f"   recoverable from the request: {len(rows) - unknown}  "
           f"genuinely the main chat: {unknown}", file=out)
     print("   per chat: " + ", ".join(
-        f"{chat_id}={count}" for chat_id, count in
-        sorted(recoverable.items(), key=lambda item: -item[1])[:20]), file=out)
+        f"{chat_id}={count}"
+        for chat_id, count in sorted(recoverable.items(), key=lambda item: -item[1])[:20]), file=out)
     print("   sample rows: " + ", ".join(
-        f"#{row_id} {operation} -> topic {thread_id}" for row_id, _chat, operation, thread_id in samples),
-        file=out)
+        f"#{row_id} {operation} -> topic {thread_id}"
+        for row_id, _chat, operation, thread_id in samples), file=out)
 
 
-def resolve_data_dir(value: Path | None) -> Path:
+def resolve_data_dir(value) -> Path:
     if value is not None:
         return Path(value).expanduser().resolve()
     if (Path.cwd() / QUEUE_FILENAME).exists():
         return Path.cwd()
-    from ehforwarderbot import coordinator
-    profile = getattr(coordinator, "profile", None) or "default"
-    return get_base_path() / "profiles" / profile / MODULE_ID
+    base = Path(__import__("os").environ.get("EFB_DATA_PATH") or Path.home() / ".ehforwarderbot")
+    return base / "profiles" / "default" / MODULE_ID
 
 
-def report(directory: Path, out=sys.stdout) -> int:
-    directory = Path(directory).resolve()
-    queue_path = directory / QUEUE_FILENAME
+def report(queue_path: Path, tg_path: Path | None = None, out=sys.stdout) -> int:
+    queue_path = Path(queue_path).resolve()
     if not queue_path.exists():
         raise FileNotFoundError(f"No outbound queue at {queue_path}")
-    tg_path = directory / TG_FILENAME
+    if tg_path is None:
+        tg_path = queue_path.parent / TG_FILENAME
+    tg_path = Path(tg_path).resolve()
     with closing(sqlite3.connect(f"{queue_path.as_uri()}?mode=ro", uri=True, timeout=5)) as db:
         if tg_path.exists():
             db.execute(f"ATTACH '{tg_path.as_uri()}?mode=ro' AS tg")
@@ -216,13 +274,19 @@ def report(directory: Path, out=sys.stdout) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-dir", type=Path, default=None,
                         help="Channel data directory (defaults to the current directory "
                              "or the default profile)")
+    parser.add_argument("--queue", type=Path, default=None, help="Path to outbound-queue.sqlite3")
+    parser.add_argument("--tg", type=Path, default=None, help="Path to tgdata.db")
     args = parser.parse_args(argv)
     try:
-        return report(resolve_data_dir(args.data_dir))
+        if args.queue is not None:
+            return report(args.queue, args.tg)
+        directory = resolve_data_dir(args.data_dir)
+        return report(directory / QUEUE_FILENAME, args.tg)
     except (OSError, sqlite3.Error) as error:
         parser.exit(1, f"Queue report failed: {error}\n")
     return 0
