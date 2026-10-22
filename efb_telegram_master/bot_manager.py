@@ -360,6 +360,8 @@ class TelegramBotManager(LocaleMixin):
     webhook = False
     logger = logging.getLogger(__name__)
     DEFAULT_SEND_WORKER_COUNT = 8
+    MAX_SEND_WORKER_COUNT = 64
+    SEND_WORKER_COUNT_KEY = 'send_worker_count'
     DEFAULT_HTTPX_POOL_MULTIPLIER = 2.0
     HTTPX_POOL_MULTIPLIER_ENV = "ETM_HTTPX_POOL_MULTIPLIER"
     BLOCKING_SEND_TIMEOUT = 300.0
@@ -422,6 +424,16 @@ class TelegramBotManager(LocaleMixin):
             return retry_on_chat_migration_wrap
 
     @classmethod
+    def _parse_send_worker_count(cls, config: Mapping[str, object]) -> int:
+        """Concurrent outbound sends; the queue grants one permit per worker."""
+        raw = config.get(cls.SEND_WORKER_COUNT_KEY)
+        try:
+            parsed = int(str(raw))
+        except (TypeError, ValueError):
+            return cls.DEFAULT_SEND_WORKER_COUNT
+        return max(1, min(cls.MAX_SEND_WORKER_COUNT, parsed))
+
+    @classmethod
     def _default_connection_pool_size(cls, config: Mapping[str, object]) -> int:
         multiplier = cls.DEFAULT_HTTPX_POOL_MULTIPLIER
         multiplier_value = os.getenv(cls.HTTPX_POOL_MULTIPLIER_ENV)
@@ -432,7 +444,9 @@ class TelegramBotManager(LocaleMixin):
                 parsed_multiplier = multiplier
             if parsed_multiplier > 0:
                 multiplier = parsed_multiplier
-        return max(1, int(round(cls.DEFAULT_SEND_WORKER_COUNT * multiplier)))
+        # One connection must stay available per concurrent send; a pool smaller
+        # than the worker count turns extra workers into waiting threads.
+        return max(1, int(round(cls._parse_send_worker_count(config) * multiplier)))
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
@@ -529,7 +543,7 @@ class TelegramBotManager(LocaleMixin):
                 auxiliary.bind_metrics(self._metrics)
         self._metrics_httpd = None
 
-        self._send_worker_count = self.DEFAULT_SEND_WORKER_COUNT
+        self._send_worker_count = self._parse_send_worker_count(config)
         self._outbound_queue = OutboundQueue(channel.db._base_path, metrics=self._metrics)
         self._send_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._send_worker_count, thread_name_prefix="ETM-send",
