@@ -367,6 +367,11 @@ class TelegramBotManager(LocaleMixin):
     BLOCKING_SEND_TIMEOUT = 300.0
     BLOCKING_SEND_TARGET_SLAVE_ID = "__blocking__"
     TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS = 60.0
+    # A single row must never freeze its destination for longer than this, and a
+    # bogus retry_after value (milliseconds, clock skew, a proxy) must not lock a
+    # chat at all. The delay belongs to the row, not to the whole sender/chat.
+    MIN_RETRY_SECONDS = 1.0
+    MAX_RETRY_SECONDS = 300.0
     MEMBERSHIP_RECHECK_SECONDS = 0.25
     SHUTDOWN_DRAIN_TIMEOUT = 5.0
     SHUTDOWN_JOIN_GRACE = 1.0
@@ -1962,8 +1967,7 @@ class TelegramBotManager(LocaleMixin):
                 affinities.setdefault(key, set()).add(row.slave_id)
 
         if row.priority == 0 and isinstance(error, telegram.error.RetryAfter):
-            retry_after = self._retry_after_seconds(error)
-            retry_at = time.monotonic() + retry_after
+            retry_at = time.monotonic() + self._bounded_retry_seconds(error)
             with self._get_bot_chat_state_lock():
                 self._bot_chat_disabled_until[key] = retry_at
             return QueuedCompletionDecision(QueuedCompletionKind.RETRY_EVENTUAL, retry_at)
@@ -2006,7 +2010,7 @@ class TelegramBotManager(LocaleMixin):
         self, row, error: telegram.error.RetryAfter, selection: SenderSelection
     ) -> None:
         """Record a sender/chat cooldown without completing the queued database update."""
-        retry_at = time.monotonic() + self._retry_after_seconds(error)
+        retry_at = time.monotonic() + self._bounded_retry_seconds(error)
         with self._get_bot_chat_state_lock():
             self._bot_chat_disabled_until[(selection.sender_bot_id, row.telegram_chat_id)] = retry_at
 
@@ -2038,6 +2042,10 @@ class TelegramBotManager(LocaleMixin):
             self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
             self._finalize_outbound_resources()
             self.logger.debug("Outbound queue worker stopped")
+
+    @classmethod
+    def _bounded_retry_seconds(cls, error: telegram.error.RetryAfter) -> float:
+        return min(cls.MAX_RETRY_SECONDS, max(cls.MIN_RETRY_SECONDS, cls._retry_after_seconds(error)))
 
     @staticmethod
     def _retry_after_seconds(error: telegram.error.RetryAfter) -> float:
