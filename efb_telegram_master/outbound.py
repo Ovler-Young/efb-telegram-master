@@ -1502,10 +1502,15 @@ class OutboundQueue:
         return row[0] if row else None
 
     def aggregation_rows(self) -> list[QueuedCall]:
-        """Read only unfinished logical/frozen aggregation rows on recovery."""
+        """Read unfinished logical/frozen aggregation rows without their payloads.
+
+        Recovery and source lookups read `log_context`, identity and ordering only.
+        Reading the payload here materialised every stored file (and every legacy
+        inline media row) on each recovery pass and on each source lookup.
+        """
         with self._lock:
             rows = self.connection.execute(
-                "SELECT id, priority, telegram_chat_id, operation, payload, slave_id, "
+                "SELECT id, priority, telegram_chat_id, operation, X'', slave_id, "
                 "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, predecessor_id "
                 "FROM outbound_queue WHERE substr(log_context, 1, 1)=? ORDER BY id", (b"\x03",),
             ).fetchall()

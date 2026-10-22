@@ -86,6 +86,10 @@ original bot. Edit/delete routing continues to use the actual author.
 results. A healthy worker can coexist with held records; queue depth alone does
 not mean that those records are awaiting a safe automatic retry.
 
+Aggregation recovery and source lookups read `log_context` and ordering only;
+`aggregation_rows()` returns no payload bytes, so a large legacy inline media
+row cannot be pulled into memory by a recovery pass.
+
 A dispatch pass that leaves queued rows with no retry deadline and nothing in
 flight logs `Outbound scheduler left N dispatchable head(s) undispatched ... while
 queued rows remain` and rescans 30 seconds later instead of sleeping until the
