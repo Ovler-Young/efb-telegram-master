@@ -1784,3 +1784,20 @@ def test_write_db_mapping_logs_failure_and_runs_completion_callback():
 
     mgr.logger.warning.assert_called_once()
     on_complete.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "configured, expected",
+    [(None, 8), (16, 16), ("24", 24), (0, 1), (-5, 1), (4096, 64), ("many", 8), (True, 8)],
+)
+def test_send_worker_count_is_configured_and_bounded(configured, expected):
+    config = {} if configured is None else {"send_worker_count": configured}
+    assert TelegramBotManager._parse_send_worker_count(config) == expected
+
+
+def test_connection_pool_keeps_one_connection_per_worker(monkeypatch):
+    monkeypatch.delenv(TelegramBotManager.HTTPX_POOL_MULTIPLIER_ENV, raising=False)
+    assert TelegramBotManager._default_connection_pool_size({}) == 16
+    assert TelegramBotManager._default_connection_pool_size({"send_worker_count": 24}) == 48
+    monkeypatch.setenv(TelegramBotManager.HTTPX_POOL_MULTIPLIER_ENV, "1")
+    assert TelegramBotManager._default_connection_pool_size({"send_worker_count": 24}) == 24
