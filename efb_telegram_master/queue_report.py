@@ -91,10 +91,11 @@ QUERIES = (
         GROUP BY bucket
         ORDER BY MIN(age)
     """),
-    # implied_per_min is the lane's own drain rate in steady state: depth divided by
-    # how long its oldest dispatchable row has waited. Far below the bot-chat limit
-    # (18/minute) means the lane is waiting on uploads, not on the rate limiter.
-    ("head per destination: age, position, drain rate and retry", f"""
+    # Depth divided by head age is NOT a drain rate here: a backlog created by a
+    # burst days ago keeps a large depth against a large age whatever the current
+    # speed, and reading it as "messages per minute" misleads. Measure drain with
+    # the queue depth over time instead.
+    ("head per destination: age, position and retry", f"""
         WITH heads AS (
             SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id,
                    COUNT(*) AS lane_depth
@@ -110,8 +111,6 @@ QUERIES = (
                    AND COALESCE(w.thread_id, 0) = COALESCE(q.thread_id, 0)
                    AND w.delivery_state = 'queued'
                    AND w.id <= q.id) AS position_in_lane,
-               ROUND(h.lane_depth * 60.0 / MAX(1, {NOW_SECONDS} - CAST(q.created_at AS INTEGER)), 2)
-                   AS implied_per_min,
                MAX(0, CAST(ROUND(q.reconcile_after - {NOW_SECONDS}) AS INTEGER)) AS retry_in_s,
                COALESCE(q.delivery_hold, '-') AS hold
         FROM outbound_queue q

@@ -55,7 +55,7 @@ def test_report_prints_depth_age_and_sources_per_destination(tmp_path):
     assert "-1001 | 11 | 3" in printed          # depth per (chat, topic)
     assert "-1001 | 11 | 9" not in printed       # repeated chatassoc rows must not fan out
     assert "A group" in printed                  # bound slave chat name
-    assert "implied_per_min" in printed          # lane drain rate vs the bot-chat limit
+    assert "retry_in_s" in printed                # why a head is not dispatched yet
     assert "__history__:slave group B" not in printed
     assert "history | slave group B | 1" in printed  # backfill rows are separable
     # Read-only: the queue is untouched and can still be opened exclusively.
