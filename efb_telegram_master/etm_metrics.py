@@ -60,6 +60,7 @@ _DATABASE_METHODS = frozenset({
     "has_pending_history_migrations",
     "get_next_history_migration_target",
     "get_pending_history_migration_target_ids",
+    "get_pending_history_migration_targets",
     "get_history_migration_entries",
     "delete_history_migration_entry",
 })
