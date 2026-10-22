@@ -123,3 +123,22 @@ def test_queued_topic_reads_the_payload_and_the_aggregation_context():
     context = encode_aggregation({"key": ("slave", -1001, "13"), "kind": "logical"})
     assert queued_topic(b"", context) == 13
     assert queued_topic(b"", None) is None
+
+
+def test_lane_listing_shows_why_a_row_is_not_sendable(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    first, _ = queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -1001, "text": "a"})],
+                                  lambda _operation: send_message)
+    second, _ = queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -1001, "text": "b"})],
+                                   lambda _operation: send_message)
+    with queue.connection:
+        queue.connection.execute(
+            "UPDATE outbound_queue SET delivery_hold='uncertain:TimedOut/ReadTimeout' WHERE id = ?", (first,))
+    queue.close()
+
+    out = io.StringIO()
+    assert report(tmp_path / QUEUE_FILENAME, out=out, lane_target=(-1001, 0)) == 0
+    printed = out.getvalue()
+    assert "uncertain:TimedOut/ReadTimeout" in printed
+    assert f"{second} | 0 | send_message | - |" in printed      # the unheld row is sendable
+    assert "sendable" in printed

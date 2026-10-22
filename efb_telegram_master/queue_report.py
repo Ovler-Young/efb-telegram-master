@@ -33,6 +33,7 @@ QUERIES = (
     ("per destination: depth, holds, age", f"""
         SELECT q.telegram_chat_id AS tg_chat, COALESCE(q.thread_id, 0) AS topic,
                COUNT(*) AS queued, SUM(q.delivery_hold IS NOT NULL) AS held,
+           SUM(q.delivery_hold IS NULL) AS dispatchable,
                GROUP_CONCAT(DISTINCT q.operation) AS operations,
                datetime(MIN(q.created_at), 'unixepoch') AS oldest,
                {NOW_SECONDS} - CAST(MIN(q.created_at) AS INTEGER) AS oldest_age_s,
@@ -236,6 +237,25 @@ def legacy_topic_rows(db: sqlite3.Connection, out) -> None:
         for row_id, _chat, operation, thread_id in samples), file=out)
 
 
+def lane(db: sqlite3.Connection, chat_id: int, topic: int, limit: int, out) -> None:
+    """Every queued row of one destination, in the order the queue would send them."""
+    cursor = db.execute(f"""
+        SELECT id, priority, operation, COALESCE(delivery_hold, '-') AS hold,
+               {NOW_SECONDS} - CAST(created_at AS INTEGER) AS age_s,
+               CASE WHEN delivery_hold IS NULL AND (predecessor_id IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM outbound_queue p WHERE p.id = outbound_queue.predecessor_id
+                       AND p.delivery_state = 'queued' AND p.delivery_hold IS NULL))
+                    THEN 'sendable' ELSE 'waiting' END AS election
+        FROM outbound_queue
+        WHERE delivery_state = 'queued' AND telegram_chat_id = ? AND COALESCE(thread_id, 0) = ?
+        ORDER BY priority DESC, id
+        LIMIT ?
+    """, (chat_id, topic, limit))
+    print("   id | priority | operation | hold | age_s | election", file=out)
+    for row in cursor.fetchall():
+        print("   " + " | ".join(str(value) for value in row), file=out)
+
+
 def media_footprint(queue_path: Path, out) -> None:
     """Bytes still owed to Telegram: every upload has to come from these files.
 
@@ -266,7 +286,8 @@ def resolve_data_dir(value) -> Path:
     return base / "profiles" / "default" / MODULE_ID
 
 
-def report(queue_path: Path, tg_path: Path | None = None, out=sys.stdout) -> int:
+def report(queue_path: Path, tg_path: Path | None = None, out=sys.stdout,
+           lane_target: tuple[int, int] | None = None, limit: int = 25) -> int:
     queue_path = Path(queue_path).resolve()
     if not queue_path.exists():
         raise FileNotFoundError(f"No outbound queue at {queue_path}")
@@ -290,6 +311,12 @@ def report(queue_path: Path, tg_path: Path | None = None, out=sys.stdout) -> int
                 print("   " + " | ".join(str(value) for value in row), file=out)
         print("\n== media still to upload", file=out)
         media_footprint(queue_path, out)
+        if lane_target is not None:
+            print(f"\n== lane {lane_target[0]}:{lane_target[1]} in send order", file=out)
+            try:
+                lane(db, lane_target[0], lane_target[1], limit, out)
+            except sqlite3.Error as error:
+                print(f"   skipped: {error}", file=out)
         print("\n== rows stuck in the main lane whose request names a topic", file=out)
         try:
             legacy_topic_rows(db, out)
@@ -306,12 +333,19 @@ def main(argv=None) -> int:
                              "or the default profile)")
     parser.add_argument("--queue", type=Path, default=None, help="Path to outbound-queue.sqlite3")
     parser.add_argument("--tg", type=Path, default=None, help="Path to tgdata.db")
+    parser.add_argument("--lane", default=None, metavar="CHAT[:TOPIC]",
+                        help="Also list one destination's queued rows in send order")
+    parser.add_argument("--limit", type=int, default=25, help="Rows to list for --lane")
     args = parser.parse_args(argv)
+    lane_target = None
+    if args.lane:
+        chat, _, topic = args.lane.partition(":")
+        lane_target = (int(chat), int(topic) if topic else 0)
     try:
         if args.queue is not None:
-            return report(args.queue, args.tg)
+            return report(args.queue, args.tg, lane_target=lane_target, limit=args.limit)
         directory = resolve_data_dir(args.data_dir)
-        return report(directory / QUEUE_FILENAME, args.tg)
+        return report(directory / QUEUE_FILENAME, args.tg, lane_target=lane_target, limit=args.limit)
     except (OSError, sqlite3.Error) as error:
         parser.exit(1, f"Queue report failed: {error}\n")
     return 0
