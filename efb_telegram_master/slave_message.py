@@ -43,7 +43,7 @@ from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import get_msg_type
 from .ptb_compat import sync_reply_text
-from .utils import TelegramChatID, TelegramTopicID, TelegramMessageID, OldMsgID
+from .utils import TelegramChatID, TelegramTopicID, TelegramMessageID, OldMsgID, link_text, removal_edit
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -305,7 +305,7 @@ class SlaveMessageProcessor(LocaleMixin):
             if log and log.aggregate and not independent_pending:
                 children = [member if member_identity(child) == member_identity(member) else child
                             for child in aggregation.prospective_members(log.master_msg_id, key)]
-                if qualifying and aggregation.fits(children, updating=True):
+                if qualifying and aggregation.fits(children, updating=True, confirmed=log.aggregate):
                     aggregation.queue_container_update(log.master_msg_id, [member], key=key)
                     return True
             elif not log and not independent_pending and qualifying:
@@ -315,7 +315,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 if initial and initial["kind"] == "aggregate":
                     children = [member if member_identity(child) == member_identity(member) else child
                                 for child in initial["aggregate"]["children"]]
-                    if aggregation.fits(children):
+                    if aggregation.fits(children, confirmed=initial["aggregate"]):
                         aggregation.queue_deferred_update(key, member, predecessor)
                         return True
             old_id = None
@@ -759,18 +759,7 @@ class SlaveMessageProcessor(LocaleMixin):
         self.bot.send_chat_action(tg_dest, ChatAction.TYPING, message_thread_id=thread_id)
 
         assert isinstance(msg.attributes, LinkAttribute)
-        attributes: LinkAttribute = msg.attributes
-
-        thumbnail = urllib.parse.quote(attributes.image or "", safe="?=&#:/")
-        thumbnail = "<a href=\"%s\">🔗</a>" % thumbnail if thumbnail else "🔗"
-        text = "%s <a href=\"%s\">%s</a>\n%s" % \
-               (thumbnail,
-                urllib.parse.quote(attributes.url, safe="?=&#:/"),
-                html.escape(attributes.title or attributes.url),
-                html.escape(attributes.description or ""))
-
-        if msg.text:
-            text += "\n\n" + self.html_substitutions(msg)
+        text = link_text(msg.attributes, self.html_substitutions(msg), as_html=True)
         if old_msg_id:
             _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
             edit_kwargs = dict(text=text, chat_id=old_msg_id[0], message_id=old_msg_id[1],
@@ -1566,7 +1555,7 @@ class SlaveMessageProcessor(LocaleMixin):
                 else:
                     self.logger.info("Source removal has no saved message: %s", identity)
                     return
-            _, (target, topic) = self.get_slave_msg_dest(message)
+            msg_template, (target, topic) = self.get_slave_msg_dest(message)
             key = (identity[0], int(target), str(topic) if topic is not None else None) if target is not None else None
             if aggregation is not None and key is not None and aggregation.remove_source_member(key, identity):
                 return
@@ -1576,22 +1565,24 @@ class SlaveMessageProcessor(LocaleMixin):
                 old_msg_id: OldMsgID = utils.message_id_str_to_id(
                     utils.TgChatMsgIDStr(old_msg.master_msg_id_alt or old_msg.master_msg_id)
                 )
-                self.logger.debug("Found message to delete in Telegram: %s.%s",
+                self.logger.debug("Found message to mark removed in Telegram: %s.%s",
                                   *old_msg_id)
                 try:
-                    if not self.channel.flag('prevent_message_removal'):
-                        self.bot.delete_message(*old_msg_id,
-                                                _sender_bot_id=old_msg.sender_bot_id)
-                        return
+                    source = old_msg.build_etm_msg(self.chat_manager)
+                    operation, kwargs = removal_edit(old_msg.media_type, source.text or "", prefix=msg_template,
+                        link=source.attributes if isinstance(source.attributes, LinkAttribute) else None)
+                    getattr(self.bot, operation)(chat_id=old_msg_id[0], message_id=old_msg_id[1],
+                                                _sender_bot_id=old_msg.sender_bot_id, **kwargs)
+                    return
                 except TelegramError as e:
-                    self.logger.warning("Failed to delete message %s.%s: %s. Sending notification instead.", *old_msg_id, e)
+                    self.logger.warning("Failed to mark message %s.%s removed: %s. Sending notification instead.", *old_msg_id, e)
                     pass
                 self.bot.send_message(chat_id=old_msg_id[0],
                                       text=self._("Message is removed in remote chat."),
                                       reply_to_message_id=old_msg_id[1],
                                       disable_notification=True)
             else:
-                self.logger.info('Was supposed to delete a message, '
+                self.logger.info('Was supposed to mark a message removed, '
                                  'but it does not exist in database: %s', status)
         elif isinstance(status, MessageReactionsUpdate):
             self.update_reactions(status)

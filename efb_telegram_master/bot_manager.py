@@ -2024,6 +2024,9 @@ class TelegramBotManager(LocaleMixin):
                 getattr(row, "id", None), operation, type(error).__name__, cause_name,
                 str(error)[:200],
             )
+        aggregation = getattr(self, "live_aggregation", None)
+        if aggregation is not None:
+            aggregation.removal_failed(row, selection.sender_bot_id)
         self._finish_queued_database_update(getattr(row, "id", None))
         self._run_database_update_callback(
             self._pop_queued_completion_callback(getattr(row, "id", None))

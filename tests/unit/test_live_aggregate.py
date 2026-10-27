@@ -181,9 +181,13 @@ def test_rendering_preserves_identities_reply_and_utf16_ranges():
     assert "Bob: 12:34:58\n" in rendered.text
     assert "Bob: <code>12:34:58</code>\n" in rendered.html
     assert member_message(members[1]).target.uid == "one"
+    members[0]["status"] = "removed"
+    removed = render_members(members, admin_id=123)
+    assert removed.text == rendered.text and removed.ranges == rendered.ranges
+    assert '<s>😀 &lt;same&gt;</s>' in removed.html
 
 
-def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones():
+def test_capacity_uses_parsed_text_and_keeps_removed_source_content():
     member = make_source_member(source(text="&" * 4000, name="A"))
     assert len(render_members([member]).html) > 4096
     assert aggregate_fits([member])
@@ -205,6 +209,7 @@ def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones
     removed = [make_source_member(source(str(index), "saved", "name" * 40), received_time=received_time)
                for index in range(200)]
     for member in removed:
+        member["display_prefix"] = ""
         member["status"] = "removed"
     for member in removed[100:]:
         member["received_time"] += datetime.timedelta(days=1)
@@ -213,4 +218,6 @@ def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones
     assert len(rendered.ranges) == 200
     assert rendered.text.count("20:34:56") == 200
     assert aggregate_fits(removed)
+    assert rendered.text.count("saved") == 200
+    assert rendered.html.count("<s>saved</s>") == 200
     assert render_members(removed, history=True).text.count("saved") == 200

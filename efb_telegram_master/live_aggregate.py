@@ -15,6 +15,7 @@ from typing import Optional
 from .aggregate import aggregate_fits, make_aggregate, member_identity, member_message, render_members
 from .outbound import QueueRequest
 from .queued_log import decode_aggregation, encode_aggregation
+from .utils import removal_edit
 
 
 @dataclass
@@ -84,12 +85,12 @@ class LiveTextAggregation:
         admins = self.manager.channel.config.get("admins", [])
         return admins[0] if admins else None
 
-    def fits(self, members, *, updating=False):
+    def fits(self, members, *, updating=False, confirmed=None):
         flag = self.manager.channel.flag
         return aggregate_fits(members, max_members=int(flag("text_aggregation_max_members")),
                               max_payload_bytes=int(flag("text_aggregation_max_payload_bytes")),
                               admin_id=self.admin_id, include_redirected_payload=not updating,
-                              display_timezone=self.display_timezone)
+                              display_timezone=self.display_timezone, confirmed=confirmed)
 
     def _tail_context(self, stream):
         if stream.tail is None:
@@ -313,6 +314,23 @@ class LiveTextAggregation:
 
     def materialize(self, row, selection):
         context = decode_aggregation(row.log_context) if row.log_context else None
+        if context and context["kind"] in {"source", "redirect"} and context["member"]["status"] == "removed":
+            member = context["member"]
+            resolved = self.manager.channel.db.resolve_source_member(*member_identity(member),
+                str(context["key"][1]), context["key"][2])
+            if resolved and not resolved[0].aggregate:
+                from .msg_type import TGMsgType
+                log = resolved[0]
+                operation, kwargs = self._removal_edit(log, member)
+                message = member_message(member)
+                message.type_telegram = TGMsgType(log.media_type)
+                message.file_id, message.file_unique_id = log.file_id, log.file_unique_id
+                message.mime, message.file_bot_id = log.mime, log.file_bot_id
+                context.update(kind="source", old_container_id=None, frozen=True,
+                               old_message_id=tuple(int(value) for value in log.master_msg_id.rsplit(".", 1)),
+                               message=message)
+                return self.queue.materialize_aggregation(row.id, operation, kwargs, encode_aggregation(context), selection)
+            raise ValueError("A removal edit requires its confirmed standalone message.")
         if context and context["kind"] in {"source", "redirect"} and not context.get("frozen"):
             member = context["member"]
             resolved = self.manager.channel.db.resolve_source_member(*member_identity(member),
@@ -324,11 +342,6 @@ class LiveTextAggregation:
             kwargs.pop("self")
             if resolved:
                 log = resolved[0]
-                if member["status"] == "removed" and not log.aggregate:
-                    operation = "edit_message_text" if log.media_type == "Text" else "delete_message"
-                    kwargs = dict(chat_id=context["key"][1], message_id=int((log.master_msg_id_alt or log.master_msg_id).rsplit(".", 1)[1]))
-                    if operation == "edit_message_text":
-                        kwargs["text"] = "[message removed]"
                 if log.aggregate:
                     context["kind"] = "redirect"
                     context["old_container_id"] = log.master_msg_id
@@ -362,7 +375,7 @@ class LiveTextAggregation:
                     if previous["status"] == "redirected":
                         children[index]["status"] = "redirected"
                         children[index]["replacement_master_msg_id"] = previous["replacement_master_msg_id"]
-            if not self.fits(children, updating=True):
+            if not self.fits(children, updating=True, confirmed=log.aggregate):
                 raise ValueError("Source changes require independent output before container update.")
             base = dict(message_id=int(log.master_msg_id.rsplit(".", 1)[1]), owner=log.sender_bot_id,
                         aggregate=log.aggregate)
@@ -374,14 +387,17 @@ class LiveTextAggregation:
         owner = base and base["owner"]
         can_edit = (base is not None and owner == selection.sender_bot_id
                     and (context["kind"] == "member_update"
-                         or self.fits(base["aggregate"]["children"] + members)))
+                         or self.fits(base["aggregate"]["children"] + members, confirmed=base["aggregate"])))
         if context["kind"] == "member_update" and not can_edit:
             raise ValueError("Existing aggregate updates require the original owner.")
         if children is None:
             children = base["aggregate"]["children"] + members if can_edit else members
         revision = base["aggregate"]["revision"] + 1 if can_edit else 1
-        aggregate = make_aggregate(children, revision, admin_id=self.admin_id, display_timezone=self.display_timezone)
-        kwargs = dict(chat_id=context["key"][1], text=render_members(children, admin_id=self.admin_id, display_timezone=self.display_timezone).html,
+        confirmed = base["aggregate"] if can_edit else None
+        aggregate = make_aggregate(children, revision, admin_id=self.admin_id, display_timezone=self.display_timezone,
+                                   confirmed=confirmed)
+        kwargs = dict(chat_id=context["key"][1], text=render_members(children, admin_id=self.admin_id, display_timezone=self.display_timezone,
+                                                                 confirmed=confirmed).html,
                       parse_mode="HTML", disable_notification=context["silent"], _live_aggregate=True)
         operation = "send_message"
         if can_edit:
@@ -457,11 +473,12 @@ class LiveTextAggregation:
             old_id = context["old_message_id"]
             receipt = SimpleNamespace(chat_id=old_id[0], message_id=old_id[1],
                                       message_thread_id=context["key"][2])
-        else:
+        elif member["status"] != "removed":
             message.type_telegram = get_msg_type(receipt)
             message.put_telegram_file(receipt)
         message.sender_bot_id = sender_bot_id
-        message.file_bot_id = file_bot_id or sender_bot_id
+        if member["status"] != "removed":
+            message.file_bot_id = file_bot_id or sender_bot_id
         member = copy.deepcopy(member)
         # Telegram file metadata belongs to this output; the complete source stays in its member snapshot.
         source = member_message(member)
@@ -469,7 +486,8 @@ class LiveTextAggregation:
         source.type_telegram, source.mime = message.type_telegram, message.mime
         source.file_bot_id = file_bot_id or sender_bot_id
         from .queued_log import encode
-        member["snapshot"] = encode(source, None)
+        if member["status"] != "removed":
+            member["snapshot"] = encode(source, None)
         db = self.manager.channel.db
         if context["kind"] == "redirect":
             saved = db.finalize_member_redirect(context["old_container_id"], member, message, receipt, sender_bot_id)
@@ -506,6 +524,30 @@ class LiveTextAggregation:
             self.manager.channel.commands.register_command(receipt,
                 ETMCommandMsgStorage(message.commands, module, member.get("display_prefix") or "", message.text))
         return True
+
+    @staticmethod
+    def _removal_edit(log, member):
+        from ehforwarderbot.message import LinkAttribute
+        source = member_message(member)
+        prefix = member.get("display_prefix") or ""
+        if prefix and not prefix.endswith(":"):
+            prefix += ":"
+        operation, kwargs = removal_edit(log.media_type, source.text or "", prefix=prefix,
+            link=source.attributes if isinstance(source.attributes, LinkAttribute) else None)
+        chat_id, message_id = (log.master_msg_id_alt or log.master_msg_id).rsplit(".", 1)
+        kwargs.update(chat_id=int(chat_id), message_id=int(message_id))
+        return operation, kwargs
+
+    def removal_failed(self, row, sender_bot_id):
+        """Keep an uneditable source output and record its removal with a notice."""
+        context = decode_aggregation(row.log_context) if row.log_context else None
+        if not context or context["kind"] != "source" or context["member"]["status"] != "removed":
+            return
+        _, kwargs = self.queue.decode_payload_raw(row.payload)
+        self.manager._enqueue_requests([QueueRequest("send_message", (), dict(
+            chat_id=kwargs["chat_id"], text=self.manager._("Message is removed in remote chat."),
+            reply_to_message_id=kwargs["message_id"], disable_notification=True, _send_mode="eventual"))])
+        self._reconcile_source(row, True, sender_bot_id, context, context["message"].file_bot_id)
 
     def remove_source_member(self, key, identity):
         """Apply a confirmed source removal to one member, retaining its full saved source."""
@@ -546,10 +588,8 @@ class LiveTextAggregation:
                 context = dict(format_version=1, kind="source", key=tuple(key), member=member,
                                message=member_message(member), old_message_id=old_id, old_container_id=None,
                                generation=-1, members=[], handoff=False, frozen=True)
-                operation = "edit_message_text" if log.media_type == "Text" else "delete_message"
-                kwargs = dict(chat_id=old_id[0], message_id=old_id[1], _required_sender_bot_id=log.sender_bot_id or "__main__")
-                if operation == "edit_message_text":
-                    kwargs["text"] = "[message removed]"
+                operation, kwargs = self._removal_edit(log, member)
+                kwargs["_required_sender_bot_id"] = log.sender_bot_id or "__main__"
                 request = QueueRequest(operation, (), kwargs, encode_aggregation(context), predecessor_id=predecessor)
                 row_id, _ = self.queue.enqueue_many([request], self.manager._queue_operation)
             self.scheduler.wake_event.set()
