@@ -1994,7 +1994,7 @@ class OutboundQueue:
     def _mark_row_destinations_dirty(self, row_id: int, *, dependents: bool = False) -> None:
         """Re-elect changed metadata, including dependency eligibility when requested."""
         sql = "SELECT telegram_chat_id, thread_id FROM outbound_queue WHERE id=?"
-        parameters = (row_id,)
+        parameters: tuple[int, ...] = (row_id,)
         if dependents:
             sql += " OR predecessor_id=?"
             parameters += (row_id,)
