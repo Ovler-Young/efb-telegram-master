@@ -1628,6 +1628,7 @@ def test_invalid_payload_is_retained_without_upload_and_later_traffic_runs(
     row_id = retained_queue.heads()[0].id
     waiter = Future()
     retained_queue.waiters[row_id] = waiter
+    valid_id, valid_waiter = enqueue(retained_queue, 151, "later valid message")
     executor = ControlledExecutor()
     adapter = RecordingAdapter()
     scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
@@ -1638,14 +1639,13 @@ def test_invalid_payload_is_retained_without_upload_and_later_traffic_runs(
         waiter.result(timeout=1)
     assert row_id not in retained_queue.waiters
     assert retained_queue.load_queued(row_id).payload == b"\x02"
-    assert retained_queue.heads(ready_only=True) == []
+    assert [row.id for row in retained_queue.heads(ready_only=True)] == [valid_id]
     assert executor.submissions == []
     assert adapter.executed == []
     assert adapter.failures == []
     assert scheduler.in_flight == {}
     assert not scheduler.stopping
 
-    valid_id, valid_waiter = enqueue(retained_queue, 151, "later valid message")
     scheduler.dispatch_once()
     assert len(executor.submissions) == 1
     function, arguments, future = executor.submissions[0]
@@ -1905,3 +1905,54 @@ def test_blocking_send_receipt_keeps_actual_auxiliary_sender_after_deferred_disp
 
     assert not editor.is_alive()
     assert edit_receipt[0].message is result
+
+
+def test_cancelled_cached_head_allows_existing_follower_to_dispatch(
+    retained_queue: OutboundQueue,
+) -> None:
+    first_id, _ = enqueue(retained_queue, 151)
+    second_id, second_waiter = enqueue(retained_queue, 151, "existing follower")
+    adapter = RecordingAdapter(retry_at=float("inf"))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+    scheduler.dispatch_once()
+
+    retained_queue.cancel_logical_aggregation(first_id)
+    adapter.retry_at = None
+    scheduler.dispatch_once()
+
+    assert not scheduler.stopping
+    assert len(executor.submissions) == 1
+    function, arguments, future = executor.submissions[0]
+    future.set_result(function(*arguments))
+    scheduler.harvest_completed()
+    assert second_waiter.result(timeout=1) == second_id
+
+
+def test_enqueue_and_completion_preserve_shallow_destination_dispatch_order(
+    retained_queue: OutboundQueue,
+) -> None:
+    first_id, _ = enqueue(retained_queue, 151)
+    shallow_id, _ = enqueue(retained_queue, 152)
+    adapter = RecordingAdapter(retry_at=float("inf"))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+    scheduler.dispatch_once()
+
+    enqueue(retained_queue, 151, "second")
+    adapter.retry_at = None
+    scheduler.dispatch_once()
+    assert list(scheduler.in_flight) == [shallow_id]
+    function, arguments, future = executor.submissions[0]
+    future.set_result(function(*arguments))
+    scheduler.harvest_completed()
+
+    scheduler.dispatch_once()
+    assert list(scheduler.in_flight) == [first_id]
+    function, arguments, future = executor.submissions[1]
+    future.set_result(function(*arguments))
+    scheduler.harvest_completed()
+    new_shallow_id, _ = enqueue(retained_queue, 153)
+    enqueue(retained_queue, 151, "third")
+    scheduler.dispatch_once()
+    assert list(scheduler.in_flight) == [new_shallow_id]
