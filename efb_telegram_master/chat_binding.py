@@ -1748,7 +1748,7 @@ class ChatBindingManager(LocaleMixin):
     def _history_migration_lock_for_target(
         self, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None,
     ) -> threading.Lock:
-        key = (target_chat_id, int(message_thread_id) if message_thread_id is not None else None)
+        key = (target_chat_id, message_thread_id)
         with self._history_migration_locks_lock:
             lock = self._history_migration_locks.get(key)
             if lock is None:

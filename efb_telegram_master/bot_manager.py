@@ -2082,7 +2082,8 @@ class TelegramBotManager(LocaleMixin):
         with self._get_bot_chat_state_lock():
             reported = getattr(self, "_retry_after_report_at", None)
             if reported is None:
-                reported = self._retry_after_report_at = {}
+                self._retry_after_report_at: dict[tuple[str, str, str], float] = {}
+                reported = self._retry_after_report_at
             previous = reported.get(key)
             if previous is not None and now - previous < self.RETRY_AFTER_LOG_INTERVAL:
                 return
@@ -2475,18 +2476,22 @@ class TelegramBotManager(LocaleMixin):
     def get_file(self, file_id: str, *, sender_bot_id: Optional[str] = None,
                  file_size: Optional[int] = None) -> File:
         """Resolve a saved file ID with its owner, independently of send routing."""
-        kwargs = {}
-        if getattr(self, '_transfer_min_mbps', None) is not None and file_size:
-            kwargs['read_timeout'] = self.file_transfer_timeout(
-                self._request_kwargs.get('read_timeout'), file_size)
+        bot: telegram.Bot | SyncBotProtocol
         if sender_bot_id is None or self._is_main_sender_id(str(sender_bot_id)):
-            return cast(File, self._bot.get_file(file_id, **kwargs))
-        auxiliary = self.bot_pool.get_bot_by_id(sender_bot_id) if self.bot_pool else None
-        if auxiliary is None or auxiliary.disabled:
-            raise RequiredSenderUnavailableError('Saved media acquisition bot is unavailable.')
-        # Membership in the destination is irrelevant to getFile. Never fall
-        # back to the main bot with somebody else's opaque file ID.
-        return cast(File, auxiliary.bot.get_file(file_id, **kwargs))
+            bot = self._bot
+        else:
+            auxiliary = self.bot_pool.get_bot_by_id(sender_bot_id) if self.bot_pool else None
+            if auxiliary is None or auxiliary.disabled:
+                raise RequiredSenderUnavailableError('Saved media acquisition bot is unavailable.')
+            # Membership in the destination is irrelevant to getFile. Never fall
+            # back to the main bot with somebody else's opaque file ID.
+            bot = auxiliary.bot
+        if getattr(self, '_transfer_min_mbps', None) is not None and file_size:
+            base = self._request_kwargs.get('read_timeout')
+            if base is None or isinstance(base, (int, float)):
+                return cast(File, bot.get_file(
+                    file_id, read_timeout=self.file_transfer_timeout(base, file_size)))
+        return cast(File, bot.get_file(file_id))
 
     @contextmanager
     def _history_media_upload(self, file_id: str, owner: Optional[str]) -> Iterator[object]:

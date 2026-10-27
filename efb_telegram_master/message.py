@@ -248,5 +248,6 @@ class ETMMsg(Message):
             else:
                 return
 
+        assert attachment is not None
         self._telegram_file_size = attachment.file_size
         self.file_bot_id = None
