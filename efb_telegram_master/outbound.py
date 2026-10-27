@@ -35,6 +35,8 @@ from telegram import (
 from telegram.error import NetworkError, RetryAfter
 import httpx
 
+from .transfer_timeout import media_size, transfer_timeout
+
 if TYPE_CHECKING:
     from .aggregate import SourceMember
 
@@ -642,7 +644,9 @@ class OutboundQueue:
     # such row at a time, rewrite it to v2 sidecar storage, then let normal
     # replay budgeting apply to the compact row.
 
-    def __init__(self, channel_data_path: Path | str, metrics: Optional[QueueMetrics] = None):
+    def __init__(self, channel_data_path: Path | str, metrics: Optional[QueueMetrics] = None,
+                 transfer_min_mbps: Optional[float] = None):
+        self.transfer_min_mbps = transfer_min_mbps
         self.path = Path(channel_data_path) / self.filename
         self.media_dir = Path(channel_data_path) / "outbound-media"
         self._lock = threading.RLock()
@@ -1156,6 +1160,18 @@ class OutboundQueue:
             return b"\x02" + pickle.dumps((args, kwargs), protocol=5)
         except Exception as error:
             raise QueueEnqueueError("Unable to serialize queued Telegram call.") from error
+
+    def blocking_timeout(self, payload: bytes) -> float:
+        if self.transfer_min_mbps is None:
+            return 300.0
+        args, kwargs = self.decode_payload_raw(payload)
+        references: list[_StoredMediaSnapshot] = []
+        self._collect_media_references((args, kwargs), references)
+        size = media_size((args, kwargs)) + sum(
+            media_size(self.media_dir / ref.storage_name if ref.storage_name else ref.external_uri)
+            for ref in references
+        )
+        return transfer_timeout(300.0, size, self.transfer_min_mbps)
 
     def _restore_media_references(self, value: object, opened: list[object]) -> object:
         if isinstance(value, _StoredMediaSnapshot):
@@ -3464,7 +3480,7 @@ class OutboundQueueScheduler:
                     if self._is_blocking_media_retry(submitted.row, error):
                         assert isinstance(error, RetryAfter)
                         retry_after = self._retry_after_seconds(error)
-                        deadline = submitted.row.created_at + 300.0
+                        deadline = submitted.row.created_at + self.queue.blocking_timeout(submitted.row.payload)
                         if not self.stopping and time.time() + retry_after <= deadline:
                             retry_row = self._blocking_media_retry_row(submitted.row, error)
                             self.adapter.record_queued_retry_after(

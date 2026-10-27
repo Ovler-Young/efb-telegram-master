@@ -79,9 +79,14 @@ class ETMMsg(Message):
                 ext = mimetypes.guess_extension(self.mime, strict=False)
                 mime = self.mime
             file = tempfile.NamedTemporaryFile(suffix=ext)
+            timeout = bot_manager.file_transfer_timeout(FILE_DOWNLOAD_TIMEOUT, file_meta.file_size)
+            download_kwargs = {}
+            if getattr(bot_manager, '_transfer_min_mbps', None) is not None:
+                download_kwargs['read_timeout'] = bot_manager.file_transfer_timeout(
+                    bot_manager._request_kwargs.get('read_timeout'), file_meta.file_size)
             bot_manager._runtime.call(
-                file_meta.download_to_memory(out=file),
-                timeout=FILE_DOWNLOAD_TIMEOUT,
+                file_meta.download_to_memory(out=file, **download_kwargs),
+                timeout=timeout,
             )
             file.seek(0)
 

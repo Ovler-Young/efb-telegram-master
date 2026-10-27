@@ -58,6 +58,7 @@ from .outbound import (
 )
 from .ptb_compat import Filters
 from .rate_limiter import SlidingWindowRateLimiter
+from .transfer_timeout import media_size, parse_transfer_min_mbps, transfer_timeout
 
 
 BotChatKey: TypeAlias = Tuple[Optional[str], int]
@@ -452,6 +453,7 @@ class TelegramBotManager(LocaleMixin):
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         config = self.channel.config
+        self._transfer_min_mbps = parse_transfer_min_mbps(config.get("transfer_min_mbps"))
         self._stopping = threading.Event()
 
         req_kwargs = {
@@ -545,7 +547,10 @@ class TelegramBotManager(LocaleMixin):
         self._metrics_httpd = None
 
         self._send_worker_count = self._parse_send_worker_count(config)
-        self._outbound_queue = OutboundQueue(channel.db._base_path, metrics=self._metrics)
+        self._outbound_queue = OutboundQueue(
+            channel.db._base_path, metrics=self._metrics,
+            transfer_min_mbps=self._transfer_min_mbps,
+        )
         self._send_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._send_worker_count, thread_name_prefix="ETM-send",
         )
@@ -617,6 +622,23 @@ class TelegramBotManager(LocaleMixin):
                 )
             normalized["proxy"] = proxy
         return normalized
+
+    def file_transfer_timeout(self, base: float | None, size: int | None) -> float | None:
+        return transfer_timeout(base, size, getattr(self, '_transfer_min_mbps', None))
+
+    def _upload_timeout_kwargs(self, args: tuple, kwargs: Mapping[str, object]) -> dict:
+        if getattr(self, '_transfer_min_mbps', None) is None:
+            return dict(kwargs)
+        size = media_size((args, kwargs))
+        result = dict(kwargs)
+        if size:
+            for key, default in (("read_timeout", 15.0), ("write_timeout", None)):
+                configured = getattr(self, '_request_kwargs', {})
+                base = result.get(key, configured.get(
+                    'media_write_timeout' if key == 'write_timeout' else key, default))
+                if base is None or isinstance(base, (int, float)):
+                    result[key] = self.file_transfer_timeout(base, size)
+        return result
 
     def _build_request(self) -> HTTPXRequest:
         socket_options = self._request_kwargs.get("socket_options")
@@ -981,7 +1003,8 @@ class TelegramBotManager(LocaleMixin):
     def _call_direct_operation(
         self, operation: str, args: tuple, kwargs: Mapping[str, object]
     ) -> object:
-        return getattr(self._bot, operation)(*args, **self._strip_private_queue_metadata(kwargs))
+        return getattr(self._bot, operation)(
+            *args, **self._upload_timeout_kwargs(args, self._strip_private_queue_metadata(kwargs)))
 
     @staticmethod
     def _parse_metrics_config(metrics_cfg: object, logger) -> tuple[int, Optional[tuple[str, int]]]:
@@ -1261,6 +1284,7 @@ class TelegramBotManager(LocaleMixin):
         if slave_id:
             queued_kwargs["_slave_id"] = slave_id
         queued_kwargs["_send_mode"] = "blocking"
+        timeout = self.file_transfer_timeout(self.BLOCKING_SEND_TIMEOUT, media_size((args, kwargs)))
         try:
             row_id, queue_waiter = self._enqueue_requests([
                 QueueRequest(
@@ -1278,10 +1302,10 @@ class TelegramBotManager(LocaleMixin):
                     pass
             raise
         try:
-            result = queue_waiter.result(timeout=self.BLOCKING_SEND_TIMEOUT)
+            result = queue_waiter.result(timeout=timeout)
         except FutureTimeoutError as error:
             raise RuntimeError(
-                f"Blocking send to chat {chat_id} timed out after {self.BLOCKING_SEND_TIMEOUT:g}s"
+                f"Blocking send to chat {chat_id} timed out after {timeout:g}s"
             ) from error
         return self._make_send_receipt(
             result,
@@ -1342,8 +1366,9 @@ class TelegramBotManager(LocaleMixin):
         request_kwargs["_send_mode"] = "blocking"
         if required_sender_bot_id is not None:
             request_kwargs["_required_sender_bot_id"] = required_sender_bot_id
+        timeout = self.file_transfer_timeout(self.BLOCKING_SEND_TIMEOUT, media_size((args, kwargs)))
         _row_id, waiter = self._enqueue_requests([QueueRequest(operation, args, request_kwargs)])
-        return waiter.result(timeout=self.BLOCKING_SEND_TIMEOUT)
+        return waiter.result(timeout=timeout)
 
     def _enqueue_main_chat_mutation(
         self, operation: str, args: tuple, kwargs: Mapping[str, object]
@@ -1578,6 +1603,7 @@ class TelegramBotManager(LocaleMixin):
         method = getattr(sender, row.operation)
         telegram_kwargs = cast(dict, OutboundQueue.streaming_uploads(self._strip_private_queue_metadata(kwargs)))
         telegram_args = cast(tuple, OutboundQueue.streaming_uploads(args))
+        telegram_kwargs = self._upload_timeout_kwargs(telegram_args, telegram_kwargs)
         migration_retried = False
         replay = kwargs.get(HISTORY_REPLAY_KEY)
         if row.operation == "copy_message" and isinstance(replay, dict) and replay.get("attempted_fallback"):
@@ -2476,7 +2502,10 @@ class TelegramBotManager(LocaleMixin):
         # requests. Stream to disk instead of buffering the complete attachment.
         with tempfile.TemporaryFile() as stream:
             try:
-                with httpx.stream('GET', path, timeout=120, follow_redirects=True) as response:
+                with httpx.stream(
+                    'GET', path, timeout=httpx.Timeout(120, read=self.file_transfer_timeout(
+                        120, file_meta.file_size)), follow_redirects=True,
+                ) as response:
                     response.raise_for_status()
                     for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                         stream.write(chunk)
