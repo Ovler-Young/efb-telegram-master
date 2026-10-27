@@ -442,7 +442,9 @@ else:
         """Convert Telegram GIF to real GIF, the non-NT way."""
         gif_file = NamedTemporaryFile(suffix='.gif')
         file.seek(0)
-        metadata = ffmpeg.probe(file.name, timeout=FFMPEG_TIMEOUT)
+        metadata = json.loads(_run_ffmpeg_command([
+            'ffprobe', '-show_format', '-show_streams', '-of', 'json', file.name,
+        ]).decode('utf-8'))
         stream = ffmpeg.input(file.name)
         if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
             # Workaround: Compress GIF for slave channel `blueset.wechat`
