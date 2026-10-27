@@ -2472,16 +2472,21 @@ class TelegramBotManager(LocaleMixin):
         return self.send_message(update.effective_chat.id, errmsg,
                                  reply_to_message_id=update.effective_message.message_id)
 
-    def get_file(self, file_id: str, *, sender_bot_id: Optional[str] = None) -> File:
+    def get_file(self, file_id: str, *, sender_bot_id: Optional[str] = None,
+                 file_size: Optional[int] = None) -> File:
         """Resolve a saved file ID with its owner, independently of send routing."""
+        kwargs = {}
+        if getattr(self, '_transfer_min_mbps', None) is not None and file_size:
+            kwargs['read_timeout'] = self.file_transfer_timeout(
+                self._request_kwargs.get('read_timeout'), file_size)
         if sender_bot_id is None or self._is_main_sender_id(str(sender_bot_id)):
-            return cast(File, self._bot.get_file(file_id))
+            return cast(File, self._bot.get_file(file_id, **kwargs))
         auxiliary = self.bot_pool.get_bot_by_id(sender_bot_id) if self.bot_pool else None
         if auxiliary is None or auxiliary.disabled:
             raise RequiredSenderUnavailableError('Saved media acquisition bot is unavailable.')
         # Membership in the destination is irrelevant to getFile. Never fall
         # back to the main bot with somebody else's opaque file ID.
-        return cast(File, auxiliary.bot.get_file(file_id))
+        return cast(File, auxiliary.bot.get_file(file_id, **kwargs))
 
     @contextmanager
     def _history_media_upload(self, file_id: str, owner: Optional[str]) -> Iterator[object]:
