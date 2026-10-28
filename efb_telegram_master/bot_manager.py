@@ -2640,16 +2640,6 @@ class TelegramBotManager(LocaleMixin):
         self._stopping.set()
         self.logger.info("Starting graceful shutdown...")
 
-        # Log the durable queue depth before setting the shutdown boundary.
-        pending_count = 0
-        if hasattr(self, '_outbound_queue'):
-            pending_count = int(
-                self._outbound_queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
-            )
-
-        if pending_count > 0:
-            self.logger.info("Found %d pending queued send tasks", pending_count)
-
         # Stop the queued send worker first
         self.stop_queued_worker()
 
