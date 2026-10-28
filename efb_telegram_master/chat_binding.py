@@ -103,6 +103,8 @@ class ChatBindingManager(LocaleMixin):
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
     FORUM_RELINK_THRESHOLD = 960_000
+    # Class-level so a lane built without __init__ still sweeps exactly once.
+    _history_ownership_swept = False
     display_timezone = DEFAULT_TIMEZONE
 
     def __init__(self, channel: 'TelegramChannel'):
@@ -115,7 +117,7 @@ class ChatBindingManager(LocaleMixin):
         self._forum_limit_warned: set[int] = set()
         self._forum_limit_warned_lock = threading.Lock()
         self._history_migration_locks_lock = threading.Lock()
-        self._history_migration_locks: Dict[int, threading.Lock] = {}
+        self._history_migration_locks: Dict[Tuple[int, Optional[TelegramTopicID]], threading.Lock] = {}
         self._history_migration_thread: Optional[threading.Thread] = None
 
         # Link handler
@@ -1724,20 +1726,34 @@ class ChatBindingManager(LocaleMixin):
         self._history_migration_thread.start()
 
     def _resume_pending_history_migrations(self):
-        for target_chat_id in self.db.get_pending_history_migration_target_ids():
+        for target_chat_id, message_thread_id in self.db.get_pending_history_migration_targets():
             threading.Thread(
                 target=self._process_pending_history_migrations_for_target,
-                args=(int(target_chat_id),),
+                args=(int(target_chat_id), message_thread_id),
                 daemon=True,
-                name=f"HistoryMigration-{target_chat_id}",
+                name=f"HistoryMigration-{target_chat_id}-{message_thread_id or 'main'}",
             ).start()
 
-    def _history_migration_lock_for_target(self, target_chat_id: int) -> threading.Lock:
+    def _sweep_history_ownership(self) -> None:
+        """Forget ownership keys whose queue row is already gone."""
+        after = ""
+        while True:
+            keys = self.bot.history_ownership_page(after=after)
+            if not keys:
+                return
+            present = self.db.existing_history_ownership(keys)
+            self.bot.forget_history_entries(set(keys) - present)
+            after = keys[-1]
+
+    def _history_migration_lock_for_target(
+        self, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None,
+    ) -> threading.Lock:
+        key = (target_chat_id, message_thread_id)
         with self._history_migration_locks_lock:
-            lock = self._history_migration_locks.get(target_chat_id)
+            lock = self._history_migration_locks.get(key)
             if lock is None:
                 lock = threading.Lock()
-                self._history_migration_locks[target_chat_id] = lock
+                self._history_migration_locks[key] = lock
             return lock
 
     def _queue_and_process_history_migration(self, slave_chat_id: EFBChannelChatIDStr,
@@ -1745,10 +1761,10 @@ class ChatBindingManager(LocaleMixin):
                                              thread_id: Optional[TelegramTopicID] = None,
                                              storage_key: Optional[Tuple[TelegramChatID, TelegramMessageID]] = None):
         try:
-            with self._history_migration_lock_for_target(tg_chat_id):
+            with self._history_migration_lock_for_target(tg_chat_id, thread_id):
                 queued_count = self._queue_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
                 if queued_count:
-                    self._process_pending_history_migrations_locked(tg_chat_id)
+                    self._process_pending_history_migrations_locked(tg_chat_id, thread_id)
                 elif storage_key is not None:
                     self.send_history_link(slave_chat_id, tg_chat_id, storage_key, thread_id, empty_history=True)
         except Exception as e:
@@ -1810,24 +1826,22 @@ class ChatBindingManager(LocaleMixin):
         self.logger.info("Queued %s historical messages for chat %s", queued_count, slave_chat_id)
         return queued_count
 
-    def _process_pending_history_migrations_for_target(self, target_chat_id: int):
-        with self._history_migration_lock_for_target(target_chat_id):
-            self._process_pending_history_migrations_locked(target_chat_id)
+    def _process_pending_history_migrations_for_target(
+        self, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None,
+    ):
+        with self._history_migration_lock_for_target(target_chat_id, message_thread_id):
+            self._process_pending_history_migrations_locked(target_chat_id, message_thread_id)
 
-    def _process_pending_history_migrations_locked(self, target_chat_id: Optional[int] = None):
-        after = ""
+    def _process_pending_history_migrations_locked(
+        self, target_chat_id: Optional[int] = None,
+        message_thread_id: Optional[TelegramTopicID] = None,
+    ):
+        # One lane per topic would otherwise repeat this global sweep N times.
+        if not self._history_ownership_swept:
+            self._sweep_history_ownership()
+            self._history_ownership_swept = True
         while True:
-            keys = self.bot.history_ownership_page(after=after)
-            if not keys:
-                break
-            present = self.db.existing_history_ownership(keys)
-            self.bot.forget_history_entries(set(keys) - present)
-            after = keys[-1]
-        while True:
-            if target_chat_id is None:
-                target = self.db.get_next_history_migration_target()
-            else:
-                target = self.db.get_next_history_migration_target(target_chat_id)
+            target = self.db.get_next_history_migration_target(target_chat_id, message_thread_id)
             if target is None:
                 return
             if not self._process_history_migration_target(target):

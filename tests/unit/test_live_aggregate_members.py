@@ -172,7 +172,8 @@ def test_rm_selected_source_updates_only_after_source_success(handler, monkeypat
     assert statuses[-1].message.uid == 'source-1'
     row = MsgLog.get()
     assert [child['status'] for child in row.aggregate['children']] == ['active', 'removed']
-    assert 'first source' in row.text and '[message removed]' in row.text
+    assert 'first source' in row.text and 'second source' in row.text
+    assert handler.bot.transport.calls[-1][2].endswith('<s>second source</s>')
     assert len(handler.bot.transport.messages) == 1 and not deleted
 
 
@@ -228,9 +229,15 @@ def test_single_message_paths_and_deferred_aggregate_reactions(handler, monkeypa
     monkeypatch.setattr(coordinator, 'send_status', statuses.append)
     handler.channel.flag.config['prevent_message_removal'] = False
     handler.bot.delete_message = lambda *args, **kwargs: deleted.append(args)
+    handler.bot.transport.messages[88] = target
+    handler.bot.edit_message_text = handler.bot.transport.edit_message_text
     handler.delete_message(incoming(target, '/rm'), SimpleNamespace())
     assert statuses[-1].message.uid == 'legacy'
-    assert deleted == [(-100, 88)]
+    assert deleted == []
+    assert handler.bot.transport.messages[88].text == original.text
+    assert handler.bot.transport.calls[-1][2] == original.text
+    assert handler.bot.transport.messages[88].entities[0].type == 'strikethrough'
+    handler.bot.transport.messages.pop(88)
     handler.channel.bot_manager = handler.bot
     aggregate = container(handler)
     TelegramChannel.react(handler.channel, incoming(aggregate, '/react 👍'), SimpleNamespace())

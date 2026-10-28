@@ -5,16 +5,17 @@ from unittest.mock import patch, Mock
 import datetime
 
 import pytest
-from telegram.error import NetworkError
-from telegram import Document, Message, Chat
+from telegram.error import BadRequest, NetworkError
+from telegram import Document, Message, Chat, MessageEntity, PhotoSize, Sticker
 from ehforwarderbot import MsgType, Channel
 from ehforwarderbot.chat import ChatMember, GroupChat, PrivateChat, SystemChat
 from ehforwarderbot.status import MessageRemoval
 from ehforwarderbot.message import LinkAttribute, MessageCommand, MessageCommands
 
-from efb_telegram_master.aggregate import make_source_member, member_message
+from efb_telegram_master.aggregate import make_aggregate, make_source_member, member_message, utf16_length
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.live_aggregate import LiveTextAggregation
+from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest
 from efb_telegram_master.queued_log import decode_aggregation
 from efb_telegram_master.slave_message import SlaveMessageProcessor
@@ -87,7 +88,8 @@ def test_pending_and_inflight_source_edit_removal_recover(runtime):
     complete(manager)
     removed = MsgLog.get().aggregate["children"][0]
     assert removed["status"] == "removed"
-    assert MsgLog.get().text == "Alice: 08:00:01\n[message removed]"
+    assert MsgLog.get().text == "Alice: 08:00:01\nedited during first send"
+    assert manager.transport.calls[-1][2] == "Alice: <code>08:00:01</code>\n<s>edited during first send</s>"
     assert member_message(removed).text == "edited during first send"
     append(manager, "empty", 10)
     assert manager.live_aggregation.remove_source_member(key, (key[0], "empty"))
@@ -109,6 +111,159 @@ def test_independent_boundary_survives_restart(runtime):
     complete(manager)
     assert [call[2] for call in manager.transport.calls] == ["Alice: <code>08:00:01</code>\nbody", "media", "Alice: <code>08:00:01</code>\nbody"]
     assert [row.aggregate["children"][0]["source_id"] for row in MsgLog.select().order_by(MsgLog.master_msg_id)] == ["one", "three"]
+
+
+@pytest.mark.parametrize("photo", [False, True])
+def test_legacy_source_removal_edits_original_text_or_caption(runtime, photo):
+    manager = runtime
+    handler = processor(manager)
+    original = source("legacy", "saved <body> & caption")
+    content = dict(text="Alice:\n" + original.text)
+    if photo:
+        original.type, original.type_telegram = MsgType.Image, TGMsgType.Photo
+        original.file_id, original.file_unique_id = "photo-file", "photo-unique"
+        content = dict(caption="Alice:\n" + original.text,
+                       photo=[PhotoSize("photo-file", "photo-unique", 100, 100)])
+    receipt = Message(88, datetime.datetime.now(datetime.timezone.utc), Chat(-100, "supergroup"), **content)
+    manager.transport.messages[88] = receipt
+    manager.channel.db.add_or_update_message_log(original, receipt)
+    manager.edit_message_text = manager.transport.edit_message_text
+    manager.edit_message_caption = manager.transport.edit_message_caption
+    remove(handler, "legacy")
+    retained = manager.transport.messages[88]
+    assert (retained.caption if photo else retained.text) == "Alice:\n" + original.text
+    assert manager.transport.calls[-1][2] == "Alice:\nsaved <body> & caption"
+    entities = retained.caption_entities if photo else retained.entities
+    assert entities == (MessageEntity(MessageEntity.STRIKETHROUGH, 0, utf16_length("Alice:\n" + original.text)),)
+    assert MsgLog.get().text == original.text
+    if photo:
+        assert retained.photo == receipt.photo
+
+
+def test_persisted_photo_removal_edits_caption_and_preserves_alternate_route(runtime):
+    manager = runtime
+    original = source("photo", "saved <caption>")
+    original.type, original.type_telegram = MsgType.Image, TGMsgType.Photo
+    original.file_id, original.file_unique_id = "photo-file", "photo-unique"
+    original.mime, original.file_bot_id = "image/jpeg", "900"
+    photo = PhotoSize("photo-file", "photo-unique", 100, 100)
+    receipt = Message(88, datetime.datetime.now(datetime.timezone.utc), Chat(-100, "supergroup"),
+                      caption="Alice:\n" + original.text, photo=[photo], message_thread_id=7)
+    member = make_source_member(original, display_prefix="Alice")
+    manager.channel.db.finalize_source_message(original, receipt, member, "700")
+    alternate = Message(89, receipt.date, receipt.chat, caption=receipt.caption, photo=[photo], message_thread_id=7)
+    member["source_revision"] = 2
+    manager.channel.db.finalize_source_message(original, alternate, member, "700", old_message_id=(-100, 88))
+    manager.transport.messages[89] = alternate
+    key = (member["origin_uid"], -100, "7")
+    assert manager.live_aggregation.remove_source_member(key, (key[0], "photo"))
+    row = manager._outbound_queue.aggregation_rows()[0]
+    # Upgrade an already frozen removal from the former media-deletion format.
+    payload = manager._outbound_queue.encode_payload((), dict(chat_id=-100, message_id=89))
+    manager._outbound_queue.connection.execute("UPDATE outbound_queue SET operation=?, payload=? WHERE id=?",
+                                               ("delete_message", payload, row.id))
+    manager._outbound_queue.connection.commit()
+    restart(manager)
+    complete(manager)
+    assert manager.transport.calls == [("edit_message_caption", -100, "Alice:\nsaved <caption>", {"message_id": 89})]
+    assert manager.transport.messages[89].photo == alternate.photo
+    assert manager.transport.messages[89].caption == alternate.caption
+    assert manager.transport.messages[89].caption_entities == (
+        MessageEntity(MessageEntity.STRIKETHROUGH, 0, utf16_length(alternate.caption)),)
+    saved, removed = manager.channel.db.resolve_source_member(key[0], "photo", "-100", "7")
+    assert (saved.master_msg_id, saved.master_msg_id_alt, saved.sender_bot_id, saved.media_type,
+            saved.file_id, saved.file_unique_id, saved.file_bot_id) == (
+        "-100.88", "-100.89", "700", "Photo", "photo-file", "photo-unique", "900")
+    assert removed["status"] == "removed" and removed["snapshot"] == member["snapshot"]
+    assert not manager._outbound_queue.aggregation_rows()
+
+
+def test_uneditable_source_removal_keeps_media_and_notifies(runtime):
+    manager = runtime
+    manager.channel._ = lambda text: text
+    original = source("sticker", "")
+    original.type, original.type_telegram = MsgType.Sticker, TGMsgType.Sticker
+    original.file_id, original.file_unique_id = "sticker-file", "sticker-unique"
+    receipt = Message(1, datetime.datetime.now(datetime.timezone.utc), Chat(-100, "supergroup"),
+                      sticker=Sticker("sticker-file", "sticker-unique", "regular", 100, 100, False, False))
+    member = make_source_member(original)
+    manager.channel.db.finalize_source_message(original, receipt, member)
+    manager.transport.messages[1] = receipt
+    def reject_caption(chat_id, message_id, **kwargs):
+        raise BadRequest("There is no caption in the message to edit")
+    manager.transport.edit_message_caption = reject_caption
+    key = (member["origin_uid"], -100, None)
+    manager.live_aggregation.remove_source_member(key, (key[0], "sticker"))
+    manager._outbound_scheduler.dispatch_once()
+    submitted = next(iter(manager._outbound_scheduler.in_flight.values()))
+    with pytest.raises(BadRequest):
+        submitted.future.result(timeout=2)
+    manager._outbound_scheduler.harvest_completed()
+    assert manager._outbound_scheduler.failure is None
+    complete(manager)
+    assert manager.transport.messages[1] == receipt
+    assert manager.transport.calls[-1][2] == "Message is removed in remote chat."
+    saved, removed = manager.channel.db.resolve_source_member(key[0], "sticker", "-100")
+    assert saved.master_msg_id == "-100.1" and saved.media_type == "Sticker"
+    assert removed["status"] == "removed" and removed["snapshot"] == member["snapshot"]
+
+
+def test_removal_keeps_confirmed_legacy_marker_without_restoring_old_body(runtime):
+    manager = runtime
+    first = make_source_member(source("old", "A" * 3500), received_time=datetime.datetime.fromtimestamp(1))
+    first.update(status="removed", source_revision=2)
+    second = make_source_member(source("current", "B" * 3500), received_time=datetime.datetime.fromtimestamp(2))
+    aggregate = make_aggregate([first, second], 3)
+    old_display = "Alice: 08:00:01\n[message removed]"
+    current_display = "Alice: 08:00:02\n" + "B" * 3500
+    aggregate["confirmed_text"] = old_display + "\n\n" + current_display
+    aggregate["confirmed_ranges"] = [
+        dict(origin_uid=first["origin_uid"], source_id="old", start=0, end=utf16_length(old_display)),
+        dict(origin_uid=second["origin_uid"], source_id="current", start=utf16_length(old_display) + 2,
+             end=utf16_length(aggregate["confirmed_text"])),
+    ]
+    receipt = manager.transport._save(-100, 1, aggregate["confirmed_text"], None, parse_mode=None)
+    manager.channel.db.finalize_aggregate_message(receipt, aggregate)
+    key = (first["origin_uid"], -100, None)
+    manager.live_aggregation.remove_source_member(key, (key[0], "current"))
+    restart(manager)
+    complete(manager)
+    saved = manager.channel.db.get_msg_log(master_msg_id="-100.1")
+    assert saved.text == aggregate["confirmed_text"]
+    assert manager.transport.calls[-1][2].startswith(old_display + "\n\n")
+    assert manager.transport.calls[-1][2].endswith("<s>" + "B" * 3500 + "</s>")
+    assert [child["status"] for child in saved.aggregate["children"]] == ["removed", "removed"]
+    append(manager, "next", 10, "delivery continues", topic=7)
+    complete(manager)
+    assert manager.transport.messages[2].text.endswith("delivery continues")
+
+
+def test_link_removal_preserves_title_description_note_and_url(runtime):
+    manager = runtime
+    handler = processor(manager)
+    original = source("link", "optional 😀 note")
+    original.type = MsgType.Link
+    original.attributes = LinkAttribute("Link title", description="Link description", url="https://example.com/link")
+    visible = "Alice:\n🔗 Link title\nLink description\n\noptional 😀 note"
+    receipt = manager.transport._save(-100, 88, visible, None, parse_mode=None)
+    manager.channel.db.add_or_update_message_log(original, receipt)
+    manager.edit_message_text = manager.transport.edit_message_text
+    remove(handler, "link")
+    assert manager.transport.messages[88].text == visible
+    assert manager.transport.messages[88].entities[1].url == original.attributes.url
+    # Managed outputs use the same link presentation after queue recovery.
+    member = make_source_member(original, display_prefix="Alice")
+    manager.channel.db.finalize_source_message(original, receipt, member)
+    key = (member["origin_uid"], -100, None)
+    manager.live_aggregation.remove_source_member(key, (key[0], "link"))
+    restart(manager)
+    complete(manager)
+    retained = manager.transport.messages[88]
+    assert retained.text == visible
+    assert retained.entities[0] == MessageEntity(MessageEntity.STRIKETHROUGH, 0, utf16_length(visible))
+    assert retained.parse_entity(retained.entities[1]) == "Link title"
+    assert retained.entities[1].url == original.attributes.url
+    assert member_message(manager.channel.db.get_msg_log(master_msg_id="-100.88").source_member).text == original.text
 
 
 @pytest.mark.parametrize("middle_type", [MsgType.Text, MsgType.Link])
@@ -162,7 +317,9 @@ def test_fixed_owner_update_uncertainty_survives_restart(runtime):
     restart(manager)
     member["source_revision"] = 3
     child = manager.live_aggregation.queue_container_update("-100.1", [member], key=key)
-    assert child not in [row.id for row in manager._outbound_queue.heads(ready_only=True)]
+    # A permanently held parent must not strand its dependent: the held row stays
+    # retained for confirmation, but delivery continues behind it.
+    assert child in [row.id for row in manager._outbound_queue.heads(ready_only=True)]
     assert manager._outbound_queue.contains(parent)
 
 

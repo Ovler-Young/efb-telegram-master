@@ -86,6 +86,36 @@ original bot. Edit/delete routing continues to use the actual author.
 results. A healthy worker can coexist with held records; queue depth alone does
 not mean that those records are awaiting a safe automatic retry.
 
+Aggregation recovery and source lookups read `log_context` and ordering only;
+`aggregation_rows()` returns no payload bytes, so a large legacy inline media
+row cannot be pulled into memory by a recovery pass.
+
+A dispatch pass that leaves queued rows with no retry deadline and nothing in
+flight logs `Outbound scheduler left N dispatchable head(s) undispatched ... while
+queued rows remain` and rescans 30 seconds later instead of sleeping until the
+next message or restart. That covers a row waiting behind another row and a row
+whose readiness filter excludes it from every head. Worker permits held without
+a submitted call cannot be released by a completion, so they are reset and
+reported the same way. All of these mean delivery is still being attempted, not
+that rows were dropped.
+
+A dependent row is deferred only while the row it links to is itself still
+waiting: queued and unheld, in flight, or delivered and awaiting its MsgLog write.
+A predecessor that is gone, permanently held, or linked into a cycle is not an
+ordering barrier — waiting for it either already happened or can never happen —
+so it cannot strand everything queued behind it. Held rows themselves are kept
+and still require an operator. When every waiting row defers to another waiting
+row there is no valid order at all; the scheduler then dispatches the oldest row
+per destination and logs `deferred by predecessor links that never resolve`:
+
+```sql
+SELECT q.id, q.predecessor_id, p.id IS NOT NULL AS predecessor_exists
+FROM outbound_queue q LEFT JOIN outbound_queue p ON p.id = q.predecessor_id
+WHERE q.delivery_state = 'queued' AND q.delivery_hold IS NULL
+  AND NOT EXISTS (SELECT 1 FROM outbound_queue p2 WHERE p2.id = q.predecessor_id)
+LIMIT 20;
+```
+
 ```sql
 SELECT id, operation, telegram_chat_id, delivery_state, delivery_hold,
        attempt_sender_bot_id, attempt_started_at,
@@ -93,6 +123,12 @@ SELECT id, operation, telegram_chat_id, delivery_state, delivery_hold,
 FROM outbound_queue
 WHERE delivery_hold IS NOT NULL;
 ```
+
+Startup sweeps unreferenced media sidecars only for a queue of at most
+`MAX_ORPHAN_SCAN_ROWS` rows, because the sweep opens one blob reader per
+queued row. A larger queue logs `Skipping the outbound media sweep` and keeps
+every sidecar; the sweep resumes as the queue drains. Delivery never depends
+on it.
 
 Sidecar uploads are wrapped with PTB `InputFile(read_file_handle=False)`, including
 nested input media. Passing a normal file object to PTB would otherwise read the

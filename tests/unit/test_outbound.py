@@ -1189,7 +1189,7 @@ def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path
 
     assert [row.id for row in queue.heads()] == [row_id]
     assert not waiter.done()
-    assert scheduler.next_deadline == 10.25
+    assert scheduler.next_deadline == 11.0
     assert adapter.calls == []
 
 
@@ -1651,3 +1651,38 @@ def test_constructor_failure_releases_queue_ownership(tmp_path, monkeypatch):
         assert queue.load_queued(row_id).operation == "send_message"
     finally:
         queue.close()
+
+
+def test_rows_written_before_the_topic_column_regain_their_lane(tmp_path):
+    """A topic carried only by the request must not stay in the chat's main lane."""
+    from efb_telegram_master.queued_log import encode_aggregation
+
+    def send_photo(photo, chat_id, message_thread_id=None):
+        return photo, chat_id, message_thread_id
+
+    def container(chat_id, topic):
+        return encode_aggregation(dict(
+            format_version=1, kind="logical", key=("slave", chat_id, topic), members=[], base=None,
+            inherit=False, generation=1, recent=[], last_new=0, waiting=False, due=0, silent=False,
+        ))
+
+    queue = OutboundQueue(tmp_path)
+    for topic in (11, 12, 11, 12):
+        queue.enqueue_many([QueueRequest("send_photo", (b"image",), {
+            "chat_id": -1001, "message_thread_id": topic,
+        })], lambda _operation: send_photo)
+    queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -1001, "text": "", "_slave_id": "slave"},
+                                     container(-1001, "13"))], lambda _operation: send_message)
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET thread_id = NULL")
+    assert [row.thread_id for row in queue.heads(ready_only=True)] == [None], \
+        "legacy rows all collapse into the main lane"
+    queue.close()
+
+    reopened = OutboundQueue(tmp_path)  # opening the queue repairs them
+    try:
+        assert sorted(row.thread_id for row in reopened.heads(ready_only=True)) == [11, 12, 13]
+        # Idempotent: a second pass has nothing left to do.
+        assert reopened.repair_legacy_thread_ids() == 0
+    finally:
+        reopened.close()

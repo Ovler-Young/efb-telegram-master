@@ -1,6 +1,8 @@
 import re
 import datetime
 import time
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from io import BytesIO
 
@@ -117,3 +119,26 @@ def test_aggregation_rule_configuration():
     ):
         with raises(ValueError, match="flags.text_aggregation_rules"):
             ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"text_aggregation_rules": invalid}}))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Uses the non-Windows file conversion path")
+def test_gif_conversion_uses_process_timeout(monkeypatch, tmp_path):
+    from efb_telegram_master import utils
+
+    source = tmp_path / "animation.mp4"
+    source.write_bytes(b"video input")
+
+    def run(args, **kwargs):
+        assert kwargs["timeout"] == 60
+        assert "-timeout" not in args
+        if args[0] == "ffprobe":
+            assert args[1:] == ["-show_format", "-show_streams", "-of", "json", str(source)]
+            return SimpleNamespace(returncode=0, stdout=b'{"streams": [], "format": {}}', stderr=b"")
+        Path(args[-2]).write_bytes(b"GIF89a")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(utils.subprocess, "run", run)
+    with source.open("rb") as input_file:
+        with utils.gif_conversion(input_file, "tests.slave") as output:
+            assert output.read() == b"GIF89a"
+        assert input_file.closed

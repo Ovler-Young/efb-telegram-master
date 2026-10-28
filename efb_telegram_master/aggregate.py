@@ -12,7 +12,7 @@ from telegram.constants import MessageLimit
 
 from . import queued_log
 from .message import ETMMsg
-from .utils import DEFAULT_TIMEZONE, chat_id_to_str, format_message_time
+from .utils import DEFAULT_TIMEZONE, chat_id_to_str, format_message_time, removed_text
 
 
 class SourceReply(TypedDict):
@@ -117,11 +117,22 @@ def _body_html(message: ETMMsg, admin_id: Optional[int], self_mentions: List[Tup
 
 def render_members(members: List[SourceMember], *, admin_id: Optional[int] = None,
                    history: bool = False, display_timezone: ZoneInfo = DEFAULT_TIMEZONE,
+                   confirmed: Optional[AggregatePayload] = None,
                    _compact_status: bool = False) -> RenderedAggregate:
     """Render every real source separately; ranges refer to parsed UTF-16 text."""
     html_parts: List[str] = []
     text_parts: List[str] = []
     ranges: List[MemberRange] = []
+    removed_displays = {}
+    if confirmed and not history:
+        removed = {member_identity(child) for child in confirmed["children"] if child["status"] == "removed"}
+        encoded = confirmed["confirmed_text"].encode("utf-16-le")
+        for member_range in confirmed["confirmed_ranges"]:
+            range_identity = member_range["origin_uid"], member_range["source_id"]
+            if range_identity in removed:
+                visible = encoded[member_range["start"] * 2:member_range["end"] * 2].decode("utf-16-le")
+                if visible.endswith(("[message removed]", "[removed]")):
+                    removed_displays[range_identity] = visible
     offset = 0
     for member in members:
         if history and member["status"] == "redirected":
@@ -130,18 +141,22 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
         if name is None:
             name = member["author_name"]
         # Status displays remain bounded even after many source edits.
-        if not history and member["status"] != "active":
+        if not history and member["status"] == "redirected":
             name = name[:80]
-            body = "[message removed]" if member["status"] == "removed" else "[message moved]"
+            body = "[message moved]"
             if _compact_status:
                 name = ""
-                body = "[removed]" if member["status"] == "removed" else "[moved]"
+                body = "[moved]"
             body_html = html.escape(body)
             reply_text = ""
         else:
             message = member_message(member)
             body = message.text or ""
             body_html = _body_html(message, admin_id, member["self_mentions"])
+            if not history and member["status"] == "removed":
+                body_html = removed_text(body)
+                if not body:
+                    body = "[message removed]"
             reply = member["reply"]
             reply_text = ""
             if reply:
@@ -153,7 +168,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
         else:
             display_time = member["source_time"] or member["received_time"]
             timestamp = format_message_time(display_time, display_timezone)
-            if _compact_status and member["status"] != "active":
+            if _compact_status and member["status"] == "redirected":
                 prefix = timestamp + " "
                 prefix_html = f"<code>{timestamp}</code> "
             else:
@@ -162,32 +177,40 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
                 author_html = f"{html.escape(author_prefix)} " if name else ""
                 prefix_html = author_html + f"<code>{timestamp}</code>\n"
         visible = prefix + reply_text + body
+        visible_html = prefix_html + html.escape(reply_text) + body_html
+        previous_display = removed_displays.get(member_identity(member))
+        if member["status"] == "removed" and previous_display is not None and previous_display != visible:
+            # Older containers already replaced these sources with a removal marker.
+            visible, visible_html = previous_display, html.escape(previous_display)
         if text_parts:
             offset += 2
         ranges.append(MemberRange(origin_uid=member["origin_uid"], source_id=member["source_id"],
                                   start=offset, end=offset + utf16_length(visible)))
         offset += utf16_length(visible)
         text_parts.append(visible)
-        html_parts.append(prefix_html + html.escape(reply_text) + body_html)
+        html_parts.append(visible_html)
     if not text_parts:
         return RenderedAggregate("[message removed]", "[message removed]", [])
     if (not history and not _compact_status and
             len("\n\n".join(text_parts)) > int(MessageLimit.MAX_TEXT_LENGTH) and
-            any(member["status"] != "active" for member in members)):
-        return render_members(members, admin_id=admin_id, display_timezone=display_timezone, _compact_status=True)
+            any(member["status"] == "redirected" for member in members)):
+        return render_members(members, admin_id=admin_id, display_timezone=display_timezone,
+                              confirmed=confirmed, _compact_status=True)
     return RenderedAggregate("\n\n".join(html_parts), "\n\n".join(text_parts), ranges)
 
 
 def make_aggregate(members: List[SourceMember], revision: int, *,
-                   admin_id: Optional[int] = None, display_timezone: ZoneInfo = DEFAULT_TIMEZONE) -> AggregatePayload:
-    rendered = render_members(members, admin_id=admin_id, display_timezone=display_timezone)
+                   admin_id: Optional[int] = None, display_timezone: ZoneInfo = DEFAULT_TIMEZONE,
+                   confirmed: Optional[AggregatePayload] = None) -> AggregatePayload:
+    rendered = render_members(members, admin_id=admin_id, display_timezone=display_timezone, confirmed=confirmed)
     return AggregatePayload(format_version=1, revision=revision, children=members,
                             confirmed_text=rendered.text, confirmed_ranges=rendered.ranges)
 
 
 def aggregate_fits(members: List[SourceMember], *, max_members: int = 200,
                    max_payload_bytes: int = 256 * 1024, admin_id: Optional[int] = None,
-                   include_redirected_payload: bool = True, display_timezone: ZoneInfo = DEFAULT_TIMEZONE) -> bool:
+                   include_redirected_payload: bool = True, display_timezone: ZoneInfo = DEFAULT_TIMEZONE,
+                   confirmed: Optional[AggregatePayload] = None) -> bool:
     """Enforce display/member limits and saved payload capacity.
 
     Redirected members retain their full snapshots after replacement confirmation;
@@ -196,5 +219,6 @@ def aggregate_fits(members: List[SourceMember], *, max_members: int = 200,
     payload_members = members if include_redirected_payload else [
         member for member in members if member["status"] != "redirected"]
     return (len(members) <= max_members and
-            len(render_members(members, admin_id=admin_id, display_timezone=display_timezone).text) <= int(MessageLimit.MAX_TEXT_LENGTH) and
+            len(render_members(members, admin_id=admin_id, display_timezone=display_timezone,
+                               confirmed=confirmed).text) <= int(MessageLimit.MAX_TEXT_LENGTH) and
             len(pickle.dumps(payload_members, protocol=5)) <= max_payload_bytes)

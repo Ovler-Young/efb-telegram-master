@@ -43,6 +43,9 @@ class ETMMsg(Message):
     chat: ETMChatType
     author: ETMChatMember
 
+    _telegram_file_size: Optional[int] = None
+    """Transient attachment size used before getFile returns metadata."""
+
     __file = None
     __path = None
     __filename = None
@@ -68,7 +71,9 @@ class ETMMsg(Message):
             bot_manager = coordinator.master.bot_manager
 
             try:
-                file_meta = bot_manager.get_file(self.file_id, sender_bot_id=self.file_bot_id or self.sender_bot_id)
+                file_meta = bot_manager.get_file(
+                    self.file_id, sender_bot_id=self.file_bot_id or self.sender_bot_id,
+                    file_size=self._telegram_file_size)
             except BadRequest:
                 logger.exception("Original bot could not resolve saved file metadata.")
                 return
@@ -79,9 +84,14 @@ class ETMMsg(Message):
                 ext = mimetypes.guess_extension(self.mime, strict=False)
                 mime = self.mime
             file = tempfile.NamedTemporaryFile(suffix=ext)
+            timeout = bot_manager.file_transfer_timeout(FILE_DOWNLOAD_TIMEOUT, file_meta.file_size)
+            download_kwargs = {}
+            if getattr(bot_manager, '_transfer_min_mbps', None) is not None:
+                download_kwargs['read_timeout'] = bot_manager.file_transfer_timeout(
+                    bot_manager._request_kwargs.get('read_timeout'), file_meta.file_size)
             bot_manager._runtime.call(
-                file_meta.download_to_memory(out=file),
-                timeout=FILE_DOWNLOAD_TIMEOUT,
+                file_meta.download_to_memory(out=file, **download_kwargs),
+                timeout=timeout,
             )
             file.seek(0)
 
@@ -199,23 +209,27 @@ class ETMMsg(Message):
         if not is_common_file:
             if self.type_telegram is TGMsgType.Audio:
                 assert message.audio
+                attachment = message.audio
                 self.file_id = message.audio.file_id
                 self.file_unique_id = message.audio.file_unique_id
                 self.mime = message.audio.mime_type
                 self.filename = message.audio.file_name
             elif self.type_telegram is TGMsgType.Sticker:
                 assert message.sticker
+                attachment = message.sticker
                 self.file_id = message.sticker.file_id
                 self.file_unique_id = message.sticker.file_unique_id
                 self.mime = 'image/webp'
             elif self.type_telegram is TGMsgType.AnimatedSticker:
                 assert message.sticker
+                attachment = message.sticker
                 self.file_id = message.sticker.file_id
                 self.file_unique_id = message.sticker.file_unique_id
                 self.mime = 'application/json+tgs'
                 self.type = MsgType.Animation
             elif self.type_telegram is TGMsgType.VideoSticker:
                 assert message.sticker
+                attachment = message.sticker
                 self.file_id = message.sticker.file_id
                 self.file_unique_id = message.sticker.file_unique_id
                 self.mime = 'video/webm'
@@ -227,10 +241,13 @@ class ETMMsg(Message):
                 self.mime = 'image/jpeg'
             elif self.type_telegram is TGMsgType.VideoNote:
                 assert message.video_note
+                attachment = message.video_note
                 self.file_id = message.video_note.file_id
                 self.file_unique_id = message.video_note.file_unique_id
                 self.mime = 'video/mpeg'
             else:
                 return
 
+        assert attachment is not None
+        self._telegram_file_size = attachment.file_size
         self.file_bot_id = None

@@ -1326,17 +1326,21 @@ def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
     manager._runtime.shutdown.assert_not_called()
 
 
-def test_graceful_stop_is_idempotent_after_outbound_queue_closes():
+def test_graceful_stop_is_idempotent_after_outbound_queue_closes(tmp_path):
     shutdown_complete_event = threading.Event()
     shutdown_complete_event.set()
-    connection = Mock()
-    connection.execute.return_value.fetchone.return_value = (0,)
+    queue = OutboundQueue(tmp_path)
+    queue.close()
+    metrics_httpd = Mock(thread=None)
+    runtime = SimpleNamespace(_owns_loop_thread=True, shutdown=Mock())
     manager = SimpleNamespace(
         logger=Mock(),
         _stopping=threading.Event(),
         _graceful_stop_lock=threading.Lock(),
         _graceful_stop_complete=False,
-        _outbound_queue=SimpleNamespace(connection=connection),
+        _outbound_queue=queue,
+        _metrics_httpd=metrics_httpd,
+        _runtime=runtime,
         stop_queued_worker=Mock(),
         bot_pool=None,
         _shutdown_complete_event=shutdown_complete_event,
@@ -1345,7 +1349,9 @@ def test_graceful_stop_is_idempotent_after_outbound_queue_closes():
     TelegramBotManager.graceful_stop(manager)
     TelegramBotManager.graceful_stop(manager)
 
-    connection.execute.assert_called_once_with("SELECT COUNT(*) FROM outbound_queue")
+    metrics_httpd.server_close.assert_called_once_with()
+    runtime.shutdown.assert_called_once_with()
+    assert manager._graceful_stop_complete
     manager.stop_queued_worker.assert_called_once_with()
 
 
@@ -1784,3 +1790,44 @@ def test_write_db_mapping_logs_failure_and_runs_completion_callback():
 
     mgr.logger.warning.assert_called_once()
     on_complete.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "configured, expected",
+    [(None, 8), (16, 16), ("24", 24), (0, 1), (-5, 1), (4096, 64), ("many", 8), (True, 8)],
+)
+def test_send_worker_count_is_configured_and_bounded(configured, expected):
+    config = {"flags": {}} if configured is None else {"flags": {"send_worker_count": configured}}
+    assert TelegramBotManager._parse_send_worker_count(config) == expected
+
+
+def test_connection_pool_keeps_one_connection_per_worker(monkeypatch):
+    monkeypatch.delenv(TelegramBotManager.HTTPX_POOL_MULTIPLIER_ENV, raising=False)
+    assert TelegramBotManager._default_connection_pool_size({}) == 16
+    assert TelegramBotManager._default_connection_pool_size({"flags": {"send_worker_count": 24}}) == 48
+    monkeypatch.setenv(TelegramBotManager.HTTPX_POOL_MULTIPLIER_ENV, "1")
+    assert TelegramBotManager._default_connection_pool_size({"flags": {"send_worker_count": 24}}) == 24
+
+
+def test_rate_limited_retries_are_reported_once_per_window(monkeypatch, caplog):
+    """A RetryAfter retry is otherwise silent, so a stalled lane has no explanation."""
+    manager = object.__new__(TelegramBotManager)
+    manager._bot_chat_state_lock = threading.Lock()
+    manager._bot_chat_disabled_until = {}
+    manager.bot_pool = None
+    now = [1_000.0]
+    monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: now[0])
+    task = SimpleNamespace(id=7, telegram_chat_id=100, slave_id=None, priority=0)
+    selection = SimpleNamespace(sender_bot_id="10")
+
+    def reported():
+        return [record for record in caplog.records if "wait" in record.getMessage()]
+
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.bot_manager"):
+        manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+        manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+        assert len(reported()) == 1
+        now[0] += 61
+        manager.record_queued_failure(task, telegram.error.RetryAfter(20), selection)
+        assert len(reported()) == 2
+    assert "20" in reported()[-1].getMessage()

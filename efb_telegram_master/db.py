@@ -1427,25 +1427,58 @@ class DatabaseManager:
     @observe_database_method("get_next_history_migration_target")
     def get_next_history_migration_target(
         self, target_chat_id: Optional[int] = None,
+        message_thread_id: Optional[TelegramTopicID] = None,
     ) -> Optional[HistoryMigrationEntry]:
         # Seek one head per published generation; ordering a combined
         # visibility predicate can instead scan every unpublished staging row.
-        target_filter = (
-            HistoryMigrationTarget.target_chat_id == str(target_chat_id)
-            if target_chat_id is not None else True
-        )
+        # A topic scopes the search to one replay lane: topics of a chat are
+        # ordered only within themselves, so one topic must not hide the others.
+        thread_value = str(message_thread_id) if message_thread_id is not None else None
+        published_filter: list[object] = []
+        if target_chat_id is not None:
+            published_filter.append(HistoryMigrationTarget.target_chat_id == str(target_chat_id))
+        if thread_value is not None:
+            published_filter.append(HistoryMigrationTarget.message_thread_id == thread_value)
         head = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             HistoryMigrationEntry.generation == HistoryMigrationTarget.generation,
         ).order_by(HistoryMigrationEntry.position, HistoryMigrationEntry.id).limit(1)
-        published_id = HistoryMigrationTarget.select(fn.MIN(EnclosedNodeList([head]))).where(target_filter).scalar()
+        published_id = HistoryMigrationTarget.select(
+            fn.MIN(EnclosedNodeList([head]))
+        ).where(*(published_filter or (True,))).scalar()
         legacy_filter = HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
         if target_chat_id is not None:
             legacy_filter &= HistoryMigrationEntry.target_chat_id == str(target_chat_id)
+        if thread_value is not None:
+            legacy_filter &= HistoryMigrationEntry.message_thread_id == thread_value
         legacy_id = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             legacy_filter
         ).order_by(HistoryMigrationEntry.position, HistoryMigrationEntry.id).limit(1).scalar()
         ids = [identifier for identifier in (published_id, legacy_id) if identifier is not None]
         return HistoryMigrationEntry.get_by_id(min(ids)) if ids else None
+
+    @observe_database_method("get_pending_history_migration_targets")
+    def get_pending_history_migration_targets(self) -> List[Tuple[int, Optional[int]]]:
+        """Return every (target chat, topic) pair that still has unpublished entries.
+
+        Replay is serialized per topic, not per chat, so this is the set that
+        deserves its own replay lane.
+        """
+        published = HistoryMigrationTarget.select(
+            HistoryMigrationTarget.target_chat_id, HistoryMigrationTarget.message_thread_id,
+        )
+        legacy = HistoryMigrationEntry.select(
+            HistoryMigrationEntry.target_chat_id, HistoryMigrationEntry.message_thread_id,
+        ).where(
+            HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
+        )
+        pairs = {
+            (int(row.target_chat_id), int(row.message_thread_id) if row.message_thread_id else None)
+            for row in list(published) + list(legacy)
+        }
+        return [
+            pair for pair in sorted(pairs, key=lambda pair: (pair[0], -1 if pair[1] is None else pair[1]))
+            if self.get_next_history_migration_target(*pair) is not None
+        ]
 
     @observe_database_method("get_pending_history_migration_target_ids")
     def get_pending_history_migration_target_ids(self) -> List[int]:

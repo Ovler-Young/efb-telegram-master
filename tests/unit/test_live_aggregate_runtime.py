@@ -33,17 +33,31 @@ class Transport:
         if self.error:
             raise self.error
         message_id = len(self.messages) + 1
-        return self._save(chat_id, message_id, text, kwargs.get("message_thread_id"))
+        return self._save(chat_id, message_id, text, kwargs.get("message_thread_id"),
+                          parse_mode=kwargs.get("parse_mode"), entities=kwargs.get("entities"))
 
     def edit_message_text(self, text, chat_id, message_id, parse_mode=None, **kwargs):
         self.calls.append(("edit_message_text", chat_id, text, {"message_id": message_id}))
         if self.error:
             raise self.error
-        return self._save(chat_id, message_id, text, self.messages[message_id].message_thread_id)
+        return self._save(chat_id, message_id, text, self.messages[message_id].message_thread_id,
+                          parse_mode=parse_mode, entities=kwargs.get("entities"))
 
-    def _save(self, chat_id, message_id, text, topic):
+    def edit_message_caption(self, chat_id, message_id, caption=None, parse_mode=None, **kwargs):
+        self.calls.append(("edit_message_caption", chat_id, caption, {"message_id": message_id}))
+        if self.error:
+            raise self.error
+        saved = self.messages[message_id].to_dict()
+        saved["caption"] = html.unescape(re.sub(r"<[^>]+>", "", caption or "")) if parse_mode == "HTML" else caption
+        saved["caption_entities"] = [entity.to_dict() for entity in kwargs.get("caption_entities", [])]
+        message = Message.de_json(saved, None)
+        self.messages[message_id] = message
+        return message
+
+    def _save(self, chat_id, message_id, text, topic, parse_mode="HTML", entities=None):
         message = Message(message_id, datetime.datetime.now(datetime.timezone.utc), Chat(chat_id, "supergroup"),
-                          text=html.unescape(re.sub(r"<[^>]+>", "", text)), message_thread_id=topic)
+                          text=html.unescape(re.sub(r"<[^>]+>", "", text)) if parse_mode == "HTML" else text,
+                          entities=entities, message_thread_id=topic)
         self.messages[message_id] = message
         return message
 

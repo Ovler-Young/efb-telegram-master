@@ -2,7 +2,7 @@ from pytest import mark
 from unittest.mock import patch
 
 from ehforwarderbot.status import MessageRemoval
-from tests.integration.helper.filters import in_chats, regex, deleted, has_button
+from tests.integration.helper.filters import in_chats, regex, has_button
 from tests.integration.utils import link_chats
 
 pytestmark = mark.asyncio
@@ -47,8 +47,8 @@ async def test_rm_edit(helper, client, bot_group, slave, channel):
         assert removal_status.message.uid == message.uid
 
 
-async def test_rm_command_delete(helper, client, bot_id, bot_group, slave, channel,
-                                 private_response):
+async def test_rm_command_preserves_message(helper, client, bot_id, bot_group, slave, channel,
+                                             private_response):
     chat = slave.chat_with_alias
     with patch.dict(channel.flag.config, prevent_message_removal=False):
 
@@ -58,16 +58,20 @@ async def test_rm_command_delete(helper, client, bot_id, bot_group, slave, chann
         )
         await tg_msg.click(0)
         tg_msg = await helper.wait_for_message(in_chats(bot_id) & ~has_button)
-        content = "test_rm_command_delete message to be removed from Telegram in private chat"
+        content = "test_rm_command_preserves_message in private chat"
         tg_msg = await tg_msg.reply(content)
         assert slave.messages.get(timeout=5)
         await tg_msg.edit(text=f"rm`{tg_msg.text}")
-        await helper.wait_for_event(deleted(tg_msg))
+        await helper.wait_for_message(in_chats(bot_id) & regex("Message is removed in remote chat"))
+        retained = await client.get_messages(bot_id, ids=tg_msg.id)
+        assert retained and content in retained.text
 
-        # Failure case: send prompt
+        # User-authored messages remain available when the bot cannot edit them.
         with link_chats(channel, (chat,), bot_group):
-            content = "test_rm_command_delete message to be removed from Telegram but failed"
+            content = "test_rm_command_preserves_message in group chat"
             tg_msg = await client.send_message(bot_group, content)
             assert slave.messages.get(timeout=5)
             await tg_msg.edit(text=f"rm`{tg_msg.text}")
             await helper.wait_for_message(in_chats(bot_group))
+            retained = await client.get_messages(bot_group, ids=tg_msg.id)
+            assert retained and content in retained.text

@@ -110,13 +110,16 @@ def test_admissions_publication_updates_and_real_http_scrape(observed):
     append(manager, "first", 1.05)
     append(manager, "second", 1.1)
     assert sample(metrics, "aggregation_sources_total") == 2
-    with patch("efb_telegram_master.live_aggregate.time.time", return_value=2):
+    # These members are backfill (they arrive long after reception), so their
+    # container is held for the aggregation window before it is published.
+    with patch("efb_telegram_master.live_aggregate.time.time", return_value=4):
         complete(manager)
     assert sample(metrics, "aggregation_containers_total") == 1
     assert sample(metrics, "aggregation_published_batch_members_sum") == 2
-    assert sample(metrics, "aggregation_member_confirmation_seconds_sum") == pytest.approx(1.9)
+    assert sample(metrics, "aggregation_member_confirmation_seconds_sum") == pytest.approx(5.9)
     append(manager, "third", 10)
-    complete(manager)
+    with patch("efb_telegram_master.live_aggregate.time.time", return_value=13):
+        complete(manager)
     payload_before_update = sample(metrics, "aggregation_payload_bytes_sum")
     revised = copy.deepcopy(member)
     revised["source_revision"] = 2
