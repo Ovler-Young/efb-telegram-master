@@ -165,7 +165,7 @@ Stored spellings never change between versions.
 | invalid_payload | `queued` / `invalid_payload` | The stored request cannot be decoded. Not evidence of delivery. | Investigate the row. |
 | history_failed | `queued` / `history_failed:<Class>` | History replay was rejected. Startup re-queues `RequiredSenderUnavailableError` rows that never started an attempt. | Investigate, or `/confirm_send` if it was delivered. |
 | supplement_failed | `queued` / `supplement_failed:<Class>` | The full-content attachment of a long message was rejected; the primary message is unaffected. | Investigate the row. |
-| aggregation_failed | `queued` / `aggregation_failed:<Class>` | An aggregated text batch, or a row others are ordered behind, failed for good. | Investigate the row. |
+| aggregation_failed | `queued` / `aggregation_failed:<Class>` | An aggregated text batch, or a row others are ordered behind, failed for good. A batch that was never sent as one Telegram message cannot be confirmed with `/confirm_send`. | Investigate the row. |
 | unrecognized hold | `queued` / any other text | A hold written by another version. Kept and never sent. | Use the version that wrote it, or `/confirm_send`. |
 | sent_pending | `sent_pending` / NULL | Telegram receipt saved; the MsgLog write is retried with backoff. | None. |
 | absent | no row | Not yet enqueued, or removed. | None. |
@@ -187,7 +187,7 @@ that was not delivered stays in the queue until an operator removes it.
 | hold_failed_aggregation | waiting, deferred, in_flight | aggregation_failed | `hold_failed_aggregation` |
 | defer_acquisition | waiting, deferred, in_flight | deferred | `defer_acquisition` |
 | record_completion | waiting, deferred, in_flight | sent_pending | `record_telegram_completion` |
-| operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`) |
+| operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`); refused for an aggregation row whose context takes no receipt (an unsent batch or deferred member update) |
 | defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
 | remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held) |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
@@ -203,7 +203,9 @@ stopping: releasing a row that is not in flight logs `Send attempt not
 released: ...`, and deferring the reconciliation of a row that is not
 `sent_pending` logs `... its receipt reconciliation was not deferred.`
 `/confirm_send` answers `Only a held, unconfirmed send can be confirmed.` for a
-row it cannot resolve, and `hold_send` exits with `Hold failed: This row is
+row it cannot resolve, `This batch was never sent to Telegram as one message, so
+no reply can confirm it. It stays held and no data was changed.` for an unsent
+aggregation batch, and `hold_send` exits with `Hold failed: This row is
 already held as <hold>; no data changed` for a row held for another reason.
 
 ## Ordering links

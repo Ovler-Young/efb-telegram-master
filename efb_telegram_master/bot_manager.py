@@ -1871,13 +1871,19 @@ class TelegramBotManager(LocaleMixin):
                 raise ValueError("This queue row requires the original document message.")
             completion = self._queued_completion_result(row, args, kwargs, message, selection)
             receipt = self.encode_queued_completion_receipt(message, selection, file_bot_id=file_bot_id)
-            if isinstance(completion, QueuedDeliveryResult):
-                queue.record_telegram_completion(
-                    row_id, receipt, supplement=completion.supplement,
-                    operation_resolver=self._queue_operation, operator_confirmed=True,
-                )
-            else:
-                queue.record_telegram_completion(row_id, receipt, operator_confirmed=True)
+            try:
+                if isinstance(completion, QueuedDeliveryResult):
+                    queue.record_telegram_completion(
+                        row_id, receipt, supplement=completion.supplement,
+                        operation_resolver=self._queue_operation, operator_confirmed=True,
+                    )
+                else:
+                    queue.record_telegram_completion(row_id, receipt, operator_confirmed=True)
+            except IllegalAggregationTransitionError:
+                raise ValueError(
+                    "This batch was never sent to Telegram as one message, so no reply can confirm it. "
+                    "It stays held and no data was changed."
+                ) from None
             if has_log:
                 completed = row_id in self._outbound_scheduler.reconcile_sent_pending(row_id)
             else:

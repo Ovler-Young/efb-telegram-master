@@ -2747,11 +2747,12 @@ class OutboundQueue:
                     row_id, Event.OPERATOR_CONFIRM if operator_confirmed else Event.RECORD_COMPLETION,
                     dependents=True,
                 )
+                from .queued_log import decode_aggregation, encode_aggregation
+                parent_context = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0]
+                parent = decode_aggregation(parent_context) if parent_context else None
+                check_context_transition(row_id, parent, ContextEvent.RECEIPT)
                 if prepared is not None:
                     operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media = prepared
-                    from .queued_log import decode_aggregation, encode_aggregation
-                    parent_context = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0]
-                    parent = decode_aggregation(parent_context) if parent_context else None
                     if parent is not None:
                         log_context = encode_aggregation(dict(format_version=1, kind=ContextKind.BOUNDARY, key=parent["key"],
                             generation=parent.get("generation", 0), recent=parent.get("recent", []),
