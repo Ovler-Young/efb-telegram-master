@@ -1,9 +1,8 @@
 """Regression checks for query plans, bounded BLOB reads and durable backoff."""
 
 import sqlite3
-import time
 import tracemalloc
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from types import SimpleNamespace
 
@@ -12,10 +11,10 @@ import pytest
 from efb_telegram_master import db as db_module
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.outbound import (
-    OutboundQueue, OutboundQueueScheduler, SenderSelection, SubmittedCall,
+    OutboundQueue, OutboundQueueScheduler, QueueRequest,
 )
 from tests.unit.test_database_safety import remove_source_columns
-from tests.unit.test_outbound import DurableAdapter
+from tests.unit.test_outbound import DurableAdapter, enqueue
 
 
 @pytest.fixture
@@ -233,32 +232,30 @@ def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkey
         scheduler.dispatch_once()
         assert loads == []
         scheduler.in_flight_destinations.clear()
-        # The only worker permit belongs to a submitted call for that destination.
-        head = queue.heads(include_payload=False)[0]
-        scheduler._permits.acquire()
-        scheduler.in_flight[head.id] = SubmittedCall(
-            head, SenderSelection(adapter, None), Future(), time.monotonic(), ()
-        )
-        scheduler.in_flight_destinations.add((head.telegram_chat_id, head.thread_id))
-        scheduler.dispatch_once()
-        assert loads == []
-        scheduler.in_flight.clear()
-        scheduler.in_flight_destinations.clear()
-        scheduler._permits.release()
         with monkeypatch.context() as unavailable:
             unavailable.setattr(adapter, "select_sender", lambda row, now: SenderSelectionResult(retry_at=now + 60))
             scheduler.dispatch_once()
             assert loads == []
-        monkeypatch.setattr(adapter, "acquire_sender_limits", lambda selection, chat_id: False)
-        for _ in range(3):
-            scheduler.dispatch_once()
+        with monkeypatch.context() as full_bucket:
+            full_bucket.setattr(adapter, "acquire_sender_limits", lambda selection, chat_id: False)
+            for _ in range(3):
+                scheduler.dispatch_once()
         # A full bucket must not cost a payload read: the row is deferred before
         # the blob is touched, and nothing is submitted.
         assert scheduler.in_flight == {}
-        assert scheduler._permits.acquire(blocking=False)
-        scheduler._permits.release()
+        assert scheduler.slots.free == 1
         assert len(queue.heads(include_payload=False)) == 10
         assert adapter.calls == []
+        # The only worker slot belongs to a call in flight: no other head is read.
+        adapter.block = True
+        sent, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 99, "text": "busy"}))
+        loads.clear()
+        scheduler.dispatch_once()
+        assert list(scheduler.in_flight) == [sent] and loads == [sent]
+        scheduler.dispatch_once()
+        assert loads == [sent]
+        adapter.release.set()
+        scheduler.stop_and_drain(timeout=2)
     queue.close()
 
 

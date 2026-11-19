@@ -23,8 +23,9 @@ import time
 import urllib.request
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
-from typing import Callable, IO, Iterable, Mapping, Optional, Protocol, TYPE_CHECKING
+from typing import Callable, IO, Iterable, Mapping, Optional, Protocol, TYPE_CHECKING, final
 from urllib.parse import unquote, urlsplit
 
 from telegram import (
@@ -2901,6 +2902,122 @@ class OutboundQueue:
             self.fail_waiter(row_id, _fresh_exception(error))
 
 
+class PassOutcome(Enum):
+    """How one dispatch pass left the outbound worker, and so how long it waits.
+
+    ``OutboundQueueScheduler.dispatch_once`` returns exactly one outcome, chosen
+    at the end of the pass in the order listed here. The worker then waits for
+    a wake-up event (an enqueue or a completion) or until ``next_deadline``,
+    whichever comes first; no deadline means it waits for the event alone.
+    """
+
+    STOPPED = "stopped"          # scheduler stopping or failed: the worker exits
+    STALLED = "stalled"          # rows left, no deadline, nothing in flight: rescan later
+    CYCLE = "cycle"              # links never resolve: oldest row per destination sent
+    PERMIT_LEAK = "permit_leak"  # worker slots held with nothing in flight were reset
+    BUSY = "busy"                # a call is in flight: its completion wakes the worker
+    DEFERRED = "deferred"        # nothing in flight, a retry deadline is set
+    IDLE = "idle"                # nothing waiting, nothing in flight: wait for an event
+
+
+@final
+class ReservedSlot:
+    """One worker slot reserved for a single dispatch attempt.
+
+    ``own(row_id)`` hands the slot to the row that was submitted; leaving the
+    ``with`` block without that releases it, on every exit path.
+    """
+
+    __slots__ = ("_settled", "_slots")
+
+    def __init__(self, slots: WorkerSlots) -> None:
+        self._slots = slots
+        self._settled = False
+
+    def own(self, row_id: int) -> None:
+        if self._settled:
+            self._slots.report("own", row_id)
+            return
+        self._settled = True
+        self._slots._own(row_id)
+
+    def release(self) -> None:
+        if not self._settled:
+            self._settled = True
+            self._slots._release_reservation()
+
+    def __enter__(self) -> ReservedSlot:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.release()
+
+
+class WorkerSlots:
+    """Outbound worker capacity: one slot per call that may run at once.
+
+    A slot is free, reserved (``reserve``: a pass is preparing one row), or
+    owned by an in-flight row (``ReservedSlot.own``). An owned slot is freed
+    by ``release(row_id)`` when its row leaves ``in_flight``; a reservation is
+    freed when its block ends unowned. A release or ownership that does not
+    match a reservation is reported and ignored, never applied.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._reserved = 0
+        self._owners: set[int] = set()
+        self._lock = threading.Lock()
+
+    @property
+    def free(self) -> int:
+        with self._lock:
+            return self.capacity - self._reserved - len(self._owners)
+
+    def reserve(self) -> ReservedSlot | None:
+        """Reserve a free slot, or return ``None`` when every slot is taken."""
+        with self._lock:
+            if self._reserved + len(self._owners) >= self.capacity:
+                return None
+            self._reserved += 1
+        return ReservedSlot(self)
+
+    def release(self, row_id: int) -> None:
+        """Free the slot an in-flight row owned."""
+        with self._lock:
+            if row_id in self._owners:
+                self._owners.discard(row_id)
+                return
+        self.report("release", row_id)
+
+    def reset(self) -> None:
+        """Free every slot; the backstop for slots that nothing can release."""
+        with self._lock:
+            self._reserved = 0
+            self._owners.clear()
+
+    def report(self, event: str, row_id: int | None) -> None:
+        logging.getLogger(__name__).error(
+            "Outbound worker slot %s for queue row %s has no matching reservation; ignored.",
+            event, row_id,
+        )
+
+    def _own(self, row_id: int) -> None:
+        with self._lock:
+            if self._reserved > 0 and row_id not in self._owners:
+                self._reserved -= 1
+                self._owners.add(row_id)
+                return
+        self.report("own", row_id)
+
+    def _release_reservation(self) -> None:
+        with self._lock:
+            if self._reserved > 0:
+                self._reserved -= 1
+                return
+        self.report("release", None)
+
+
 class OutboundQueueScheduler:
     """Schedule one in-flight call per chat and retain eventual rows through retries."""
 
@@ -2922,8 +3039,7 @@ class OutboundQueueScheduler:
         self.queue = queue
         self.adapter = adapter
         self.executor = executor
-        self._worker_count = worker_count
-        self._permits = threading.BoundedSemaphore(worker_count)
+        self.slots = WorkerSlots(worker_count)
         self._lock = threading.RLock()
         self._stall_reported_at = 0.0
         self.wake_event = threading.Event()
@@ -3157,75 +3273,106 @@ class OutboundQueueScheduler:
             if self._destination_key(retry.row) in self.in_flight_destinations:
                 self._schedule_blocking_retry_before_deadline(retry)
                 continue
-            if not self._permits.acquire(blocking=False):
+            slot = self.slots.reserve()
+            if slot is None:
                 self._record_dispatch("deferred")
                 self.queue.observe_metrics(
                     lambda metrics: metrics.record_retry(retry.row.priority, retry.row.operation, "worker_capacity")
                 )
                 self._schedule_blocking_retry_before_deadline(retry)
                 continue
-            decision = self.adapter.select_sender(retry.row, now)
-            if decision.terminal_error_class is not None:
-                self._permits.release()
-                self._record_dispatch("failed")
-                self._fail_blocking_retry(
-                    retry, RequiredSenderUnavailableError(decision.terminal_error_class)
+            with slot:
+                decision = self._select_sender(retry.row, now)
+                if decision is None:
+                    self._schedule_blocking_retry_before_deadline(retry, now + self.STALL_RESCAN_SECONDS)
+                    continue
+                if decision.terminal_error_class is not None:
+                    self._record_dispatch("failed")
+                    self._fail_blocking_retry(
+                        retry, RequiredSenderUnavailableError(decision.terminal_error_class)
+                    )
+                    continue
+                if decision.selection is None:
+                    self._record_dispatch("deferred")
+                    if decision.retry_at is not None:
+                        self._schedule_blocking_retry_before_deadline(retry, decision.retry_at)
+                    continue
+                if (
+                    decision.selection.sender is not retry.selection.sender
+                    or decision.selection.sender_bot_id != retry.selection.sender_bot_id
+                ):
+                    self._record_dispatch("failed")
+                    self._fail_blocking_retry(retry, retry.error)
+                    continue
+                limits_acquired = self._acquire_sender_limits(retry.row, retry.selection)
+                if limits_acquired is None:
+                    self._schedule_blocking_retry_before_deadline(retry, now + self.STALL_RESCAN_SECONDS)
+                    continue
+                if not limits_acquired:
+                    self._record_dispatch("deferred")
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_retry(retry.row.priority, retry.row.operation, "local_limit")
+                    )
+                    self._schedule_blocking_retry_before_deadline(retry, now + 0.25)
+                    continue
+                closeables: tuple[object, ...] = ()
+                try:
+                    args, kwargs = self.queue.decode_payload(retry.row.payload)
+                    closeables = self.queue.payload_closeables(args, kwargs)
+                    dispatched_at = self._record_dispatch_attempt(retry.row)
+                    future = self.executor.submit(
+                        self.adapter.execute_queued_call, retry.row, args, kwargs, retry.selection
+                    )
+                except BaseException as error:
+                    self.queue.close_payload_resources(closeables)
+                    self._record_dispatch("failed")
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.record_failure(retry.row.priority, retry.row.operation, "dispatch")
+                    )
+                    self._fail_blocking_retry(retry, error)
+                    continue
+                self.blocking_media_retries.pop(row_id, None)
+                self._record_dispatch("submitted")
+                future.add_done_callback(partial(
+                    self._close_payload_on_future_completion, closeables=closeables
+                ))
+                future.add_done_callback(self._wake_on_future_completion)
+                self.in_flight[row_id] = SubmittedCall(
+                    retry.row, retry.selection, future, dispatched_at, closeables
                 )
-                continue
-            if decision.selection is None:
-                self._permits.release()
-                self._record_dispatch("deferred")
-                if decision.retry_at is not None:
-                    self._schedule_blocking_retry_before_deadline(retry, decision.retry_at)
-                continue
-            if (
-                decision.selection.sender is not retry.selection.sender
-                or decision.selection.sender_bot_id != retry.selection.sender_bot_id
-            ):
-                self._permits.release()
-                self._record_dispatch("failed")
-                self._fail_blocking_retry(retry, retry.error)
-                continue
-            if not self.adapter.acquire_sender_limits(retry.selection, retry.row.telegram_chat_id):
-                self._permits.release()
-                self._record_dispatch("deferred")
+                slot.own(row_id)
+                self.in_flight_destinations.add(self._destination_key(retry.row))
                 self.queue.observe_metrics(
-                    lambda metrics: metrics.record_retry(retry.row.priority, retry.row.operation, "local_limit")
+                    lambda metrics: metrics.increment_in_flight(
+                        retry.row.priority, retry.row.operation, self._sender_kind(retry.selection)
+                    )
                 )
-                self._schedule_blocking_retry_before_deadline(retry, now + 0.25)
-                continue
-            closeables: tuple[object, ...] = ()
-            try:
-                args, kwargs = self.queue.decode_payload(retry.row.payload)
-                closeables = self.queue.payload_closeables(args, kwargs)
-                dispatched_at = self._record_dispatch_attempt(retry.row)
-                future = self.executor.submit(
-                    self.adapter.execute_queued_call, retry.row, args, kwargs, retry.selection
-                )
-            except BaseException as error:
-                self.queue.close_payload_resources(closeables)
-                self._permits.release()
-                self._record_dispatch("failed")
-                self.queue.observe_metrics(
-                    lambda metrics: metrics.record_failure(retry.row.priority, retry.row.operation, "dispatch")
-                )
-                self._fail_blocking_retry(retry, error)
-                continue
-            self.blocking_media_retries.pop(row_id, None)
-            self._record_dispatch("submitted")
-            future.add_done_callback(partial(
-                self._close_payload_on_future_completion, closeables=closeables
-            ))
-            future.add_done_callback(self._wake_on_future_completion)
-            self.in_flight[row_id] = SubmittedCall(
-                retry.row, retry.selection, future, dispatched_at, closeables
+
+    # A sender lookup that raises defers its row instead of stopping the worker.
+    SENDER_FAILURE_MESSAGE = (
+        "Choosing a sender for queue row %s failed; the row stays queued and is "
+        "retried in %.0f seconds."
+    )
+
+    def _select_sender(self, row: QueuedCall, now: float) -> SenderSelectionResult | None:
+        try:
+            return self.adapter.select_sender(row, now)
+        except Exception as error:
+            self._record_dispatch("deferred")
+            logging.getLogger(__name__).error(
+                self.SENDER_FAILURE_MESSAGE, row.id, self.STALL_RESCAN_SECONDS, exc_info=error
             )
-            self.in_flight_destinations.add(self._destination_key(retry.row))
-            self.queue.observe_metrics(
-                lambda metrics: metrics.increment_in_flight(
-                    retry.row.priority, retry.row.operation, self._sender_kind(retry.selection)
-                )
+            return None
+
+    def _acquire_sender_limits(self, row: QueuedCall, selection: SenderSelection) -> bool | None:
+        try:
+            return self.adapter.acquire_sender_limits(selection, row.telegram_chat_id)
+        except Exception as error:
+            self._record_dispatch("deferred")
+            logging.getLogger(__name__).error(
+                self.SENDER_FAILURE_MESSAGE, row.id, self.STALL_RESCAN_SECONDS, exc_info=error
             )
+            return None
 
     def _stop_for_persistence_error(self, error: Exception) -> None:
         if self.failure is None:
@@ -3295,30 +3442,32 @@ class OutboundQueueScheduler:
             self._stop_for_persistence_error(error)
         return reconciled
 
-    def dispatch_once(self) -> None:
+    def dispatch_once(self) -> PassOutcome:
+        """Run one dispatch pass and return how it left the worker."""
         with self._lock:
             if self.stopping:
-                return
+                return PassOutcome.STOPPED
             self.next_deadline = None
             for submitted in self.in_flight.values():
                 if submitted.completion_retry_at:
                     self._schedule_retry(submitted.completion_retry_at)
             self.reconcile_sent_pending()
             if self.stopping:
-                return
+                return PassOutcome.STOPPED
             self._dispatch_blocking_media_retries()
-            if not self._permits.acquire(blocking=False):
+            slots_reset = False
+            if not self.slots.free:
                 if self.in_flight:
-                    return  # A future completion will wake us; do not scan the backlog.
-                # Nothing is in flight, so no completion can release these permits.
+                    return PassOutcome.BUSY  # A completion will wake us; do not scan the backlog.
+                # Nothing is in flight, so no completion can release these slots.
                 # Waiting for one would stop delivery until the next restart.
                 logging.getLogger(__name__).error(
                     "Outbound worker permits were held without a submitted call; "
                     "resetting them. Queued rows are retained."
                 )
-                self._permits = threading.BoundedSemaphore(self._worker_count)
-            else:
-                self._permits.release()
+                self.slots.reset()
+                slots_reset = True
+            broke_cycle = False
             retry_destinations = {
                 self._destination_key(retry.row) for retry in self.blocking_media_retries.values()
             }
@@ -3353,6 +3502,7 @@ class OutboundQueueScheduler:
                     )
                     # This bypassed the incremental election; rescan next pass.
                     self._heal_heads = True
+                    broke_cycle = True
             for row in heads:
                 if (
                     row.id in self.in_flight
@@ -3395,186 +3545,210 @@ class OutboundQueueScheduler:
                         self._schedule_retry(not_before)
                         continue
                     self._row_not_before.pop(row.id, None)
-                if not self._permits.acquire(blocking=False):
+                slot = self.slots.reserve()
+                if slot is None:
                     self._record_dispatch("deferred")
                     self.queue.observe_metrics(
                         lambda metrics: metrics.record_retry(row.priority, row.operation, "worker_capacity")
                     )
                     continue
-                decision = self.adapter.select_sender(row, now)
-                if decision.terminal_error_class is not None:
-                    self._permits.release()
-                    unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
-                    try:
-                        if self.queue.hold_failed_aggregation(row.id, unavailable_error):
-                            self.wake_event.set()
-                            self.queue.fail_waiter(row.id, unavailable_error)
-                            self._record_terminal_completion(row, None, "failure")
-                            continue
-                        if self._retain_failed_history(row, unavailable_error):
-                            self._record_terminal_completion(row, None, "failure")
-                            continue
-                        self.queue.delete(row.id)
-                    except Exception as delete_error:
-                        self._stop_for_persistence_error(delete_error)
-                        return
-                    self._record_terminal_discard(row)
-                    self._row_not_before.pop(row.id, None)
-                    self._record_dispatch("failed")
-                    self.queue.observe_metrics(
-                        lambda metrics: metrics.record_failure(row.priority, row.operation, "terminal")
-                    )
-                    unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
-                    self._record_terminal_completion(row, None, "failure")
-                    self.queue.fail_waiter(row.id, unavailable_error)
-                    continue
-                if decision.selection is None:
-                    self._permits.release()
-                    self._record_dispatch("deferred")
-                    if decision.retry_at is not None:
-                        self._schedule_retry(decision.retry_at)
-                    continue
-                # Take capacity before reading the payload: a rejection here must
-                # stay cheap, because a full bucket re-asks within 250 ms.
-                if not self.adapter.acquire_sender_limits(decision.selection, row.telegram_chat_id):
-                    self._permits.release()
-                    self._record_dispatch("deferred")
-                    self.queue.observe_metrics(
-                        lambda metrics: metrics.record_retry(row.priority, row.operation, "local_limit")
-                    )
-                    self._schedule_retry(now + self.LOCAL_LIMIT_RETRY_SECONDS)
-                    continue
-                try:
-                    if legacy_recovery:
-                        row = self.queue.recover_legacy_media_payload(row.id)
-                        self.queue.check_replay_size(row.id, row.stored_bytes)
-                    else:
-                        row = self.queue.load_queued(row.id)
-                    materialize = getattr(self.adapter, "materialize_queued_aggregation", None)
-                    if callable(materialize):
-                        row = materialize(row, decision.selection)
-                    args, kwargs = self.queue.decode_payload(row.payload)
-                except MissingQueuedExternalMediaError as error:
-                    self._permits.release()
-                    self._reopen_aggregation(row)
-                    try:
-                        self.queue.delete(row.id)
-                    except Exception as delete_error:
-                        self._stop_for_persistence_error(delete_error)
-                        return
-                    self._record_terminal_discard(row)
-                    self._row_not_before.pop(row.id, None)
-                    self._record_dispatch("failed")
-                    self.queue.observe_metrics(
-                        lambda metrics: metrics.record_failure(row.priority, row.operation, "terminal")
-                    )
-                    self.queue.fail_waiter(row.id, error)
-                    continue
-                except InvalidQueuedPayloadError as error:
-                    self._permits.release()
-                    try:
-                        self.queue.hold_invalid_payload(row.id)
-                    except Exception as persistence_error:
-                        self._stop_for_persistence_error(persistence_error)
-                        return
-                    self.queue.fail_waiter(row.id, error)
-                    self.wake_event.set()
-                    continue
-                except QueuePersistenceError as error:
-                    self._permits.release()
-                    if legacy_recovery:
-                        self.quarantined_rows[row.id] = str(error)
-                        self._heal_heads = True
+                with slot:
+                    decision = self._select_sender(row, now)
+                    if decision is None:
+                        self._defer_row(row, now + self.STALL_RESCAN_SECONDS)
                         continue
-                    self._stop_for_persistence_error(error)
-                    return
-                except Exception as error:
-                    self._permits.release()
-                    self._stop_for_persistence_error(error)
-                    return
-                # Rows carrying a durable log context are retained until the
-                # MsgLog write is committed, regardless of blocking priority.
-                retained = row.priority == 0 or row.log_context is not None or row.operation in RETAINED_OPERATIONS
-                closeables = self.queue.payload_closeables(args, kwargs)
-                if not retained:
-                    try:
-                        self.queue.delete(row.id, cleanup_media=False)
-                    except Exception as delete_error:
-                        self.queue.close_payload_resources(closeables)
-                        self._permits.release()
-                        self._stop_for_persistence_error(delete_error)
-                        return
-                    self._record_submitted_removal(row)
-                attempt_marked = False
-                if row.operation in RETAINED_OPERATIONS:
-                    try:
-                        self.queue.begin_delivery_attempt(row.id, decision.selection)
-                        attempt_marked = True
-                    except Exception as persistence_error:
-                        self.queue.close_payload_resources(closeables)
-                        self._permits.release()
-                        self._stop_for_persistence_error(persistence_error)
-                        return
-                try:
-                    dispatched_at = self._record_dispatch_attempt(row)
-                    future = self.executor.submit(
-                        self.adapter.execute_queued_call, row, args, kwargs, decision.selection
-                    )
-                except Exception:
-                    self.queue.close_payload_resources(closeables)
-                    self._permits.release()
-                    if attempt_marked:
+                    if decision.terminal_error_class is not None:
+                        unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
                         try:
-                            self.queue.release_delivery_attempt(row.id)
+                            if self.queue.hold_failed_aggregation(row.id, unavailable_error):
+                                self.wake_event.set()
+                                self.queue.fail_waiter(row.id, unavailable_error)
+                                self._record_terminal_completion(row, None, "failure")
+                                continue
+                            if self._retain_failed_history(row, unavailable_error):
+                                self._record_terminal_completion(row, None, "failure")
+                                continue
+                            self.queue.delete(row.id)
+                        except Exception as delete_error:
+                            self._stop_for_persistence_error(delete_error)
+                            return PassOutcome.STOPPED
+                        self._record_terminal_discard(row)
+                        self._row_not_before.pop(row.id, None)
+                        self._record_dispatch("failed")
+                        self.queue.observe_metrics(
+                            lambda metrics: metrics.record_failure(row.priority, row.operation, "terminal")
+                        )
+                        unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
+                        self._record_terminal_completion(row, None, "failure")
+                        self.queue.fail_waiter(row.id, unavailable_error)
+                        continue
+                    if decision.selection is None:
+                        self._record_dispatch("deferred")
+                        if decision.retry_at is not None:
+                            self._schedule_retry(decision.retry_at)
+                        continue
+                    # Take capacity before reading the payload: a rejection here must
+                    # stay cheap, because a full bucket re-asks within 250 ms.
+                    limits_acquired = self._acquire_sender_limits(row, decision.selection)
+                    if limits_acquired is None:
+                        self._defer_row(row, now + self.STALL_RESCAN_SECONDS)
+                        continue
+                    if not limits_acquired:
+                        self._record_dispatch("deferred")
+                        self.queue.observe_metrics(
+                            lambda metrics: metrics.record_retry(row.priority, row.operation, "local_limit")
+                        )
+                        self._schedule_retry(now + self.LOCAL_LIMIT_RETRY_SECONDS)
+                        continue
+                    try:
+                        if legacy_recovery:
+                            row = self.queue.recover_legacy_media_payload(row.id)
+                            self.queue.check_replay_size(row.id, row.stored_bytes)
+                        else:
+                            row = self.queue.load_queued(row.id)
+                        materialize = getattr(self.adapter, "materialize_queued_aggregation", None)
+                        if callable(materialize):
+                            row = materialize(row, decision.selection)
+                        args, kwargs = self.queue.decode_payload(row.payload)
+                    except MissingQueuedExternalMediaError as error:
+                        self._reopen_aggregation(row)
+                        try:
+                            self.queue.delete(row.id)
+                        except Exception as delete_error:
+                            self._stop_for_persistence_error(delete_error)
+                            return PassOutcome.STOPPED
+                        self._record_terminal_discard(row)
+                        self._row_not_before.pop(row.id, None)
+                        self._record_dispatch("failed")
+                        self.queue.observe_metrics(
+                            lambda metrics: metrics.record_failure(row.priority, row.operation, "terminal")
+                        )
+                        self.queue.fail_waiter(row.id, error)
+                        continue
+                    except InvalidQueuedPayloadError as error:
+                        try:
+                            self.queue.hold_invalid_payload(row.id)
                         except Exception as persistence_error:
                             self._stop_for_persistence_error(persistence_error)
-                            return
-                    self._record_dispatch("failed")
-                    self.queue.observe_metrics(
-                        lambda metrics: metrics.record_dispatch_failure(row.priority, row.operation)
-                    )
-                    self.queue.observe_metrics(
-                        lambda metrics: metrics.record_failure(row.priority, row.operation, "dispatch")
-                    )
-                    if retained:
-                        self._schedule_retry(now + self.LOCAL_LIMIT_RETRY_SECONDS)
-                    else:
-                        self.queue.cleanup_payload_media(row.payload)
-                        submit_error = ExecutorSubmitError("Unable to submit queued Telegram call.")
-                        self._record_terminal_completion(row, decision.selection, "failure")
-                        self.queue.fail_waiter(row.id, submit_error)
+                            return PassOutcome.STOPPED
+                        self.queue.fail_waiter(row.id, error)
                         self.wake_event.set()
-                    continue
-                self._record_dispatch("submitted")
-                future.add_done_callback(partial(
-                    self._close_payload_on_future_completion, closeables=closeables
-                ))
-                future.add_done_callback(self._wake_on_future_completion)
-                self.in_flight[row.id] = SubmittedCall(
-                    row, decision.selection, future, dispatched_at, closeables
-                )
-                self.in_flight_destinations.add(self._destination_key(row))
-                sender_kind = self._sender_kind(decision.selection)
-                self.queue.observe_metrics(
-                    lambda metrics: metrics.increment_in_flight(
-                        row.priority, row.operation, sender_kind
-                    )
-                )
-            if heads or self.queue.has_waiting_rows():
-                if self.next_deadline is None and not self.in_flight:
-                    # Nothing was dispatched and nothing is in flight, so no
-                    # completion will wake this worker: without a deadline these
-                    # rows would stay queued until the next message or restart.
-                    now = time.monotonic()
-                    if now - self._stall_reported_at >= self.STALL_REPORT_INTERVAL:
-                        self._stall_reported_at = now
-                        logging.getLogger(__name__).error(
-                            "Outbound scheduler left %d dispatchable head(s) undispatched with no "
-                            "retry deadline and nothing in flight while queued rows remain; "
-                            "rescanning in %.0f seconds.",
-                            len(heads), self.STALL_RESCAN_SECONDS,
+                        continue
+                    except QueuePersistenceError as error:
+                        if legacy_recovery:
+                            self.quarantined_rows[row.id] = str(error)
+                            self._heal_heads = True
+                            continue
+                        self._stop_for_persistence_error(error)
+                        return PassOutcome.STOPPED
+                    except Exception as error:
+                        self._stop_for_persistence_error(error)
+                        return PassOutcome.STOPPED
+                    # Rows carrying a durable log context are retained until the
+                    # MsgLog write is committed, regardless of blocking priority.
+                    retained = row.priority == 0 or row.log_context is not None or row.operation in RETAINED_OPERATIONS
+                    closeables = self.queue.payload_closeables(args, kwargs)
+                    if not retained:
+                        try:
+                            self.queue.delete(row.id, cleanup_media=False)
+                        except Exception as delete_error:
+                            self.queue.close_payload_resources(closeables)
+                            self._stop_for_persistence_error(delete_error)
+                            return PassOutcome.STOPPED
+                        self._record_submitted_removal(row)
+                    attempt_marked = False
+                    if row.operation in RETAINED_OPERATIONS:
+                        try:
+                            self.queue.begin_delivery_attempt(row.id, decision.selection)
+                            attempt_marked = True
+                        except Exception as persistence_error:
+                            self.queue.close_payload_resources(closeables)
+                            self._stop_for_persistence_error(persistence_error)
+                            return PassOutcome.STOPPED
+                    try:
+                        dispatched_at = self._record_dispatch_attempt(row)
+                        future = self.executor.submit(
+                            self.adapter.execute_queued_call, row, args, kwargs, decision.selection
                         )
-                    self._schedule_retry(now + self.STALL_RESCAN_SECONDS)
+                    except Exception:
+                        self.queue.close_payload_resources(closeables)
+                        if attempt_marked:
+                            try:
+                                self.queue.release_delivery_attempt(row.id)
+                            except Exception as persistence_error:
+                                self._stop_for_persistence_error(persistence_error)
+                                return PassOutcome.STOPPED
+                        self._record_dispatch("failed")
+                        self.queue.observe_metrics(
+                            lambda metrics: metrics.record_dispatch_failure(row.priority, row.operation)
+                        )
+                        self.queue.observe_metrics(
+                            lambda metrics: metrics.record_failure(row.priority, row.operation, "dispatch")
+                        )
+                        if retained:
+                            self._schedule_retry(now + self.LOCAL_LIMIT_RETRY_SECONDS)
+                        else:
+                            self.queue.cleanup_payload_media(row.payload)
+                            submit_error = ExecutorSubmitError("Unable to submit queued Telegram call.")
+                            self._record_terminal_completion(row, decision.selection, "failure")
+                            self.queue.fail_waiter(row.id, submit_error)
+                            self.wake_event.set()
+                        continue
+                    self._record_dispatch("submitted")
+                    future.add_done_callback(partial(
+                        self._close_payload_on_future_completion, closeables=closeables
+                    ))
+                    future.add_done_callback(self._wake_on_future_completion)
+                    self.in_flight[row.id] = SubmittedCall(
+                        row, decision.selection, future, dispatched_at, closeables
+                    )
+                    slot.own(row.id)
+                    self.in_flight_destinations.add(self._destination_key(row))
+                    sender_kind = self._sender_kind(decision.selection)
+                    self.queue.observe_metrics(
+                        lambda metrics: metrics.increment_in_flight(
+                            row.priority, row.operation, sender_kind
+                        )
+                    )
+            return self._finish_pass(heads, broke_cycle=broke_cycle, slots_reset=slots_reset)
+
+    def _finish_pass(
+        self, heads: list[QueuedCall], *, broke_cycle: bool, slots_reset: bool
+    ) -> PassOutcome:
+        """Name the pass outcome; a stalled pass reports itself and schedules a rescan."""
+        if self.stopping:
+            return PassOutcome.STOPPED
+        if (
+            self.next_deadline is None and not self.in_flight
+            and (heads or self.queue.has_waiting_rows())
+        ):
+            # Nothing was dispatched and nothing is in flight, so no
+            # completion will wake this worker: without a deadline these
+            # rows would stay queued until the next message or restart.
+            now = time.monotonic()
+            if now - self._stall_reported_at >= self.STALL_REPORT_INTERVAL:
+                self._stall_reported_at = now
+                logging.getLogger(__name__).error(
+                    "Outbound scheduler left %d dispatchable head(s) undispatched with no "
+                    "retry deadline and nothing in flight while queued rows remain; "
+                    "rescanning in %.0f seconds.",
+                    len(heads), self.STALL_RESCAN_SECONDS,
+                )
+            self._schedule_retry(now + self.STALL_RESCAN_SECONDS)
+            return PassOutcome.STALLED
+        if broke_cycle:
+            return PassOutcome.CYCLE
+        if slots_reset:
+            return PassOutcome.PERMIT_LEAK
+        if self.in_flight:
+            return PassOutcome.BUSY
+        if self.next_deadline is not None:
+            return PassOutcome.DEFERRED
+        return PassOutcome.IDLE
+
+    def _defer_row(self, row: QueuedCall, retry_at: float) -> None:
+        self._row_not_before[row.id] = retry_at
+        self._schedule_retry(retry_at)
 
     def harvest_completed(self) -> None:
         with self._lock:
@@ -3609,7 +3783,7 @@ class OutboundQueueScheduler:
                 any_harvested = True
                 self.in_flight.pop(row_id)
                 self.in_flight_destinations.discard(self._destination_key(submitted.row))
-                self._permits.release()
+                self.slots.release(row_id)
                 self.queue.observe_metrics(
                     lambda metrics: metrics.decrement_in_flight(
                         submitted.row.priority, submitted.row.operation, self._sender_kind(submitted.selection)
@@ -3810,7 +3984,7 @@ class OutboundQueueScheduler:
             for row_id, submitted in tuple(self.in_flight.items()):
                 self.in_flight.pop(row_id)
                 self.in_flight_destinations.discard(self._destination_key(submitted.row))
-                self._permits.release()
+                self.slots.release(row_id)
                 self.queue.observe_metrics(
                     lambda metrics: metrics.decrement_in_flight(
                         submitted.row.priority, submitted.row.operation, self._sender_kind(submitted.selection)

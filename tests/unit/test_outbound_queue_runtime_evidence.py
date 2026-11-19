@@ -1129,8 +1129,7 @@ def test_scheduler_telemetry_failure_preserves_delivery_and_worker_capacity(
             assert not retained_queue.waiters
             assert not scheduler.in_flight
             assert not scheduler.in_flight_destinations
-            assert scheduler._permits.acquire(blocking=False)
-            scheduler._permits.release()
+            assert scheduler.slots.free == scheduler.slots.capacity
 
     assert calls == [(48, "first"), (48, "subsequent")]
     assert scheduler.failure is None
@@ -1609,11 +1608,10 @@ def test_startup_wakes_recompute_deadline_without_dequeue_when_worker_permit_is_
     assert scheduler.next_deadline == 50.25
     assert not waiter.done()
 
-    assert scheduler._permits.acquire(blocking=False)
+    assert scheduler.slots.reserve() is not None
     adapter.retry_at = None
     scheduler.dispatch_once()
     assert [row.id for row in retained_queue.heads()] == [row_id]
-    scheduler._permits.release()
 
 
 def test_invalid_payload_is_retained_without_upload_and_later_traffic_runs(

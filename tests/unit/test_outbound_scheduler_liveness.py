@@ -13,6 +13,7 @@ import pytest
 from efb_telegram_master.outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
+    PassOutcome,
     QueueRequest,
     SenderSelectionResult,
 )
@@ -56,7 +57,7 @@ def test_permits_held_without_a_submission_are_reset(tmp_path):
     queue, scheduler = _scheduler(tmp_path, adapter)
     enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "resumes"}))
     try:
-        assert scheduler._permits.acquire()  # Lost with an aborted attempt.
+        assert scheduler.slots.reserve() is not None  # Lost with an aborted attempt.
         scheduler.dispatch_once()
         assert [call[1:] for call in adapter.calls] == [(7, "send_message")]
         assert scheduler.next_deadline is None
@@ -341,3 +342,99 @@ def test_one_destination_head_matches_the_full_scan(tmp_path):
         assert queue.head_for(8, None, ready_only=True).priority == 0
     finally:
         queue.close()
+
+
+def _linked_in_a_cycle(queue, scheduler, adapter):
+    first, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "first"}))
+    second, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "second"}))
+    with queue.connection:
+        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (second, first))
+        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (first, second))
+
+
+def _one_row(select_sender=None, *, block=False, leak_slot=False, stop=False):
+    def scenario(queue, scheduler, adapter):
+        if select_sender is not None:
+            adapter.select_sender = select_sender
+        adapter.block = block
+        enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "row"}))
+        if leak_slot:
+            assert scheduler.slots.reserve() is not None
+        if stop:
+            scheduler.stop_and_drain(timeout=0)
+    return scenario
+
+
+# Each outcome, the queue that produces it, and the deadline the worker then
+# waits for (None: it waits for an enqueue or completion event only).
+PASS_SCENARIOS = {
+    PassOutcome.IDLE: (lambda queue, scheduler, adapter: None, None),
+    PassOutcome.BUSY: (_one_row(block=True), None),
+    PassOutcome.DEFERRED: (_one_row(lambda row, now: SenderSelectionResult(retry_at=now + 5)), 1005.0),
+    PassOutcome.STALLED: (_one_row(lambda row, now: SenderSelectionResult()), 1030.0),
+    PassOutcome.CYCLE: (_linked_in_a_cycle, None),
+    PassOutcome.PERMIT_LEAK: (_one_row(leak_slot=True), None),
+    PassOutcome.STOPPED: (_one_row(stop=True), None),
+}
+
+
+@pytest.mark.parametrize("outcome", list(PassOutcome), ids=lambda outcome: outcome.value)
+def test_each_pass_outcome_sets_the_wait_the_worker_uses(tmp_path, monkeypatch, outcome):
+    """A pass names how it left the worker; only a stall adds its own rescan deadline."""
+    monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: 1000.0)
+    scenario, deadline = PASS_SCENARIOS[outcome]
+    adapter = Adapter()
+    queue = OutboundQueue(tmp_path)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        try:
+            scenario(queue, scheduler, adapter)
+            assert scheduler.dispatch_once() is outcome
+            assert scheduler.next_deadline == deadline
+            if outcome in (PassOutcome.BUSY, PassOutcome.CYCLE, PassOutcome.PERMIT_LEAK):
+                assert len(scheduler.in_flight) == 1
+        finally:
+            adapter.release.set()
+            scheduler.stop_and_drain(timeout=2)
+            queue.close()
+
+
+def test_a_failing_sender_lookup_releases_its_slot_and_delivery_continues(tmp_path, monkeypatch, caplog):
+    """A sender lookup that raises defers its row; the worker's only slot serves the next one."""
+    clock = [1000.0]
+    monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
+    adapter = Adapter()
+    broken_chats = {7}
+    select_sender = adapter.select_sender
+
+    def failing_select_sender(row, now):
+        if row.telegram_chat_id in broken_chats:
+            raise RuntimeError("sender pool unavailable")
+        return select_sender(row, now)
+
+    adapter.select_sender = failing_select_sender
+    queue = OutboundQueue(tmp_path)
+    failing, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "first"}))
+    later, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 8, "text": "next"}))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
+        try:
+            with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
+                assert scheduler.dispatch_once() is PassOutcome.BUSY
+            assert list(scheduler.in_flight) == [later]
+            assert f"Choosing a sender for queue row {failing} failed" in caplog.text
+            scheduler.in_flight[later].future.result(timeout=2)
+            scheduler.harvest_completed()
+            assert scheduler.slots.free == 1
+
+            broken_chats.clear()
+            assert scheduler.dispatch_once() is PassOutcome.DEFERRED
+            assert scheduler.next_deadline == 1000.0 + OutboundQueueScheduler.STALL_RESCAN_SECONDS
+            clock[0] = scheduler.next_deadline
+            assert scheduler.dispatch_once() is PassOutcome.BUSY
+            assert list(scheduler.in_flight) == [failing]
+            scheduler.in_flight[failing].future.result(timeout=2)
+            assert [call[1] for call in adapter.calls] == [8, 7]
+        finally:
+            scheduler.stop_and_drain(timeout=2)
+            queue.close()
