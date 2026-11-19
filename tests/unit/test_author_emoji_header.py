@@ -23,6 +23,7 @@ from efb_telegram_master.custom_emoji import (
 from efb_telegram_master.outbound import (
     OutboundQueue,
     QueuedDeliveryResult,
+    QueueRequest,
     SenderSelection,
 )
 from efb_telegram_master.slave_message import SlaveMessageProcessor
@@ -63,6 +64,12 @@ class FakeBot:
         raise AssertionError("queued calls are not sent while enqueueing")
 
     def edit_message_text(self, text, chat_id=None, message_id=None, parse_mode=None, **kwargs):
+        raise AssertionError("queued calls are not sent while enqueueing")
+
+    def send_sticker(self, chat_id, sticker, reply_markup=None, **kwargs):
+        raise AssertionError("queued calls are not sent while enqueueing")
+
+    def send_location(self, chat_id, latitude=None, longitude=None, reply_markup=None, **kwargs):
         raise AssertionError("queued calls are not sent while enqueueing")
 
 
@@ -115,6 +122,11 @@ def make_manager(tmp_path, store):
     manager._queued_db_log_context_lock = threading.Lock()
     manager._queued_db_log_contexts = {}
     manager._queued_completion_callbacks = {}
+    # Edits and stickers wait for their result; store them as the blocking path would, without waiting.
+    manager._enqueue_blocking_send_and_wait = lambda _slave, _chat, function, args, kwargs, **_: (
+        manager._enqueue_send_task(function, args, {**kwargs, "_send_mode": "blocking"}))
+    manager._enqueue_blocking_api_operation = lambda *, operation, args, kwargs, **_: (
+        manager._enqueue_requests([QueueRequest(operation, args, {**kwargs, "_send_mode": "blocking"})]))
     return manager
 
 
@@ -180,6 +192,30 @@ def test_header_in_a_group_chat_header_keeps_the_emoji_after_the_chat_name_icons
     assert not args[1].startswith("<tg-emoji")
 
 
+@pytest.mark.parametrize("operation", ["send_sticker", "send_location"])
+def test_header_in_an_inline_keyboard_is_queued_as_plain_text(
+        profile, tmp_path, author, author_uid, operation):  # noqa: F811
+    store = make_store(profile, [saved_row(author_uid, "5001")])
+    processor, _ = make_processor(store)
+    manager = make_manager(tmp_path, store)
+    message = Message(chat=author.chat, author=author, text="")
+
+    header = processor.generate_message_template(message, False)
+    assert isinstance(header, AuthorEmojiHeader)
+    markup = SlaveMessageProcessor.build_chat_info_inline_keyboard(message, header, "", None)
+    if operation == "send_sticker":
+        manager.send_sticker(123, "sticker-file-id", reply_markup=markup, _slave_id="slave")
+    else:
+        manager.send_location(123, latitude=1.0, longitude=2.0, reply_markup=markup, _slave_id="slave")
+    newest = manager._outbound_queue.connection.execute("SELECT MAX(id) FROM outbound_queue").fetchone()[0]
+    row = manager._outbound_queue.load_queued(newest)
+
+    assert b"AuthorEmojiHeader" not in row.payload
+    _, kwargs = manager._outbound_queue.decode_payload_raw(row.payload)
+    button = kwargs["reply_markup"].inline_keyboard[0][0]
+    assert type(button.text) is str and button.text == str(header)
+
+
 def test_markdown_send_gets_the_plain_header(profile, tmp_path, author, author_uid):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
@@ -195,9 +231,6 @@ def test_edit_by_an_incapable_authoring_bot_drops_the_tag(profile, tmp_path, aut
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
     manager = make_manager(tmp_path, store)
-    # An edit waits for its result; store it as the blocking path would, without waiting.
-    manager._enqueue_blocking_send_and_wait = lambda _slave, _chat, function, args, kwargs, **_: (
-        manager._enqueue_send_task(function, args, {**kwargs, "_send_mode": "blocking"}))
     header = processor.generate_message_template(Message(chat=author.chat, author=author), True)
     manager.edit_message_text(
         "edited", chat_id=123, message_id=9, prefix=header, parse_mode="HTML", _sender_bot_id=INCAPABLE_AUXILIARY)
@@ -267,6 +300,21 @@ def test_user_text_with_a_literal_tag_is_delivered_unchanged(profile, tmp_path, 
             assert sent_text(sender).count("&lt;tg-emoji") == 1
     # Header-less sends hold no tag of ours at all, so the whole text is what the user wrote.
     assert sent_text(sender) == escaped
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_header_text_that_looks_like_a_tag_is_kept_when_no_parse_mode_is_set(
+        profile, tmp_path, author_uid, enabled):  # noqa: F811
+    store = make_store(profile, enabled=enabled)
+    manager = make_manager(tmp_path, store)
+    literal = '<tg-emoji emoji-id="1">😀</tg-emoji> Alice:'
+    row, args, kwargs = enqueue(manager, "hello", literal, parse_mode=None)
+    assert args[1] == f"{literal}\nhello"
+
+    sender = FakeSender()
+    manager.execute_queued_call(row, args, kwargs, SenderSelection(sender, INCAPABLE_AUXILIARY))
+
+    assert sent_text(sender) == f"{literal}\nhello"
 
 
 def test_uncached_author_gets_the_plain_header_and_one_request(profile, tmp_path, author, author_uid):  # noqa: F811

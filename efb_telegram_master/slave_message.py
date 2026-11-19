@@ -1076,7 +1076,7 @@ class SlaveMessageProcessor(LocaleMixin):
         """
         description = []
         if msg_template:
-            description.append([InlineKeyboardButton(msg_template, callback_data="void")])
+            description.append([InlineKeyboardButton(str(msg_template), callback_data="void")])
         if msg.text:
             description.append([InlineKeyboardButton(msg.text, callback_data="void")])
         if reactions:

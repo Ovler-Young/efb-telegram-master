@@ -1497,7 +1497,12 @@ class TelegramBotManager(LocaleMixin):
     def _without_custom_emoji(
         operation: str, args: tuple, kwargs: dict,
     ) -> tuple[tuple, dict, bool]:
-        """Return the call with the header's custom emoji tag replaced by its fallback emoji, and whether it had one."""
+        """Return the call with the header's custom emoji tag replaced by its fallback emoji, and whether it had one.
+
+        The tag is only ever written for HTML sends, so other sends are left as they are.
+        """
+        if str(kwargs.get("parse_mode", "")).lower() != "html":
+            return args, kwargs, False
         content_spec = _QUEUED_CONTENT_SPECS.get(operation)
         if content_spec is None:
             return args, kwargs, False
@@ -1676,10 +1681,10 @@ class TelegramBotManager(LocaleMixin):
                         )
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
-            telegram_kwargs.pop("parse_mode")
             telegram_args, telegram_kwargs, _ = self._without_custom_emoji(
                 row.operation, telegram_args, telegram_kwargs
             )
+            telegram_kwargs = {key: value for key, value in telegram_kwargs.items() if key != "parse_mode"}
             self._rewind_queued_files(telegram_args, telegram_kwargs)
             result = call_method()
         if content is None:
