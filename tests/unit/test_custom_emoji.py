@@ -112,13 +112,15 @@ def test_user_row_in_topiciconcache_is_used_when_useremojicache_has_none(profile
 
 
 @pytest.mark.parametrize("kind", ["only-topic", "only-user", "neither"])
-def test_profiles_with_one_or_no_legacy_table_load_and_get_both_tables(profile, kind):
+def test_profiles_with_one_or_no_legacy_table_load_without_creating_the_topic_table(profile, kind):
     directory, open_manager = profile
     write_legacy_tables(directory,
                         TOPIC_ROWS if kind == "only-topic" else None, USER_ROWS if kind == "only-user" else None)
     store = CustomEmojiStore(open_manager(), CustomEmojiConfig())
     store.load()
-    assert {"topiciconcache", "useremojicache"} <= table_names(directory)
+    tables = table_names(directory)
+    assert "useremojicache" in tables
+    assert ("topiciconcache" in tables) == (kind == "only-topic")
     assert (store.lookup("bob") is not None) == (kind == "only-topic")
     assert (store.lookup("carol") is not None) == (kind != "neither")
 

@@ -21,7 +21,6 @@ from telegram.request import HTTPXRequest
 
 from efb_telegram_master import custom_emoji
 from efb_telegram_master.custom_emoji import (
-    AuthorEmojiState,
     CustomEmojiConfig,
     CustomEmojiStore,
     FeatureState,
@@ -153,7 +152,8 @@ def api():
 
 
 @pytest.fixture
-def make_creator(profile, api, monkeypatch):  # noqa: F811
+def make_creator(profile, api, monkeypatch, caplog):  # noqa: F811
+    caplog.set_level(logging.DEBUG, logger="efb_telegram_master.custom_emoji")
     directory, open_manager = profile
     creators = []
 
@@ -196,8 +196,13 @@ def wait_until(condition, timeout=10.0):
         time.sleep(0.01)
 
 
-def settled(creator, uids):
-    return lambda: all(creator.author_state(uid) in (AuthorEmojiState.READY, AuthorEmojiState.FAILED) for uid in uids)
+def failures(caplog, uid):
+    return sum(f"No custom emoji for {uid} (" in record.getMessage() for record in caplog.records)
+
+
+def settled(store, caplog, uids):
+    """Every author has an emoji, or the worker gave up on it for now."""
+    return lambda: all(store.lookup(uid) is not None or failures(caplog, uid) for uid in uids)
 
 
 def test_known_author_costs_no_telegram_or_database_call(make_creator, api, monkeypatch):
@@ -212,10 +217,9 @@ def test_known_author_costs_no_telegram_or_database_call(make_creator, api, monk
         creator.request(uid, lambda: loaded.append(1) or avatar())
     time.sleep(0.2)
     assert (api.calls, queries, loaded) == ([], [], [])
-    assert creator.author_state("old0") is AuthorEmojiState.READY
 
 
-def test_new_authors_continue_the_last_saved_set_and_move_on_when_it_fills(make_creator, api, profile):  # noqa: F811
+def test_new_authors_continue_the_last_saved_set_and_move_on_when_it_fills(make_creator, api, profile, caplog):  # noqa: F811
     directory, _ = profile
     api.sets[SET_6] = [f"s{i}" for i in range(190)]
     store, creator = make_creator(legacy_rows(2), write_interval=0.05)
@@ -224,11 +228,10 @@ def test_new_authors_continue_the_last_saved_set_and_move_on_when_it_fills(make_
     for uid in uids:
         creator.request(uid, avatar)
         creator.request(uid, avatar)  # duplicate while queued
-    wait_until(settled(creator, uids))
+    wait_until(settled(store, caplog, uids))
 
     rows = saved_rows(directory)
     for uid in uids:
-        assert creator.author_state(uid) is AuthorEmojiState.READY
         assert store.lookup(uid).custom_emoji_id == rows["member-user:" + uid][0]
     assert [rows["member-user:" + uid][1] for uid in uids] == [SET_6] * 10 + [SET_7] * 10
     assert len({emoji for emoji, _ in rows.values()}) == len(rows)
@@ -245,12 +248,12 @@ def test_new_authors_continue_the_last_saved_set_and_move_on_when_it_fills(make_
     assert min(b - a for a, b in itertools.pairwise(write_times)) > 0.04  # server-side arrival jitter
 
 
-def test_sticker_matches_earlier_releases(make_creator, api):
-    _, creator = make_creator(legacy_rows(1))
+def test_sticker_matches_earlier_releases(make_creator, api, caplog):
+    store, creator = make_creator(legacy_rows(1))
     creator.start()
     uid = "slave.channel_alice"
     creator.request(uid, avatar)
-    wait_until(settled(creator, [uid]))
+    wait_until(settled(store, caplog, [uid]))
 
     (_, method, params), = [call for call in api.calls if call[1] in WRITES]
     (sticker,) = json.loads(params["stickers"])
@@ -264,58 +267,57 @@ def test_sticker_matches_earlier_releases(make_creator, api):
     assert (image.format, image.size) == ("PNG", (100, 100))
 
 
-def test_set_reported_full_moves_to_the_next_set(make_creator, api, profile):  # noqa: F811
+def test_set_reported_full_moves_to_the_next_set(make_creator, api, profile, caplog):  # noqa: F811
     directory, _ = profile
     api.sets[SET_6] = [f"s{i}" for i in range(150)]
     api.full_on_add.add(SET_6)
-    _, creator = make_creator(legacy_rows(1))
+    store, creator = make_creator(legacy_rows(1))
     creator.start()
     creator.request("bob", avatar)
-    wait_until(settled(creator, ["bob"]))
+    wait_until(settled(store, caplog, ["bob"]))
 
     assert saved_rows(directory)["member-user:bob"] == (api.sets[SET_7][0], SET_7)
     assert api.methods() == [("getStickerSet", SET_6), ("addStickerToSet", SET_6), ("getStickerSet", SET_7),
                              ("createNewStickerSet", SET_7), ("getStickerSet", SET_7)]
 
 
-def test_failed_look_up_of_the_next_set_does_not_skip_it(make_creator, api, profile):  # noqa: F811
+def test_failed_look_up_of_the_next_set_does_not_skip_it(make_creator, api, profile, caplog):  # noqa: F811
     directory, _ = profile
     api.sets[SET_6] = [f"s{i}" for i in range(199)]
-    _, creator = make_creator(legacy_rows(1))
+    store, creator = make_creator(legacy_rows(1))
     creator.start()
     creator.request("ann", avatar)
-    wait_until(settled(creator, ["ann"]))
+    wait_until(settled(store, caplog, ["ann"]))
     api.errors["getStickerSet"] = "Bad Request: temporarily unavailable"
     creator.request("ben", avatar)
-    wait_until(settled(creator, ["ben"]))
+    wait_until(settled(store, caplog, ["ben"]))
     del api.errors["getStickerSet"]
     creator.request("cid", avatar)
-    wait_until(settled(creator, ["cid"]))
+    wait_until(settled(store, caplog, ["cid"]))
 
     rows = saved_rows(directory)
-    assert creator.author_state("ben") is AuthorEmojiState.FAILED
+    assert store.lookup("ben") is None
     assert (rows["member-user:ann"][1], rows["member-user:cid"][1]) == (SET_6, SET_7)
 
 
-def test_lost_reply_to_set_creation_does_not_block_later_authors(make_creator, api, profile):  # noqa: F811
+def test_lost_reply_to_set_creation_does_not_block_later_authors(make_creator, api, profile, caplog):  # noqa: F811
     directory, _ = profile
     api.lose_reply.add("createNewStickerSet")
-    _, creator = make_creator(legacy_rows(1))
+    store, creator = make_creator(legacy_rows(1))
     creator.start()
     creator.request("ivy", avatar)
-    wait_until(settled(creator, ["ivy"]))
+    wait_until(settled(store, caplog, ["ivy"]))
     creator.request("jon", avatar)
-    wait_until(settled(creator, ["jon"]))
+    wait_until(settled(store, caplog, ["jon"]))
 
-    assert creator.author_state("ivy") is AuthorEmojiState.FAILED
-    assert creator.author_state("jon") is AuthorEmojiState.READY
+    assert store.lookup("ivy") is None
     assert saved_rows(directory)["member-user:jon"] == (api.sets[SET_6][1], SET_6)
     assert api.methods() == [("getStickerSet", SET_6), ("createNewStickerSet", SET_6), ("getStickerSet", SET_6),
                              ("addStickerToSet", SET_6), ("getStickerSet", SET_6)]
 
 
-def test_failed_author_waits_for_its_retry_time(make_creator, api):
-    _, creator = make_creator(legacy_rows(1), retry_base=0.3)
+def test_failed_author_waits_for_its_retry_time(make_creator, api, caplog):
+    store, creator = make_creator(legacy_rows(1), retry_base=0.3)
     creator.start()
     attempts = []
 
@@ -324,8 +326,7 @@ def test_failed_author_waits_for_its_retry_time(make_creator, api):
         raise EFBOperationNotSupported()
 
     creator.request("nobody", no_avatar)
-    wait_until(settled(creator, ["nobody"]))
-    assert creator.author_state("nobody") is AuthorEmojiState.FAILED
+    wait_until(settled(store, caplog, ["nobody"]))
     for _ in range(5):
         creator.request("nobody", no_avatar)
     time.sleep(0.1)
@@ -333,7 +334,7 @@ def test_failed_author_waits_for_its_retry_time(make_creator, api):
 
     time.sleep(0.25)
     creator.request("nobody", no_avatar)
-    wait_until(lambda: len(attempts) == 2 and creator.author_state("nobody") is AuthorEmojiState.FAILED)
+    wait_until(lambda: len(attempts) == 2 and failures(caplog, "nobody") == 2)
     time.sleep(0.3)  # the second failure doubles the wait
     creator.request("nobody", no_avatar)
     time.sleep(0.1)
@@ -341,28 +342,56 @@ def test_failed_author_waits_for_its_retry_time(make_creator, api):
     assert api.methods(*WRITES) == []
 
 
-def test_telegram_error_fails_only_that_author(make_creator, api):
-    _, creator = make_creator(legacy_rows(1))
+def test_failed_read_back_after_the_upload_is_retried_without_uploading_again(
+        make_creator, api, profile, caplog):  # noqa: F811
+    directory, _ = profile
+    api.sets[SET_6] = ["s0"]
+    answer = api.answer
+    read_back_failed = []
+
+    def failing_read_back(method, params, files):
+        if method == "getStickerSet" and (api.methods("addStickerToSet") and not read_back_failed):
+            read_back_failed.append(1)
+            return 400, {"ok": False, "error_code": 400, "description": "Bad Request: temporarily unavailable"}
+        return answer(method, params, files)
+
+    api.answer = failing_read_back
+    store, creator = make_creator(legacy_rows(1), retry_base=0.1)
+    creator.start()
+    creator.request("kim", avatar)
+    wait_until(settled(store, caplog, ["kim"]))
+    assert store.lookup("kim") is None
+    time.sleep(0.15)
+    creator.request("kim", avatar)
+    wait_until(lambda: store.lookup("kim") is not None)
+
+    assert saved_rows(directory)["member-user:kim"] == (api.sets[SET_6][-1], SET_6)
+    assert api.methods(*WRITES) == [("addStickerToSet", SET_6)]
+    assert len(api.files) == 1
+
+
+def test_telegram_error_fails_only_that_author(make_creator, api, caplog):
+    store, creator = make_creator(legacy_rows(1))
     creator.start()
     api.errors["addStickerToSet"] = "Bad Request: STICKER_PNG_NOPNG"
     api.sets[SET_6] = ["s0"]
     creator.request("carol", avatar)
-    wait_until(settled(creator, ["carol"]))
+    wait_until(settled(store, caplog, ["carol"]))
     creator.request("carol", avatar)
     time.sleep(0.1)
 
-    assert creator.author_state("carol") is AuthorEmojiState.FAILED
+    assert store.lookup("carol") is None
     assert creator.feature_state is FeatureState.ENABLED
     assert api.methods(*WRITES) == [("addStickerToSet", SET_6)]
 
 
 def test_permission_error_makes_the_feature_unavailable(make_creator, api, caplog):
-    _, creator = make_creator(legacy_rows(1))
+    store, creator = make_creator(legacy_rows(1))
     creator.start()
     api.errors["createNewStickerSet"] = "Bad Request: PEER_ID_INVALID"
     with caplog.at_level(logging.WARNING, logger="efb_telegram_master.custom_emoji"):
         creator.request("dave", avatar)
-        wait_until(settled(creator, ["dave"]))
+        wait_until(lambda: creator.feature_state is FeatureState.UNAVAILABLE)
         calls = len(api.calls)
         loaded = []
         for uid in ("erin", "frank", "dave"):
@@ -370,15 +399,14 @@ def test_permission_error_makes_the_feature_unavailable(make_creator, api, caplo
         time.sleep(0.1)
 
     assert creator.feature_state is FeatureState.UNAVAILABLE
-    assert "peer_id_invalid" in creator.unavailable_reason.lower()
-    assert [record.levelname for record in caplog.records if record.name == "efb_telegram_master.custom_emoji"] == [
-        "WARNING"]
+    (warning,) = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert "peer_id_invalid" in warning.getMessage().lower()
     assert (len(api.calls), loaded) == (calls, [])
-    assert creator.author_state("erin") is AuthorEmojiState.ABSENT
+    assert store.lookup("erin") is None
 
 
 def test_full_queue_drops_without_waiting(make_creator, api):
-    _, creator = make_creator(legacy_rows(1), queue_size=3)  # worker not started: nothing leaves the queue
+    store, creator = make_creator(legacy_rows(1), queue_size=3)  # worker not started: nothing leaves the queue
     for uid in ("a", "b", "c"):
         creator.request(uid, avatar)
     durations = []
@@ -388,19 +416,23 @@ def test_full_queue_drops_without_waiting(make_creator, api):
         durations.append(time.perf_counter() - started)
 
     assert statistics.median(durations) < 0.001
-    assert [creator.author_state(uid) for uid in ("a", "b", "c", "late0")] == [AuthorEmojiState.QUEUED] * 3 + [
-        AuthorEmojiState.ABSENT]
     assert api.calls == []
+
+    creator.start()
+    wait_until(lambda: all(store.lookup(uid) is not None for uid in ("a", "b", "c")))
+    time.sleep(0.1)
+    assert store.lookup("late0") is None
+    assert len(api.methods(*WRITES)) == 3
 
 
 def test_stop_returns_within_its_bound_with_jobs_queued(make_creator, api):
-    _, creator = make_creator(legacy_rows(1), write_interval=30.0)
+    store, creator = make_creator(legacy_rows(1), write_interval=30.0)
     api.sets[SET_6] = ["s0"]
     creator.start()
     uids = [f"u{i}" for i in range(5)]
     for uid in uids:
         creator.request(uid, avatar)
-    wait_until(lambda: creator.author_state("u0") is AuthorEmojiState.READY)
+    wait_until(lambda: store.lookup("u0") is not None)
     started = time.monotonic()
     creator.stop()
 

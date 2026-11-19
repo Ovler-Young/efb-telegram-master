@@ -13,7 +13,6 @@ from efb_telegram_master import utils
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.custom_emoji import (
     AuthorEmojiHeader,
-    AuthorEmojiState,
     CustomEmojiConfig,
     CustomEmojiStore,
     UserEmoji,
@@ -152,7 +151,7 @@ def sent_text(sender):
 def test_cached_author_tag_reaches_a_capable_sender_and_the_fallback_an_incapable_one(
         profile, tmp_path, author, author_uid):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
-    processor, creator = make_processor(store)
+    processor, _ = make_processor(store)
     manager = make_manager(tmp_path, store)
     message = Message(chat=author.chat, author=author)
     fallback = fallback_emoji(author_uid)
@@ -162,7 +161,6 @@ def test_cached_author_tag_reaches_a_capable_sender_and_the_fallback_an_incapabl
 
     tag = TAG.format("5001", fallback)
     assert args[1] == f"{tag} {html.escape(author.long_name)}:\nhello &lt;b&gt;"
-    assert creator.author_state(author_uid) is AuthorEmojiState.READY
 
     for selection, expected in (
         (MAIN, args[1]),
@@ -319,7 +317,7 @@ def test_header_text_that_looks_like_a_tag_is_kept_when_no_parse_mode_is_set(
 
 def test_uncached_author_gets_the_plain_header_and_one_request(profile, tmp_path, author, author_uid):  # noqa: F811
     store = make_store(profile)
-    processor, creator = make_processor(store)
+    processor, _ = make_processor(store)
     message = Message(chat=author.chat, author=author)
 
     header = processor.generate_message_template(message, True)
@@ -327,7 +325,6 @@ def test_uncached_author_gets_the_plain_header_and_one_request(profile, tmp_path
     assert header == f"{author.long_name}:" and type(header) is str
     processor.channel.custom_emoji_creator.request.assert_called_once()
     assert processor.channel.custom_emoji_creator.request.call_args.args[0] == author_uid
-    assert creator.author_state(author_uid) is AuthorEmojiState.QUEUED
 
 
 def test_uncached_author_avatar_is_fetched_only_when_the_worker_asks(profile, slave, author, author_uid):  # noqa: F811

@@ -390,7 +390,7 @@ class DatabaseManager:
         """
         database.create_tables([
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
-            TopicIconCache, UserEmojiCache,
+            UserEmojiCache,
         ])
 
     @staticmethod
@@ -398,7 +398,7 @@ class DatabaseManager:
         """Create tables introduced after the original schema without touching existing data."""
         database.create_tables([
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
-            TopicIconCache, UserEmojiCache,
+            UserEmojiCache,
         ], safe=True)
 
     def _check_and_run_migrations(self):

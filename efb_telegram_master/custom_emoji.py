@@ -293,10 +293,6 @@ class IllegalTransition(RuntimeError):
 
     def __init__(self, machine: str, identity: str, state: Enum, event: Enum):
         super().__init__(f"{machine} {identity!r}: event {event.value!r} is not allowed in state {state.value!r}")
-        self.machine = machine
-        self.identity = identity
-        self.state = state
-        self.event = event
 
 
 class StateMachine(Generic[S, E]):
@@ -440,6 +436,8 @@ class _Author:
     failures: int = 0
     retry_at: float = 0.0
     load_avatar: Callable[[], BinaryIO] | None = None
+    added_to: str | None = None
+    """Set the sticker was added to, while its custom emoji id is still to be read back."""
     unsaved: tuple[str, str] | None = None
     """(custom emoji id, set name) uploaded to Telegram but not saved yet."""
 
@@ -472,7 +470,6 @@ class UserEmojiCreator:
         self._title = title
         config = store.config
         self.feature_state = FeatureState.ENABLED if config.enabled else FeatureState.DISABLED_BY_CONFIG
-        self.unavailable_reason: str | None = None
         self.set_state = StickerSetState.UNKNOWN
         self.set_index = highest_set_index(store.sticker_set_names, config.sticker_set_name, bot_username)
         self._set_count = 0
@@ -519,12 +516,6 @@ class UserEmojiCreator:
                 self._wakeup.notify()
         except IllegalTransition as error:
             logger.warning("Custom emoji request for %s ignored: %s", uid, error)
-
-    def author_state(self, uid: str) -> AuthorEmojiState:
-        if self._store.lookup(uid) is not None:
-            return AuthorEmojiState.READY
-        author = self._authors.get(uid)
-        return author.state if author else AuthorEmojiState.ABSENT
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -582,11 +573,12 @@ class UserEmojiCreator:
     def _create(self, uid: str, author: _Author) -> None:
         try:
             if author.unsaved is None:
-                load_avatar, author.load_avatar = author.load_avatar, None
-                if load_avatar is None:
-                    raise _AuthorFailed("no avatar source")
-                png = self._avatar_png(load_avatar)
-                author.unsaved = self._upload(uid, png)
+                if author.added_to is None:
+                    load_avatar, author.load_avatar = author.load_avatar, None
+                    if load_avatar is None:
+                        raise _AuthorFailed("no avatar source")
+                    author.added_to = self._upload(uid, self._avatar_png(load_avatar))
+                author.unsaved = self._read_back(author.added_to)
             self._save(uid, author)
         except _AuthorFailed as failure:
             self._fail(uid, author, str(failure), failure.retry_after)
@@ -615,8 +607,8 @@ class UserEmojiCreator:
         assert self._loop is not None
         return self._loop.run_until_complete(coroutine)
 
-    def _upload(self, uid: str, png: io.BytesIO) -> tuple[str, str]:
-        """Add the sticker to the current set, moving to the next set when it is full."""
+    def _upload(self, uid: str, png: io.BytesIO) -> str:
+        """Add the sticker to the current set, moving to the next set when it is full; returns the set's name."""
         assert self._bot is not None
         owner = self._store.config.owner_user_id
         assert owner is not None
@@ -646,12 +638,16 @@ class UserEmojiCreator:
                 # our back: look the set up again before the next write.
                 self._move_set(StickerSetEvent.WRITE_FAILED)
                 self._telegram_failed(error)
-            sticker_set = self._read_set(name)
-            if not sticker_set.stickers or not sticker_set.stickers[-1].custom_emoji_id:
-                raise _AuthorFailed(f"sticker set {name} has no new custom emoji")
-            self._set_count = len(sticker_set.stickers)
-            self._move_set(StickerSetEvent.FILLED if self._set_count >= STICKER_SET_LIMIT else StickerSetEvent.ADDED)
-            return sticker_set.stickers[-1].custom_emoji_id, name
+            return name
+
+    def _read_back(self, name: str) -> tuple[str, str]:
+        """The custom emoji id of the sticker just added to the set ``name``."""
+        sticker_set = self._read_set(name)
+        if not sticker_set.stickers or not sticker_set.stickers[-1].custom_emoji_id:
+            raise _AuthorFailed(f"sticker set {name} has no new custom emoji")
+        self._set_count = len(sticker_set.stickers)
+        self._move_set(StickerSetEvent.FILLED if self._set_count >= STICKER_SET_LIMIT else StickerSetEvent.ADDED)
+        return sticker_set.stickers[-1].custom_emoji_id, name
 
     def _open_set(self) -> str:
         """Name of a set with room, looking up each set at most once per session."""
@@ -744,7 +740,6 @@ class UserEmojiCreator:
             if self.feature_state is not FeatureState.ENABLED:
                 return
             self.feature_state = FEATURE_MACHINE.next_state("user emoji", self.feature_state, FeatureEvent.FAILED)
-            self.unavailable_reason = reason
             while self._queue:
                 uid = self._queue.popleft()
                 self._move_author(uid, self._authors.pop(uid), AuthorEmojiEvent.DISCARDED)
