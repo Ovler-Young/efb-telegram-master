@@ -115,7 +115,7 @@ async def test_author_custom_emoji_is_replaced_when_the_avatar_changes(
             return io.BytesIO(picture.read())
 
     monkeypatch.setattr(slave, "get_chat_member_picture", member_picture, raising=False)
-    monkeypatch.setattr(custom_emoji, "AVATAR_RECHECK_INTERVAL", 0.01)
+    monkeypatch.setattr(custom_emoji, "GROUP_AVATAR_RECHECK_INTERVAL", 0.01)
 
     with link_chats(channel, (chat,), bot_group):
         first = slave.send_text_message(chat=chat, author=author)
@@ -155,7 +155,7 @@ async def test_author_custom_emoji_saved_by_an_earlier_version_is_made_again_on_
             return io.BytesIO(picture.read())
 
     monkeypatch.setattr(slave, "get_chat_member_picture", member_picture, raising=False)
-    monkeypatch.setattr(custom_emoji, "AVATAR_RECHECK_INTERVAL", 0.01)
+    monkeypatch.setattr(custom_emoji, "GROUP_AVATAR_RECHECK_INTERVAL", 0.01)
 
     with link_chats(channel, (chat,), bot_group):
         first = slave.send_text_message(chat=chat, author=author)

@@ -1713,9 +1713,10 @@ class SlaveMessageProcessor(LocaleMixin):
             )
 
     def _author_custom_emoji(self, msg: Message) -> UserEmoji | None:
-        """The group author's custom emoji if it is known; otherwise ask for it to be created and return None.
+        """The author's custom emoji if it is known; for a group author not known yet, ask for it to be created.
 
-        A known author's avatar is checked for changes now and then in the background.
+        A known author's avatar is checked for changes now and then in the background,
+        sooner after a message from a private chat than after one from a group.
         This runs while the message is being prepared for sending, so it only reads memory.
         """
         store = self.channel.custom_emoji
@@ -1726,7 +1727,11 @@ class SlaveMessageProcessor(LocaleMixin):
         found = store.lookup(uid)
         if store.config.enabled:
             creator = self.channel.custom_emoji_creator
-            (creator.request if found is None else creator.refresh)(uid, lambda: self._load_author_avatar(author))
+            private_chat = isinstance(msg.chat, PrivateChat)
+            if found is not None:
+                creator.refresh(uid, lambda: self._load_author_avatar(author), private_chat)
+            elif not private_chat:
+                creator.request(uid, lambda: self._load_author_avatar(author))
         return found
 
     @staticmethod
@@ -1746,6 +1751,8 @@ class SlaveMessageProcessor(LocaleMixin):
             author_emoji = self._author_custom_emoji(msg)
             if author_emoji:
                 msg_prefix = f"{author_emoji.fallback} {msg_prefix}"
+        elif isinstance(msg.chat, PrivateChat):
+            self._author_custom_emoji(msg)  # private headers show no emoji, but the author's avatar may be due a check
 
         emoji_offset = 0
         if singly_linked:

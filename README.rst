@@ -318,7 +318,9 @@ How it behaves:
   Sticker sets that already exist, including those made by earlier ETM
   versions, are reused.
 - When an author writes, ETM compares their avatar with the one their emoji
-  was made from, at most once every 6 hours per author, in the background.
+  was made from, in the background: at most once every 7 days per author
+  when the message comes from a group, and at most once a day when it comes
+  from a private chat.
   If the avatar has changed, ETM makes a new emoji and puts it in place of
   the old one in its sticker set, so sets do not fill up with old avatars.
   Messages never wait for this: they use the old emoji until the new one is

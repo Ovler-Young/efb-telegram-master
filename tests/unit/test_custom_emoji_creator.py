@@ -678,7 +678,7 @@ def test_avatar_is_checked_at_most_once_per_interval(make_creator, api, clock, c
     finish_running_job(store, creator, caplog)
     assert len(loader.threads) == 1
 
-    clock.now += custom_emoji.AVATAR_RECHECK_INTERVAL - 1
+    clock.now += custom_emoji.GROUP_AVATAR_RECHECK_INTERVAL - 1
     for _ in range(5):
         creator.refresh("old0", loader)
     creator.refresh("old2", probe)  # checks run in order, so a check of old0 would run before this one
@@ -690,6 +690,48 @@ def test_avatar_is_checked_at_most_once_per_interval(make_creator, api, clock, c
     creator.refresh("old0", loader)
     wait_until(lambda: len(loader.threads) == 2)
     assert configured.threads == []
+
+
+DAY = 24 * 3600.0
+
+
+@pytest.mark.parametrize("private_chat, not_due, due", [
+    (False, 6 * DAY, 7 * DAY + 1),
+    (True, DAY - 1, DAY + 1),
+], ids=["group", "private"])
+def test_avatar_check_interval_follows_the_chat_of_the_message(
+        make_creator, api, clock, caplog, private_chat, not_due, due):
+    store, creator = make_creator(legacy_rows(2))
+    creator.start()
+    loader, probe = Avatar(), Avatar()
+    creator.refresh("old0", loader, private_chat)
+    wait_until(lambda: loader.threads)
+    finish_running_job(store, creator, caplog)
+    checked = clock.now
+
+    clock.now = checked + not_due
+    creator.refresh("old0", loader, private_chat)
+    creator.refresh("old1", probe, private_chat)  # checks run in order, so a check of old0 would run before this one
+    wait_until(lambda: probe.threads)
+    finish_running_job(store, creator, caplog)
+    assert len(loader.threads) == 1
+
+    clock.now = checked + due
+    creator.refresh("old0", loader, private_chat)
+    wait_until(lambda: len(loader.threads) == 2)
+
+
+def test_private_message_checks_an_author_a_group_message_would_not_yet(make_creator, api, clock, caplog):
+    store, creator = make_creator(legacy_rows(1))
+    creator.start()
+    loader = Avatar()
+    creator.refresh("old0", loader)
+    wait_until(lambda: loader.threads)
+    finish_running_job(store, creator, caplog)
+
+    clock.now += DAY + 1
+    creator.refresh("old0", loader, private_chat=True)
+    wait_until(lambda: len(loader.threads) == 2)
 
 
 def test_failed_replacement_keeps_the_old_emoji_until_it_is_retried(
@@ -807,7 +849,7 @@ def test_author_whose_row_another_writer_saved_first_is_still_checked(make_creat
     wait_until(lambda: store.lookup("zoe") is not None)
     assert store.lookup("zoe").custom_emoji_id == "other-zoe"
 
-    clock.now += custom_emoji.AVATAR_RECHECK_INTERVAL + 1
+    clock.now += custom_emoji.GROUP_AVATAR_RECHECK_INTERVAL + 1
     loader = Avatar()
     creator.refresh("zoe", loader)
     wait_until(lambda: loader.threads)

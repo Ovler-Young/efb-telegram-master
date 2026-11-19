@@ -349,6 +349,23 @@ def test_uncached_author_avatar_is_fetched_only_when_the_worker_asks(profile, sl
     slave.get_chat_member_picture.assert_called_once_with(author)
 
 
+def test_private_message_asks_for_an_avatar_check_with_the_private_interval_and_keeps_a_plain_header(
+        profile, slave):  # noqa: F811
+    known, unknown = slave.chat_with_alias, slave.chat_without_alias
+    known_uid = utils.chat_id_to_str(channel_id=known.other.module_id, chat_uid=known.other.uid)
+    store = make_store(profile, [saved_row(known_uid, "5001")])
+    processor, _ = make_processor(store)
+    creator = processor.channel.custom_emoji_creator
+
+    header = processor.generate_message_template(Message(chat=known, author=known.other), False)
+    processor.generate_message_template(Message(chat=unknown, author=unknown.other), False)
+
+    assert type(header) is str and "<tg-emoji" not in header
+    creator.refresh.assert_called_once()
+    assert creator.refresh.call_args.args[0] == known_uid and creator.refresh.call_args.args[2] is True
+    creator.request.assert_not_called()
+
+
 @pytest.mark.parametrize("enabled", [False, None], ids=["disabled", "no_section"])
 def test_disabled_feature_leaves_headers_as_they_were(profile, author, author_uid, enabled):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")], enabled=enabled)

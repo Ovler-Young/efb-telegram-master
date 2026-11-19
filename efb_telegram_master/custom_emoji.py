@@ -429,8 +429,9 @@ STICKER_SET_LIMIT = 200
 QUEUE_SIZE = 100
 CHECK_QUEUE_SIZE = 50
 # Each check downloads the avatar from the slave channel; avatars change rarely, and a late refresh only
-# affects later messages, so an author who keeps writing is checked a few times a day.
-AVATAR_RECHECK_INTERVAL = 6 * 3600.0
+# affects later messages. A message from a private chat checks its author sooner than one from a group.
+GROUP_AVATAR_RECHECK_INTERVAL = 7 * 24 * 3600.0
+PRIVATE_AVATAR_RECHECK_INTERVAL = 24 * 3600.0
 WRITE_INTERVAL = 1.0
 RETRY_BASE = 600.0
 RETRY_CAP = 12 * 3600.0
@@ -537,7 +538,7 @@ class UserEmojiCreator:
         self._authors: dict[str, _Author] = {}
         self._queue: deque[str] = deque()
         self._checks: deque[str] = deque()
-        self._next_check: dict[str, float] = {}  # uid -> earliest time of the next avatar check
+        self._checked_at: dict[str, float] = {}  # uid -> time its avatar was last checked or loaded
         self._lock = threading.Lock()
         self._wakeup = threading.Condition(self._lock)
         self._stopping = threading.Event()
@@ -579,16 +580,20 @@ class UserEmojiCreator:
         except IllegalTransition as error:
             logger.warning("Custom emoji request for %s ignored: %s", uid, error)
 
-    def refresh(self, uid: str, load_avatar: Callable[[], BinaryIO]) -> None:
+    def refresh(self, uid: str, load_avatar: Callable[[], BinaryIO], private_chat: bool = False) -> None:
         """Queue a check of ``uid``'s avatar when its saved emoji was last checked long enough ago.
 
-        A changed avatar gets a new emoji in place of the old one. ``load_avatar``
-        runs later on the worker thread. Configured ids are never checked.
+        How long is enough depends on the chat of the message that asks: a private
+        chat's interval is shorter than a group's. A changed avatar gets a new emoji
+        in place of the old one. ``load_avatar`` runs later on the worker thread.
+        Configured ids are never checked.
         """
         if self.feature_state is not FeatureState.ENABLED or self._stopping.is_set():
             return
         now = time.monotonic()
-        if self._next_check.get(uid, 0.0) > now or self._store.saved(uid) is None:
+        interval = PRIVATE_AVATAR_RECHECK_INTERVAL if private_chat else GROUP_AVATAR_RECHECK_INTERVAL
+        checked_at = self._checked_at.get(uid)
+        if (checked_at is not None and now - checked_at < interval) or self._store.saved(uid) is None:
             return
         try:
             with self._lock:
@@ -604,7 +609,7 @@ class UserEmojiCreator:
                 self._move_author(uid, author, AuthorEmojiEvent.CHECK_DUE)
                 author.load_avatar = load_avatar
                 self._checks.append(uid)
-                self._next_check[uid] = now + AVATAR_RECHECK_INTERVAL
+                self._checked_at[uid] = now
                 self._wakeup.notify()
         except IllegalTransition as error:
             logger.warning("Custom emoji check for %s ignored: %s", uid, error)
@@ -904,7 +909,7 @@ class UserEmojiCreator:
         custom_emoji_id, set_name = author.unsaved
         if self._left_behind:
             raise _AuthorFailed("stopping")  # stop gave up waiting, so the database may be closed
-        self._next_check[uid] = time.monotonic() + AVATAR_RECHECK_INTERVAL  # the emoji shows the avatar just loaded
+        self._checked_at[uid] = time.monotonic()  # the emoji shows the avatar just loaded
         try:
             if author.replaces is not None:
                 assert author.avatar_hash is not None
@@ -930,7 +935,7 @@ class UserEmojiCreator:
             author.retry_at = time.monotonic() + max(delay, retry_after)
             self._move_author(uid, author, AuthorEmojiEvent.FAILED)
             if author.replaces is not None:
-                self._next_check[uid] = author.retry_at
+                self._checked_at.pop(uid, None)  # the next message retries the replacement once retry_at has passed
         logger.debug("No custom emoji for %s (attempt %d, next try in %.0f s): %s",
                      uid, author.failures, max(delay, retry_after), reason)
 
