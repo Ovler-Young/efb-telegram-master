@@ -97,7 +97,8 @@ next message or restart. That covers a row waiting behind another row and a row
 whose readiness filter excludes it from every head. Worker permits held without
 a submitted call cannot be released by a completion, so they are reset and
 reported the same way. All of these mean delivery is still being attempted, not
-that rows were dropped.
+that rows were dropped. [Outbound worker](#outbound-worker) lists every way a
+pass can end.
 
 A dependent row is deferred only while the row it links to is itself still
 waiting: queued and unheld, in flight, or delivered and awaiting its MsgLog write.
@@ -232,3 +233,69 @@ run without the package (a unit test keeps the copy identical): its
 ready rows like the scheduler, and `--lane` shows `behind predecessor` for a
 row behind a barrier and `sendable` for a ready one. A deferred head is ready
 but waits for `retry_in_s`.
+
+## Outbound worker
+
+One worker thread delivers the queue. Each pass harvests finished calls,
+reconciles receipts, retries blocked media edits and then offers each
+destination's head a worker slot. The pass ends in exactly one outcome, and the
+outcome decides how long the worker sleeps before the next pass. Enqueues and
+completions always wake it early. The definition is `PassOutcome` in
+`efb_telegram_master/outbound.py`, returned by
+`OutboundQueueScheduler.dispatch_once`; when several apply, the first one in
+this table wins.
+
+| Outcome | When | Worker then waits | Log |
+|---|---|---|---|
+| stopped | The scheduler is stopping or hit a queue persistence error. | Does not wait: the worker exits and durable rows stay queued. | `Outbound recovery stopped; durable rows retained: ...` after a persistence error |
+| stalled | Rows are still waiting, none has a retry deadline, nothing is in flight. | 30 seconds (`STALL_RESCAN_SECONDS`), then rescans. | `Outbound scheduler left N dispatchable head(s) undispatched ... while queued rows remain`, at most once a minute |
+| cycle | No head was ready and every waiting row defers to another waiting row; the oldest row per destination was sent anyway. | For that call to complete, or for a retry deadline. The next pass re-elects every head. | `deferred by predecessor links that never resolve` |
+| permit_leak | Every worker slot was taken while nothing was in flight, so no completion could free one; the slots were reset. | For the calls this pass started, or for a retry deadline. | `Outbound worker permits were held without a submitted call; resetting them. Queued rows are retained.` |
+| busy | A call is in flight. | For a completion, or for a retry deadline. | None. |
+| deferred | Nothing is in flight; a row, receipt or blocked media edit has a retry deadline. | Until the earliest deadline. | None. |
+| idle | Nothing is waiting and nothing is in flight. | For the next enqueue, with no timeout. | None. |
+
+`N` in the stall line counts the heads the pass looked at. It is 0 when every
+waiting row sits behind an ordering link, so `left 0 dispatchable head(s)`
+means rows are waiting for a predecessor (see [Ordering links](#ordering-links)),
+not that the queue is empty. A stall, a cycle and a slot reset all mean
+delivery is still being attempted; no row was dropped.
+
+### Worker slots
+
+`send_worker_count` sets how many calls may run at once. `WorkerSlots` in
+`outbound.py` holds them; each slot is:
+
+* **free**: available to the next head;
+* **reserved**: `WorkerSlots.reserve` handed it to the row a pass is preparing
+  (sender choice, rate limits, payload read, submission);
+* **owned**: `ReservedSlot.own(row_id)` gave it to that row once its call was
+  submitted. `WorkerSlots.release(row_id)` frees it when the call leaves
+  `in_flight` (completion, shutdown).
+
+A reservation is held in a `with` block, so a row that is deferred, held,
+discarded or fails to submit frees its slot on every path, including when
+choosing a sender or taking its rate limit raises. Such a row stays queued and
+is retried 30 seconds later; the worker carries on with the next head and logs
+`Choosing a sender for queue row N failed; the row stays queued and is retried
+in 30 seconds.` with the traceback. Releasing a slot no row owns, or owning one
+without a reservation, is never applied: it logs `Outbound worker slot release
+for queue row N has no matching reservation; ignored.` The permit_leak reset
+above is kept as a backstop for slots that nothing can free.
+
+### Head cache
+
+The scheduler keeps the last elected head of every destination instead of
+reading every waiting row on each pass. The cache is:
+
+* **fresh**: a full scan (`OutboundQueue.heads`) just elected every head;
+* **incremental**: only the destinations a queue change marked dirty
+  (`mark_destination_dirty`, `take_dirty_destinations`) are re-elected with
+  `head_for`;
+* **heal required**: the next pass does a full scan. That happens at start,
+  when the cache is empty, after a cycle was broken, after a row was
+  quarantined for its replay size, and at least every 30 seconds
+  (`HEADS_FULL_RESCAN_SECONDS`).
+
+The periodic full scan bounds how long a queue change that was not marked dirty
+can go unseen. The cache lives in memory only; a restart starts fresh.
