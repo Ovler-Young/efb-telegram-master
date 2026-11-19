@@ -32,11 +32,13 @@ def link_chats(channel: TelegramChannel,
     db.remove_chat_assoc(master_uid=master_str)
     for i in slave_ids:
         db.add_chat_assoc(master_str, i, multiple_slave=True)
-    yield
-    # Unlink the chats and revert back
-    db.remove_chat_assoc(master_uid=master_str)
-    for i in backup:
-        db.add_chat_assoc(master_str, i, multiple_slave=True)
+    try:
+        yield
+    finally:
+        # Unlink the chats and revert back
+        db.remove_chat_assoc(master_uid=master_str)
+        for i in backup:
+            db.add_chat_assoc(master_str, i, multiple_slave=True)
 
 
 async def is_bot_admin(client: TelegramClient, bot_id: int, group):
