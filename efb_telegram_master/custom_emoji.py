@@ -10,6 +10,7 @@ Emoji for new users are created on one background thread (``UserEmojiCreator``).
 import asyncio
 import datetime
 import hashlib
+import html
 import io
 import logging
 import re
@@ -33,6 +34,7 @@ from telegram.error import (
     RetryAfter,
     TelegramError,
 )
+from typing_extensions import Self  # noqa: UP035  (typing.Self needs Python 3.11)
 
 if TYPE_CHECKING:
     from .db import DatabaseManager
@@ -259,6 +261,47 @@ class CustomEmojiStore:
             if current is None or current[1] != SOURCE_CONFIG:
                 self._index[uid] = (stored_id, SOURCE_USER_CACHE)
             return self.lookup(uid)  # type: ignore[return-value]
+
+
+_EMOJI_TAG = re.compile(
+    r'<tg-emoji emoji-id="[^"<>]*">(' + "|".join(re.escape(emoji) for emoji in FALLBACK_EMOJIS) + r")</tg-emoji>"
+)
+
+
+class AuthorEmojiHeader(str):
+    """A group message header that names an author whose custom emoji is known.
+
+    As text it is the plain header, with the author's fallback emoji where the
+    custom emoji goes, so every place that uses the header as text keeps working.
+    An HTML send asks ``html_with_emoji`` for the header with the custom emoji tag.
+    """
+
+    emoji: UserEmoji
+    offset: int
+
+    def __new__(cls, text: str, emoji: UserEmoji, offset: int) -> Self:
+        header = super().__new__(cls, text)
+        header.emoji = emoji
+        header.offset = offset
+        return header
+
+    def html_with_emoji(self) -> str:
+        """The header as HTML: text escaped, the fallback emoji replaced by its custom emoji tag."""
+        end = self.offset + len(self.emoji.fallback)
+        tag = f'<tg-emoji emoji-id="{html.escape(self.emoji.custom_emoji_id)}">{self.emoji.fallback}</tg-emoji>'
+        return html.escape(self[:self.offset]) + tag + html.escape(self[end:])
+
+
+def strip_custom_emoji_tag(content: str) -> str:
+    """Replace the custom emoji tag of a message header with its fallback emoji.
+
+    The header is the first line of a queued message, and it holds at most one
+    tag, so only the first tag of the first line is replaced. Message text
+    comes after the first line and is escaped when it is queued, so what the
+    user wrote is never changed.
+    """
+    first_line, newline, rest = content.partition("\n")
+    return _EMOJI_TAG.sub(r"\1", first_line, count=1) + newline + rest
 
 
 # State machines for generated user emoji. Every state change goes through

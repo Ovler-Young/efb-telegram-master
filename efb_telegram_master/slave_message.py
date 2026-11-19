@@ -13,7 +13,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, Tuple, Optional, TYPE_CHECKING, List, IO, Union, cast
+from typing import BinaryIO, Callable, Tuple, Optional, TYPE_CHECKING, List, IO, Union, cast
 
 import humanize
 import telegram  # lgtm [py/import-and-import-from]
@@ -27,7 +27,7 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 
 from ehforwarderbot import Message, Status, coordinator
-from ehforwarderbot.chat import ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
+from ehforwarderbot.chat import ChatMember, ChatNotificationState, SelfChatMember, GroupChat, PrivateChat, SystemChat, Chat
 from ehforwarderbot.constants import MsgType
 from ehforwarderbot.message import LinkAttribute, LocationAttribute, MessageCommand, Reactions, \
     StatusAttribute
@@ -39,6 +39,7 @@ from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import ETMCommandMsgStorage
 from .constants import Emoji
+from .custom_emoji import AuthorEmojiHeader, UserEmoji
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import get_msg_type
@@ -1583,12 +1584,40 @@ class SlaveMessageProcessor(LocaleMixin):
                 database_old_msg_id=(chat_id, msg_id), target_msg_id_override=primary_msg_id,
             )
 
+    def _author_custom_emoji(self, msg: Message) -> UserEmoji | None:
+        """The group author's custom emoji if it is known; otherwise ask for it to be created and return None.
+
+        This runs while the message is being prepared for sending, so it only reads memory.
+        """
+        store = self.channel.custom_emoji
+        author = msg.author
+        if not store.config.enabled or isinstance(author, SelfChatMember) or author == getattr(msg.chat, "self", None):
+            return None
+        uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
+        found = store.lookup(uid)
+        if found is None:
+            self.channel.custom_emoji_creator.request(uid, lambda: self._load_author_avatar(author))
+        return found
+
+    @staticmethod
+    def _load_author_avatar(author: ChatMember) -> BinaryIO:
+        slave_channel = coordinator.slaves[author.module_id]
+        get_member_picture = getattr(slave_channel, "get_chat_member_picture", None)
+        if callable(get_member_picture):
+            return get_member_picture(author)
+        return slave_channel.get_chat_picture(cast(Chat, author))
+
     def generate_message_template(self, msg: Message, singly_linked: bool) -> str:
         msg_prefix = ""  # For group member name
+        author_emoji = None
         if isinstance(msg.chat, GroupChat):
             self.logger.debug("[%s] Message is from a group. Sender: %s", msg.uid, msg.author)
             msg_prefix = msg.author.long_name
+            author_emoji = self._author_custom_emoji(msg)
+            if author_emoji:
+                msg_prefix = f"{author_emoji.fallback} {msg_prefix}"
 
+        emoji_offset = 0
         if singly_linked:
             if msg_prefix:  # if group message
                 msg_template = f"{msg_prefix}:"
@@ -1607,6 +1636,7 @@ class SlaveMessageProcessor(LocaleMixin):
             emoji_prefix = msg.chat.channel_emoji + Emoji.GROUP
             name_prefix = msg.chat.long_name
             msg_template = f"{emoji_prefix} {msg_prefix} [{name_prefix}]:"
+            emoji_offset = len(emoji_prefix) + 1
         elif isinstance(msg.chat, SystemChat):
             emoji_prefix = msg.chat.channel_emoji + Emoji.SYSTEM
             name_prefix = msg.chat.long_name
@@ -1615,6 +1645,8 @@ class SlaveMessageProcessor(LocaleMixin):
             msg_template = f"{emoji_prefix} {name_prefix}:"
         else:
             msg_template = f"{Emoji.UNKNOWN} {msg.author.long_name} ({msg.chat.display_name}):"
+        if author_emoji and msg_template:
+            return AuthorEmojiHeader(msg_template, author_emoji, emoji_offset)
         return msg_template
 
     def check_file_size(self, file: Optional[IO[bytes]]) -> Optional[str]:

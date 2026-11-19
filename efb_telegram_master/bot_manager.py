@@ -35,6 +35,7 @@ from telegram.request import HTTPXRequest
 
 from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
+from .custom_emoji import AuthorEmojiHeader, strip_custom_emoji_tag
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
 from .outbound import (
@@ -119,6 +120,20 @@ _INTERNAL_KWARGS = frozenset({
     HISTORY_REPLAY_KEY,
     SUPPLEMENTAL_KEY,
 })
+
+_CAPTION_LIMIT = int(telegram.constants.MessageLimit.CAPTION_LENGTH)
+# operation -> (content argument name, its position, its length limit)
+_QUEUED_CONTENT_SPECS = {
+    "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
+    "edit_message_text": ("text", 0, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
+    "send_audio": ("caption", 2, _CAPTION_LIMIT),
+    "send_voice": ("caption", 2, _CAPTION_LIMIT),
+    "send_video": ("caption", 2, _CAPTION_LIMIT),
+    "send_document": ("caption", 2, _CAPTION_LIMIT),
+    "send_animation": ("caption", 2, _CAPTION_LIMIT),
+    "send_photo": ("caption", 2, _CAPTION_LIMIT),
+    "edit_message_caption": ("caption", 3, _CAPTION_LIMIT),
+}
 
 
 class SyncBotProtocol(Protocol):
@@ -357,6 +372,8 @@ class TelegramBotManager(LocaleMixin):
     """
 
     webhook = False
+    _custom_emoji_auxiliary_ids: frozenset[str] = frozenset()
+    """IDs of the auxiliary bots that may send custom emoji."""
     logger = logging.getLogger(__name__)
     DEFAULT_SEND_WORKER_COUNT = 8
     DEFAULT_HTTPX_POOL_MULTIPLIER = 2.0
@@ -863,7 +880,10 @@ class TelegramBotManager(LocaleMixin):
         prefix_text = f"{prefix}\n" if prefix else ""
         suffix_text = f"\n{suffix}" if suffix else ""
         if str(parse_mode).lower() == "html":
-            prefix_text = html.escape(prefix_text)
+            if isinstance(prefix, AuthorEmojiHeader):
+                prefix_text = prefix.html_with_emoji() + "\n"
+            else:
+                prefix_text = html.escape(prefix_text)
             suffix_text = html.escape(suffix_text)
         return prefix_text + text + suffix_text
 
@@ -1103,6 +1123,8 @@ class TelegramBotManager(LocaleMixin):
             aux_bot.bind_runtime(self._runtime)
             if aux_bot.initialize():
                 aux_bots.append(aux_bot)
+                if token in channel.custom_emoji.config.auxiliary_tokens:
+                    self._custom_emoji_auxiliary_ids |= {str(aux_bot.bot_id)}
             else:
                 self.logger.error("Skipping auxiliary bot with invalid token")
 
@@ -1472,20 +1494,37 @@ class TelegramBotManager(LocaleMixin):
         return (content, False) if isinstance(content, str) else (None, False)
 
     @staticmethod
+    def _without_custom_emoji(
+        operation: str, args: tuple, kwargs: dict,
+    ) -> tuple[tuple, dict, bool]:
+        """Return the call with the header's custom emoji tag replaced by its fallback emoji, and whether it had one."""
+        content_spec = _QUEUED_CONTENT_SPECS.get(operation)
+        if content_spec is None:
+            return args, kwargs, False
+        content_key, content_index, _limit = content_spec
+        content, positional = TelegramBotManager._queued_content_argument(args, kwargs, content_key, content_index)
+        if content is None or "<tg-emoji" not in content:
+            return args, kwargs, False
+        plain = strip_custom_emoji_tag(content)
+        if plain == content:
+            return args, kwargs, False
+        if positional:
+            plain_args = list(args)
+            plain_args[content_index] = plain
+            return tuple(plain_args), kwargs, True
+        return args, {**kwargs, content_key: plain}, True
+
+    def _sender_can_send_custom_emoji(self, selection: SenderSelection) -> bool:
+        """The main bot may when ``user_emoji`` is enabled; an auxiliary bot only when its entry opts in."""
+        if selection.sender_bot_id is None:
+            return self.channel.custom_emoji.config.enabled
+        return selection.sender_bot_id in self._custom_emoji_auxiliary_ids
+
+    @staticmethod
     def _queued_full_content(
         operation: str, args: tuple, kwargs: Mapping[str, object],
     ) -> Optional[tuple[str, int, str, bool]]:
-        content_spec = {
-            "send_message": ("text", 1, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
-            "edit_message_text": ("text", 0, int(telegram.constants.MessageLimit.MAX_TEXT_LENGTH)),
-            "send_audio": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_voice": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_video": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_document": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_animation": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "send_photo": ("caption", 2, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-            "edit_message_caption": ("caption", 3, int(telegram.constants.MessageLimit.CAPTION_LENGTH)),
-        }.get(operation)
+        content_spec = _QUEUED_CONTENT_SPECS.get(operation)
         if content_spec is None:
             return None
         content_key, content_index, content_limit = content_spec
@@ -1579,6 +1618,15 @@ class TelegramBotManager(LocaleMixin):
                     setattr(retry_error, "_etm_telegram_chat_id", error.new_chat_id)
                     raise
 
+        plain_args, plain_kwargs, has_custom_emoji = self._without_custom_emoji(
+            row.operation, telegram_args, telegram_kwargs
+        )
+        if has_custom_emoji and (
+            self._queued_full_content(row.operation, telegram_args, telegram_kwargs) is not None
+            or not self._sender_can_send_custom_emoji(selection)
+        ):
+            # Long content is cut and attached as a file, and the cut could split the tag.
+            telegram_args, telegram_kwargs = plain_args, plain_kwargs
         full_args, full_kwargs = telegram_args, dict(telegram_kwargs)
         content = self._queued_full_content(row.operation, telegram_args, telegram_kwargs)
         if content is not None:
@@ -1629,6 +1677,9 @@ class TelegramBotManager(LocaleMixin):
             if not error.message.lower().startswith("can't parse entities") or "parse_mode" not in telegram_kwargs:
                 raise
             telegram_kwargs.pop("parse_mode")
+            telegram_args, telegram_kwargs, _ = self._without_custom_emoji(
+                row.operation, telegram_args, telegram_kwargs
+            )
             self._rewind_queued_files(telegram_args, telegram_kwargs)
             result = call_method()
         if content is None:
