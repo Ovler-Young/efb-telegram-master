@@ -337,6 +337,26 @@ class HistoryMigrationTarget(BaseModel):
         indexes = ((("slave_chat_id", "target_chat_id", "message_thread_id"), True),)
 
 
+class TopicIconCache(BaseModel):
+    """Custom emoji generated from avatars by earlier releases; existing rows are only read."""
+    avatar_hash = TextField(primary_key=True)
+    custom_emoji_id = TextField()
+    sticker_set_name = TextField()
+    created_at = DateTimeField(default=datetime.datetime.now)
+    updated_at = DateTimeField(default=datetime.datetime.now)
+
+
+class UserEmojiCache(BaseModel):
+    """Custom emoji generated for slave users."""
+    cache_key = TextField(primary_key=True)
+    custom_emoji_id = TextField()
+    sticker_set_name = TextField()
+    created_at = DateTimeField(default=datetime.datetime.now)
+    updated_at = DateTimeField(default=datetime.datetime.now)
+    avatar_hash = TextField(null=True)
+    """Fingerprint of the avatar the emoji was made from; empty for emoji made by earlier releases."""
+
+
 class SlaveChatInfo(BaseModel):
     slave_channel_id = TextField()
     slave_channel_emoji = CharField()
@@ -445,6 +465,7 @@ class DatabaseManager:
         """
         database.create_tables([
             ChatAssoc, MsgLog, MsgLogMember, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
+            UserEmojiCache,
         ])
 
     @staticmethod
@@ -452,6 +473,7 @@ class DatabaseManager:
         """Create tables introduced after the original schema without touching existing data."""
         database.create_tables([
             ChatAssoc, MsgLog, MsgLogMember, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
+            UserEmojiCache,
         ], safe=True)
 
     def _check_and_run_migrations(self):
@@ -462,7 +484,7 @@ class DatabaseManager:
         """
         migrator = self._migrator_cls(database.obj)
         schema = current_schema(database.obj)
-        for model in (MsgLog, SlaveChatInfo, HistoryMigrationEntry):
+        for model in (MsgLog, SlaveChatInfo, HistoryMigrationEntry, UserEmojiCache):
             columns = {column.name for column in database.get_columns(model._meta.table_name, schema=schema)}
             for field in model._meta.sorted_fields:
                 if field.null and field.column_name not in columns:
@@ -520,6 +542,70 @@ class DatabaseManager:
                 task_count,
                 state_summary,
             )
+
+    def read_custom_emoji_rows(self) -> dict[str, list[tuple[str, str, object, str | None, str | None]]]:
+        """Read every ``(key, custom_emoji_id, updated_at, sticker_set_name, avatar_hash)`` row of the emoji tables.
+
+        Missing tables, and tables that lack the expected columns (logged once
+        as a warning), yield an empty list. Timestamps are returned as stored
+        (datetime, text or ``None``); the set name is ``None`` when the table has
+        no such column, and the avatar fingerprint is ``None`` except in
+        ``useremojicache``. Not on the metrics label allow-list: it runs once at startup.
+        """
+        with connection_scope(self._managed_database):
+            schema = current_schema(database.obj)
+            present = set(database.get_tables(schema=schema))
+            rows: dict[str, list[tuple[str, str, object, str | None, str | None]]] = {}
+            for model, key_column in ((TopicIconCache, "avatar_hash"), (UserEmojiCache, "cache_key")):
+                table = model._meta.table_name
+                rows[table] = []
+                if table not in present:
+                    continue
+                columns = {column.name for column in database.get_columns(table, schema=schema)}
+                if not {key_column, "custom_emoji_id", "updated_at"} <= columns:
+                    self.logger.warning(
+                        "Table %s does not have the expected emoji cache columns; ignoring its rows.", table)
+                    continue
+                set_name = "sticker_set_name" if "sticker_set_name" in columns else "NULL"
+                # In topiciconcache the key column itself is called avatar_hash.
+                avatar_hash = "avatar_hash" if model is UserEmojiCache and "avatar_hash" in columns else "NULL"
+                rows[table] = [
+                    tuple(row) for row in database.execute_sql(
+                        f"SELECT {key_column}, custom_emoji_id, updated_at, {set_name}, {avatar_hash} "
+                        f"FROM {table}").fetchall()
+                ]
+            return rows
+
+    def add_user_emoji_cache(self, cache_key: str, custom_emoji_id: str, sticker_set_name: str,
+                             avatar_hash: str | None) -> tuple[str, str | None, str | None]:
+        """Record a new user emoji and return the ``(id, set name, avatar fingerprint)`` now stored for ``cache_key``.
+
+        An existing row is never modified: its values are returned unchanged.
+        """
+        with connection_scope(self._managed_database):
+            now = datetime.datetime.now()
+            UserEmojiCache.insert(
+                cache_key=cache_key, custom_emoji_id=custom_emoji_id, sticker_set_name=sticker_set_name,
+                created_at=now, updated_at=now, avatar_hash=avatar_hash,
+            ).on_conflict_ignore().execute()
+            row = UserEmojiCache.get(UserEmojiCache.cache_key == cache_key)
+            return row.custom_emoji_id, row.sticker_set_name, row.avatar_hash
+
+    def replace_user_emoji_cache(self, cache_key: str, custom_emoji_id: str, sticker_set_name: str,
+                                 avatar_hash: str) -> None:
+        """Point ``cache_key`` at the emoji made from a changed avatar, adding the row if there is none."""
+        with connection_scope(self._managed_database):
+            now = datetime.datetime.now()
+            UserEmojiCache.insert(
+                cache_key=cache_key, custom_emoji_id=custom_emoji_id, sticker_set_name=sticker_set_name,
+                created_at=now, updated_at=now, avatar_hash=avatar_hash,
+            ).on_conflict(
+                conflict_target=[UserEmojiCache.cache_key],
+                update={UserEmojiCache.custom_emoji_id: custom_emoji_id,
+                        UserEmojiCache.sticker_set_name: sticker_set_name,
+                        UserEmojiCache.avatar_hash: avatar_hash,
+                        UserEmojiCache.updated_at: now},
+            ).execute()
 
     @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,

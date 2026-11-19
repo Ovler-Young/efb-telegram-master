@@ -4,6 +4,7 @@ import copy
 import datetime
 import html
 import pickle
+from collections.abc import Callable
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 from typing import List, NamedTuple, Optional, Tuple, TypedDict
@@ -12,8 +13,11 @@ from ehforwarderbot.chat import Chat, SelfChatMember
 from telegram.constants import MessageLimit
 
 from . import queued_log
+from .custom_emoji import AuthorEmojiHeader, UserEmoji
 from .message import ETMMsg
-from .utils import DEFAULT_TIMEZONE, chat_id_to_str, format_message_time, removed_text
+from .utils import (
+    DEFAULT_TIMEZONE, EFBChannelChatIDStr, chat_id_str_to_id, chat_id_to_str, format_message_time, removed_text,
+)
 
 
 class SourceReply(TypedDict):
@@ -235,11 +239,30 @@ def _body_html(message: ETMMsg, admin_id: Optional[int], self_mentions: List[Tup
     return "".join(parts)
 
 
+def _author_html(header: str, member: SourceMember,
+                 author_emoji: Callable[[str], UserEmoji | None] | None) -> str:
+    """The author header as HTML, with the author's custom emoji where the header shows its fallback emoji.
+
+    The header got the fallback emoji when the source was received, if the author's emoji was ready then.
+    """
+    channel_id, chat_uid, _group = chat_id_str_to_id(EFBChannelChatIDStr(member["author_uid"]))
+    emoji = author_emoji(chat_id_to_str(channel_id=channel_id, chat_uid=chat_uid)) if author_emoji else None
+    offset = header.find(f"{emoji.fallback} {member['author_name']}") if emoji else -1
+    if emoji is None or offset < 0:
+        return html.escape(header)
+    return AuthorEmojiHeader(header, emoji, offset).html_with_emoji()
+
+
 def render_members(members: List[SourceMember], *, admin_id: Optional[int] = None,
                    history: bool = False, display_timezone: ZoneInfo = DEFAULT_TIMEZONE,
                    confirmed: Optional[AggregatePayload] = None,
+                   author_emoji: Callable[[str], UserEmoji | None] | None = None,
                    _compact_status: bool = False) -> RenderedAggregate:
-    """Render every real source separately; ranges refer to parsed UTF-16 text."""
+    """Render every real source separately; ranges refer to parsed UTF-16 text.
+
+    ``author_emoji`` looks up an author's custom emoji in memory; the HTML then carries it in that
+    author's header. The text and ranges are the same either way.
+    """
     html_parts: List[str] = []
     text_parts: List[str] = []
     ranges: List[MemberRange] = []
@@ -294,7 +317,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
             else:
                 author_prefix = name if name.endswith(":") else f"{name}:"
                 prefix = f"{author_prefix} {timestamp}\n" if name else f"{timestamp}\n"
-                author_html = f"{html.escape(author_prefix)} " if name else ""
+                author_html = f"{_author_html(author_prefix, member, author_emoji)} " if name else ""
                 prefix_html = author_html + f"<code>{timestamp}</code>\n"
         visible = prefix + reply_text + body
         visible_html = prefix_html + html.escape(reply_text) + body_html
@@ -315,7 +338,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
             len("\n\n".join(text_parts)) > int(MessageLimit.MAX_TEXT_LENGTH) and
             any(member["status"] == MemberStatus.REDIRECTED for member in members)):
         return render_members(members, admin_id=admin_id, display_timezone=display_timezone,
-                              confirmed=confirmed, _compact_status=True)
+                              confirmed=confirmed, author_emoji=author_emoji, _compact_status=True)
     return RenderedAggregate("\n\n".join(html_parts), "\n\n".join(text_parts), ranges)
 
 

@@ -40,6 +40,7 @@ from .chat_binding import ChatBindingManager
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import CommandsManager
+from .custom_emoji import CustomEmojiConfig, CustomEmojiStore, UserEmojiCreator
 from .db import DatabaseManager
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
@@ -128,9 +129,14 @@ class TelegramChannel(MasterChannel):
         # Initialize managers
         self.flag: ExperimentalFlagsManager = ExperimentalFlagsManager(self)
         self.db: DatabaseManager = DatabaseManager(self)
+        self.custom_emoji: CustomEmojiStore = CustomEmojiStore(self.db, CustomEmojiConfig.from_channel_config(self.config))
+        self.custom_emoji.load()
         self.chat_manager: ChatObjectCacheManager = ChatObjectCacheManager(self)
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
         self.bot_manager: TelegramBotManager = TelegramBotManager(self)
+        self.custom_emoji_creator: UserEmojiCreator = UserEmojiCreator(
+            self.custom_emoji, self.bot_manager.build_standalone_bot,
+            self.bot_manager.me.username if self.bot_manager.me else None, self._("ETM user avatars"))
         self.commands: CommandsManager = CommandsManager(self)
         self.aggregation_settings = AggregationSettings(self)
         self.chat_binding: ChatBindingManager = ChatBindingManager(self)
@@ -614,6 +620,7 @@ class TelegramChannel(MasterChannel):
         """
         Message polling process.
         """
+        self.custom_emoji_creator.start()
         self.bot_manager.polling()
 
     def error(self, update: object, context: CallbackContext):
@@ -779,6 +786,7 @@ class TelegramChannel(MasterChannel):
         self._stop_polling_called = True
         self.logger.debug("Gracefully stopping %s (%s).", self.channel_name, self.channel_id)
         self.rpc_utilities.shutdown()
+        self.custom_emoji_creator.stop()
         self.bot_manager.graceful_stop()
         self.master_messages.stop_worker()
         self.db.stop_worker()

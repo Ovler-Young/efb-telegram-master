@@ -250,6 +250,90 @@ Notes:
 - Under heavy rate limiting, some outbound sends may be queued for delayed
   execution; ETM will update message logs once the real Telegram message is
   sent.
+- Auxiliary bots show custom emoji in message headers only when their entry
+  sets ``custom_emoji: true`` (see below).
+
+Optional: Custom emoji for message authors
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In group chats, ETM can put the sender's avatar, turned into a Telegram custom
+emoji, in front of the sender's name in the message header. This is off
+unless the configuration file has a ``user_emoji`` section (not under
+``flags``); add ``user_emoji: {enabled: true}`` to turn it on:
+
+-   ``user_emoji`` *(dict)* [Default: not set, the feature is off]
+
+    - ``enabled`` *(bool)* [Default: ``true`` when the ``user_emoji`` section
+      is present]: set to ``false`` to stop ETM from creating or using
+      generated avatar emoji. Headers then use the plain emoji character,
+      except for users listed in ``custom_emoji_ids``, which are still used.
+    - ``sticker_set_name`` *(str)* [Default: ``etm_user_avatars``]: base name
+      of the custom emoji sticker sets that ETM creates. ETM appends
+      ``_by_<bot username>`` when it is not already there. When a set reaches
+      Telegram's limit of 200 stickers, ETM continues in a new set and adds
+      ``_<n>`` before the ``_by_<bot username>`` part.
+    - ``owner_user_id`` *(int)* [Default: the first user in ``admins``]:
+      Telegram user ID that owns the sticker sets ETM creates.
+    - ``custom_emoji_ids`` *(dict)* [Default: ``{}``]: custom emoji IDs you
+      choose yourself, as a mapping from the remote user, written as
+      ``<slave channel ID> <user ID>``, to a ``custom_emoji_id``. These take
+      precedence over generated emoji.
+
+    .. code:: yaml
+
+       user_emoji:
+           enabled: true
+           sticker_set_name: etm_user_avatars
+           owner_user_id: 102938475
+           custom_emoji_ids:
+               "example.slave_channel user-id": "5368324170671202286"
+
+    To let an auxiliary bot show custom emoji too, opt in on its entry:
+
+    .. code:: yaml
+
+       auxiliary_bots:
+       - token: "111111:AUX_BOT_TOKEN_1"
+         custom_emoji: true
+
+How it behaves:
+
+- Telegram only shows a bot's custom emoji when the bot's owner has Telegram
+  Premium (or the bot has a Fragment username). Messages sent by any other
+  bot show the plain emoji character in the same place, so enabling the
+  feature is harmless. The main bot uses generated emoji whenever the
+  ``user_emoji`` section is present and ``enabled`` is ``true``, and the
+  ``custom_emoji_ids`` you configure either way. An auxiliary bot uses them
+  only with ``custom_emoji: true``, and the setting should be used only for
+  bots whose owner has Premium (or that have a Fragment username).
+- The sticker set owner must have started the bot (send ``/start`` to it
+  once), otherwise Telegram refuses to create the sets.
+  Member rights in the group are enough; no admin rights are needed.
+- Messages never wait for custom emoji. The first message of an author goes
+  out at once with the plain emoji character. In the background ETM downloads
+  the author's avatar and adds it to a sticker set, and later messages from
+  that author use it. If this fails, ETM tries again later, with longer waits
+  after repeated failures.
+- Generated emoji are saved in ETM's database and reused after a restart.
+  Sticker sets that already exist, including those made by earlier ETM
+  versions, are reused.
+- When an author writes, ETM compares their avatar with the one their emoji
+  was made from, in the background: at most once every 7 days per author
+  when the message comes from a group, and at most once a day when it comes
+  from a private chat.
+  If the avatar has changed, ETM makes a new emoji and puts it in place of
+  the old one in its sticker set, so sets do not fill up with old avatars.
+  Messages never wait for this: they use the old emoji until the new one is
+  ready.
+- Emoji made by earlier ETM versions do not record which avatar they show,
+  so each of them is made again once, from the current avatar, the next time
+  its author writes (in the background, like any avatar change). The new
+  emoji takes the old one's place in its sticker set and the old sticker is
+  removed, so earlier messages that used it may then show the plain emoji
+  character. Authors who do not write keep their emoji as it is.
+- The custom emoji is shown in group chats, in messages sent as HTML with
+  short text. Long messages, plain-text sends, keyboards and private chats
+  show the plain header.
 
 Usage
 -----
