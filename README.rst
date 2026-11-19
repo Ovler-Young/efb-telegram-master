@@ -298,13 +298,14 @@ file (not under ``flags``):
 
 How it behaves:
 
-- Telegram only shows a bot's custom emoji when the bot was created by a
-  Telegram Premium account. Messages sent by any other bot show the plain
-  emoji character in the same place, so enabling the feature is harmless.
-  The main bot uses generated emoji whenever ``enabled`` is ``true``, and
-  the ``custom_emoji_ids`` you configure either way. An auxiliary bot uses
-  them only with ``custom_emoji: true``, and the setting should be used only
-  for bots created by a Premium account.
+- Telegram only shows a bot's custom emoji when the bot's owner has Telegram
+  Premium (or the bot has a Fragment username). Messages sent by any other
+  bot show the plain emoji character in the same place, so enabling the
+  feature is harmless. The main bot uses generated emoji whenever ``enabled``
+  is ``true``, and the ``custom_emoji_ids`` you configure either way. An
+  auxiliary bot uses them only with ``custom_emoji: true``, and the setting
+  should be used only for bots whose owner has Premium (or that have a
+  Fragment username).
 - The sticker set owner must have started the bot (send ``/start`` to it
   once), otherwise Telegram refuses to create the sets.
   Member rights in the group are enough; no admin rights are needed.
