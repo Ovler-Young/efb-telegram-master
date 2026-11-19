@@ -146,9 +146,11 @@ removal edit of a confirmed standalone message) or `boundary`. Updating the
 rows behind a confirmed one (setting their container, owner or base) changes
 data, not their state.
 
-Older rows keep loading: contexts without `appendable`, `generation`, `recent`,
-`container_id` or `routing_hint` read the defaults, and a frozen removal stored
-as `delete_message` is rebuilt as an edit.
+Older rows keep loading: contexts without `appendable`, `container_id` or
+`routing_hint` read the defaults, and a frozen removal stored as
+`delete_message` is rebuilt as an edit. `generation` and `recent` have no
+default: every stored batch carries them, and a batch row without them stops
+the outbound worker at its first attempt.
 
 ### When a row is in a state its event does not accept
 
