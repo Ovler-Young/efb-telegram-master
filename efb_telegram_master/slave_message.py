@@ -1591,11 +1591,11 @@ class SlaveMessageProcessor(LocaleMixin):
         """
         store = self.channel.custom_emoji
         author = msg.author
-        if not store.config.enabled or isinstance(author, SelfChatMember) or author == getattr(msg.chat, "self", None):
+        if isinstance(author, SelfChatMember) or author == getattr(msg.chat, "self", None):
             return None
         uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
         found = store.lookup(uid)
-        if found is None:
+        if found is None and store.config.enabled:
             self.channel.custom_emoji_creator.request(uid, lambda: self._load_author_avatar(author))
         return found
 

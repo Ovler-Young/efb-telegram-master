@@ -88,11 +88,11 @@ def author_uid(author):
     return utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
 
 
-def make_store(profile, rows=(), *, enabled=True):  # noqa: F811
+def make_store(profile, rows=(), *, enabled=True, custom_emoji_ids=None):  # noqa: F811
     directory, open_manager = profile
     write_legacy_tables(directory, [], list(rows))
     store = CustomEmojiStore(open_manager(), CustomEmojiConfig.from_channel_config(
-        {"user_emoji": {"enabled": enabled}, "auxiliary_bots": [{"token": "t", "custom_emoji": True}]}))
+        {"user_emoji": {"enabled": enabled, "custom_emoji_ids": custom_emoji_ids or {}}, "auxiliary_bots": [{"token": "t", "custom_emoji": True}]}))
     store.load()
     return store
 
@@ -356,6 +356,27 @@ def test_disabled_feature_leaves_headers_as_they_were(profile, author, author_ui
     assert type(full) is str
     assert full == f"{author.chat.channel_emoji}{'👥'} {author.long_name} [{author.chat.long_name}]:"
     processor.channel.custom_emoji_creator.request.assert_not_called()
+
+
+def test_disabled_feature_still_uses_configured_ids_and_creates_nothing(
+        profile, tmp_path, author, author_uid):  # noqa: F811
+    other = next(member for member in author.chat.members if member.uid not in ("__self__", author.uid))
+    store = make_store(profile, [saved_row(author_uid, "5001")], enabled=False,
+                       custom_emoji_ids={author_uid: "9001"})
+    processor, _ = make_processor(store)
+
+    configured = processor.generate_message_template(Message(chat=author.chat, author=author), True)
+    unconfigured = processor.generate_message_template(Message(chat=other.chat, author=other), True)
+
+    assert isinstance(configured, AuthorEmojiHeader) and configured.emoji.custom_emoji_id == "9001"
+    assert type(unconfigured) is str
+    processor.channel.custom_emoji_creator.request.assert_not_called()
+
+    manager = make_manager(tmp_path, store)
+    row, args, kwargs = enqueue(manager, "hi", configured)
+    sender = FakeSender()
+    manager.execute_queued_call(row, args, kwargs, SenderSelection(sender, None))
+    assert TAG.format("9001", configured.emoji.fallback) in sent_text(sender)
 
 
 def test_auxiliary_bot_may_send_custom_emoji_only_when_its_entry_opts_in(monkeypatch):

@@ -4,6 +4,7 @@ Runs only when ``ETM_TEST_PREMIUM_BOT`` is set, with ``TOKEN`` of such a bot, an
 It creates a sticker set owned by ``ADMINS[0]`` and deletes it afterwards.
 """
 import asyncio
+import io
 import os
 import uuid
 
@@ -51,7 +52,8 @@ async def test_author_custom_emoji_appears_after_it_is_created(helper, slave, ch
     uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
 
     def member_picture(_member):
-        return open("tests/mocks/A.png", "rb")
+        with open("tests/mocks/A.png", "rb") as picture:
+            return io.BytesIO(picture.read())
 
     monkeypatch.setattr(slave, "get_chat_member_picture", member_picture, raising=False)
 

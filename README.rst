@@ -262,9 +262,10 @@ file (not under ``flags``):
 
 -   ``user_emoji`` *(dict)* [Default: ``{}``]
 
-    - ``enabled`` *(bool)* [Default: ``true``]: set to ``false`` to turn the
-      feature off completely: headers use the plain emoji character, and
-      ``custom_emoji_ids`` is not used either.
+    - ``enabled`` *(bool)* [Default: ``true``]: set to ``false`` to stop
+      ETM from creating or using generated avatar emoji. Headers then use the
+      plain emoji character, except for users listed in ``custom_emoji_ids``,
+      which are still used.
     - ``sticker_set_name`` *(str)* [Default: ``etm_user_avatars``]: base name
       of the custom emoji sticker sets that ETM creates. ETM appends
       ``_by_<bot username>`` when it is not already there. When a set reaches

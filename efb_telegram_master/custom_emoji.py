@@ -205,7 +205,8 @@ class CustomEmojiStore:
                     candidate = (3, -_timestamp(updated_at), emoji_id)
                 if current is None or candidate[:2] < current[:2]:
                     best[uid] = candidate
-        index = {uid: emoji_id for uid, (_, _, emoji_id) in best.items()}
+        # Turned off, only the ids written in the configuration are used.
+        index = {uid: emoji_id for uid, (_, _, emoji_id) in best.items()} if self.config.enabled else {}
         index.update(self.config.custom_emoji_ids)
         self._index = index
         self.sticker_set_names = frozenset(set_names)

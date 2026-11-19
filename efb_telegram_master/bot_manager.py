@@ -1520,9 +1520,9 @@ class TelegramBotManager(LocaleMixin):
         return args, {**kwargs, content_key: plain}, True
 
     def _sender_can_send_custom_emoji(self, selection: SenderSelection) -> bool:
-        """The main bot may when ``user_emoji`` is enabled; an auxiliary bot only when its entry opts in."""
+        """The main bot always may; an auxiliary bot only when its entry opts in."""
         if selection.sender_bot_id is None:
-            return self.channel.custom_emoji.config.enabled
+            return True
         return selection.sender_bot_id in self._custom_emoji_auxiliary_ids
 
     @staticmethod
