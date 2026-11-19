@@ -12,7 +12,7 @@ import httpx
 import pytest
 from telethon.tl.types import MessageEntityCustomEmoji
 
-from efb_telegram_master import utils
+from efb_telegram_master import custom_emoji, utils
 
 from ..conftest import build_channel_config, load_test_coordinator
 from .helper.filters import in_chats, regex
@@ -83,3 +83,57 @@ async def test_author_custom_emoji_appears_after_it_is_created(helper, slave, ch
         assert third.text in combined.raw_text
         entities = custom_emoji_entities(combined)
         assert [(entity.offset, entity.document_id) for entity in entities] == [(0, int(created.custom_emoji_id))]
+
+
+async def test_author_custom_emoji_is_replaced_when_the_avatar_changes(
+        helper, slave, channel, bot_group, bot_token, monkeypatch):
+    chat = slave.group
+    author = [member for member in chat.members if member.uid != chat.self.uid][2]
+    uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
+    avatar = {"path": "tests/mocks/A.png"}
+
+    def member_picture(_member):
+        with open(avatar["path"], "rb") as picture:
+            return io.BytesIO(picture.read())
+
+    monkeypatch.setattr(slave, "get_chat_member_picture", member_picture, raising=False)
+    monkeypatch.setattr(custom_emoji, "AVATAR_RECHECK_INTERVAL", 0.01)
+
+    def sticker_set_ids(set_name):
+        reply = httpx.post(f"https://api.telegram.org/bot{bot_token}/getStickerSet",
+                           data={"name": set_name}, timeout=60).json()
+        return [sticker.get("custom_emoji_id") for sticker in reply["result"]["stickers"]]
+
+    with link_chats(channel, (chat,), bot_group):
+        first = slave.send_text_message(chat=chat, author=author)
+        await helper.wait_for_message(in_chats(bot_group) & regex(first.text))
+        for _ in range(60):
+            created = channel.custom_emoji.lookup(uid)
+            if created is not None:
+                break
+            await asyncio.sleep(1)
+        assert created is not None, "the author's custom emoji was not created in time"
+        set_name = channel.custom_emoji.saved(uid).sticker_set_name
+        assert created.custom_emoji_id in sticker_set_ids(set_name)
+
+        avatar["path"] = "tests/mocks/B.png"
+
+        # The message that follows the change is sent at once with the emoji that exists.
+        second = slave.send_text_message(chat=chat, author=author)
+        second_tg = await helper.wait_for_message(in_chats(bot_group) & regex(second.text))
+        assert [entity.document_id for entity in custom_emoji_entities(second_tg)] == [int(created.custom_emoji_id)]
+
+        for _ in range(90):
+            replaced = channel.custom_emoji.lookup(uid)
+            if replaced is not None and replaced.custom_emoji_id != created.custom_emoji_id:
+                break
+            await asyncio.sleep(1)
+        assert replaced.custom_emoji_id != created.custom_emoji_id, "the author's custom emoji was not replaced in time"
+
+        third = slave.send_text_message(chat=chat, author=author)
+        third_tg = await helper.wait_for_message(in_chats(bot_group) & regex(third.text))
+        assert [entity.document_id for entity in custom_emoji_entities(third_tg)] == [int(replaced.custom_emoji_id)]
+
+        ids = sticker_set_ids(set_name)
+        assert replaced.custom_emoji_id in ids
+        assert created.custom_emoji_id not in ids
