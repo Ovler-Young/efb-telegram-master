@@ -339,7 +339,7 @@ FEATURE_MACHINE: StateMachine[FeatureState, FeatureEvent] = StateMachine("user e
 
 class StickerSetState(Enum):
     UNKNOWN = "unknown"
-    """The current set has not been looked up in this session."""
+    """The current set has not been looked up in this session, or a write to it failed for an unclear reason."""
     OPEN = "open"
     """The current set has room, or does not exist yet and is created by the next upload."""
     FULL = "full"
@@ -350,6 +350,8 @@ class StickerSetEvent(Enum):
     OPENED = "opened"
     ADDED = "added"
     FILLED = "filled"
+    WRITE_FAILED = "write failed"
+    """A write failed for a reason other than a full set; the set may exist or be gone despite the cached view."""
     BROKEN = "broken"
 
 
@@ -359,6 +361,7 @@ STICKER_SET_MACHINE: StateMachine[StickerSetState, StickerSetEvent] = StateMachi
     (StickerSetState.UNKNOWN, StickerSetEvent.BROKEN): StickerSetState.ERROR,
     (StickerSetState.OPEN, StickerSetEvent.ADDED): StickerSetState.OPEN,
     (StickerSetState.OPEN, StickerSetEvent.FILLED): StickerSetState.FULL,
+    (StickerSetState.OPEN, StickerSetEvent.WRITE_FAILED): StickerSetState.UNKNOWN,
     (StickerSetState.OPEN, StickerSetEvent.BROKEN): StickerSetState.ERROR,
     (StickerSetState.FULL, StickerSetEvent.OPENED): StickerSetState.OPEN,
     (StickerSetState.FULL, StickerSetEvent.FILLED): StickerSetState.FULL,
@@ -620,12 +623,14 @@ class UserEmojiCreator:
                         user_id=owner, name=name, title=self._title, stickers=[sticker],
                         sticker_type=Sticker.CUSTOM_EMOJI))
                     self._set_exists = True
-            except BadRequest as error:
-                if any(marker in _error_text(error) for marker in _SET_FULL_MARKERS):
+            except TelegramError as error:
+                if isinstance(error, BadRequest) and any(
+                        marker in _error_text(error) for marker in _SET_FULL_MARKERS):
                     self._move_set(StickerSetEvent.FILLED)
                     continue
-                self._telegram_failed(error)
-            except TelegramError as error:
+                # A lost reply may hide a set that now exists, and a set may be deleted behind
+                # our back: look the set up again before the next write.
+                self._move_set(StickerSetEvent.WRITE_FAILED)
                 self._telegram_failed(error)
             sticker_set = self._read_set(name)
             if not sticker_set.stickers or not sticker_set.stickers[-1].custom_emoji_id:

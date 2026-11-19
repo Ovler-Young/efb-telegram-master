@@ -55,6 +55,7 @@ class FakeBotApi:
         self.files: list[bytes] = []
         self.full_on_add: set[str] = set()
         self.errors: dict[str, str] = {}
+        self.lose_reply: set[str] = set()
         self._next_id = 9000
         self._lock = threading.Lock()
         api = self
@@ -99,29 +100,36 @@ class FakeBotApi:
             self.files.extend(files.values())
             if method in self.errors:
                 return 400, {"ok": False, "error_code": 400, "description": self.errors[method]}
-            name = params.get("name")
-            if method == "getStickerSet":
-                if name not in self.sets:
-                    return 400, {"ok": False, "error_code": 400, "description": "Bad Request: STICKERSET_INVALID"}
-                return 200, {"ok": True, "result": {
-                    "name": name, "title": "t", "sticker_type": "custom_emoji",
-                    "stickers": [{"file_id": i, "file_unique_id": i, "type": "custom_emoji", "width": 100,
-                                  "height": 100, "is_animated": False, "is_video": False, "custom_emoji_id": i}
-                                 for i in self.sets[name]]}}
-            if method == "createNewStickerSet":
-                if name in self.sets:
-                    return 400, {"ok": False, "error_code": 400,
-                                 "description": "Bad Request: sticker set name is already occupied"}
-                self.sets[name] = [self._new_id()]
-                return 200, {"ok": True, "result": True}
-            if method == "addStickerToSet":
-                if name not in self.sets:
-                    return 400, {"ok": False, "error_code": 400, "description": "Bad Request: STICKERSET_INVALID"}
-                if name in self.full_on_add or len(self.sets[name]) >= 200:
-                    return 400, {"ok": False, "error_code": 400, "description": "Bad Request: STICKERS_TOO_MUCH"}
-                self.sets[name].append(self._new_id())
-                return 200, {"ok": True, "result": True}
-            return 404, {"ok": False, "error_code": 404, "description": "Not Found"}
+            if method in self.lose_reply:  # the call takes effect, but the client sees a server error
+                self.lose_reply.discard(method)
+                self._apply(method, params)
+                return 500, {"ok": False, "error_code": 500, "description": "Internal Server Error"}
+            return self._apply(method, params)
+
+    def _apply(self, method, params):
+        name = params.get("name")
+        if method == "getStickerSet":
+            if name not in self.sets:
+                return 400, {"ok": False, "error_code": 400, "description": "Bad Request: STICKERSET_INVALID"}
+            return 200, {"ok": True, "result": {
+                "name": name, "title": "t", "sticker_type": "custom_emoji",
+                "stickers": [{"file_id": i, "file_unique_id": i, "type": "custom_emoji", "width": 100,
+                              "height": 100, "is_animated": False, "is_video": False, "custom_emoji_id": i}
+                             for i in self.sets[name]]}}
+        if method == "createNewStickerSet":
+            if name in self.sets:
+                return 400, {"ok": False, "error_code": 400,
+                             "description": "Bad Request: sticker set name is already occupied"}
+            self.sets[name] = [self._new_id()]
+            return 200, {"ok": True, "result": True}
+        if method == "addStickerToSet":
+            if name not in self.sets:
+                return 400, {"ok": False, "error_code": 400, "description": "Bad Request: STICKERSET_INVALID"}
+            if name in self.full_on_add or len(self.sets[name]) >= 200:
+                return 400, {"ok": False, "error_code": 400, "description": "Bad Request: STICKERS_TOO_MUCH"}
+            self.sets[name].append(self._new_id())
+            return 200, {"ok": True, "result": True}
+        return 404, {"ok": False, "error_code": 404, "description": "Not Found"}
 
     def _new_id(self):
         self._next_id += 1
@@ -286,6 +294,23 @@ def test_failed_look_up_of_the_next_set_does_not_skip_it(make_creator, api, prof
     rows = saved_rows(directory)
     assert creator.author_state("ben") is AuthorEmojiState.FAILED
     assert (rows["member-user:ann"][1], rows["member-user:cid"][1]) == (SET_6, SET_7)
+
+
+def test_lost_reply_to_set_creation_does_not_block_later_authors(make_creator, api, profile):  # noqa: F811
+    directory, _ = profile
+    api.lose_reply.add("createNewStickerSet")
+    _, creator = make_creator(legacy_rows(1))
+    creator.start()
+    creator.request("ivy", avatar)
+    wait_until(settled(creator, ["ivy"]))
+    creator.request("jon", avatar)
+    wait_until(settled(creator, ["jon"]))
+
+    assert creator.author_state("ivy") is AuthorEmojiState.FAILED
+    assert creator.author_state("jon") is AuthorEmojiState.READY
+    assert saved_rows(directory)["member-user:jon"] == (api.sets[SET_6][1], SET_6)
+    assert api.methods() == [("getStickerSet", SET_6), ("createNewStickerSet", SET_6), ("getStickerSet", SET_6),
+                             ("addStickerToSet", SET_6), ("getStickerSet", SET_6)]
 
 
 def test_failed_author_waits_for_its_retry_time(make_creator, api):
