@@ -481,6 +481,7 @@ class UserEmojiCreator:
         self._lock = threading.Lock()
         self._wakeup = threading.Condition(self._lock)
         self._stopping = threading.Event()
+        self._left_behind = False
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bot: telegram.Bot | None = None
@@ -547,6 +548,7 @@ class UserEmojiCreator:
             return
         thread.join(JOIN_TIMEOUT)
         if thread.is_alive():
+            self._left_behind = True
             logger.warning("Custom emoji worker did not stop within %.1f s; leaving it behind.", JOIN_TIMEOUT)
 
     # -- worker ------------------------------------------------------------
@@ -712,8 +714,8 @@ class UserEmojiCreator:
     def _save(self, uid: str, author: _Author) -> None:
         assert author.unsaved is not None
         custom_emoji_id, set_name = author.unsaved
-        if self._stopping.is_set():
-            raise _AuthorFailed("stopping")  # the database may be closed by now
+        if self._left_behind:
+            raise _AuthorFailed("stopping")  # stop gave up waiting, so the database may be closed
         try:
             self._store.record(uid, custom_emoji_id, set_name)
         except Exception as error:
@@ -729,16 +731,10 @@ class UserEmojiCreator:
 
     def _fail(self, uid: str, author: _Author, reason: str, retry_after: float = 0.0) -> None:
         with self._lock:
-            now = time.monotonic()
             author.failures += 1
             delay = min(RETRY_BASE * 2 ** (author.failures - 1), RETRY_CAP)
-            author.retry_at = now + max(delay, retry_after)
+            author.retry_at = time.monotonic() + max(delay, retry_after)
             self._move_author(uid, author, AuthorEmojiEvent.FAILED)
-            # Failed authors whose wait is over start afresh on their next request, unless an
-            # uploaded emoji still has to be saved.
-            self._authors = {name: other for name, other in self._authors.items()
-                             if other.state is not AuthorEmojiState.FAILED or other.retry_at > now
-                             or other.unsaved is not None}
         logger.debug("No custom emoji for %s (attempt %d, next try in %.0f s): %s",
                      uid, author.failures, max(delay, retry_after), reason)
 

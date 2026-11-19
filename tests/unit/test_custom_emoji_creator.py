@@ -406,3 +406,25 @@ def test_stop_returns_within_its_bound_with_jobs_queued(make_creator, api):
 
     assert time.monotonic() - started < 1.0
     assert not creator._thread.is_alive()
+
+
+def test_upload_in_flight_when_stopping_is_still_saved(make_creator, api, profile):  # noqa: F811
+    directory, _ = profile
+    api.sets[SET_6] = ["s0"]
+    answer = api.answer
+    uploading = threading.Event()
+
+    def slow_answer(method, params, files):
+        if method == "addStickerToSet":
+            uploading.set()
+            time.sleep(0.3)
+        return answer(method, params, files)
+
+    api.answer = slow_answer
+    _, creator = make_creator(legacy_rows(1))
+    creator.start()
+    creator.request("zed", avatar)
+    assert uploading.wait(10)
+    creator.stop()
+
+    assert saved_rows(directory)["member-user:zed"] == ("9001", SET_6)
