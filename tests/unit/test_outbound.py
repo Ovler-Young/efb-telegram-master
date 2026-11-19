@@ -989,6 +989,9 @@ class Adapter:
     def reopen_aggregation(self, row):
         pass
 
+    def finish_discarded_delivery(self, row):
+        pass
+
 
 class DurableAdapter(Adapter):
     def __init__(self, reconcile: bool) -> None:

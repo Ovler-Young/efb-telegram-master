@@ -275,6 +275,9 @@ class RecordingAdapter:
         self.successes.append((row, result))
         return CompletionDecision("success")
 
+    def finish_discarded_delivery(self, row) -> None:
+        pass
+
 
 @pytest.fixture
 def retained_queue(tmp_path: Path) -> OutboundQueue:

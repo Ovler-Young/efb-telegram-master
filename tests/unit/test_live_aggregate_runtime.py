@@ -13,7 +13,7 @@ from telegram import Chat, Message
 from telegram.error import BadRequest, NetworkError, RetryAfter
 
 from efb_telegram_master.aggregate import make_source_member
-from efb_telegram_master.bot_manager import TelegramBotManager
+from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.live_aggregate import LiveTextAggregation
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest, SenderSelection, SenderSelectionResult
@@ -399,3 +399,32 @@ def test_incoming_boundary_while_first_send_in_flight_cannot_reopen(runtime):
     append(manager, "third", 9)
     complete(manager)
     assert [call[0] for call in manager.transport.calls] == ["send_message"] * 3
+
+
+@pytest.mark.parametrize("branch", ["sender_unavailable", "external_media_missing"])
+def test_row_discarded_at_dispatch_finishes_its_source_delivery(runtime, tmp_path, branch):
+    manager = runtime
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    finished = []
+    on_complete = lambda: finished.append(True)
+    if branch == "sender_unavailable":
+        request = QueueRequest("send_message", (), {"chat_id": -100, "text": "plain", "_send_mode": "eventual"})
+        manager.select_sender = lambda row, now: SenderSelectionResult(terminal_error_class="BotRemoved")
+    else:
+        media = tmp_path / "temporary.bin"
+        media.write_bytes(b"temporary media")
+        manager.transport.send_document = lambda chat_id, document, **kwargs: None
+        request = QueueRequest("send_document", (-100, media.as_uri()), {}, cleanup_files=(str(media),))
+    row_id, waiter = manager._enqueue_requests(
+        [request], db_log_context=QueuedDbLogContext(source("plain", "body"), None, on_complete))
+    row_id = int(row_id)
+    if branch == "external_media_missing":
+        media.unlink()
+    assert list(manager._queued_completion_callbacks) == [row_id]
+
+    scheduler.dispatch_once()
+
+    assert not queue.contains(row_id)
+    assert waiter.done() and waiter.exception() is not None
+    assert finished == [True]
+    assert manager._queued_completion_callbacks == {}

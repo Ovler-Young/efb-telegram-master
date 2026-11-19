@@ -2001,6 +2001,10 @@ class TelegramBotManager(LocaleMixin):
     def reopen_aggregation(self, row) -> None:
         self.live_aggregation.reopen(row)
 
+    def finish_discarded_delivery(self, row) -> None:
+        """Finish the source delivery of a row discarded before it reached Telegram."""
+        self._run_database_update_callback(self._pop_queued_completion_callback(row.id))
+
     def record_queued_retry_after(
         self, row, error: telegram.error.RetryAfter, selection: SenderSelection
     ) -> None:

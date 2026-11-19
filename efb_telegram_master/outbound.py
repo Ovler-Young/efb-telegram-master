@@ -580,6 +580,9 @@ class QueueAdapter(Protocol):
     def reopen_aggregation(self, row: QueuedCall) -> None:
         ...
 
+    def finish_discarded_delivery(self, row: QueuedCall) -> None:
+        ...
+
     def execute_queued_call(
         self, row: QueuedCall, args: tuple, kwargs: dict, selection: SenderSelection
     ) -> object:
@@ -3594,6 +3597,7 @@ class OutboundQueueScheduler:
                         unavailable_error = RequiredSenderUnavailableError(decision.terminal_error_class)
                         self._record_terminal_completion(row, None, "failure")
                         self.queue.fail_waiter(row.id, unavailable_error)
+                        self.adapter.finish_discarded_delivery(row)
                         continue
                     if decision.selection is None:
                         self._record_dispatch("deferred")
@@ -3637,6 +3641,7 @@ class OutboundQueueScheduler:
                             lambda metrics: metrics.record_failure(row.priority, row.operation, "terminal")
                         )
                         self.queue.fail_waiter(row.id, error)
+                        self.adapter.finish_discarded_delivery(row)
                         continue
                     except InvalidQueuedPayloadError as error:
                         try:
