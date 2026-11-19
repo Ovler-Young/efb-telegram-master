@@ -47,7 +47,9 @@ from ehforwarderbot.types import ModuleID, ChatID, MessageID, ReactionName
 from .chat_object_cache import ChatObjectCacheManager
 from .message import ETMMsg
 from .msg_type import TGMsgType
-from .aggregate import AggregatePayload, SourceMember, member_identity, member_message
+from .aggregate import (
+    AggregatePayload, MemberEvent, MemberStatus, SourceMember, apply_member_event, member_identity, member_message,
+)
 from .utils import TelegramChatID, EFBChannelChatIDStr, TgChatMsgIDStr, message_id_to_str, \
     chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID, message_id_str_to_id
 
@@ -911,14 +913,9 @@ class DatabaseManager:
                     raise ValueError("Confirmed live members cannot disappear from a container.")
                 for index, member in enumerate(saved["children"]):
                     old = previous_members.get(member_identity(member))
-                    if old and (old["source_revision"] > member["source_revision"] or
-                                (old["source_revision"] == member["source_revision"] and
-                                 old["status"] != "active")):
-                        saved["children"][index] = copy.deepcopy(old)
-                    elif old and old["status"] == "redirected":
-                        # Confirmed replacement routing survives every container receipt.
-                        member["status"] = "redirected"
-                        member["replacement_master_msg_id"] = old["replacement_master_msg_id"]
+                    if old:
+                        # Newer saved routing and removals survive an older receipt snapshot.
+                        saved["children"][index] = apply_member_event(old, MemberEvent.RECEIPT, member).member
             first = saved["children"][0]
             if row is None:
                 self.add_or_update_message_log(member_message(first), master_message, sender_bot_id=sender_bot_id)
@@ -950,7 +947,9 @@ class DatabaseManager:
             row = self._locked_message_log(master_id, include_alt=True)
             if row is None and old_message_id:
                 row = self._locked_message_log(str(message_id_to_str(*old_message_id)), include_alt=True)
-            if row and row.source_member and row.source_member["source_revision"] >= member["source_revision"]:
+            saved_member = apply_member_event(row.source_member if row else None, MemberEvent.SOURCE_RECEIPT, member)
+            if not saved_member.changed:
+                assert row is not None
                 return row
             if row is not None:
                 old_message_id = message_id_str_to_id(TgChatMsgIDStr(row.master_msg_id))
@@ -960,7 +959,7 @@ class DatabaseManager:
                 row = self._locked_message_log(str(message_id_to_str(*old_message_id)), include_alt=True)
             assert row is not None
             misc = pickle.loads(bytes(row.pickle)) if row.pickle else {}
-            misc["source_member"] = copy.deepcopy(member)
+            misc["source_member"] = saved_member.member
             row.pickle = pickle.dumps(misc, protocol=5)
             topic = getattr(master_message, "message_thread_id", None)
             if topic is not None:
@@ -982,17 +981,14 @@ class DatabaseManager:
                              if member_identity(child) == member_identity(member)), None)
             if previous is None:
                 raise ValueError("The source member does not belong to this container.")
-            if previous["source_revision"] > member["source_revision"] or (
-                    previous["source_revision"] == member["source_revision"] and previous["status"] == "removed"):
-                raise ValueError("A stale receipt cannot redirect a newer source version.")
-            if previous["status"] == "redirected" and previous["source_revision"] >= member["source_revision"]:
+            change = apply_member_event(previous, MemberEvent.REDIRECT, member)
+            if not change.changed:
                 replacement = self.get_msg_log(master_msg_id=previous["replacement_master_msg_id"])
                 if replacement is None:
                     raise ValueError("The confirmed replacement is missing.")
                 return replacement
             replacement = self.finalize_source_message(msg, master_message, member, sender_bot_id)
-            redirected = copy.deepcopy(member)
-            redirected["status"] = "redirected"
+            redirected = change.member
             redirected["replacement_master_msg_id"] = replacement.master_msg_id
             aggregate["children"] = [redirected if member_identity(child) == member_identity(member) else child
                                      for child in aggregate["children"]]
@@ -1043,7 +1039,7 @@ class DatabaseManager:
             if aggregate:
                 member = next((child for child in aggregate["children"]
                                if member_identity(child) == (slave_origin_uid, slave_msg_id)), None)
-                if member is None or member["status"] == "redirected":
+                if member is None or member["status"] == MemberStatus.REDIRECTED:
                     continue
             else:
                 member = row.source_member

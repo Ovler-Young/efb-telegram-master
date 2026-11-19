@@ -12,7 +12,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
-from .aggregate import aggregate_fits, make_aggregate, member_identity, member_message, render_members
+from .aggregate import (
+    MemberEvent, MemberStatus, aggregate_fits, apply_member_event, make_aggregate, member_identity, member_message,
+    render_members,
+)
 from .outbound import QueueRequest
 from .queued_log import decode_aggregation, encode_aggregation
 from .utils import removal_edit
@@ -314,7 +317,7 @@ class LiveTextAggregation:
 
     def materialize(self, row, selection):
         context = decode_aggregation(row.log_context) if row.log_context else None
-        if context and context["kind"] in {"source", "redirect"} and context["member"]["status"] == "removed":
+        if context and context["kind"] in {"source", "redirect"} and context["member"]["status"] == MemberStatus.REMOVED:
             member = context["member"]
             resolved = self.manager.channel.db.resolve_source_member(*member_identity(member),
                 str(context["key"][1]), context["key"][2])
@@ -371,10 +374,7 @@ class LiveTextAggregation:
             for index, previous in enumerate(children):
                 update = updates.get(member_identity(previous))
                 if update and update["source_revision"] > previous["source_revision"]:
-                    children[index] = copy.deepcopy(update)
-                    if previous["status"] == "redirected":
-                        children[index]["status"] = "redirected"
-                        children[index]["replacement_master_msg_id"] = previous["replacement_master_msg_id"]
+                    children[index] = apply_member_event(previous, MemberEvent.RECEIPT, update).member
             if not self.fits(children, updating=True, confirmed=log.aggregate):
                 raise ValueError("Source changes require independent output before container update.")
             base = dict(message_id=int(log.master_msg_id.rsplit(".", 1)[1]), owner=log.sender_bot_id,
@@ -473,11 +473,11 @@ class LiveTextAggregation:
             old_id = context["old_message_id"]
             receipt = SimpleNamespace(chat_id=old_id[0], message_id=old_id[1],
                                       message_thread_id=context["key"][2])
-        elif member["status"] != "removed":
+        elif member["status"] != MemberStatus.REMOVED:
             message.type_telegram = get_msg_type(receipt)
             message.put_telegram_file(receipt)
         message.sender_bot_id = sender_bot_id
-        if member["status"] != "removed":
+        if member["status"] != MemberStatus.REMOVED:
             message.file_bot_id = file_bot_id or sender_bot_id
         member = copy.deepcopy(member)
         # Telegram file metadata belongs to this output; the complete source stays in its member snapshot.
@@ -486,7 +486,7 @@ class LiveTextAggregation:
         source.type_telegram, source.mime = message.type_telegram, message.mime
         source.file_bot_id = file_bot_id or sender_bot_id
         from .queued_log import encode
-        if member["status"] != "removed":
+        if member["status"] != MemberStatus.REMOVED:
             member["snapshot"] = encode(source, None)
         db = self.manager.channel.db
         if context["kind"] == "redirect":
@@ -517,7 +517,7 @@ class LiveTextAggregation:
                 requests=requests, operation_resolver=self.manager._queue_operation)
         if identifiers:
             self.container_tails[context["old_container_id"]] = identifiers[-1]
-        if message.commands and member["status"] == "active":
+        if message.commands and member["status"] == MemberStatus.ACTIVE:
             from ehforwarderbot import coordinator
             from .commands import ETMCommandMsgStorage
             module = coordinator.get_module_by_id(message.author.module_id)
@@ -541,7 +541,7 @@ class LiveTextAggregation:
     def removal_failed(self, row, sender_bot_id):
         """Keep an uneditable source output and record its removal with a notice."""
         context = decode_aggregation(row.log_context) if row.log_context else None
-        if not context or context["kind"] != "source" or context["member"]["status"] != "removed":
+        if not context or context["kind"] != "source" or context["member"]["status"] != MemberStatus.REMOVED:
             return
         _, kwargs = self.queue.decode_payload_raw(row.payload)
         self.manager._enqueue_requests([QueueRequest("send_message", (), dict(
@@ -555,10 +555,10 @@ class LiveTextAggregation:
             log, previous, predecessor = self.source_state(key, identity)
             if previous is None:
                 return False
-            if previous["status"] == "removed":
+            change = apply_member_event(previous, MemberEvent.REMOVE)
+            if not change.changed:
                 return True
-            member = copy.deepcopy(previous)
-            member.update(status="removed", source_revision=previous["source_revision"] + 1)
+            member = change.member
             if self.update_pending_member(key, member):
                 return True
             payload = self.queue.aggregation_context(predecessor) if predecessor else None
@@ -718,7 +718,7 @@ class LiveTextAggregation:
                 if member_identity(previous) == member_identity(member):
                     if member["source_revision"] <= previous["source_revision"]:
                         return True
-                    if member["status"] == "removed":
+                    if member["status"] == MemberStatus.REMOVED:
                         context["members"].pop(position)
                         self.pending_sources.pop(member_identity(member), None)
                         if not context["members"]:
@@ -733,7 +733,7 @@ class LiveTextAggregation:
                     if not self.fits(context["members"]):
                         return False
                     return self.queue.replace_logical_aggregation(row_id, encode_aggregation(context),
-                        cancelled_member=member if member["status"] == "removed" else None)
+                        cancelled_member=member if member["status"] == MemberStatus.REMOVED else None)
             return False
 
     def queue_container_update(self, container_id, updates, *, key=None):

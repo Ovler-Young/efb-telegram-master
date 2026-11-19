@@ -286,15 +286,16 @@ class SlaveMessageProcessor(LocaleMixin):
         return msg
 
     def _aggregate_source_edit(self, aggregation, key, msg, msg_template, silent):
-        from .aggregate import make_source_member, member_identity
+        from .aggregate import MemberEvent, apply_member_event, make_source_member, member_identity
         with aggregation.scheduler._lock:
             log, previous, predecessor = aggregation.source_state(key, (key[0], str(msg.uid)))
             if previous is None:
                 return False
             source = ETMMsg.from_efbmsg(msg, self.chat_manager)
-            member = make_source_member(source, source_revision=previous["source_revision"] + 1,
-                                        received_time=previous["received_time"], source_time=previous["source_time"],
-                                        display_prefix=msg_template.removesuffix(":"))
+            member = apply_member_event(previous, MemberEvent.NEW_REVISION, make_source_member(
+                source, source_revision=previous["source_revision"] + 1,
+                received_time=previous["received_time"], source_time=previous["source_time"],
+                display_prefix=msg_template.removesuffix(":"))).member
             qualifying = msg.type == MsgType.Text and not msg.commands
             from .queued_log import decode_aggregation
             payload = aggregation.queue.aggregation_context(predecessor) if predecessor else None

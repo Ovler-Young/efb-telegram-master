@@ -221,3 +221,30 @@ def test_capacity_uses_parsed_text_and_keeps_removed_source_content():
     assert rendered.text.count("saved") == 200
     assert rendered.html.count("<s>saved</s>") == 200
     assert render_members(removed, history=True).text.count("saved") == 200
+
+
+def test_member_events_follow_the_transition_table():
+    from efb_telegram_master.aggregate import MemberEvent, MemberStatus, MemberTransitionError, apply_member_event
+
+    active = make_source_member(source())
+    removed = apply_member_event(active, MemberEvent.REMOVE)
+    assert (removed.member["status"], removed.member["source_revision"], removed.changed) == (
+        MemberStatus.REMOVED, 2, True)
+    assert not apply_member_event(removed.member, MemberEvent.REMOVE).changed
+
+    # An edit after a removal makes the source live again.
+    edit = make_source_member(source(text="edited"), source_revision=3)
+    revived = apply_member_event(removed.member, MemberEvent.NEW_REVISION, edit).member
+    assert (revived["status"], revived["source_revision"]) == (MemberStatus.ACTIVE, 3)
+    with pytest.raises(MemberTransitionError):
+        apply_member_event(revived, MemberEvent.NEW_REVISION, edit)
+    with pytest.raises(MemberTransitionError):
+        apply_member_event(None, MemberEvent.REMOVE)
+    with pytest.raises(MemberTransitionError):
+        apply_member_event(None, MemberEvent.REDIRECT, edit)
+
+    redirected = apply_member_event(active, MemberEvent.REDIRECT, active, replacement_master_msg_id="-100.2")
+    assert redirected.member["status"] == MemberStatus.REDIRECTED
+    newer = apply_member_event(redirected.member, MemberEvent.RECEIPT, edit).member
+    assert (newer["status"], newer["replacement_master_msg_id"]) == (MemberStatus.REDIRECTED, "-100.2")
+    assert apply_member_event(removed.member, MemberEvent.RECEIPT, active).event == MemberEvent.STALE_RECEIPT

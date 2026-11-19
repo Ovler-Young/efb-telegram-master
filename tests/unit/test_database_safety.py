@@ -1118,3 +1118,56 @@ def test_cache_discovery_rejects_generated_columns(sqlite_source, storage):
         with pytest.raises(RuntimeError, match="Unsupported generated or hidden columns in useremojicache.*emoji"):
             migrate_db._cache_models(source)
         assert source.execute("SELECT id, emoji FROM useremojicache").fetchall() == [(1, "emoji")]
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_source_member_status_rows_load_and_progress(sqlite_source, manager_factory, request, backend):
+    from efb_telegram_master.aggregate import (
+        MemberEvent, MemberTransitionError, SourceMember, apply_member_event, make_aggregate, make_source_member,
+    )
+    from tests.unit.test_live_aggregate import receipt, source
+
+    postgres = request.getfixturevalue("postgres_config") if backend == "postgresql" else None
+    if postgres:
+        migrate_db.migrate(sqlite_source, postgres)
+    manager = manager_factory(sqlite_source, postgres)
+
+    one, two, three = (make_source_member(source(uid, f"text {uid}")) for uid in ("one", "two", "three"))
+    manager.finalize_aggregate_message(receipt(1), make_aggregate([one, two, three], 1), "700")
+
+    removed_two = apply_member_event(two, MemberEvent.REMOVE).member
+    manager.finalize_aggregate_message(receipt(1), make_aggregate([one, removed_two, three], 2), "700")
+    edited = source("one", "text one edited")
+    moved_one = apply_member_event(one, MemberEvent.NEW_REVISION, make_source_member(edited, source_revision=2)).member
+    replacement = manager.finalize_member_redirect("-100.1", moved_one, edited, receipt(2), "700")
+    assert replacement.master_msg_id == "-100.2"
+
+    # A late snapshot of the first presentation cannot undo the removal or the replacement routing.
+    manager.finalize_aggregate_message(receipt(1), make_aggregate([one, two, three], 3), "700")
+    row = manager.get_msg_log(master_msg_id="-100.1")
+    raw = pickle.loads(bytes(row.pickle))["aggregate"]["children"]
+    assert [(child["status"], child["source_revision"]) for child in raw] == [
+        ("redirected", 2), ("removed", 2), ("active", 1)]
+    assert raw[0]["replacement_master_msg_id"] == "-100.2"
+    assert set(raw[0]) == set(SourceMember.__annotations__)
+
+    # Standalone output: removal, then an edit re-activates the member with the next revision.
+    standalone = source("solo", "solo text")
+    active = make_source_member(standalone)
+    manager.finalize_source_message(standalone, receipt(5), active, "700")
+    removed = apply_member_event(active, MemberEvent.REMOVE).member
+    manager.finalize_source_message(standalone, receipt(5), removed, "700", old_message_id=(-100, 5))
+    assert pickle.loads(bytes(manager.get_msg_log(master_msg_id="-100.5").pickle))["source_member"]["status"] == "removed"
+    manager.finalize_source_message(standalone, receipt(5), active, "700", old_message_id=(-100, 5))
+    assert manager.get_msg_log(master_msg_id="-100.5").source_member["status"] == "removed"  # stale receipt
+    again = apply_member_event(removed, MemberEvent.NEW_REVISION,
+                               make_source_member(standalone, source_revision=3)).member
+    manager.finalize_source_message(standalone, receipt(5), again, "700", old_message_id=(-100, 5))
+    saved = manager.get_msg_log(master_msg_id="-100.5").source_member
+    assert (saved["status"], saved["source_revision"]) == ("active", 3)
+    resolved_row, resolved = manager.resolve_source_member(active["origin_uid"], "solo", "-100")
+    assert (resolved_row.master_msg_id, resolved["status"]) == ("-100.5", "active")
+
+    # An older version cannot be redirected over what is already saved.
+    with pytest.raises(MemberTransitionError, match="stale receipt"):
+        manager.finalize_member_redirect("-100.1", one, source("one"), receipt(6), "700")

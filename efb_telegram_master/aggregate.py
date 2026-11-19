@@ -1,11 +1,12 @@
 """Saved source members and presentation of live text containers."""
 
+import copy
 import datetime
 import html
 import pickle
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
-from typing import List, Optional, Tuple, TypedDict
+from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
 
 from ehforwarderbot.chat import Chat, SelfChatMember
 from telegram.constants import MessageLimit
@@ -64,6 +65,127 @@ def member_identity(member: SourceMember) -> Tuple[str, str]:
     return member["origin_uid"], member["source_id"]
 
 
+class MemberStatus:
+    """Persisted spellings of ``SourceMember["status"]``; never change them."""
+    ACTIVE = "active"
+    REMOVED = "removed"
+    REDIRECTED = "redirected"
+
+
+class MemberEvent:
+    """What can happen to one source member.
+
+    ``NEW_REVISION``    a source version was created or edited (a removed member becomes active again).
+    ``REMOVE``          the source was removed; the member keeps its saved content.
+    ``REDIRECT``        a replacement output was confirmed for a member inside a container.
+    ``RECEIPT``         a confirmed container presentation is saved over an earlier saved copy.
+    ``SOURCE_RECEIPT``  a confirmed independent output is saved over an earlier saved copy.
+    ``STALE_RECEIPT``   reported by ``MemberChange.event`` when a receipt was older than what is saved.
+    """
+    NEW_REVISION = "new_revision"
+    REMOVE = "remove"
+    REDIRECT = "redirect"
+    RECEIPT = "receipt"
+    SOURCE_RECEIPT = "source_receipt"
+    STALE_RECEIPT = "stale_receipt"
+
+
+# (status before, event) -> statuses the saved member may have afterwards. None means "no saved member".
+MEMBER_TRANSITIONS: Dict[Tuple[Optional[str], str], Tuple[str, ...]] = {
+    (None, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
+    (MemberStatus.ACTIVE, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
+    # An edit after a removal makes the source live again, with a newer revision.
+    (MemberStatus.REMOVED, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
+    # Reachable while a routing update of the old container is still queued.
+    (MemberStatus.REDIRECTED, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
+    (MemberStatus.ACTIVE, MemberEvent.REMOVE): (MemberStatus.REMOVED,),
+    (MemberStatus.REMOVED, MemberEvent.REMOVE): (MemberStatus.REMOVED,),
+    # Reachable while a routing update of the old container is still queued.
+    (MemberStatus.REDIRECTED, MemberEvent.REMOVE): (MemberStatus.REMOVED,),
+    (MemberStatus.ACTIVE, MemberEvent.REDIRECT): (MemberStatus.REDIRECTED,),
+    (MemberStatus.REMOVED, MemberEvent.REDIRECT): (MemberStatus.REDIRECTED,),
+    (MemberStatus.REDIRECTED, MemberEvent.REDIRECT): (MemberStatus.REDIRECTED,),
+    (MemberStatus.ACTIVE, MemberEvent.RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
+    (MemberStatus.REMOVED, MemberEvent.RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
+    # Confirmed replacement routing survives every later container receipt.
+    (MemberStatus.REDIRECTED, MemberEvent.RECEIPT): (MemberStatus.REDIRECTED,),
+    (None, MemberEvent.SOURCE_RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
+    (MemberStatus.ACTIVE, MemberEvent.SOURCE_RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
+    (MemberStatus.REMOVED, MemberEvent.SOURCE_RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
+    (MemberStatus.REDIRECTED, MemberEvent.SOURCE_RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
+}
+
+
+class MemberTransitionError(ValueError):
+    """A member event that the transition table or the revision order does not allow."""
+
+
+class MemberChange(NamedTuple):
+    """Outcome of one event: the member to keep, what was applied, and whether it differs from before."""
+    member: SourceMember
+    event: str
+    changed: bool
+
+
+def apply_member_event(previous: Optional[SourceMember], event: str,
+                       incoming: Optional[SourceMember] = None, *,
+                       replacement_master_msg_id: Optional[str] = None) -> MemberChange:
+    """Apply one event to a saved member and return the member to keep.
+
+    ``incoming`` is the newer version for ``NEW_REVISION``, ``REDIRECT`` and both receipts.
+    ``REMOVE`` needs only ``previous``. A receipt older than ``previous`` is reported as
+    ``STALE_RECEIPT`` with ``changed`` False and ``previous`` returned; ``REDIRECT`` of a newer
+    source version, ``NEW_REVISION`` that does not advance the revision, and every pair missing from
+    ``MEMBER_TRANSITIONS`` raise ``MemberTransitionError``. The input members are never modified.
+    """
+    before = previous["status"] if previous is not None else None
+    known = previous if previous is not None else incoming
+    identity = member_identity(known) if known is not None else None
+    allowed = MEMBER_TRANSITIONS.get((before, event))
+    if allowed is None:
+        raise MemberTransitionError(f"Source member {identity} cannot take event {event!r} while {before!r}.")
+    if event == MemberEvent.REMOVE:
+        assert previous is not None
+        if before == MemberStatus.REMOVED:
+            return MemberChange(previous, event, False)
+        member = copy.deepcopy(previous)
+        member["status"] = MemberStatus.REMOVED
+        member["source_revision"] = previous["source_revision"] + 1
+        return MemberChange(member, event, True)
+    if incoming is None:
+        raise MemberTransitionError(f"Source member {identity} event {event!r} requires a source version.")
+    if event == MemberEvent.NEW_REVISION:
+        if previous is not None and incoming["source_revision"] <= previous["source_revision"]:
+            raise MemberTransitionError(
+                f"Source member {identity} revision {incoming['source_revision']} does not follow "
+                f"{previous['source_revision']}.")
+        member = copy.deepcopy(incoming)
+    elif event == MemberEvent.REDIRECT:
+        assert previous is not None
+        if previous["source_revision"] > incoming["source_revision"] or (
+                previous["source_revision"] == incoming["source_revision"] and before == MemberStatus.REMOVED):
+            raise MemberTransitionError("A stale receipt cannot redirect a newer source version.")
+        if before == MemberStatus.REDIRECTED and previous["source_revision"] >= incoming["source_revision"]:
+            return MemberChange(previous, event, False)
+        member = copy.deepcopy(incoming)
+        member["status"] = MemberStatus.REDIRECTED
+        member["replacement_master_msg_id"] = replacement_master_msg_id
+    else:
+        if previous is not None and (
+                previous["source_revision"] > incoming["source_revision"] or
+                (previous["source_revision"] == incoming["source_revision"] and
+                 (event == MemberEvent.SOURCE_RECEIPT or before != MemberStatus.ACTIVE))):
+            return MemberChange(previous, MemberEvent.STALE_RECEIPT, False)
+        member = copy.deepcopy(incoming)
+        if previous is not None and before == MemberStatus.REDIRECTED and event == MemberEvent.RECEIPT:
+            member["status"] = MemberStatus.REDIRECTED
+            member["replacement_master_msg_id"] = previous["replacement_master_msg_id"]
+    if member["status"] not in allowed:
+        raise MemberTransitionError(
+            f"Source member {identity} cannot become {member['status']!r} through {event!r} while {before!r}.")
+    return MemberChange(member, event, True)
+
+
 def utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
@@ -89,7 +211,7 @@ def make_source_member(message: ETMMsg, *, received_time: Optional[datetime.date
         self_mentions=[key for key, chat in (message.substitutions or {}).items()
                        if isinstance(chat, SelfChatMember) or (isinstance(chat, Chat) and chat.has_self)],
         received_time=received_time or datetime.datetime.now(), reply=reply,
-        source_revision=source_revision, status="active", replacement_master_msg_id=None,
+        source_revision=source_revision, status=MemberStatus.ACTIVE, replacement_master_msg_id=None,
     )
 
 
@@ -125,7 +247,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
     ranges: List[MemberRange] = []
     removed_displays = {}
     if confirmed and not history:
-        removed = {member_identity(child) for child in confirmed["children"] if child["status"] == "removed"}
+        removed = {member_identity(child) for child in confirmed["children"] if child["status"] == MemberStatus.REMOVED}
         encoded = confirmed["confirmed_text"].encode("utf-16-le")
         for member_range in confirmed["confirmed_ranges"]:
             range_identity = member_range["origin_uid"], member_range["source_id"]
@@ -135,13 +257,13 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
                     removed_displays[range_identity] = visible
     offset = 0
     for member in members:
-        if history and member["status"] == "redirected":
+        if history and member["status"] == MemberStatus.REDIRECTED:
             continue
         name = member.get("display_prefix")
         if name is None:
             name = member["author_name"]
         # Status displays remain bounded even after many source edits.
-        if not history and member["status"] == "redirected":
+        if not history and member["status"] == MemberStatus.REDIRECTED:
             name = name[:80]
             body = "[message moved]"
             if _compact_status:
@@ -153,7 +275,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
             message = member_message(member)
             body = message.text or ""
             body_html = _body_html(message, admin_id, member["self_mentions"])
-            if not history and member["status"] == "removed":
+            if not history and member["status"] == MemberStatus.REMOVED:
                 body_html = removed_text(body)
                 if not body:
                     body = "[message removed]"
@@ -168,7 +290,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
         else:
             display_time = member["source_time"] or member["received_time"]
             timestamp = format_message_time(display_time, display_timezone)
-            if _compact_status and member["status"] == "redirected":
+            if _compact_status and member["status"] == MemberStatus.REDIRECTED:
                 prefix = timestamp + " "
                 prefix_html = f"<code>{timestamp}</code> "
             else:
@@ -179,7 +301,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
         visible = prefix + reply_text + body
         visible_html = prefix_html + html.escape(reply_text) + body_html
         previous_display = removed_displays.get(member_identity(member))
-        if member["status"] == "removed" and previous_display is not None and previous_display != visible:
+        if member["status"] == MemberStatus.REMOVED and previous_display is not None and previous_display != visible:
             # Older containers already replaced these sources with a removal marker.
             visible, visible_html = previous_display, html.escape(previous_display)
         if text_parts:
@@ -193,7 +315,7 @@ def render_members(members: List[SourceMember], *, admin_id: Optional[int] = Non
         return RenderedAggregate("[message removed]", "[message removed]", [])
     if (not history and not _compact_status and
             len("\n\n".join(text_parts)) > int(MessageLimit.MAX_TEXT_LENGTH) and
-            any(member["status"] == "redirected" for member in members)):
+            any(member["status"] == MemberStatus.REDIRECTED for member in members)):
         return render_members(members, admin_id=admin_id, display_timezone=display_timezone,
                               confirmed=confirmed, _compact_status=True)
     return RenderedAggregate("\n\n".join(html_parts), "\n\n".join(text_parts), ranges)
@@ -217,7 +339,7 @@ def aggregate_fits(members: List[SourceMember], *, max_members: int = 200,
     fixed-container updates can omit them from payload capacity.
     """
     payload_members = members if include_redirected_payload else [
-        member for member in members if member["status"] != "redirected"]
+        member for member in members if member["status"] != MemberStatus.REDIRECTED]
     return (len(members) <= max_members and
             len(render_members(members, admin_id=admin_id, display_timezone=display_timezone,
                                confirmed=confirmed).text) <= int(MessageLimit.MAX_TEXT_LENGTH) and
