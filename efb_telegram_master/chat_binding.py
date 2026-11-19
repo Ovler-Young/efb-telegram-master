@@ -26,7 +26,7 @@ from ehforwarderbot.chat import SystemChatMember
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBOperationNotSupported
 from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
-from .aggregate import render_members
+from .aggregate import MemberStatus, render_members
 from .utils import DEFAULT_TIMEZONE, format_message_time
 from .chat import ETMChatType, ETMGroupChat, unpickle
 from .constants import Emoji, Flags
@@ -1782,7 +1782,7 @@ class ChatBindingManager(LocaleMixin):
                     aggregate = msg_log.aggregate
                     members = aggregate["children"] if aggregate is not None else [msg_log.source_member]
                     for member in members:
-                        if member is not None and member["status"] == "redirected":
+                        if member is not None and member["status"] == MemberStatus.REDIRECTED:
                             continue
                         source_time = member["source_time"] if member is not None else msg_log.time
                         received_time = member["received_time"] if member is not None else None

@@ -128,8 +128,7 @@ class MemberChange(NamedTuple):
 
 
 def apply_member_event(previous: Optional[SourceMember], event: str,
-                       incoming: Optional[SourceMember] = None, *,
-                       replacement_master_msg_id: Optional[str] = None) -> MemberChange:
+                       incoming: Optional[SourceMember] = None) -> MemberChange:
     """Apply one event to a saved member and return the member to keep.
 
     ``incoming`` is the newer version for ``NEW_REVISION``, ``REDIRECT`` and both receipts.
@@ -169,7 +168,6 @@ def apply_member_event(previous: Optional[SourceMember], event: str,
             return MemberChange(previous, event, False)
         member = copy.deepcopy(incoming)
         member["status"] = MemberStatus.REDIRECTED
-        member["replacement_master_msg_id"] = replacement_master_msg_id
     else:
         if previous is not None and (
                 previous["source_revision"] > incoming["source_revision"] or

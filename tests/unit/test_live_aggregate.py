@@ -243,8 +243,10 @@ def test_member_events_follow_the_transition_table():
     with pytest.raises(MemberTransitionError):
         apply_member_event(None, MemberEvent.REDIRECT, edit)
 
-    redirected = apply_member_event(active, MemberEvent.REDIRECT, active, replacement_master_msg_id="-100.2")
+    redirected = apply_member_event(active, MemberEvent.REDIRECT, active)
     assert redirected.member["status"] == MemberStatus.REDIRECTED
+    # The confirmed replacement is recorded by the caller once its output is saved.
+    redirected.member["replacement_master_msg_id"] = "-100.2"
     newer = apply_member_event(redirected.member, MemberEvent.RECEIPT, edit).member
     assert (newer["status"], newer["replacement_master_msg_id"]) == (MemberStatus.REDIRECTED, "-100.2")
     assert apply_member_event(removed.member, MemberEvent.RECEIPT, active).event == MemberEvent.STALE_RECEIPT

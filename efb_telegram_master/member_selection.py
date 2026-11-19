@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext, CallbackQueryHandler
 
-from .aggregate import member_identity, member_message, utf16_length
+from .aggregate import MemberStatus, member_identity, member_message, utf16_length
 from .ptb_compat import sync_reply_text
 from .selection_session import (
     SESSION_SECONDS,
@@ -81,7 +81,7 @@ class SourceMemberSelector:
                 (identity[0], target_chat, topic), identity)
         except ValueError:
             return None
-        if row is None or member is None or member['status'] != 'active':
+        if row is None or member is None or member['status'] != MemberStatus.ACTIVE:
             return None
         message = row.build_source_member(member, self.processor.chat_manager)
         message.target = None
