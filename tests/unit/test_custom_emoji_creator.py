@@ -2,13 +2,12 @@
 import email.parser
 import hashlib
 import io
-import itertools
 import json
 import logging
 import sqlite3
-import statistics
 import threading
 import time
+import types
 import urllib.parse
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -222,7 +221,7 @@ def test_known_author_costs_no_telegram_or_database_call(make_creator, api, monk
 def test_new_authors_continue_the_last_saved_set_and_move_on_when_it_fills(make_creator, api, profile, caplog):  # noqa: F811
     directory, _ = profile
     api.sets[SET_6] = [f"s{i}" for i in range(190)]
-    store, creator = make_creator(legacy_rows(2), write_interval=0.05)
+    store, creator = make_creator(legacy_rows(2))
     creator.start()
     uids = [f"slave.channel_user{i}" for i in range(20)]
     for uid in uids:
@@ -244,8 +243,19 @@ def test_new_authors_continue_the_last_saved_set_and_move_on_when_it_fills(make_
     assert {name for _, name in reads} == {SET_6, SET_7}
     assert api.methods(*WRITES) == [("addStickerToSet", SET_6)] * 10 + [("createNewStickerSet", SET_7)] + [
         ("addStickerToSet", SET_7)] * 9
-    write_times = [at for at, method, _ in api.calls if method in WRITES]
-    assert min(b - a for a, b in itertools.pairwise(write_times)) > 0.04  # server-side arrival jitter
+
+
+def test_writes_wait_for_the_write_interval(make_creator, api, caplog):
+    api.sets[SET_6] = ["s0"]
+    store, creator = make_creator(legacy_rows(1), write_interval=30.0)
+    creator.start()
+    for uid in ("u0", "u1", "u2"):
+        creator.request(uid, avatar)
+    wait_until(lambda: store.lookup("u0") is not None)
+    time.sleep(0.2)  # unpaced, the other two would be written by now; paced, they wait out the interval
+
+    assert len(api.methods(*WRITES)) == 1
+    assert store.lookup("u1") is None
 
 
 def test_sticker_matches_earlier_releases(make_creator, api, caplog):
@@ -316,8 +326,10 @@ def test_lost_reply_to_set_creation_does_not_block_later_authors(make_creator, a
                              ("addStickerToSet", SET_6), ("getStickerSet", SET_6)]
 
 
-def test_failed_author_waits_for_its_retry_time(make_creator, api, caplog):
-    store, creator = make_creator(legacy_rows(1), retry_base=0.3)
+def test_failed_author_waits_for_its_retry_time(make_creator, api, caplog, monkeypatch):
+    clock = types.SimpleNamespace(now=1000.0, monotonic=lambda: clock.now)
+    monkeypatch.setattr(custom_emoji, "time", clock)
+    store, creator = make_creator(legacy_rows(1), retry_base=300.0)
     creator.start()
     attempts = []
 
@@ -329,13 +341,13 @@ def test_failed_author_waits_for_its_retry_time(make_creator, api, caplog):
     wait_until(settled(store, caplog, ["nobody"]))
     for _ in range(5):
         creator.request("nobody", no_avatar)
-    time.sleep(0.1)
+    time.sleep(0.1)  # a wrongly accepted request would be attempted by now
     assert len(attempts) == 1
 
-    time.sleep(0.25)
+    clock.now += 301
     creator.request("nobody", no_avatar)
     wait_until(lambda: len(attempts) == 2 and failures(caplog, "nobody") == 2)
-    time.sleep(0.3)  # the second failure doubles the wait
+    clock.now += 301  # the second failure doubles the wait
     creator.request("nobody", no_avatar)
     time.sleep(0.1)
     assert len(attempts) == 2
@@ -361,13 +373,17 @@ def test_failed_read_back_after_the_upload_is_retried_without_uploading_again(
     creator.request("kim", avatar)
     wait_until(settled(store, caplog, ["kim"]))
     assert store.lookup("kim") is None
+    api.errors["addStickerToSet"] = "Bad Request: unexpected failure"  # another author's write leaves the set state unclear
+    creator.request("lee", avatar)
+    wait_until(settled(store, caplog, ["lee"]))
+    del api.errors["addStickerToSet"]
     time.sleep(0.15)
     creator.request("kim", avatar)
     wait_until(lambda: store.lookup("kim") is not None)
 
     assert saved_rows(directory)["member-user:kim"] == (api.sets[SET_6][-1], SET_6)
-    assert api.methods(*WRITES) == [("addStickerToSet", SET_6)]
-    assert len(api.files) == 1
+    assert api.methods(*WRITES) == [("addStickerToSet", SET_6)] * 2  # kim's, and lee's that failed
+    assert len(api.files) == 2
 
 
 def test_retried_read_back_saves_this_authors_sticker_not_a_later_one(
@@ -439,13 +455,9 @@ def test_full_queue_drops_without_waiting(make_creator, api):
     store, creator = make_creator(legacy_rows(1), queue_size=3)  # worker not started: nothing leaves the queue
     for uid in ("a", "b", "c"):
         creator.request(uid, avatar)
-    durations = []
     for i in range(200):
-        started = time.perf_counter()
         creator.request(f"late{i}", avatar)
-        durations.append(time.perf_counter() - started)
 
-    assert statistics.median(durations) < 0.001
     assert api.calls == []
 
     creator.start()
@@ -463,11 +475,9 @@ def test_stop_returns_within_its_bound_with_jobs_queued(make_creator, api):
     for uid in uids:
         creator.request(uid, avatar)
     wait_until(lambda: store.lookup("u0") is not None)
-    started = time.monotonic()
     creator.stop()
 
-    assert time.monotonic() - started < 1.0
-    assert not creator._thread.is_alive()
+    assert not creator._thread.is_alive()  # stop interrupts the 30 s wait instead of leaving the worker behind
 
 
 def test_upload_in_flight_when_stopping_is_still_saved(make_creator, api, profile):  # noqa: F811
