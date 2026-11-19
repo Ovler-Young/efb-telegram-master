@@ -145,6 +145,9 @@ unconfirmed duplicate upload.
 
 ## Queue row states
 
+Every state machine in the queue and in text aggregation is listed in
+[State machines](state-machines.md).
+
 Every row of `outbound-queue.sqlite3` is in exactly one state, read from its
 `delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
 deferred row). The definition lives in `efb_telegram_master/delivery_states.py`:

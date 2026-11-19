@@ -101,6 +101,9 @@ reply says so, because it overrides the preference.
 
 ## Queue row kinds
 
+Every state machine in the queue and in text aggregation is listed in
+[State machines](state-machines.md).
+
 Every unpublished step of text aggregation is a row in the outbound queue. Its
 `log_context` holds the marker byte `\x03` and a pickled dict whose `kind`
 says what the row is doing; two flags, `frozen` and `handoff`, refine it.
