@@ -154,6 +154,8 @@ def manager_factory(monkeypatch):
 
 
 def test_real_postgresql_import_preserves_every_field_id_queue_and_next_sequence(sqlite_source, postgres_config, manager_factory):
+    with sqlite3.connect(sqlite_source / "tgdata.db") as source:
+        source.execute("UPDATE slavechatinfo SET text_aggregation_enabled = 1 WHERE id = 63")
     before = source_rows(sqlite_source)
     queue_before = migrate_db._queue_digest(sqlite_source / "outbound-queue.sqlite3")
     older_archive = sqlite_source / "tgdata.db.migrated"
@@ -177,6 +179,7 @@ def test_real_postgresql_import_preserves_every_field_id_queue_and_next_sequence
         assert TopicAssoc.create(topic_chat_id="next", message_thread_id="next", slave_uid="next").id == 53
         assert SlaveChatInfo.create(slave_channel_id="next", slave_channel_emoji="", slave_chat_uid="next", slave_chat_name="next", slave_chat_type="PrivateChat").id == 64
         assert HistoryMigrationEntry.create(slave_chat_id="next", target_chat_id="next", source_master_msg_id="next", position=1).id == 75
+    assert manager.get_text_aggregation_override("slave", "chat") is True
     assert manager.get_msg_log(master_msg_id="ä.2").time is None
     assert manager.get_msg_log(master_msg_id="z.1").time == datetime(2020, 1, 2, 3, 4, 5, 123456)
 
@@ -699,6 +702,12 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
     ]
     with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source, source:
         legacy["tables"]["msglog"] = migrate_db._digest(migrate_db._source_rows(source, MsgLog, columns))
+        legacy["tables"]["slavechatinfo"] = migrate_db._digest(migrate_db._source_rows(
+            source, SlaveChatInfo, [
+                "id", "slave_channel_id", "slave_channel_emoji", "slave_chat_uid", "slave_chat_group_id",
+                "slave_chat_name", "slave_chat_alias", "slave_chat_type", "pickle",
+            ],
+        ))
         legacy["tables"].pop("historymigrationtarget")
         legacy["tables"]["historymigrationentry"] = migrate_db._digest(migrate_db._source_rows(
             source, HistoryMigrationEntry, migrate_db.V1_COLUMNS["historymigrationentry"],
@@ -707,6 +716,7 @@ def test_committed_v1_manifest_recovers_with_original_column_projection(sqlite_s
         source.execute("CREATE TABLE useremojicache (user_id TEXT, emoji TEXT)")
     with connection_scope(target):
         target.execute_sql("ALTER TABLE msglog DROP COLUMN master_message_thread_id")
+        target.execute_sql("ALTER TABLE slavechatinfo DROP COLUMN text_aggregation_enabled")
         target.execute_sql("ALTER TABLE historymigrationentry DROP COLUMN generation")
         target.execute_sql("DROP TABLE historymigrationtarget")
         target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s", (json.dumps(legacy),))
@@ -1108,3 +1118,61 @@ def test_cache_discovery_rejects_generated_columns(sqlite_source, storage):
         with pytest.raises(RuntimeError, match="Unsupported generated or hidden columns in useremojicache.*emoji"):
             migrate_db._cache_models(source)
         assert source.execute("SELECT id, emoji FROM useremojicache").fetchall() == [(1, "emoji")]
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_source_member_status_rows_load_and_progress(sqlite_source, manager_factory, request, backend):
+    from efb_telegram_master.aggregate import (
+        MemberEvent,
+        MemberTransitionError,
+        SourceMember,
+        apply_member_event,
+        make_aggregate,
+        make_source_member,
+    )
+    from tests.unit.test_live_aggregate import receipt, source
+
+    postgres = request.getfixturevalue("postgres_config") if backend == "postgresql" else None
+    if postgres:
+        migrate_db.migrate(sqlite_source, postgres)
+    manager = manager_factory(sqlite_source, postgres)
+
+    one, two, three = (make_source_member(source(uid, f"text {uid}")) for uid in ("one", "two", "three"))
+    manager.finalize_aggregate_message(receipt(1), make_aggregate([one, two, three], 1), "700")
+
+    removed_two = apply_member_event(two, MemberEvent.REMOVE).member
+    manager.finalize_aggregate_message(receipt(1), make_aggregate([one, removed_two, three], 2), "700")
+    edited = source("one", "text one edited")
+    moved_one = apply_member_event(one, MemberEvent.NEW_REVISION, make_source_member(edited, source_revision=2)).member
+    replacement = manager.finalize_member_redirect("-100.1", moved_one, edited, receipt(2), "700")
+    assert replacement.master_msg_id == "-100.2"
+
+    # A late snapshot of the first presentation cannot undo the removal or the replacement routing.
+    manager.finalize_aggregate_message(receipt(1), make_aggregate([one, two, three], 3), "700")
+    row = manager.get_msg_log(master_msg_id="-100.1")
+    raw = pickle.loads(bytes(row.pickle))["aggregate"]["children"]
+    assert [(child["status"], child["source_revision"]) for child in raw] == [
+        ("redirected", 2), ("removed", 2), ("active", 1)]
+    assert raw[0]["replacement_master_msg_id"] == "-100.2"
+    assert set(raw[0]) == set(SourceMember.__annotations__)
+
+    # Standalone output: removal, then an edit re-activates the member with the next revision.
+    standalone = source("solo", "solo text")
+    active = make_source_member(standalone)
+    manager.finalize_source_message(standalone, receipt(5), active, "700")
+    removed = apply_member_event(active, MemberEvent.REMOVE).member
+    manager.finalize_source_message(standalone, receipt(5), removed, "700", old_message_id=(-100, 5))
+    assert pickle.loads(bytes(manager.get_msg_log(master_msg_id="-100.5").pickle))["source_member"]["status"] == "removed"
+    manager.finalize_source_message(standalone, receipt(5), active, "700", old_message_id=(-100, 5))
+    assert manager.get_msg_log(master_msg_id="-100.5").source_member["status"] == "removed"  # stale receipt
+    again = apply_member_event(removed, MemberEvent.NEW_REVISION,
+                               make_source_member(standalone, source_revision=3)).member
+    manager.finalize_source_message(standalone, receipt(5), again, "700", old_message_id=(-100, 5))
+    saved = manager.get_msg_log(master_msg_id="-100.5").source_member
+    assert (saved["status"], saved["source_revision"]) == ("active", 3)
+    resolved_row, resolved = manager.resolve_source_member(active["origin_uid"], "solo", "-100")
+    assert (resolved_row.master_msg_id, resolved["status"]) == ("-100.5", "active")
+
+    # An older version cannot be redirected over what is already saved.
+    with pytest.raises(MemberTransitionError, match="stale receipt"):
+        manager.finalize_member_redirect("-100.1", one, source("one"), receipt(6), "700")

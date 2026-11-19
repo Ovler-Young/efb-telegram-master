@@ -28,6 +28,7 @@ from efb_telegram_master.outbound import (
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 from tests.mocks.slave import MockSlaveChannel
 from tests.unit.test_custom_emoji import profile, write_legacy_tables  # noqa: F401  (profile is a fixture)
+from tests.unit.test_live_aggregate import idle_live_aggregation
 
 MAIN = SenderSelection(sender=None, sender_bot_id=None)
 CAPABLE_AUXILIARY = "111"
@@ -113,6 +114,8 @@ def make_manager(tmp_path, store):
     manager = object.__new__(TelegramBotManager)
     manager._bot = FakeBot()
     manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
+    manager._transfer_min_mbps = None
+    manager.live_aggregation = idle_live_aggregation()
     manager.channel = SimpleNamespace(custom_emoji=store)
     manager._custom_emoji_auxiliary_ids = frozenset({CAPABLE_AUXILIARY})
     manager._outbound_queue = OutboundQueue(tmp_path)

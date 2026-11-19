@@ -16,6 +16,7 @@ from PIL import Image
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
+from telegram.helpers import escape_markdown
 from telegram.ext import ConversationHandler, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler
 from telegram.ext._utils.types import ConversationDict
 
@@ -25,6 +26,8 @@ from ehforwarderbot.chat import SystemChatMember
 from ehforwarderbot.exceptions import EFBChatNotFound, EFBOperationNotSupported
 from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
+from .aggregate import MemberStatus, render_members
+from .utils import DEFAULT_TIMEZONE, format_message_time
 from .chat import ETMChatType, ETMGroupChat, unpickle
 from .constants import Emoji, Flags
 from .locale_mixin import LocaleMixin
@@ -100,9 +103,12 @@ class ChatBindingManager(LocaleMixin):
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
     FORUM_RELINK_THRESHOLD = 960_000
+    display_timezone = DEFAULT_TIMEZONE
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
+        self.display_timezone = channel.flag.timezone
+        self._history_ownership_swept = False
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
@@ -110,7 +116,7 @@ class ChatBindingManager(LocaleMixin):
         self._forum_limit_warned: set[int] = set()
         self._forum_limit_warned_lock = threading.Lock()
         self._history_migration_locks_lock = threading.Lock()
-        self._history_migration_locks: Dict[int, threading.Lock] = {}
+        self._history_migration_locks: Dict[Tuple[int, Optional[TelegramTopicID]], threading.Lock] = {}
         self._history_migration_thread: Optional[threading.Thread] = None
 
         # Link handler
@@ -259,10 +265,17 @@ class ChatBindingManager(LocaleMixin):
                 master_msg_id=utils.message_id_to_str(
                     chat_id=TelegramChatID(rtm.chat_id),
                     message_id=TelegramMessageID(rtm.message_id)
-                )
+                ), include_managed_alt=True
             )
             if msg_log:
-                channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(msg_log.slave_origin_uid))
+                if msg_log.aggregate:
+                    origins = {child['origin_uid'] for child in msg_log.aggregate['children']}
+                    if len(origins) != 1:
+                        return self.bot.reply_error(update, self._('Cannot determine the source chat of this container.'))
+                    origin_uid = origins.pop()
+                else:
+                    origin_uid = msg_log.slave_origin_uid
+                channel_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(origin_uid))
                 chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                 tg_chat_id = TelegramChatID(message.chat_id)
                 tg_msg_id = TelegramMessageID(
@@ -1190,12 +1203,12 @@ class ChatBindingManager(LocaleMixin):
             return
         # chat_list: Optional[ChatListStorage] = self.msg_storage.get(storage_id, None)
         self.msg_storage[storage_id].set_chat_suggestion(update)
+        self._set_conversation_state(self.suggestion_handler, storage_id, Flags.SUGGEST_RECIPIENTS)
         self.bot.edit_message_text(text=self._("Error: No recipient specified.\n"
                                                "Please reply to a previous message, "
                                                "or choose a recipient:\n\nLegend:\n") + "\n".join(legends),
                                    chat_id=chat_id, message_id=message_id,
                                    reply_markup=InlineKeyboardMarkup(buttons))
-        self._set_conversation_state(self.suggestion_handler, storage_id, Flags.SUGGEST_RECIPIENTS)
 
     def suggested_recipient(self, update: Update, context: CallbackContext):
         """Send the message to selected recipient among all suggested when a
@@ -1712,20 +1725,34 @@ class ChatBindingManager(LocaleMixin):
         self._history_migration_thread.start()
 
     def _resume_pending_history_migrations(self):
-        for target_chat_id in self.db.get_pending_history_migration_target_ids():
+        for target_chat_id, message_thread_id in self.db.get_pending_history_migration_targets():
             threading.Thread(
                 target=self._process_pending_history_migrations_for_target,
-                args=(int(target_chat_id),),
+                args=(int(target_chat_id), message_thread_id),
                 daemon=True,
-                name=f"HistoryMigration-{target_chat_id}",
+                name=f"HistoryMigration-{target_chat_id}-{message_thread_id or 'main'}",
             ).start()
 
-    def _history_migration_lock_for_target(self, target_chat_id: int) -> threading.Lock:
+    def _sweep_history_ownership(self) -> None:
+        """Forget ownership keys whose queue row is already gone."""
+        after = ""
+        while True:
+            keys = self.bot.history_ownership_page(after=after)
+            if not keys:
+                return
+            present = self.db.existing_history_ownership(keys)
+            self.bot.forget_history_entries(set(keys) - present)
+            after = keys[-1]
+
+    def _history_migration_lock_for_target(
+        self, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None,
+    ) -> threading.Lock:
+        key = (target_chat_id, message_thread_id)
         with self._history_migration_locks_lock:
-            lock = self._history_migration_locks.get(target_chat_id)
+            lock = self._history_migration_locks.get(key)
             if lock is None:
                 lock = threading.Lock()
-                self._history_migration_locks[target_chat_id] = lock
+                self._history_migration_locks[key] = lock
             return lock
 
     def _queue_and_process_history_migration(self, slave_chat_id: EFBChannelChatIDStr,
@@ -1733,10 +1760,10 @@ class ChatBindingManager(LocaleMixin):
                                              thread_id: Optional[TelegramTopicID] = None,
                                              storage_key: Optional[Tuple[TelegramChatID, TelegramMessageID]] = None):
         try:
-            with self._history_migration_lock_for_target(tg_chat_id):
+            with self._history_migration_lock_for_target(tg_chat_id, thread_id):
                 queued_count = self._queue_history_migration_entries(slave_chat_id, tg_chat_id, thread_id)
                 if queued_count:
-                    self._process_pending_history_migrations_locked(tg_chat_id)
+                    self._process_pending_history_migrations_locked(tg_chat_id, thread_id)
                 elif storage_key is not None:
                     self.send_history_link(slave_chat_id, tg_chat_id, storage_key, thread_id, empty_history=True)
         except Exception as e:
@@ -1751,24 +1778,45 @@ class ChatBindingManager(LocaleMixin):
             while True:
                 page = self.db.get_recent_messages(slave_chat_id, limit=32, after=after)
                 for msg_log in page:
-                    message_text = msg_log.text or ""
-                    formatted_text = None
-                    if message_text.strip() and not (msg_log.media_type and msg_log.media_type != 'Text'):
-                        etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
-                        timestamp = msg_log.time.strftime("%Y-%m-%d %H:%M") if msg_log.time else "Unknown"
-                        author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
-                        formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
-                    yield {
-                        "slave_chat_id": str(slave_chat_id),
-                        "target_chat_id": str(tg_chat_id),
-                        "message_thread_id": str(thread_id) if thread_id is not None else None,
-                        "source_master_msg_id": msg_log.master_msg_id,
-                        "formatted_text": formatted_text,
-                        "media_type": msg_log.media_type,
-                        "source_time": msg_log.time,
-                        "position": position,
-                    }
-                    position += 1
+                    aggregate = msg_log.aggregate
+                    members = aggregate["children"] if aggregate is not None else [msg_log.source_member]
+                    for member in members:
+                        if member is not None and member["status"] == MemberStatus.REDIRECTED:
+                            continue
+                        source_time = member["source_time"] if member is not None else msg_log.time
+                        received_time = member["received_time"] if member is not None else None
+                        media_type = 'Text' if aggregate is not None else msg_log.media_type
+                        formatted_text = None
+                        if member is not None and not (media_type and media_type != 'Text'):
+                            # History has its own author/timestamp header. Render
+                            # only the saved body/reply here, never the live hint
+                            # or destination display prefix.
+                            message_text = render_members(
+                                [dict(member, display_prefix="")], history=True,
+                            ).text
+                            author_name = escape_markdown(member["author_name"] or "Unknown")
+                            message_text = escape_markdown(message_text)
+                        else:
+                            message_text = msg_log.text or ""
+                            if message_text.strip() and not (media_type and media_type != 'Text'):
+                                etm_msg = msg_log.build_etm_msg(self.chat_manager, recur=False)
+                                author_name = etm_msg.author.display_name if etm_msg.author else "Unknown"
+                        if (member is not None or message_text.strip()) and not (media_type and media_type != 'Text'):
+                            display_time = source_time or received_time
+                            timestamp = format_message_time(display_time, self.display_timezone) if display_time else "Unknown"
+                            formatted_text = f"*{author_name}* `{timestamp}`\n{message_text}\n\n"
+                        yield {
+                            "slave_chat_id": str(slave_chat_id),
+                            "target_chat_id": str(tg_chat_id),
+                            "message_thread_id": str(thread_id) if thread_id is not None else None,
+                            "source_master_msg_id": msg_log.master_msg_id,
+                            "formatted_text": formatted_text,
+                            "media_type": media_type,
+                            "source_time": source_time,
+                            "received_time": received_time,
+                            "position": position,
+                        }
+                        position += 1
                 if len(page) < 32:
                     return
                 after = page[-1].time, page[-1].master_msg_id
@@ -1777,24 +1825,22 @@ class ChatBindingManager(LocaleMixin):
         self.logger.info("Queued %s historical messages for chat %s", queued_count, slave_chat_id)
         return queued_count
 
-    def _process_pending_history_migrations_for_target(self, target_chat_id: int):
-        with self._history_migration_lock_for_target(target_chat_id):
-            self._process_pending_history_migrations_locked(target_chat_id)
+    def _process_pending_history_migrations_for_target(
+        self, target_chat_id: int, message_thread_id: Optional[TelegramTopicID] = None,
+    ):
+        with self._history_migration_lock_for_target(target_chat_id, message_thread_id):
+            self._process_pending_history_migrations_locked(target_chat_id, message_thread_id)
 
-    def _process_pending_history_migrations_locked(self, target_chat_id: Optional[int] = None):
-        after = ""
+    def _process_pending_history_migrations_locked(
+        self, target_chat_id: Optional[int] = None,
+        message_thread_id: Optional[TelegramTopicID] = None,
+    ):
+        # One lane per topic would otherwise repeat this global sweep N times.
+        if not self._history_ownership_swept:
+            self._sweep_history_ownership()
+            self._history_ownership_swept = True
         while True:
-            keys = self.bot.history_ownership_page(after=after)
-            if not keys:
-                break
-            present = self.db.existing_history_ownership(keys)
-            self.bot.forget_history_entries(set(keys) - present)
-            after = keys[-1]
-        while True:
-            if target_chat_id is None:
-                target = self.db.get_next_history_migration_target()
-            else:
-                target = self.db.get_next_history_migration_target(target_chat_id)
+            target = self.db.get_next_history_migration_target(target_chat_id, message_thread_id)
             if target is None:
                 return
             if not self._process_history_migration_target(target):

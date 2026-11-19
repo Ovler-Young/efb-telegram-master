@@ -1,6 +1,6 @@
 import threading
 from concurrent.futures import Future
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -15,6 +15,9 @@ from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
 from efb_telegram_master.constants import Flags
 from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
+from tests.unit.test_history_replay import history as history
+
+
 def _build_link_update(chat_id, *, is_forum=False):
     effective_chat = SimpleNamespace(id=chat_id, is_forum=is_forum, type="group")
     message = Mock()
@@ -314,26 +317,23 @@ def test_start_uses_raw_message_args_for_link_chat(channel):
     link_chat.assert_called_once_with(update, ["token", "true"])
 
 
-def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channel):
-    HistoryMigrationEntry.delete().execute()
+def test_migrate_chat_history_enqueues_ordered_batches_and_clears_pending_entries(history):
+    manager = history.binding
+    manager._history_migration_locks_lock = threading.Lock()
+    manager._history_migration_locks = {}
+    manager.bot.history_ownership_page = Mock(return_value=[])
     msg_logs = []
     base_time = datetime.now()
     for idx in range(3):
-        msg_log = Mock()
-        msg_log.master_msg_id = f"1.{idx}"
         # Each source exceeds half the batch limit, so these stay separate.
-        msg_log.text = "x" * 2500
-        msg_log.media_type = "Text"
-        msg_log.time = base_time + timedelta(seconds=idx)
+        msg_log = MsgLog(master_msg_id=f"1.{idx}", text="x" * 2500,
+                         media_type="Text", time=base_time + timedelta(seconds=idx))
         etm_msg = SimpleNamespace(author=SimpleNamespace(display_name=f"author-{idx}"))
-        msg_log.build_etm_msg.return_value = etm_msg
+        msg_log.build_etm_msg = Mock(return_value=etm_msg)
         msg_logs.append(msg_log)
 
-    media_log = Mock()
-    media_log.text = ""
-    media_log.media_type = "Photo"
-    media_log.master_msg_id = "1.2"
-    media_log.time = base_time + timedelta(seconds=10)
+    media_log = MsgLog(master_msg_id="1.2", text="", media_type="Photo",
+                       time=base_time + timedelta(seconds=10))
     msg_logs.append(media_log)
 
     waiters = []
@@ -342,10 +342,10 @@ def test_migrate_chat_history_waits_for_each_call_before_deleting_entries(channe
         waiter.set_result(None)
         waiters.append(waiter)
     source = SimpleNamespace(sender_bot_id=None, master_msg_id_alt=None, media_type=None, file_id=None)
-    with patch.object(channel.db, "get_recent_messages", return_value=msg_logs), \
-         patch.object(channel.db, "get_msg_log", return_value=source), \
-         patch.object(channel.bot_manager, "enqueue_history_operation", side_effect=waiters) as enqueue:
-        channel.chat_binding._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
+    with patch.object(manager.db, "get_recent_messages", return_value=msg_logs), \
+         patch.object(manager.db, "get_msg_log", return_value=source), \
+         patch.object(manager.bot, "enqueue_history_operation", side_effect=waiters) as enqueue:
+        manager._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
 
     assert enqueue.call_count == 4
     assert [call.kwargs["operation"] for call in enqueue.call_args_list] == [
@@ -362,18 +362,22 @@ def test_queue_history_migration_entries_persists_pending_rows():
     manager.db = Mock()
     manager.chat_manager = Mock()
     manager.logger = Mock()
-    base_time = datetime.now()
+    base_time = datetime(2026, 10, 9, 11, 33, 31, tzinfo=timezone.utc)
     text_log = Mock()
     text_log.master_msg_id = "10.20"
     text_log.text = "hello"
     text_log.media_type = "Text"
     text_log.time = base_time
+    text_log.aggregate = None
+    text_log.source_member = None
     text_log.build_etm_msg.return_value = SimpleNamespace(author=SimpleNamespace(display_name="author"))
     media_log = Mock()
     media_log.master_msg_id = "10.21"
     media_log.text = ""
     media_log.media_type = "Photo"
     media_log.time = base_time + timedelta(seconds=1)
+    media_log.aggregate = None
+    media_log.source_member = None
     manager.db.get_recent_messages.return_value = [text_log, media_log]
     manager.db.replace_history_migration_entries.return_value = 2
 
@@ -387,7 +391,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
     assert queued_count == 2
     assert len(entries) == 2
     assert entries[0]["source_master_msg_id"] == "10.20"
-    assert entries[0]["formatted_text"] == f"*author* `{base_time.strftime('%Y-%m-%d %H:%M')}`\nhello\n\n"
+    assert entries[0]["formatted_text"] == "*author* `19:33:31`\nhello\n\n"
     assert entries[1]["source_master_msg_id"] == "10.21"
     assert entries[1]["formatted_text"] is None
 
@@ -395,6 +399,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
 def test_process_pending_history_migrations_transfers_entries_to_durable_queue_before_waiting():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager.logger = Mock()
+    manager._history_ownership_swept = False
     pending_entries = [
         SimpleNamespace(
             id=1, ownership_key="legacy:1",
@@ -431,7 +436,7 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
         ),
     ]
 
-    def get_next_history_migration_target():
+    def get_next_history_migration_target(*_args, **_kwargs):
         return pending_entries[0] if pending_entries else None
 
     def get_history_migration_entries(_slave_chat_id, _tg_chat_id, _thread_id, limit=None):
@@ -508,77 +513,59 @@ def test_process_pending_history_migrations_transfers_entries_to_durable_queue_b
     assert pending_entries == []
 
 
-def test_history_migrations_run_concurrently_per_target_group():
+def test_history_migration_lanes_serialize_per_topic_not_per_chat():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager._history_migration_locks_lock = threading.Lock()
     manager._history_migration_locks = {}
     manager.logger = Mock()
 
     queued_targets = []
-    manager._queue_history_migration_entries = lambda _source, target, _thread: (
-        queued_targets.append(target) or 1
+    manager._queue_history_migration_entries = lambda _source, target, thread: (
+        queued_targets.append((target, thread)) or 1
     )
 
-    entered = {101: threading.Event(), 202: threading.Event()}
-    second_101_entered = threading.Event()
-    release_first_101 = threading.Event()
-    release_second_101 = threading.Event()
-    release_202 = threading.Event()
-    active_targets = set()
+    entered = {}
+    releases = {}
+    active = set()
     active_lock = threading.Lock()
-    starts = []
 
-    def process_target(target):
+    def process_target(target, thread=None):
+        key = (target, thread)
         with active_lock:
-            assert target not in active_targets
-            active_targets.add(target)
-            starts.append(target)
-            if target == 101:
-                if starts.count(101) == 1:
-                    entered[101].set()
-                    release = release_first_101
-                else:
-                    second_101_entered.set()
-                    release = release_second_101
-            else:
-                entered[202].set()
-                release = release_202
-        assert release.wait(timeout=2)
+            assert key not in active, "one topic must not run two lanes at once"
+            active.add(key)
+            entered.setdefault(key, threading.Event()).set()
+            releases.setdefault(key, threading.Event())
+        assert releases[key].wait(timeout=2)
         with active_lock:
-            active_targets.remove(target)
+            active.discard(key)
 
     manager._process_pending_history_migrations_locked = process_target
 
-    def migrate(target):
-        ChatBindingManager._queue_and_process_history_migration(manager, "source", target)
+    def migrate(target, thread=None):
+        ChatBindingManager._queue_and_process_history_migration(manager, "source", target, thread)
 
-    first_101 = threading.Thread(target=migrate, args=(101,))
-    first_101.start()
-    assert entered[101].wait(timeout=2)
+    # Two topics of one chat are separate lanes and must not block each other.
+    first = threading.Thread(target=migrate, args=(101, 11))
+    first.start()
+    second = threading.Thread(target=migrate, args=(101, 12))
+    second.start()
+    assert entered[(101, 11)].wait(timeout=2)
+    assert entered[(101, 12)].wait(timeout=2)
 
-    worker_202 = threading.Thread(target=migrate, args=(202,))
-    worker_202.start()
-    assert entered[202].wait(timeout=2)
+    # A second run of an already active topic waits for that topic's lane.
+    duplicate_done = threading.Event()
+    duplicate = threading.Thread(target=lambda: (migrate(101, 11), duplicate_done.set()))
+    duplicate.start()
+    assert not duplicate_done.wait(timeout=0.05)
 
-    second_101_finished = threading.Event()
-    second_101 = threading.Thread(target=lambda: (migrate(101), second_101_finished.set()))
-    second_101.start()
-    assert not second_101_finished.wait(timeout=0.05)
-    assert starts == [101, 202]
-
-    release_first_101.set()
-    assert second_101_entered.wait(timeout=2)
-    assert starts.count(101) == 2
-
-    release_second_101.set()
-    release_202.set()
-    first_101.join(timeout=2)
-    second_101.join(timeout=2)
-    worker_202.join(timeout=2)
-    assert not first_101.is_alive()
-    assert not second_101.is_alive()
-    assert not worker_202.is_alive()
-    assert sorted(queued_targets) == [101, 101, 202]
+    for event in tuple(releases.values()):
+        event.set()
+    assert duplicate_done.wait(timeout=2)
+    for worker in (first, second, duplicate):
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert sorted(queued_targets) == [(101, 11), (101, 11), (101, 12)]
 
 
 def test_history_migration_continues_after_terminal_delivery_failure():

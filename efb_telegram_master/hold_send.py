@@ -8,8 +8,7 @@ from pathlib import Path
 import sqlite3
 
 from .db_runtime import DataDirectoryLock
-
-OPERATOR_HOLD = "uncertain:operator_observed_delivery"
+from .delivery_states import OPERATOR_HOLD, Event, RowState, classify, next_state
 
 
 def hold(directory: Path, row_id: int, *, apply: bool = False) -> dict:
@@ -21,17 +20,22 @@ def hold(directory: Path, row_id: int, *, apply: bool = False) -> dict:
     )) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
+            columns = {col[1] for col in db.execute("PRAGMA table_info(outbound_queue)")}
+            # Queues from versions without holds have no delivery_hold column yet.
+            hold_column = "delivery_hold" if "delivery_hold" in columns else "NULL"
             row = db.execute(
-                "SELECT operation, telegram_chat_id, delivery_state, completion_receipt IS NOT NULL "
-                "FROM outbound_queue WHERE id=?", (row_id,),
+                "SELECT operation, telegram_chat_id, delivery_state, completion_receipt IS NOT NULL, "
+                f"{hold_column} FROM outbound_queue WHERE id=?", (row_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("Queue row not found; no data changed")
-            operation, chat_id, state, has_receipt = row
-            if state != "queued" or has_receipt:
+            operation, chat_id, state, has_receipt, current_hold = row
+            current = classify(state, current_hold)
+            if current is RowState.SENT_PENDING or has_receipt:
                 raise ValueError("This row already has a completion state/receipt; do not override it")
+            if next_state(current, Event.OPERATOR_HOLD) is None:
+                raise ValueError(f"This row is already held as {current_hold}; no data changed")
             if apply:
-                columns = {col[1] for col in db.execute("PRAGMA table_info(outbound_queue)")}
                 if "delivery_hold" not in columns:
                     db.execute("ALTER TABLE outbound_queue ADD COLUMN delivery_hold TEXT NULL")
                 db.execute("UPDATE outbound_queue SET delivery_hold=? WHERE id=?", (OPERATOR_HOLD, row_id))
