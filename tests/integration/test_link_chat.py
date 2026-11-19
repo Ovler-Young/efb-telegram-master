@@ -1,15 +1,16 @@
 import asyncio
 import re
+from dataclasses import dataclass
 from itertools import chain
 from typing import List, Optional
 from uuid import uuid4
 
+import pytest_asyncio
 from pytest import mark
 from telethon.errors import MessageIdInvalidError
 from telethon.tl.custom import Message, MessageButton
 from telethon.tl.functions.channels import DeleteChannelRequest
-from telethon.tl.functions.messages import CreateChatRequest, MigrateChatRequest, \
-    DeleteChatUserRequest
+from telethon.tl.functions.messages import CreateChatRequest, DeleteChatRequest, MigrateChatRequest
 from telethon.tl.types import MessageEntityCode, Updates, Chat as TelethonChat
 from telethon.utils import get_peer_id
 
@@ -253,46 +254,83 @@ async def simulate_link_chat(client, helper, chat: Chat, command_chat: int, dest
     )
 
 
-async def test_group_chat_migration(client, helper, channel, slave, bot_id):
-    slave_chats = slave.chats_by_chat_type["PrivateChat"]
-    title = f"Chat upgrade test {uuid4()}"
-    response = await client(CreateChatRequest(users=[bot_id], title=title))
-    if getattr(response, "chats", None):
-        chat: TelethonChat = response.chats[0]
-    elif getattr(response, "updates", None) and getattr(response.updates, "chats", None):
-        chat: TelethonChat = response.updates.chats[0]
-    else:
-        chat = await client.get_entity(title)
-    with link_chats(channel, slave_chats, get_peer_id(chat)):
-        mega_chat_response = await client(MigrateChatRequest(chat_id=chat.id))
-        if getattr(mega_chat_response, "chats", None):
-            mega_chat: TelethonChat = next(
-                c for c in mega_chat_response.chats
-                if getattr(c, "id", None) != chat.id
-            )
-        elif getattr(mega_chat_response, "updates", None) and getattr(mega_chat_response.updates, "chats", None):
-            mega_chat = next(
-                c for c in mega_chat_response.updates.chats
-                if getattr(c, "id", None) != chat.id
-            )
+@dataclass
+class UpgradeTestGroup:
+    """A basic group created for the migration test and the supergroup it becomes."""
+    title: str
+    chat: TelethonChat | None = None
+    migrated: TelethonChat | None = None
+
+
+async def _delete_upgrade_test_group(client, group: UpgradeTestGroup):
+    """Delete every chat this test created, however the test ended."""
+    deleted_ids = set()
+    if group.migrated is not None:
+        await client(DeleteChannelRequest(group.migrated))
+        deleted_ids.add(group.migrated.id)
+    # A failure between migrating and reading the result leaves the supergroup unknown:
+    # find it by the unique title among the newest dialogs.
+    async for dialog in client.iter_dialogs(limit=50):
+        if dialog.title != group.title or dialog.entity.id in deleted_ids:
+            continue
+        if dialog.is_channel:
+            await client(DeleteChannelRequest(dialog.entity))
         else:
-            mega_chat = await client.get_entity(get_peer_id(chat))
+            await client(DeleteChatRequest(dialog.entity.id))
+        deleted_ids.add(dialog.entity.id)
+    if group.chat is not None and group.chat.id not in deleted_ids:
+        # The basic group stays behind, deactivated, after it is migrated.
+        await client(DeleteChatRequest(group.chat.id))
 
-        deadline = asyncio.get_running_loop().time() + 20
-        while True:
-            migrated = get_peer_id(mega_chat)
-            original = get_peer_id(chat)
-            try:
-                assert_is_linked(channel, slave_chats, migrated)
-                assert_is_linked(channel, tuple(), original)
-            except AssertionError:
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise
-                await asyncio.sleep(0.1)
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def upgrade_test_group(client, bot_id):
+    group = UpgradeTestGroup(title=f"Chat upgrade test {uuid4()}")
+    try:
+        response = await client(CreateChatRequest(users=[bot_id], title=group.title))
+        if getattr(response, "chats", None):
+            group.chat = response.chats[0]
+        elif getattr(response, "updates", None) and getattr(response.updates, "chats", None):
+            group.chat = response.updates.chats[0]
+        else:
+            group.chat = await client.get_entity(group.title)
+        yield group
+    finally:
+        await _delete_upgrade_test_group(client, group)
+
+
+async def test_group_chat_migration(client, helper, channel, slave, upgrade_test_group):
+    slave_chats = slave.chats_by_chat_type["PrivateChat"]
+    chat = upgrade_test_group.chat
+    try:
+        with link_chats(channel, slave_chats, get_peer_id(chat)):
+            mega_chat_response = await client(MigrateChatRequest(chat_id=chat.id))
+            if getattr(mega_chat_response, "chats", None):
+                chats = mega_chat_response.chats
+            elif getattr(mega_chat_response, "updates", None) and getattr(mega_chat_response.updates, "chats", None):
+                chats = mega_chat_response.updates.chats
             else:
-                break
+                chats = []
+            mega_chat: TelethonChat = next(
+                (c for c in chats if getattr(c, "id", None) != chat.id),
+                None
+            ) or await client.get_entity(get_peer_id(chat))
+            upgrade_test_group.migrated = mega_chat
 
-    # Clean up
-    unlink_all_chats(channel, get_peer_id(mega_chat))
-    unlink_all_chats(channel, get_peer_id(chat))
-    await client(DeleteChannelRequest(mega_chat.id))
+            deadline = asyncio.get_running_loop().time() + 20
+            while True:
+                migrated = get_peer_id(mega_chat)
+                original = get_peer_id(chat)
+                try:
+                    assert_is_linked(channel, slave_chats, migrated)
+                    assert_is_linked(channel, tuple(), original)
+                except AssertionError:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise
+                    await asyncio.sleep(0.1)
+                else:
+                    break
+    finally:
+        unlink_all_chats(channel, get_peer_id(chat))
+        if upgrade_test_group.migrated is not None:
+            unlink_all_chats(channel, get_peer_id(upgrade_test_group.migrated))

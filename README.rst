@@ -222,7 +222,8 @@ The stored data includes:
 Normal sends and history text batching use ordinary sender selection, never
 an original-bot constraint. Only saved-file acquisition uses the file-ID issuer.
 See the `history replay guide <docs/history-replay.md>`_ and
-`delivery recovery guide <docs/delivery-recovery.md>`_ for recovery boundaries.
+`delivery recovery guide <docs/delivery-recovery.md>`_ for recovery boundaries,
+and the `state machine index <docs/state-machines.md>`_ for every persisted lifecycle.
 
 Runtime queue recovery streams oversized legacy media into sidecars while
 retaining filenames. Failed preparation and decoding preserve existing media;

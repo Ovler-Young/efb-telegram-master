@@ -7,10 +7,11 @@ from unittest.mock import Mock
 import httpx
 import pytest
 from telegram import InputFile
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.db_runtime import connection_scope
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.outbound import HISTORY_REPLAY_KEY, OutboundQueue, RequiredSenderUnavailableError
 from tests.unit.test_history_replay import (
     Sender, finish_attempt, history as history, populate, prepare_runtime,
@@ -69,6 +70,44 @@ def enqueue_owned(manager, target, operation, kwargs):
         source_key='slave chat', target_chat_id=-1002, operation=operation,
         args=(), kwargs=kwargs, history_entry_ids=[target.id],
     )
+
+
+def test_acquisition_retry_is_counted_after_durable_deferral(history, monkeypatch):
+    class ThrottledAcquisition(Sender):
+        def get_file(self, file_id):
+            self.file_requests.append(file_id)
+            raise RetryAfter(10)
+
+    target, operation, kwargs = prepare_owned(history, owner=None)
+    sender = ThrottledAcquisition(copy_error=BadRequest('Message to copy not found'))
+    manager, executor, scheduler = prepare_runtime(history, sender)
+    queue = manager._outbound_queue
+    metrics = Metrics()
+    queue.metrics = metrics
+    monkeypatch.setattr('efb_telegram_master.outbound.time.time', lambda: 1000)
+    monkeypatch.setattr('efb_telegram_master.outbound.time.monotonic', lambda: 1000)
+    try:
+        waiter = enqueue_owned(manager, target, operation, kwargs)
+        scheduler.dispatch_once()
+        finish_attempt(executor, scheduler)
+
+        labels = dict(priority='normal', operation='copy_message', reason='acquisition')
+        assert metrics.registry.get_sample_value('etm_outbound_retries_total', labels) == 1
+        assert queue.connection.execute(
+            'SELECT delivery_state, delivery_hold, reconcile_attempts, reconcile_after FROM outbound_queue'
+        ).fetchall() == [('queued', None, 1, 1010)]
+        assert not waiter.done()
+        assert scheduler.next_deadline == 1010
+        assert [kind for kind, _ in sender.calls] == ['copy_message']
+        assert sender.file_requests == ['saved-video-file-id']
+
+        scheduler.harvest_completed()
+        scheduler.dispatch_once()
+        assert metrics.registry.get_sample_value('etm_outbound_retries_total', labels) == 1
+        assert len(executor.submissions) == 1
+        assert not waiter.done()
+    finally:
+        queue.close()
 
 
 @pytest.mark.parametrize('media_type,operation,argument', MEDIA)
@@ -204,13 +243,17 @@ def test_get_file_never_falls_back_to_another_bot(history, state):
 def test_remote_download_is_chunked_and_not_forwarded_as_owner_url(history, monkeypatch):
     manager, _, _ = prepare_runtime(history, Sender())
     url = 'https://files.example/file/botOWNER/media.mp4'
-    owner = SimpleNamespace(get_file=Mock(return_value=SimpleNamespace(file_path=url)))
+    manager._transfer_min_mbps = 2.5
+    owner = SimpleNamespace(get_file=Mock(return_value=SimpleNamespace(
+        file_path=url, file_size=312500)))
     attach_owner(manager, owner, membership=False)
     requested = []
 
     @contextmanager
     def stream(method, path, **kwargs):
         requested.append((method, path))
+        assert kwargs["timeout"].read == 121
+        assert kwargs["timeout"].connect == 120
         def chunks(*, chunk_size):
             assert chunk_size == 1024 * 1024
             yield b'one'

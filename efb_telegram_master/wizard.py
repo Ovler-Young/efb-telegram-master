@@ -380,6 +380,7 @@ def setup_telegram_bot_commands_list(data):
                 ("link", _("Link a remote chat to a group.")),
                 ("unlink_all", _("Unlink all remote chats from a group.")),
                 ("info", _("Display information of the current Telegram chat.")),
+                ("aggregation", _("Show or set text aggregation for a linked source chat.")),
                 ("chat", _("Generate a chat head.")),
                 ("extra", _("Access additional features from Slave Channels.")),
                 ("update_info", _("Update info of linked Telegram group.")),

@@ -76,6 +76,7 @@ def test_history_migration_entry_table_exists():
         "message_thread_id",
         "source_master_msg_id",
         "formatted_text",
+        "received_time",
         "position",
     }.issubset(history_columns)
     assert "source_master_msg_id" not in msglog_columns
