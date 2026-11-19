@@ -490,3 +490,33 @@ def test_upload_in_flight_when_stopping_is_still_saved(make_creator, api, profil
     creator.stop()
 
     assert saved_rows(directory)["member-user:zed"] == ("9001", SET_6)
+
+
+def test_retried_read_back_of_a_filled_set_does_not_change_the_current_set(
+        make_creator, api, profile, caplog):  # noqa: F811
+    directory, _ = profile
+    api.sets[SET_6] = [f"s{i}" for i in range(198)]
+    answer = api.answer
+    read_back_failed = []
+
+    def failing_first_read_back(method, params, files):
+        if method == "getStickerSet" and api.methods("addStickerToSet") and not read_back_failed:
+            read_back_failed.append(1)
+            return 400, {"ok": False, "error_code": 400, "description": "Bad Request: temporarily unavailable"}
+        return answer(method, params, files)
+
+    api.answer = failing_first_read_back
+    store, creator = make_creator(legacy_rows(1), retry_base=0.1)
+    creator.start()
+    for uid in ("kim", "lee", "max"):  # kim and lee fill set 6, max starts set 7
+        creator.request(uid, avatar)
+        wait_until(settled(store, caplog, [uid]))
+    time.sleep(0.15)
+    creator.request("kim", avatar)
+    wait_until(lambda: store.lookup("kim") is not None)
+    creator.request("zed", avatar)
+    wait_until(lambda: store.lookup("zed") is not None)
+
+    rows = saved_rows(directory)
+    assert [rows["member-user:" + uid][1] for uid in ("kim", "lee", "max", "zed")] == [SET_6, SET_6, SET_7, SET_7]
+    assert len(api.sets[SET_7]) == 2
