@@ -141,3 +141,93 @@ and existing media while allowing later runnable rows to continue. This hold
 indicates a payload problem, not evidence that Telegram accepted the message.
 Configured request timeouts remain unchanged; expiry never authorizes an
 unconfirmed duplicate upload.
+
+## Queue row states
+
+Every row of `outbound-queue.sqlite3` is in exactly one state, read from its
+`delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
+deferred row). The definition lives in `efb_telegram_master/delivery_states.py`:
+`RowState` (states), `HoldKind` (stored hold spellings), `Event`, `TRANSITIONS`
+(the allowed-transition table), `classify`, `parse_hold` and `format_hold`.
+Stored spellings never change between versions.
+
+| State | `delivery_state` / `delivery_hold` | Meaning | Operator action |
+|---|---|---|---|
+| waiting | `queued` / NULL | Will be sent when its destination's turn comes. | None. |
+| deferred | `queued` / NULL, `reconcile_after` ahead | Media acquisition failed before any send; retried after a capped backoff. | None. |
+| in_flight | `queued` / `in_flight` | Attempt recorded before submission. After a restart it is an interrupted attempt that may have been delivered. | If delivered, `/confirm_send`; otherwise investigate. |
+| uncertain | `queued` / `uncertain:<Class>[/<Cause>]` | Ambiguous result: Telegram may have accepted it. | `/confirm_send` on the delivered message. |
+| uncertain (operator) | `queued` / `uncertain:operator_observed_delivery` | Held offline by `hold_send` for a send already seen on Telegram. | `/confirm_send`; any configured bot is accepted. |
+| invalid_payload | `queued` / `invalid_payload` | The stored request cannot be decoded. Not evidence of delivery. | Investigate the row. |
+| history_failed | `queued` / `history_failed:<Class>` | History replay was rejected. Startup re-queues `RequiredSenderUnavailableError` rows that never started an attempt. | Investigate, or `/confirm_send` if it was delivered. |
+| supplement_failed | `queued` / `supplement_failed:<Class>` | The full-content attachment of a long message was rejected; the primary message is unaffected. | Investigate the row. |
+| aggregation_failed | `queued` / `aggregation_failed:<Class>` | An aggregated text batch, or a row others are ordered behind, failed for good. | Investigate the row. |
+| unrecognized hold | `queued` / any other text | A hold written by another version. Kept and never sent. | Use the version that wrote it, or `/confirm_send`. |
+| sent_pending | `sent_pending` / NULL | Telegram receipt saved; the MsgLog write is retried with backoff. | None. |
+| absent | no row | Not yet enqueued, or removed. | None. |
+
+| Event | From | To | Code |
+|---|---|---|---|
+| enqueue | absent | waiting | `OutboundQueue.enqueue_many`, aggregation handoff, supplement insert |
+| begin_attempt | waiting, deferred | in_flight | `begin_delivery_attempt` (an aggregation row that `materialize` already moved to in_flight is left unchanged) |
+| materialize | waiting, deferred | in_flight | `materialize_aggregation` |
+| release_attempt | in_flight | waiting | `release_delivery_attempt` (submission failed or Telegram definitely rejected; an aggregate rewinds to its logical batch) |
+| hold_uncertain | waiting, deferred, in_flight | uncertain | `hold_uncertain_delivery` |
+| operator_hold | waiting, deferred, in_flight, uncertain | uncertain | `python -m efb_telegram_master.hold_send --apply` |
+| hold_invalid_payload | waiting, deferred, in_flight | invalid_payload | `hold_invalid_payload` |
+| hold_failed_history / hold_failed_supplement | waiting, deferred, in_flight | history_failed / supplement_failed | `hold_failed_history` |
+| hold_failed_aggregation | waiting, deferred, in_flight | aggregation_failed | `hold_failed_aggregation` |
+| defer_acquisition | waiting, deferred, in_flight | deferred | `defer_acquisition` |
+| record_completion | waiting, deferred, in_flight | sent_pending | `record_telegram_completion` |
+| operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`) |
+| defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
+| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, terminal discard, cancellation) |
+| repair_history_sender | history_failed | waiting | queue open, schema migration |
+
+An event the row's state does not accept is never applied. The queue raises
+`IllegalDeliveryTransitionError` with a message such as `Queue row 12 is
+invalid_payload; hold_uncertain is not allowed there, so the row was left
+unchanged.` It is handled like any other queue persistence error, and the row
+keeps its bytes. In particular a hold never replaces another hold, and an
+acquisition retry never clears one. Two events are reported instead of
+stopping: releasing a row that is not in flight logs `Send attempt not
+released: ...`, and deferring the reconciliation of a row that is not
+`sent_pending` logs `... its receipt reconciliation was not deferred.`
+`/confirm_send` answers `Only a held, unconfirmed send can be confirmed.` for a
+row it cannot resolve, and `hold_send` exits with `Hold failed: This row is
+already held as <hold>; no data changed` for a row held for another reason.
+
+## Ordering links
+
+A row may name a predecessor in `predecessor_id`: aggregated text, a long
+message's attachment and history replay use it to keep their order. From the
+dependent's side a link is:
+
+* **free**: no predecessor; the row is ready when it is waiting.
+* **barrier**: the predecessor exists, is not the row itself, and is waiting,
+  deferred, in flight or `sent_pending`. The dependent waits.
+* **void**: the predecessor is gone, is the row itself, or is held. The
+  dependent is ready: waiting for it either already happened or never ends.
+* **cycle**: every waiting row defers to another waiting row. The scheduler
+  then sends the oldest row per destination and logs `deferred by predecessor
+  links that never resolve`.
+
+An attempt interrupted by a restart stays `in_flight`, so rows linked behind it
+keep waiting until `/confirm_send` resolves it.
+
+Links are set at enqueue. A successful removal or an aggregation handoff clears
+the links that point at the row. Cancelling a batch or a pending source
+re-points them at the removed row's own predecessor, splitting a batch at its
+last part, and a long message's attachment at that attachment. A failed row
+that is discarded leaves them void.
+
+The rule is defined once in `efb_telegram_master/delivery_states.py`:
+`waiting_sql`, `barrier_sql`, `behind_barrier_sql` and `ready_sql` build the SQL,
+and `is_waiting`, `is_barrier` and `is_ready` mirror it in Python.
+`OutboundQueue.heads`, `head_for`, `has_waiting_rows` and
+`has_unresolvable_dependency` use it. `queue_report.py` carries a copy so it can
+run without the package (a unit test keeps the copy identical): its
+`dispatchable` column counts ready rows, `head per destination` elects among
+ready rows like the scheduler, and `--lane` shows `behind predecessor` for a
+row behind a barrier and `sendable` for a ready one. A deferred head is ready
+but waits for `retry_in_s`.
