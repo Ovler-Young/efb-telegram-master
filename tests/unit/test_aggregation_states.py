@@ -64,6 +64,14 @@ def test_rows_of_every_kind_recover_and_reconcile(runtime):
         manager._enqueue_requests([QueueRequest("send_message", (), {"chat_id": -100, "text": "Alice:\nthree body"})])
     assert states(manager) == {ContextState.AGGREGATE, ContextState.FROZEN_SOURCE, ContextState.MEMBER_UPDATE,
                                ContextState.LOGICAL, ContextState.BOUNDARY, ContextState.SOURCE}
+    # A container update in the shape stored before rows carried their append flag.
+    update, = [row for row in queue.aggregation_rows()
+               if context_state(decode_aggregation(row.log_context)) is ContextState.MEMBER_UPDATE]
+    older_update = decode_aggregation(update.log_context)
+    del older_update["appendable"]
+    queue.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
+                             (encode_aggregation(older_update), update.id))
+    queue.connection.commit()
 
     restart(manager)
     assert manager._outbound_scheduler.reconcile_sent_pending() == {sent_id}

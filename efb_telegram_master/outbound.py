@@ -1616,9 +1616,13 @@ class OutboundQueue:
                     before = logical_split.get("before")
                     # The batch keeps the members before the source, or is
                     # withdrawn when the split rows replace all of it.
-                    check_context_transition(
-                        logical_split["row_id"], decode_aggregation(original[1]),
-                        ContextEvent.REPLACE if before else ContextEvent.WITHDRAW, before)
+                    original_context = decode_aggregation(original[1])
+                    split_event = ContextEvent.REPLACE if before else ContextEvent.WITHDRAW
+                    if check_context_transition(logical_split["row_id"], original_context, split_event,
+                                                before) is not ContextState.LOGICAL:
+                        raise IllegalAggregationTransitionError(
+                            logical_split["row_id"], (original_context or {}).get("kind"), split_event,
+                            "Only a logical batch is split.")
                     if before:
                         self._mark_row_destinations_dirty(logical_split["row_id"], dependents=True)
                     else:
