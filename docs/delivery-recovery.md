@@ -171,12 +171,17 @@ Stored spellings never change between versions.
 | absent | no row | Not yet enqueued, or removed. | None. |
 
 Only `/confirm_send` ends a hold (and startup, for the `history_failed` rows
-named above). The bot never removes a held row or its media by itself: a row
-that was not delivered stays in the queue until an operator removes it.
+named above: when the queue opens, the schema migration clears only
+`history_failed:RequiredSenderUnavailableError` on a history row that never
+started an attempt). The bot never removes a held row or its media by itself: a
+row that was not delivered stays in the queue until an operator removes it.
+
+A new row is written as waiting by `OutboundQueue.enqueue_many`, the aggregation
+handoff and the supplement insert; it has no earlier state to check, so the table
+below lists only events on an existing row.
 
 | Event | From | To | Code |
 |---|---|---|---|
-| enqueue | absent | waiting | `OutboundQueue.enqueue_many`, aggregation handoff, supplement insert (a new row has no earlier state to check) |
 | begin_attempt | waiting, deferred | in_flight | `begin_delivery_attempt` (an aggregation row that `materialize` already moved to in_flight is left unchanged) |
 | materialize | waiting, deferred | in_flight | `materialize_aggregation` |
 | release_attempt | in_flight | waiting | `release_delivery_attempt` (submission failed or Telegram definitely rejected; an aggregate rewinds to its logical batch) |
@@ -191,7 +196,6 @@ that was not delivered stays in the queue until an operator removes it.
 | defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
 | remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held) |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
-| repair_history_sender | history_failed | waiting | queue open, schema migration; only `history_failed:RequiredSenderUnavailableError` on a history row that never started an attempt |
 
 An event the row's state does not accept is never applied. The queue raises
 `IllegalDeliveryTransitionError` with a message such as `Queue row 12 is
@@ -233,28 +237,27 @@ last part, and a long message's attachment at that attachment. A failed row
 that is discarded leaves them void.
 
 The rule is defined once in `efb_telegram_master/delivery_states.py`:
-`waiting_sql`, `barrier_sql`, `behind_barrier_sql` and `ready_sql` build the SQL,
-and `is_waiting`, `is_barrier` and `is_ready` mirror it in Python.
+`waiting_sql`, `barrier_sql` and `ready_sql` build the SQL.
 `OutboundQueue.heads`, `head_for`, `has_waiting_rows` and
 `has_unresolvable_dependency` use it. `queue_report.py` carries a copy so it can
-run without the package (a unit test keeps the copy identical): its
-`dispatchable` column counts ready rows, `head per destination` elects among
-ready rows like the scheduler, and `--lane` shows `behind predecessor` for a
-row behind a barrier and `sendable` for a ready one. A deferred head is ready
-but waits for `retry_in_s`.
+run without the package (a unit test keeps the copies of `waiting_sql`,
+`barrier_sql` and `ready_sql` identical; `behind_barrier_sql` exists only there,
+for the report): its `dispatchable` column counts ready rows, `head per
+destination` elects among ready rows like the scheduler, and `--lane` shows
+`behind predecessor` for a row behind a barrier and `sendable` for a ready one.
+A deferred head is ready but waits for `retry_in_s`.
 
 ## Outbound worker
 
 One worker thread delivers the queue. Each pass harvests finished calls,
 reconciles receipts, retries blocked media edits and then offers each
-destination's head a worker slot. The pass ends in exactly one outcome, and the
-outcome decides how long the worker sleeps before the next pass. Enqueues and
-completions always wake it early. The definition is `PassOutcome` in
-`efb_telegram_master/outbound.py`, returned by
-`OutboundQueueScheduler.dispatch_once`; when several apply, the first one in
-this table wins.
+destination's head a worker slot. A pass ends in one of the ways below, and the
+way it ends decides how long the worker sleeps before the next pass. Enqueues and
+completions always wake it early. `OutboundQueueScheduler.dispatch_once` sets
+`next_deadline` and leaves calls in flight accordingly; when several apply, the
+first one in this table wins.
 
-| Outcome | When | Worker then waits | Log |
+| Pass ends as | When | Worker then waits | Log |
 |---|---|---|---|
 | stopped | The scheduler is stopping or hit a queue persistence error. | Does not wait: the worker exits and durable rows stay queued. | `Outbound recovery stopped; durable rows retained: ...` after a persistence error |
 | stalled | Rows are still waiting, none has a retry deadline, nothing is in flight. | 30 seconds (`STALL_RESCAN_SECONDS`), then rescans. | `Outbound scheduler left N dispatchable head(s) undispatched ... while queued rows remain`, at most once a minute |
