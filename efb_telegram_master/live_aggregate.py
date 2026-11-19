@@ -434,7 +434,7 @@ class LiveTextAggregation:
         confirmed = base["aggregate"] if can_edit else None
         aggregate = make_aggregate(children, revision, admin_id=self.admin_id, display_timezone=self.display_timezone,
                                    confirmed=confirmed)
-        # Only memory is read here; an author whose emoji is not ready keeps the plain header.
+        # The emoji lookup reads only memory; an author whose emoji is not ready keeps the plain header.
         author_emoji = (self.manager.channel.custom_emoji.lookup
                         if self.manager._sender_can_send_custom_emoji(selection) else None)
         kwargs = dict(chat_id=context["key"][1], text=render_members(children, admin_id=self.admin_id, display_timezone=self.display_timezone,
