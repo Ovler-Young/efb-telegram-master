@@ -1,4 +1,5 @@
 import datetime
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -7,7 +8,7 @@ from telegram import CallbackQuery, Chat, Document, Message, TextQuote, Update, 
 from ehforwarderbot import Channel, MsgType, coordinator
 from ehforwarderbot.exceptions import EFBOperationNotSupported
 
-from efb_telegram_master import TelegramChannel
+from efb_telegram_master import TelegramChannel, selection_session
 from efb_telegram_master.aggregate import make_source_member, utf16_length
 from efb_telegram_master.chat_destination_cache import ChatDestinationCache
 from efb_telegram_master.db import MsgLog
@@ -283,3 +284,77 @@ def test_managed_alternate_output_reply_and_rm_use_effective_member_state(handle
     handler.msg(incoming(canonical), SimpleNamespace())
     assert len(handler.sent) == 1
     assert 'no longer available' in handler.notices[-1].text
+
+
+EXPIRED = 'This selection has expired or belongs to another user. Please retry the reply or /rm.'
+
+
+class FakeClock:
+    def __init__(self, now):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+
+def record_answers(handler):
+    answers = []
+    handler.bot.answer_callback_query = lambda query_id, text=None, **kwargs: answers.append(text)
+    return answers
+
+
+def test_cancel_and_choice_end_selection_and_reject_later_actions(handler):
+    target = container(handler)
+    answers = record_answers(handler)
+    handler.msg(incoming(target), SimpleNamespace())
+    notice = handler.notices[-1]
+    cancel = notice.reply_markup.inline_keyboard[-1][0].callback_data
+    click(handler, notice, data=cancel)
+    assert not handler.sent and not handler.members.sessions
+    click(handler, notice, data=notice.reply_markup.inline_keyboard[1][0].callback_data)
+    assert not handler.sent
+    assert answers[-1] == EXPIRED
+    handler.msg(incoming(target), SimpleNamespace())
+    notice = handler.notices[-1]
+    choose = notice.reply_markup.inline_keyboard[1][0].callback_data
+    click(handler, notice, data=choose)
+    click(handler, notice, data=choose)
+    assert [message.target.uid for message in handler.sent] == ['source-1']
+    assert answers[-1] == EXPIRED
+
+
+def test_page_invalidates_selection_when_sources_change(handler):
+    target = container(handler, tuple(['duplicate'] * 10))
+    answers = record_answers(handler)
+    handler.msg(incoming(target), SimpleNamespace())
+    notice = handler.notices[-1]
+    next_page = notice.reply_markup.inline_keyboard[-1][-1].callback_data
+    handler.db.add_chat_assoc(chat_id_to_str('tests.master', '-200'), chat_id_to_str('tests.source', 'group'))
+    click(handler, notice, data=next_page)
+    assert answers[-1] == 'Source messages have changed. Please retry the reply or /rm.'
+    assert not handler.members.sessions
+    click(handler, notice, data=notice.reply_markup.inline_keyboard[0][0].callback_data)
+    assert not handler.sent
+    assert answers[-1] == EXPIRED
+
+
+def test_selection_expires_at_the_fifteen_minute_deadline(handler, monkeypatch):
+    target = container(handler)
+    answers = record_answers(handler)
+    clock = FakeClock(time.monotonic())
+    monkeypatch.setattr(selection_session, 'time', clock)
+    handler.msg(incoming(target), SimpleNamespace())
+    notice = handler.notices[-1]
+    (session,) = handler.members.sessions.values()
+    assert session.expires_at - clock.now == pytest.approx(900, abs=1)
+    clock.now = session.expires_at - 1
+    click(handler, notice)
+    assert [message.target.uid for message in handler.sent] == ['source-1']
+    handler.msg(incoming(target), SimpleNamespace())
+    notice = handler.notices[-1]
+    (session,) = handler.members.sessions.values()
+    clock.now = session.expires_at
+    click(handler, notice)
+    assert len(handler.sent) == 1
+    assert answers[-1] == EXPIRED
+    assert not handler.members.sessions

@@ -11,6 +11,15 @@ from telegram.ext import CallbackContext, CallbackQueryHandler
 
 from .aggregate import member_identity, member_message, utf16_length
 from .ptb_compat import sync_reply_text
+from .selection_session import (
+    SESSION_SECONDS,
+    SelectionEvent,
+    SelectionState,
+    advance,
+    expire_stale,
+    find_session,
+    is_owner,
+)
 from . import utils
 from .utils import EFBChannelChatIDStr
 
@@ -44,11 +53,11 @@ class MemberSelection:
     identities: list[SourceIdentity]
     expires_at: float
     message_id: Optional[int] = None
+    state: SelectionState = SelectionState.OPEN
 
 
 class SourceMemberSelector:
     PAGE_SIZE = 8
-    SESSION_SECONDS = 900
 
     def __init__(self, processor: 'MasterMessageProcessor'):
         self.processor = processor
@@ -144,10 +153,9 @@ class SourceMemberSelector:
                 'This source message is no longer available here. Please retry the reply or /rm.'))
         session = MemberSelection(update, context, destination, method, target.master_msg_id,
                                   user.id, update.effective_chat.id, identities,
-                                  time.monotonic() + self.SESSION_SECONDS)
+                                  time.monotonic() + SESSION_SECONDS)
         with self.lock:
-            self.sessions = {token: saved for token, saved in self.sessions.items()
-                             if saved.expires_at > time.monotonic()}
+            expire_stale(self.sessions)
             token = secrets.token_urlsafe(9)
             self.sessions[token] = session
             try:
@@ -157,7 +165,7 @@ class SourceMemberSelector:
                                         _force_main_bot=True)
                 session.message_id = reply.message_id
             except Exception:
-                self.sessions.pop(token, None)
+                advance(self.sessions, token, session, SelectionEvent.INVALIDATE)
                 raise
 
     def keyboard(self, token: str, session: MemberSelection, target: 'MsgLog', page: int):
@@ -185,11 +193,11 @@ class SourceMemberSelector:
             return
         with self.lock:
             parts = (query.data or '').split(':')
-            session = self.sessions.get(parts[1]) if len(parts) == 4 else None
-            if (session is None or session.expires_at <= time.monotonic() or user is None
-                    or user.id != session.requester_id or user.id not in self.processor.channel.config['admins']
-                    or update.effective_chat is None or update.effective_chat.id != session.chat_id
-                    or update.effective_message is None or update.effective_message.message_id != session.message_id):
+            session = find_session(self.sessions, parts[1]) if len(parts) == 4 else None
+            chat, message = update.effective_chat, update.effective_message
+            if (session is None or user is None or chat is None or message is None
+                    or user.id not in self.processor.channel.config['admins']
+                    or not is_owner(session, user.id, chat.id, message.message_id)):
                 return self.processor.bot.answer_callback_query(query.id, text=self.processor._(
                     'This selection has expired or belongs to another user. Please retry the reply or /rm.'))
             token, action, argument = parts[1:]
@@ -200,15 +208,17 @@ class SourceMemberSelector:
             index = int(argument)
             if action == 'p' and 0 <= index <= (len(session.identities) - 1) // self.PAGE_SIZE:
                 if not all(self.resolve(target, identity) for identity in session.identities):
-                    self.sessions.pop(token, None)
+                    advance(self.sessions, token, session, SelectionEvent.INVALIDATE)
                     return self.processor.bot.answer_callback_query(query.id, text=self.processor._(
                         'Source messages have changed. Please retry the reply or /rm.'))
+                advance(self.sessions, token, session, SelectionEvent.PAGE)
                 self.processor.bot.edit_message_reply_markup(chat_id=session.chat_id, message_id=session.message_id,
                                                              reply_markup=self.keyboard(token, session, target, index))
                 return self.processor.bot.answer_callback_query(query.id)
             if action != 'c' and (action != 's' or not 0 <= index < len(session.identities)):
                 return self.processor.bot.answer_callback_query(query.id)
-            self.sessions.pop(token, None)
+            advance(self.sessions, token, session,
+                    SelectionEvent.CANCEL if action == 'c' else SelectionEvent.SELECT)
             self.processor.bot.edit_message_reply_markup(chat_id=session.chat_id, message_id=session.message_id,
                                                          reply_markup=None)
             self.processor.bot.answer_callback_query(query.id)
