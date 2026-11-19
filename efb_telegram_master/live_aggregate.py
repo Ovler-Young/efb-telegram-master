@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
+import math
 import pickle
 import time
 from contextlib import contextmanager
@@ -338,10 +339,6 @@ class LiveTextAggregation:
                 reserved[0] = False
                 self.scheduler._lock.release()
 
-    # How often a row that needs a failing predecessor on Telegram checks it again;
-    # the predecessor's own retry or completion wakes the scheduler sooner.
-    PREDECESSOR_RECHECK_SECONDS = 30.0
-
     def deadline(self, row):
         # Scheduler heads deliberately omit contexts until a worker is available.
         if row.log_context is None:
@@ -354,7 +351,7 @@ class LiveTextAggregation:
         if failing is not None:
             predecessor = decode_aggregation(failing[1]) if failing[1] else None
             if needs_delivered_predecessor(context, predecessor):
-                return time.time() + self.PREDECESSOR_RECHECK_SECONDS
+                return math.inf
         return context.get("due") if context["kind"] in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE} else None
 
     def materialize(self, row, selection):

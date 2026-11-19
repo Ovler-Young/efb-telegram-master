@@ -261,12 +261,18 @@ an edit of a container (`member_update`, including a removal or routing hint),
 an append into the predecessor's container (`logical` with `inherit`), and
 another output of a member the predecessor carries (`source`, `redirect`).
 `needs_delivered_predecessor` in `aggregation_states.py` names them, and the
-aggregation readiness check (`LiveTextAggregation.deadline`) defers them and
-checks again every 30 seconds. The predecessor's retry or delivery wakes the
-worker sooner. Such a waiting row is still its destination's head, so the rows
-after it in that destination wait with it, as they do behind a batch window. A
-row ordered behind such a waiting row also waits, because the waiting row
-itself has no failed attempts.
+aggregation readiness check (`LiveTextAggregation.deadline`) reports them as
+waiting with no deadline. The scheduler then leaves such a row out of head
+election, re-elects its destination and wakes, so the rows after it in that
+destination are sent while it waits. Each pass checks the rows set aside this
+way (`OutboundQueue.still_waiting_for_failing`); once a row's predecessor is
+delivered, confirmed, held or gone, or the row itself stopped waiting, the row
+takes part in head election again and its destination is re-elected. The set
+lives in memory only; after a restart the first pass finds such rows again.
+`queue_report.py` cannot read aggregation contexts, so its `head per
+destination` still shows a set-aside row as its destination's head. A row
+ordered behind such a waiting row also waits, because the waiting row itself
+has no failed attempts.
 
 Links are set at enqueue. A successful removal or an aggregation handoff clears
 the links that point at the row. Cancelling a batch or a pending source

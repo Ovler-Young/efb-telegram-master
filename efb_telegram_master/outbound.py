@@ -8,6 +8,7 @@ import inspect
 import io
 import itertools
 import logging
+import math
 import numbers
 import os
 import pickle
@@ -606,6 +607,11 @@ class QueueAdapter(Protocol):
         ...
 
     def queued_aggregation_deadline(self, row: QueuedCall) -> float | None:
+        """When ``row`` may be sent; None means now.
+
+        ``math.inf`` means it waits for its predecessor, which keeps failing, to
+        reach Telegram first.
+        """
         ...
 
     def materialize_queued_aggregation(
@@ -2839,6 +2845,24 @@ class OutboundQueue:
             ).fetchone()
         return None if row is None else (int(row[0]), row[1])
 
+    def still_waiting_for_failing(self, row_ids: Iterable[int]) -> set[int]:
+        """Those of ``row_ids`` that are waiting and whose predecessor still keeps failing."""
+        identifiers = tuple(row_ids)
+        if not identifiers:
+            return set()
+        with self._lock:
+            return {
+                int(row[0])
+                for row in self.connection.execute(
+                    "SELECT dependent.id FROM outbound_queue AS dependent "
+                    "JOIN outbound_queue AS predecessor ON predecessor.id = dependent.predecessor_id "
+                    "WHERE dependent.id IN (" + ",".join("?" for _ in identifiers) + ") "
+                    "AND predecessor.id != dependent.id AND " + waiting_sql("dependent") +
+                    " AND " + failing_sql("predecessor"),
+                    identifiers,
+                )
+            }
+
     def failing_retries(self) -> list[tuple[int, int, int | None, float]]:
         """Failing rows waiting for a retry: id, chat, topic and Unix retry time."""
         with self._lock:
@@ -3171,14 +3195,19 @@ class OutboundQueueScheduler:
         # Rows whose receipt their aggregation kind cannot take; reported once each.
         self._illegal_receipt_rows: set[int] = set()
         self._head_rows: dict[tuple[int, Optional[int]], QueuedCall] = {}
+        # Rows that need a predecessor which keeps failing on Telegram first. They
+        # are left out of head election until it stops failing, so the rest of
+        # their destination is sent meanwhile.
+        self._waiting_for_failing: dict[int, tuple[int, int | None]] = {}
         self._heads_scanned_at = 0.0
         self._heal_heads = True
 
     def _dispatch_heads(self) -> list[QueuedCall]:
         """Runnable heads in dispatch order, re-electing only what changed."""
         now = time.monotonic()
-        excluded = self.quarantined_rows
         self._schedule_failing_retries()
+        self._readmit_waiting_for_failing()
+        excluded = self._election_excluded()
         dirty = self.queue.take_dirty_destinations()
         if (self._heal_heads or not self._head_rows
                 or now - self._heads_scanned_at >= self.HEADS_FULL_RESCAN_SECONDS):
@@ -3205,6 +3234,18 @@ class OutboundQueueScheduler:
         return [
             row for layer in itertools.zip_longest(*tiers.values()) for row in layer if row is not None
         ]
+
+    def _election_excluded(self) -> set[int]:
+        return {*self.quarantined_rows, *self._waiting_for_failing}
+
+    def _readmit_waiting_for_failing(self) -> None:
+        """Put rows back into head election once their predecessor stopped failing."""
+        if not self._waiting_for_failing:
+            return
+        still = self.queue.still_waiting_for_failing(self._waiting_for_failing)
+        for row_id in tuple(self._waiting_for_failing):
+            if row_id not in still:
+                self.queue.mark_destination_dirty(*self._waiting_for_failing.pop(row_id))
 
     def _schedule_failing_retries(self) -> None:
         """Wake for each failing row's retry, and re-elect its destination once it is due.
@@ -3620,7 +3661,7 @@ class OutboundQueueScheduler:
                 # order at all, so deliver the oldest row per destination instead of
                 # leaving the queue idle until the next restart.
                 heads = self.queue.heads(
-                    include_payload=False, excluded_ids=self.quarantined_rows,
+                    include_payload=False, excluded_ids=self._election_excluded(),
                     ready_only=True, respect_predecessors=False,
                 )
                 if heads:
@@ -3663,6 +3704,12 @@ class OutboundQueueScheduler:
                     self._schedule_retry(now + row.retry_after - time.time())
                     continue
                 deadline = self.adapter.queued_aggregation_deadline(row)
+                if deadline == math.inf:
+                    # Re-elect its destination without it in the next pass.
+                    self._waiting_for_failing[row.id] = self._destination_key(row)
+                    self.queue.mark_destination_dirty(row.telegram_chat_id, row.thread_id)
+                    self.wake_event.set()
+                    continue
                 if deadline is not None and deadline > time.time():
                     self._schedule_retry(now + deadline - time.time())
                     continue
