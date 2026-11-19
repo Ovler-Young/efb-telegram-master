@@ -436,8 +436,8 @@ class _Author:
     failures: int = 0
     retry_at: float = 0.0
     load_avatar: Callable[[], BinaryIO] | None = None
-    added_to: str | None = None
-    """Set the sticker was added to, while its custom emoji id is still to be read back."""
+    added_to: tuple[str, int] | None = None
+    """(set name, position in the set) of the sticker added for this author, while its custom emoji id is still to be read back."""
     unsaved: tuple[str, str] | None = None
     """(custom emoji id, set name) uploaded to Telegram but not saved yet."""
 
@@ -578,7 +578,7 @@ class UserEmojiCreator:
                     if load_avatar is None:
                         raise _AuthorFailed("no avatar source")
                     author.added_to = self._upload(uid, self._avatar_png(load_avatar))
-                author.unsaved = self._read_back(author.added_to)
+                author.unsaved = self._read_back(*author.added_to)
             self._save(uid, author)
         except _AuthorFailed as failure:
             self._fail(uid, author, str(failure), failure.retry_after)
@@ -607,8 +607,11 @@ class UserEmojiCreator:
         assert self._loop is not None
         return self._loop.run_until_complete(coroutine)
 
-    def _upload(self, uid: str, png: io.BytesIO) -> str:
-        """Add the sticker to the current set, moving to the next set when it is full; returns the set's name."""
+    def _upload(self, uid: str, png: io.BytesIO) -> tuple[str, int]:
+        """Add the sticker to the current set, moving to the next set when it is full.
+
+        Returns the set's name and the sticker's position in it.
+        """
         assert self._bot is not None
         owner = self._store.config.owner_user_id
         assert owner is not None
@@ -638,16 +641,21 @@ class UserEmojiCreator:
                 # our back: look the set up again before the next write.
                 self._move_set(StickerSetEvent.WRITE_FAILED)
                 self._telegram_failed(error)
-            return name
+            position, self._set_count = self._set_count, self._set_count + 1
+            return name, position
 
-    def _read_back(self, name: str) -> tuple[str, str]:
-        """The custom emoji id of the sticker just added to the set ``name``."""
+    def _read_back(self, name: str, position: int) -> tuple[str, str]:
+        """The custom emoji id of the sticker added at ``position`` of the set ``name``.
+
+        Other authors' stickers may have been added since, so the last sticker is not necessarily this one.
+        """
         sticker_set = self._read_set(name)
-        if not sticker_set.stickers or not sticker_set.stickers[-1].custom_emoji_id:
+        emoji_id = sticker_set.stickers[position].custom_emoji_id if position < len(sticker_set.stickers) else None
+        if not emoji_id:
             raise _AuthorFailed(f"sticker set {name} has no new custom emoji")
         self._set_count = len(sticker_set.stickers)
         self._move_set(StickerSetEvent.FILLED if self._set_count >= STICKER_SET_LIMIT else StickerSetEvent.ADDED)
-        return sticker_set.stickers[-1].custom_emoji_id, name
+        return emoji_id, name
 
     def _open_set(self) -> str:
         """Name of a set with room, looking up each set at most once per session."""

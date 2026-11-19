@@ -370,6 +370,36 @@ def test_failed_read_back_after_the_upload_is_retried_without_uploading_again(
     assert len(api.files) == 1
 
 
+def test_retried_read_back_saves_this_authors_sticker_not_a_later_one(
+        make_creator, api, profile, caplog):  # noqa: F811
+    directory, _ = profile
+    api.sets[SET_6] = ["s0"]
+    answer = api.answer
+    read_back_failed = []
+
+    def failing_first_read_back(method, params, files):
+        if method == "getStickerSet" and api.methods("addStickerToSet") and not read_back_failed:
+            read_back_failed.append(1)
+            return 400, {"ok": False, "error_code": 400, "description": "Bad Request: temporarily unavailable"}
+        return answer(method, params, files)
+
+    api.answer = failing_first_read_back
+    store, creator = make_creator(legacy_rows(1), retry_base=0.1)
+    creator.start()
+    creator.request("kim", avatar)
+    wait_until(settled(store, caplog, ["kim"]))
+    creator.request("lee", avatar)
+    wait_until(lambda: store.lookup("lee") is not None)
+    time.sleep(0.15)
+    creator.request("kim", avatar)
+    wait_until(lambda: store.lookup("kim") is not None)
+
+    rows = saved_rows(directory)
+    kim, lee = (rows["member-user:" + uid][0] for uid in ("kim", "lee"))
+    assert api.sets[SET_6][1:] == [kim, lee]
+    assert len(api.files) == 2
+
+
 def test_telegram_error_fails_only_that_author(make_creator, api, caplog):
     store, creator = make_creator(legacy_rows(1))
     creator.start()
