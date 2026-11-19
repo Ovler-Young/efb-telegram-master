@@ -2938,8 +2938,8 @@ class ReservedSlot:
         if self._settled:
             self._slots.report("own", row_id)
             return
-        self._settled = True
-        self._slots._own(row_id)
+        # A rejected ownership leaves the reservation for the block's exit to release.
+        self._settled = self._slots._own(row_id)
 
     def release(self) -> None:
         if not self._settled:
@@ -3002,13 +3002,14 @@ class WorkerSlots:
             event, row_id,
         )
 
-    def _own(self, row_id: int) -> None:
+    def _own(self, row_id: int) -> bool:
         with self._lock:
             if self._reserved > 0 and row_id not in self._owners:
                 self._reserved -= 1
                 self._owners.add(row_id)
-                return
+                return True
         self.report("own", row_id)
+        return False
 
     def _release_reservation(self) -> None:
         with self._lock:
@@ -3284,7 +3285,10 @@ class OutboundQueueScheduler:
             with slot:
                 decision = self._select_sender(retry.row, now)
                 if decision is None:
-                    self._schedule_blocking_retry_before_deadline(retry, now + self.STALL_RESCAN_SECONDS)
+                    # The sender lookup raised: hold the row for the delay the log names.
+                    retry = self.blocking_media_retries[row_id] = replace(
+                        retry, retry_at=now + self.STALL_RESCAN_SECONDS)
+                    self._schedule_blocking_retry_before_deadline(retry, retry.retry_at)
                     continue
                 if decision.terminal_error_class is not None:
                     self._record_dispatch("failed")
@@ -3306,7 +3310,10 @@ class OutboundQueueScheduler:
                     continue
                 limits_acquired = self._acquire_sender_limits(retry.row, retry.selection)
                 if limits_acquired is None:
-                    self._schedule_blocking_retry_before_deadline(retry, now + self.STALL_RESCAN_SECONDS)
+                    # Acquiring the sender's limits raised: hold the row for the delay the log names.
+                    retry = self.blocking_media_retries[row_id] = replace(
+                        retry, retry_at=now + self.STALL_RESCAN_SECONDS)
+                    self._schedule_blocking_retry_before_deadline(retry, retry.retry_at)
                     continue
                 if not limits_acquired:
                     self._record_dispatch("deferred")

@@ -781,6 +781,39 @@ def test_blocking_media_retry_caps_limiter_wait_at_original_deadline(
     assert len(executor.submissions) == 1
 
 
+def test_blocking_media_retry_waits_the_logged_delay_after_a_failing_sender_lookup(
+    retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
+    adapter = RecordingAdapter()
+    _enqueue_blocking_media_edit(retained_queue, io.BufferedReader(io.BytesIO(b"media")))
+    executor = ControlledExecutor()
+    scheduler = OutboundQueueScheduler(retained_queue, adapter, executor, worker_count=1)
+    scheduler.dispatch_once()
+    executor.submissions[0][2].set_exception(RetryAfter(10))
+    scheduler.harvest_completed()
+    lookups = []
+
+    def failing_select_sender(_row, now: float) -> SenderSelectionResult:
+        lookups.append(now)
+        raise RuntimeError("sender pool unavailable")
+
+    monkeypatch.setattr(adapter, "select_sender", failing_select_sender)
+    clock.update(monotonic=110.0, wall=1010.0)
+    scheduler.dispatch_once()
+    # An unrelated wake-up before the logged delay does not ask, or log, again.
+    clock.update(monotonic=111.0, wall=1011.0)
+    scheduler.dispatch_once()
+    assert lookups == [110.0]
+    assert scheduler.next_deadline == 110.0 + OutboundQueueScheduler.STALL_RESCAN_SECONDS
+
+    clock.update(monotonic=scheduler.next_deadline, wall=1010.0 + OutboundQueueScheduler.STALL_RESCAN_SECONDS)
+    scheduler.dispatch_once()
+    assert len(lookups) == 2
+
+
 def test_blocking_media_retry_keeps_required_auxiliary_sender(
     retained_queue: OutboundQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
