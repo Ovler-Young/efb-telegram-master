@@ -504,6 +504,54 @@ def test_an_edit_of_a_batch_that_keeps_failing_waits_while_later_messages_go(run
     assert not queue.aggregation_rows()
 
 
+def test_a_message_ordered_behind_a_waiting_edit_waits_too(runtime, monkeypatch, caplog):
+    manager = runtime
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    real_time, real_monotonic, skipped = time.time, time.monotonic, [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + skipped[0])
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + skipped[0])
+    not_sent = NetworkError("request not sent")
+    not_sent.__cause__ = httpx.ConnectError("connection refused")
+    manager.transport.error = not_sent
+    key, member = append(manager, "one", 1)
+    batch = queue.aggregation_rows()[0].id
+    scheduler.dispatch_once()
+    next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+    assert manager.live_aggregation.remove_source_member(key, member_identity(member))
+    removal = max(row.id for row in queue.aggregation_rows())
+    assert decode_aggregation(queue.aggregation_context(removal))["kind"] == "member_update"
+    chained, _ = queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": -100, "text": "chained"}, predecessor_id=removal)],
+        manager._queue_operation)
+    scheduler.harvest_completed()
+    for _ in range(2):
+        skipped[0] += 2
+        scheduler.dispatch_once()
+        next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+        scheduler.harvest_completed()
+    manager.transport.error = None
+
+    # Nothing else is queued: the chain ends at a send that is retried later,
+    # so it is not a cycle to break and the message keeps its place.
+    with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
+        for _ in range(3):
+            scheduler.dispatch_once()
+            assert not scheduler.in_flight and scheduler.failure is None
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert "chained" not in [call[2] for call in manager.transport.calls]
+    assert queue.contains(batch) and queue.contains(removal) and queue.contains(chained)
+
+    # The batch is delivered late, then its member is removed, then the message goes.
+    skipped[0] += 2
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "send_message"
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "edit_message_text"
+    complete(manager)
+    assert manager.transport.calls[-1][2] == "chained"
+    assert not queue.contains(chained) and not queue.aggregation_rows()
+
+
 def test_an_append_into_a_batch_that_keeps_failing_waits_while_later_messages_go(runtime, monkeypatch):
     manager = runtime
     queue, scheduler = manager._outbound_queue, manager._outbound_scheduler

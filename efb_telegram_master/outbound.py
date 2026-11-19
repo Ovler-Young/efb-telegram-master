@@ -2176,14 +2176,17 @@ class OutboundQueue:
         """Whether every waiting row defers to another waiting row.
 
         Deferring to a row that is already delivered, held or gone resolves on its
-        own. Deferring only to other waiting rows cannot: it is a cycle, and no
-        dispatch pass can ever pick a head from it.
+        own, and so does deferring to a row that keeps failing: it is retried, and
+        a row that needs its Telegram message waits for that retry. Deferring only
+        to other waiting rows cannot: it is a cycle, and no dispatch pass can ever
+        pick a head from it.
         """
         with self._lock:
             resolvable = self.connection.execute(
                 "SELECT 1 FROM outbound_queue AS waiting "
                 "JOIN outbound_queue AS predecessor ON predecessor.id = waiting.predecessor_id "
-                "WHERE " + waiting_sql("waiting") + " AND NOT (" + waiting_sql("predecessor") + ") LIMIT 1"
+                "WHERE " + waiting_sql("waiting") + " AND (NOT (" + waiting_sql("predecessor") + ") OR "
+                + failing_sql("predecessor") + ") LIMIT 1"
             ).fetchone()
         return resolvable is None
 

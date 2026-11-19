@@ -233,9 +233,10 @@ dependent's side a link is:
   ready unless it needs the predecessor's Telegram message (below).
 * **void**: the predecessor is gone, is the row itself, or is held. The
   dependent is ready: waiting for it either already happened or never ends.
-* **cycle**: every waiting row defers to another waiting row. The scheduler
-  then sends the oldest row per destination and logs `deferred by predecessor
-  links that never resolve`.
+* **cycle**: every waiting row defers to another waiting row that has not
+  failed 3 attempts in a row. The scheduler then sends the oldest row per
+  destination and logs `deferred by predecessor links that never resolve`. A
+  chain that ends at a failing row is not a cycle: that row is retried.
 
 A failed attempt is a send that failed with a retryable error (a connection
 that never reached Telegram, a chat migration) or a failed media acquisition.
@@ -306,7 +307,7 @@ first one in this table wins.
 |---|---|---|---|
 | stopped | The scheduler is stopping or hit a queue persistence error. | Does not wait: the worker exits and durable rows stay queued. | `Outbound recovery stopped; durable rows retained: ...` after a persistence error |
 | stalled | Rows are still waiting, none has a retry deadline, nothing is in flight. | 30 seconds (`STALL_RESCAN_SECONDS`), then rescans. | `Outbound scheduler left N dispatchable head(s) undispatched ... while queued rows remain`, at most once a minute |
-| cycle | No head was ready and every waiting row defers to another waiting row; the oldest row per destination was sent anyway. | For that call to complete, or for a retry deadline. The next pass re-elects every head. | `deferred by predecessor links that never resolve` |
+| cycle | No head was ready and every waiting row defers to another waiting row that is not failing; the oldest row per destination was sent anyway. | For that call to complete, or for a retry deadline. The next pass re-elects every head. | `deferred by predecessor links that never resolve` |
 | permit_leak | Every worker slot was taken while nothing was in flight, so no completion could free one; the slots were reset. | For the calls this pass started, or for a retry deadline. | `Outbound worker permits were held without a submitted call; resetting them. Queued rows are retained.` |
 | busy | A call is in flight. | For a completion, or for a retry deadline. | None. |
 | deferred | Nothing is in flight; a row, receipt or blocked media edit has a retry deadline. | Until the earliest deadline. | None. |
