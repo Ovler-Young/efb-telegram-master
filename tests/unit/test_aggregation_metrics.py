@@ -64,8 +64,13 @@ def test_logical_split_only_counts_deleted_original(observed, retain_before):
 def test_handoff_insert_rollback_and_idempotence(observed):
     manager, metrics = observed
     key, _ = append(manager, "first", 1)
+    # Send the container; its receipt is applied below instead of by the scheduler.
+    manager._outbound_scheduler.dispatch_once()
+    for submitted in manager._outbound_scheduler.in_flight.values():
+        submitted.future.result(timeout=2)
     parent = manager._outbound_queue.aggregation_rows()[0]
     context = decode_aggregation(parent.log_context)
+    assert context["kind"] == "aggregate"
     context["handoff"] = True
     request = QueueRequest("edit_message_text", (), {"chat_id": -100, "message_id": 1, "text": "hint", "_required_sender_bot_id": "__main__"},
                            encode_aggregation(dict(context, kind="member_update", routing_hint=True)),

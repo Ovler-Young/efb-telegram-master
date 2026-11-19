@@ -35,6 +35,9 @@ from telegram import (
 from telegram.error import NetworkError, RetryAfter
 import httpx
 
+from .aggregation_states import (
+    ContextEvent, ContextKind, ContextState, context_state, next_context_states,
+)
 from .delivery_states import (
     QUEUED, SENT_PENDING, Event, HoldKind, RowState, classify, error_detail,
     format_hold, next_state, ready_sql, waiting_sql,
@@ -175,6 +178,37 @@ class QueuePersistenceError(QueueError):
 
 class IllegalDeliveryTransitionError(QueuePersistenceError):
     """A row's delivery state does not accept the requested event; nothing was written."""
+
+
+class IllegalAggregationTransitionError(QueuePersistenceError):
+    """An aggregation row's context does not accept the requested event; nothing was written."""
+
+    def __init__(self, row_id: int, kind: object, event: ContextEvent, reason: str = ""):
+        self.row_id, self.kind, self.event = row_id, kind, event
+        message = f"Aggregation queue row {row_id} of kind {kind!r} does not accept {event.value}; the row was left unchanged."
+        super().__init__(f"{message} {reason}" if reason else message)
+
+
+def check_context_transition(
+    row_id: int, context: dict | None, event: ContextEvent, target: dict | None = None, *, reason: str = "",
+) -> ContextState:
+    """Check ``event`` (and the resulting ``target`` context, when given) before a write.
+
+    Returns the current state; raises ``IllegalAggregationTransitionError`` when
+    the transition table does not allow it. A row without an aggregation
+    context (None) is not an aggregation row: only its delivery state applies.
+    """
+    if context is None:
+        return ContextState.ABSENT
+    state = context_state(context)
+    allowed = next_context_states(state, event)
+    kind = context.get("kind")
+    if not allowed:
+        raise IllegalAggregationTransitionError(row_id, kind, event, reason)
+    if target is not None and context_state(target) not in allowed:
+        raise IllegalAggregationTransitionError(
+            row_id, kind, event, f"It cannot become {context_state(target).value}.")
+    return state
 
 
 class OversizedQueuedPayloadError(QueuePersistenceError):
@@ -1577,9 +1611,14 @@ class OutboundQueue:
                     from .queued_log import decode_aggregation, encode_aggregation
                     original = self.connection.execute("SELECT predecessor_id, log_context, priority, operation, created_at FROM outbound_queue WHERE "
                         "id=? AND " + waiting_sql(), (logical_split["row_id"],)).fetchone()
-                    if original is None or decode_aggregation(original[1])["kind"] != "logical":
+                    if original is None:
                         raise QueuePersistenceError("Source batch was submitted before its split.")
                     before = logical_split.get("before")
+                    # The batch keeps the members before the source, or is
+                    # withdrawn when the split rows replace all of it.
+                    check_context_transition(
+                        logical_split["row_id"], decode_aggregation(original[1]),
+                        ContextEvent.REPLACE if before else ContextEvent.WITHDRAW, before)
                     if before:
                         self._mark_row_destinations_dirty(logical_split["row_id"], dependents=True)
                     else:
@@ -1680,7 +1719,7 @@ class OutboundQueue:
 
     def _record_source_cancellation(self, key: tuple, member: SourceMember) -> None:
         from .queued_log import encode_aggregation
-        context = encode_aggregation(dict(format_version=1, kind="cancellation", key=tuple(key), member=member))
+        context = encode_aggregation(dict(format_version=1, kind=ContextKind.CANCELLATION, key=tuple(key), member=member))
         self.connection.execute(
             "INSERT INTO source_cancellations (origin_uid, source_id, source_revision, log_context) "
             "VALUES (?, ?, ?, ?) ON CONFLICT (origin_uid, source_id) DO UPDATE SET "
@@ -1703,9 +1742,12 @@ class OutboundQueue:
                 key = context.get("key")
                 if not key or int(key[1]) != chat_id or key[2] != topic:
                     continue
-                if context["kind"] == "logical":
+                # Rows without append flags (independent outputs, boundaries) do not take it.
+                if not next_context_states(context_state(context), ContextEvent.CLOSE_DESTINATION):
+                    continue
+                if context["kind"] == ContextKind.LOGICAL:
                     context.update(base=None, inherit=False, appendable=False, incoming_boundary=True)
-                elif context["kind"] in {"aggregate", "member_update"}:
+                elif context["kind"] in {ContextKind.AGGREGATE, ContextKind.MEMBER_UPDATE}:
                     context.update(appendable=False, incoming_boundary=True)
                     retry = context.get("retry_context")
                     if retry:
@@ -1723,7 +1765,13 @@ class OutboundQueue:
             row = self.connection.execute(
                 "SELECT log_context FROM outbound_queue WHERE id=? AND " + waiting_sql(), (row_id,),
             ).fetchone()
-            if row is None or decode_aggregation(row[0]).get("kind") not in {"logical", "member_update"}:
+            if row is None:
+                return False
+            try:
+                check_context_transition(row_id, decode_aggregation(row[0]), ContextEvent.REPLACE,
+                                         decode_aggregation(context))
+            except IllegalAggregationTransitionError as error:
+                logging.getLogger(__name__).warning("Aggregation batch not replaced: %s", error)
                 return False
             if cancelled_member is not None:
                 self._record_source_cancellation(tuple(decode_aggregation(row[0])["key"]), cancelled_member)
@@ -1733,9 +1781,13 @@ class OutboundQueue:
     def materialize_aggregation(self, row_id: int, operation: str, kwargs: dict,
                                 context: bytes, selection: SenderSelection) -> QueuedCall:
         """Freeze the selected operation and sender before executor submission."""
+        from .queued_log import decode_aggregation
         payload = self.encode_payload((), kwargs)
         with self._lock, self.connection:
             self._transition(row_id, Event.MATERIALIZE)
+            stored = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
+            check_context_transition(row_id, decode_aggregation(stored[0]), ContextEvent.MATERIALIZE,
+                                     decode_aggregation(context))
             cursor = self.connection.execute(
                 "UPDATE outbound_queue SET operation=?, payload=?, log_context=?, required_sender_bot_id=?, "
                 "attempt_sender_bot_id=?, delivery_hold=?, attempt_started_at=? "
@@ -1755,7 +1807,12 @@ class OutboundQueue:
         with self._lock:
             with self.connection:
                 previous = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
-                if previous is None or decode_aggregation(previous[0]).get("handoff"):
+                if previous is None:
+                    return [], False
+                parent = decode_aggregation(parent_context)
+                if check_context_transition(row_id, decode_aggregation(previous[0]), ContextEvent.RECEIPT,
+                                            parent) is ContextState.HANDED_OFF:
+                    # Applied already; a retry after a failed row removal changes nothing.
                     return [], False
                 self._mark_row_destinations_dirty(row_id, dependents=True)
                 identifiers = []
@@ -1775,7 +1832,6 @@ class OutboundQueue:
                     self.mark_destination_dirty(chat_id, queued_thread_id(kwargs, context))
                     identifiers.append(identifier)
                     inserted.append((priority, operation))
-                parent = decode_aggregation(parent_context)
                 rows = self.connection.execute(
                     "SELECT id, log_context FROM outbound_queue WHERE predecessor_id=? OR predecessor_id=?",
                     (row_id, parent.get("supplement_id")),
@@ -1806,8 +1862,9 @@ class OutboundQueue:
                                               + waiting_sql(), (row_id,)).fetchone()
                 if row is None:
                     raise QueuePersistenceError("The logical batch was already submitted.")
+                from .queued_log import decode_aggregation
+                check_context_transition(row_id, decode_aggregation(row[1]), ContextEvent.WITHDRAW)
                 if cancelled_member is not None:
-                    from .queued_log import decode_aggregation
                     self._record_source_cancellation(tuple(decode_aggregation(row[1])["key"]), cancelled_member)
                 self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (row[0], row_id))
                 self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
@@ -1827,9 +1884,15 @@ class OutboundQueue:
             matching = []
             for row in rows:
                 context = decode_aggregation(row[1])
-                if (tuple(context["key"]) == tuple(key) and context["kind"] in {"source", "redirect"}
+                if (tuple(context["key"]) == tuple(key)
+                        and context["kind"] in {ContextKind.SOURCE, ContextKind.REDIRECT}
                         and member_identity(context["member"]) == member_identity(member)):
                     if next_state(classify(row[2], row[3]), Event.WITHDRAW) is None or row[4] is not None:
+                        return {}
+                    try:
+                        check_context_transition(row[0], context, ContextEvent.WITHDRAW)
+                    except IllegalAggregationTransitionError as error:
+                        logging.getLogger(__name__).warning("Pending source not withdrawn: %s", error)
                         return {}
                     matching.append(row[0])
             if not matching:
@@ -2591,6 +2654,13 @@ class OutboundQueue:
                 return
             row = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
             context = decode_aggregation(row[0]) if row and row[0] else None
+            if context is not None:
+                try:
+                    check_context_transition(row_id, context, ContextEvent.RELEASE,
+                                             context.get("retry_context") or context)
+                except IllegalAggregationTransitionError as error:
+                    logging.getLogger(__name__).warning("Send attempt not released: %s", error)
+                    return
             if context and context.get("retry_context"):
                 logical = context["retry_context"]
                 self.connection.execute(
@@ -2673,7 +2743,7 @@ class OutboundQueue:
                     parent_context = self.connection.execute("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0]
                     parent = decode_aggregation(parent_context) if parent_context else None
                     if parent is not None:
-                        log_context = encode_aggregation(dict(format_version=1, kind="boundary", key=parent["key"],
+                        log_context = encode_aggregation(dict(format_version=1, kind=ContextKind.BOUNDARY, key=parent["key"],
                             generation=parent.get("generation", 0), recent=parent.get("recent", []),
                             last_new=parent.get("last_new", 0), members=[], legacy_context=log_context))
                     supplement_cursor = self.connection.execute(
@@ -2864,6 +2934,8 @@ class OutboundQueueScheduler:
         self._row_not_before: dict[int, float] = {}
         self.next_deadline: Optional[float] = None
         self._reconciliation_not_before = 0.0
+        # Rows whose receipt their aggregation kind cannot take; reported once each.
+        self._illegal_receipt_rows: set[int] = set()
         self._head_rows: dict[tuple[int, Optional[int]], QueuedCall] = {}
         self._heads_scanned_at = 0.0
         self._heal_heads = True
@@ -3187,6 +3259,15 @@ class OutboundQueueScheduler:
                         failed.append(row.id)
                         continue
                     self.queue.delete(row.id, successful=True)
+                except IllegalAggregationTransitionError as error:
+                    if row.id not in self._illegal_receipt_rows:
+                        self._illegal_receipt_rows.add(row.id)
+                        logging.getLogger(__name__).warning(
+                            "Receipt of queue row %s (aggregation kind %r) cannot be reconciled; "
+                            "it stays queued and is retried: %s", row.id, error.kind, error,
+                        )
+                    failed.append(row.id)
+                    continue
                 except Exception:
                     failed.append(row.id)
                     continue
