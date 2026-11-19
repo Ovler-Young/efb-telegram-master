@@ -35,6 +35,7 @@ from telegram.request import HTTPXRequest
 
 from .auxiliary_bot import AuxiliaryBot
 from .bot_pool import BotPool
+from .delivery_states import OPERATOR_HOLD, Event, classify, next_state
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
 from .outbound import (
@@ -1873,10 +1874,10 @@ class TelegramBotManager(LocaleMixin):
             if metadata is None:
                 raise ValueError("Queue row does not exist; no data was changed.")
             chat_id, state, hold, sender_id, has_log = metadata
-            if state != "queued" or hold is None:
+            if next_state(classify(state, hold), Event.OPERATOR_CONFIRM) is None:
                 raise ValueError("Only a held, unconfirmed send can be confirmed.")
             expected_sender = sender_id or str(self.me.id if self.me is not None else "")
-            if hold == "uncertain:operator_observed_delivery" and message.from_user is not None:
+            if hold == OPERATOR_HOLD and message.from_user is not None:
                 # Old versions did not record the attempt's bot. An explicit offline
                 # operator hold can be resolved only with a currently configured bot.
                 actual_sender = str(message.from_user.id)
@@ -1906,10 +1907,10 @@ class TelegramBotManager(LocaleMixin):
             if isinstance(completion, QueuedDeliveryResult):
                 queue.record_telegram_completion(
                     row_id, receipt, supplement=completion.supplement,
-                    operation_resolver=self._queue_operation,
+                    operation_resolver=self._queue_operation, operator_confirmed=True,
                 )
             else:
-                queue.record_telegram_completion(row_id, receipt)
+                queue.record_telegram_completion(row_id, receipt, operator_confirmed=True)
             if has_log:
                 completed = row_id in self._outbound_scheduler.reconcile_sent_pending(row_id)
             else:

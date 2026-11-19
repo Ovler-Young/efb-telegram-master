@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import io
+import logging
 import pickle
 from pathlib import Path
 import sqlite3
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -21,16 +23,22 @@ from telegram import (
     PhotoSize,
 )
 
+from efb_telegram_master import delivery_states, queue_report
+from efb_telegram_master.delivery_states import Event, RowState, classify, next_state
+from efb_telegram_master.hold_send import hold as operator_hold
 from efb_telegram_master.outbound import (
+    IllegalDeliveryTransitionError,
     InvalidQueuedPayloadError,
     OutboundQueue,
     OutboundQueueScheduler,
     QueueEnqueueError,
     QueueRequest,
+    RequiredSenderUnavailableError,
     SchedulerStoppedError,
     SenderSelection,
     SenderSelectionResult,
 )
+from efb_telegram_master.queued_log import encode_aggregation
 
 
 def send_message(chat_id, text):
@@ -1686,3 +1694,301 @@ def test_rows_written_before_the_topic_column_regain_their_lane(tmp_path):
         assert reopened.repair_legacy_thread_ids() == 0
     finally:
         reopened.close()
+
+
+# Queue row states and ordering links, on rows written by the queue's own writers.
+
+ATTEMPT = SenderSelection(sender=None, sender_bot_id="901")
+
+
+class ReadTimeoutCause(Exception):
+    pass
+
+
+def _ambiguous_error():
+    try:
+        try:
+            raise ReadTimeoutCause()
+        except ReadTimeoutCause as cause:
+            raise TimeoutError() from cause
+    except TimeoutError as error:
+        return error
+
+
+# Each spelling the current code writes, the writer calls that produce it, and the
+# exact stored delivery_state / delivery_hold.
+ROW_SPELLINGS = {
+    "waiting": ([], ("queued", None), RowState.WAITING),
+    "deferred": ([Event.DEFER_ACQUISITION], ("queued", None), RowState.DEFERRED),
+    "in_flight": ([Event.BEGIN_ATTEMPT], ("queued", "in_flight"), RowState.IN_FLIGHT),
+    "uncertain": ([Event.BEGIN_ATTEMPT, Event.HOLD_UNCERTAIN],
+                  ("queued", "uncertain:TimeoutError/ReadTimeoutCause"), RowState.UNCERTAIN),
+    "operator_hold": ([Event.OPERATOR_HOLD],
+                      ("queued", "uncertain:operator_observed_delivery"), RowState.UNCERTAIN),
+    "invalid_payload": ([Event.HOLD_INVALID_PAYLOAD], ("queued", "invalid_payload"), RowState.INVALID_PAYLOAD),
+    "history_failed": ([Event.HOLD_FAILED_HISTORY],
+                       ("queued", "history_failed:RequiredSenderUnavailableError"), RowState.HISTORY_FAILED),
+    "supplement_failed": ([Event.BEGIN_ATTEMPT, Event.HOLD_FAILED_SUPPLEMENT],
+                          ("queued", "supplement_failed:RequiredSenderUnavailableError"),
+                          RowState.SUPPLEMENT_FAILED),
+    "aggregation_failed": ([Event.BEGIN_ATTEMPT, Event.HOLD_FAILED_AGGREGATION],
+                           ("queued", "aggregation_failed:RuntimeError"), RowState.AGGREGATION_FAILED),
+    # A hold written by another version: kept, never sent, confirmable.
+    "unrecognized_hold": ([], ("queued", "paused_by_newer_version"), RowState.UNRECOGNIZED_HOLD),
+    "sent_pending": ([Event.BEGIN_ATTEMPT, Event.RECORD_COMPLETION], ("sent_pending", None), RowState.SENT_PENDING),
+    "absent": ([Event.REMOVE], None, RowState.ABSENT),
+}
+
+
+def _apply(queue, directory, row_id, event):
+    calls = {
+        Event.BEGIN_ATTEMPT: lambda: queue.begin_delivery_attempt(row_id, ATTEMPT),
+        Event.MATERIALIZE: lambda: queue.materialize_aggregation(
+            row_id, "send_message", {"chat_id": -1001, "text": "batch"},
+            encode_aggregation({"format_version": 1, "kind": "aggregate", "key": ("slave", -1001, None)}),
+            ATTEMPT),
+        Event.RELEASE_ATTEMPT: lambda: queue.release_delivery_attempt(row_id),
+        Event.HOLD_UNCERTAIN: lambda: queue.hold_uncertain_delivery(row_id, _ambiguous_error()),
+        Event.OPERATOR_HOLD: lambda: operator_hold(directory, row_id, apply=True),
+        Event.HOLD_INVALID_PAYLOAD: lambda: queue.hold_invalid_payload(row_id),
+        Event.HOLD_FAILED_HISTORY: lambda: queue.hold_failed_history(
+            row_id, RequiredSenderUnavailableError("gone")),
+        Event.HOLD_FAILED_SUPPLEMENT: lambda: queue.hold_failed_history(
+            row_id, RequiredSenderUnavailableError("gone"), supplement=True),
+        Event.HOLD_FAILED_AGGREGATION: lambda: queue.hold_failed_aggregation(row_id, RuntimeError("failed")),
+        Event.DEFER_ACQUISITION: lambda: queue.defer_acquisition(row_id),
+        Event.RECORD_COMPLETION: lambda: queue.record_telegram_completion(row_id, b"\x01receipt"),
+        Event.OPERATOR_CONFIRM: lambda: queue.record_telegram_completion(
+            row_id, b"\x01receipt", operator_confirmed=True),
+        Event.DEFER_RECONCILIATION: lambda: queue.defer_reconciliation([row_id], time.time()),
+        Event.REMOVE: lambda: queue.delete(row_id),
+    }
+    calls[event]()
+
+
+# Events a queue mutator performs on an existing row. Enqueue creates the row and
+# the history-sender repair runs only at startup (covered in test_history_sender).
+ROW_EVENTS = [event for event in Event if event not in {Event.ENQUEUE, Event.REPAIR_HISTORY_SENDER}]
+# Illegal events that leave the row unchanged with a WARNING instead of an error.
+REPORTED_EVENTS = {Event.RELEASE_ATTEMPT, Event.DEFER_RECONCILIATION}
+
+
+def _write_row(queue, directory, spelling):
+    row_id, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "row"}))
+    # A dependent makes the row eligible for an aggregation-failure hold.
+    enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1002, "text": "next"}, predecessor_id=row_id))
+    writers, _stored, _state = ROW_SPELLINGS[spelling]
+    for event in writers:
+        _apply(queue, directory, row_id, event)
+    if spelling == "unrecognized_hold":
+        with queue.connection:
+            queue.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold='paused_by_newer_version' WHERE id=?", (row_id,))
+    return row_id
+
+
+def _stored_state(queue, row_id):
+    row = queue.connection.execute(
+        "SELECT delivery_state, delivery_hold, reconcile_after FROM outbound_queue WHERE id=?", (row_id,)
+    ).fetchone()
+    return classify(*row, now=time.time()) if row else RowState.ABSENT
+
+
+def _table(queue):
+    return queue.connection.execute("SELECT * FROM outbound_queue ORDER BY id").fetchall()
+
+
+@pytest.mark.parametrize("spelling", sorted(ROW_SPELLINGS))
+def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spelling, caplog):
+    """Rows as the current code writes them load, classify and follow the transition table.
+
+    A legal event leads to the table's state; an illegal one raises or warns and
+    leaves the stored rows byte-identical.
+    """
+    _writers, stored, expected = ROW_SPELLINGS[spelling]
+    mismatches = []
+    for event in ROW_EVENTS:
+        directory = tmp_path / event.value
+        queue = OutboundQueue(directory)
+        try:
+            row_id = _write_row(queue, directory, spelling)
+            columns = queue.connection.execute(
+                "SELECT delivery_state, delivery_hold FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
+            assert columns == stored
+            assert _stored_state(queue, row_id) is expected
+            before = _table(queue)
+            target = next_state(expected, event)
+            caplog.clear()
+            if target is not None:
+                _apply(queue, directory, row_id, event)
+                if _stored_state(queue, row_id) is not target:
+                    mismatches.append((event, "became", _stored_state(queue, row_id), "expected", target))
+                continue
+            if event in REPORTED_EVENTS:
+                with caplog.at_level(logging.WARNING, logger="efb_telegram_master.outbound"):
+                    _apply(queue, directory, row_id, event)
+                if not any(str(row_id) in record.getMessage() for record in caplog.records):
+                    mismatches.append((event, "was not reported"))
+            else:
+                error = ValueError if event is Event.OPERATOR_HOLD else IllegalDeliveryTransitionError
+                try:
+                    _apply(queue, directory, row_id, event)
+                except error:
+                    pass
+                else:
+                    mismatches.append((event, "was accepted"))
+            if _table(queue) != before:
+                mismatches.append((event, "changed the rows although it was rejected"))
+        finally:
+            queue.close()
+    assert mismatches == []
+
+
+def test_a_hold_never_replaces_another_hold(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    try:
+        row_id = _write_row(queue, tmp_path, "invalid_payload")
+        with pytest.raises(IllegalDeliveryTransitionError, match="invalid_payload"):
+            queue.hold_uncertain_delivery(row_id, _ambiguous_error())
+        with pytest.raises(IllegalDeliveryTransitionError):
+            queue.defer_acquisition(row_id)
+        assert queue.connection.execute(
+            "SELECT delivery_hold, reconcile_after FROM outbound_queue WHERE id=?", (row_id,)
+        ).fetchone() == ("invalid_payload", 0)
+    finally:
+        queue.close()
+
+
+def test_releasing_a_held_aggregate_keeps_its_frozen_request(tmp_path, caplog):
+    """Only an in-flight attempt rewinds to its logical batch; a held one stays for the operator."""
+    queue = OutboundQueue(tmp_path)
+    try:
+        logical = {"format_version": 1, "kind": "logical", "key": ("slave", -1001, None), "members": []}
+        row_id, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": ""},
+                                                encode_aggregation(logical)))
+        frozen = encode_aggregation({"format_version": 1, "kind": "aggregate", "key": ("slave", -1001, None),
+                                     "retry_context": logical})
+        queue.materialize_aggregation(row_id, "send_message", {"chat_id": -1001, "text": "batch"}, frozen, ATTEMPT)
+        queue.hold_uncertain_delivery(row_id, _ambiguous_error())
+        before = _table(queue)
+        with caplog.at_level(logging.WARNING, logger="efb_telegram_master.outbound"):
+            queue.release_delivery_attempt(row_id)
+        assert _table(queue) == before
+        assert f"Queue row {row_id} is uncertain" in caplog.text
+    finally:
+        queue.close()
+
+
+def _lane_section(output, title):
+    lines = output.split(f"== {title}", 1)[1].split("\n== ", 1)[0].strip().splitlines()
+    header = [name.strip() for name in lines[0].split("|")]
+    return [dict(zip(header, (value.strip() for value in line.split("|")))) for line in lines[1:]]
+
+
+def _run_report(queue_path, *arguments):
+    from efb_telegram_master.queue_report import __file__ as script
+    result = subprocess.run(
+        [sys.executable, script, "--queue", str(queue_path), *arguments],
+        capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ""}, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_every_readiness_user_elects_the_same_rows(tmp_path):
+    """Scheduler heads, the Python mirror and the standalone report agree on which rows may send."""
+    queue = OutboundQueue(tmp_path)
+    chats = iter(range(-1001, -1100, -1))
+    rows = {}
+    try:
+        def row(name, predecessor=None, *writers):
+            row_id, _ = enqueue(queue, QueueRequest(
+                "send_message", (), {"chat_id": next(chats), "text": name},
+                predecessor_id=rows.get(predecessor)))
+            for event in writers:
+                _apply(queue, tmp_path, row_id, event)
+            rows[name] = row_id
+
+        row("parent waiting")
+        row("behind waiting", "parent waiting")
+        row("parent in flight", None, Event.BEGIN_ATTEMPT)
+        row("behind in flight", "parent in flight")
+        row("parent sent", None, Event.BEGIN_ATTEMPT, Event.RECORD_COMPLETION)
+        row("behind sent", "parent sent")
+        row("parent deferred", None, Event.DEFER_ACQUISITION)
+        row("behind deferred", "parent deferred")
+        row("parent held", None, Event.BEGIN_ATTEMPT, Event.HOLD_UNCERTAIN)
+        row("after held", "parent held")
+        row("parent gone")
+        row("after gone", "parent gone")
+        queue.delete(rows["parent gone"])
+        row("self linked")
+        with queue.connection:
+            queue.connection.execute("UPDATE outbound_queue SET predecessor_id=id WHERE id=?", (rows["self linked"],))
+        expected = {rows[name] for name in (
+            "parent waiting", "parent deferred", "after held", "after gone", "self linked")}
+
+        stored = {
+            row_id: (classify(state, hold, after, time.time()), predecessor)
+            for row_id, state, hold, after, predecessor in queue.connection.execute(
+                "SELECT id, delivery_state, delivery_hold, reconcile_after, predecessor_id FROM outbound_queue")
+        }
+        mirror = {
+            row_id for row_id, (state, predecessor) in stored.items()
+            if delivery_states.is_ready(row_id, state, predecessor,
+                                        stored.get(predecessor, (RowState.ABSENT,))[0])
+        }
+        assert mirror == expected
+        assert {row.id for row in queue.heads(include_payload=False, ready_only=True)} == expected
+        destinations = queue.connection.execute(
+            "SELECT DISTINCT telegram_chat_id FROM outbound_queue").fetchall()
+        assert {head.id for (chat,) in destinations if (head := queue.head_for(chat, None))} == expected
+        assert queue.has_waiting_rows()
+        # A row behind an in-flight or delivered parent resolves without help.
+        assert not queue.has_unresolvable_dependency()
+    finally:
+        queue.close()
+
+    printed = _run_report(tmp_path / "outbound-queue.sqlite3")
+    heads = _lane_section(printed, "head per destination: age, position and retry")
+    assert {int(head["head_id"]) for head in heads} == expected
+    depth = _lane_section(printed, "per destination: depth, holds, age")
+    assert {int(item["tg_chat"]) for item in depth if item["dispatchable"] == "1"} == {
+        chat for chat, in destinations
+        if any(int(head["tg_chat"]) == chat for head in heads)
+    }
+    sendable = set()
+    for (chat,) in destinations:
+        lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", f"--lane={chat}:0"),
+                             f"lane {chat}:0 in send order")
+        sendable |= {int(item["id"]) for item in lane if item["election"] == "sendable"}
+    assert sendable == expected
+
+
+def test_rows_that_only_wait_for_each_other_are_reported_as_a_cycle(tmp_path):
+    queue = OutboundQueue(tmp_path)
+    try:
+        first, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "a"}))
+        second, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "b"},
+                                                predecessor_id=first))
+        with queue.connection:
+            queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (second, first))
+        assert queue.heads(ready_only=True) == []
+        assert queue.head_for(-1001, None) is None
+        assert queue.has_unresolvable_dependency()
+    finally:
+        queue.close()
+    lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", "--lane=-1001:0"),
+                         "lane -1001:0 in send order")
+    assert [item["election"] for item in lane] == ["behind predecessor", "behind predecessor"]
+
+
+@pytest.mark.parametrize("alias", ["", "q", "r", "outbound_queue"])
+def test_the_standalone_report_keeps_the_package_readiness_rule(alias):
+    assert queue_report.waiting_sql(alias) == delivery_states.waiting_sql(alias)
+    if alias:
+        for predecessor in ("predecessor", "p"):
+            assert queue_report.barrier_sql(predecessor) == delivery_states.barrier_sql(predecessor)
+            assert (queue_report.behind_barrier_sql(alias, predecessor)
+                    == delivery_states.behind_barrier_sql(alias, predecessor))
+            assert queue_report.ready_sql(alias, predecessor) == delivery_states.ready_sql(alias, predecessor)

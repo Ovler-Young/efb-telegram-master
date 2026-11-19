@@ -29,11 +29,56 @@ NOW_SECONDS = "CAST(strftime('%s','now') AS INTEGER)"
 AGGREGATION_MARKER = b"\x03"
 MEDIA_SIDECAR_MARKER = b"\x02"
 
+# Copied from efb_telegram_master.delivery_states, because this file must run on
+# its own; a unit test keeps both copies identical. A row is "waiting" when it is
+# queued and unheld, a predecessor is a "barrier" while it is waiting, in flight or
+# awaiting its MsgLog write, and a waiting row no barrier defers is "ready": the
+# scheduler elects each destination's next send among ready rows.
+
+
+def waiting_sql(alias: str = "") -> str:
+    """Rows the scheduler may pick: queued and unheld."""
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}delivery_state = 'queued' AND {prefix}delivery_hold IS NULL"
+
+
+def barrier_sql(alias: str) -> str:
+    """The row ``alias`` still defers its dependents: waiting, in flight or awaiting MsgLog."""
+    return (
+        f"({alias}.delivery_state = 'sent_pending' "
+        f"OR ({alias}.delivery_state = 'queued' "
+        f"AND ({alias}.delivery_hold IS NULL "
+        f"OR {alias}.delivery_hold = 'in_flight')))"
+    )
+
+
+def behind_barrier_sql(alias: str, predecessor: str = "predecessor") -> str:
+    """The row ``alias`` links to another existing row that is still a barrier."""
+    return (
+        f"{alias}.predecessor_id IS NOT NULL AND EXISTS ("
+        f"SELECT 1 FROM outbound_queue AS {predecessor} "
+        f"WHERE {predecessor}.id = {alias}.predecessor_id "
+        f"AND {predecessor}.id != {alias}.id "
+        f"AND {barrier_sql(predecessor)})"
+    )
+
+
+def ready_sql(alias: str, predecessor: str = "predecessor") -> str:
+    """Waiting rows that no ordering link defers: candidates for a destination head."""
+    return (
+        f"{waiting_sql(alias)} AND ({alias}.predecessor_id IS NULL OR NOT EXISTS ("
+        f"SELECT 1 FROM outbound_queue AS {predecessor} "
+        f"WHERE {predecessor}.id = {alias}.predecessor_id "
+        f"AND {predecessor}.id != {alias}.id "
+        f"AND {barrier_sql(predecessor)}))"
+    )
+
+
 QUERIES = (
     ("per destination: depth, holds, age", f"""
         SELECT q.telegram_chat_id AS tg_chat, COALESCE(q.thread_id, 0) AS topic,
                COUNT(*) AS queued, SUM(q.delivery_hold IS NOT NULL) AS held,
-           SUM(q.delivery_hold IS NULL) AS dispatchable,
+               SUM({ready_sql("q")}) AS dispatchable,
                GROUP_CONCAT(DISTINCT q.operation) AS operations,
                datetime(MIN(q.created_at), 'unixepoch') AS oldest,
                {NOW_SECONDS} - CAST(MIN(q.created_at) AS INTEGER) AS oldest_age_s,
@@ -97,11 +142,11 @@ QUERIES = (
     # the queue depth over time instead.
     ("head per destination: age, position and retry", f"""
         WITH heads AS (
-            SELECT COALESCE(MIN(CASE WHEN priority = 1 THEN id END), MIN(id)) AS head_id,
+            SELECT COALESCE(MIN(CASE WHEN r.priority = 1 THEN r.id END), MIN(r.id)) AS head_id,
                    COUNT(*) AS lane_depth
-            FROM outbound_queue
-            WHERE delivery_state = 'queued' AND delivery_hold IS NULL
-            GROUP BY telegram_chat_id, COALESCE(thread_id, 0)
+            FROM outbound_queue r
+            WHERE {ready_sql("r")}
+            GROUP BY r.telegram_chat_id, COALESCE(r.thread_id, 0)
         )
         SELECT q.telegram_chat_id AS tg_chat, COALESCE(q.thread_id, 0) AS topic, q.id AS head_id,
                q.operation, q.priority, h.lane_depth AS lane_depth,
@@ -243,9 +288,7 @@ def lane(db: sqlite3.Connection, chat_id: int, topic: int, limit: int, out) -> N
                {NOW_SECONDS} - CAST(created_at AS INTEGER) AS age_s,
                CASE WHEN delivery_state != 'queued' THEN delivery_state
                     WHEN delivery_hold IS NOT NULL THEN 'held'
-                    WHEN predecessor_id IS NOT NULL AND EXISTS (
-                     SELECT 1 FROM outbound_queue p WHERE p.id = outbound_queue.predecessor_id
-                       AND p.delivery_state = 'queued' AND p.delivery_hold IS NULL)
+                    WHEN {behind_barrier_sql("outbound_queue", "p")}
                     THEN 'behind predecessor'
                     ELSE 'sendable' END AS election
         FROM outbound_queue
