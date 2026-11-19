@@ -94,8 +94,10 @@ def author_uid(author):
 def make_store(profile, rows=(), *, enabled=True, custom_emoji_ids=None):  # noqa: F811
     directory, open_manager = profile
     write_legacy_tables(directory, [], list(rows))
-    store = CustomEmojiStore(open_manager(), CustomEmojiConfig.from_channel_config(
-        {"user_emoji": {"enabled": enabled, "custom_emoji_ids": custom_emoji_ids or {}}, "auxiliary_bots": [{"token": "t", "custom_emoji": True}]}))
+    config = {"auxiliary_bots": [{"token": "t", "custom_emoji": True}]}
+    if enabled is not None:
+        config["user_emoji"] = {"enabled": enabled, "custom_emoji_ids": custom_emoji_ids or {}}
+    store = CustomEmojiStore(open_manager(), CustomEmojiConfig.from_channel_config(config))
     store.load()
     return store
 
@@ -347,8 +349,9 @@ def test_uncached_author_avatar_is_fetched_only_when_the_worker_asks(profile, sl
     slave.get_chat_member_picture.assert_called_once_with(author)
 
 
-def test_disabled_feature_leaves_headers_as_they_were(profile, author, author_uid):  # noqa: F811
-    store = make_store(profile, [saved_row(author_uid, "5001")], enabled=False)
+@pytest.mark.parametrize("enabled", [False, None], ids=["disabled", "no_section"])
+def test_disabled_feature_leaves_headers_as_they_were(profile, author, author_uid, enabled):  # noqa: F811
+    store = make_store(profile, [saved_row(author_uid, "5001")], enabled=enabled)
     processor, _ = make_processor(store)
     message = Message(chat=author.chat, author=author)
 
@@ -455,7 +458,7 @@ def test_combined_message_with_two_ready_authors_loses_every_tag_for_an_incapabl
     alice, bob = "tests.source alice", "tests.source bob"
     for uid, emoji_id in ((alice, "5001"), (bob, "5002")):
         manager.channel.db.add_user_emoji_cache(f"member-user:{uid}", emoji_id, "etm_user_avatars_by_bot")
-    store = CustomEmojiStore(manager.channel.db, CustomEmojiConfig.from_channel_config({}))
+    store = CustomEmojiStore(manager.channel.db, CustomEmojiConfig.from_channel_config({"user_emoji": {}}))
     store.load()
     manager.channel.custom_emoji = store
     handler = aggregation_processor(manager)

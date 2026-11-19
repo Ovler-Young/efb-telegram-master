@@ -106,6 +106,7 @@ class CustomEmojiConfig:
     @classmethod
     def from_channel_config(cls, config: Mapping[str, Any]) -> 'CustomEmojiConfig':
         section = config.get("user_emoji")
+        present = isinstance(section, Mapping)
         if not isinstance(section, Mapping):
             section = {}
         name = section.get("sticker_set_name", DEFAULT_STICKER_SET_NAME)
@@ -117,7 +118,7 @@ class CustomEmojiConfig:
             owner = admins[0] if isinstance(admins, list) and admins and isinstance(admins[0], int) else None
         auxiliary = config.get("auxiliary_bots")
         return cls(
-            enabled=bool(section.get("enabled", True)),
+            enabled=present and bool(section.get("enabled", True)),
             sticker_set_name=name,
             owner_user_id=owner,
             custom_emoji_ids=_id_map(section.get("custom_emoji_ids")),

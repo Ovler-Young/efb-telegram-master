@@ -257,16 +257,16 @@ Optional: Custom emoji for message authors
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 In group chats, ETM can put the sender's avatar, turned into a Telegram custom
-emoji, in front of the sender's name in the message header. This is on by
-default and is configured with the ``user_emoji`` key of the configuration
-file (not under ``flags``):
+emoji, in front of the sender's name in the message header. This is off
+unless the configuration file has a ``user_emoji`` section (not under
+``flags``); add ``user_emoji: {enabled: true}`` to turn it on:
 
--   ``user_emoji`` *(dict)* [Default: ``{}``]
+-   ``user_emoji`` *(dict)* [Default: not set, the feature is off]
 
-    - ``enabled`` *(bool)* [Default: ``true``]: set to ``false`` to stop
-      ETM from creating or using generated avatar emoji. Headers then use the
-      plain emoji character, except for users listed in ``custom_emoji_ids``,
-      which are still used.
+    - ``enabled`` *(bool)* [Default: ``true`` when the ``user_emoji`` section
+      is present]: set to ``false`` to stop ETM from creating or using
+      generated avatar emoji. Headers then use the plain emoji character,
+      except for users listed in ``custom_emoji_ids``, which are still used.
     - ``sticker_set_name`` *(str)* [Default: ``etm_user_avatars``]: base name
       of the custom emoji sticker sets that ETM creates. ETM appends
       ``_by_<bot username>`` when it is not already there. When a set reaches
@@ -301,11 +301,11 @@ How it behaves:
 - Telegram only shows a bot's custom emoji when the bot's owner has Telegram
   Premium (or the bot has a Fragment username). Messages sent by any other
   bot show the plain emoji character in the same place, so enabling the
-  feature is harmless. The main bot uses generated emoji whenever ``enabled``
-  is ``true``, and the ``custom_emoji_ids`` you configure either way. An
-  auxiliary bot uses them only with ``custom_emoji: true``, and the setting
-  should be used only for bots whose owner has Premium (or that have a
-  Fragment username).
+  feature is harmless. The main bot uses generated emoji whenever the
+  ``user_emoji`` section is present and ``enabled`` is ``true``, and the
+  ``custom_emoji_ids`` you configure either way. An auxiliary bot uses them
+  only with ``custom_emoji: true``, and the setting should be used only for
+  bots whose owner has Premium (or that have a Fragment username).
 - The sticker set owner must have started the bot (send ``/start`` to it
   once), otherwise Telegram refuses to create the sets.
   Member rights in the group are enough; no admin rights are needed.

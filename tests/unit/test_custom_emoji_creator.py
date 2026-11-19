@@ -161,7 +161,7 @@ def make_creator(profile, api, monkeypatch, caplog):  # noqa: F811
         if user_rows is not None:
             write_legacy_tables(directory, user_rows=user_rows)
         store = CustomEmojiStore(open_manager(), CustomEmojiConfig.from_channel_config(
-            config or {"admins": [OWNER]}))
+            config or {"admins": [OWNER], "user_emoji": {}}))
         store.load()
         options.setdefault("write_interval", 0.0)
         for name, value in options.items():

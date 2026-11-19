@@ -189,7 +189,8 @@ def test_recorded_emoji_does_not_replace_a_configured_one(profile):
 
 
 def test_config_defaults_and_old_user_emoji_section():
-    defaults = CustomEmojiConfig.from_channel_config({"admins": [42, 43]})
+    assert not CustomEmojiConfig.from_channel_config({"admins": [42, 43]}).enabled
+    defaults = CustomEmojiConfig.from_channel_config({"admins": [42, 43], "user_emoji": {}})
     assert (defaults.enabled, defaults.sticker_set_name, defaults.owner_user_id) == (True, "etm_user_avatars", 42)
     assert not defaults.custom_emoji_ids and not defaults.auxiliary_tokens
 
