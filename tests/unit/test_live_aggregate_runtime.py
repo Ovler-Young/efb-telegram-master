@@ -428,3 +428,21 @@ def test_row_discarded_at_dispatch_finishes_its_source_delivery(runtime, tmp_pat
     assert waiter.done() and waiter.exception() is not None
     assert finished == [True]
     assert manager._queued_completion_callbacks == {}
+
+
+def test_reopen_after_an_appended_member_was_withdrawn_edits_the_earlier_container(runtime):
+    manager = runtime
+    aggregation = manager.live_aggregation
+    key, _ = append(manager, "one", 1)
+    complete(manager)
+    with aggregation.independent(key):
+        media_id, _ = manager._enqueue_requests([QueueRequest("send_message", (), {"chat_id": -100, "text": "media"})])
+    media_id = int(media_id)
+    append(manager, "two", 2)
+    assert aggregation.remove_source_member(key, (key[0], "two"))
+    media = manager._outbound_queue.load_queued(media_id)
+    manager._outbound_queue.delete(media_id)
+    aggregation.reopen(media)
+    append(manager, "three", 3)
+    complete(manager)
+    assert [call[0] for call in manager.transport.calls] == ["send_message", "edit_message_text"]

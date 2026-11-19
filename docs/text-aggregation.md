@@ -194,19 +194,20 @@ The definition lives in `efb_telegram_master/aggregation_states.py`:
 |---|---|
 | `absent` | No member or independent delivery for this key since startup. |
 | `open` | The next member may join the current batch or edit the current container. |
-| `closed` | The current container ended; the next member starts a new one. The previous container is remembered for one `reopen`. |
+| `closed` | The current container ended; the next member starts a new one. The container it replaced is remembered until the next close or reopen. |
 
 | Event | absent | open | closed |
 |---|---|---|---|
 | `append` | open | open | open |
 | `close` | absent (no-op) | closed | closed |
-| `reopen` | absent (no-op) | open | open (the previous container is restored) |
+| `reopen` | absent (no-op) | open (the remembered container is restored, if any) | open (the remembered container is restored) |
 
 `LiveTextAggregation` changes a stream's state only through `_Stream.apply`,
 which follows `STREAM_TRANSITIONS`. `reopen` acts only when the discarded row
 is still the stream's last row; otherwise a later row has already continued
-the run and nothing changes. Both no-ops are logged at DEBUG. A container
-receipt changes no stream state: it makes the confirmed container the one to
+the run and nothing changes. Both no-ops are logged at DEBUG. An `append` leaves the remembered container
+alone, so a `reopen` after members were appended and withdrawn still restores
+it. A container receipt changes no stream state: it makes the confirmed container the one to
 edit next, and only when it belongs to the stream's current generation.
 
 Every close names its reason (`CloseReason`):

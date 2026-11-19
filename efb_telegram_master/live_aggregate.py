@@ -31,26 +31,26 @@ class _Stream:
     recent: list[float] = field(default_factory=list)
     last_new: float = 0
     generation: int = 0
-    # The (base, generation) a close replaced, kept for one reopen; set while CLOSED.
+    state: StreamState = StreamState.OPEN
+    # The (base, generation) the latest close replaced. Only a close overwrites it
+    # and only a reopen consumes it; an append leaves it alone.
     closed: Optional[tuple] = None
 
     def apply(self, event: StreamEvent) -> None:
         """Move this stream along ``STREAM_TRANSITIONS``."""
-        after = next_stream_state(_stream_state(self), event)
+        after = next_stream_state(self.state, event)
         if after is StreamState.CLOSED:
             self.closed = (self.base, self.generation)
             self.base = None
             self.generation += 1
-        elif after is StreamState.OPEN:
-            if event is StreamEvent.REOPEN and self.closed is not None:
-                self.base, self.generation = self.closed
+        elif event is StreamEvent.REOPEN and self.closed is not None:
+            self.base, self.generation = self.closed
             self.closed = None
+        self.state = after
 
 
 def _stream_state(stream: _Stream | None) -> StreamState:
-    if stream is None:
-        return StreamState.ABSENT
-    return StreamState.OPEN if stream.closed is None else StreamState.CLOSED
+    return StreamState.ABSENT if stream is None else stream.state
 
 
 # Rows that end a container: later members of the source start a new one.
