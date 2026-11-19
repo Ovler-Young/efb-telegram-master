@@ -34,6 +34,18 @@ class _Stream:
     # The (base, generation) a close replaced, kept for one reopen; set while CLOSED.
     closed: Optional[tuple] = None
 
+    def apply(self, event: StreamEvent) -> None:
+        """Move this stream along ``STREAM_TRANSITIONS``."""
+        after = next_stream_state(_stream_state(self), event)
+        if after is StreamState.CLOSED:
+            self.closed = (self.base, self.generation)
+            self.base = None
+            self.generation += 1
+        elif after is StreamState.OPEN:
+            if event is StreamEvent.REOPEN and self.closed is not None:
+                self.base, self.generation = self.closed
+            self.closed = None
+
 
 def _stream_state(stream: _Stream | None) -> StreamState:
     if stream is None:
@@ -130,9 +142,7 @@ class LiveTextAggregation:
             logging.getLogger(__name__).debug("No live aggregation stream to close for %s (%s).", key, reason)
         else:
             assert stream is not None
-            stream.closed = (stream.base, stream.generation)
-            stream.base = None
-            stream.generation += 1
+            stream.apply(StreamEvent.CLOSE)
             # One line a minute, with a tally: every container close splits a run,
             # and which rule did it is the only way to tell why. Unthrottled, this
             # would flood an active chat.
@@ -164,9 +174,7 @@ class LiveTextAggregation:
             return
         predecessor = row.predecessor_id
         stream.tail = predecessor if predecessor and self.queue.contains(predecessor) else None
-        if _stream_state(stream) is StreamState.CLOSED:
-            stream.base, stream.generation = stream.closed
-        stream.closed = None  # REOPEN leads to OPEN from either state.
+        stream.apply(StreamEvent.REOPEN)
         self.scheduler.wake_event.set()
 
     def close_destination(self, chat_id, topic):
@@ -223,7 +231,7 @@ class LiveTextAggregation:
                         context.update(waiting=True, due=context["members"][0]["received_time"].timestamp()
                                        + float(self.manager.channel.flag("text_aggregation_window_seconds")))
                     if self.queue.replace_logical_aggregation(stream.tail, encode_aggregation(context)):
-                        stream.closed = None  # APPEND leads to OPEN.
+                        stream.apply(StreamEvent.APPEND)
                         self.pending_sources[identity] = stream.tail
                         self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_source())
                         self.scheduler.wake_event.set()
@@ -250,7 +258,7 @@ class LiveTextAggregation:
                                    encode_aggregation(context), predecessor_id=predecessor)
             row_id, _ = self.queue.enqueue_many([request], self.manager._queue_operation)
             stream.tail = row_id
-            stream.closed = None  # APPEND leads to OPEN.
+            stream.apply(StreamEvent.APPEND)
             self.pending_sources[identity] = row_id
             self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_source())
             self.scheduler.wake_event.set()
@@ -491,6 +499,9 @@ class LiveTextAggregation:
         stream = self.streams.get(tuple(context["key"]))
         if stream and context.get("appendable", True) and stream.generation == context["generation"]:
             stream.base = base
+        # A confirmed container update no longer orders later updates of that container.
+        if context.get("container_id") and self.container_tails.get(context["container_id"]) == row.id:
+            del self.container_tails[context["container_id"]]
         for member in context.get("members", []):
             if self.pending_sources.get(member_identity(member)) == row.id:
                 self.pending_sources.pop(member_identity(member))
@@ -599,6 +610,10 @@ class LiveTextAggregation:
             if independent_pending and log is None:
                 cancelled = self.queue.cancel_pending_source(tuple(key), member)
                 if cancelled:
+                    for row_id in cancelled:
+                        # A withdrawn output finishes its source's delivery, as a discarded one does.
+                        self.manager._run_database_update_callback(
+                            self.manager._pop_queued_completion_callback(row_id))
                     for stream in self.streams.values():
                         if stream.tail in cancelled:
                             stream.tail = cancelled[stream.tail]

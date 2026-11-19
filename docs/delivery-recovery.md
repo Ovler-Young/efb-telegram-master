@@ -167,6 +167,10 @@ Stored spellings never change between versions.
 | sent_pending | `sent_pending` / NULL | Telegram receipt saved; the MsgLog write is retried with backoff. | None. |
 | absent | no row | Not yet enqueued, or removed. | None. |
 
+Only `/confirm_send` ends a hold (and startup, for the `history_failed` rows
+named above). The bot never removes a held row or its media by itself: a row
+that was not delivered stays in the queue until an operator removes it.
+
 | Event | From | To | Code |
 |---|---|---|---|
 | enqueue | absent | waiting | `OutboundQueue.enqueue_many`, aggregation handoff, supplement insert (a new row has no earlier state to check) |

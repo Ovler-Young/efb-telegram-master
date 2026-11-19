@@ -1678,6 +1678,8 @@ class OutboundQueue:
                     self.observe_metrics(lambda metrics: metrics.record_enqueued(priority, operation))
             if logical_split and not before:
                 self._observe_removed(original[2], original[3], original[4], "replaced")
+                self.fail_waiter(logical_split["row_id"], QueueError(
+                    f"Queue row {logical_split['row_id']} was replaced by its split before it was sent."))
             self.refresh_depth()
             waiter: Future = Future()
             self.waiters[identifiers[0]] = waiter
@@ -1874,6 +1876,7 @@ class OutboundQueue:
                 self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (row[0], row_id))
                 self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
             self._observe_removed(row[2], row[3], row[4], "cancelled")
+            self.fail_waiter(row_id, QueueError(f"Queue row {row_id} was withdrawn before it was sent."))
             self.refresh_depth()
         return row[0]
 
@@ -1920,6 +1923,8 @@ class OutboundQueue:
             self._observe_removed(priority, operation, created_at, "cancelled")
         for payload in payloads:
             self.cleanup_payload_media(payload)
+        for row_id in predecessors:
+            self.fail_waiter(row_id, QueueError(f"Queue row {row_id} was withdrawn before it was sent."))
         self.refresh_depth()
         return predecessors
 
@@ -3431,6 +3436,7 @@ class OutboundQueueScheduler:
                     continue
                 self._record_submitted_removal(row)
                 self._row_not_before.pop(row.id, None)
+                self._illegal_receipt_rows.discard(row.id)
                 reconciled.add(row.id)
             self.queue.defer_reconciliation(failed, time.time())
             finished = time.monotonic()

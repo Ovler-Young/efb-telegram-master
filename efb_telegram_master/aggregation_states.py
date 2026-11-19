@@ -70,8 +70,10 @@ CONTEXT_TRANSITIONS: dict[tuple[ContextState, ContextEvent], frozenset[ContextSt
     # Appending, merging an edit or removal, or keeping the head of a split batch.
     **{(state, _E.REPLACE): frozenset({state}) for state in (_S.LOGICAL, _S.MEMBER_UPDATE)},
     # A new Telegram message in the destination ends appending; only rows that
-    # carry append flags take it. A handed-off aggregate still records it, so a
-    # retried receipt after a restart cannot reopen the container.
+    # carry append flags take it. In ``HANDED_OFF`` that is a handed-off
+    # aggregate, which still records it so a retried receipt after a restart
+    # cannot reopen the container; ``close_aggregation_destination`` skips
+    # handed-off independent outputs.
     **{(state, _E.CLOSE_DESTINATION): frozenset({state})
        for state in (_S.LOGICAL, _S.MEMBER_UPDATE, _S.AGGREGATE, _S.HANDED_OFF)},
     (_S.LOGICAL, _E.MATERIALIZE): frozenset({_S.AGGREGATE}),
@@ -132,7 +134,6 @@ class StreamEvent(Enum):
     APPEND = "append"    # a new member is queued for this key
     CLOSE = "close"      # end the current container (see CloseReason)
     REOPEN = "reopen"    # the row that closed it was discarded before reaching Telegram
-    RECEIPT = "receipt"  # a container of the current generation was confirmed
 
 
 class CloseReason:
@@ -163,11 +164,9 @@ STREAM_TRANSITIONS: dict[tuple[StreamState, StreamEvent], StreamState] = {
     (StreamState.ABSENT, StreamEvent.REOPEN): StreamState.ABSENT,
     (StreamState.OPEN, StreamEvent.REOPEN): StreamState.OPEN,
     (StreamState.CLOSED, StreamEvent.REOPEN): StreamState.OPEN,
-    # A receipt sets the container to edit next only for its own generation.
-    (StreamState.ABSENT, StreamEvent.RECEIPT): StreamState.ABSENT,
-    (StreamState.OPEN, StreamEvent.RECEIPT): StreamState.OPEN,
-    (StreamState.CLOSED, StreamEvent.RECEIPT): StreamState.CLOSED,
 }
+# A container receipt changes no stream state: it only sets the container to
+# edit next, and only for the stream's current generation.
 
 
 def next_stream_state(state: StreamState, event: StreamEvent) -> StreamState:
