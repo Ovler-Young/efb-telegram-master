@@ -275,6 +275,24 @@ class HistoryMigrationTarget(BaseModel):
         indexes = ((("slave_chat_id", "target_chat_id", "message_thread_id"), True),)
 
 
+class TopicIconCache(BaseModel):
+    """Custom emoji generated from avatars by earlier releases; existing rows are only read."""
+    avatar_hash = TextField(primary_key=True)
+    custom_emoji_id = TextField()
+    sticker_set_name = TextField()
+    created_at = DateTimeField(default=datetime.datetime.now)
+    updated_at = DateTimeField(default=datetime.datetime.now)
+
+
+class UserEmojiCache(BaseModel):
+    """Custom emoji generated for slave users by earlier releases."""
+    cache_key = TextField(primary_key=True)
+    custom_emoji_id = TextField()
+    sticker_set_name = TextField()
+    created_at = DateTimeField(default=datetime.datetime.now)
+    updated_at = DateTimeField(default=datetime.datetime.now)
+
+
 class SlaveChatInfo(BaseModel):
     slave_channel_id = TextField()
     slave_channel_emoji = CharField()
@@ -372,6 +390,7 @@ class DatabaseManager:
         """
         database.create_tables([
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
+            TopicIconCache, UserEmojiCache,
         ])
 
     @staticmethod
@@ -379,6 +398,7 @@ class DatabaseManager:
         """Create tables introduced after the original schema without touching existing data."""
         database.create_tables([
             ChatAssoc, MsgLog, SlaveChatInfo, TopicAssoc, HistoryMigrationEntry, HistoryMigrationTarget,
+            TopicIconCache, UserEmojiCache,
         ], safe=True)
 
     def _check_and_run_migrations(self):
@@ -446,6 +466,37 @@ class DatabaseManager:
                 task_count,
                 state_summary,
             )
+
+    def read_custom_emoji_rows(self) -> dict[str, list[tuple[str, str, object]]]:
+        """Read every ``(key, custom_emoji_id, updated_at)`` row of the legacy emoji tables.
+
+        Missing tables yield an empty list. Timestamps are returned as stored
+        (datetime, text or ``None``). Not on the metrics label allow-list: it
+        runs once at startup.
+        """
+        with connection_scope(self._managed_database):
+            present = set(database.get_tables(schema=current_schema(database.obj)))
+            rows: dict[str, list[tuple[str, str, object]]] = {}
+            for model, key_column in ((TopicIconCache, "avatar_hash"), (UserEmojiCache, "cache_key")):
+                table = model._meta.table_name
+                rows[table] = [] if table not in present else [
+                    tuple(row) for row in database.execute_sql(
+                        f"SELECT {key_column}, custom_emoji_id, updated_at FROM {table}").fetchall()
+                ]
+            return rows
+
+    def add_user_emoji_cache(self, cache_key: str, custom_emoji_id: str, sticker_set_name: str) -> str:
+        """Record a new user emoji and return the id now stored for ``cache_key``.
+
+        An existing row is never modified: its id is returned unchanged.
+        """
+        with connection_scope(self._managed_database):
+            now = datetime.datetime.now()
+            UserEmojiCache.insert(
+                cache_key=cache_key, custom_emoji_id=custom_emoji_id, sticker_set_name=sticker_set_name,
+                created_at=now, updated_at=now,
+            ).on_conflict_ignore().execute()
+            return UserEmojiCache.get(UserEmojiCache.cache_key == cache_key).custom_emoji_id
 
     @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,

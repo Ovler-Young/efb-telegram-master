@@ -39,6 +39,7 @@ from .chat_binding import ChatBindingManager
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import CommandsManager
+from .custom_emoji import CustomEmojiConfig, CustomEmojiStore
 from .db import DatabaseManager
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
@@ -127,6 +128,8 @@ class TelegramChannel(MasterChannel):
         # Initialize managers
         self.flag: ExperimentalFlagsManager = ExperimentalFlagsManager(self)
         self.db: DatabaseManager = DatabaseManager(self)
+        self.custom_emoji: CustomEmojiStore = CustomEmojiStore(self.db, CustomEmojiConfig.from_channel_config(self.config))
+        self.custom_emoji.load()
         self.chat_manager: ChatObjectCacheManager = ChatObjectCacheManager(self)
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
         self.bot_manager: TelegramBotManager = TelegramBotManager(self)
