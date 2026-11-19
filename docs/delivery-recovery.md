@@ -150,16 +150,18 @@ Every state machine in the queue and in text aggregation is listed in
 
 Every row of `outbound-queue.sqlite3` is in exactly one state, read from its
 `delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
-deferred row). The definition lives in `efb_telegram_master/delivery_states.py`:
-`RowState` (states), `HoldKind` (stored hold spellings), `Event`, `TRANSITIONS`
+deferred row). On a queued row `reconcile_attempts` counts its failed attempts
+in a row; from 3 on (`FAILED_ATTEMPTS_LIMIT`) it no longer holds back the rows
+ordered after it (see [Ordering links](#ordering-links)). The definition lives
+in `efb_telegram_master/delivery_states.py`: `RowState` (states), `HoldKind` (stored hold spellings), `Event`, `TRANSITIONS`
 (the allowed-transition table), `classify`, `parse_hold` and `format_hold`.
 Stored spellings never change between versions.
 
 | State | `delivery_state` / `delivery_hold` | Meaning | Operator action |
 |---|---|---|---|
 | waiting | `queued` / NULL | Will be sent when its destination's turn comes. | None. |
-| deferred | `queued` / NULL, `reconcile_after` ahead | Media acquisition failed before any send; retried after a capped backoff. | None. |
-| in_flight | `queued` / `in_flight` | Attempt recorded before submission. After a restart it is an interrupted attempt that may have been delivered. | If delivered, `/confirm_send`; otherwise investigate. |
+| deferred | `queued` / NULL, `reconcile_after` ahead | Media acquisition failed before any send, or a send kept failing with a retryable error (a connection that never reached Telegram, a chat migration) for 3 attempts; retried after a backoff. Earlier failed sends are retried after a backoff the scheduler keeps in memory, and the row stays waiting. | None. |
+| in_flight | `queued` / `in_flight` | Attempt recorded before submission. After a restart it is an interrupted attempt that may have been delivered; opening the queue counts it as 3 failed attempts, so later rows no longer wait for it. | If delivered, `/confirm_send`; otherwise investigate. |
 | uncertain | `queued` / `uncertain:<Class>[/<Cause>]` | Ambiguous result: Telegram may have accepted it. | `/confirm_send` on the delivered message. |
 | uncertain (operator) | `queued` / `uncertain:operator_observed_delivery` | Held offline by `hold_send` for a send already seen on Telegram. | `/confirm_send`; any configured bot is accepted. |
 | invalid_payload | `queued` / `invalid_payload` | The stored request cannot be decoded. Not evidence of delivery. | Investigate the row. |
@@ -190,7 +192,8 @@ below lists only events on an existing row.
 | hold_invalid_payload | waiting, deferred, in_flight | invalid_payload | `hold_invalid_payload` |
 | hold_failed_history / hold_failed_supplement | waiting, deferred, in_flight | history_failed / supplement_failed | `hold_failed_history` |
 | hold_failed_aggregation | waiting, deferred, in_flight | aggregation_failed | `hold_failed_aggregation` |
-| defer_acquisition | waiting, deferred, in_flight | deferred | `defer_acquisition` |
+| defer_acquisition | waiting, deferred, in_flight | deferred | `defer_acquisition` (counts a failed attempt unless a flood wait caused it) |
+| defer_failed_send | waiting, deferred | deferred | `defer_failed_send`, after the attempt was released (counts a failed attempt and, from the 3rd, stores the backoff; earlier ones leave the state as it was; a flood wait is retried without it) |
 | record_completion | waiting, deferred, in_flight | sent_pending | `record_telegram_completion` |
 | operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`); refused for an aggregation row whose context takes no receipt (an unsent batch or deferred member update) |
 | defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
@@ -202,10 +205,13 @@ An event the row's state does not accept is never applied. The queue raises
 invalid_payload; hold_uncertain is not allowed there, so the row was left
 unchanged.` It is handled like any other queue persistence error, and the row
 keeps its bytes. In particular a hold never replaces another hold, and an
-acquisition retry never clears one. Two events are reported instead of
-stopping: releasing a row that is not in flight logs `Send attempt not
-released: ...`, and deferring the reconciliation of a row that is not
-`sent_pending` logs `... its receipt reconciliation was not deferred.`
+acquisition retry never clears one. Raising the failed-attempt count of an
+interrupted `in_flight` row when the queue opens changes no state and is not an
+event. Three events are reported instead of stopping: releasing a row that is
+not in flight logs `Send attempt not released: ...`, counting a failed send on
+a row that is not waiting logs `Failed send not counted: ...`, and deferring
+the reconciliation of a row that is not `sent_pending` logs `... its receipt
+reconciliation was not deferred.`
 `/confirm_send` answers `Only a held, unconfirmed send can be confirmed.` for a
 row it cannot resolve, `This batch was never sent to Telegram as one message, so
 no reply can confirm it. It stays held and no data was changed.` for an unsent
@@ -219,16 +225,48 @@ message's attachment and history replay use it to keep their order. From the
 dependent's side a link is:
 
 * **free**: no predecessor; the row is ready when it is waiting.
-* **barrier**: the predecessor exists, is not the row itself, and is waiting,
-  deferred, in flight or `sent_pending`. The dependent waits.
+* **barrier**: the predecessor exists, is not the row itself, and is
+  `sent_pending`, or is waiting, deferred or in flight with fewer than 3 failed
+  attempts in a row. The dependent waits.
+* **failing**: the predecessor is waiting, deferred or in flight after 3 failed
+  attempts in a row, or after a restart interrupted its send. The dependent is
+  ready unless it needs the predecessor's Telegram message (below).
 * **void**: the predecessor is gone, is the row itself, or is held. The
   dependent is ready: waiting for it either already happened or never ends.
 * **cycle**: every waiting row defers to another waiting row. The scheduler
   then sends the oldest row per destination and logs `deferred by predecessor
   links that never resolve`.
 
-An attempt interrupted by a restart stays `in_flight`, so rows linked behind it
-keep waiting until `/confirm_send` resolves it.
+A failed attempt is a send that failed with a retryable error (a connection
+that never reached Telegram, a chat migration) or a failed media acquisition.
+Telegram flood waits (`RetryAfter`) are not counted, because they hold back the
+whole chat, and neither are waits for a bot, a rate limit or a worker slot,
+since nothing was attempted. The count resets when the row is
+delivered. When a row reaches 3 failed attempts the queue logs `Queue row N for
+chat C failed 3 attempts in a row; later rows no longer wait for it. It keeps
+retrying and is delivered late if a retry succeeds.` From then on a failed
+send stores its backoff in `reconcile_after`, as a failed acquisition always does. While that deadline is ahead the row is not its
+destination's head, so later rows of the same chat are sent. Once the deadline
+passes, the row is the oldest again and is retried. If it succeeds it appears in
+the chat after the messages that overtook it; nothing is dropped.
+
+An attempt interrupted by a restart stays `in_flight` and is never sent again
+by itself. Opening the queue raises its count to 3 and logs `Queue row N for
+chat C was interrupted by a restart while sending; counted as 3 failed
+attempts, later rows no longer wait for it. It stays held for /confirm_send.`
+`/confirm_send` resolves it as before.
+
+Some dependents of a failing row need its Telegram message, not only its turn:
+an edit of a container (`member_update`, including a removal or routing hint),
+an append into the predecessor's container (`logical` with `inherit`), and
+another output of a member the predecessor carries (`source`, `redirect`).
+`needs_delivered_predecessor` in `aggregation_states.py` names them, and the
+aggregation readiness check (`LiveTextAggregation.deadline`) defers them and
+checks again every 30 seconds. The predecessor's retry or delivery wakes the
+worker sooner. Such a waiting row is still its destination's head, so the rows
+after it in that destination wait with it, as they do behind a batch window. A
+row ordered behind such a waiting row also waits, because the waiting row
+itself has no failed attempts.
 
 Links are set at enqueue. A successful removal or an aggregation handoff clears
 the links that point at the row. Cancelling a batch or a pending source
@@ -237,15 +275,16 @@ last part, and a long message's attachment at that attachment. A failed row
 that is discarded leaves them void.
 
 The rule is defined once in `efb_telegram_master/delivery_states.py`:
-`waiting_sql`, `barrier_sql` and `ready_sql` build the SQL.
-`OutboundQueue.heads`, `head_for`, `has_waiting_rows` and
+`waiting_sql`, `barrier_sql`, `failing_sql`, `backing_off_sql` and `ready_sql`
+build the SQL. `OutboundQueue.heads`, `head_for`, `has_waiting_rows` and
 `has_unresolvable_dependency` use it. `queue_report.py` carries a copy so it can
 run without the package (a unit test keeps the copies of `waiting_sql`,
-`barrier_sql` and `ready_sql` identical; `behind_barrier_sql` exists only there,
-for the report): its `dispatchable` column counts ready rows, `head per
-destination` elects among ready rows like the scheduler, and `--lane` shows
-`behind predecessor` for a row behind a barrier and `sendable` for a ready one.
-A deferred head is ready but waits for `retry_in_s`.
+`barrier_sql`, `backing_off_sql` and `ready_sql` identical; `behind_barrier_sql`
+exists only there, for the report): its `dispatchable` column counts ready rows,
+`head per destination` elects among ready rows like the scheduler, passing over
+a failing row whose retry deadline is ahead, and `--lane` shows `behind
+predecessor` for a row behind a barrier and `sendable` for a ready one. A
+deferred head is ready but waits for `retry_in_s`.
 
 ## Outbound worker
 
@@ -308,6 +347,10 @@ reading every waiting row on each pass. The cache is:
   when the cache is empty, after a cycle was broken, after a row was
   quarantined for its replay size, and at least every 30 seconds
   (`HEADS_FULL_RESCAN_SECONDS`).
+
+A failing row whose retry deadline is ahead is not elected, so no head carries
+that deadline. Each pass schedules a wake-up for it and, once it is due, marks
+its destination dirty unless it is already that destination's head.
 
 The periodic full scan bounds how long a queue change that was not marked dirty
 can go unseen. The cache lives in memory only; a restart starts fresh.
