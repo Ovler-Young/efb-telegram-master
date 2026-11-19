@@ -4,7 +4,8 @@ Earlier releases generated one custom emoji per slave user from the user's avata
 and saved its id in the ``useremojicache`` table (and, before that, in
 ``topiciconcache``). This module reads those rows once at startup into a dict, so
 that sending a message needs only a dict lookup, never database or network work.
-Emoji for new users are created on one background thread (``UserEmojiCreator``).
+Emoji for new users are created on one background thread (``UserEmojiCreator``),
+which also replaces an author's emoji when their avatar has changed.
 """
 
 import asyncio
@@ -135,6 +136,16 @@ class UserEmoji:
     fallback: str
 
 
+@dataclass(frozen=True)
+class SavedEmoji:
+    """The saved emoji of a user, as the avatar check needs it."""
+
+    custom_emoji_id: str
+    sticker_set_name: str | None
+    avatar_hash: str | None
+    """Fingerprint of the avatar the emoji shows; ``None`` until the first check of an emoji made by an earlier release."""
+
+
 def _timestamp(value: Any) -> float:
     """Seconds for a stored timestamp, whether the column returned a datetime or text; 0 if unreadable."""
     if isinstance(value, datetime.datetime):
@@ -176,6 +187,7 @@ class CustomEmojiStore:
         self._db = db
         self.config = config
         self._index: dict[str, str] = {}  # uid -> custom emoji id
+        self._saved: dict[str, SavedEmoji] = {}  # uid -> saved generated emoji (never a configured one)
         self.sticker_set_names: frozenset[str] = frozenset()
         """Sticker set names found in the saved rows."""
         self._write_lock = threading.Lock()
@@ -186,11 +198,11 @@ class CustomEmojiStore:
         user_rows = rows.get(USER_EMOJI_TABLE, [])
         topic_rows = rows.get(TOPIC_ICON_TABLE, [])
         counts: dict[str, Counter] = {USER_EMOJI_TABLE: Counter(), TOPIC_ICON_TABLE: Counter()}
-        # uid -> (rank, -timestamp, custom emoji id); the smallest rank and newest row win.
-        best: dict[str, tuple[int, float, str]] = {}
+        # uid -> (rank, -timestamp, saved emoji); the smallest rank and newest row win.
+        best: dict[str, tuple[int, float, SavedEmoji]] = {}
         set_names: set[str] = set()
         for table, table_rows, direct_rank in ((USER_EMOJI_TABLE, user_rows, 1), (TOPIC_ICON_TABLE, topic_rows, 2)):
-            for key, emoji_id, updated_at, set_name in table_rows:
+            for key, emoji_id, updated_at, set_name, avatar_hash in table_rows:
                 key_format, uid, direct = classify_key(key)
                 if set_name:
                     set_names.add(set_name)
@@ -199,17 +211,20 @@ class CustomEmojiStore:
                     continue
                 current = best.get(uid)
                 if direct:
-                    candidate = (direct_rank, 0.0, emoji_id)
+                    candidate = (direct_rank, 0.0, SavedEmoji(emoji_id, set_name, avatar_hash))
                 elif current is not None and current[0] < 3:
                     continue  # a saved row for the user itself wins; skip reading the timestamp
                 else:
-                    candidate = (3, -_timestamp(updated_at), emoji_id)
+                    candidate = (3, -_timestamp(updated_at), SavedEmoji(emoji_id, set_name, None))
                 if current is None or candidate[:2] < current[:2]:
                     best[uid] = candidate
         # Turned off, only the ids written in the configuration are used.
-        index = {uid: emoji_id for uid, (_, _, emoji_id) in best.items()} if self.config.enabled else {}
+        saved = {uid: emoji for uid, (_, _, emoji) in best.items()
+                 if uid not in self.config.custom_emoji_ids} if self.config.enabled else {}
+        index = {uid: emoji.custom_emoji_id for uid, emoji in saved.items()}
         index.update(self.config.custom_emoji_ids)
         self._index = index
+        self._saved = saved
         self.sticker_set_names = frozenset(set_names)
         logger.info(
             "Custom emoji cache loaded: %s users (%s from configuration), %s",
@@ -226,18 +241,40 @@ class CustomEmojiStore:
         emoji_id = self._index.get(uid)
         return UserEmoji(emoji_id, fallback_emoji(uid)) if emoji_id else None
 
-    def record(self, uid: str, custom_emoji_id: str, sticker_set_name: str) -> UserEmoji:
+    def saved(self, uid: str) -> SavedEmoji | None:
+        """The generated emoji saved for ``uid``; ``None`` for configured ids and unknown users."""
+        return self._saved.get(uid)
+
+    def record(self, uid: str, custom_emoji_id: str, sticker_set_name: str, avatar_hash: str | None) -> UserEmoji:
         """Save a new emoji for ``uid`` as ``member-user:<uid>`` and make it available to ``lookup``.
 
         A row that already exists for that key is kept as it is, and its id is the one used.
         """
         with self._write_lock:
-            stored_id = self._db.add_user_emoji_cache(USER_KEY_PREFIX + uid, custom_emoji_id, sticker_set_name)
+            stored_id = self._db.add_user_emoji_cache(
+                USER_KEY_PREFIX + uid, custom_emoji_id, sticker_set_name, avatar_hash)
             if stored_id != custom_emoji_id:
                 logger.warning("Custom emoji row for user %s already exists; keeping the saved one.", uid)
             if uid not in self.config.custom_emoji_ids:
                 self._index[uid] = stored_id
+                if stored_id == custom_emoji_id:
+                    self._saved[uid] = SavedEmoji(custom_emoji_id, sticker_set_name, avatar_hash)
             return self.lookup(uid)  # type: ignore[return-value]
+
+    def replace(self, uid: str, custom_emoji_id: str, sticker_set_name: str, avatar_hash: str) -> None:
+        """Save the emoji made from ``uid``'s changed avatar in the ``member-user:<uid>`` row and use it from now on."""
+        with self._write_lock:
+            self._db.replace_user_emoji_cache(USER_KEY_PREFIX + uid, custom_emoji_id, sticker_set_name, avatar_hash)
+            self._saved[uid] = SavedEmoji(custom_emoji_id, sticker_set_name, avatar_hash)
+            self._index[uid] = custom_emoji_id
+
+    def adopt(self, uid: str, avatar_hash: str) -> None:
+        """Record ``avatar_hash`` as the avatar shown by ``uid``'s saved emoji, which had no fingerprint."""
+        with self._write_lock:
+            saved = self._saved[uid]
+            self._db.adopt_user_emoji_avatar(
+                USER_KEY_PREFIX + uid, saved.custom_emoji_id, saved.sticker_set_name, avatar_hash)
+            self._saved[uid] = SavedEmoji(saved.custom_emoji_id, saved.sticker_set_name, avatar_hash)
 
 
 _EMOJI_TAG = re.compile(
@@ -312,7 +349,11 @@ class AuthorEmojiState(Enum):
     READY = "ready"
     """Saved: loaded from a row at startup, or created and recorded in this session."""
     FAILED = "failed"
-    """Creation failed; a new request is accepted only after the author's retry time."""
+    """Creating or replacing failed; a new request or check is accepted only after the author's retry time."""
+    CHECK_QUEUED = "check queued"
+    """A ready author's avatar check waits for the worker."""
+    CHECKING = "checking"
+    """The worker loads the avatar and compares it with the one the saved emoji shows."""
 
 
 class AuthorEmojiEvent(Enum):
@@ -322,6 +363,10 @@ class AuthorEmojiEvent(Enum):
     FAILED = "failed"
     DISCARDED = "discarded"
     """The feature became unavailable before the queued job ran."""
+    CHECK_DUE = "check due"
+    UNCHANGED = "unchanged"
+    """The avatar is the one the saved emoji shows, or its fingerprint was recorded for the first time."""
+    CHANGED = "changed"
 
 
 AUTHOR_EMOJI_MACHINE: StateMachine[AuthorEmojiState, AuthorEmojiEvent] = StateMachine("author emoji", {
@@ -331,6 +376,13 @@ AUTHOR_EMOJI_MACHINE: StateMachine[AuthorEmojiState, AuthorEmojiEvent] = StateMa
     (AuthorEmojiState.QUEUED, AuthorEmojiEvent.DISCARDED): AuthorEmojiState.ABSENT,
     (AuthorEmojiState.CREATING, AuthorEmojiEvent.CREATED): AuthorEmojiState.READY,
     (AuthorEmojiState.CREATING, AuthorEmojiEvent.FAILED): AuthorEmojiState.FAILED,
+    (AuthorEmojiState.READY, AuthorEmojiEvent.CHECK_DUE): AuthorEmojiState.CHECK_QUEUED,
+    (AuthorEmojiState.FAILED, AuthorEmojiEvent.CHECK_DUE): AuthorEmojiState.CHECK_QUEUED,
+    (AuthorEmojiState.CHECK_QUEUED, AuthorEmojiEvent.STARTED): AuthorEmojiState.CHECKING,
+    (AuthorEmojiState.CHECK_QUEUED, AuthorEmojiEvent.DISCARDED): AuthorEmojiState.READY,
+    (AuthorEmojiState.CHECKING, AuthorEmojiEvent.UNCHANGED): AuthorEmojiState.READY,
+    (AuthorEmojiState.CHECKING, AuthorEmojiEvent.CHANGED): AuthorEmojiState.CREATING,
+    (AuthorEmojiState.CHECKING, AuthorEmojiEvent.FAILED): AuthorEmojiState.READY,
 })
 
 
@@ -384,6 +436,10 @@ STICKER_SET_MACHINE: StateMachine[StickerSetState, StickerSetEvent] = StateMachi
 
 STICKER_SET_LIMIT = 200
 QUEUE_SIZE = 100
+CHECK_QUEUE_SIZE = 50
+# Each check downloads the avatar from the slave channel; avatars change rarely, and a late refresh only
+# affects later messages, so an author who keeps writing is checked a few times a day.
+AVATAR_RECHECK_INTERVAL = 6 * 3600.0
 WRITE_INTERVAL = 1.0
 RETRY_BASE = 600.0
 RETRY_CAP = 12 * 3600.0
@@ -401,20 +457,26 @@ def _error_text(error: TelegramError) -> str:
     return error.message.lower()
 
 
+def user_emoji_set_index(name: str, base_name: str, bot_username: str | None) -> int | None:
+    """The ``n`` for which ``user_emoji_set_name(base_name, n, bot_username)`` is ``name``; ``None`` if there is none."""
+    match = re.search(r"_(\d+)_by_[^_]", name) if bot_username else re.search(r"_(\d+)$", name)
+    for index in (int(match.group(1)), 1) if match else (1,):
+        if user_emoji_set_name(base_name, index, bot_username).lower() == name.lower():
+            return index
+    return None
+
+
 def highest_set_index(set_names: Iterable[str], base_name: str, bot_username: str | None) -> int:
     """The largest ``n`` such that ``user_emoji_set_name(base_name, n, bot_username)`` is in ``set_names``; 1 if none."""
-    highest = 1
-    for name in set_names:
-        match = re.search(r"_(\d+)_by_[^_]", name) if bot_username else re.search(r"_(\d+)$", name)
-        if match:
-            index = int(match.group(1))
-            if index > highest and user_emoji_set_name(base_name, index, bot_username).lower() == name.lower():
-                highest = index
-    return highest
+    return max([1] + [index for name in set_names
+                      if (index := user_emoji_set_index(name, base_name, bot_username)) is not None])
 
 
-def make_avatar_png(picture: BinaryIO) -> io.BytesIO:
-    """Crop the picture to a centred square and scale it to a 100x100 PNG."""
+def make_avatar_png(picture: BinaryIO) -> tuple[bytes, str]:
+    """Crop the picture to a centred square and scale it to a 100x100 PNG.
+
+    Returns the PNG and a fingerprint of its pixels, which does not depend on how the PNG is encoded.
+    """
     picture.seek(0)
     image = Image.open(picture).convert("RGBA")
     side = min(image.size)
@@ -424,8 +486,7 @@ def make_avatar_png(picture: BinaryIO) -> io.BytesIO:
     image = image.resize((CUSTOM_EMOJI_SIZE, CUSTOM_EMOJI_SIZE), Image.Resampling.LANCZOS)
     out = io.BytesIO()
     image.save(out, "PNG")
-    out.seek(0)
-    return out
+    return out.getvalue(), hashlib.sha256(image.tobytes()).hexdigest()
 
 
 @dataclass
@@ -438,6 +499,14 @@ class _Author:
     """(set name, position in the set) of the sticker added for this author, while its custom emoji id is still to be read back."""
     unsaved: tuple[str, str] | None = None
     """(custom emoji id, set name) uploaded to Telegram but not saved yet."""
+    avatar_hash: str | None = None
+    """Fingerprint of the avatar the new emoji is made from."""
+    replaces: SavedEmoji | None = None
+    """The saved emoji of an author whose avatar changed; the new emoji takes its place."""
+    png: bytes | None = None
+    """The changed avatar as a sticker, kept until the replacement is saved."""
+    replaced: tuple[str, frozenset[str]] | None = None
+    """(set name, custom emoji ids before) of a set whose old sticker was replaced, while the new id is still to be read back."""
 
 
 class _AuthorFailed(Exception):
@@ -449,10 +518,11 @@ class _AuthorFailed(Exception):
 class UserEmojiCreator:
     """Creates custom emoji from slave users' avatars on one background thread.
 
-    ``request`` is cheap enough for the send path: it reads only memory and
-    never blocks. Avatar fetches, image work, Telegram calls and saving happen
-    on the worker thread, which uses its own bot and connection pool so it
-    never takes connections from message sending.
+    ``request`` and ``refresh`` are cheap enough for the send path: they read
+    only memory and never block. Avatar fetches, image work, Telegram calls and
+    saving happen on the worker thread, which uses its own bot and connection
+    pool so it never takes connections from message sending. New authors are
+    served before avatar checks.
     """
 
     def __init__(
@@ -474,6 +544,8 @@ class UserEmojiCreator:
         self._set_exists = False
         self._authors: dict[str, _Author] = {}
         self._queue: deque[str] = deque()
+        self._checks: deque[str] = deque()
+        self._next_check: dict[str, float] = {}  # uid -> earliest time of the next avatar check
         self._lock = threading.Lock()
         self._wakeup = threading.Condition(self._lock)
         self._stopping = threading.Event()
@@ -515,6 +587,36 @@ class UserEmojiCreator:
         except IllegalTransition as error:
             logger.warning("Custom emoji request for %s ignored: %s", uid, error)
 
+    def refresh(self, uid: str, load_avatar: Callable[[], BinaryIO]) -> None:
+        """Queue a check of ``uid``'s avatar when its saved emoji was last checked long enough ago.
+
+        A changed avatar gets a new emoji in place of the old one. ``load_avatar``
+        runs later on the worker thread. Configured ids are never checked.
+        """
+        if self.feature_state is not FeatureState.ENABLED or self._stopping.is_set():
+            return
+        now = time.monotonic()
+        if self._next_check.get(uid, 0.0) > now or self._store.saved(uid) is None:
+            return
+        try:
+            with self._lock:
+                author = self._authors.get(uid)
+                if author is None:
+                    author = _Author(state=AuthorEmojiState.READY)
+                elif not (author.state is AuthorEmojiState.FAILED and now >= author.retry_at):
+                    return
+                if len(self._checks) >= CHECK_QUEUE_SIZE:
+                    logger.debug("Custom emoji check queue is full; not checking the avatar of %s now.", uid)
+                    return
+                self._authors[uid] = author
+                self._move_author(uid, author, AuthorEmojiEvent.CHECK_DUE)
+                author.load_avatar = load_avatar
+                self._checks.append(uid)
+                self._next_check[uid] = now + AVATAR_RECHECK_INTERVAL
+                self._wakeup.notify()
+        except IllegalTransition as error:
+            logger.warning("Custom emoji check for %s ignored: %s", uid, error)
+
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
@@ -531,6 +633,7 @@ class UserEmojiCreator:
         with self._lock:
             self._stopping.set()
             self._queue.clear()
+            self._checks.clear()
             self._authors.clear()
             self._wakeup.notify_all()
         thread = self._thread
@@ -549,15 +652,18 @@ class UserEmojiCreator:
             self._bot = self._bot_factory()
             while True:
                 with self._lock:
-                    while not self._queue and not self._stopping.is_set():
+                    while not self._queue and not self._checks and not self._stopping.is_set():
                         self._wakeup.wait()
                     if self._stopping.is_set():
                         return
-                    uid = self._queue.popleft()
+                    uid = (self._queue or self._checks).popleft()
                     author = self._authors[uid]
                     self._move_author(uid, author, AuthorEmojiEvent.STARTED)
                 try:
-                    self._create(uid, author)
+                    if author.state is AuthorEmojiState.CHECKING:
+                        self._check(uid, author)
+                    else:
+                        self._create(uid, author)
                 except IllegalTransition as error:
                     logger.warning("Custom emoji job for %s stopped: %s", uid, error)
         except Exception:
@@ -568,15 +674,56 @@ class UserEmojiCreator:
                     self._loop.run_until_complete(self._bot.request.shutdown())
             self._loop.close()
 
+    def _check(self, uid: str, author: _Author) -> None:
+        """Compare the avatar with the one the saved emoji shows; a changed avatar continues as a creation."""
+        if author.replaces is None:  # not a retry of a replacement that failed
+            load_avatar, author.load_avatar = author.load_avatar, None
+            saved = self._store.saved(uid)
+            try:
+                if load_avatar is None or saved is None:
+                    raise _AuthorFailed("no avatar source")
+                png, avatar_hash = self._avatar_png(load_avatar)
+            except _AuthorFailed as failure:
+                logger.debug("Avatar of %s not checked; keeping its custom emoji: %s", uid, failure)
+                with self._lock:
+                    self._move_author(uid, author, AuthorEmojiEvent.FAILED)
+                    self._authors.pop(uid, None)
+                return
+            if saved.avatar_hash is None or saved.avatar_hash == avatar_hash:
+                if saved.avatar_hash is None and not self._left_behind:
+                    try:
+                        self._store.adopt(uid, avatar_hash)
+                    except Exception:
+                        logger.warning("Saving the avatar fingerprint of %s failed.", uid, exc_info=True)
+                with self._lock:
+                    self._move_author(uid, author, AuthorEmojiEvent.UNCHANGED)
+                    self._authors.pop(uid, None)
+                return
+            logger.debug("Avatar of %s changed; replacing its custom emoji %s.", uid, saved.custom_emoji_id)
+            author.replaces, author.png, author.avatar_hash = saved, png, avatar_hash
+        with self._lock:
+            self._move_author(uid, author, AuthorEmojiEvent.CHANGED)
+        self._create(uid, author)
+
     def _create(self, uid: str, author: _Author) -> None:
         try:
             if author.unsaved is None:
-                if author.added_to is None:
-                    load_avatar, author.load_avatar = author.load_avatar, None
-                    if load_avatar is None:
-                        raise _AuthorFailed("no avatar source")
-                    author.added_to = self._upload(uid, self._avatar_png(load_avatar))
-                author.unsaved = self._read_back(*author.added_to)
+                if author.added_to is None and author.replaced is None:
+                    png = author.png
+                    if png is None:
+                        load_avatar, author.load_avatar = author.load_avatar, None
+                        if load_avatar is None:
+                            raise _AuthorFailed("no avatar source")
+                        png, author.avatar_hash = self._avatar_png(load_avatar)
+                    if author.replaces is not None:
+                        author.replaced = self._replace(uid, png, author.replaces)
+                    if author.replaced is None:
+                        author.added_to = self._upload(uid, png)
+                if author.replaced is not None:
+                    author.unsaved = self._read_back_replaced(*author.replaced)
+                else:
+                    assert author.added_to is not None
+                    author.unsaved = self._read_back(*author.added_to)
             self._save(uid, author)
         except _AuthorFailed as failure:
             self._fail(uid, author, str(failure), failure.retry_after)
@@ -584,7 +731,7 @@ class UserEmojiCreator:
             logger.warning("Failed to create a custom emoji for %s.", uid, exc_info=True)
             self._fail(uid, author, f"{type(error).__name__}: {error}")
 
-    def _avatar_png(self, load_avatar: Callable[[], BinaryIO]) -> io.BytesIO:
+    def _avatar_png(self, load_avatar: Callable[[], BinaryIO]) -> tuple[bytes, str]:
         try:
             picture = load_avatar()
         except EFBOperationNotSupported:
@@ -605,7 +752,16 @@ class UserEmojiCreator:
         assert self._loop is not None
         return self._loop.run_until_complete(coroutine)
 
-    def _upload(self, uid: str, png: io.BytesIO) -> tuple[str, int]:
+    @staticmethod
+    def _sticker(uid: str, png: bytes) -> InputSticker:
+        return InputSticker(
+            sticker=png,
+            emoji_list=[fallback_emoji(uid)],
+            format="static",
+            keywords=["etm-" + hashlib.sha1(uid.encode("utf-8")).hexdigest()[:16]],
+        )
+
+    def _upload(self, uid: str, png: bytes) -> tuple[str, int]:
         """Add the sticker to the current set, moving to the next set when it is full.
 
         Returns the set's name and the sticker's position in it.
@@ -613,12 +769,7 @@ class UserEmojiCreator:
         assert self._bot is not None
         owner = self._store.config.owner_user_id
         assert owner is not None
-        sticker = InputSticker(
-            sticker=png,
-            emoji_list=[fallback_emoji(uid)],
-            format="static",
-            keywords=["etm-" + hashlib.sha1(uid.encode("utf-8")).hexdigest()[:16]],
-        )
+        sticker = self._sticker(uid, png)
         while True:
             name = self._open_set()
             self._pace()
@@ -656,6 +807,49 @@ class UserEmojiCreator:
             self._set_count = len(sticker_set.stickers)
             self._move_set(StickerSetEvent.FILLED if self._set_count >= STICKER_SET_LIMIT else StickerSetEvent.ADDED)
         return emoji_id, name
+
+    def _replace(self, uid: str, png: bytes, old: SavedEmoji) -> tuple[str, frozenset[str]] | None:
+        """Put the new sticker in place of the old one in its set.
+
+        Returns the set's name and its custom emoji ids before the replacement;
+        ``None`` when the old sticker is not in one of this bot's user emoji
+        sets any more, and the new sticker is added like a new author's.
+        """
+        assert self._bot is not None
+        owner = self._store.config.owner_user_id
+        assert owner is not None
+        name = old.sticker_set_name
+        if not name or user_emoji_set_index(name, self._store.config.sticker_set_name, self._bot_username) is None:
+            return None
+        try:
+            stickers = self._read_set(name).stickers
+        except _AuthorFailed as failure:
+            if isinstance(failure.__cause__, BadRequest) and any(
+                    marker in _error_text(failure.__cause__) for marker in _SET_MISSING_MARKERS):
+                return None
+            raise
+        old_sticker = next((sticker for sticker in stickers if sticker.custom_emoji_id == old.custom_emoji_id), None)
+        if old_sticker is None:
+            return None
+        self._pace()
+        try:
+            self._call(self._bot.replace_sticker_in_set(
+                user_id=owner, name=name, old_sticker=old_sticker.file_id,
+                sticker=self._sticker(uid, png)))
+        except TelegramError as error:
+            self._telegram_failed(error)
+        return name, frozenset(sticker.custom_emoji_id for sticker in stickers if sticker.custom_emoji_id)
+
+    def _read_back_replaced(self, name: str, before: frozenset[str]) -> tuple[str, str]:
+        """The custom emoji id of the sticker that replaced an old one in the set ``name``.
+
+        Found as the one id that was not in the set before, never by position.
+        """
+        new = [sticker.custom_emoji_id for sticker in self._read_set(name).stickers
+               if sticker.custom_emoji_id and sticker.custom_emoji_id not in before]
+        if len(new) != 1:
+            raise _AuthorFailed(f"sticker set {name} has {len(new)} new custom emoji instead of one")
+        return new[0], name
 
     def _open_set(self) -> str:
         """Name of a set with room, looking up each set at most once per session."""
@@ -722,7 +916,11 @@ class UserEmojiCreator:
         if self._left_behind:
             raise _AuthorFailed("stopping")  # stop gave up waiting, so the database may be closed
         try:
-            self._store.record(uid, custom_emoji_id, set_name)
+            if author.replaces is not None:
+                assert author.avatar_hash is not None
+                self._store.replace(uid, custom_emoji_id, set_name, author.avatar_hash)
+            else:
+                self._store.record(uid, custom_emoji_id, set_name, author.avatar_hash)
         except Exception as error:
             self._save_failures += 1
             if self._save_failures >= SAVE_FAILURE_LIMIT:
@@ -732,7 +930,8 @@ class UserEmojiCreator:
         with self._lock:
             self._move_author(uid, author, AuthorEmojiEvent.CREATED)
             self._authors.pop(uid, None)  # the store knows the emoji now
-        logger.info("Created custom emoji for %s: custom_emoji_id=%s sticker_set=%s", uid, custom_emoji_id, set_name)
+        logger.info("%s custom emoji for %s: custom_emoji_id=%s sticker_set=%s",
+                    "Created" if author.replaces is None else "Replaced", uid, custom_emoji_id, set_name)
 
     def _fail(self, uid: str, author: _Author, reason: str, retry_after: float = 0.0) -> None:
         with self._lock:
@@ -740,6 +939,8 @@ class UserEmojiCreator:
             delay = min(RETRY_BASE * 2 ** (author.failures - 1), RETRY_CAP)
             author.retry_at = time.monotonic() + max(delay, retry_after)
             self._move_author(uid, author, AuthorEmojiEvent.FAILED)
+            if author.replaces is not None:
+                self._next_check[uid] = author.retry_at
         logger.debug("No custom emoji for %s (attempt %d, next try in %.0f s): %s",
                      uid, author.failures, max(delay, retry_after), reason)
 
@@ -748,9 +949,10 @@ class UserEmojiCreator:
             if self.feature_state is not FeatureState.ENABLED:
                 return
             self.feature_state = FEATURE_MACHINE.next_state("user emoji", self.feature_state, FeatureEvent.FAILED)
-            while self._queue:
-                uid = self._queue.popleft()
-                self._move_author(uid, self._authors.pop(uid), AuthorEmojiEvent.DISCARDED)
+            for queue in (self._queue, self._checks):
+                while queue:
+                    uid = queue.popleft()
+                    self._move_author(uid, self._authors.pop(uid), AuthorEmojiEvent.DISCARDED)
         logger.warning("Custom emoji for slave users are unavailable for this session: %s", reason)
 
     @staticmethod

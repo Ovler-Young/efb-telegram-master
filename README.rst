@@ -317,6 +317,16 @@ How it behaves:
 - Generated emoji are saved in ETM's database and reused after a restart.
   Sticker sets and saved emoji that already exist, including those made by
   earlier ETM versions, are reused as they are, never uploaded again.
+- When an author writes, ETM compares their avatar with the one their emoji
+  was made from, at most once every 6 hours per author, in the background.
+  If the avatar has changed, ETM makes a new emoji and puts it in place of
+  the old one in its sticker set, so sets do not fill up with old avatars.
+  Messages never wait for this: they use the old emoji until the new one is
+  ready.
+- Emoji made by earlier ETM versions do not record which avatar they show.
+  The first check of such an author only records the current avatar and
+  uploads nothing, so an avatar that changed before that first check keeps
+  the old emoji until the author changes their avatar again.
 - The custom emoji is shown in group chats, in messages sent as HTML with
   short text. Long messages, plain-text sends, keyboards and private chats
   show the plain header.

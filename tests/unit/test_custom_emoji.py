@@ -68,9 +68,11 @@ def write_legacy_tables(directory, topic_rows=None, user_rows=None):
 
 
 def dump_tables(directory):
+    """The five columns earlier releases wrote, of both tables."""
     with closing(sqlite3.connect(directory / "tgdata.db")) as connection:
-        return {table: connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
-                for table in ("topiciconcache", "useremojicache")}
+        return {table: connection.execute(
+            f"SELECT {key}, custom_emoji_id, sticker_set_name, created_at, updated_at FROM {table} ORDER BY 1").fetchall()
+            for table, key in (("topiciconcache", "avatar_hash"), ("useremojicache", "cache_key"))}
 
 
 def table_names(directory):
@@ -100,6 +102,21 @@ def test_saved_rows_of_every_old_key_format_resolve_in_priority_order(profile, c
         assert found.fallback == fallback_emoji(uid)
     assert "bare-hash=1" in caplog.text and "member-placeholder=1" in caplog.text and "unknown=1" in caplog.text
     assert dump_tables(directory) == before
+
+
+def test_rows_of_earlier_releases_keep_their_columns_and_get_an_empty_avatar_fingerprint(profile):
+    directory, open_manager = profile
+    rows = [(f"member-user:qq.{i}", f"5{i:03}", "etm_user_avatars_by_yuEFbot" if i < 3 else "etm_user_avatars_2_by_yuEFbot",
+             f"2026-06-2{i} 10:00:00.12345{i}", f"2026-06-2{i} 11:00:00.12345{i}") for i in range(6)]
+    write_legacy_tables(directory, [], rows)
+    store = CustomEmojiStore(open_manager(), CustomEmojiConfig.from_channel_config({"user_emoji": {}}))
+    store.load()
+
+    assert dump_tables(directory)["useremojicache"] == rows
+    with closing(sqlite3.connect(directory / "tgdata.db")) as connection:
+        assert connection.execute("SELECT avatar_hash FROM useremojicache").fetchall() == [(None,)] * len(rows)
+    for key, emoji_id, *_ in rows:
+        assert store.lookup(key[len("member-user:"):]).custom_emoji_id == emoji_id
 
 
 def test_user_row_in_topiciconcache_is_used_when_useremojicache_has_none(profile):
@@ -165,7 +182,7 @@ def test_new_emoji_is_recorded_as_a_member_user_row_and_found_by_lookup(profile)
     store.load()
 
     assert store.lookup("frank") is None
-    assert store.record("frank", "new-frank", "etm_user_avatars_2_by_bot").custom_emoji_id == "new-frank"
+    assert store.record("frank", "new-frank", "etm_user_avatars_2_by_bot", "f-hash").custom_emoji_id == "new-frank"
     assert store.lookup("frank").custom_emoji_id == "new-frank"
     after = dump_tables(directory)
     assert after["topiciconcache"] == before["topiciconcache"]
@@ -174,7 +191,7 @@ def test_new_emoji_is_recorded_as_a_member_user_row_and_found_by_lookup(profile)
     assert len(after["useremojicache"]) == len(before["useremojicache"]) + 1
 
     # An existing row is never rewritten: its id stays and is what lookup returns.
-    assert store.record("carol", "different-id", "other_set").custom_emoji_id == "u-carol"
+    assert store.record("carol", "different-id", "other_set", "c-hash").custom_emoji_id == "u-carol"
     assert dump_tables(directory)["useremojicache"] == after["useremojicache"]
 
 
@@ -184,7 +201,7 @@ def test_recorded_emoji_does_not_replace_a_configured_one(profile):
     config = CustomEmojiConfig.from_channel_config({"user_emoji": {"custom_emoji_ids": {"gina": "configured"}}})
     store = CustomEmojiStore(open_manager(), config)
     store.load()
-    store.record("gina", "generated", "set")
+    store.record("gina", "generated", "set", "g-hash")
     assert store.lookup("gina").custom_emoji_id == "configured"
 
 

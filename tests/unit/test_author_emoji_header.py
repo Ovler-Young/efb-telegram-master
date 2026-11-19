@@ -362,6 +362,7 @@ def test_disabled_feature_leaves_headers_as_they_were(profile, author, author_ui
     assert type(full) is str
     assert full == f"{author.chat.channel_emoji}{'👥'} {author.long_name} [{author.chat.long_name}]:"
     processor.channel.custom_emoji_creator.request.assert_not_called()
+    processor.channel.custom_emoji_creator.refresh.assert_not_called()
 
 
 def test_disabled_feature_still_uses_configured_ids_and_creates_nothing(
@@ -377,6 +378,7 @@ def test_disabled_feature_still_uses_configured_ids_and_creates_nothing(
     assert isinstance(configured, AuthorEmojiHeader) and configured.emoji.custom_emoji_id == "9001"
     assert type(unconfigured) is str
     processor.channel.custom_emoji_creator.request.assert_not_called()
+    processor.channel.custom_emoji_creator.refresh.assert_not_called()
 
     manager = make_manager(tmp_path, store)
     row, args, kwargs = enqueue(manager, "hi", configured)
@@ -422,7 +424,7 @@ def test_combined_message_shows_each_ready_author_emoji_and_asks_for_the_others(
     manager = runtime
     manager.channel.flag.config["text_aggregation"] = True
     alice, bob = "tests.source alice", "tests.source bob"
-    manager.channel.db.add_user_emoji_cache(f"member-user:{alice}", "5001", "etm_user_avatars_by_bot")
+    manager.channel.db.add_user_emoji_cache(f"member-user:{alice}", "5001", "etm_user_avatars_by_bot", None)
     store = CustomEmojiStore(manager.channel.db, CustomEmojiConfig.from_channel_config(
         {"user_emoji": {"enabled": enabled}}))
     store.load()
@@ -457,10 +459,11 @@ def test_combined_message_with_two_ready_authors_loses_every_tag_for_an_incapabl
     manager._custom_emoji_auxiliary_ids = frozenset()
     alice, bob = "tests.source alice", "tests.source bob"
     for uid, emoji_id in ((alice, "5001"), (bob, "5002")):
-        manager.channel.db.add_user_emoji_cache(f"member-user:{uid}", emoji_id, "etm_user_avatars_by_bot")
+        manager.channel.db.add_user_emoji_cache(f"member-user:{uid}", emoji_id, "etm_user_avatars_by_bot", None)
     store = CustomEmojiStore(manager.channel.db, CustomEmojiConfig.from_channel_config({"user_emoji": {}}))
     store.load()
     manager.channel.custom_emoji = store
+    manager.channel.custom_emoji_creator = UserEmojiCreator(store, Mock(), "bot", "ETM user avatars")
     handler = aggregation_processor(manager)
     handler.get_slave_msg_dest = lambda msg: (handler.generate_message_template(msg, True), (-100, None))
     for uid, name in (("one", "Alice"), ("two", "Bob")):

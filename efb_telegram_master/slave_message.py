@@ -1715,6 +1715,7 @@ class SlaveMessageProcessor(LocaleMixin):
     def _author_custom_emoji(self, msg: Message) -> UserEmoji | None:
         """The group author's custom emoji if it is known; otherwise ask for it to be created and return None.
 
+        A known author's avatar is checked for changes now and then in the background.
         This runs while the message is being prepared for sending, so it only reads memory.
         """
         store = self.channel.custom_emoji
@@ -1723,8 +1724,9 @@ class SlaveMessageProcessor(LocaleMixin):
             return None
         uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
         found = store.lookup(uid)
-        if found is None and store.config.enabled:
-            self.channel.custom_emoji_creator.request(uid, lambda: self._load_author_avatar(author))
+        if store.config.enabled:
+            creator = self.channel.custom_emoji_creator
+            (creator.request if found is None else creator.refresh)(uid, lambda: self._load_author_avatar(author))
         return found
 
     @staticmethod
