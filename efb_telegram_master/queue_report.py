@@ -29,8 +29,10 @@ NOW_SECONDS = "CAST(strftime('%s','now') AS INTEGER)"
 AGGREGATION_MARKER = b"\x03"
 MEDIA_SIDECAR_MARKER = b"\x02"
 
-# Copied from efb_telegram_master.delivery_states, because this file must run on
-# its own; a unit test keeps both copies identical. A row is "waiting" when it is
+# ``waiting_sql``, ``barrier_sql`` and ``ready_sql`` are copied from
+# efb_telegram_master.delivery_states, because this file must run on its own; a
+# unit test keeps those copies identical. ``behind_barrier_sql`` exists only here
+# and only for the report. A row is "waiting" when it is
 # queued and unheld, a predecessor is a "barrier" while it is waiting, in flight or
 # awaiting its MsgLog write, and a waiting row no barrier defers is "ready": the
 # scheduler elects each destination's next send among ready rows.

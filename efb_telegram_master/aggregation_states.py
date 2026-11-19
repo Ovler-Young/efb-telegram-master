@@ -44,7 +44,6 @@ class ContextState(Enum):
     FROZEN_REDIRECT = "frozen_redirect"  # frozen output of a member that left its container
     HANDED_OFF = "handed_off"            # receipt applied to MsgLog and successors; awaits removal
     BOUNDARY = "boundary"                # ordinary request ordered between batches
-    CANCELLATION = "cancellation"        # withdrawn unpublished member, kept for later edits
 
 
 class ContextEvent(Enum):
@@ -55,7 +54,6 @@ class ContextEvent(Enum):
     RELEASE = "release"
     RECEIPT = "receipt"
     WITHDRAW = "withdraw"
-    RECORD_CANCELLATION = "record_cancellation"
 
 
 def _from(states, event: ContextEvent, *targets: ContextState) -> dict:
@@ -94,8 +92,6 @@ CONTEXT_TRANSITIONS: dict[tuple[ContextState, ContextEvent], frozenset[ContextSt
     # Only rows no attempt has started on: an emptied batch, a batch replaced by
     # its split, or an unpublished member's pending outputs.
     **_from((_S.LOGICAL, _S.SOURCE, _S.FROZEN_SOURCE), _E.WITHDRAW, _S.ABSENT),
-    # A newer withdrawn revision replaces the stored one.
-    **_from((_S.ABSENT, _S.CANCELLATION), _E.RECORD_CANCELLATION, _S.CANCELLATION),
 }
 
 

@@ -9,9 +9,9 @@ to. Queue mutators consult ``next_state`` before they write, so an event a
 state does not accept is rejected or reported instead of being applied.
 
 The ordering-link rule (which predecessor still defers its dependent) is
-defined here too, once as SQL fragments and once as a Python mirror.
-``queue_report.py`` runs without the package and keeps a copy of the SQL
-builders; a unit test keeps that copy identical to these.
+defined here too, as SQL fragments. ``queue_report.py`` runs without the
+package and keeps a copy of the builders it needs; a unit test keeps those
+copies identical to these.
 """
 from enum import Enum
 
@@ -62,21 +62,14 @@ _HOLD_STATES = {
     HoldKind.AGGREGATION_FAILED: RowState.AGGREGATION_FAILED,
 }
 
-# Rows the scheduler may pick: queued and unheld (a deferred row only after its deadline).
-WAITING_STATES = frozenset({RowState.WAITING, RowState.DEFERRED})
 # Rows kept for an operator: never sent automatically and never an ordering barrier.
 HELD_STATES = frozenset({
     RowState.UNCERTAIN, RowState.INVALID_PAYLOAD, RowState.HISTORY_FAILED,
     RowState.SUPPLEMENT_FAILED, RowState.AGGREGATION_FAILED, RowState.UNRECOGNIZED_HOLD,
 })
-# A predecessor in one of these states still defers its dependents.
-BARRIER_STATES = frozenset({
-    RowState.WAITING, RowState.DEFERRED, RowState.IN_FLIGHT, RowState.SENT_PENDING,
-})
 
 
 class Event(Enum):
-    ENQUEUE = "enqueue"
     BEGIN_ATTEMPT = "begin_attempt"
     MATERIALIZE = "materialize"
     RELEASE_ATTEMPT = "release_attempt"
@@ -92,7 +85,6 @@ class Event(Enum):
     DEFER_RECONCILIATION = "defer_reconciliation"
     REMOVE = "remove"
     WITHDRAW = "withdraw"
-    REPAIR_HISTORY_SENDER = "repair_history_sender"
 
 
 def _from(states, event: Event, target: RowState) -> dict:
@@ -103,7 +95,6 @@ _ATTEMPTABLE = (RowState.WAITING, RowState.DEFERRED)
 _UNSETTLED = (RowState.WAITING, RowState.DEFERRED, RowState.IN_FLIGHT)
 
 TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
-    (RowState.ABSENT, Event.ENQUEUE): RowState.WAITING,
     **_from(_ATTEMPTABLE, Event.BEGIN_ATTEMPT, RowState.IN_FLIGHT),
     **_from(_ATTEMPTABLE, Event.MATERIALIZE, RowState.IN_FLIGHT),
     (RowState.IN_FLIGHT, Event.RELEASE_ATTEMPT): RowState.WAITING,
@@ -121,9 +112,6 @@ TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
     # Cancelling an empty batch or a pending source, or splitting a batch into
     # rows that replace it, removes only a row no attempt has started on.
     **_from(_ATTEMPTABLE, Event.WITHDRAW, RowState.ABSENT),
-    # Startup clears only `history_failed:RequiredSenderUnavailableError` on
-    # history rows that never started an attempt; see OutboundQueue._migrate_schema.
-    (RowState.HISTORY_FAILED, Event.REPAIR_HISTORY_SENDER): RowState.WAITING,
 }
 
 
@@ -186,24 +174,6 @@ def classify(
     return RowState.UNRECOGNIZED_HOLD if parsed is None else _HOLD_STATES[parsed[0]]
 
 
-def is_waiting(state: RowState) -> bool:
-    """Python mirror of ``waiting_sql``."""
-    return state in WAITING_STATES
-
-
-def is_barrier(state: RowState) -> bool:
-    """Python mirror of ``barrier_sql``: this predecessor still defers its dependents."""
-    return state in BARRIER_STATES
-
-
-def is_ready(row_id: int, state: RowState, predecessor_id: int | None,
-             predecessor_state: RowState) -> bool:
-    """Python mirror of ``ready_sql``. Pass ABSENT for a missing predecessor."""
-    if not is_waiting(state):
-        return False
-    return predecessor_id is None or predecessor_id == row_id or not is_barrier(predecessor_state)
-
-
 # SQL builders. They emit SQLite 3.31-compatible SQL. ``alias`` qualifies the
 # columns of the row being tested; an empty alias leaves them unqualified.
 
@@ -220,17 +190,6 @@ def barrier_sql(alias: str) -> str:
         f"OR ({alias}.delivery_state = '{QUEUED}' "
         f"AND ({alias}.delivery_hold IS NULL "
         f"OR {alias}.delivery_hold = '{HoldKind.IN_FLIGHT.value}')))"
-    )
-
-
-def behind_barrier_sql(alias: str, predecessor: str = "predecessor") -> str:
-    """The row ``alias`` links to another existing row that is still a barrier."""
-    return (
-        f"{alias}.predecessor_id IS NOT NULL AND EXISTS ("
-        f"SELECT 1 FROM outbound_queue AS {predecessor} "
-        f"WHERE {predecessor}.id = {alias}.predecessor_id "
-        f"AND {predecessor}.id != {alias}.id "
-        f"AND {barrier_sql(predecessor)})"
     )
 
 

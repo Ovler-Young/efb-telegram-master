@@ -992,15 +992,24 @@ class Adapter:
     def finish_discarded_delivery(self, row):
         pass
 
+    def queued_aggregation_deadline(self, row):
+        return None
+
+    def materialize_queued_aggregation(self, row, selection):
+        return row
+
+    def encode_queued_completion_receipt(self, result, selection):
+        return f"receipt:{result}:{selection.sender_bot_id}".encode()
+
+    def reconcile_queued_delivery(self, row):
+        return False
+
 
 class DurableAdapter(Adapter):
     def __init__(self, reconcile: bool) -> None:
         super().__init__()
         self.reconcile = reconcile
         self.reconciled: list[int] = []
-
-    def encode_queued_completion_receipt(self, result, selection):
-        return f"receipt:{result}:{selection.sender_bot_id}".encode()
 
     def reconcile_queued_delivery(self, row):
         self.reconciled.append(row.id)
@@ -1774,9 +1783,6 @@ def _apply(queue, directory, row_id, event):
     calls[event]()
 
 
-# Events a queue mutator performs on an existing row. Enqueue creates the row and
-# the history-sender repair runs only at startup (covered in test_history_sender).
-ROW_EVENTS = [event for event in Event if event not in {Event.ENQUEUE, Event.REPAIR_HISTORY_SENDER}]
 # Illegal events that leave the row unchanged with a WARNING instead of an error.
 REPORTED_EVENTS = {Event.RELEASE_ATTEMPT, Event.DEFER_RECONCILIATION}
 
@@ -1815,7 +1821,7 @@ def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spell
     """
     _writers, stored, expected = ROW_SPELLINGS[spelling]
     mismatches = []
-    for event in ROW_EVENTS:
+    for event in Event:
         directory = tmp_path / event.value
         queue = OutboundQueue(directory)
         try:
@@ -1904,7 +1910,7 @@ def _run_report(queue_path, *arguments):
 
 
 def test_every_readiness_user_elects_the_same_rows(tmp_path):
-    """Scheduler heads, the Python mirror and the standalone report agree on which rows may send."""
+    """Scheduler heads and the standalone report agree on which rows may send."""
     queue = OutboundQueue(tmp_path)
     chats = iter(range(-1001, -1100, -1))
     rows = {}
@@ -1936,17 +1942,6 @@ def test_every_readiness_user_elects_the_same_rows(tmp_path):
         expected = {rows[name] for name in (
             "parent waiting", "parent deferred", "after held", "after gone", "self linked")}
 
-        stored = {
-            row_id: (classify(state, hold, after, time.time()), predecessor)
-            for row_id, state, hold, after, predecessor in queue.connection.execute(
-                "SELECT id, delivery_state, delivery_hold, reconcile_after, predecessor_id FROM outbound_queue")
-        }
-        mirror = {
-            row_id for row_id, (state, predecessor) in stored.items()
-            if delivery_states.is_ready(row_id, state, predecessor,
-                                        stored.get(predecessor, (RowState.ABSENT,))[0])
-        }
-        assert mirror == expected
         assert {row.id for row in queue.heads(include_payload=False, ready_only=True)} == expected
         destinations = queue.connection.execute(
             "SELECT DISTINCT telegram_chat_id FROM outbound_queue").fetchall()
@@ -1997,6 +1992,4 @@ def test_the_standalone_report_keeps_the_package_readiness_rule(alias):
     if alias:
         for predecessor in ("predecessor", "p"):
             assert queue_report.barrier_sql(predecessor) == delivery_states.barrier_sql(predecessor)
-            assert (queue_report.behind_barrier_sql(alias, predecessor)
-                    == delivery_states.behind_barrier_sql(alias, predecessor))
             assert queue_report.ready_sql(alias, predecessor) == delivery_states.ready_sql(alias, predecessor)

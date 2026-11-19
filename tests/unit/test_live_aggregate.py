@@ -1,6 +1,7 @@
 import copy
 import datetime
 import sqlite3
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -48,6 +49,8 @@ def bare_manager():
     manager = object.__new__(TelegramBotManager)
     manager._transfer_min_mbps = None
     manager._retry_after_report_at = {}
+    manager._queued_completion_callbacks = {}
+    manager._queued_db_log_context_lock = threading.Lock()
     manager.live_aggregation = idle_live_aggregation()
     return manager
 

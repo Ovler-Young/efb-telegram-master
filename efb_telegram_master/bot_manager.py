@@ -1772,12 +1772,8 @@ class TelegramBotManager(LocaleMixin):
     def _pop_queued_completion_callback(self, row_id: object) -> Optional[Callable[[], None]]:
         if not isinstance(row_id, int):
             return None
-        callbacks = getattr(self, "_queued_completion_callbacks", None)
-        context_lock = getattr(self, "_queued_db_log_context_lock", None)
-        if callbacks is None or context_lock is None:
-            return None
-        with context_lock:
-            return callbacks.pop(row_id, None)
+        with self._queued_db_log_context_lock:
+            return self._queued_completion_callbacks.pop(row_id, None)
 
     def reconcile_queued_delivery(self, row) -> bool:
         """Write a persisted Telegram completion to MsgLog."""

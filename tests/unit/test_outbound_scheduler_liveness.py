@@ -13,7 +13,6 @@ import pytest
 from efb_telegram_master.outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
-    PassOutcome,
     QueueRequest,
     SenderSelectionResult,
 )
@@ -141,15 +140,10 @@ def test_a_persistent_stall_is_reported_once_per_interval(tmp_path, monkeypatch,
     """Wakes from new traffic must not turn a stall into a log flood."""
     clock = [1000.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
-    queue, scheduler = _scheduler(tmp_path, Adapter())
-    parent, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "parent"}))
-    child, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "child"}))
-    with queue.connection:
-        queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (parent, child))
-        queue.connection.execute(
-            "UPDATE outbound_queue SET delivery_state='sent_pending', completion_receipt=X'00' WHERE id=?",
-            (parent,),
-        )
+    adapter = Adapter()
+    adapter.select_sender = lambda row, now: SenderSelectionResult()
+    queue, scheduler = _scheduler(tmp_path, adapter)
+    enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "left behind"}))
     try:
         with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
             scheduler.dispatch_once()
@@ -349,34 +343,35 @@ def _one_row(select_sender=None, *, block=False, leak_slot=False, stop=False):
     return scenario
 
 
-# Each outcome, the queue that produces it, and the deadline the worker then
-# waits for (None: it waits for an enqueue or completion event only).
+# Each way a pass can end: the queue that produces it, the deadline the worker
+# then waits for (None: it waits for an enqueue or completion event only), the
+# calls left in flight and whether the scheduler stopped.
 PASS_SCENARIOS = {
-    PassOutcome.IDLE: (lambda queue, scheduler, adapter: None, None),
-    PassOutcome.BUSY: (_one_row(block=True), None),
-    PassOutcome.DEFERRED: (_one_row(lambda row, now: SenderSelectionResult(retry_at=now + 5)), 1005.0),
-    PassOutcome.STALLED: (_one_row(lambda row, now: SenderSelectionResult()), 1030.0),
-    PassOutcome.CYCLE: (_linked_in_a_cycle, None),
-    PassOutcome.PERMIT_LEAK: (_one_row(leak_slot=True), None),
-    PassOutcome.STOPPED: (_one_row(stop=True), None),
+    "idle": (lambda queue, scheduler, adapter: None, None, 0, False),
+    "busy": (_one_row(block=True), None, 1, False),
+    "deferred": (_one_row(lambda row, now: SenderSelectionResult(retry_at=now + 5)), 1005.0, 0, False),
+    "stalled": (_one_row(lambda row, now: SenderSelectionResult()), 1030.0, 0, False),
+    "cycle": (_linked_in_a_cycle, None, 1, False),
+    "permit_leak": (_one_row(leak_slot=True), None, 1, False),
+    "stopped": (_one_row(stop=True), None, 0, True),
 }
 
 
-@pytest.mark.parametrize("outcome", list(PassOutcome), ids=lambda outcome: outcome.value)
-def test_each_pass_outcome_sets_the_wait_the_worker_uses(tmp_path, monkeypatch, outcome):
-    """A pass names how it left the worker; only a stall adds its own rescan deadline."""
+@pytest.mark.parametrize("scenario_name", list(PASS_SCENARIOS))
+def test_each_way_a_pass_ends_sets_the_wait_the_worker_uses(tmp_path, monkeypatch, scenario_name):
+    """Only a stall adds its own rescan deadline; the worker otherwise waits for an event."""
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: 1000.0)
-    scenario, deadline = PASS_SCENARIOS[outcome]
+    scenario, deadline, in_flight, stopped = PASS_SCENARIOS[scenario_name]
     adapter = Adapter()
     queue = OutboundQueue(tmp_path)
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
         try:
             scenario(queue, scheduler, adapter)
-            assert scheduler.dispatch_once() is outcome
+            scheduler.dispatch_once()
             assert scheduler.next_deadline == deadline
-            if outcome in (PassOutcome.BUSY, PassOutcome.CYCLE, PassOutcome.PERMIT_LEAK):
-                assert len(scheduler.in_flight) == 1
+            assert len(scheduler.in_flight) == in_flight
+            assert scheduler.stopping is stopped
         finally:
             adapter.release.set()
             scheduler.stop_and_drain(timeout=2)
@@ -404,7 +399,7 @@ def test_a_failing_sender_lookup_releases_its_slot_and_delivery_continues(tmp_pa
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
         try:
             with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
-                assert scheduler.dispatch_once() is PassOutcome.BUSY
+                scheduler.dispatch_once()
             assert list(scheduler.in_flight) == [later]
             assert f"Choosing a sender for queue row {failing} failed" in caplog.text
             scheduler.in_flight[later].future.result(timeout=2)
@@ -412,10 +407,11 @@ def test_a_failing_sender_lookup_releases_its_slot_and_delivery_continues(tmp_pa
             assert scheduler.slots.free == 1
 
             broken_chats.clear()
-            assert scheduler.dispatch_once() is PassOutcome.DEFERRED
+            scheduler.dispatch_once()
+            assert not scheduler.in_flight
             assert scheduler.next_deadline == 1000.0 + OutboundQueueScheduler.STALL_RESCAN_SECONDS
             clock[0] = scheduler.next_deadline
-            assert scheduler.dispatch_once() is PassOutcome.BUSY
+            scheduler.dispatch_once()
             assert list(scheduler.in_flight) == [failing]
             scheduler.in_flight[failing].future.result(timeout=2)
             assert [call[1] for call in adapter.calls] == [8, 7]
