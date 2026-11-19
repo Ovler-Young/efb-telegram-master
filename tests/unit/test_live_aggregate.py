@@ -13,9 +13,12 @@ from efb_telegram_master.aggregate import (
     aggregate_fits, make_aggregate, make_source_member, member_message, render_members, utf16_length,
 )
 from efb_telegram_master import migrate_db
+from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.db import DatabaseManager, MsgLog, MsgLogMember, database
+from efb_telegram_master.live_aggregate import LiveTextAggregation
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
+from efb_telegram_master.utils import DEFAULT_TIMEZONE
 
 
 @pytest.fixture
@@ -28,6 +31,25 @@ def manager(tmp_path, monkeypatch):
     finally:
         manager.stop_worker()
         database.initialize(original_database)
+
+
+def idle_live_aggregation():
+    """A real aggregation over an empty queue, for managers built without a runtime."""
+    return LiveTextAggregation(SimpleNamespace(
+        channel=SimpleNamespace(flag=SimpleNamespace(timezone=DEFAULT_TIMEZONE)),
+        _outbound_queue=SimpleNamespace(aggregation_rows=list, aggregation_context=lambda row_id: None,
+                                     cancelled_source=lambda identity: False),
+        _outbound_scheduler=None,
+    ))
+
+
+def bare_manager():
+    """A manager built without its runtime, holding the attributes its code paths read."""
+    manager = object.__new__(TelegramBotManager)
+    manager._transfer_min_mbps = None
+    manager._retry_after_report_at = {}
+    manager.live_aggregation = idle_live_aggregation()
+    return manager
 
 
 def source(uid="one", text="body", name="Alice"):
@@ -181,9 +203,13 @@ def test_rendering_preserves_identities_reply_and_utf16_ranges():
     assert "Bob: 12:34:58\n" in rendered.text
     assert "Bob: <code>12:34:58</code>\n" in rendered.html
     assert member_message(members[1]).target.uid == "one"
+    members[0]["status"] = "removed"
+    removed = render_members(members, admin_id=123)
+    assert removed.text == rendered.text and removed.ranges == rendered.ranges
+    assert '<s>😀 &lt;same&gt;</s>' in removed.html
 
 
-def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones():
+def test_capacity_uses_parsed_text_and_keeps_removed_source_content():
     member = make_source_member(source(text="&" * 4000, name="A"))
     assert len(render_members([member]).html) > 4096
     assert aggregate_fits([member])
@@ -205,6 +231,7 @@ def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones
     removed = [make_source_member(source(str(index), "saved", "name" * 40), received_time=received_time)
                for index in range(200)]
     for member in removed:
+        member["display_prefix"] = ""
         member["status"] = "removed"
     for member in removed[100:]:
         member["received_time"] += datetime.timedelta(days=1)
@@ -213,4 +240,40 @@ def test_capacity_uses_parsed_text_and_keeps_full_source_with_bounded_tombstones
     assert len(rendered.ranges) == 200
     assert rendered.text.count("20:34:56") == 200
     assert aggregate_fits(removed)
+    assert rendered.text.count("saved") == 200
+    assert rendered.html.count("<s>saved</s>") == 200
     assert render_members(removed, history=True).text.count("saved") == 200
+
+
+def test_member_events_follow_the_transition_table():
+    from efb_telegram_master.aggregate import (
+        MemberEvent,
+        MemberStatus,
+        MemberTransitionError,
+        apply_member_event,
+    )
+
+    active = make_source_member(source())
+    removed = apply_member_event(active, MemberEvent.REMOVE)
+    assert (removed.member["status"], removed.member["source_revision"], removed.changed) == (
+        MemberStatus.REMOVED, 2, True)
+    assert not apply_member_event(removed.member, MemberEvent.REMOVE).changed
+
+    # An edit after a removal makes the source live again.
+    edit = make_source_member(source(text="edited"), source_revision=3)
+    revived = apply_member_event(removed.member, MemberEvent.NEW_REVISION, edit).member
+    assert (revived["status"], revived["source_revision"]) == (MemberStatus.ACTIVE, 3)
+    with pytest.raises(MemberTransitionError):
+        apply_member_event(revived, MemberEvent.NEW_REVISION, edit)
+    with pytest.raises(MemberTransitionError):
+        apply_member_event(None, MemberEvent.REMOVE)
+    with pytest.raises(MemberTransitionError):
+        apply_member_event(None, MemberEvent.REDIRECT, edit)
+
+    redirected = apply_member_event(active, MemberEvent.REDIRECT, active)
+    assert redirected.member["status"] == MemberStatus.REDIRECTED
+    # The confirmed replacement is recorded by the caller once its output is saved.
+    redirected.member["replacement_master_msg_id"] = "-100.2"
+    newer = apply_member_event(redirected.member, MemberEvent.RECEIPT, edit).member
+    assert (newer["status"], newer["replacement_master_msg_id"]) == (MemberStatus.REDIRECTED, "-100.2")
+    assert apply_member_event(removed.member, MemberEvent.RECEIPT, active).event == MemberEvent.STALE_RECEIPT

@@ -778,8 +778,7 @@ def test_shutdown_releases_accepted_future_with_unpersistable_receipt(tmp_path, 
     with pytest.raises(SchedulerStoppedError):
         waiter.result(timeout=1)
     assert not scheduler.in_flight and not scheduler.in_flight_destinations and not queue.waiters
-    assert scheduler._permits.acquire(blocking=False)
-    scheduler._permits.release()
+    assert scheduler.slots.free == scheduler.slots.capacity
     samples = [sample for family in metrics.in_flight.collect() for sample in family.samples]
     assert samples and all(sample.value == 0 for sample in samples)
     assert queue.connection.execute("SELECT id, delivery_hold, completion_receipt FROM outbound_queue").fetchall() == [
@@ -825,8 +824,7 @@ def test_receipt_recovery_during_drain_settles_primary_and_preserves_attachment(
     assert db.get_msg_log(master_msg_id="42.100").slave_message_id == "source-1"
     assert scheduler.failure is None
     assert not scheduler.in_flight and not scheduler.in_flight_destinations and not queue.waiters
-    assert scheduler._permits.acquire(blocking=False)
-    scheduler._permits.release()
+    assert scheduler.slots.free == scheduler.slots.capacity
     # Repeated shutdown/harvest must not publish a second primary completion.
     scheduler.harvest_completed()
     scheduler.stop_and_drain(timeout=0)

@@ -47,7 +47,9 @@ from ehforwarderbot.types import ModuleID, ChatID, MessageID, ReactionName
 from .chat_object_cache import ChatObjectCacheManager
 from .message import ETMMsg
 from .msg_type import TGMsgType
-from .aggregate import AggregatePayload, SourceMember, member_identity, member_message
+from .aggregate import (
+    AggregatePayload, MemberEvent, MemberStatus, SourceMember, apply_member_event, member_identity, member_message,
+)
 from .utils import TelegramChatID, EFBChannelChatIDStr, TgChatMsgIDStr, message_id_to_str, \
     chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID, message_id_str_to_id
 
@@ -911,14 +913,9 @@ class DatabaseManager:
                     raise ValueError("Confirmed live members cannot disappear from a container.")
                 for index, member in enumerate(saved["children"]):
                     old = previous_members.get(member_identity(member))
-                    if old and (old["source_revision"] > member["source_revision"] or
-                                (old["source_revision"] == member["source_revision"] and
-                                 old["status"] != "active")):
-                        saved["children"][index] = copy.deepcopy(old)
-                    elif old and old["status"] == "redirected":
-                        # Confirmed replacement routing survives every container receipt.
-                        member["status"] = "redirected"
-                        member["replacement_master_msg_id"] = old["replacement_master_msg_id"]
+                    if old:
+                        # Newer saved routing and removals survive an older receipt snapshot.
+                        saved["children"][index] = apply_member_event(old, MemberEvent.RECEIPT, member).member
             first = saved["children"][0]
             if row is None:
                 self.add_or_update_message_log(member_message(first), master_message, sender_bot_id=sender_bot_id)
@@ -950,7 +947,9 @@ class DatabaseManager:
             row = self._locked_message_log(master_id, include_alt=True)
             if row is None and old_message_id:
                 row = self._locked_message_log(str(message_id_to_str(*old_message_id)), include_alt=True)
-            if row and row.source_member and row.source_member["source_revision"] >= member["source_revision"]:
+            saved_member = apply_member_event(row.source_member if row else None, MemberEvent.SOURCE_RECEIPT, member)
+            if not saved_member.changed:
+                assert row is not None
                 return row
             if row is not None:
                 old_message_id = message_id_str_to_id(TgChatMsgIDStr(row.master_msg_id))
@@ -960,7 +959,7 @@ class DatabaseManager:
                 row = self._locked_message_log(str(message_id_to_str(*old_message_id)), include_alt=True)
             assert row is not None
             misc = pickle.loads(bytes(row.pickle)) if row.pickle else {}
-            misc["source_member"] = copy.deepcopy(member)
+            misc["source_member"] = saved_member.member
             row.pickle = pickle.dumps(misc, protocol=5)
             topic = getattr(master_message, "message_thread_id", None)
             if topic is not None:
@@ -982,17 +981,14 @@ class DatabaseManager:
                              if member_identity(child) == member_identity(member)), None)
             if previous is None:
                 raise ValueError("The source member does not belong to this container.")
-            if previous["source_revision"] > member["source_revision"] or (
-                    previous["source_revision"] == member["source_revision"] and previous["status"] == "removed"):
-                raise ValueError("A stale receipt cannot redirect a newer source version.")
-            if previous["status"] == "redirected" and previous["source_revision"] >= member["source_revision"]:
+            change = apply_member_event(previous, MemberEvent.REDIRECT, member)
+            if not change.changed:
                 replacement = self.get_msg_log(master_msg_id=previous["replacement_master_msg_id"])
                 if replacement is None:
                     raise ValueError("The confirmed replacement is missing.")
                 return replacement
             replacement = self.finalize_source_message(msg, master_message, member, sender_bot_id)
-            redirected = copy.deepcopy(member)
-            redirected["status"] = "redirected"
+            redirected = change.member
             redirected["replacement_master_msg_id"] = replacement.master_msg_id
             aggregate["children"] = [redirected if member_identity(child) == member_identity(member) else child
                                      for child in aggregate["children"]]
@@ -1043,7 +1039,7 @@ class DatabaseManager:
             if aggregate:
                 member = next((child for child in aggregate["children"]
                                if member_identity(child) == (slave_origin_uid, slave_msg_id)), None)
-                if member is None or member["status"] == "redirected":
+                if member is None or member["status"] == MemberStatus.REDIRECTED:
                     continue
             else:
                 member = row.source_member
@@ -1427,25 +1423,58 @@ class DatabaseManager:
     @observe_database_method("get_next_history_migration_target")
     def get_next_history_migration_target(
         self, target_chat_id: Optional[int] = None,
+        message_thread_id: Optional[TelegramTopicID] = None,
     ) -> Optional[HistoryMigrationEntry]:
         # Seek one head per published generation; ordering a combined
         # visibility predicate can instead scan every unpublished staging row.
-        target_filter = (
-            HistoryMigrationTarget.target_chat_id == str(target_chat_id)
-            if target_chat_id is not None else True
-        )
+        # A topic scopes the search to one replay lane: topics of a chat are
+        # ordered only within themselves, so one topic must not hide the others.
+        thread_value = str(message_thread_id) if message_thread_id is not None else None
+        published_filter: list[object] = []
+        if target_chat_id is not None:
+            published_filter.append(HistoryMigrationTarget.target_chat_id == str(target_chat_id))
+        if thread_value is not None:
+            published_filter.append(HistoryMigrationTarget.message_thread_id == thread_value)
         head = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             HistoryMigrationEntry.generation == HistoryMigrationTarget.generation,
         ).order_by(HistoryMigrationEntry.position, HistoryMigrationEntry.id).limit(1)
-        published_id = HistoryMigrationTarget.select(fn.MIN(EnclosedNodeList([head]))).where(target_filter).scalar()
+        published_id = HistoryMigrationTarget.select(
+            fn.MIN(EnclosedNodeList([head]))
+        ).where(*(published_filter or (True,))).scalar()
         legacy_filter = HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
         if target_chat_id is not None:
             legacy_filter &= HistoryMigrationEntry.target_chat_id == str(target_chat_id)
+        if thread_value is not None:
+            legacy_filter &= HistoryMigrationEntry.message_thread_id == thread_value
         legacy_id = HistoryMigrationEntry.select(HistoryMigrationEntry.id).where(
             legacy_filter
         ).order_by(HistoryMigrationEntry.position, HistoryMigrationEntry.id).limit(1).scalar()
         ids = [identifier for identifier in (published_id, legacy_id) if identifier is not None]
         return HistoryMigrationEntry.get_by_id(min(ids)) if ids else None
+
+    @observe_database_method("get_pending_history_migration_targets")
+    def get_pending_history_migration_targets(self) -> List[Tuple[int, Optional[int]]]:
+        """Return every (target chat, topic) pair that still has unpublished entries.
+
+        Replay is serialized per topic, not per chat, so this is the set that
+        deserves its own replay lane.
+        """
+        published = HistoryMigrationTarget.select(
+            HistoryMigrationTarget.target_chat_id, HistoryMigrationTarget.message_thread_id,
+        )
+        legacy = HistoryMigrationEntry.select(
+            HistoryMigrationEntry.target_chat_id, HistoryMigrationEntry.message_thread_id,
+        ).where(
+            HistoryMigrationEntry.generation.is_null(True) & ~fn.EXISTS(self._history_entry_target())
+        )
+        pairs = {
+            (int(row.target_chat_id), int(row.message_thread_id) if row.message_thread_id else None)
+            for row in list(published) + list(legacy)
+        }
+        return [
+            pair for pair in sorted(pairs, key=lambda pair: (pair[0], -1 if pair[1] is None else pair[1]))
+            if self.get_next_history_migration_target(*pair) is not None
+        ]
 
     @observe_database_method("get_pending_history_migration_target_ids")
     def get_pending_history_migration_target_ids(self) -> List[int]:

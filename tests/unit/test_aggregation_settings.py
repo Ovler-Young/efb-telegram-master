@@ -1,11 +1,13 @@
 import datetime
 import sqlite3
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 from telegram import CallbackQuery, Chat, Message, Update, User
 
+from efb_telegram_master import selection_session
 from efb_telegram_master.aggregation_settings import AggregationSettings
 from efb_telegram_master.chat import ETMGroupChat
 from efb_telegram_master.db import DatabaseManager, SlaveChatInfo, database
@@ -80,9 +82,20 @@ def test_old_schema_upgrade_and_restart_load_overrides(tmp_path, monkeypatch):
         database.initialize(original)
 
 
+UIDS = ('one', 'two', *(f'page{index}' for index in range(8)))
+
+
+class FakeClock:
+    def __init__(self, now):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+
 @pytest.fixture
 def settings(manager):
-    chats = {uid: source_chat(manager, uid) for uid in ('one', 'two')}
+    chats = {uid: source_chat(manager, uid) for uid in UIDS}
     bot = Mock()
     bot.send_message.return_value = SimpleNamespace(message_id=100)
     channel = SimpleNamespace(db=manager, config={'admins': [7, 8]}, bot_manager=bot,
@@ -162,4 +175,48 @@ def test_multiple_bindings_require_selection_and_recheck(settings):
     settings.callback(update(callback=callback_data, message_id=100), SimpleNamespace())
     assert settings.channel.db.get_text_aggregation_override('tests.source', 'two') is False
     assert settings.channel.db.get_text_aggregation_override('tests.source', 'one') is None
+    assert not settings.sessions
+
+
+def test_page_then_choose_ends_selection_and_repeats_are_rejected(settings):
+    for uid in UIDS:
+        bind(settings, uid)
+    settings.command(update(), SimpleNamespace(args=['off']))
+    keyboard = settings.bot.send_message.call_args.kwargs['reply_markup'].inline_keyboard
+    next_page = keyboard[-1][-1].callback_data
+    token = next_page.split(':')[1]
+    settings.callback(update(callback=next_page, message_id=100), SimpleNamespace())
+    paged = settings.bot.edit_message_reply_markup.call_args.kwargs['reply_markup'].inline_keyboard
+    assert paged[0][0].callback_data.startswith(f'aggregation:{token}:select:')
+    choice = paged[0][0]
+    settings.callback(update(callback=choice.callback_data, message_id=100), SimpleNamespace())
+    assert settings.channel.db.get_text_aggregation_override('tests.source', choice.text) is False
+    assert 'chat override: off' in settings.bot.edit_message_text.call_args.kwargs['text']
+    assert not settings.sessions
+    for data in (choice.callback_data, next_page):
+        settings.callback(update(callback=data, message_id=100), SimpleNamespace())
+        assert settings.bot.answer_callback_query.call_args.kwargs['text'] == (
+            'This selection has expired. Send /aggregation again.')
+    assert settings.channel.db.get_text_aggregation_override('tests.source', choice.text) is False
+    assert settings.bot.edit_message_text.call_count == 1
+
+
+def test_selection_expires_at_the_fifteen_minute_deadline(settings, monkeypatch):
+    bind(settings, 'one')
+    bind(settings, 'two')
+    clock = FakeClock(time.monotonic())
+    monkeypatch.setattr(selection_session, 'time', clock)
+    settings.command(update(), SimpleNamespace(args=['off']))
+    callback_data = settings.bot.send_message.call_args.kwargs['reply_markup'].inline_keyboard[1][0].callback_data
+    token = callback_data.split(':')[1]
+    deadline = settings.sessions[token].expires_at
+    assert deadline - clock.now == pytest.approx(900, abs=1)
+    clock.now = deadline - 1
+    settings.callback(update(callback=f'aggregation:{token}:page:0', message_id=100), SimpleNamespace())
+    assert settings.bot.edit_message_reply_markup.call_count == 1
+    clock.now = deadline
+    settings.callback(update(callback=callback_data, message_id=100), SimpleNamespace())
+    assert settings.bot.answer_callback_query.call_args.kwargs['text'] == (
+        'This selection has expired. Send /aggregation again.')
+    assert settings.channel.db.get_text_aggregation_override('tests.source', 'two') is None
     assert not settings.sessions

@@ -243,13 +243,17 @@ def test_get_file_never_falls_back_to_another_bot(history, state):
 def test_remote_download_is_chunked_and_not_forwarded_as_owner_url(history, monkeypatch):
     manager, _, _ = prepare_runtime(history, Sender())
     url = 'https://files.example/file/botOWNER/media.mp4'
-    owner = SimpleNamespace(get_file=Mock(return_value=SimpleNamespace(file_path=url)))
+    manager._transfer_min_mbps = 2.5
+    owner = SimpleNamespace(get_file=Mock(return_value=SimpleNamespace(
+        file_path=url, file_size=312500)))
     attach_owner(manager, owner, membership=False)
     requested = []
 
     @contextmanager
     def stream(method, path, **kwargs):
         requested.append((method, path))
+        assert kwargs["timeout"].read == 121
+        assert kwargs["timeout"].connect == 120
         def chunks(*, chunk_size):
             assert chunk_size == 1024 * 1024
             yield b'one'

@@ -8,6 +8,7 @@ import telegram.error
 from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.bot_pool import BotPool
 from efb_telegram_master.outbound import OutboundQueue, QueuedCall, SenderSelection
+from tests.unit.test_live_aggregate import bare_manager
 
 
 class Limiter:
@@ -35,7 +36,7 @@ def _auxiliary(bot_id: int, *, disabled: bool = False, membership: bool | None =
 
 
 def _manager(*auxiliaries: Mock) -> TelegramBotManager:
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._bot = object()
     manager._rate_limiter = Limiter()
     manager._bot_chat_disabled_until = {}

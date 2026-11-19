@@ -27,7 +27,7 @@ from .message import ETMMsg
 from .member_selection import SourceMemberSelector, SourceIdentity
 from .msg_type import TGMsgType, get_msg_type
 from .ptb_compat import Filters, sync_reply_text
-from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
+from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, removal_edit
 
 ForumRoute = Tuple[Optional[EFBChannelChatIDStr]]
 QueuedMessage = Tuple[Update, CallbackContext, Optional[ForumRoute]]
@@ -425,12 +425,12 @@ class MasterMessageProcessor(LocaleMixin):
                         destination_channel=coordinator.slaves[channel],
                         message=m
                     ))
-                    if not self.channel.flag('prevent_message_removal'):
-                        try:
-                            self.bot.delete_message(message.chat_id, message.message_id)
-                        except TelegramError:
-                            sync_reply_text(self.bot, message, self._("Message is removed in remote chat."))
-                    else:
+                    try:
+                        operation, kwargs = removal_edit(get_msg_type(message).value,
+                                                         (message.text or message.caption or "").removeprefix(self.DELETE_FLAG))
+                        getattr(self.bot, operation)(chat_id=message.chat_id, message_id=message.message_id,
+                                                    _sender_bot_id=edited.sender_bot_id, **kwargs)
+                    except TelegramError:
                         sync_reply_text(self.bot, message, self._("Message is removed in remote chat."))
                     log_message = False
                     return
@@ -708,16 +708,15 @@ class MasterMessageProcessor(LocaleMixin):
             key = (origin, reply.chat_id, msg_log.master_message_thread_id)
             self.bot.live_aggregation.remove_source_member(key, (origin, str(etm_msg.uid)))
             return sync_reply_text(self.bot, message, self._("Message is removed in remote chat."))
-        if not self.channel.flag('prevent_message_removal'):
-            try:
-                self.bot.delete_message(
-                    reply.chat_id,
-                    reply.message_id,
-                    _sender_bot_id=msg_log.sender_bot_id,
-                )
-            except TelegramError:
-                sync_reply_text(self.bot, reply, self._("Message is removed in remote chat."))
-        else:
+        try:
+            operation, kwargs = removal_edit(get_msg_type(reply).value, reply.text or reply.caption or "")
+            getattr(self.bot, operation)(
+                chat_id=reply.chat_id,
+                message_id=reply.message_id,
+                _sender_bot_id=msg_log.sender_bot_id,
+                **kwargs,
+            )
+        except TelegramError:
             sync_reply_text(self.bot, reply, self._("Message is removed in remote chat."))
 
     def unsupported_message(self, update: Update, context: CallbackContext):

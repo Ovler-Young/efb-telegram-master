@@ -13,6 +13,15 @@ from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler
 from . import utils
 from .locale_mixin import LocaleMixin
 from .ptb_compat import Filters, sync_reply_text
+from .selection_session import (
+    SESSION_SECONDS,
+    SelectionEvent,
+    SelectionState,
+    advance,
+    expire_stale,
+    find_session,
+    is_owner,
+)
 from .utils import EFBChannelChatIDStr
 
 if TYPE_CHECKING:
@@ -29,11 +38,11 @@ class ChatSelection:
     origins: list[EFBChannelChatIDStr]
     expires_at: float
     message_id: Optional[int] = None
+    state: SelectionState = SelectionState.OPEN
 
 
 class AggregationSettings(LocaleMixin):
     PAGE_SIZE = 8
-    SESSION_SECONDS = 900
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel = channel
@@ -107,11 +116,10 @@ class AggregationSettings(LocaleMixin):
         if len(origins) == 1:
             return sync_reply_text(self.bot, message, self._apply(origins[0], action))
         with self.lock:
-            now = time.monotonic()
-            self.sessions = {key: value for key, value in self.sessions.items() if value.expires_at > now}
+            expire_stale(self.sessions)
             token = secrets.token_hex(8)
             selection = ChatSelection(user.id, message.chat.id, message.message_thread_id,
-                                      action, origins, now + self.SESSION_SECONDS)
+                                      action, origins, time.monotonic() + SESSION_SECONDS)
             sent = sync_reply_text(self.bot, message, self._('Select a source chat:'),
                                    reply_markup=self._keyboard(token, selection), _force_main_bot=True)
             selection.message_id = sent.message_id
@@ -125,10 +133,8 @@ class AggregationSettings(LocaleMixin):
             return self.bot.answer_callback_query(query.id, text=self._('Only configured bot admins can change this setting.'))
         parts = (query.data or '').split(':')
         with self.lock:
-            selection = self.sessions.get(parts[1]) if len(parts) == 4 else None
-            if (selection is None or selection.expires_at <= time.monotonic()
-                    or selection.requester_id != user.id or selection.chat_id != message.chat.id
-                    or selection.message_id != message.message_id
+            selection = find_session(self.sessions, parts[1]) if len(parts) == 4 else None
+            if (selection is None or not is_owner(selection, user.id, message.chat.id, message.message_id)
                     or selection.topic_id != message.message_thread_id):
                 return self.bot.answer_callback_query(query.id, text=self._('This selection has expired. Send /aggregation again.'))
             token, action, index_text = parts[1:]
@@ -138,6 +144,7 @@ class AggregationSettings(LocaleMixin):
             if index >= len(selection.origins):
                 return self.bot.answer_callback_query(query.id, text=self._('Invalid selection.'))
             if action == 'page':
+                advance(self.sessions, token, selection, SelectionEvent.PAGE)
                 self.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message.message_id,
                                                     reply_markup=self._keyboard(token, selection, index))
             else:
@@ -145,7 +152,7 @@ class AggregationSettings(LocaleMixin):
                 if origin not in self._origins(message):
                     return self.bot.answer_callback_query(query.id, text=self._('The chat binding changed. Send /aggregation again.'))
                 text = self._apply(origin, selection.action)
-                self.sessions.pop(token)
+                advance(self.sessions, token, selection, SelectionEvent.SELECT)
                 self.bot.edit_message_text(chat_id=message.chat.id, message_id=message.message_id,
                                            text=text, reply_markup=None)
             self.bot.answer_callback_query(query.id)

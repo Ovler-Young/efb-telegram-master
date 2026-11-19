@@ -35,6 +35,7 @@ def history(tmp_path, monkeypatch, request):
     binding.db = db
     binding.chat_manager = Mock()
     binding.logger = Mock()
+    binding._history_ownership_swept = False
     calls = []
 
     def enqueue(**kwargs):
@@ -464,3 +465,19 @@ def test_failed_video_replay_is_retained_and_later_history_can_continue(history)
         assert manager._outbound_queue.connection.execute('SELECT COUNT(*) FROM outbound_queue').fetchone()[0] == 1
     finally:
         manager._outbound_queue.close()
+
+
+def test_replay_lanes_are_per_topic_and_one_topic_never_hides_another(history):
+    """Topics of one chat replay independently; staging order is per topic."""
+    def entries(topic, texts):
+        return [dict(slave_chat_id='slave chat', target_chat_id='-1002', message_thread_id=str(topic),
+                     source_master_msg_id=f'{topic}.{index}', formatted_text=text, media_type='Text',
+                     position=index) for index, text in enumerate(texts)]
+
+    history.db.replace_history_migration_entries('slave chat', -1002, 11, entries(11, ['a1\n', 'a2\n']))
+    history.db.replace_history_migration_entries('slave chat', -1002, 12, entries(12, ['b1\n', 'b2\n']))
+
+    assert history.db.get_pending_history_migration_targets() == [(-1002, 11), (-1002, 12)]
+    assert history.db.get_next_history_migration_target(-1002, 11).formatted_text == 'a1\n'
+    assert history.db.get_next_history_migration_target(-1002, 12).formatted_text == 'b1\n'
+

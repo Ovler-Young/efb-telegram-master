@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import logging
 import pickle
 import time
 from contextlib import contextmanager
@@ -11,9 +12,16 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
-from .aggregate import aggregate_fits, make_aggregate, member_identity, member_message, render_members
-from .outbound import QueueRequest
+from .aggregate import (
+    MemberEvent, MemberStatus, aggregate_fits, apply_member_event, make_aggregate, member_identity, member_message,
+    render_members,
+)
+from .aggregation_states import (
+    CloseReason, ContextEvent, ContextKind, ContextState, StreamEvent, StreamState, next_stream_state,
+)
+from .outbound import IllegalAggregationTransitionError, QueueRequest, check_context_transition
 from .queued_log import decode_aggregation, encode_aggregation
+from .utils import removal_edit
 
 
 @dataclass
@@ -23,9 +31,36 @@ class _Stream:
     recent: list[float] = field(default_factory=list)
     last_new: float = 0
     generation: int = 0
+    # The (base, generation) a close replaced, kept for one reopen; set while CLOSED.
+    closed: Optional[tuple] = None
+
+    def apply(self, event: StreamEvent) -> None:
+        """Move this stream along ``STREAM_TRANSITIONS``."""
+        after = next_stream_state(_stream_state(self), event)
+        if after is StreamState.CLOSED:
+            self.closed = (self.base, self.generation)
+            self.base = None
+            self.generation += 1
+        elif after is StreamState.OPEN:
+            if event is StreamEvent.REOPEN and self.closed is not None:
+                self.base, self.generation = self.closed
+            self.closed = None
+
+
+def _stream_state(stream: _Stream | None) -> StreamState:
+    if stream is None:
+        return StreamState.ABSENT
+    return StreamState.OPEN if stream.closed is None else StreamState.CLOSED
+
+
+# Rows that end a container: later members of the source start a new one.
+_INDEPENDENT_KINDS = frozenset({ContextKind.BOUNDARY, ContextKind.SOURCE, ContextKind.REDIRECT})
 
 
 class LiveTextAggregation:
+    # Members delivered this much later than they arrived are part of a backfill
+    # rather than live traffic; their containers are held so the run can join.
+    BACKFILL_LATENESS_SECONDS = 5.0
     """Keep append eligibility in memory and every unpublished member durable."""
 
     def __init__(self, manager):
@@ -38,6 +73,8 @@ class LiveTextAggregation:
         self.container_tails: dict[str, int] = {}
         self._source_delivery = ContextVar("aggregate_source_delivery", default=None)
         self._independent: ContextVar[Optional[tuple]] = ContextVar("aggregate_independent", default=None)
+        self._close_counts: dict[str, int] = {}
+        self._close_logged_at = 0.0
         rows = self.queue.aggregation_rows()
         publication_rows = {}
         predecessors = {}
@@ -65,10 +102,10 @@ class LiveTextAggregation:
             row, logical = max(terminal or candidates, key=lambda item: item[0].id)
             stream = self.streams[key]
             stream.tail = row.id
-            stream.base = logical.get("base") if logical.get("appendable", True) and logical["kind"] not in {"boundary", "source", "redirect"} else None
+            stream.base = logical.get("base") if logical.get("appendable", True) and logical["kind"] not in _INDEPENDENT_KINDS else None
             stream.recent = logical.get("recent", [])
             stream.last_new = logical.get("last_new", row.created_at)
-            if logical["kind"] in {"boundary", "source", "redirect"} and logical.get("generation", 0) < stream.generation:
+            if logical["kind"] in _INDEPENDENT_KINDS and logical.get("generation", 0) < stream.generation:
                 # Earlier split rows cannot reopen a container beyond this boundary.
                 stream.generation += 1
 
@@ -77,12 +114,12 @@ class LiveTextAggregation:
         admins = self.manager.channel.config.get("admins", [])
         return admins[0] if admins else None
 
-    def fits(self, members, *, updating=False):
+    def fits(self, members, *, updating=False, confirmed=None):
         flag = self.manager.channel.flag
         return aggregate_fits(members, max_members=int(flag("text_aggregation_max_members")),
                               max_payload_bytes=int(flag("text_aggregation_max_payload_bytes")),
                               admin_id=self.admin_id, include_redirected_payload=not updating,
-                              display_timezone=self.display_timezone)
+                              display_timezone=self.display_timezone, confirmed=confirmed)
 
     def _tail_context(self, stream):
         if stream.tail is None:
@@ -93,11 +130,52 @@ class LiveTextAggregation:
     def _existing_tail(self, stream):
         return stream.tail if stream.tail is not None and self.queue.contains(stream.tail) else None
 
-    def close(self, key):
+    def close(self, key, reason: str):
+        """End the current container for one source.
+
+        Every caller states why (a ``CloseReason``): a silently closed container
+        splits the run, and the observable blocks of two or three messages give
+        no clue which rule did it.
+        """
         stream = self.streams.get(tuple(key))
-        if stream is not None:
-            stream.base = None
-            stream.generation += 1
+        if next_stream_state(_stream_state(stream), StreamEvent.CLOSE) is StreamState.ABSENT:
+            logging.getLogger(__name__).debug("No live aggregation stream to close for %s (%s).", key, reason)
+        else:
+            assert stream is not None
+            stream.apply(StreamEvent.CLOSE)
+            # One line a minute, with a tally: every container close splits a run,
+            # and which rule did it is the only way to tell why. Unthrottled, this
+            # would flood an active chat.
+            self._close_counts[reason] = self._close_counts.get(reason, 0) + 1
+            now = time.monotonic()
+            if now - self._close_logged_at >= 60.0:
+                self._close_logged_at = now
+                logging.getLogger(__name__).warning(
+                    "Live aggregation container closes in the last interval: %s (latest %s)",
+                    dict(self._close_counts), reason,
+                )
+                self._close_counts.clear()
+
+    def reopen(self, row):
+        """Rejoin the text run a discarded media row had ended.
+
+        An undeliverable media row is removed without ever reaching Telegram, so
+        the boundary it created was phantom: restore the container it closed
+        instead of starting a new one.
+        """
+        from .queued_log import decode_aggregation
+        context = decode_aggregation(row.log_context) if row.log_context else None
+        if not context:
+            return
+        stream = self.streams.get(tuple(context["key"]))
+        if stream is None or stream.tail != row.id:
+            # A later row already continued the run, or there is no stream.
+            logging.getLogger(__name__).debug("Discarded queue row %s is not a live aggregation tail.", row.id)
+            return
+        predecessor = row.predecessor_id
+        stream.tail = predecessor if predecessor and self.queue.contains(predecessor) else None
+        stream.apply(StreamEvent.REOPEN)
+        self.scheduler.wake_event.set()
 
     def close_destination(self, chat_id, topic):
         """New Telegram messages end every source stream in their destination."""
@@ -105,7 +183,7 @@ class LiveTextAggregation:
             self.queue.close_aggregation_destination(chat_id, topic)
             for key in self.streams:
                 if int(key[1]) == chat_id and key[2] == topic:
-                    self.close(key)
+                    self.close(key, CloseReason.TELEGRAM_DESTINATION)
             self.scheduler.wake_event.set()
 
     def close_source_routes(self, key):
@@ -115,7 +193,7 @@ class LiveTextAggregation:
         for old_key, old_stream in self.streams.items():
             if old_key[0] == key[0] and old_key != key:
                 prior_tail = self._existing_tail(old_stream) or prior_tail
-                self.close(old_key)
+                self.close(old_key, CloseReason.ROUTE_CHANGED)
         return prior_tail
 
     def append(self, key, member, *, silent=False):
@@ -140,11 +218,12 @@ class LiveTextAggregation:
             prior_tail = self.close_source_routes(key)
             stream = self.streams.setdefault(key, _Stream())
             if stream.last_new and now - stream.last_new >= float(self.manager.channel.flag("text_aggregation_idle_seconds")):
-                self.close(key)
+                self.close(key, CloseReason.IDLE)
             stream.recent = [stamp for stamp in stream.recent if now - stamp < 3][-2:] + [now]
             stream.last_new = now
             context = self._tail_context(stream)
-            if context and context["kind"] == "logical" and context["generation"] == stream.generation and not context.get("incoming_boundary"):
+            if (context and context["kind"] == ContextKind.LOGICAL and context["generation"] == stream.generation
+                    and not context.get("incoming_boundary")):
                 members = context["members"] + [member]
                 if self.fits(members):
                     context.update(members=members, recent=stream.recent, last_new=now)
@@ -152,25 +231,34 @@ class LiveTextAggregation:
                         context.update(waiting=True, due=context["members"][0]["received_time"].timestamp()
                                        + float(self.manager.channel.flag("text_aggregation_window_seconds")))
                     if self.queue.replace_logical_aggregation(stream.tail, encode_aggregation(context)):
+                        stream.apply(StreamEvent.APPEND)
                         self.pending_sources[identity] = stream.tail
                         self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_source())
                         self.scheduler.wake_event.set()
                         return True
                 # Pending capacity becomes a publication boundary.
-                self.close(key)
+                self.close(key, CloseReason.CAPACITY)
             predecessor = self._existing_tail(stream) or prior_tail
             inherit = bool(predecessor and context and context.get("generation") == stream.generation and not context.get("incoming_boundary"))
-            waiting = len(stream.recent) > 2
-            context = dict(format_version=1, kind="logical", key=key, members=[member],
+            # The window applies from the first member: otherwise the container is
+            # dispatched before it can absorb the run, and every later member starts
+            # a new container instead of joining this one.
+            window = float(self.manager.channel.flag("text_aggregation_window_seconds"))
+            # A member that is already late when it reaches the aggregator belongs
+            # to a backfill: hold its container for the window so the rest of the
+            # run can join it. Fresh traffic still publishes immediately.
+            waiting = (time.time() - now) >= self.BACKFILL_LATENESS_SECONDS
+            context = dict(format_version=1, kind=ContextKind.LOGICAL, key=key, members=[member],
                            base=stream.base, inherit=inherit, generation=stream.generation,
                            recent=stream.recent, last_new=now, waiting=waiting,
-                           due=now + float(self.manager.channel.flag("text_aggregation_window_seconds")) if waiting else now,
+                           due=(now + window) if waiting else now,
                            silent=silent)
             request = QueueRequest("send_message", (), {"chat_id": key[1], "text": "", "_slave_id": key[0],
                                                          "_send_mode": "eventual"},
                                    encode_aggregation(context), predecessor_id=predecessor)
             row_id, _ = self.queue.enqueue_many([request], self.manager._queue_operation)
             stream.tail = row_id
+            stream.apply(StreamEvent.APPEND)
             self.pending_sources[identity] = row_id
             self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_source())
             self.scheduler.wake_event.set()
@@ -186,7 +274,7 @@ class LiveTextAggregation:
         reserved = [True]
         try:
             stream = self.streams.setdefault(key, _Stream())
-            self.close(key)
+            self.close(key, CloseReason.INDEPENDENT_DELIVERY)
             token = self._independent.set((key, self._existing_tail(stream), reserved))
             try:
                 yield
@@ -213,7 +301,7 @@ class LiveTextAggregation:
                     context["message"] = decode(request.log_context)[0]
                 context.setdefault("message", member_message(context["member"]))
             else:
-                context = dict(format_version=1, kind="boundary", key=key, generation=stream.generation,
+                context = dict(format_version=1, kind=ContextKind.BOUNDARY, key=key, generation=stream.generation,
                                recent=stream.recent, last_new=stream.last_new,
                                members=[], legacy_context=request.log_context)
             contexts.append(replace(request, predecessor_id=predecessor, log_context=encode_aggregation(context)))
@@ -228,7 +316,7 @@ class LiveTextAggregation:
             if split:
                 for row in self.queue.aggregation_rows():
                     context = decode_aggregation(row.log_context)
-                    if tuple(context["key"]) == key and context["kind"] == "logical":
+                    if tuple(context["key"]) == key and context["kind"] == ContextKind.LOGICAL:
                         for member in context["members"]:
                             self.pending_sources[member_identity(member)] = row.id
                 self.pending_sources.pop(member_identity(source["member"]), None)
@@ -237,8 +325,8 @@ class LiveTextAggregation:
                 else:
                     self.streams[key].tail = split["tail"]
                     tail = self._tail_context(self.streams[key])
-                    if tail and tail["kind"] in {"boundary", "source", "redirect"}:
-                        self.close(key)
+                    if tail and tail["kind"] in _INDEPENDENT_KINDS:
+                        self.close(key, CloseReason.split_tail(str(tail["kind"])))
             else:
                 self.streams[key].tail = int(row_id)
             if source is not None:
@@ -255,11 +343,30 @@ class LiveTextAggregation:
             return None
         payload = self.queue.aggregation_context(row.id)
         context = decode_aggregation(payload) if payload else None
-        return context.get("due") if context and context["kind"] in {"logical", "member_update"} else None
+        return context.get("due") if context and context["kind"] in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE} else None
 
     def materialize(self, row, selection):
         context = decode_aggregation(row.log_context) if row.log_context else None
-        if context and context["kind"] in {"source", "redirect"} and not context.get("frozen"):
+        independent = context is not None and context["kind"] in {ContextKind.SOURCE, ContextKind.REDIRECT}
+        if independent and context["member"]["status"] == MemberStatus.REMOVED:
+            member = context["member"]
+            resolved = self.manager.channel.db.resolve_source_member(*member_identity(member),
+                str(context["key"][1]), context["key"][2])
+            if resolved and not resolved[0].aggregate:
+                from .msg_type import TGMsgType
+                log = resolved[0]
+                operation, kwargs = self._removal_edit(log, member)
+                message = member_message(member)
+                message.type_telegram = TGMsgType(log.media_type)
+                message.file_id, message.file_unique_id = log.file_id, log.file_unique_id
+                message.mime, message.file_bot_id = log.mime, log.file_bot_id
+                context.update(kind=ContextKind.SOURCE, old_container_id=None, frozen=True,
+                               old_message_id=tuple(int(value) for value in log.master_msg_id.rsplit(".", 1)),
+                               message=message)
+                return self.queue.materialize_aggregation(row.id, operation, kwargs, encode_aggregation(context), selection)
+            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.MATERIALIZE,
+                                                    "A removal edit requires its confirmed standalone message.")
+        if independent and not context.get("frozen"):
             member = context["member"]
             resolved = self.manager.channel.db.resolve_source_member(*member_identity(member),
                 str(context["key"][1]), context["key"][2])
@@ -270,16 +377,11 @@ class LiveTextAggregation:
             kwargs.pop("self")
             if resolved:
                 log = resolved[0]
-                if member["status"] == "removed" and not log.aggregate:
-                    operation = "edit_message_text" if log.media_type == "Text" else "delete_message"
-                    kwargs = dict(chat_id=context["key"][1], message_id=int((log.master_msg_id_alt or log.master_msg_id).rsplit(".", 1)[1]))
-                    if operation == "edit_message_text":
-                        kwargs["text"] = "[message removed]"
                 if log.aggregate:
-                    context["kind"] = "redirect"
+                    context["kind"] = ContextKind.REDIRECT
                     context["old_container_id"] = log.master_msg_id
                 else:
-                    context["kind"] = "source"
+                    context["kind"] = ContextKind.SOURCE
                     context["old_container_id"] = None
                     context["old_message_id"] = tuple(int(value) for value in log.master_msg_id.rsplit(".", 1))
                     if operation == "send_message" and log.media_type == "Text":
@@ -289,14 +391,17 @@ class LiveTextAggregation:
                         kwargs["message_id"] = int((log.master_msg_id_alt or log.master_msg_id).rsplit(".", 1)[1])
             context["frozen"] = True
             return self.queue.materialize_aggregation(row.id, operation, kwargs, encode_aggregation(context), selection)
-        if context is None or context["kind"] not in {"logical", "member_update"}:
+        if context is None or context["kind"] not in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE}:
+            # Frozen requests are sent as stored.
             return row
-        if context["kind"] == "member_update":
+        if context["kind"] == ContextKind.MEMBER_UPDATE:
             if not context.get("container_id"):
                 member = context["updates"][0]
                 resolved = self.manager.channel.db.resolve_source_member(*member_identity(member), str(context["key"][1]), context["key"][2])
                 if not resolved or not resolved[0].aggregate:
-                    raise ValueError("Deferred source update requires its confirmed container.")
+                    raise IllegalAggregationTransitionError(
+                        row.id, context["kind"], ContextEvent.MATERIALIZE,
+                        "Deferred source update requires its confirmed container.")
                 context["container_id"] = resolved[0].master_msg_id
             log = self.manager.channel.db.get_msg_log(master_msg_id=context["container_id"])
             children = copy.deepcopy(log.aggregate["children"])
@@ -304,12 +409,11 @@ class LiveTextAggregation:
             for index, previous in enumerate(children):
                 update = updates.get(member_identity(previous))
                 if update and update["source_revision"] > previous["source_revision"]:
-                    children[index] = copy.deepcopy(update)
-                    if previous["status"] == "redirected":
-                        children[index]["status"] = "redirected"
-                        children[index]["replacement_master_msg_id"] = previous["replacement_master_msg_id"]
-            if not self.fits(children, updating=True):
-                raise ValueError("Source changes require independent output before container update.")
+                    children[index] = apply_member_event(previous, MemberEvent.RECEIPT, update).member
+            if not self.fits(children, updating=True, confirmed=log.aggregate):
+                raise IllegalAggregationTransitionError(
+                    row.id, context["kind"], ContextEvent.MATERIALIZE,
+                    "Source changes require independent output before container update.")
             base = dict(message_id=int(log.master_msg_id.rsplit(".", 1)[1]), owner=log.sender_bot_id,
                         aggregate=log.aggregate)
             members = []
@@ -319,15 +423,19 @@ class LiveTextAggregation:
             children = None
         owner = base and base["owner"]
         can_edit = (base is not None and owner == selection.sender_bot_id
-                    and (context["kind"] == "member_update"
-                         or self.fits(base["aggregate"]["children"] + members)))
-        if context["kind"] == "member_update" and not can_edit:
-            raise ValueError("Existing aggregate updates require the original owner.")
+                    and (context["kind"] == ContextKind.MEMBER_UPDATE
+                         or self.fits(base["aggregate"]["children"] + members, confirmed=base["aggregate"])))
+        if context["kind"] == ContextKind.MEMBER_UPDATE and not can_edit:
+            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.MATERIALIZE,
+                                                    "Existing aggregate updates require the original owner.")
         if children is None:
             children = base["aggregate"]["children"] + members if can_edit else members
         revision = base["aggregate"]["revision"] + 1 if can_edit else 1
-        aggregate = make_aggregate(children, revision, admin_id=self.admin_id, display_timezone=self.display_timezone)
-        kwargs = dict(chat_id=context["key"][1], text=render_members(children, admin_id=self.admin_id, display_timezone=self.display_timezone).html,
+        confirmed = base["aggregate"] if can_edit else None
+        aggregate = make_aggregate(children, revision, admin_id=self.admin_id, display_timezone=self.display_timezone,
+                                   confirmed=confirmed)
+        kwargs = dict(chat_id=context["key"][1], text=render_members(children, admin_id=self.admin_id, display_timezone=self.display_timezone,
+                                                                 confirmed=confirmed).html,
                       parse_mode="HTML", disable_notification=context["silent"], _live_aggregate=True)
         operation = "send_message"
         if can_edit:
@@ -336,9 +444,9 @@ class LiveTextAggregation:
             kwargs["message_id"] = base["message_id"]
         elif context["key"][2] is not None:
             kwargs["message_thread_id"] = int(context["key"][2])
-        frozen = dict(format_version=1, kind="aggregate", key=context["key"], aggregate=aggregate,
+        frozen = dict(format_version=1, kind=ContextKind.AGGREGATE, key=context["key"], aggregate=aggregate,
                       generation=context["generation"], recent=context["recent"], last_new=context["last_new"],
-                      retry_context=copy.deepcopy(context) if context["kind"] == "logical" else None,
+                      retry_context=copy.deepcopy(context) if context["kind"] == ContextKind.LOGICAL else None,
                       container_id=f"{context['key'][1]}.{base['message_id']}" if can_edit else None,
                       routing_hint=context.get("routing_hint", False),
                       members=context.get("members", []), appendable=context.get("appendable", True), handoff=False)
@@ -351,10 +459,12 @@ class LiveTextAggregation:
         context = decode_aggregation(row.log_context)
         if context is None:
             return False
-        if context["kind"] in {"source", "redirect"}:
+        state = check_context_transition(row.id, context, ContextEvent.RECEIPT)
+        if state is ContextState.BOUNDARY:
+            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.RECEIPT,
+                                                    "A boundary row is reconciled through its own MsgLog context.")
+        if context["kind"] in {ContextKind.SOURCE, ContextKind.REDIRECT}:
             return self._reconcile_source(row, receipt, sender_bot_id, context, file_bot_id)
-        if context["kind"] != "aggregate":
-            raise ValueError("A logical aggregation batch cannot have a Telegram receipt.")
         saved = self.manager.channel.db.finalize_aggregate_message(receipt, context["aggregate"], sender_bot_id)
         base = dict(message_id=receipt.message_id, owner=sender_bot_id, aggregate=saved.aggregate)
 
@@ -363,7 +473,7 @@ class LiveTextAggregation:
             if successor.get("inherit") and not successor.get("incoming_boundary") and tuple(successor["key"]) == tuple(context["key"]):
                 successor["base"] = base
                 successor["inherit"] = False
-            if successor["kind"] == "member_update" and not successor.get("container_id"):
+            if successor["kind"] == ContextKind.MEMBER_UPDATE and not successor.get("container_id"):
                 successor["container_id"] = saved.master_msg_id
                 successor["required_sender"] = sender_bot_id or "__main__"
             return encode_aggregation(successor)
@@ -389,6 +499,9 @@ class LiveTextAggregation:
         stream = self.streams.get(tuple(context["key"]))
         if stream and context.get("appendable", True) and stream.generation == context["generation"]:
             stream.base = base
+        # A confirmed container update no longer orders later updates of that container.
+        if context.get("container_id") and self.container_tails.get(context["container_id"]) == row.id:
+            del self.container_tails[context["container_id"]]
         for member in context.get("members", []):
             if self.pending_sources.get(member_identity(member)) == row.id:
                 self.pending_sources.pop(member_identity(member))
@@ -403,11 +516,12 @@ class LiveTextAggregation:
             old_id = context["old_message_id"]
             receipt = SimpleNamespace(chat_id=old_id[0], message_id=old_id[1],
                                       message_thread_id=context["key"][2])
-        else:
+        elif member["status"] != MemberStatus.REMOVED:
             message.type_telegram = get_msg_type(receipt)
             message.put_telegram_file(receipt)
         message.sender_bot_id = sender_bot_id
-        message.file_bot_id = file_bot_id or sender_bot_id
+        if member["status"] != MemberStatus.REMOVED:
+            message.file_bot_id = file_bot_id or sender_bot_id
         member = copy.deepcopy(member)
         # Telegram file metadata belongs to this output; the complete source stays in its member snapshot.
         source = member_message(member)
@@ -415,19 +529,20 @@ class LiveTextAggregation:
         source.type_telegram, source.mime = message.type_telegram, message.mime
         source.file_bot_id = file_bot_id or sender_bot_id
         from .queued_log import encode
-        member["snapshot"] = encode(source, None)
+        if member["status"] != MemberStatus.REMOVED:
+            member["snapshot"] = encode(source, None)
         db = self.manager.channel.db
-        if context["kind"] == "redirect":
+        if context["kind"] == ContextKind.REDIRECT:
             saved = db.finalize_member_redirect(context["old_container_id"], member, message, receipt, sender_bot_id)
         else:
             saved = db.finalize_source_message(message, receipt, member, sender_bot_id,
                                                old_message_id=context.get("old_message_id"))
         requests = []
-        if context["kind"] == "redirect":
+        if context["kind"] == ContextKind.REDIRECT:
             old = db.get_msg_log(master_msg_id=context["old_container_id"])
             redirected = next(child for child in old.aggregate["children"] if member_identity(child) == member_identity(member))
             chat_id, message_id = old.master_msg_id.rsplit(".", 1)
-            hint = dict(format_version=1, kind="member_update", key=context["key"], container_id=old.master_msg_id,
+            hint = dict(format_version=1, kind=ContextKind.MEMBER_UPDATE, key=context["key"], container_id=old.master_msg_id,
                         updates=[redirected], members=[], due=time.time(), appendable=False,
                         generation=-1, recent=[], last_new=0, silent=False, routing_hint=True)
             requests.append(QueueRequest("edit_message_text", (), {"chat_id": int(chat_id), "message_id": int(message_id),
@@ -445,7 +560,7 @@ class LiveTextAggregation:
                 requests=requests, operation_resolver=self.manager._queue_operation)
         if identifiers:
             self.container_tails[context["old_container_id"]] = identifiers[-1]
-        if message.commands and member["status"] == "active":
+        if message.commands and member["status"] == MemberStatus.ACTIVE:
             from ehforwarderbot import coordinator
             from .commands import ETMCommandMsgStorage
             module = coordinator.get_module_by_id(message.author.module_id)
@@ -453,31 +568,59 @@ class LiveTextAggregation:
                 ETMCommandMsgStorage(message.commands, module, member.get("display_prefix") or "", message.text))
         return True
 
+    @staticmethod
+    def _removal_edit(log, member):
+        from ehforwarderbot.message import LinkAttribute
+        source = member_message(member)
+        prefix = member.get("display_prefix") or ""
+        if prefix and not prefix.endswith(":"):
+            prefix += ":"
+        operation, kwargs = removal_edit(log.media_type, source.text or "", prefix=prefix,
+            link=source.attributes if isinstance(source.attributes, LinkAttribute) else None)
+        chat_id, message_id = (log.master_msg_id_alt or log.master_msg_id).rsplit(".", 1)
+        kwargs.update(chat_id=int(chat_id), message_id=int(message_id))
+        return operation, kwargs
+
+    def removal_failed(self, row, sender_bot_id):
+        """Keep an uneditable source output and record its removal with a notice."""
+        context = decode_aggregation(row.log_context) if row.log_context else None
+        if not context or context["kind"] != ContextKind.SOURCE or context["member"]["status"] != MemberStatus.REMOVED:
+            return
+        _, kwargs = self.queue.decode_payload_raw(row.payload)
+        self.manager._enqueue_requests([QueueRequest("send_message", (), dict(
+            chat_id=kwargs["chat_id"], text=self.manager._("Message is removed in remote chat."),
+            reply_to_message_id=kwargs["message_id"], disable_notification=True, _send_mode="eventual"))])
+        self._reconcile_source(row, True, sender_bot_id, context, context["message"].file_bot_id)
+
     def remove_source_member(self, key, identity):
         """Apply a confirmed source removal to one member, retaining its full saved source."""
         with self.scheduler._lock:
             log, previous, predecessor = self.source_state(key, identity)
             if previous is None:
                 return False
-            if previous["status"] == "removed":
+            change = apply_member_event(previous, MemberEvent.REMOVE)
+            if not change.changed:
                 return True
-            member = copy.deepcopy(previous)
-            member.update(status="removed", source_revision=previous["source_revision"] + 1)
+            member = change.member
             if self.update_pending_member(key, member):
                 return True
             payload = self.queue.aggregation_context(predecessor) if predecessor else None
             pending = decode_aggregation(payload) if payload else None
-            independent_pending = pending and pending["kind"] in {"source", "redirect"}
+            independent_pending = pending and pending["kind"] in {ContextKind.SOURCE, ContextKind.REDIRECT}
             if independent_pending and log is None:
                 cancelled = self.queue.cancel_pending_source(tuple(key), member)
                 if cancelled:
+                    for row_id in cancelled:
+                        # A withdrawn output finishes its source's delivery, as a discarded one does.
+                        self.manager._run_database_update_callback(
+                            self.manager._pop_queued_completion_callback(row_id))
                     for stream in self.streams.values():
                         if stream.tail in cancelled:
                             stream.tail = cancelled[stream.tail]
                     self.scheduler.wake_event.set()
                     return True
             if independent_pending:
-                context = dict(format_version=1, kind="source", key=tuple(key), member=member,
+                context = dict(format_version=1, kind=ContextKind.SOURCE, key=tuple(key), member=member,
                                message=member_message(member), old_message_id=None, old_container_id=None,
                                generation=-1, members=[], handoff=False)
                 request = QueueRequest("send_message", (), {"chat_id": key[1], "text": "[message removed]"},
@@ -489,13 +632,11 @@ class LiveTextAggregation:
                 self.queue_deferred_update(key, member, predecessor)
             else:
                 old_id = tuple(int(value) for value in (log.master_msg_id_alt or log.master_msg_id).rsplit(".", 1))
-                context = dict(format_version=1, kind="source", key=tuple(key), member=member,
+                context = dict(format_version=1, kind=ContextKind.SOURCE, key=tuple(key), member=member,
                                message=member_message(member), old_message_id=old_id, old_container_id=None,
                                generation=-1, members=[], handoff=False, frozen=True)
-                operation = "edit_message_text" if log.media_type == "Text" else "delete_message"
-                kwargs = dict(chat_id=old_id[0], message_id=old_id[1], _required_sender_bot_id=log.sender_bot_id or "__main__")
-                if operation == "edit_message_text":
-                    kwargs["text"] = "[message removed]"
+                operation, kwargs = self._removal_edit(log, member)
+                kwargs["_required_sender_bot_id"] = log.sender_bot_id or "__main__"
                 request = QueueRequest(operation, (), kwargs, encode_aggregation(context), predecessor_id=predecessor)
                 row_id, _ = self.queue.enqueue_many([request], self.manager._queue_operation)
             self.scheduler.wake_event.set()
@@ -514,7 +655,8 @@ class LiveTextAggregation:
             context = decode_aggregation(row.log_context)
             if tuple(context["key"]) != key:
                 continue
-            if log is not None and log.aggregate is None and context["kind"] in {"aggregate", "member_update", "logical"}:
+            if log is not None and log.aggregate is None and context["kind"] in {
+                    ContextKind.AGGREGATE, ContextKind.MEMBER_UPDATE, ContextKind.LOGICAL}:
                 continue
             candidates = list(context.get("members", [])) + list(context.get("updates", []))
             if context.get("member"):
@@ -543,7 +685,7 @@ class LiveTextAggregation:
                 candidates = context.get("updates", [])
                 if context.get("aggregate"):
                     candidates = context["aggregate"]["children"]
-            elif context["kind"] == "logical":
+            elif context["kind"] == ContextKind.LOGICAL:
                 base = context.get("base") or (stream.base if stream and context.get("inherit") else None)
                 if base and base["message_id"] == message_id:
                     candidates = context["members"]
@@ -561,7 +703,7 @@ class LiveTextAggregation:
     def queue_deferred_update(self, key, member, predecessor):
         """Save an edit of a first-send member until its parent has a real receipt."""
         with self.scheduler._lock:
-            context = dict(format_version=1, kind="member_update", key=tuple(key), container_id=None,
+            context = dict(format_version=1, kind=ContextKind.MEMBER_UPDATE, key=tuple(key), container_id=None,
                            updates=[member], members=[], due=time.time(), appendable=False,
                            generation=-1, recent=[], last_new=0, silent=False)
             request = QueueRequest("edit_message_text", (), {"chat_id": key[1], "message_id": 0, "text": "",
@@ -583,14 +725,14 @@ class LiveTextAggregation:
                     stream_predecessor = None
             parents = [identifier for identifier in (predecessor, stream_predecessor) if identifier is not None and self.queue.contains(identifier)]
             self._independent.set((boundary_key, max(parents) if parents else None, reserved))
-            context = dict(format_version=1, kind="source", key=tuple(key), member=member,
+            context = dict(format_version=1, kind=ContextKind.SOURCE, key=tuple(key), member=member,
                            old_container_id=old_container_id, old_message_id=old_message_id,
                            generation=self.streams[tuple(key)].generation, members=[], handoff=False,
                            recent=self.streams[tuple(key)].recent, last_new=self.streams[tuple(key)].last_new)
             pending_id = self.pending_sources.get(member_identity(member))
             payload = self.queue.aggregation_context(pending_id) if pending_id else None
             pending = decode_aggregation(payload) if payload else None
-            if pending and pending["kind"] == "logical" and tuple(pending["key"]) == tuple(key):
+            if pending and pending["kind"] == ContextKind.LOGICAL and tuple(pending["key"]) == tuple(key):
                 index = next(index for index, child in enumerate(pending["members"]) if member_identity(child) == member_identity(member))
                 before, after = copy.deepcopy(pending), copy.deepcopy(pending)
                 before["members"] = pending["members"][:index]
@@ -618,13 +760,13 @@ class LiveTextAggregation:
             context = decode_aggregation(payload) if payload else None
             if context is None:
                 return False
-            if context["kind"] != "logical" or tuple(context["key"]) != tuple(key):
+            if context["kind"] != ContextKind.LOGICAL or tuple(context["key"]) != tuple(key):
                 return False
             for position, previous in enumerate(context["members"]):
                 if member_identity(previous) == member_identity(member):
                     if member["source_revision"] <= previous["source_revision"]:
                         return True
-                    if member["status"] == "removed":
+                    if member["status"] == MemberStatus.REMOVED:
                         context["members"].pop(position)
                         self.pending_sources.pop(member_identity(member), None)
                         if not context["members"]:
@@ -639,7 +781,7 @@ class LiveTextAggregation:
                     if not self.fits(context["members"]):
                         return False
                     return self.queue.replace_logical_aggregation(row_id, encode_aggregation(context),
-                        cancelled_member=member if member["status"] == "removed" else None)
+                        cancelled_member=member if member["status"] == MemberStatus.REMOVED else None)
             return False
 
     def queue_container_update(self, container_id, updates, *, key=None):
@@ -660,7 +802,7 @@ class LiveTextAggregation:
             if predecessor:
                 payload = self.queue.aggregation_context(predecessor)
                 context = decode_aggregation(payload) if payload else None
-                if context and context["kind"] == "member_update" and context["container_id"] == container_id:
+                if context and context["kind"] == ContextKind.MEMBER_UPDATE and context["container_id"] == container_id:
                     merged = {member_identity(member): member for member in context["updates"]}
                     for member in updates:
                         previous = merged.get(member_identity(member))
@@ -670,7 +812,7 @@ class LiveTextAggregation:
                     if self.queue.replace_logical_aggregation(predecessor, encode_aggregation(context)):
                         self.scheduler.wake_event.set()
                         return predecessor
-            context = dict(format_version=1, kind="member_update", key=key, container_id=container_id,
+            context = dict(format_version=1, kind=ContextKind.MEMBER_UPDATE, key=key, container_id=container_id,
                            updates=list(updates), members=[], due=time.time(), appendable=appendable,
                            generation=stream.generation if appendable else -1,
                            recent=stream.recent if stream else [], last_new=stream.last_new if stream else 0,

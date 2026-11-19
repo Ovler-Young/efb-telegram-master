@@ -35,12 +35,17 @@ class RPCUtilities:
         self.server.register_instance(self.channel.db)
         self.server.register_function(self.get_slave_channels_ids)
 
-        threading.Thread(target=self.server.serve_forever, name="ETM RPC server thread")
+        self._server_thread = threading.Thread(
+            target=self.server.serve_forever, name="ETM RPC server thread", daemon=True,
+        )
+        self._server_thread.start()
 
     def shutdown(self):
         """Shutdown RPC server if running."""
         if self.server:
             self.server.shutdown()
+            self._server_thread.join()
+            self.server.server_close()
 
     @staticmethod
     def get_slave_channels_ids() -> List[str]:

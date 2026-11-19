@@ -2,10 +2,12 @@
 
 import base64
 import datetime
+import html
 import json
 import logging
 import os
 import subprocess
+import urllib.parse
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tempfile import NamedTemporaryFile
@@ -19,6 +21,7 @@ from typing_extensions import NewType
 
 from ehforwarderbot import Channel
 from ehforwarderbot.chat import BaseChat, ChatMember, GroupChat, PrivateChat, SystemChat
+from ehforwarderbot.message import LinkAttribute
 from ehforwarderbot.types import ChatID, ModuleID
 from .locale_mixin import LocaleMixin
 
@@ -35,6 +38,46 @@ def format_message_time(value: datetime.datetime, display_timezone: ZoneInfo = D
     if value.tzinfo is None or value.utcoffset() is None:
         value = value.astimezone()
     return value.astimezone(display_timezone).strftime("%H:%M:%S")
+
+
+def removed_text(text: str) -> str:
+    # Code/pre entities cannot be nested inside Telegram strikethrough entities.
+    return f"<s>{html.escape(text)}</s>" if text else "[message removed]"
+
+
+def link_text(attributes: LinkAttribute, body: str, *, as_html: bool = False) -> str:
+    """Render a link's title, description and optional source note."""
+    title = attributes.title or attributes.url
+    description = attributes.description or ""
+    thumbnail = "🔗"
+    if as_html:
+        image = urllib.parse.quote(attributes.image or "", safe="?=&#:/")
+        thumbnail = f'<a href="{image}">🔗</a>' if image else thumbnail
+        title = f'<a href="{urllib.parse.quote(attributes.url, safe="?=&#:/")}">{html.escape(title)}</a>'
+        description = html.escape(description)
+    text = f"{thumbnail} {title}\n{description}"
+    return text + ("\n\n" + body if body else "")
+
+
+def removal_edit(media_type: str, text: str, *, prefix: str = "", link: Optional[LinkAttribute] = None):
+    """Retain the Telegram message and edit its text or media caption."""
+    if link is not None:
+        text = link_text(link, text)
+    header = prefix + "\n" if prefix else ""
+    text = header + text
+    entities = [telegram.MessageEntity(telegram.MessageEntity.STRIKETHROUGH, 0,
+                                      len(text.encode("utf-16-le")) // 2)] if text else []
+    if link is not None:
+        title = link.title or link.url
+        entities.append(telegram.MessageEntity(telegram.MessageEntity.TEXT_LINK,
+            len((header + "🔗 ").encode("utf-16-le")) // 2, len(title.encode("utf-16-le")) // 2,
+            url=urllib.parse.quote(link.url, safe="?=&#:/")))
+        if link.image:
+            entities.append(telegram.MessageEntity(telegram.MessageEntity.TEXT_LINK,
+                len(header.encode("utf-16-le")) // 2, 2, url=urllib.parse.quote(link.image, safe="?=&#:/")))
+    if media_type == "Text":
+        return "edit_message_text", dict(text=text or "[message removed]", entities=entities, parse_mode=None)
+    return "edit_message_caption", dict(caption=text or "[message removed]", caption_entities=entities, parse_mode=None)
 
 
 TelegramChatID = NewType('TelegramChatID', int)
@@ -69,6 +112,8 @@ class ExperimentalFlagsManager(LocaleMixin):
         "local_tdlib_api": False,
         "topic_group": None,
         "timezone": DEFAULT_TIMEZONE.key,
+        # Concurrent outbound sends; also sizes the HTTP connection pool.
+        "send_worker_count": 8,
         "text_aggregation": False,
         "text_aggregation_origins": None,
         "text_aggregation_chat_types": None,
@@ -440,7 +485,9 @@ else:
         """Convert Telegram GIF to real GIF, the non-NT way."""
         gif_file = NamedTemporaryFile(suffix='.gif')
         file.seek(0)
-        metadata = ffmpeg.probe(file.name, timeout=FFMPEG_TIMEOUT)
+        metadata = json.loads(_run_ffmpeg_command([
+            'ffprobe', '-show_format', '-show_streams', '-of', 'json', file.name,
+        ]).decode('utf-8'))
         stream = ffmpeg.input(file.name)
         if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
             # Workaround: Compress GIF for slave channel `blueset.wechat`
