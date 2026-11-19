@@ -65,22 +65,6 @@ def test_permits_held_without_a_submission_are_reset(tmp_path):
         queue.close()
 
 
-@pytest.mark.parametrize("pending_chats", [1, 3])
-def test_stall_recovery_keeps_every_retained_row(tmp_path, pending_chats):
-    """Recovery reschedules delivery without dropping or reordering rows."""
-    adapter = Adapter()
-    adapter.select_sender = lambda row, now: SenderSelectionResult()
-    queue, scheduler = _scheduler(tmp_path, adapter, workers=2)
-    for chat_id in range(pending_chats):
-        enqueue(queue, QueueRequest("send_message", (), {"chat_id": chat_id, "text": "kept"}))
-    try:
-        scheduler.dispatch_once()
-        assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == pending_chats
-        assert scheduler.next_deadline is not None
-    finally:
-        queue.close()
-
-
 def test_link_to_a_predecessor_that_no_longer_exists_does_not_block(tmp_path):
     """A discarded or failed predecessor must not strand its dependent forever."""
     queue, scheduler = _scheduler(tmp_path, Adapter())

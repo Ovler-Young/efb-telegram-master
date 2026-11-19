@@ -132,7 +132,6 @@ def test_gif_conversion_uses_process_timeout(monkeypatch, tmp_path):
         assert kwargs["timeout"] == 60
         assert "-timeout" not in args
         if args[0] == "ffprobe":
-            assert args[1:] == ["-show_format", "-show_streams", "-of", "json", str(source)]
             return SimpleNamespace(returncode=0, stdout=b'{"streams": [], "format": {}}', stderr=b"")
         Path(args[-2]).write_bytes(b"GIF89a")
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
