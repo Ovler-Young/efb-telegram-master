@@ -16,6 +16,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter
 
 from efb_telegram_master.aggregate import make_source_member, member_identity
 from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
+from efb_telegram_master.custom_emoji import CustomEmojiConfig, CustomEmojiStore
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.live_aggregate import LiveTextAggregation
 from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest, SenderSelection, SenderSelectionResult
@@ -82,7 +83,8 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr("efb_telegram_master.db.utils.get_data_path", lambda _: tmp_path)
     db = DatabaseManager(SimpleNamespace(channel_id="tests.aggregate.runtime", config={}))
     manager = Manager.__new__(Manager)
-    manager.channel = SimpleNamespace(db=db, config={"admins": [1]})
+    manager.channel = SimpleNamespace(db=db, config={"admins": [1]},
+                                      custom_emoji=CustomEmojiStore(db, CustomEmojiConfig.from_channel_config({})))
     manager.channel.flag = ExperimentalFlagsManager(manager.channel)
     manager.logger = logging.getLogger("tests.aggregate.runtime")
     manager.transport = Transport()
