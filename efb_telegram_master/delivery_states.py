@@ -19,6 +19,12 @@ from enum import Enum
 QUEUED = "queued"
 SENT_PENDING = "sent_pending"
 
+# ``reconcile_attempts`` of a queued row counts its failed attempts in a row
+# (Telegram flood waits excluded). From this many on, the row no longer defers
+# the rows ordered after it: it keeps retrying and is delivered late. A send
+# interrupted by a restart is raised to this count when the queue opens.
+FAILED_ATTEMPTS_LIMIT = 3
+
 
 class HoldKind(Enum):
     """Persisted ``delivery_hold`` spellings; a value ending in ``:`` is a prefix."""
@@ -80,6 +86,7 @@ class Event(Enum):
     HOLD_FAILED_SUPPLEMENT = "hold_failed_supplement"
     HOLD_FAILED_AGGREGATION = "hold_failed_aggregation"
     DEFER_ACQUISITION = "defer_acquisition"
+    DEFER_FAILED_SEND = "defer_failed_send"
     RECORD_COMPLETION = "record_completion"
     OPERATOR_CONFIRM = "operator_confirm"
     DEFER_RECONCILIATION = "defer_reconciliation"
@@ -105,6 +112,10 @@ TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
     **_from(_UNSETTLED, Event.HOLD_FAILED_SUPPLEMENT, RowState.SUPPLEMENT_FAILED),
     **_from(_UNSETTLED, Event.HOLD_FAILED_AGGREGATION, RowState.AGGREGATION_FAILED),
     **_from(_UNSETTLED, Event.DEFER_ACQUISITION, RowState.DEFERRED),
+    # A send that failed with a retryable error; its attempt was released first.
+    # Earlier failures only count; the one that makes the row failing stores its
+    # backoff.
+    **_from(_ATTEMPTABLE, Event.DEFER_FAILED_SEND, RowState.DEFERRED),
     **_from(_UNSETTLED, Event.RECORD_COMPLETION, RowState.SENT_PENDING),
     **_from((RowState.IN_FLIGHT, *HELD_STATES), Event.OPERATOR_CONFIRM, RowState.SENT_PENDING),
     (RowState.SENT_PENDING, Event.DEFER_RECONCILIATION): RowState.SENT_PENDING,
@@ -156,9 +167,10 @@ def classify(
 ) -> RowState:
     """Read stored columns into a state. ``delivery_state`` None means no row.
 
-    ``reconcile_after`` is the acquisition retry deadline while a row is queued
-    and the receipt-reconciliation deadline once it is ``sent_pending``; only
-    the former makes a row DEFERRED, and only when ``now`` is given.
+    ``reconcile_after`` is the retry deadline after a failed acquisition or send
+    while a row is queued and the receipt-reconciliation deadline once it is
+    ``sent_pending``; only the former makes a row DEFERRED, and only when
+    ``now`` is given.
     """
     if delivery_state is None:
         return RowState.ABSENT
@@ -183,13 +195,38 @@ def waiting_sql(alias: str = "") -> str:
     return f"{prefix}delivery_state = '{QUEUED}' AND {prefix}delivery_hold IS NULL"
 
 
+def failing_sql(alias: str) -> str:
+    """The row ``alias`` is waiting or in flight after too many failed attempts."""
+    return (
+        f"({alias}.delivery_state = '{QUEUED}' "
+        f"AND {alias}.reconcile_attempts >= {FAILED_ATTEMPTS_LIMIT} "
+        f"AND ({alias}.delivery_hold IS NULL "
+        f"OR {alias}.delivery_hold = '{HoldKind.IN_FLIGHT.value}'))"
+    )
+
+
 def barrier_sql(alias: str) -> str:
-    """The row ``alias`` still defers its dependents: waiting, in flight or awaiting MsgLog."""
+    """The row ``alias`` still defers its dependents: awaiting MsgLog, or waiting or
+    in flight with fewer than ``FAILED_ATTEMPTS_LIMIT`` failed attempts."""
     return (
         f"({alias}.delivery_state = '{SENT_PENDING}' "
         f"OR ({alias}.delivery_state = '{QUEUED}' "
+        f"AND {alias}.reconcile_attempts < {FAILED_ATTEMPTS_LIMIT} "
         f"AND ({alias}.delivery_hold IS NULL "
         f"OR {alias}.delivery_hold = '{HoldKind.IN_FLIGHT.value}')))"
+    )
+
+
+def backing_off_sql(alias: str, now: str) -> str:
+    """The row ``alias`` failed too often and waits for its retry deadline.
+
+    It is not its destination's head meanwhile, so the destination's later rows
+    are elected; once the deadline passes it is the oldest row again and is
+    retried. ``now`` is an SQL expression for the current Unix time.
+    """
+    return (
+        f"({alias}.reconcile_attempts >= {FAILED_ATTEMPTS_LIMIT} "
+        f"AND {alias}.reconcile_after > {now})"
     )
 
 

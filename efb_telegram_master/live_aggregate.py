@@ -17,7 +17,8 @@ from .aggregate import (
     render_members,
 )
 from .aggregation_states import (
-    CloseReason, ContextEvent, ContextKind, ContextState, StreamEvent, StreamState, next_stream_state,
+    CloseReason, ContextEvent, ContextKind, ContextState, StreamEvent, StreamState, needs_delivered_predecessor,
+    next_stream_state,
 )
 from .outbound import IllegalAggregationTransitionError, QueueRequest, check_context_transition
 from .queued_log import decode_aggregation, encode_aggregation
@@ -337,13 +338,24 @@ class LiveTextAggregation:
                 reserved[0] = False
                 self.scheduler._lock.release()
 
+    # How often a row that needs a failing predecessor on Telegram checks it again;
+    # the predecessor's own retry or completion wakes the scheduler sooner.
+    PREDECESSOR_RECHECK_SECONDS = 30.0
+
     def deadline(self, row):
         # Scheduler heads deliberately omit contexts until a worker is available.
         if row.log_context is None:
             return None
         payload = self.queue.aggregation_context(row.id)
         context = decode_aggregation(payload) if payload else None
-        return context.get("due") if context and context["kind"] in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE} else None
+        if context is None:
+            return None
+        failing = self.queue.failing_predecessor(row.id)
+        if failing is not None:
+            predecessor = decode_aggregation(failing[1]) if failing[1] else None
+            if needs_delivered_predecessor(context, predecessor):
+                return time.time() + self.PREDECESSOR_RECHECK_SECONDS
+        return context.get("due") if context["kind"] in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE} else None
 
     def materialize(self, row, selection):
         context = decode_aggregation(row.log_context) if row.log_context else None

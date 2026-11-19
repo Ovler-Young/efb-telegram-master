@@ -9,7 +9,11 @@ import pytest
 from telegram import Chat, Message, User
 
 from efb_telegram_master.aggregate import make_source_member
-from efb_telegram_master.aggregation_states import ContextState, context_state
+from efb_telegram_master.aggregation_states import (
+    ContextState,
+    context_state,
+    needs_delivered_predecessor,
+)
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.outbound import (
     IllegalAggregationTransitionError,
@@ -199,3 +203,21 @@ def test_receipt_stored_for_an_unsent_batch_by_an_older_version_is_reported_once
     assert f"Receipt of queue row {row.id} (aggregation kind 'logical') cannot be reconciled" in warnings[0].getMessage()
     assert "MsgLog reconciliation failed" not in caplog.text
     assert decode_aggregation(stored(manager, row.id)[8])["kind"] == "logical"
+
+
+def _member(source_id):
+    return {"origin_uid": "origin", "source_id": source_id}
+
+
+@pytest.mark.parametrize("context, predecessor, waits", [
+    ({"kind": "member_update", "updates": [_member("one")]}, None, True),
+    ({"kind": "logical", "members": [_member("two")], "inherit": True}, None, True),
+    ({"kind": "logical", "members": [_member("two")], "inherit": True, "incoming_boundary": True}, None, False),
+    ({"kind": "logical", "members": [_member("two")], "inherit": False}, None, False),
+    ({"kind": "boundary", "members": []}, None, False),
+    ({"kind": "source", "member": _member("one")}, {"kind": "logical", "members": [_member("one")]}, True),
+    ({"kind": "source", "member": _member("two")}, {"kind": "logical", "members": [_member("one")]}, False),
+], ids=["container edit", "append into its container", "append after a Telegram message",
+        "new batch", "independent message", "output of its member", "output of another member"])
+def test_only_rows_that_need_a_failing_predecessor_on_telegram_wait_for_it(context, predecessor, waits):
+    assert needs_delivered_predecessor(context, predecessor) is waits

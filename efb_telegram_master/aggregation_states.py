@@ -117,6 +117,36 @@ def next_context_states(state: ContextState, event: ContextEvent) -> frozenset[C
     return CONTEXT_TRANSITIONS.get((state, event), frozenset())
 
 
+def _member_identities(context: dict) -> set[tuple[str, str]]:
+    members = list(context.get("members") or []) + list(context.get("updates") or [])
+    if context.get("member"):
+        members.append(context["member"])
+    if context.get("aggregate"):
+        members += context["aggregate"].get("children") or []
+    return {(member["origin_uid"], member["source_id"]) for member in members}
+
+
+def needs_delivered_predecessor(context: dict, predecessor: dict | None) -> bool:
+    """Whether a row must wait until its predecessor is on Telegram, not only sent first.
+
+    A predecessor that keeps failing stops being an ordering barrier, but an edit
+    of a container, an append into the predecessor's container and another
+    output of a member the predecessor carries need its Telegram message, so they
+    keep waiting. Everything else only keeps order and may go first.
+    ``predecessor`` is the predecessor's decoded context, None when it has none.
+    """
+    kind = context.get("kind")
+    if kind == ContextKind.MEMBER_UPDATE:
+        return True
+    if kind == ContextKind.AGGREGATE:
+        return bool(context.get("container_id"))
+    if kind == ContextKind.LOGICAL:
+        return bool(context.get("inherit")) and not context.get("incoming_boundary")
+    if kind in {ContextKind.SOURCE, ContextKind.REDIRECT} and predecessor is not None:
+        return bool(_member_identities(context) & _member_identities(predecessor))
+    return False
+
+
 # Live streams. A stream exists once a source key has had a member or an
 # independent delivery in this process (or a queued row at startup).
 

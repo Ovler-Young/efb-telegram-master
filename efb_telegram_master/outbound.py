@@ -39,8 +39,8 @@ from .aggregation_states import (
     ContextEvent, ContextKind, ContextState, context_state, next_context_states,
 )
 from .delivery_states import (
-    QUEUED, SENT_PENDING, Event, HoldKind, RowState, classify, error_detail,
-    format_hold, next_state, ready_sql, waiting_sql,
+    FAILED_ATTEMPTS_LIMIT, QUEUED, SENT_PENDING, Event, HoldKind, RowState, backing_off_sql,
+    classify, error_detail, failing_sql, format_hold, next_state, ready_sql, waiting_sql,
 )
 from .transfer_timeout import media_size, transfer_timeout
 
@@ -751,6 +751,7 @@ class OutboundQueue:
                 "completion_receipt BLOB NULL)"
             )
             self._migrate_schema(connection)
+            self._release_interrupted_attempts(connection)
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS history_ownership (entry_key TEXT PRIMARY KEY)"
             )
@@ -881,6 +882,33 @@ class OutboundQueue:
             "AND delivery_hold=? AND attempt_started_at IS NULL",
             (len(HISTORY_SOURCE_PREFIX), HISTORY_SOURCE_PREFIX, QUEUED, repaired_hold),
         )
+
+    @staticmethod
+    def _release_interrupted_attempts(connection: sqlite3.Connection) -> None:
+        """A send left in flight by a restart stops deferring the rows after it.
+
+        Nothing is in flight while the queue opens, so the outcome of such a send
+        is unknown and it is never replayed. It keeps its hold for /confirm_send;
+        counting it as failed often enough lets later rows go out meanwhile.
+        """
+        interrupted = connection.execute(
+            "SELECT id, telegram_chat_id FROM outbound_queue "
+            "WHERE delivery_state=? AND delivery_hold=? AND reconcile_attempts < ? ORDER BY id",
+            (QUEUED, HoldKind.IN_FLIGHT.value, FAILED_ATTEMPTS_LIMIT),
+        ).fetchall()
+        if not interrupted:
+            return
+        connection.execute(
+            "UPDATE outbound_queue SET reconcile_attempts=? "
+            "WHERE delivery_state=? AND delivery_hold=? AND reconcile_attempts < ?",
+            (FAILED_ATTEMPTS_LIMIT, QUEUED, HoldKind.IN_FLIGHT.value, FAILED_ATTEMPTS_LIMIT),
+        )
+        for row_id, chat_id in interrupted:
+            logging.getLogger(__name__).warning(
+                "Queue row %s for chat %s was interrupted by a restart while sending; counted as "
+                "%d failed attempts, later rows no longer wait for it. It stays held for /confirm_send.",
+                row_id, chat_id, FAILED_ATTEMPTS_LIMIT,
+            )
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -2005,11 +2033,12 @@ class OutboundQueue:
             # barrier: waiting for it either already happened or can never happen,
             # so a held row must not strand everything queued behind it.
             candidates_sql = ready_sql("outbound_queue") if respect_predecessors else waiting_sql()
+            candidates_sql += " AND NOT " + backing_off_sql("outbound_queue", "?")
         exclusion_sql = ""
-        parameters: tuple[object, ...] = ()
+        parameters: tuple[object, ...] = (time.time(),) if ready_only else ()
         if excluded:
             exclusion_sql += " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
-            parameters = tuple(excluded)
+            parameters += tuple(excluded)
         with self._lock:
             # Select one runnable head per destination before reading media BLOBs.
             # Quarantined historical rows may be skipped explicitly so one
@@ -2052,7 +2081,8 @@ class OutboundQueue:
         """One destination's next runnable row, without scanning the whole queue.
 
         Same election rule as `heads()`: the lowest priority-1 id wins, else the
-        lowest id, among rows that are not held and not waiting for a predecessor.
+        lowest id, among rows that are not held, not waiting for a predecessor
+        and not backing off after repeated failures.
         """
         sql = (
             "SELECT q.id, q.priority, q.telegram_chat_id, q.operation, X'', q.slave_id, "
@@ -2066,7 +2096,8 @@ class OutboundQueue:
         )
         parameters: list[object] = [int(telegram_chat_id), int(thread_id) if thread_id is not None else 0]
         if ready_only:
-            sql += " AND " + ready_sql("q")
+            sql += " AND " + ready_sql("q") + " AND NOT " + backing_off_sql("q", "?")
+            parameters.append(time.time())
         excluded = tuple(exclude_ids)
         if excluded:
             sql += " AND q.id NOT IN (" + ",".join("?" for _ in excluded) + ")"
@@ -2729,20 +2760,97 @@ class OutboundQueue:
             self._hold(row_id, Event.HOLD_FAILED_HISTORY,
                        format_hold(HoldKind.HISTORY_FAILED, error_detail(error)))
 
-    def defer_acquisition(self, row_id: int, minimum_delay: float = 0) -> float:
-        """Persist capped backoff for an acquisition that never attempted a send."""
+    def defer_acquisition(self, row_id: int, minimum_delay: float = 0, *, counted: bool = True) -> float:
+        """Persist capped backoff for an acquisition that never attempted a send.
+
+        ``counted`` False keeps the failed-attempt count: a flood wait is not a
+        failure of this row.
+        """
         with self._lock, self.connection:
             self._transition(row_id, Event.DEFER_ACQUISITION)
             attempts = self.connection.execute(
                 "SELECT reconcile_attempts FROM outbound_queue WHERE id=?", (row_id,)
             ).fetchone()[0]
             delay = max(min(60, 2 ** min(attempts, 6)), minimum_delay)
+            updated = min(attempts + 1, 6) if counted else attempts
             self.connection.execute(
                 "UPDATE outbound_queue SET delivery_hold=NULL, reconcile_attempts=?, reconcile_after=? "
                 "WHERE id=? AND delivery_state=?",
-                (min(attempts + 1, 6), time.time() + delay, row_id, QUEUED),
+                (updated, time.time() + delay, row_id, QUEUED),
             )
+            self._note_failed_attempts(row_id, attempts, updated)
         return float(delay)
+
+    def defer_failed_send(self, row_id: int, retry_at: float) -> None:
+        """Count a send that failed with a retryable error; retry at ``retry_at`` (Unix time).
+
+        The deadline is stored once the row is failing.
+
+        Flood waits are not counted: they hold back the whole chat, not this row.
+        A row that is not waiting (its attempt was not released) is left
+        unchanged and reported.
+        """
+        with self._lock, self.connection:
+            try:
+                self._transition(row_id, Event.DEFER_FAILED_SEND)
+            except IllegalDeliveryTransitionError as error:
+                logging.getLogger(__name__).warning("Failed send not counted: %s", error)
+                return
+            attempts = self.connection.execute(
+                "SELECT reconcile_attempts FROM outbound_queue WHERE id=?", (row_id,)
+            ).fetchone()[0]
+            updated = min(attempts + 1, 6)
+            # Below the limit the row stays its destination's head and the
+            # scheduler's own deadline paces it; only a failing row's backoff is
+            # stored, so head election can step past it.
+            self.connection.execute(
+                "UPDATE outbound_queue SET reconcile_attempts=?, "
+                "reconcile_after=COALESCE(?, reconcile_after) WHERE id=? AND " + waiting_sql(),
+                (updated, retry_at if updated >= FAILED_ATTEMPTS_LIMIT else None, row_id),
+            )
+            self._note_failed_attempts(row_id, attempts, updated)
+
+    def _note_failed_attempts(self, row_id: int, before: int, after: int) -> None:
+        """Report the attempt that made a row stop deferring the rows after it."""
+        if before >= FAILED_ATTEMPTS_LIMIT or after < FAILED_ATTEMPTS_LIMIT:
+            return
+        self._mark_row_destinations_dirty(row_id, dependents=True)
+        chat_id = self.connection.execute(
+            "SELECT telegram_chat_id FROM outbound_queue WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        logging.getLogger(__name__).warning(
+            "Queue row %s for chat %s failed %d attempts in a row; later rows no longer wait "
+            "for it. It keeps retrying and is delivered late if a retry succeeds.",
+            row_id, chat_id, after,
+        )
+
+    def failing_predecessor(self, row_id: int) -> tuple[int, bytes | None] | None:
+        """The predecessor ``row_id`` no longer waits for because it keeps failing.
+
+        Returns its id and stored context, or None when the row's predecessor is
+        missing, delivered, held or still an ordering barrier.
+        """
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT predecessor.id, predecessor.log_context FROM outbound_queue AS dependent "
+                "JOIN outbound_queue AS predecessor ON predecessor.id = dependent.predecessor_id "
+                "WHERE dependent.id = ? AND predecessor.id != dependent.id AND " + failing_sql("predecessor"),
+                (row_id,),
+            ).fetchone()
+        return None if row is None else (int(row[0]), row[1])
+
+    def failing_retries(self) -> list[tuple[int, int, int | None, float]]:
+        """Failing rows waiting for a retry: id, chat, topic and Unix retry time."""
+        with self._lock:
+            return [
+                (int(row[0]), int(row[1]), row[2], float(row[3]))
+                for row in self.connection.execute(
+                    "SELECT id, telegram_chat_id, thread_id, reconcile_after FROM outbound_queue "
+                    "WHERE delivery_state = ? AND reconcile_after > 0 AND delivery_hold IS NULL "
+                    "AND reconcile_attempts >= ?",
+                    (QUEUED, FAILED_ATTEMPTS_LIMIT),
+                )
+            ]
 
     def record_telegram_completion(
         self, row_id: int, receipt: bytes, *, supplement: Optional[QueueRequest] = None,
@@ -3070,6 +3178,7 @@ class OutboundQueueScheduler:
         """Runnable heads in dispatch order, re-electing only what changed."""
         now = time.monotonic()
         excluded = self.quarantined_rows
+        self._schedule_failing_retries()
         dirty = self.queue.take_dirty_destinations()
         if (self._heal_heads or not self._head_rows
                 or now - self._heads_scanned_at >= self.HEADS_FULL_RESCAN_SECONDS):
@@ -3096,6 +3205,21 @@ class OutboundQueueScheduler:
         return [
             row for layer in itertools.zip_longest(*tiers.values()) for row in layer if row is not None
         ]
+
+    def _schedule_failing_retries(self) -> None:
+        """Wake for each failing row's retry, and re-elect its destination once it is due.
+
+        A failing row is passed over while its retry deadline is ahead, so no
+        head carries that deadline and no completion of its own will wake us.
+        """
+        now = time.time()
+        for row_id, chat_id, thread_id, retry_at in self.queue.failing_retries():
+            if retry_at > now:
+                self._schedule_retry(time.monotonic() + retry_at - now)
+                continue
+            head = self._head_rows.get((chat_id, thread_id))
+            if head is None or head.id != row_id:
+                self.queue.mark_destination_dirty(chat_id, thread_id)
 
     @staticmethod
     def _destination_key(row: QueuedCall) -> tuple[int, Optional[int]]:
@@ -3816,7 +3940,8 @@ class OutboundQueueScheduler:
                     if decision.retry_reason == "acquisition":
                         try:
                             delay = self.queue.defer_acquisition(
-                                row_id, max(0, (decision.retry_at or 0) - time.monotonic())
+                                row_id, max(0, (decision.retry_at or 0) - time.monotonic()),
+                                counted=not isinstance(error.__cause__, RetryAfter),
                             )
                         except Exception as persistence_error:
                             self._stop_for_persistence_error(persistence_error)
@@ -3842,17 +3967,22 @@ class OutboundQueueScheduler:
                         )
                         continue
                     if decision.kind == "retry_eventual" and submitted.row.priority == 0:
-                        if submitted.row.operation in RETAINED_OPERATIONS:
-                            try:
+                        if decision.retry_at is None:
+                            raise RuntimeError("Retry decision requires a retry deadline.")
+                        try:
+                            if submitted.row.operation in RETAINED_OPERATIONS:
                                 self.queue.release_delivery_attempt(row_id)
-                            except Exception as persistence_error:
-                                self._stop_for_persistence_error(persistence_error)
-                                return
+                            # A flood wait holds back the whole chat, not only this row.
+                            if not isinstance(error, RetryAfter):
+                                self.queue.defer_failed_send(
+                                    row_id, time.time() + max(0.0, decision.retry_at - time.monotonic())
+                                )
+                        except Exception as persistence_error:
+                            self._stop_for_persistence_error(persistence_error)
+                            return
                         if self.stopping:
                             self.queue.fail_waiter(row_id, SchedulerStoppedError("Outbound scheduler stopped."))
                             continue
-                        if decision.retry_at is None:
-                            raise RuntimeError("Retry decision requires a retry deadline.")
                         self._row_not_before[row_id] = decision.retry_at
                         self._schedule_retry(decision.retry_at)
                         if self.queue.metrics is not None:

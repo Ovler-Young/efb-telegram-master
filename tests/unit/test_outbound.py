@@ -24,7 +24,7 @@ from telegram import (
 )
 
 from efb_telegram_master import delivery_states, queue_report
-from efb_telegram_master.delivery_states import Event, RowState, classify, next_state
+from efb_telegram_master.delivery_states import FAILED_ATTEMPTS_LIMIT, Event, RowState, classify, next_state
 from efb_telegram_master.hold_send import hold as operator_hold
 from efb_telegram_master.outbound import (
     IllegalDeliveryTransitionError,
@@ -1756,6 +1756,17 @@ ROW_SPELLINGS = {
 }
 
 
+def _fail_send_to_limit(queue, row_id):
+    """The failed send that makes a row failing; earlier ones only count."""
+    with queue.connection:
+        queue.connection.execute(
+            "UPDATE outbound_queue SET reconcile_attempts=? "
+            "WHERE id=? AND delivery_state='queued' AND delivery_hold IS NULL",
+            (FAILED_ATTEMPTS_LIMIT - 1, row_id),
+        )
+    queue.defer_failed_send(row_id, time.time() + 60)
+
+
 def _apply(queue, directory, row_id, event):
     calls = {
         Event.BEGIN_ATTEMPT: lambda: queue.begin_delivery_attempt(row_id, ATTEMPT),
@@ -1773,6 +1784,7 @@ def _apply(queue, directory, row_id, event):
             row_id, RequiredSenderUnavailableError("gone"), supplement=True),
         Event.HOLD_FAILED_AGGREGATION: lambda: queue.hold_failed_aggregation(row_id, RuntimeError("failed")),
         Event.DEFER_ACQUISITION: lambda: queue.defer_acquisition(row_id),
+        Event.DEFER_FAILED_SEND: lambda: _fail_send_to_limit(queue, row_id),
         Event.RECORD_COMPLETION: lambda: queue.record_telegram_completion(row_id, b"\x01receipt"),
         Event.OPERATOR_CONFIRM: lambda: queue.record_telegram_completion(
             row_id, b"\x01receipt", operator_confirmed=True),
@@ -1784,7 +1796,7 @@ def _apply(queue, directory, row_id, event):
 
 
 # Illegal events that leave the row unchanged with a WARNING instead of an error.
-REPORTED_EVENTS = {Event.RELEASE_ATTEMPT, Event.DEFER_RECONCILIATION}
+REPORTED_EVENTS = {Event.RELEASE_ATTEMPT, Event.DEFER_FAILED_SEND, Event.DEFER_RECONCILIATION}
 
 
 def _write_row(queue, directory, spelling):
@@ -1990,6 +2002,8 @@ def test_rows_that_only_wait_for_each_other_are_reported_as_a_cycle(tmp_path):
 def test_the_standalone_report_keeps_the_package_readiness_rule(alias):
     assert queue_report.waiting_sql(alias) == delivery_states.waiting_sql(alias)
     if alias:
+        assert (queue_report.backing_off_sql(alias, queue_report.NOW_SECONDS)
+                == delivery_states.backing_off_sql(alias, queue_report.NOW_SECONDS))
         for predecessor in ("predecessor", "p"):
             assert queue_report.barrier_sql(predecessor) == delivery_states.barrier_sql(predecessor)
             assert queue_report.ready_sql(alias, predecessor) == delivery_states.ready_sql(alias, predecessor)

@@ -1,5 +1,7 @@
 """A missing HTTP response must not send an already accepted message again."""
 import asyncio
+import logging
+import time
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
@@ -168,6 +170,130 @@ def test_known_rate_limit_remains_retryable(tmp_path):
         manager._outbound_scheduler.harvest_completed()
     assert sender.call_count == 2 and waiter.result().message_id == 100
     queue.close()
+
+
+def _later_message(queue, after):
+    """An ordinary message for the same chat, ordered after row ``after``."""
+    row_id, _ = queue.enqueue_many(
+        [QueueRequest("send_message", (42, "later"), {}, predecessor_id=after)],
+        lambda _: lambda chat_id, text: None,
+    )
+    return row_id
+
+
+def _not_sent():
+    failure = TimedOut()
+    failure.__cause__ = httpx.ConnectError("request not sent")
+    return failure
+
+
+def _skip_time(monkeypatch):
+    """Let time pass without sleeping: ``skip(seconds)`` moves both clocks forward."""
+    real_time, real_monotonic, skipped = time.time, time.monotonic, [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + skipped[0])
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + skipped[0])
+
+    def skip(seconds):
+        skipped[0] += seconds
+    return skip
+
+
+def test_a_send_that_keeps_failing_lets_later_messages_go_and_arrives_late(tmp_path, monkeypatch, caplog):
+    skip = _skip_time(monkeypatch)
+    queue = OutboundQueue(tmp_path)
+    failing, waiter = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
+    _later_message(queue, failing)
+    sender = Mock(side_effect=[_not_sent(), _not_sent(), _not_sent(), delivered_message()])
+    later_sender = Mock(return_value=delivered_message())
+    manager = setup_manager(queue)
+    manager.TRANSPORT_RETRY_SECONDS = 1
+    manager._bot = SimpleNamespace(send_document=sender, send_message=later_sender)
+    scheduler = manager._outbound_scheduler
+    try:
+        for _ in range(2):
+            scheduler.dispatch_once()
+            scheduler.harvest_completed()
+            skip(2)
+        assert sender.call_count == 2 and later_sender.call_count == 0
+        with caplog.at_level(logging.WARNING, logger="efb_telegram_master.outbound"):
+            scheduler.dispatch_once()
+            scheduler.harvest_completed()
+        assert [record.getMessage() for record in caplog.records if "in a row" in record.getMessage()] == [(
+            f"Queue row {failing} for chat 42 failed 3 attempts in a row; later rows no longer wait "
+            "for it. It keeps retrying and is delivered late if a retry succeeds."
+        )]
+        # Its retry is still a second away: the later message goes first.
+        scheduler.dispatch_once()
+        scheduler.harvest_completed()
+        assert sender.call_count == 3 and later_sender.call_count == 1
+        assert queue.connection.execute("SELECT id FROM outbound_queue").fetchall() == [(failing,)]
+        assert scheduler.next_deadline is not None  # its retry wakes the worker
+        skip(2)
+        scheduler.dispatch_once()
+        scheduler.harvest_completed()
+        assert sender.call_count == 4 and waiter.result().message_id == 100
+        assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
+    finally:
+        queue.close()
+
+
+def test_flood_waits_do_not_count_as_failed_attempts(tmp_path, monkeypatch):
+    skip = _skip_time(monkeypatch)
+    queue = OutboundQueue(tmp_path)
+    failing, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
+    _later_message(queue, failing)
+    sender = Mock(side_effect=[_not_sent(), _not_sent(), RetryAfter(0), RetryAfter(0), RetryAfter(0),
+                               _not_sent()])
+    later_sender = Mock(return_value=delivered_message())
+    manager = setup_manager(queue)
+    manager.TRANSPORT_RETRY_SECONDS = 1
+    manager._bot = SimpleNamespace(send_document=sender, send_message=later_sender)
+    scheduler = manager._outbound_scheduler
+    try:
+        for _ in range(5):
+            scheduler.dispatch_once()
+            scheduler.harvest_completed()
+            skip(2)
+        assert sender.call_count == 5 and later_sender.call_count == 0
+        assert queue.connection.execute(
+            "SELECT reconcile_attempts FROM outbound_queue WHERE id=?", (failing,)).fetchone() == (2,)
+        scheduler.dispatch_once()
+        scheduler.harvest_completed()
+        scheduler.dispatch_once()
+        scheduler.harvest_completed()
+        assert sender.call_count == 6 and later_sender.call_count == 1
+        assert queue.connection.execute("SELECT id FROM outbound_queue").fetchall() == [(failing,)]
+    finally:
+        queue.close()
+
+
+def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confirmable(tmp_path, caplog):
+    queue = OutboundQueue(tmp_path)
+    row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
+    _later_message(queue, row_id)
+    sender = Mock(return_value=delivered_message())
+    manager = setup_manager(queue)
+    manager._bot = SimpleNamespace(send_document=sender)
+    manager._outbound_scheduler.dispatch_once()
+    # Restart before the response was harvested: the outcome of the send is unknown.
+    queue.close()
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.outbound"):
+        queue = OutboundQueue(tmp_path)
+    assert f"Queue row {row_id} for chat 42 was interrupted by a restart" in caplog.text
+    manager = setup_manager(queue)
+    later_sender = Mock(return_value=delivered_message())
+    manager._bot = SimpleNamespace(send_document=sender, send_message=later_sender)
+    try:
+        for _ in range(3):
+            manager._outbound_scheduler.dispatch_once()
+            manager._outbound_scheduler.harvest_completed()
+        assert sender.call_count == 1 and later_sender.call_count == 1
+        assert queue.connection.execute(
+            "SELECT id, delivery_hold FROM outbound_queue").fetchall() == [(row_id, "in_flight")]
+        assert manager.confirm_queued_delivery(row_id, delivered_message())
+        assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
+    finally:
+        queue.close()
 
 
 def test_operator_confirmation_writes_real_msglog_without_resending(tmp_path, manager_factory):

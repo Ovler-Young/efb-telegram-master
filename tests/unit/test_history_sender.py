@@ -95,7 +95,7 @@ def test_acquisition_retry_is_counted_after_durable_deferral(history, monkeypatc
         assert metrics.registry.get_sample_value('etm_outbound_retries_total', labels) == 1
         assert queue.connection.execute(
             'SELECT delivery_state, delivery_hold, reconcile_attempts, reconcile_after FROM outbound_queue'
-        ).fetchall() == [('queued', None, 1, 1010)]
+        ).fetchall() == [('queued', None, 0, 1010)]  # a flood wait is not a failed attempt
         assert not waiter.done()
         assert scheduler.next_deadline == 1010
         assert [kind for kind, _ in sender.calls] == ['copy_message']

@@ -4,15 +4,17 @@ import html
 import logging
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 import pytest
 from telegram import Chat, Message
 from telegram.error import BadRequest, NetworkError, RetryAfter
 
-from efb_telegram_master.aggregate import make_source_member
+from efb_telegram_master.aggregate import make_source_member, member_identity
 from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.live_aggregate import LiveTextAggregation
@@ -446,3 +448,51 @@ def test_reopen_after_an_appended_member_was_withdrawn_edits_the_earlier_contain
     append(manager, "three", 3)
     complete(manager)
     assert [call[0] for call in manager.transport.calls] == ["send_message", "edit_message_text"]
+
+
+def test_an_edit_of_a_batch_that_keeps_failing_waits_while_later_messages_go(runtime, monkeypatch):
+    manager = runtime
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    real_time, real_monotonic, skipped = time.time, time.monotonic, [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + skipped[0])
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + skipped[0])
+    not_sent = NetworkError("request not sent")
+    not_sent.__cause__ = httpx.ConnectError("connection refused")
+    manager.transport.error = not_sent
+    key, member = append(manager, "one", 1)
+    batch = queue.aggregation_rows()[0].id
+    scheduler.dispatch_once()
+    next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+    # While the batch is in flight: a media message, then the removal of its member.
+    with manager.live_aggregation.independent(key):
+        request = manager.live_aggregation.bind_independent_requests(
+            [QueueRequest("send_message", (), {"chat_id": -100, "text": "media"})])
+        media, _ = queue.enqueue_many(request, manager._queue_operation)
+        manager.live_aggregation.note_independent_enqueued(media)
+    assert manager.live_aggregation.remove_source_member(key, member_identity(member))
+    removal = max(row.id for row in queue.aggregation_rows())
+    assert decode_aggregation(queue.aggregation_context(removal))["kind"] == "member_update"
+    scheduler.harvest_completed()
+    for _ in range(2):
+        skipped[0] += 2
+        scheduler.dispatch_once()
+        next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+        scheduler.harvest_completed()
+    assert [call[2] for call in manager.transport.calls].count("media") == 0
+    manager.transport.error = None
+
+    # The third failure is a second ago: the media goes, the removal keeps waiting.
+    complete(manager)
+    assert manager.transport.calls[-1][2] == "media"
+    scheduler.dispatch_once()
+    assert not scheduler.in_flight and scheduler.failure is None
+    assert queue.contains(batch) and queue.contains(removal)
+
+    # The batch is delivered late, and only then is its member removed.
+    skipped[0] += 2
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "send_message"
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "edit_message_text"
+    assert [call[0] for call in manager.transport.calls] == ["send_message"] * 5 + ["edit_message_text"]
+    assert not queue.aggregation_rows()
