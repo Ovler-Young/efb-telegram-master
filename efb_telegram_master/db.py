@@ -467,18 +467,18 @@ class DatabaseManager:
                 state_summary,
             )
 
-    def read_custom_emoji_rows(self) -> dict[str, list[tuple[str, str, object]]]:
-        """Read every ``(key, custom_emoji_id, updated_at)`` row of the legacy emoji tables.
+    def read_custom_emoji_rows(self) -> dict[str, list[tuple[str, str, object, str | None]]]:
+        """Read every ``(key, custom_emoji_id, updated_at, sticker_set_name)`` row of the legacy emoji tables.
 
         Missing tables, and tables that lack the expected columns (logged once
         as a warning), yield an empty list. Timestamps are returned as stored
-        (datetime, text or ``None``). Not on the metrics label allow-list: it
-        runs once at startup.
+        (datetime, text or ``None``); the set name is ``None`` when the table has
+        no such column. Not on the metrics label allow-list: it runs once at startup.
         """
         with connection_scope(self._managed_database):
             schema = current_schema(database.obj)
             present = set(database.get_tables(schema=schema))
-            rows: dict[str, list[tuple[str, str, object]]] = {}
+            rows: dict[str, list[tuple[str, str, object, str | None]]] = {}
             for model, key_column in ((TopicIconCache, "avatar_hash"), (UserEmojiCache, "cache_key")):
                 table = model._meta.table_name
                 rows[table] = []
@@ -489,9 +489,10 @@ class DatabaseManager:
                     self.logger.warning(
                         "Table %s does not have the expected emoji cache columns; ignoring its rows.", table)
                     continue
+                set_name = "sticker_set_name" if "sticker_set_name" in columns else "NULL"
                 rows[table] = [
                     tuple(row) for row in database.execute_sql(
-                        f"SELECT {key_column}, custom_emoji_id, updated_at FROM {table}").fetchall()
+                        f"SELECT {key_column}, custom_emoji_id, updated_at, {set_name} FROM {table}").fetchall()
                 ]
             return rows
 

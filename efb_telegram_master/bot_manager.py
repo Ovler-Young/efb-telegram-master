@@ -600,13 +600,15 @@ class TelegramBotManager(LocaleMixin):
             normalized["proxy"] = proxy
         return normalized
 
-    def _build_request(self) -> HTTPXRequest:
+    def _build_request(self, connection_pool_size: int | None = None) -> HTTPXRequest:
+        if connection_pool_size is None:
+            connection_pool_size = cast(int, self._request_kwargs.get("connection_pool_size", 1))
         socket_options = self._request_kwargs.get("socket_options")
         http_version = self._request_kwargs.get("http_version")
         httpx_kwargs = self._request_kwargs.get("httpx_kwargs")
         proxy = self._request_kwargs.get("proxy")
         return HTTPXRequest(
-            connection_pool_size=cast(int, self._request_kwargs.get("connection_pool_size", 1)),
+            connection_pool_size=connection_pool_size,
             read_timeout=cast(Optional[float], self._request_kwargs.get("read_timeout")),
             write_timeout=cast(Optional[float], self._request_kwargs.get("write_timeout")),
             connect_timeout=cast(Optional[float], self._request_kwargs.get("connect_timeout")),
@@ -661,6 +663,14 @@ class TelegramBotManager(LocaleMixin):
             request=request,
             get_updates_request=get_updates_request,
         )
+
+    def build_standalone_bot(self, connection_pool_size: int = 1) -> telegram.Bot:
+        """A bot for this token with its own connection pool, for work that must not delay sends.
+
+        It is not initialized; close it with ``bot.request.shutdown()``.
+        """
+        request = self._build_request(connection_pool_size)
+        return self._build_bot(request=request, get_updates_request=request)
 
     async def _post_init(self, application: Application):
         self._runtime.bind_loop(asyncio.get_running_loop())
