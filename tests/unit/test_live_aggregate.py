@@ -13,9 +13,12 @@ from efb_telegram_master.aggregate import (
     aggregate_fits, make_aggregate, make_source_member, member_message, render_members, utf16_length,
 )
 from efb_telegram_master import migrate_db
+from efb_telegram_master.bot_manager import TelegramBotManager
 from efb_telegram_master.db import DatabaseManager, MsgLog, MsgLogMember, database
+from efb_telegram_master.live_aggregate import LiveTextAggregation
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
+from efb_telegram_master.utils import DEFAULT_TIMEZONE
 
 
 @pytest.fixture
@@ -28,6 +31,25 @@ def manager(tmp_path, monkeypatch):
     finally:
         manager.stop_worker()
         database.initialize(original_database)
+
+
+def idle_live_aggregation():
+    """A real aggregation over an empty queue, for managers built without a runtime."""
+    return LiveTextAggregation(SimpleNamespace(
+        channel=SimpleNamespace(flag=SimpleNamespace(timezone=DEFAULT_TIMEZONE)),
+        _outbound_queue=SimpleNamespace(aggregation_rows=list, aggregation_context=lambda row_id: None,
+                                     cancelled_source=lambda identity: False),
+        _outbound_scheduler=None,
+    ))
+
+
+def bare_manager():
+    """A manager built without its runtime, holding the attributes its code paths read."""
+    manager = object.__new__(TelegramBotManager)
+    manager._transfer_min_mbps = None
+    manager._retry_after_report_at = {}
+    manager.live_aggregation = idle_live_aggregation()
+    return manager
 
 
 def source(uid="one", text="body", name="Alice"):
@@ -224,7 +246,12 @@ def test_capacity_uses_parsed_text_and_keeps_removed_source_content():
 
 
 def test_member_events_follow_the_transition_table():
-    from efb_telegram_master.aggregate import MemberEvent, MemberStatus, MemberTransitionError, apply_member_event
+    from efb_telegram_master.aggregate import (
+        MemberEvent,
+        MemberStatus,
+        MemberTransitionError,
+        apply_member_event,
+    )
 
     active = make_source_member(source())
     removed = apply_member_event(active, MemberEvent.REMOVE)

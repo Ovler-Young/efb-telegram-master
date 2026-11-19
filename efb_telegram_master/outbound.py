@@ -3188,10 +3188,9 @@ class OutboundQueueScheduler:
         The media row was removed without being delivered, so the aggregation
         boundary it created must not split the surrounding text run.
         """
-        reopen = getattr(self.adapter, "reopen_aggregation", None)
-        if callable(reopen) and row.log_context:
+        if row.log_context:
             try:
-                reopen(row)
+                self.adapter.reopen_aggregation(row)
             except Exception:
                 logging.getLogger(__name__).exception("Unable to reopen an aggregation stream.")
 
@@ -3835,7 +3834,7 @@ class OutboundQueueScheduler:
                             )
                             continue
                     decision = self.adapter.record_queued_failure(submitted.row, error, submitted.selection)
-                    if getattr(decision, "retry_reason", None) == "acquisition":
+                    if decision.retry_reason == "acquisition":
                         try:
                             delay = self.queue.defer_acquisition(
                                 row_id, max(0, (decision.retry_at or 0) - time.monotonic())
@@ -3878,7 +3877,7 @@ class OutboundQueueScheduler:
                         self._row_not_before[row_id] = decision.retry_at
                         self._schedule_retry(decision.retry_at)
                         if self.queue.metrics is not None:
-                            retry_reason = getattr(decision, "retry_reason", None)
+                            retry_reason = decision.retry_reason
                             if retry_reason is None:
                                 if isinstance(error, RetryAfter):
                                     retry_reason = "rate_limit"

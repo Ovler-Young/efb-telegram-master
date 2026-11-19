@@ -86,7 +86,7 @@ class ETMMsg(Message):
             file = tempfile.NamedTemporaryFile(suffix=ext)
             timeout = bot_manager.file_transfer_timeout(FILE_DOWNLOAD_TIMEOUT, file_meta.file_size)
             download_kwargs = {}
-            if getattr(bot_manager, '_transfer_min_mbps', None) is not None:
+            if bot_manager._transfer_min_mbps is not None:
                 download_kwargs['read_timeout'] = bot_manager.file_transfer_timeout(
                     bot_manager._request_kwargs.get('read_timeout'), file_meta.file_size)
             bot_manager._runtime.call(

@@ -29,6 +29,7 @@ from efb_telegram_master.outbound import (
 
 
 from efb_telegram_master.message import ETMMsg
+from tests.unit.test_live_aggregate import bare_manager
 from tests.unit.test_restart_memory import message_with_group
 
 
@@ -197,7 +198,7 @@ def test_malformed_html_caption(formatted_channel, bot_admin, image):
 
 
 def _make_queueing_manager() -> TelegramBotManager:
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._bot = Mock()
     manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
     manager._enqueue_eventual_send = Mock()
@@ -300,7 +301,7 @@ def test_prechange_version_one_payloads_decode_and_execute_without_reencoding(
     encoder = Mock(side_effect=AssertionError("legacy payload must not be re-encoded"))
     monkeypatch.setattr(OutboundQueue, "encode_payload", encoder)
     args, kwargs = OutboundQueue.decode_payload_raw(payload)
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     sender = Mock()
 
     manager.execute_queued_call(
@@ -314,7 +315,7 @@ def test_prechange_version_one_payloads_decode_and_execute_without_reencoding(
 
 
 def test_build_bot_passes_local_mode_when_enabled():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._bot_identity_kwargs = {
         "token": "123:token",
         "base_url": "http://localhost:8081/bot",
@@ -351,11 +352,11 @@ def test_default_connection_pool_size_uses_worker_count_multiplier(monkeypatch):
 def test_queued_failure_decision_retries_eventual_rate_limits_and_transport_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {("10", 100): 1_111.0}
     manager.bot_pool = None
-    task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
+    task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0, log_context=None)
     selection = SimpleNamespace(sender_bot_id="10")
     monkeypatch.setattr("efb_telegram_master.bot_manager.time.monotonic", lambda: 1_000.0)
 
@@ -369,7 +370,7 @@ def test_queued_failure_decision_retries_eventual_rate_limits_and_transport_erro
         assert retry.retry_at == 1_001.0
 
     blocking = manager.record_queued_failure(
-        SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=1),
+        SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=1, log_context=None),
         telegram.error.RetryAfter(20),
         selection,
     )
@@ -384,11 +385,11 @@ def test_queued_failure_decision_retries_eventual_rate_limits_and_transport_erro
 
 
 def test_terminal_eventual_failure_does_not_clear_existing_cooldown() -> None:
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {("10", 100): 1_025.0}
     manager.bot_pool = None
-    task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0)
+    task = SimpleNamespace(telegram_chat_id=100, slave_id=None, priority=0, log_context=None)
 
     decision = manager.record_queued_failure(task, Exception("send failed"), SimpleNamespace(sender_bot_id="10"))
 
@@ -540,7 +541,7 @@ def test_queued_execution_retries_entity_parse_failure_once_without_parse_mode(
     args,
     kwargs,
 ):
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     sender = Mock()
     getattr(sender, operation).side_effect = [
         telegram.error.BadRequest("Can't parse entities"),
@@ -789,32 +790,8 @@ def test_queued_route_rejects_invalid_db_mapping_context():
         )
 
 
-def test_queued_success_writes_deferred_db_mapping_once():
-    manager = object.__new__(TelegramBotManager)
-    etm_msg = Mock()
-    old_msg_id = Mock()
-    on_complete = Mock()
-    manager._queued_db_log_contexts = {7: QueuedDbLogContext(etm_msg, old_msg_id, on_complete)}
-    manager._queued_db_log_context_lock = threading.Lock()
-    manager.bot_pool = None
-    manager._write_database_update = Mock()
-    row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
-    result = Mock()
-
-    TelegramBotManager.record_queued_success(manager, row, result, SimpleNamespace(sender_bot_id="10"))
-
-    manager._write_database_update.assert_called_once_with(
-        etm_msg,
-        old_msg_id,
-        result,
-        sender_bot_id="10",
-        on_complete=on_complete,
-    )
-    assert manager._queued_db_log_contexts == {}
-
-
 def test_enqueue_registers_deferred_mapping_before_waking_worker():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     db_context = QueuedDbLogContext(message_with_group(), None, Mock())
     manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
@@ -849,7 +826,7 @@ def test_enqueue_registers_deferred_mapping_before_waking_worker():
 
 
 def test_stopped_scheduler_raises_fresh_failures_without_growing_stored_traceback():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     stored_failure = QueuePersistenceError("oversized legacy row")
     manager._outbound_scheduler = SimpleNamespace(
         _lock=threading.RLock(), stopping=True, failure=stored_failure,
@@ -870,15 +847,14 @@ def test_stopped_scheduler_raises_fresh_failures_without_growing_stored_tracebac
 
 
 def test_terminal_queued_failure_releases_deferred_mapping_callback():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     on_complete = Mock()
-    manager._queued_db_log_contexts = {7: QueuedDbLogContext(Mock(), None, on_complete)}
-    manager._queued_completion_callbacks = {}
+    manager._queued_completion_callbacks = {7: on_complete}
     manager._queued_db_log_context_lock = threading.Lock()
     manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
     manager.bot_pool = None
-    row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None)
+    row = SimpleNamespace(id=7, priority=0, telegram_chat_id=123, slave_id=None, log_context=None)
 
     decision = TelegramBotManager.record_queued_failure(
         manager,
@@ -889,11 +865,11 @@ def test_terminal_queued_failure_releases_deferred_mapping_callback():
 
     assert decision.kind.name == "TERMINAL_FAILURE"
     on_complete.assert_called_once_with()
-    assert manager._queued_db_log_contexts == {}
+    assert manager._queued_completion_callbacks == {}
 
 
 def test_durable_reconciliation_retries_db_write_and_preserves_sender(monkeypatch):
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     etm_msg = message_with_group()
     real_tg_msg = SimpleNamespace(chat_id=123, message_id=9)
     db_write = Mock(side_effect=RuntimeError("database unavailable"))
@@ -932,7 +908,7 @@ def test_durable_reconciliation_retries_db_write_and_preserves_sender(monkeypatc
 
 
 def test_durable_reconciliation_logs_corrupt_context_and_keeps_it_pending(caplog):
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager.logger = logging.getLogger("tests.durable_reconciliation")
     row = SimpleNamespace(
         id=7,
@@ -979,7 +955,7 @@ def test_cooldown_metrics_snapshot_blocks_mutation_until_iteration_is_safe(
         def __exit__(self, exc_type, exc_value, traceback) -> None:
             self._lock.release()
 
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     cooldowns = BlockingCooldowns()
     lock = TrackingLock()
     manager._bot_chat_state_lock = lock
@@ -1125,7 +1101,7 @@ def test_public_positional_edit_retries_chat_migration_without_replacing_text():
 
 
 def test_queued_positional_media_edit_retries_chat_migration_with_new_chat_id():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._outbound_queue = Mock()
     old_chat_id = 123
     new_chat_id = 456
@@ -1158,7 +1134,7 @@ def test_queued_positional_media_edit_retries_chat_migration_with_new_chat_id():
 
 
 def test_enqueue_send_task_keeps_only_live_inputs_and_eventual_metadata():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._enqueue_requests = Mock(return_value=("row-1", Mock()))
     manager._create_queued_message_placeholder = Mock(return_value=Mock())
     manager._make_send_receipt = Mock()
@@ -1482,7 +1458,7 @@ def test_metrics_server_stop_closes_unstarted_server_without_shutdown_or_join():
 
 
 def test_stop_worker_join_covers_outbound_drain_deadline():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager.logger = Mock()
     manager._send_worker_stop = threading.Event()
     manager._outbound_scheduler = SimpleNamespace(
@@ -1500,7 +1476,7 @@ def test_stop_worker_join_covers_outbound_drain_deadline():
 
 
 def test_worker_finalizes_resources_once_after_stop_join_timeout():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager.logger = Mock()
     manager._send_worker_stop = threading.Event()
     manager._outbound_scheduler = SimpleNamespace(
@@ -1533,7 +1509,7 @@ def test_worker_finalizes_resources_once_after_stop_join_timeout():
 
 
 def test_queued_worker_finalizes_resources_after_stop_timeout():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager.logger = Mock()
     manager._send_worker_stop = threading.Event()
     manager._outbound_scheduler = SimpleNamespace(
@@ -1575,7 +1551,7 @@ def test_parse_metrics_config_defaults_and_disables_invalid_endpoint_options():
 
 
 def test_metrics_endpoint_bind_failure_is_non_fatal_but_programming_errors_propagate():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager.logger = Mock()
     manager._metrics = Metrics()
     bind_error = OSError("address already in use")
@@ -1601,7 +1577,7 @@ def test_metrics_endpoint_bind_failure_is_non_fatal_but_programming_errors_propa
 
 
 def test_destination_metrics_pass_configured_limit_to_queue_query():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._metrics = Mock()
     manager._outbound_queue = Mock()
     manager._outbound_queue.destination_snapshot.return_value = []
@@ -1625,7 +1601,7 @@ async def test_shutdown_ptb_application_signals_stop_running():
 
 @pytest.mark.asyncio
 async def test_post_init_starts_durable_worker_after_runtime_binding():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     events: list[str] = []
     manager._runtime = SimpleNamespace(bind_loop=lambda _loop: events.append("bind"))
     manager.bot_pool = None
@@ -1643,7 +1619,7 @@ async def test_post_init_starts_durable_worker_after_runtime_binding():
 
 @pytest.mark.asyncio
 async def test_post_init_does_not_start_worker_after_shutdown_before_start():
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._runtime = SimpleNamespace(bind_loop=Mock())
     manager.bot_pool = None
     manager._send_worker_stop = threading.Event()
@@ -1811,7 +1787,7 @@ def test_connection_pool_keeps_one_connection_per_worker(monkeypatch):
 
 def test_rate_limited_retries_are_reported_once_per_window(monkeypatch, caplog):
     """A RetryAfter retry is otherwise silent, so a stalled lane has no explanation."""
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
     manager.bot_pool = None

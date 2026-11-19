@@ -277,6 +277,7 @@ def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager)
     binding = object.__new__(ChatBindingManager)
     binding.db = manager
     binding.logger = logging.getLogger("tests.history-memory")
+    binding._history_ownership_swept = False
     binding._history_migration_locks_lock = threading.Lock()
     binding._history_migration_locks = {}
     tracemalloc.start()

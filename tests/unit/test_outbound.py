@@ -39,6 +39,7 @@ from efb_telegram_master.outbound import (
     SenderSelectionResult,
 )
 from efb_telegram_master.queued_log import encode_aggregation
+from tests.unit.test_live_aggregate import bare_manager
 
 
 def send_message(chat_id, text):
@@ -952,9 +953,10 @@ def test_multi_call_is_atomic_ordered_and_returns_only_first_waiter(tmp_path):
 
 
 class CompletionDecision:
-    def __init__(self, kind, retry_at=None):
+    def __init__(self, kind, retry_at=None, retry_reason=None):
         self.kind = kind
         self.retry_at = retry_at
+        self.retry_reason = retry_reason
 
 
 class Adapter:
@@ -1593,11 +1595,10 @@ else:
 
 def test_shutdown_waits_for_preparation_and_rejects_publication_after_close(tmp_path, monkeypatch):
     from concurrent.futures import TimeoutError
-    from efb_telegram_master.bot_manager import TelegramBotManager
     from efb_telegram_master.outbound import QueuePersistenceError
 
     queue = OutboundQueue(tmp_path)
-    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager.logger = Mock()
     manager._outbound_queue = queue
     manager._outbound_finalization_lock = threading.Lock()

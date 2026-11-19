@@ -399,6 +399,7 @@ def test_queue_history_migration_entries_persists_pending_rows():
 def test_process_pending_history_migrations_transfers_entries_to_durable_queue_before_waiting():
     manager = ChatBindingManager.__new__(ChatBindingManager)
     manager.logger = Mock()
+    manager._history_ownership_swept = False
     pending_entries = [
         SimpleNamespace(
             id=1, ownership_key="legacy:1",

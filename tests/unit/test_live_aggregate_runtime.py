@@ -86,12 +86,13 @@ def runtime(tmp_path, monkeypatch):
     manager.transport = Transport()
     manager._bot = manager.transport
     manager.sender_id = None
+    manager._transfer_min_mbps = None
+    manager._retry_after_report_at = {}
     manager.bot_pool = None
     manager._bot_chat_state_lock = threading.Lock()
     manager._bot_chat_disabled_until = {}
     manager._queued_db_log_context_lock = threading.Lock()
     manager._queued_completion_callbacks = {}
-    manager._queued_db_log_contexts = {}
     manager._outbound_queue = OutboundQueue(tmp_path)
     executor = ThreadPoolExecutor(max_workers=1)
     manager._outbound_scheduler = OutboundQueueScheduler(manager._outbound_queue, manager, executor, 1)

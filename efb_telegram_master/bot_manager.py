@@ -537,7 +537,7 @@ class TelegramBotManager(LocaleMixin):
         self._bot_chat_state_lock = threading.Lock()
         self._bot_chat_disabled_until: dict[BotChatKey, float] = {}
         self._membership_failure_affinities: dict[BotChatKey, set[str]] = {}
-        self._queued_db_log_contexts: dict[int, QueuedDbLogContext] = {}
+        self._retry_after_report_at: dict[tuple[str, str, str], float] = {}
         self._queued_completion_callbacks: dict[int, Optional[Callable[[], None]]] = {}
         self._queued_db_log_context_lock = threading.Lock()
         self._last_metrics_snapshot = 0.0
@@ -628,16 +628,16 @@ class TelegramBotManager(LocaleMixin):
         return normalized
 
     def file_transfer_timeout(self, base: float | None, size: int | None) -> float | None:
-        return transfer_timeout(base, size, getattr(self, '_transfer_min_mbps', None))
+        return transfer_timeout(base, size, self._transfer_min_mbps)
 
     def _upload_timeout_kwargs(self, args: tuple, kwargs: Mapping[str, object]) -> dict:
-        if getattr(self, '_transfer_min_mbps', None) is None:
+        if self._transfer_min_mbps is None:
             return dict(kwargs)
         size = media_size((args, kwargs))
         result = dict(kwargs)
         if size:
             for key, default in (("read_timeout", 15.0), ("write_timeout", None)):
-                configured = getattr(self, '_request_kwargs', {})
+                configured = self._request_kwargs
                 base = result.get(key, configured.get(
                     'media_write_timeout' if key == 'write_timeout' else key, default))
                 if base is None or isinstance(base, (int, float)):
@@ -963,8 +963,8 @@ class TelegramBotManager(LocaleMixin):
 
         function = self._queued_operation_callable(operation)
         function_args = (self,) + args
-        aggregation = getattr(self, "live_aggregation", None)
-        if aggregation is not None and aggregation._source_delivery.get() is not None:
+        aggregation = self.live_aggregation
+        if aggregation._source_delivery.get() is not None:
             # Source receipts register buttons after durable finalization.
             slave_id = slave_id or aggregation._source_delivery.get()["key"][0]
             if sender_bot_id and not eventual_capable:
@@ -1203,15 +1203,13 @@ class TelegramBotManager(LocaleMixin):
                     )
                     for request in requests
                 ]
-            aggregation = getattr(self, "live_aggregation", None)
-            if aggregation is not None:
-                durable_requests = aggregation.bind_independent_requests(durable_requests)
+            aggregation = self.live_aggregation
+            durable_requests = aggregation.bind_independent_requests(durable_requests)
             row_id, waiter = self._outbound_queue.enqueue_many(
                 durable_requests, self._queue_operation, history_keys=history_keys,
-                logical_split=aggregation.source_split() if aggregation is not None else None,
+                logical_split=aggregation.source_split(),
             )
-            if aggregation is not None:
-                aggregation.note_independent_enqueued(row_id)
+            aggregation.note_independent_enqueued(row_id)
             if db_log_context is not None:
                 with self._queued_db_log_context_lock:
                     self._queued_completion_callbacks[row_id] = db_log_context.on_complete
@@ -1396,17 +1394,10 @@ class TelegramBotManager(LocaleMixin):
         )
 
     def queued_aggregation_deadline(self, row):
-        aggregation = getattr(self, "live_aggregation", None)
-        return aggregation.deadline(row) if aggregation is not None else None
+        return self.live_aggregation.deadline(row)
 
     def materialize_queued_aggregation(self, row, selection):
-        aggregation = getattr(self, "live_aggregation", None)
-        if aggregation is not None:
-            return aggregation.materialize(row, selection)
-        from .queued_log import decode_aggregation
-        if row.log_context and decode_aggregation(row.log_context):
-            raise QueuePersistenceError("Live aggregation runtime is unavailable.")
-        return row
+        return self.live_aggregation.materialize(row, selection)
 
     def select_sender(self, row, now: float) -> SenderSelectionResult:
         chat_id = row.telegram_chat_id
@@ -1778,16 +1769,6 @@ class TelegramBotManager(LocaleMixin):
             raise QueuePersistenceError("Queued Telegram completion receipt has an invalid file owner.")
         return cast(TelegramMessage, value[0]), value[1], value[2] if len(value) == 3 else None
 
-    def _pop_queued_db_log_context(self, row_id: object) -> Optional[QueuedDbLogContext]:
-        if not isinstance(row_id, int):
-            return None
-        contexts = getattr(self, "_queued_db_log_contexts", None)
-        context_lock = getattr(self, "_queued_db_log_context_lock", None)
-        if contexts is None or context_lock is None:
-            return None
-        with context_lock:
-            return contexts.pop(row_id, None)
-
     def _pop_queued_completion_callback(self, row_id: object) -> Optional[Callable[[], None]]:
         if not isinstance(row_id, int):
             return None
@@ -1797,27 +1778,6 @@ class TelegramBotManager(LocaleMixin):
             return None
         with context_lock:
             return callbacks.pop(row_id, None)
-
-    def _finish_queued_database_update(
-        self,
-        row_id: object,
-        real_tg_msg: Optional[TelegramMessage] = None,
-        *,
-        sender_bot_id: Optional[str] = None,
-    ) -> None:
-        db_log_context = self._pop_queued_db_log_context(row_id)
-        if db_log_context is None:
-            return
-        if real_tg_msg is None:
-            self._run_database_update_callback(db_log_context.on_complete)
-            return
-        self._write_database_update(
-            db_log_context.etm_msg,
-            db_log_context.old_msg_id,
-            real_tg_msg,
-            sender_bot_id=sender_bot_id,
-            on_complete=db_log_context.on_complete,
-        )
 
     def reconcile_queued_delivery(self, row) -> bool:
         """Write a persisted Telegram completion to MsgLog."""
@@ -1932,12 +1892,6 @@ class TelegramBotManager(LocaleMixin):
     def record_queued_success(
         self, row, result: object, selection: SenderSelection
     ) -> QueuedCompletionDecision:
-        if getattr(row, "log_context", None) is None:
-            self._finish_queued_database_update(
-                getattr(row, "id", None),
-                cast(TelegramMessage, result),
-                sender_bot_id=selection.sender_bot_id,
-            )
         if selection.sender_bot_id is not None and self.bot_pool and row.slave_id:
             self.bot_pool.record_successful_auxiliary_send(row.slave_id, selection.sender_bot_id)
         if isinstance(result, TelegramMessage) and result.chat.is_forum:
@@ -2032,19 +1986,14 @@ class TelegramBotManager(LocaleMixin):
                 getattr(row, "id", None), operation, type(error).__name__, cause_name,
                 str(error)[:200],
             )
-        aggregation = getattr(self, "live_aggregation", None)
-        if aggregation is not None:
-            aggregation.removal_failed(row, selection.sender_bot_id)
-        self._finish_queued_database_update(getattr(row, "id", None))
+        self.live_aggregation.removal_failed(row, selection.sender_bot_id)
         self._run_database_update_callback(
             self._pop_queued_completion_callback(getattr(row, "id", None))
         )
         return QueuedCompletionDecision(QueuedCompletionKind.TERMINAL_FAILURE)
 
     def reopen_aggregation(self, row) -> None:
-        aggregation = getattr(self, "live_aggregation", None)
-        if aggregation is not None:
-            aggregation.reopen(row)
+        self.live_aggregation.reopen(row)
 
     def record_queued_retry_after(
         self, row, error: telegram.error.RetryAfter, selection: SenderSelection
@@ -2091,10 +2040,7 @@ class TelegramBotManager(LocaleMixin):
         key = (str(operation), type(error).__name__, cause)
         now = time.monotonic()
         with self._get_bot_chat_state_lock():
-            reported = getattr(self, "_retry_after_report_at", None)
-            if reported is None:
-                self._retry_after_report_at: dict[tuple[str, str, str], float] = {}
-                reported = self._retry_after_report_at
+            reported = self._retry_after_report_at
             previous = reported.get(key)
             if previous is not None and now - previous < self.RETRY_AFTER_LOG_INTERVAL:
                 return
@@ -2497,7 +2443,7 @@ class TelegramBotManager(LocaleMixin):
             # Membership in the destination is irrelevant to getFile. Never fall
             # back to the main bot with somebody else's opaque file ID.
             bot = auxiliary.bot
-        if getattr(self, '_transfer_min_mbps', None) is not None and file_size:
+        if self._transfer_min_mbps is not None and file_size:
             base = self._request_kwargs.get('read_timeout')
             if base is None or isinstance(base, (int, float)):
                 return cast(File, bot.get_file(

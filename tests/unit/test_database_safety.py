@@ -1123,7 +1123,12 @@ def test_cache_discovery_rejects_generated_columns(sqlite_source, storage):
 @pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
 def test_source_member_status_rows_load_and_progress(sqlite_source, manager_factory, request, backend):
     from efb_telegram_master.aggregate import (
-        MemberEvent, MemberTransitionError, SourceMember, apply_member_event, make_aggregate, make_source_member,
+        MemberEvent,
+        MemberTransitionError,
+        SourceMember,
+        apply_member_event,
+        make_aggregate,
+        make_source_member,
     )
     from tests.unit.test_live_aggregate import receipt, source
 

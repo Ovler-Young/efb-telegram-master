@@ -16,6 +16,7 @@ from ehforwarderbot.types import MessageID, ReactionName
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.constants import Emoji
 from efb_telegram_master.slave_message import SlaveMessageProcessor
+from tests.unit.test_live_aggregate import idle_live_aggregation
 
 
 def test_slave_message_reaction_footer(slave):
@@ -136,7 +137,9 @@ def build_slave_message_processor() -> SlaveMessageProcessor:
 
 def build_duplicate_test_processor() -> SlaveMessageProcessor:
     processor = object.__new__(SlaveMessageProcessor)
+    processor.bot = SimpleNamespace(live_aggregation=idle_live_aggregation())
     processor.db = Mock()
+    processor.flag = Mock(return_value=False)
     processor.logger = Mock()
     setattr(processor, "get_slave_msg_dest", Mock(return_value=("__template__", (123, None))))
     setattr(processor, "is_silent", Mock(return_value=False))
@@ -684,6 +687,7 @@ def test_reaction_target_prefers_alt_message_for_telegram_origin_text():
 
 def test_update_reactions_waits_for_queued_database_log():
     processor = Mock(spec=SlaveMessageProcessor)
+    processor.bot = SimpleNamespace(live_aggregation=idle_live_aggregation())
     processor.REACTION_DB_WAIT_TIMEOUT = 1.0
     processor.REACTION_DB_WAIT_INTERVAL = 0.01
     processor.chat_manager = Mock()
@@ -724,6 +728,7 @@ def test_update_reactions_waits_for_queued_database_log():
 
 def test_first_telegram_origin_reaction_replies_to_user_message():
     processor = Mock(spec=SlaveMessageProcessor)
+    processor.bot = SimpleNamespace(live_aggregation=idle_live_aggregation())
     processor.REACTION_DB_WAIT_TIMEOUT = 0
     processor.chat_manager = Mock()
     processor.dispatch_message = Mock()
@@ -767,6 +772,7 @@ def test_first_telegram_origin_reaction_replies_to_user_message():
 
 def test_telegram_origin_reaction_updates_and_retraction_edit_bot_alternate():
     processor = Mock(spec=SlaveMessageProcessor)
+    processor.bot = SimpleNamespace(live_aggregation=idle_live_aggregation())
     processor.REACTION_DB_WAIT_TIMEOUT = 0
     processor.chat_manager = Mock()
     processor.dispatch_message = Mock()
@@ -863,6 +869,7 @@ def test_restarted_reactions_route_edits_to_persisted_auxiliary_sender():
 
 def build_reaction_failure_processor(error):
     processor = Mock(spec=SlaveMessageProcessor)
+    processor.bot = SimpleNamespace(live_aggregation=idle_live_aggregation())
     processor.REACTION_DB_WAIT_TIMEOUT = 0
     processor.chat_manager = Mock()
     processor.get_slave_msg_dest = Mock(return_value=("__template__", (100, None)))

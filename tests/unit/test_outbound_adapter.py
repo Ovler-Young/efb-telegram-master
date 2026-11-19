@@ -7,10 +7,11 @@ import pytest
 from efb_telegram_master.bot_manager import SendReceipt, TelegramBotManager
 from efb_telegram_master.outbound import QUEUED_OPERATIONS, QueueEnqueueError
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
+from tests.unit.test_live_aggregate import bare_manager
 
 
 def _manager_with_adapter_stubs():
-    manager = TelegramBotManager.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._bot = Mock()
     manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
     manager._bot_chat_state_lock = threading.Lock()

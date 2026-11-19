@@ -103,13 +103,12 @@ class ChatBindingManager(LocaleMixin):
     MAX_LEN_CHAT_TITLE = 255
     MAX_LEN_CHAT_DESC = 255
     FORUM_RELINK_THRESHOLD = 960_000
-    # Class-level so a lane built without __init__ still sweeps exactly once.
-    _history_ownership_swept = False
     display_timezone = DEFAULT_TIMEZONE
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
         self.display_timezone = channel.flag.timezone
+        self._history_ownership_swept = False
         self.bot: 'TelegramBotManager' = channel.bot_manager
         self.db: 'DatabaseManager' = channel.db
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager

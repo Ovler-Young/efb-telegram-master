@@ -20,7 +20,6 @@ from telegram.error import ChatMigrated, NetworkError, RetryAfter, TelegramError
 import efb_telegram_master.outbound as outbound
 from efb_telegram_master.bot_manager import (
     QueuedChatMigrationRetry,
-    QueuedDbLogContext,
     TelegramBotManager,
 )
 from efb_telegram_master.bot_pool import BotPool
@@ -38,6 +37,7 @@ from efb_telegram_master.outbound import (
     SenderSelectionResult,
 )
 from efb_telegram_master.rate_limiter import SlidingWindowRateLimiter
+from tests.unit.test_live_aggregate import bare_manager
 
 
 def send_message(chat_id: int, text: str) -> tuple[int, str]:
@@ -119,7 +119,7 @@ def auxiliary_probe_publishing_non_membership(bot_id: int, chat_id: int) -> Auxi
 
 def manager_adapter() -> TelegramBotManager:
     """Build the public queue-adapter surface without starting a Telegram runtime."""
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._bot = object()
     manager._rate_limiter = AlwaysAvailableLimiter()
     manager._bot_chat_disabled_until = {}
@@ -134,7 +134,7 @@ def test_membership_publication_not_telegram_failure_removes_only_triggering_aff
     manager.bot_pool = BotPool([auxiliary], manager)
     manager.bot_pool.record_successful_auxiliary_send("slave-a", 17)
     manager.bot_pool.record_successful_auxiliary_send("slave-b", 17)
-    row = SimpleNamespace(telegram_chat_id=211, slave_id="slave-a", priority=0)
+    row = SimpleNamespace(telegram_chat_id=211, slave_id="slave-a", priority=0, log_context=None)
     selection = SenderSelection(auxiliary.bot, "17")
 
     manager.record_queued_failure(row, TelegramError("send failed"), selection)
@@ -520,7 +520,7 @@ def _required_auxiliary(bot: object) -> SimpleNamespace:
 
 def _manager_with_required_auxiliary(auxiliary: SimpleNamespace) -> TelegramBotManager:
     manager = manager_adapter()
-    manager._queued_db_log_contexts = {}
+    manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
     manager.bot_pool = BotPool([auxiliary], manager)
     return manager
@@ -644,9 +644,8 @@ def test_blocking_media_retry_preserves_database_context_until_real_manager_succ
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
     manager = manager_adapter()
-    manager._queued_db_log_contexts = {}
+    manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
-    manager._write_database_update = Mock()
     completed = Mock()
     row_id, waiter = retained_queue.enqueue_many(
         [QueueRequest(
@@ -655,7 +654,7 @@ def test_blocking_media_retry_preserves_database_context_until_real_manager_succ
         )],
         lambda _operation: edit_message_media,
     )
-    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    manager._queued_completion_callbacks[row_id] = completed
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
 
@@ -663,7 +662,7 @@ def test_blocking_media_retry_preserves_database_context_until_real_manager_succ
     executor.submissions[0][2].set_exception(RetryAfter(121))
     scheduler.harvest_completed()
 
-    assert manager._queued_db_log_contexts.keys() == {row_id}
+    assert manager._queued_completion_callbacks.keys() == {row_id}
     completed.assert_not_called()
     assert manager._bot_chat_disabled_until == {(None, 67): 221.0}
     clock.update(monotonic=221.0, wall=1121.0)
@@ -673,8 +672,6 @@ def test_blocking_media_retry_preserves_database_context_until_real_manager_succ
     scheduler.harvest_completed()
 
     assert waiter.result() is result
-    assert manager._queued_db_log_contexts == {}
-    manager._write_database_update.assert_called_once()
     completed.assert_not_called()
 
 
@@ -696,14 +693,13 @@ def test_blocking_media_retry_terminal_paths_finish_real_manager_database_contex
     monkeypatch.setattr(outbound.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(outbound.time, "time", lambda: clock["wall"])
     manager = manager_adapter()
-    manager._queued_db_log_contexts = {}
+    manager._queued_completion_callbacks = {}
     manager._queued_db_log_context_lock = threading.Lock()
-    manager._write_database_update = Mock()
     completed = Mock()
     row_id, waiter = _enqueue_blocking_media_edit(
         retained_queue, io.BufferedReader(io.BytesIO(b"media")), "__main__"
     )
-    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    manager._queued_completion_callbacks[row_id] = completed
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
 
@@ -724,9 +720,8 @@ def test_blocking_media_retry_terminal_paths_finish_real_manager_database_contex
     with pytest.raises(expected_error):
         waiter.result()
     scheduler.stop_and_drain(timeout=0.0)
-    assert manager._queued_db_log_contexts == {}
+    assert manager._queued_completion_callbacks == {}
     completed.assert_called_once_with()
-    manager._write_database_update.assert_not_called()
 
 
 def test_blocking_media_retry_caps_required_sender_wait_at_original_deadline(
@@ -861,7 +856,7 @@ def test_blocking_media_retry_fails_when_required_auxiliary_changes(
     row_id, waiter = _enqueue_blocking_media_edit(
         retained_queue, io.BufferedReader(io.BytesIO(b"media")), "10"
     )
-    manager._queued_db_log_contexts[row_id] = QueuedDbLogContext(Mock(), None, completed)
+    manager._queued_completion_callbacks[row_id] = completed
     scheduler = OutboundQueueScheduler(retained_queue, manager, executor, worker_count=1)
 
     scheduler.dispatch_once()
@@ -878,7 +873,7 @@ def test_blocking_media_retry_fails_when_required_auxiliary_changes(
         waiter.result()
     assert len(executor.submissions) == 1
     assert manager._bot is not auxiliary.bot
-    assert manager._queued_db_log_contexts == {}
+    assert manager._queued_completion_callbacks == {}
     completed.assert_called_once_with()
 
 
@@ -1450,7 +1445,7 @@ def test_manager_registers_runtime_snapshot_collectors_with_configured_destinati
     enqueue(queue, 61, "second")
     enqueue(queue, 62, "third")
     metrics = Metrics()
-    manager = object.__new__(TelegramBotManager)
+    manager = bare_manager()
     manager._metrics = metrics
     manager._outbound_queue = queue
     manager._outbound_scheduler = SimpleNamespace(in_flight_count=lambda: 3)

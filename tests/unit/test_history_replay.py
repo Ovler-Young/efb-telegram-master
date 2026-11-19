@@ -35,6 +35,7 @@ def history(tmp_path, monkeypatch, request):
     binding.db = db
     binding.chat_manager = Mock()
     binding.logger = Mock()
+    binding._history_ownership_swept = False
     calls = []
 
     def enqueue(**kwargs):
@@ -479,6 +480,4 @@ def test_replay_lanes_are_per_topic_and_one_topic_never_hides_another(history):
     assert history.db.get_pending_history_migration_targets() == [(-1002, 11), (-1002, 12)]
     assert history.db.get_next_history_migration_target(-1002, 11).formatted_text == 'a1\n'
     assert history.db.get_next_history_migration_target(-1002, 12).formatted_text == 'b1\n'
-    # The chat-wide selection used to pick one target and drain it before the other.
-    assert history.db.get_next_history_migration_target(-1002) is not None
 

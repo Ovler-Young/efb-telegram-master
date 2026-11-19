@@ -6,7 +6,7 @@ import html
 import pickle
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
-from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
+from typing import List, NamedTuple, Optional, Tuple, TypedDict
 
 from ehforwarderbot.chat import Chat, SelfChatMember
 from telegram.constants import MessageLimit
@@ -91,7 +91,7 @@ class MemberEvent:
 
 
 # (status before, event) -> statuses the saved member may have afterwards. None means "no saved member".
-MEMBER_TRANSITIONS: Dict[Tuple[Optional[str], str], Tuple[str, ...]] = {
+MEMBER_TRANSITIONS: dict[tuple[str | None, str], tuple[str, ...]] = {
     (None, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
     (MemberStatus.ACTIVE, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
     # An edit after a removal makes the source live again, with a newer revision.
@@ -127,8 +127,8 @@ class MemberChange(NamedTuple):
     changed: bool
 
 
-def apply_member_event(previous: Optional[SourceMember], event: str,
-                       incoming: Optional[SourceMember] = None) -> MemberChange:
+def apply_member_event(previous: SourceMember | None, event: str,
+                       incoming: SourceMember | None = None) -> MemberChange:
     """Apply one event to a saved member and return the member to keep.
 
     ``incoming`` is the newer version for ``NEW_REVISION``, ``REDIRECT`` and both receipts.

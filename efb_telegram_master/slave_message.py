@@ -34,6 +34,7 @@ from ehforwarderbot.message import LinkAttribute, LocationAttribute, MessageComm
 from ehforwarderbot.status import ChatUpdates, MemberUpdates, MessageRemoval, MessageReactionsUpdate
 from ehforwarderbot.types import MessageID
 from . import utils
+from .aggregation_states import ContextKind
 from .bot_manager import QueuedDbLogContext
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
@@ -209,17 +210,15 @@ class SlaveMessageProcessor(LocaleMixin):
                 self._release_pending_slave_message(dedupe_key)
                 return msg
 
-            from .live_aggregate import LiveTextAggregation
-            aggregation = getattr(getattr(self, "bot", None), "live_aggregation", None)
+            aggregation = self.bot.live_aggregation
             key = (slave_origin_uid, int(tg_dest), str(thread_id) if thread_id is not None else None)
-            if (isinstance(aggregation, LiveTextAggregation) and not msg.edit
+            if (not msg.edit
                     and aggregation.queue.cancelled_source((slave_origin_uid, str(msg.uid)))):
                 self._release_pending_slave_message(dedupe_key)
                 return msg
-            if isinstance(aggregation, LiveTextAggregation) and msg.edit:
-                if self._aggregate_source_edit(aggregation, key, msg, msg_template, silent):
-                    return msg
-            if (isinstance(aggregation, LiveTextAggregation) and self.flag("text_aggregation")
+            if msg.edit and self._aggregate_source_edit(aggregation, key, msg, msg_template, silent):
+                return msg
+            if (self.flag("text_aggregation")
                     and self.flag.allows_text_aggregation(
                         msg.chat, slave_origin_uid,
                         self.db.get_text_aggregation_override(msg.chat.module_id, msg.chat.uid))
@@ -255,7 +254,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
             with self._timed_phase(xid, "Dispatch"):
                 key = (slave_origin_uid, int(tg_dest), str(thread_id) if thread_id is not None else None)
-                if (isinstance(aggregation, LiveTextAggregation) and not msg.edit
+                if (not msg.edit
                         and (self.flag("text_aggregation") or key in aggregation.streams)):
                     with aggregation.independent(key):
                         aggregation.close_source_routes(key)
@@ -286,7 +285,12 @@ class SlaveMessageProcessor(LocaleMixin):
         return msg
 
     def _aggregate_source_edit(self, aggregation, key, msg, msg_template, silent):
-        from .aggregate import MemberEvent, apply_member_event, make_source_member, member_identity
+        from .aggregate import (
+            MemberEvent,
+            apply_member_event,
+            make_source_member,
+            member_identity,
+        )
         with aggregation.scheduler._lock:
             log, previous, predecessor = aggregation.source_state(key, (key[0], str(msg.uid)))
             if previous is None:
@@ -300,7 +304,7 @@ class SlaveMessageProcessor(LocaleMixin):
             from .queued_log import decode_aggregation
             payload = aggregation.queue.aggregation_context(predecessor) if predecessor else None
             pending = decode_aggregation(payload) if payload else None
-            independent_pending = pending and pending["kind"] in {"source", "redirect"}
+            independent_pending = pending and pending["kind"] in {ContextKind.SOURCE, ContextKind.REDIRECT}
             if qualifying and aggregation.update_pending_member(key, member):
                 return True
             if log and log.aggregate and not independent_pending:
@@ -452,13 +456,10 @@ class SlaveMessageProcessor(LocaleMixin):
                                            .format(msg.type.name),
                                            **self._make_send_kwargs(msg, old_msg_id, on_complete=on_db_complete))
 
-        if tg_msg and commands:
-            aggregation = getattr(self.bot, "live_aggregation", None)
-            source_delivery = aggregation is not None and aggregation._source_delivery.get() is not None
-            if not source_delivery:
-                self.channel.commands.register_command(tg_msg, ETMCommandMsgStorage(
-                    commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
-                ))
+        if tg_msg and commands and self.bot.live_aggregation._source_delivery.get() is None:
+            self.channel.commands.register_command(tg_msg, ETMCommandMsgStorage(
+                commands, coordinator.get_module_by_id(msg.author.module_id), msg_template, msg.text
+            ))
 
         if tg_msg is None:
             self.logger.warning("[%s] Message sending returned None, skipping database logging. "
@@ -1524,7 +1525,7 @@ class SlaveMessageProcessor(LocaleMixin):
         elif isinstance(status, MessageRemoval):
             self.logger.debug("Received message removal request from channel %s on message %s",
                               status.source_channel, status.message)
-            aggregation = getattr(self.bot, "live_aggregation", None)
+            aggregation = self.bot.live_aggregation
             identity = (str(utils.chat_id_to_str(chat=status.message.chat)), str(status.message.uid))
             message = status.message
             if message.author is None:
@@ -1534,7 +1535,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     member = next((child for child in members if (child["origin_uid"], child["source_id"]) == identity), None)
                     restored = row.build_source_member(member, self.chat_manager) if member else row.build_etm_msg(self.chat_manager)
                     break
-                if restored is None and aggregation is not None:
+                if restored is None:
                     from .aggregate import member_identity, member_message
                     cancellation = aggregation.queue.cancelled_source(identity)
                     if cancellation:
@@ -1558,7 +1559,7 @@ class SlaveMessageProcessor(LocaleMixin):
                     return
             msg_template, (target, topic) = self.get_slave_msg_dest(message)
             key = (identity[0], int(target), str(topic) if topic is not None else None) if target is not None else None
-            if aggregation is not None and key is not None and aggregation.remove_source_member(key, identity):
+            if key is not None and aggregation.remove_source_member(key, identity):
                 return
             resolved = self.db.resolve_source_member(*identity, str(target), key[2]) if key else None
             old_msg = resolved[0] if resolved else None
@@ -1668,8 +1669,8 @@ class SlaveMessageProcessor(LocaleMixin):
                               status.msg_id, status.chat)
             return
 
-        aggregation = getattr(getattr(self, "bot", None), "live_aggregation", None)
-        if aggregation is not None and isinstance(getattr(old_msg_db, "source_member", None), dict):
+        aggregation = self.bot.live_aggregation
+        if isinstance(getattr(old_msg_db, "source_member", None), dict):
             key = (str(slave_origin_uid), int(tg_dest), str(thread_id) if thread_id is not None else None)
             self._aggregate_source_edit(aggregation, key, old_msg, msg_template, False)
             return
