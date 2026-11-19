@@ -93,3 +93,125 @@ Bot admins use `/aggregation` in a group or topic linked to a source chat:
 Any other argument gets the usage text. When a group links several source
 chats, the command asks which chat to change. If the global switch is off, the
 reply says so, because it overrides the preference.
+
+## Queue row kinds
+
+Every unpublished step of text aggregation is a row in the outbound queue. Its
+`log_context` holds the marker byte `\x03` and a pickled dict whose `kind`
+says what the row is doing; two flags, `frozen` and `handoff`, refine it.
+These spellings are persisted and fixed. The row's delivery columns (queued,
+in flight, held, `sent_pending`) are a separate machine, described in
+`docs/delivery-recovery.md`.
+
+The definition lives in `efb_telegram_master/aggregation_states.py`:
+`ContextKind` (the stored spellings), `ContextState`, `ContextEvent`, the table
+`CONTEXT_TRANSITIONS` and `context_state()`. The queue mutators in
+`outbound.py` (`replace_logical_aggregation`, `close_aggregation_destination`,
+`materialize_aggregation`, `handoff_aggregation`, `cancel_logical_aggregation`,
+`cancel_pending_source`, `release_delivery_attempt`, and the batch split in
+`enqueue_many`), `LiveTextAggregation.materialize` and `reconcile`, and
+`TelegramBotManager.execute_queued_call` check it through
+`check_context_transition()` before they write.
+
+| State | Stored as | Meaning |
+|---|---|---|
+| `logical` | `kind='logical'` | An unsent batch of new members. It can still grow. |
+| `member_update` | `kind='member_update'` | Pending source edits or removals for a confirmed container. `container_id` is empty until the container's first receipt; a routing update (`routing_hint`) marks a member as moved. |
+| `aggregate` | `kind='aggregate'` | The frozen container send or edit, with its sender fixed. A new batch keeps its logical form in `retry_context`. |
+| `source` | `kind='source'` or `'redirect'`, not `frozen` | One member's own output, not yet attempted. |
+| `frozen_source` | `kind='source'`, `frozen` | The frozen standalone send, edit or removal edit of one member. |
+| `frozen_redirect` | `kind='redirect'`, `frozen` | The frozen output of a member that left its container. |
+| `handed_off` | `kind` `aggregate`, `source` or `redirect`, `handoff` | The receipt is written to MsgLog and passed to the rows behind it; the row is removed next. |
+| `boundary` | `kind='boundary'` | An ordinary request (media, commands, a full-content attachment) ordered between batches. It is logged through its own `legacy_context`. |
+| `cancellation` | `kind='cancellation'` in `source_cancellations` | A withdrawn unpublished member, kept so a later edit is not published. |
+
+| Event | From | To | Where |
+|---|---|---|---|
+| `replace` | `logical`, `member_update` | same | Append a member, merge an edit or removal, keep the head of a split batch. |
+| `close_destination` | `logical`, `member_update`, `aggregate`, `handed_off` | same | A new Telegram message in the destination ends appending. Other rows have no append flags and are skipped. |
+| `materialize` | `logical`, `member_update` | `aggregate` | First attempt. |
+| `materialize` | `source` | `frozen_source`, `frozen_redirect` | First attempt; the saved source decides which. |
+| `materialize` | `aggregate`, `frozen_source`, `frozen_redirect`, `boundary` | same | Frozen requests are sent as stored. A removal edit is rebuilt from the saved standalone message, which also upgrades a removal stored in the former `delete_message` format. |
+| `execute` | `aggregate`, `frozen_source`, `frozen_redirect`, `boundary` | same | The Telegram call. |
+| `release` | `aggregate` | `logical`, `aggregate` | A definite rejection: a new batch returns to its logical form, a container update stays frozen for its owner. |
+| `release` | `frozen_source`, `frozen_redirect`, `boundary` | same | |
+| `receipt` | `aggregate`, `frozen_source`, `frozen_redirect` | `handed_off` | Write MsgLog, update the rows behind it. |
+| `receipt` | `handed_off` | `handed_off` | A retry after the row could not be removed; nothing is applied twice. |
+| `receipt` | `boundary` | `boundary` | Logged through its `legacy_context`. |
+| `withdraw` | `logical`, `source`, `frozen_source` | none | Only before any attempt: an emptied batch, a batch replaced by its split, an unpublished member's pending outputs. |
+| `record_cancellation` | none, `cancellation` | `cancellation` | A newer withdrawn revision replaces the stored one. |
+
+A row is created as `logical`, `member_update`, `source`, `frozen_source` (a
+removal edit of a confirmed standalone message) or `boundary`. Updating the
+rows behind a confirmed one (setting their container, owner or base) changes
+data, not their state.
+
+Older rows keep loading: contexts without `appendable`, `generation`, `recent`,
+`container_id` or `routing_hint` read the defaults, and a frozen removal stored
+as `delete_message` is rebuilt as an edit.
+
+### When a row is in a state its event does not accept
+
+The check raises `IllegalAggregationTransitionError` and writes nothing. Its
+message names the row, its kind and the event, for example
+`Aggregation queue row 12 of kind 'member_update' does not accept materialize; the row was left unchanged. Deferred source update requires its confirmed container.`
+
+* **At the first attempt or the Telegram call** (`materialize`, `execute`), the
+  outbound worker stops, as for any queue persistence error, and stops again
+  after a restart. Find the row with
+  `python3 -m efb_telegram_master.queue_report --data-dir <channel data directory>`
+  and report the message with the log lines around it.
+* **At receipt reconciliation**, the scheduler logs once per row
+  `Receipt of queue row 12 (aggregation kind 'logical') cannot be reconciled; it stays queued and is retried: ...`
+  and keeps retrying on the usual backoff. Other rows continue.
+* **For a merge, a withdrawal of a pending output or a release**, the row is
+  left as it is and a WARNING says why (`Aggregation batch not replaced: ...`,
+  `Pending source not withdrawn: ...`, `Send attempt not released: ...`). A
+  refused merge or withdrawal is handled like a row that was already sent: the
+  change goes into a new row.
+
+## Live streams
+
+A live stream is the in-memory append state of one source in one destination
+(the key is origin, chat and topic). It is never stored; at startup it is
+rebuilt from the queued rows. It decides whether a new member joins the
+current container or starts a new one.
+
+The definition lives in `efb_telegram_master/aggregation_states.py`:
+`StreamState`, `StreamEvent`, `STREAM_TRANSITIONS` and `CloseReason`, used by
+`LiveTextAggregation` in `live_aggregate.py`.
+
+| State | Meaning |
+|---|---|
+| `absent` | No member or independent delivery for this key since startup. |
+| `open` | The next member may join the current batch or edit the current container. |
+| `closed` | The current container ended; the next member starts a new one. The previous container is remembered for one `reopen`. |
+
+| Event | absent | open | closed |
+|---|---|---|---|
+| `append` | open | open | open |
+| `close` | absent (no-op) | closed | closed |
+| `reopen` | absent (no-op) | open | open (the previous container is restored) |
+| `receipt` | absent | open | closed |
+
+`reopen` acts only when the discarded row is still the stream's last row;
+otherwise a later row has already continued the run and nothing changes. Both
+no-ops are logged at DEBUG. A `receipt` makes the confirmed container the one
+to edit next only when it belongs to the stream's current generation.
+
+Every close names its reason (`CloseReason`):
+
+| Reason | Cause |
+|---|---|
+| `telegram-destination` | A new Telegram message arrived in the destination. |
+| `route-changed` | The source now delivers to another chat or topic. |
+| `idle` | No new member for `text_aggregation_idle_seconds`. |
+| `capacity` | The pending batch is full. |
+| `independent-delivery` | A media, command or oversized message is sent on its own. |
+| `split-tail-<kind>` | Splitting a pending batch left a `boundary`, `source` or `redirect` row last. |
+
+At most once a minute the closes are logged as a WARNING with a tally, for example
+`Live aggregation container closes in the last interval: {'idle': 3, 'capacity': 1} (latest capacity)`.
+Use it to tell which rule split a run of messages into several containers.
+`capacity` closes follow `text_aggregation_max_members` and
+`text_aggregation_max_payload_bytes`.
