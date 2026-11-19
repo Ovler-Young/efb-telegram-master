@@ -1,5 +1,6 @@
 """Group author custom emoji in message headers: rendering, queueing and dispatch."""
 import html
+import re
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -28,7 +29,9 @@ from efb_telegram_master.outbound import (
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 from tests.mocks.slave import MockSlaveChannel
 from tests.unit.test_custom_emoji import profile, write_legacy_tables  # noqa: F401  (profile is a fixture)
-from tests.unit.test_live_aggregate import idle_live_aggregation
+from tests.unit.test_live_aggregate import idle_live_aggregation, source
+from tests.unit.test_live_aggregate_runtime import complete, runtime  # noqa: F401  (runtime is a fixture)
+from tests.unit.test_live_aggregate_source import processor as aggregation_processor
 
 MAIN = SenderSelection(sender=None, sender_bot_id=None)
 CAPABLE_AUXILIARY = "111"
@@ -407,3 +410,39 @@ def test_auxiliary_bot_may_send_custom_emoji_only_when_its_entry_opts_in(monkeyp
     manager._init_bot_pool(config["auxiliary_bots"], config, channel)
 
     assert manager._custom_emoji_auxiliary_ids == {"2"}
+
+
+# The long text is short enough to combine, but its HTML is longer than a message may be.
+@pytest.mark.parametrize("enabled, alice_text", [(True, "hi"), (False, "hi"), (True, "<" * 1500)])
+def test_combined_message_shows_each_ready_author_emoji_and_asks_for_the_others(
+        runtime, enabled, alice_text):  # noqa: F811
+    manager = runtime
+    manager.channel.flag.config["text_aggregation"] = True
+    alice, bob = "tests.source alice", "tests.source bob"
+    manager.channel.db.add_user_emoji_cache(f"member-user:{alice}", "5001", "etm_user_avatars_by_bot")
+    store = CustomEmojiStore(manager.channel.db, CustomEmojiConfig.from_channel_config(
+        {"user_emoji": {"enabled": enabled}}))
+    store.load()
+    bot_factory = Mock()
+    creator = Mock(wraps=UserEmojiCreator(store, bot_factory, "bot", "ETM user avatars"))
+    manager.channel.custom_emoji, manager.channel.custom_emoji_creator = store, creator
+    handler = aggregation_processor(manager)
+    handler.get_slave_msg_dest = lambda msg: (handler.generate_message_template(msg, True), (-100, None))
+
+    for uid, text, name in (("one", alice_text, "Alice"), ("two", "yo", "Bob")):
+        message = source(uid, text, name)
+        message.chat.members.append(message.author)
+        handler.send_message(message)
+    complete(manager)
+
+    [(operation, _chat, sent, _kwargs)] = manager.transport.calls
+    time = r"<code>\d\d:\d\d:\d\d</code>"
+    if enabled:
+        alice_header = re.escape(TAG.format("5001", fallback_emoji(alice))) + " Alice:"
+        assert [call.args[0] for call in creator.request.call_args_list] == [bob]
+    else:
+        alice_header = "Alice:"
+        creator.request.assert_not_called()
+    assert operation == "send_message"
+    assert re.fullmatch(rf"{alice_header} {time}\n{re.escape(html.escape(alice_text))}\n\nBob: {time}\nyo", sent), sent
+    bot_factory.assert_not_called()

@@ -1711,10 +1711,12 @@ class TelegramBotManager(LocaleMixin):
             row.operation, telegram_args, telegram_kwargs
         )
         if has_custom_emoji and (
-            self._queued_full_content(row.operation, telegram_args, telegram_kwargs) is not None
+            (not kwargs.get("_live_aggregate")
+             and self._queued_full_content(row.operation, telegram_args, telegram_kwargs) is not None)
             or not self._sender_can_send_custom_emoji(selection)
         ):
             # Long content is cut and attached as a file, and the cut could split the tag.
+            # A combined message is never cut.
             telegram_args, telegram_kwargs = plain_args, plain_kwargs
         full_args, full_kwargs = telegram_args, dict(telegram_kwargs)
         content = None if kwargs.get("_live_aggregate") else self._queued_full_content(row.operation, telegram_args, telegram_kwargs)

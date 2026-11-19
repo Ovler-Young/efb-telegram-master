@@ -226,3 +226,14 @@ At most once a minute the closes are logged as a WARNING with a tally, for examp
 Use it to tell which rule split a run of messages into several containers.
 `capacity` closes follow `text_aggregation_max_members` and
 `text_aggregation_max_payload_bytes`.
+
+## Author custom emoji
+
+An author header in a combined message shows the author's custom emoji (the
+`user_emoji` section of the README) when the emoji was ready as the source
+arrived; otherwise it shows the plain header, and the emoji is created in the
+background for that author's later messages. A source already in a container
+keeps the header it arrived with when the container is edited later. The
+container is rendered from memory when it is sent or edited, without waiting
+for an avatar download or emoji creation, and a sender bot that may not send
+custom emoji gets plain headers.
