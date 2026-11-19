@@ -650,7 +650,8 @@ class UserEmojiCreator:
         emoji_id = sticker_set.stickers[position].custom_emoji_id if position < len(sticker_set.stickers) else None
         if not emoji_id:
             raise _AuthorFailed(f"sticker set {name} has no new custom emoji")
-        if name == self._set_name():  # a retry may read a set that was filled and left behind
+        if name == self._set_name() and self.set_state is StickerSetState.OPEN:
+            # A retry may read a set that was filled and left behind, or arrive while the set is being looked up again.
             self._set_count = len(sticker_set.stickers)
             self._move_set(StickerSetEvent.FILLED if self._set_count >= STICKER_SET_LIMIT else StickerSetEvent.ADDED)
         return emoji_id, name
