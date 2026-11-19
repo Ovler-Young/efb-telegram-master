@@ -446,3 +446,42 @@ def test_combined_message_shows_each_ready_author_emoji_and_asks_for_the_others(
     assert operation == "send_message"
     assert re.fullmatch(rf"{alice_header} {time}\n{re.escape(html.escape(alice_text))}\n\nBob: {time}\nyo", sent), sent
     bot_factory.assert_not_called()
+
+
+def test_combined_message_with_two_ready_authors_loses_every_tag_for_an_incapable_sender_and_the_retry(runtime):  # noqa: F811
+    manager = runtime
+    manager.channel.flag.config["text_aggregation"] = True
+    manager._custom_emoji_auxiliary_ids = frozenset()
+    alice, bob = "tests.source alice", "tests.source bob"
+    for uid, emoji_id in ((alice, "5001"), (bob, "5002")):
+        manager.channel.db.add_user_emoji_cache(f"member-user:{uid}", emoji_id, "etm_user_avatars_by_bot")
+    store = CustomEmojiStore(manager.channel.db, CustomEmojiConfig.from_channel_config({}))
+    store.load()
+    manager.channel.custom_emoji = store
+    handler = aggregation_processor(manager)
+    handler.get_slave_msg_dest = lambda msg: (handler.generate_message_template(msg, True), (-100, None))
+    for uid, name in (("one", "Alice"), ("two", "Bob")):
+        message = source(uid, "hi", name)
+        message.chat.members.append(message.author)
+        handler.send_message(message)
+    complete(manager)
+    [(_, _, combined, _)] = manager.transport.calls
+    assert combined.count("<tg-emoji") == 2
+
+    row = SimpleNamespace(operation="send_message", id=1, log_context=None, priority=1, slave_id="slave")
+    kwargs = {"chat_id": -100, "text": combined, "parse_mode": "HTML", "_live_aggregate": True}
+    capable = FakeSender()
+    manager.execute_queued_call(row, (), kwargs, SenderSelection(capable, None))
+    assert sent_text(capable) == combined
+
+    incapable = FakeSender()
+    manager.execute_queued_call(row, (), kwargs, SenderSelection(incapable, INCAPABLE_AUXILIARY))
+    assert "<tg-emoji" not in sent_text(incapable)
+    assert sent_text(incapable).startswith(f"{fallback_emoji(alice)} Alice:")
+    assert f"{fallback_emoji(bob)} Bob:" in sent_text(incapable)
+
+    retried = FakeSender(failures=[telegram.error.BadRequest("Can't parse entities: unclosed tag")])
+    manager.execute_queued_call(row, (), kwargs, SenderSelection(retried, None))
+    first, second = retried.calls
+    assert first[0] == combined and "<tg-emoji" not in second[0]
+    assert f"{fallback_emoji(bob)} Bob:" in second[0] and "parse_mode" not in second[1]

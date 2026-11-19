@@ -269,15 +269,12 @@ class AuthorEmojiHeader(str):
 
 
 def strip_custom_emoji_tag(content: str) -> str:
-    """Replace the custom emoji tag of a message header with its fallback emoji.
+    """Replace every custom emoji tag the bridge wrote with its fallback emoji.
 
-    The header is the first line of a queued message, and it holds at most one
-    tag, so only the first tag of the first line is replaced. Message text
-    comes after the first line and is escaped when it is queued, so what the
-    user wrote is never changed.
+    Message text is escaped when it is queued, so a tag typed by a user never
+    matches and what the user wrote is never changed.
     """
-    first_line, newline, rest = content.partition("\n")
-    return _EMOJI_TAG.sub(r"\1", first_line, count=1) + newline + rest
+    return _EMOJI_TAG.sub(r"\1", content)
 
 
 # State machines for generated user emoji. Every state change goes through
