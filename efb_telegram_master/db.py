@@ -470,16 +470,26 @@ class DatabaseManager:
     def read_custom_emoji_rows(self) -> dict[str, list[tuple[str, str, object]]]:
         """Read every ``(key, custom_emoji_id, updated_at)`` row of the legacy emoji tables.
 
-        Missing tables yield an empty list. Timestamps are returned as stored
+        Missing tables, and tables that lack the expected columns (logged once
+        as a warning), yield an empty list. Timestamps are returned as stored
         (datetime, text or ``None``). Not on the metrics label allow-list: it
         runs once at startup.
         """
         with connection_scope(self._managed_database):
-            present = set(database.get_tables(schema=current_schema(database.obj)))
+            schema = current_schema(database.obj)
+            present = set(database.get_tables(schema=schema))
             rows: dict[str, list[tuple[str, str, object]]] = {}
             for model, key_column in ((TopicIconCache, "avatar_hash"), (UserEmojiCache, "cache_key")):
                 table = model._meta.table_name
-                rows[table] = [] if table not in present else [
+                rows[table] = []
+                if table not in present:
+                    continue
+                columns = {column.name for column in database.get_columns(table, schema=schema)}
+                if not {key_column, "custom_emoji_id", "updated_at"} <= columns:
+                    self.logger.warning(
+                        "Table %s does not have the expected emoji cache columns; ignoring its rows.", table)
+                    continue
+                rows[table] = [
                     tuple(row) for row in database.execute_sql(
                         f"SELECT {key_column}, custom_emoji_id, updated_at FROM {table}").fetchall()
                 ]

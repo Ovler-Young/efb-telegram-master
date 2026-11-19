@@ -125,6 +125,24 @@ def test_profiles_with_one_or_no_legacy_table_load_and_get_both_tables(profile, 
     assert (store.lookup("carol") is not None) == (kind != "neither")
 
 
+def test_cache_table_of_another_shape_is_ignored_with_a_warning(profile, caplog):
+    directory, open_manager = profile
+    other_shape = 'CREATE TABLE "topiciconcache" ("chat_id" INTEGER PRIMARY KEY, "icon" TEXT NOT NULL, "data" BLOB)'
+    with closing(sqlite3.connect(directory / "tgdata.db")) as connection, connection:
+        connection.execute(other_shape)
+        connection.execute("INSERT INTO topiciconcache VALUES (1, 'x', NULL)")
+        connection.execute(USER_DDL)
+        connection.execute("INSERT INTO useremojicache VALUES (?, ?, ?, ?, ?)", USER_ROWS[0])
+    store = CustomEmojiStore(open_manager(), CustomEmojiConfig())
+    with caplog.at_level("WARNING", logger="efb_telegram_master.db"):
+        store.load()
+    assert store.lookup("carol").custom_emoji_id == "u-carol"
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1 and "topiciconcache" in warnings[0]
+    with closing(sqlite3.connect(directory / "tgdata.db")) as connection:
+        assert connection.execute("SELECT * FROM topiciconcache").fetchall() == [(1, "x", None)]
+
+
 def test_timestamps_in_a_timestamp_typed_column_order_hashed_rows(profile):
     directory, open_manager = profile
     ddl = USER_DDL.replace("DATETIME", "TIMESTAMP")
