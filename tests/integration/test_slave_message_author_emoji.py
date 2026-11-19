@@ -48,7 +48,7 @@ def custom_emoji_entities(message):
 
 async def test_author_custom_emoji_appears_after_it_is_created(helper, slave, channel, bot_group, monkeypatch):
     chat = slave.group
-    author = next(member for member in chat.members if member.uid != chat.self.uid)
+    author, other = [member for member in chat.members if member.uid != chat.self.uid][:2]
     uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
 
     def member_picture(_member):
@@ -73,3 +73,13 @@ async def test_author_custom_emoji_appears_after_it_is_created(helper, slave, ch
         second_tg = await helper.wait_for_message(in_chats(bot_group) & regex(second.text))
         entities = custom_emoji_entities(second_tg)
         assert [entity.document_id for entity in entities] == [int(created.custom_emoji_id)]
+
+        # A combined message: the author with an emoji first, then one whose emoji does not exist yet.
+        monkeypatch.setitem(channel.flag.config, "text_aggregation", True)
+        third = slave.send_text_message(chat=chat, author=author)
+        await helper.wait_for_message(in_chats(bot_group) & regex(third.text))
+        fourth = slave.send_text_message(chat=chat, author=other)
+        combined = await helper.wait_for_message(in_chats(bot_group) & regex(fourth.text))
+        assert third.text in combined.raw_text
+        entities = custom_emoji_entities(combined)
+        assert [(entity.offset, entity.document_id) for entity in entities] == [(0, int(created.custom_emoji_id))]
