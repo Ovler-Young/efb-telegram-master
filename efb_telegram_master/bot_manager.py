@@ -681,12 +681,12 @@ class TelegramBotManager(LocaleMixin):
             get_updates_request=get_updates_request,
         )
 
-    def build_standalone_bot(self, connection_pool_size: int = 1) -> telegram.Bot:
+    def build_standalone_bot(self) -> telegram.Bot:
         """A bot for this token with its own connection pool, for work that must not delay sends.
 
         It is not initialized; close it with ``bot.request.shutdown()``.
         """
-        request = self._build_request(connection_pool_size)
+        request = self._build_request(1)
         return self._build_bot(request=request, get_updates_request=request)
 
     async def _post_init(self, application: Application):

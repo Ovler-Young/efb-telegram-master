@@ -267,7 +267,7 @@ def test_parse_error_retry_sends_the_fallback_not_the_tag(profile, tmp_path, aut
 def test_oversized_content_never_carries_or_splits_the_tag(tmp_path, profile, name_length, operation):  # noqa: F811
     store = make_store(profile)
     manager = make_manager(tmp_path, store)
-    emoji = UserEmoji("5001", "🙂", "useremojicache")
+    emoji = UserEmoji("5001", "🙂")
     name = "n" * name_length
     header = AuthorEmojiHeader(f"🙂 {name}:", emoji, 0)
     limit = 4096 if operation == "send_message" else 1024

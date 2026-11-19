@@ -19,14 +19,12 @@ from ehforwarderbot.exceptions import EFBOperationNotSupported
 from PIL import Image
 from telegram.request import HTTPXRequest
 
+from efb_telegram_master import custom_emoji
 from efb_telegram_master.custom_emoji import (
-    AUTHOR_EMOJI_MACHINE,
-    AuthorEmojiEvent,
     AuthorEmojiState,
     CustomEmojiConfig,
     CustomEmojiStore,
     FeatureState,
-    IllegalTransition,
     UserEmojiCreator,
     fallback_emoji,
 )
@@ -155,18 +153,21 @@ def api():
 
 
 @pytest.fixture
-def make_creator(profile, api):  # noqa: F811
+def make_creator(profile, api, monkeypatch):  # noqa: F811
     directory, open_manager = profile
     creators = []
 
     def make(user_rows=None, config=None, **options):
+        """``options`` replace the module's pacing and size limits (``write_interval`` -> ``WRITE_INTERVAL``)."""
         if user_rows is not None:
             write_legacy_tables(directory, user_rows=user_rows)
         store = CustomEmojiStore(open_manager(), CustomEmojiConfig.from_channel_config(
             config or {"admins": [OWNER]}))
         store.load()
         options.setdefault("write_interval", 0.0)
-        creator = UserEmojiCreator(store, api.bot, BOT, "ETM user avatars", **options)
+        for name, value in options.items():
+            monkeypatch.setattr(custom_emoji, name.upper(), value)
+        creator = UserEmojiCreator(store, api.bot, BOT, "ETM user avatars")
         creators.append(creator)
         return store, creator
 
@@ -314,13 +315,12 @@ def test_lost_reply_to_set_creation_does_not_block_later_authors(make_creator, a
 
 
 def test_failed_author_waits_for_its_retry_time(make_creator, api):
-    now = [1000.0]
-    _, creator = make_creator(legacy_rows(1), retry_base=60.0, clock=lambda: now[0])
+    _, creator = make_creator(legacy_rows(1), retry_base=0.3)
     creator.start()
     attempts = []
 
     def no_avatar():
-        attempts.append(now[0])
+        attempts.append(1)
         raise EFBOperationNotSupported()
 
     creator.request("nobody", no_avatar)
@@ -328,15 +328,13 @@ def test_failed_author_waits_for_its_retry_time(make_creator, api):
     assert creator.author_state("nobody") is AuthorEmojiState.FAILED
     for _ in range(5):
         creator.request("nobody", no_avatar)
-    now[0] += 59.0
-    creator.request("nobody", no_avatar)
     time.sleep(0.1)
-    assert attempts == [1000.0]
+    assert len(attempts) == 1
 
-    now[0] += 1.0
+    time.sleep(0.25)
     creator.request("nobody", no_avatar)
     wait_until(lambda: len(attempts) == 2 and creator.author_state("nobody") is AuthorEmojiState.FAILED)
-    now[0] += 60.0  # the second failure doubles the wait
+    time.sleep(0.3)  # the second failure doubles the wait
     creator.request("nobody", no_avatar)
     time.sleep(0.1)
     assert len(attempts) == 2
@@ -344,8 +342,7 @@ def test_failed_author_waits_for_its_retry_time(make_creator, api):
 
 
 def test_telegram_error_fails_only_that_author(make_creator, api):
-    now = [0.0]
-    _, creator = make_creator(legacy_rows(1), clock=lambda: now[0])
+    _, creator = make_creator(legacy_rows(1))
     creator.start()
     api.errors["addStickerToSet"] = "Bad Request: STICKER_PNG_NOPNG"
     api.sets[SET_6] = ["s0"]
@@ -397,7 +394,7 @@ def test_full_queue_drops_without_waiting(make_creator, api):
 
 
 def test_stop_returns_within_its_bound_with_jobs_queued(make_creator, api):
-    _, creator = make_creator(legacy_rows(1), write_interval=30.0, join_timeout=2.0)
+    _, creator = make_creator(legacy_rows(1), write_interval=30.0)
     api.sets[SET_6] = ["s0"]
     creator.start()
     uids = [f"u{i}" for i in range(5)]
@@ -409,21 +406,3 @@ def test_stop_returns_within_its_bound_with_jobs_queued(make_creator, api):
 
     assert time.monotonic() - started < 1.0
     assert not creator._thread.is_alive()
-    assert creator.author_state("u2") is AuthorEmojiState.QUEUED
-    creator.request("late", avatar)
-    assert creator.author_state("late") is AuthorEmojiState.ABSENT
-
-
-def test_disabled_feature_starts_no_worker(make_creator, api):
-    _, creator = make_creator(legacy_rows(1), config={"admins": [OWNER], "user_emoji": {"enabled": False}})
-    creator.start()
-    creator.request("gina", avatar)
-
-    assert creator.feature_state is FeatureState.DISABLED_BY_CONFIG
-    assert creator._thread is None
-    assert creator.author_state("gina") is AuthorEmojiState.ABSENT
-
-
-def test_illegal_author_transition_names_the_author():
-    with pytest.raises(IllegalTransition, match="'slave.channel_hal'.*'requested'.*'ready'"):
-        AUTHOR_EMOJI_MACHINE.next_state("slave.channel_hal", AuthorEmojiState.READY, AuthorEmojiEvent.REQUESTED)

@@ -88,18 +88,16 @@ def test_saved_rows_of_every_old_key_format_resolve_in_priority_order(profile, c
         store.load()
 
     expected = {
-        "bob": ("configured-bob", "config"),  # configuration beats a saved row
-        "carol": ("u-carol", "useremojicache"),  # useremojicache beats topiciconcache
-        "alice": ("u-alice-hashed", "avatar-hash"),  # newest hashed row across both tables
-        "dave": ("u-dave-new", "avatar-hash"),
-        "erin:with:colons": ("u-erin", "useremojicache"),  # a uid with colons but no hash suffix
+        "bob": "configured-bob",  # configuration beats a saved row
+        "carol": "u-carol",  # useremojicache beats topiciconcache
+        "alice": "u-alice-hashed",  # newest hashed row across both tables
+        "dave": "u-dave-new",
+        "erin:with:colons": "u-erin",  # a uid with colons but no hash suffix
     }
-    for uid, (emoji_id, source) in expected.items():
+    for uid, emoji_id in expected.items():
         found = store.lookup(uid)
-        assert (found.custom_emoji_id, found.source) == (emoji_id, source), uid
+        assert found.custom_emoji_id == emoji_id, uid
         assert found.fallback == fallback_emoji(uid)
-    assert store.topic_icon_for_avatar_hash(H1.upper()) == "t-bare"
-    assert store.topic_icon_for_avatar_hash(H2) is None
     assert "bare-hash=1" in caplog.text and "member-placeholder=1" in caplog.text and "unknown=1" in caplog.text
     assert dump_tables(directory) == before
 
@@ -191,18 +189,16 @@ def test_recorded_emoji_does_not_replace_a_configured_one(profile):
 def test_config_defaults_and_old_user_emoji_section():
     defaults = CustomEmojiConfig.from_channel_config({"admins": [42, 43]})
     assert (defaults.enabled, defaults.sticker_set_name, defaults.owner_user_id) == (True, "etm_user_avatars", 42)
-    assert not defaults.custom_emoji_ids and not defaults.topic_icon_custom_emoji_ids and not defaults.auxiliary_tokens
+    assert not defaults.custom_emoji_ids and not defaults.auxiliary_tokens
 
     old = CustomEmojiConfig.from_channel_config({
         "admins": [42],
         "user_emoji": {"enabled": False, "sticker_set_name": "my_set", "owner_user_id": 7,
                        "custom_emoji_ids": {"alice": "e1", 12345: "e2", "bad": 5}},
-        "topic_icons": {"sticker_set_name": "ignored", "custom_emoji_ids": {"chat": "t1"}},
         "auxiliary_bots": [{"token": "a", "custom_emoji": True}, {"token": "b"}, {"token": "c", "custom_emoji": "yes"}],
     })
     assert (old.enabled, old.sticker_set_name, old.owner_user_id) == (False, "my_set", 7)
     assert dict(old.custom_emoji_ids) == {"alice": "e1", "12345": "e2"}
-    assert dict(old.topic_icon_custom_emoji_ids) == {"chat": "t1"}
     assert old.auxiliary_tokens == {"a"}
 
 
