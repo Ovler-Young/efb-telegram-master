@@ -986,6 +986,9 @@ class Adapter:
     def record_queued_success(self, row, result, selection):
         return CompletionDecision("success")
 
+    def reopen_aggregation(self, row):
+        pass
+
 
 class DurableAdapter(Adapter):
     def __init__(self, reconcile: bool) -> None:
