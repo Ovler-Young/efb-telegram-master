@@ -147,7 +147,6 @@ The definition lives in `efb_telegram_master/aggregation_states.py`:
 | `receipt` | `handed_off` | `handed_off` | A retry after the row could not be removed; nothing is applied twice. |
 | `receipt` | `boundary` | `boundary` | Logged through its `legacy_context`. |
 | `withdraw` | `logical`, `source`, `frozen_source` | none | Only before any attempt: an emptied batch, a batch replaced by its split, an unpublished member's pending outputs. |
-| `record_cancellation` | none, `cancellation` | `cancellation` | A newer withdrawn revision replaces the stored one. |
 
 A row is created as `logical`, `member_update`, `source`, `frozen_source` (a
 removal edit of a confirmed standalone message) or `boundary`. Updating the
