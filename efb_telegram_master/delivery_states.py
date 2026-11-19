@@ -91,6 +91,7 @@ class Event(Enum):
     OPERATOR_CONFIRM = "operator_confirm"
     DEFER_RECONCILIATION = "defer_reconciliation"
     REMOVE = "remove"
+    WITHDRAW = "withdraw"
     REPAIR_HISTORY_SENDER = "repair_history_sender"
 
 
@@ -117,6 +118,9 @@ TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
     **_from((RowState.IN_FLIGHT, *HELD_STATES), Event.OPERATOR_CONFIRM, RowState.SENT_PENDING),
     (RowState.SENT_PENDING, Event.DEFER_RECONCILIATION): RowState.SENT_PENDING,
     **_from(_UNSETTLED + (RowState.SENT_PENDING,), Event.REMOVE, RowState.ABSENT),
+    # Cancelling an empty batch or a pending source, or splitting a batch into
+    # rows that replace it, removes only a row no attempt has started on.
+    **_from(_ATTEMPTABLE, Event.WITHDRAW, RowState.ABSENT),
     # Startup clears only `history_failed:RequiredSenderUnavailableError` on
     # history rows that never started an attempt; see OutboundQueue._migrate_schema.
     (RowState.HISTORY_FAILED, Event.REPAIR_HISTORY_SENDER): RowState.WAITING,

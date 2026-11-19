@@ -1762,6 +1762,7 @@ def _apply(queue, directory, row_id, event):
             row_id, b"\x01receipt", operator_confirmed=True),
         Event.DEFER_RECONCILIATION: lambda: queue.defer_reconciliation([row_id], time.time()),
         Event.REMOVE: lambda: queue.delete(row_id),
+        Event.WITHDRAW: lambda: queue.cancel_logical_aggregation(row_id),
     }
     calls[event]()
 

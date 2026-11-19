@@ -168,7 +168,7 @@ Stored spellings never change between versions.
 
 | Event | From | To | Code |
 |---|---|---|---|
-| enqueue | absent | waiting | `OutboundQueue.enqueue_many`, aggregation handoff, supplement insert |
+| enqueue | absent | waiting | `OutboundQueue.enqueue_many`, aggregation handoff, supplement insert (a new row has no earlier state to check) |
 | begin_attempt | waiting, deferred | in_flight | `begin_delivery_attempt` (an aggregation row that `materialize` already moved to in_flight is left unchanged) |
 | materialize | waiting, deferred | in_flight | `materialize_aggregation` |
 | release_attempt | in_flight | waiting | `release_delivery_attempt` (submission failed or Telegram definitely rejected; an aggregate rewinds to its logical batch) |
@@ -181,8 +181,9 @@ Stored spellings never change between versions.
 | record_completion | waiting, deferred, in_flight | sent_pending | `record_telegram_completion` |
 | operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`) |
 | defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
-| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, terminal discard, cancellation) |
-| repair_history_sender | history_failed | waiting | queue open, schema migration |
+| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held) |
+| withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
+| repair_history_sender | history_failed | waiting | queue open, schema migration; only `history_failed:RequiredSenderUnavailableError` on a history row that never started an attempt |
 
 An event the row's state does not accept is never applied. The queue raises
 `IllegalDeliveryTransitionError` with a message such as `Queue row 12 is

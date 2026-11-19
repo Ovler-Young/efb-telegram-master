@@ -36,7 +36,7 @@ from telegram.error import NetworkError, RetryAfter
 import httpx
 
 from .delivery_states import (
-    QUEUED, SENT_PENDING, WAITING_STATES, Event, HoldKind, RowState, classify, error_detail,
+    QUEUED, SENT_PENDING, Event, HoldKind, RowState, classify, error_detail,
     format_hold, next_state, ready_sql, waiting_sql,
 )
 from .transfer_timeout import media_size, transfer_timeout
@@ -821,14 +821,14 @@ class OutboundQueue:
                 connection.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL")
         # Undo only pre-submission holds caused by the removed history sender
         # constraint. Attempted/uncertain deliveries must never be auto-replayed.
-        # Event.REPAIR_HISTORY_SENDER in the queue row state table.
-        connection.execute(
-            "UPDATE outbound_queue SET delivery_hold=NULL "
-            "WHERE substr(slave_id, 1, ?) = ? AND delivery_state='queued' "
-            "AND delivery_hold=? AND attempt_started_at IS NULL",
-            (len(HISTORY_SOURCE_PREFIX), HISTORY_SOURCE_PREFIX,
-             format_hold(HoldKind.HISTORY_FAILED, RequiredSenderUnavailableError.__name__)),
-        )
+        repaired_hold = format_hold(HoldKind.HISTORY_FAILED, RequiredSenderUnavailableError.__name__)
+        if next_state(classify(QUEUED, repaired_hold), Event.REPAIR_HISTORY_SENDER) is not None:
+            connection.execute(
+                "UPDATE outbound_queue SET delivery_hold=NULL "
+                "WHERE substr(slave_id, 1, ?) = ? AND delivery_state=? "
+                "AND delivery_hold=? AND attempt_started_at IS NULL",
+                (len(HISTORY_SOURCE_PREFIX), HISTORY_SOURCE_PREFIX, QUEUED, repaired_hold),
+            )
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -1579,8 +1579,12 @@ class OutboundQueue:
                         "id=? AND " + waiting_sql(), (logical_split["row_id"],)).fetchone()
                     if original is None or decode_aggregation(original[1])["kind"] != "logical":
                         raise QueuePersistenceError("Source batch was submitted before its split.")
-                    self._mark_row_destinations_dirty(logical_split["row_id"], dependents=True)
                     before = logical_split.get("before")
+                    if before:
+                        self._mark_row_destinations_dirty(logical_split["row_id"], dependents=True)
+                    else:
+                        # The split rows replace the batch row, which is removed below.
+                        self._transition(logical_split["row_id"], Event.WITHDRAW, dependents=True)
                     predecessor = logical_split["row_id"] if before else original[0]
                     if before:
                         self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?",
@@ -1797,6 +1801,7 @@ class OutboundQueue:
         """Remove an unsubmitted empty batch while retaining its predecessor barrier."""
         with self._lock:
             with self.connection:
+                self._transition(row_id, Event.WITHDRAW, dependents=True)
                 row = self.connection.execute("SELECT predecessor_id, log_context, priority, operation, created_at FROM outbound_queue WHERE id=? AND "
                                               + waiting_sql(), (row_id,)).fetchone()
                 if row is None:
@@ -1804,7 +1809,6 @@ class OutboundQueue:
                 if cancelled_member is not None:
                     from .queued_log import decode_aggregation
                     self._record_source_cancellation(tuple(decode_aggregation(row[1])["key"]), cancelled_member)
-                self._mark_row_destinations_dirty(row_id, dependents=True)
                 self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (row[0], row_id))
                 self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
             self._observe_removed(row[2], row[3], row[4], "cancelled")
@@ -1825,7 +1829,7 @@ class OutboundQueue:
                 context = decode_aggregation(row[1])
                 if (tuple(context["key"]) == tuple(key) and context["kind"] in {"source", "redirect"}
                         and member_identity(context["member"]) == member_identity(member)):
-                    if classify(row[2], row[3]) not in WAITING_STATES or row[4] is not None:
+                    if next_state(classify(row[2], row[3]), Event.WITHDRAW) is None or row[4] is not None:
                         return {}
                     matching.append(row[0])
             if not matching:
@@ -1838,7 +1842,7 @@ class OutboundQueue:
                 predecessor, payload, priority, operation, created_at = self.connection.execute(
                     "SELECT predecessor_id, payload, priority, operation, created_at FROM outbound_queue WHERE id=?", (row_id,),
                 ).fetchone()
-                self._mark_row_destinations_dirty(row_id, dependents=True)
+                self._transition(row_id, Event.WITHDRAW, dependents=True)
                 self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=?", (predecessor, row_id))
                 self.connection.execute("DELETE FROM outbound_queue WHERE id=?", (row_id,))
                 predecessors[row_id] = predecessor
@@ -1997,7 +2001,7 @@ class OutboundQueue:
             ).fetchone()
         return RowState.ABSENT if row is None else classify(row[0], row[1], row[2], time.time())
 
-    def _transition(self, row_id: int, event: Event, *, dependents: bool = False) -> RowState:
+    def _transition(self, row_id: int, event: Event, *, dependents: bool = False) -> None:
         """Check ``event`` against the row's stored state before the caller writes.
 
         An event the state does not accept raises, and nothing is written. An
@@ -2012,7 +2016,6 @@ class OutboundQueue:
                 "there, so the row was left unchanged."
             )
         self._mark_row_destinations_dirty(row_id, dependents=dependents)
-        return current
 
     def _mark_row_destinations_dirty(self, row_id: int, *, dependents: bool = False) -> None:
         """Re-elect changed metadata, including dependency eligibility when requested."""
