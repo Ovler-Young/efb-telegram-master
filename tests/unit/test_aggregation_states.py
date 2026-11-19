@@ -11,7 +11,11 @@ from telegram import Chat, Message, User
 from efb_telegram_master.aggregate import make_source_member
 from efb_telegram_master.aggregation_states import ContextState, context_state
 from efb_telegram_master.db import MsgLog
-from efb_telegram_master.outbound import IllegalAggregationTransitionError, QueueRequest, SenderSelectionResult
+from efb_telegram_master.outbound import (
+    IllegalAggregationTransitionError,
+    QueueRequest,
+    SenderSelectionResult,
+)
 from efb_telegram_master.queued_log import decode_aggregation, encode_aggregation
 from tests.unit import test_live_aggregate_runtime
 from tests.unit.test_live_aggregate import source
