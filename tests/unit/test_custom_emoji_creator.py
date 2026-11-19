@@ -578,11 +578,20 @@ def finish_running_job(store, creator, caplog):
     wait_until(settled(store, caplog, [uid]))
 
 
-def checked(store, creator, uid, loader):
-    """Check ``uid``'s avatar for the first time, which records its fingerprint."""
-    creator.refresh(uid, loader)
-    wait_until(lambda: store.saved(uid).avatar_hash is not None)
-    return store.saved(uid).avatar_hash
+def fingerprint(color):
+    return custom_emoji.make_avatar_png(avatar(color))[1]
+
+
+def write_rows(directory, rows, color=RED):
+    """``useremojicache`` rows as this release saves them: with the fingerprint of the avatar the emoji shows.
+
+    ``color`` ``None`` writes them as earlier releases did, without a fingerprint.
+    """
+    write_legacy_tables(directory, user_rows=rows)
+    if color is not None:
+        with closing(sqlite3.connect(directory / "tgdata.db")) as connection, connection:
+            connection.execute('ALTER TABLE useremojicache ADD COLUMN "avatar_hash" TEXT')
+            connection.execute("UPDATE useremojicache SET avatar_hash = ?", (fingerprint(color),))
 
 
 def saved_row(directory, uid):
@@ -592,44 +601,26 @@ def saved_row(directory, uid):
             "WHERE cache_key = ?", ("member-user:" + uid,)).fetchone()
 
 
-def test_emoji_of_earlier_releases_get_a_fingerprint_on_their_first_check_and_nothing_is_uploaded(
-        make_creator, api, profile, clock):  # noqa: F811
-    directory, _ = profile
-    topic_rows = [("member-user:tom", "t-tom", f"etm_user_avatars_by_{BOT}", STAMP, STAMP)]
-    write_legacy_tables(directory, topic_rows=topic_rows)
-    rows = legacy_rows(3) + [(f"member-user:new{i}", f"new-{i}", SET_7, STAMP, STAMP) for i in range(2)]
-    store, creator = make_creator(rows)
-    uids = [key[len("member-user:"):] for key, *_ in rows] + ["tom"]
-    creator.start()
-    for uid in uids:
-        creator.refresh(uid, avatar)
-    wait_until(lambda: all(store.saved(uid).avatar_hash for uid in uids))
-
-    assert api.calls == []
-    tables = dump_tables(directory)
-    assert tables["topiciconcache"] == topic_rows
-    assert [row for row in tables["useremojicache"] if row[0] != "member-user:tom"] == sorted(rows)
-    assert saved_row(directory, "tom")[0:2] == ("t-tom", f"etm_user_avatars_by_{BOT}")
-    assert len({saved_row(directory, uid)[4] for uid in uids}) == 1  # one picture, one fingerprint
-    assert [store.lookup(uid).custom_emoji_id for uid in uids] == [row[1] for row in rows] + ["t-tom"]
-
-
-def test_changed_avatar_replaces_the_old_sticker_and_later_headers_use_the_new_emoji(
-        make_creator, api, profile, clock):  # noqa: F811
+@pytest.mark.parametrize("saved_avatar", [None, RED], ids=["made-by-an-earlier-release", "avatar-changed"])
+def test_emoji_not_showing_the_current_avatar_is_replaced_once_and_later_headers_use_the_new_one(
+        make_creator, api, profile, clock, caplog, saved_avatar):  # noqa: F811
     directory, _ = profile
     slave = MockSlaveChannel()
     author = next(member for member in slave.group.members if member.uid != "__self__")
     uid = utils.chat_id_to_str(channel_id=author.module_id, chat_uid=author.uid)
-    api.sets[SET_6] = ["s0", "old-author", "s2"]
-    store, creator = make_creator([(f"member-user:{uid}", "old-author", SET_6, STAMP, STAMP)])
+    api.sets[SET_6] = ["old-0", "old-author", "old-1"]
+    rows = [(f"member-user:{uid}", "old-author", SET_6, STAMP, STAMP)] + legacy_rows(2)
+    write_rows(directory, rows, saved_avatar)
+    store, creator = make_creator()
     creator.start()
-    colors, threads, release = [RED], [], threading.Event()
+    finish_running_job(store, creator, caplog)
+    assert api.calls == []  # nothing is checked or remade at startup
+    threads, release = [], threading.Event()
 
     def picture(member):
         threads.append(threading.current_thread().name)
-        if colors[-1] == BLUE:
-            assert release.wait(10)
-        return avatar(colors[-1])
+        assert release.wait(10)
+        return avatar(BLUE)
 
     slave.get_chat_member_picture = picture
     processor = object.__new__(SlaveMessageProcessor)
@@ -637,12 +628,6 @@ def test_changed_avatar_replaces_the_old_sticker_and_later_headers_use_the_new_e
     processor.channel = types.SimpleNamespace(custom_emoji=store, custom_emoji_creator=creator)
     message = Message(chat=author.chat, author=author)
     with patch.dict("ehforwarderbot.coordinator.slaves", {slave.channel_id: slave}):
-        processor.generate_message_template(message, True)
-        wait_until(lambda: store.saved(uid).avatar_hash is not None)
-        baseline = store.saved(uid).avatar_hash
-        colors.append(BLUE)
-        clock.now += custom_emoji.AVATAR_RECHECK_INTERVAL + 1
-
         sent = processor.generate_message_template(message, True)
         assert sent.emoji.custom_emoji_id == "old-author"  # the message does not wait for the new emoji
         release.set()
@@ -651,25 +636,27 @@ def test_changed_avatar_replaces_the_old_sticker_and_later_headers_use_the_new_e
 
     new_id = store.lookup(uid).custom_emoji_id
     assert later.emoji.custom_emoji_id == new_id
-    assert threads == [WORKER, WORKER]
-    assert api.sets[SET_6] == ["s0", new_id, "s2"]
+    assert threads == [WORKER]
+    assert api.sets[SET_6] == ["old-0", new_id, "old-1"]
     assert api.methods(*WRITES, "replaceStickerInSet") == [("replaceStickerInSet", SET_6)]
     emoji_id, set_name, created_at, updated_at, avatar_hash = saved_row(directory, uid)
-    assert (emoji_id, set_name, created_at) == (new_id, SET_6, STAMP)
-    assert updated_at != STAMP and avatar_hash not in (None, baseline)
+    assert (emoji_id, set_name, created_at, avatar_hash) == (new_id, SET_6, STAMP, fingerprint(BLUE))
+    assert updated_at != STAMP
+    # Authors who do not write keep their emoji and row.
+    assert [saved_row(directory, f"old{i}")[:4] for i in range(2)] == [(f"old-{i}", SET_6, STAMP, STAMP) for i in range(2)]
+    assert [store.lookup(f"old{i}").custom_emoji_id for i in range(2)] == ["old-0", "old-1"]
 
 
 def test_unchanged_avatar_uploads_nothing(make_creator, api, profile, clock, caplog):  # noqa: F811
     directory, _ = profile
     api.sets[SET_6] = ["old-0"]
-    store, creator = make_creator(legacy_rows(1))
+    write_rows(directory, legacy_rows(1))
+    row = saved_row(directory, "old0")
+    store, creator = make_creator()
     creator.start()
     loader = Avatar()
-    checked(store, creator, "old0", loader)
-    row = saved_row(directory, "old0")
-    clock.now += custom_emoji.AVATAR_RECHECK_INTERVAL + 1
     creator.refresh("old0", loader)
-    wait_until(lambda: len(loader.threads) == 2)
+    wait_until(lambda: loader.threads)
     finish_running_job(store, creator, caplog)
 
     assert api.methods(*WRITES, "replaceStickerInSet") == []
@@ -678,6 +665,7 @@ def test_unchanged_avatar_uploads_nothing(make_creator, api, profile, clock, cap
 
 
 def test_avatar_is_checked_at_most_once_per_interval(make_creator, api, clock, caplog):
+    # Emoji of earlier releases: the first check remakes old0's emoji, and its next messages do not check again.
     store, creator = make_creator(legacy_rows(3), config={"admins": [OWNER], "user_emoji": {
         "custom_emoji_ids": {"configured": "c-1"}}})
     loader, configured, probe = Avatar(), Avatar(), Avatar()
@@ -708,13 +696,12 @@ def test_failed_replacement_keeps_the_old_emoji_until_it_is_retried(
         make_creator, api, profile, clock, caplog):  # noqa: F811
     directory, _ = profile
     api.sets[SET_6] = ["old-0"]
-    store, creator = make_creator(legacy_rows(1))
-    creator.start()
-    checked(store, creator, "old0", Avatar())
+    write_rows(directory, legacy_rows(1))
     row = saved_row(directory, "old0")
+    store, creator = make_creator()
+    creator.start()
     api.errors["replaceStickerInSet"] = "Bad Request: STICKER_PNG_DIMENSIONS"
     changed = Avatar(BLUE)
-    clock.now += custom_emoji.AVATAR_RECHECK_INTERVAL + 1
     creator.refresh("old0", changed)
     wait_until(lambda: failures(caplog, "old0") == 1)
 
@@ -735,7 +722,7 @@ def test_failed_replacement_keeps_the_old_emoji_until_it_is_retried(
 def test_retried_read_back_after_a_replacement_saves_the_new_emoji_without_replacing_again(
         make_creator, api, profile, clock, caplog):  # noqa: F811
     directory, _ = profile
-    api.sets[SET_6] = ["s0", "old-0"]
+    api.sets[SET_6] = ["s0", "old-0", "s2"]
     answer = api.answer
     read_back_failed = []
 
@@ -746,21 +733,25 @@ def test_retried_read_back_after_a_replacement_saves_the_new_emoji_without_repla
         return answer(method, params, files)
 
     api.answer = failing_first_read_back
-    store, creator = make_creator(legacy_rows(1))
+    write_rows(directory, legacy_rows(1))
+    store, creator = make_creator()
     creator.start()
-    checked(store, creator, "old0", Avatar())
-    clock.now += custom_emoji.AVATAR_RECHECK_INTERVAL + 1
     creator.refresh("old0", Avatar(BLUE))
     wait_until(lambda: failures(caplog, "old0") == 1)
     assert store.lookup("old0").custom_emoji_id == "old-0"
+    creator.request("kim", avatar)  # a new author's sticker goes into the same set before the retry
+    wait_until(lambda: store.lookup("kim") is not None)
 
     clock.now += custom_emoji.RETRY_BASE + 1
     creator.refresh("old0", Avatar(BLUE))
     wait_until(lambda: store.lookup("old0").custom_emoji_id != "old-0")
 
-    assert saved_row(directory, "old0")[:2] == (api.sets[SET_6][1], SET_6)
-    assert api.sets[SET_6][0] == "s0" and len(api.sets[SET_6]) == 2
-    assert api.methods(*WRITES, "replaceStickerInSet") == [("replaceStickerInSet", SET_6)]
+    replaced, kim = api.sets[SET_6][1], api.sets[SET_6][3]
+    assert saved_row(directory, "old0")[:2] == (replaced, SET_6)
+    assert store.lookup("kim").custom_emoji_id == kim
+    assert api.sets[SET_6] == ["s0", replaced, "s2", kim]
+    assert api.methods(*WRITES, "replaceStickerInSet") == [
+        ("replaceStickerInSet", SET_6), ("addStickerToSet", SET_6)]
 
 
 @pytest.mark.parametrize("old_set, old_sticker_in_set", [
@@ -773,10 +764,9 @@ def test_old_sticker_that_cannot_be_replaced_stays_and_the_new_one_is_added(
     directory, _ = profile
     api.sets[old_set] = ["old-0", "x"] if old_sticker_in_set else ["x"]
     before = list(api.sets[old_set])
-    store, creator = make_creator(legacy_rows(1, old_set))
+    write_rows(directory, legacy_rows(1, old_set))
+    store, creator = make_creator()
     creator.start()
-    checked(store, creator, "old0", Avatar())
-    clock.now += custom_emoji.AVATAR_RECHECK_INTERVAL + 1
     creator.refresh("old0", Avatar(BLUE))
     wait_until(lambda: store.lookup("old0").custom_emoji_id != "old-0")
 
@@ -788,12 +778,51 @@ def test_old_sticker_that_cannot_be_replaced_stays_and_the_new_one_is_added(
     assert api.methods("replaceStickerInSet") == []
 
 
+def test_new_authors_avatar_is_not_loaded_again_on_their_next_message(
+        make_creator, api, profile, clock, caplog):  # noqa: F811
+    directory, _ = profile
+    write_rows(directory, legacy_rows(1))
+    store, creator = make_creator()
+    creator.start()
+    loader, probe = Avatar(), Avatar()
+    creator.request("kim", loader)
+    wait_until(lambda: store.lookup("kim") is not None)
+    creator.refresh("kim", loader)
+    creator.refresh("old0", probe)  # checks run in order, so a check of kim would run before this one
+    wait_until(lambda: probe.threads)
+    finish_running_job(store, creator, caplog)
+
+    assert len(loader.threads) == 1
+
+
+def test_author_whose_row_another_writer_saved_first_is_still_checked(make_creator, api, profile, clock):  # noqa: F811
+    directory, _ = profile
+    store, creator = make_creator([])
+    with closing(sqlite3.connect(directory / "tgdata.db")) as connection, connection:
+        connection.execute(
+            "INSERT INTO useremojicache (cache_key, custom_emoji_id, sticker_set_name, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)", ("member-user:zoe", "other-zoe", SET_6, STAMP, STAMP))
+    creator.start()
+    creator.request("zoe", Avatar())
+    wait_until(lambda: store.lookup("zoe") is not None)
+    assert store.lookup("zoe").custom_emoji_id == "other-zoe"
+
+    clock.now += custom_emoji.AVATAR_RECHECK_INTERVAL + 1
+    loader = Avatar()
+    creator.refresh("zoe", loader)
+    wait_until(lambda: loader.threads)
+
+
 def test_known_author_not_due_for_a_check_costs_nothing_on_the_send_path(
-        make_creator, api, clock, caplog, monkeypatch):
-    store, creator = make_creator(legacy_rows(2))
+        make_creator, api, profile, clock, caplog, monkeypatch):  # noqa: F811
+    directory, _ = profile
+    write_rows(directory, legacy_rows(2))
+    store, creator = make_creator()
     creator.start()
     loader = Avatar()
-    checked(store, creator, "old0", loader)
+    creator.refresh("old0", loader)
+    wait_until(lambda: loader.threads)
+    finish_running_job(store, creator, caplog)
     queries = []
     original = database.obj.execute_sql
     monkeypatch.setattr(database.obj, "execute_sql", lambda *a, **k: queries.append(a) or original(*a, **k))

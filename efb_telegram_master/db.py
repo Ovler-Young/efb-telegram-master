@@ -577,10 +577,10 @@ class DatabaseManager:
             return rows
 
     def add_user_emoji_cache(self, cache_key: str, custom_emoji_id: str, sticker_set_name: str,
-                             avatar_hash: str | None) -> str:
-        """Record a new user emoji and return the id now stored for ``cache_key``.
+                             avatar_hash: str | None) -> tuple[str, str | None, str | None]:
+        """Record a new user emoji and return the ``(id, set name, avatar fingerprint)`` now stored for ``cache_key``.
 
-        An existing row is never modified: its id is returned unchanged.
+        An existing row is never modified: its values are returned unchanged.
         """
         with connection_scope(self._managed_database):
             now = datetime.datetime.now()
@@ -588,7 +588,8 @@ class DatabaseManager:
                 cache_key=cache_key, custom_emoji_id=custom_emoji_id, sticker_set_name=sticker_set_name,
                 created_at=now, updated_at=now, avatar_hash=avatar_hash,
             ).on_conflict_ignore().execute()
-            return UserEmojiCache.get(UserEmojiCache.cache_key == cache_key).custom_emoji_id
+            row = UserEmojiCache.get(UserEmojiCache.cache_key == cache_key)
+            return row.custom_emoji_id, row.sticker_set_name, row.avatar_hash
 
     def replace_user_emoji_cache(self, cache_key: str, custom_emoji_id: str, sticker_set_name: str,
                                  avatar_hash: str) -> None:
@@ -605,24 +606,6 @@ class DatabaseManager:
                         UserEmojiCache.avatar_hash: avatar_hash,
                         UserEmojiCache.updated_at: now},
             ).execute()
-
-    def adopt_user_emoji_avatar(self, cache_key: str, custom_emoji_id: str, sticker_set_name: str | None,
-                                avatar_hash: str) -> None:
-        """Store the fingerprint of the avatar an existing emoji is now taken to show.
-
-        Only a missing fingerprint is filled in; the row's emoji, set and times
-        stay as they are. When the emoji was found under another key or in
-        ``topiciconcache``, a ``cache_key`` row with the same emoji is added.
-        """
-        with connection_scope(self._managed_database):
-            updated = UserEmojiCache.update(avatar_hash=avatar_hash).where(
-                (UserEmojiCache.cache_key == cache_key) & UserEmojiCache.avatar_hash.is_null()).execute()
-            if not updated:
-                now = datetime.datetime.now()
-                UserEmojiCache.insert(
-                    cache_key=cache_key, custom_emoji_id=custom_emoji_id, sticker_set_name=sticker_set_name or "",
-                    created_at=now, updated_at=now, avatar_hash=avatar_hash,
-                ).on_conflict_ignore().execute()
 
     @observe_database_method("add_chat_assoc")
     def add_chat_assoc(self, master_uid: EFBChannelChatIDStr,

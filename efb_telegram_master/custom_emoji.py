@@ -143,7 +143,7 @@ class SavedEmoji:
     custom_emoji_id: str
     sticker_set_name: str | None
     avatar_hash: str | None
-    """Fingerprint of the avatar the emoji shows; ``None`` until the first check of an emoji made by an earlier release."""
+    """Fingerprint of the avatar the emoji shows; ``None`` for an emoji made by an earlier release, which is remade."""
 
 
 def _timestamp(value: Any) -> float:
@@ -248,17 +248,16 @@ class CustomEmojiStore:
     def record(self, uid: str, custom_emoji_id: str, sticker_set_name: str, avatar_hash: str | None) -> UserEmoji:
         """Save a new emoji for ``uid`` as ``member-user:<uid>`` and make it available to ``lookup``.
 
-        A row that already exists for that key is kept as it is, and its id is the one used.
+        A row that already exists for that key is kept as it is, and its emoji is the one used.
         """
         with self._write_lock:
-            stored_id = self._db.add_user_emoji_cache(
-                USER_KEY_PREFIX + uid, custom_emoji_id, sticker_set_name, avatar_hash)
-            if stored_id != custom_emoji_id:
+            stored = SavedEmoji(*self._db.add_user_emoji_cache(
+                USER_KEY_PREFIX + uid, custom_emoji_id, sticker_set_name, avatar_hash))
+            if stored.custom_emoji_id != custom_emoji_id:
                 logger.warning("Custom emoji row for user %s already exists; keeping the saved one.", uid)
             if uid not in self.config.custom_emoji_ids:
-                self._index[uid] = stored_id
-                if stored_id == custom_emoji_id:
-                    self._saved[uid] = SavedEmoji(custom_emoji_id, sticker_set_name, avatar_hash)
+                self._index[uid] = stored.custom_emoji_id
+                self._saved[uid] = stored
             return self.lookup(uid)  # type: ignore[return-value]
 
     def replace(self, uid: str, custom_emoji_id: str, sticker_set_name: str, avatar_hash: str) -> None:
@@ -267,14 +266,6 @@ class CustomEmojiStore:
             self._db.replace_user_emoji_cache(USER_KEY_PREFIX + uid, custom_emoji_id, sticker_set_name, avatar_hash)
             self._saved[uid] = SavedEmoji(custom_emoji_id, sticker_set_name, avatar_hash)
             self._index[uid] = custom_emoji_id
-
-    def adopt(self, uid: str, avatar_hash: str) -> None:
-        """Record ``avatar_hash`` as the avatar shown by ``uid``'s saved emoji, which had no fingerprint."""
-        with self._write_lock:
-            saved = self._saved[uid]
-            self._db.adopt_user_emoji_avatar(
-                USER_KEY_PREFIX + uid, saved.custom_emoji_id, saved.sticker_set_name, avatar_hash)
-            self._saved[uid] = SavedEmoji(saved.custom_emoji_id, saved.sticker_set_name, avatar_hash)
 
 
 _EMOJI_TAG = re.compile(
@@ -365,7 +356,7 @@ class AuthorEmojiEvent(Enum):
     """The feature became unavailable before the queued job ran."""
     CHECK_DUE = "check due"
     UNCHANGED = "unchanged"
-    """The avatar is the one the saved emoji shows, or its fingerprint was recorded for the first time."""
+    """The avatar is the one the saved emoji shows."""
     CHANGED = "changed"
 
 
@@ -505,8 +496,9 @@ class _Author:
     """The saved emoji of an author whose avatar changed; the new emoji takes its place."""
     png: bytes | None = None
     """The changed avatar as a sticker, kept until the replacement is saved."""
-    replaced: tuple[str, frozenset[str]] | None = None
-    """(set name, custom emoji ids before) of a set whose old sticker was replaced, while the new id is still to be read back."""
+    replaced: tuple[str, int, frozenset[str]] | None = None
+    """(set name, position of the old sticker, custom emoji ids before) of a set whose old sticker was replaced,
+    while the new id is still to be read back."""
 
 
 class _AuthorFailed(Exception):
@@ -689,17 +681,13 @@ class UserEmojiCreator:
                     self._move_author(uid, author, AuthorEmojiEvent.FAILED)
                     self._authors.pop(uid, None)
                 return
-            if saved.avatar_hash is None or saved.avatar_hash == avatar_hash:
-                if saved.avatar_hash is None and not self._left_behind:
-                    try:
-                        self._store.adopt(uid, avatar_hash)
-                    except Exception:
-                        logger.warning("Saving the avatar fingerprint of %s failed.", uid, exc_info=True)
+            if saved.avatar_hash == avatar_hash:
                 with self._lock:
                     self._move_author(uid, author, AuthorEmojiEvent.UNCHANGED)
                     self._authors.pop(uid, None)
                 return
-            logger.debug("Avatar of %s changed; replacing its custom emoji %s.", uid, saved.custom_emoji_id)
+            # An emoji saved without a fingerprint was made by an earlier release and is remade once.
+            logger.debug("Avatar of %s changed or not known; replacing its custom emoji %s.", uid, saved.custom_emoji_id)
             author.replaces, author.png, author.avatar_hash = saved, png, avatar_hash
         with self._lock:
             self._move_author(uid, author, AuthorEmojiEvent.CHANGED)
@@ -808,10 +796,10 @@ class UserEmojiCreator:
             self._move_set(StickerSetEvent.FILLED if self._set_count >= STICKER_SET_LIMIT else StickerSetEvent.ADDED)
         return emoji_id, name
 
-    def _replace(self, uid: str, png: bytes, old: SavedEmoji) -> tuple[str, frozenset[str]] | None:
+    def _replace(self, uid: str, png: bytes, old: SavedEmoji) -> tuple[str, int, frozenset[str]] | None:
         """Put the new sticker in place of the old one in its set.
 
-        Returns the set's name and its custom emoji ids before the replacement;
+        Returns the set's name, the old sticker's position and the set's custom emoji ids before the replacement;
         ``None`` when the old sticker is not in one of this bot's user emoji
         sets any more, and the new sticker is added like a new author's.
         """
@@ -828,28 +816,29 @@ class UserEmojiCreator:
                     marker in _error_text(failure.__cause__) for marker in _SET_MISSING_MARKERS):
                 return None
             raise
-        old_sticker = next((sticker for sticker in stickers if sticker.custom_emoji_id == old.custom_emoji_id), None)
-        if old_sticker is None:
+        position = next((index for index, sticker in enumerate(stickers)
+                         if sticker.custom_emoji_id == old.custom_emoji_id), None)
+        if position is None:
             return None
         self._pace()
         try:
             self._call(self._bot.replace_sticker_in_set(
-                user_id=owner, name=name, old_sticker=old_sticker.file_id,
+                user_id=owner, name=name, old_sticker=stickers[position].file_id,
                 sticker=self._sticker(uid, png)))
         except TelegramError as error:
             self._telegram_failed(error)
-        return name, frozenset(sticker.custom_emoji_id for sticker in stickers if sticker.custom_emoji_id)
+        return name, position, frozenset(sticker.custom_emoji_id for sticker in stickers if sticker.custom_emoji_id)
 
-    def _read_back_replaced(self, name: str, before: frozenset[str]) -> tuple[str, str]:
-        """The custom emoji id of the sticker that replaced an old one in the set ``name``.
+    def _read_back_replaced(self, name: str, position: int, before: frozenset[str]) -> tuple[str, str]:
+        """The custom emoji id of the sticker that replaced an old one at ``position`` of the set ``name``.
 
-        Found as the one id that was not in the set before, never by position.
+        Telegram puts the new sticker where the old one was; stickers of other authors may have been added since.
         """
-        new = [sticker.custom_emoji_id for sticker in self._read_set(name).stickers
-               if sticker.custom_emoji_id and sticker.custom_emoji_id not in before]
-        if len(new) != 1:
-            raise _AuthorFailed(f"sticker set {name} has {len(new)} new custom emoji instead of one")
-        return new[0], name
+        stickers = self._read_set(name).stickers
+        emoji_id = stickers[position].custom_emoji_id if position < len(stickers) else None
+        if not emoji_id or emoji_id in before:
+            raise _AuthorFailed(f"sticker set {name} has no new custom emoji at position {position}")
+        return emoji_id, name
 
     def _open_set(self) -> str:
         """Name of a set with room, looking up each set at most once per session."""
@@ -915,6 +904,7 @@ class UserEmojiCreator:
         custom_emoji_id, set_name = author.unsaved
         if self._left_behind:
             raise _AuthorFailed("stopping")  # stop gave up waiting, so the database may be closed
+        self._next_check[uid] = time.monotonic() + AVATAR_RECHECK_INTERVAL  # the emoji shows the avatar just loaded
         try:
             if author.replaces is not None:
                 assert author.avatar_hash is not None
