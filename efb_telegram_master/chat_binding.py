@@ -30,6 +30,7 @@ from .aggregate import MemberStatus, render_members
 from .utils import DEFAULT_TIMEZONE, format_message_time
 from .chat import ETMChatType, ETMGroupChat, unpickle
 from .constants import Emoji, Flags
+from .history_states import ENTRY_TRANSITIONS, EntryEvent, entry_state
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
 from .msg_type import TGMsgType
@@ -1861,7 +1862,9 @@ class ChatBindingManager(LocaleMixin):
                     )
                 owned = self.bot.owned_history_entries([entry.ownership_key for entry in page])
                 for entry in page:
-                    if entry.ownership_key in owned:
+                    # A page holds only the published generation.
+                    state = entry_state(published=True, owned=entry.ownership_key in owned)
+                    if (state, EntryEvent.FINISH) in ENTRY_TRANSITIONS:
                         self.db.delete_history_migration_entry(entry.id)
                         self.bot.forget_history_entries([entry.ownership_key])
                     else:

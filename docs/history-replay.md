@@ -88,6 +88,37 @@ On restart, entries already owned by the queue are removed without being enqueue
 again, including after an exit between enqueue and staging deletion. This makes
 the ownership handoff idempotent across the two stores.
 
+### Entry states
+
+Each staging entry has one of the states below, defined in
+`efb_telegram_master/history_states.py` (`EntryState`, `EntryEvent`,
+`ENTRY_TRANSITIONS`, `entry_state()`). No column stores it: it follows from the
+entry's `generation`, the generation its `historymigrationtarget` pointer
+publishes, and whether the queue's `history_ownership` table holds its key.
+
+| State | Meaning |
+|---|---|
+| `absent` | No staging row: not staged yet, or removed. |
+| `staged` | Outside the published generation: still being staged, or left behind by a newer publication or an interrupted one. A legacy entry (no generation) is published while its target has no pointer. |
+| `published` | In the published generation; its lane sends it next. |
+| `queued` | Published, and the queue owns its key; the row only awaits removal. |
+
+| Event | From | To | Writer |
+|---|---|---|---|
+| `supersede` | `staged` | `absent` | `replace_history_migration_entries` after publishing, and startup reclamation |
+| `finish` | `queued` | `absent` | a lane on an entry already owned after a restart |
+
+A pair not listed here is not applied. In particular, a queued entry is never
+enqueued again, and startup reclamation leaves published and queued entries in
+place. Two writers decide from the table with the state they read from rows they
+already hold: startup reclamation removes an entry only when the table accepts
+`supersede` for its state, and a lane removes an entry without enqueueing it only
+when the table accepts `finish` for it (the queue already owns its key). Staging,
+publishing, enqueueing and skipping are applied by their writers by construction
+and are not table events. This adds no query.
+Keys whose entry is already absent are forgotten by the ownership sweep once per
+process.
+
 Rejected historical sends stay in the durable queue. Held rows do not block later
 sends, and preparation failures retain staging entries. This does not guarantee
 exactly-once Telegram delivery: uncertain remote responses require confirmation.
@@ -111,6 +142,10 @@ does not assert that replay must be sent by the original bot.
 `test_history_runtime_recovery.py` covers finite snapshots with concurrent live
 writes, atomic generation publication, indexed seeks, and interrupted ownership
 handoff and staging cleanup.
+
+`test_history_states.py` reads the entry states from real rows while entries
+are staged, published, enqueued, kept across a restart with their keys owned,
+and removed without a second enqueue.
 
 The credential-dependent live Telegram tests are designed to perform
 `/start <token> true`, verify merged texts and actual recovered photo/video

@@ -45,6 +45,7 @@ from ehforwarderbot import utils, Channel, coordinator, MsgType
 from ehforwarderbot.message import Substitutions, MessageCommands, MessageAttribute
 from ehforwarderbot.types import ModuleID, ChatID, MessageID, ReactionName
 from .chat_object_cache import ChatObjectCacheManager
+from .history_states import ENTRY_TRANSITIONS, EntryEvent, entry_state
 from .message import ETMMsg
 from .msg_type import TGMsgType
 from .aggregate import (
@@ -1411,7 +1412,10 @@ class DatabaseManager:
             ).where(HistoryMigrationEntry.id > after_id).order_by(HistoryMigrationEntry.id).limit(256).dicts())
             if not rows:
                 return
-            obsolete = [row["id"] for row in rows if row["generation"] != row["published_generation"]]
+            # A legacy entry (no generation) without a target compares equal: it is published.
+            obsolete = [row["id"] for row in rows if (
+                entry_state(published=row["generation"] == row["published_generation"]), EntryEvent.SUPERSEDE,
+            ) in ENTRY_TRANSITIONS]
             if obsolete:
                 HistoryMigrationEntry.delete().where(HistoryMigrationEntry.id.in_(obsolete)).execute()
             after_id = rows[-1]["id"]
