@@ -4,16 +4,18 @@ import html
 import logging
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 import pytest
 from telegram import Chat, Message
 from telegram.error import BadRequest, NetworkError, RetryAfter
 
-from efb_telegram_master.aggregate import make_source_member
-from efb_telegram_master.bot_manager import TelegramBotManager
+from efb_telegram_master.aggregate import make_source_member, member_identity
+from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
 from efb_telegram_master.custom_emoji import CustomEmojiConfig, CustomEmojiStore
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.live_aggregate import LiveTextAggregation
@@ -401,3 +403,195 @@ def test_incoming_boundary_while_first_send_in_flight_cannot_reopen(runtime):
     append(manager, "third", 9)
     complete(manager)
     assert [call[0] for call in manager.transport.calls] == ["send_message"] * 3
+
+
+@pytest.mark.parametrize("branch", ["sender_unavailable", "external_media_missing"])
+def test_row_discarded_at_dispatch_finishes_its_source_delivery(runtime, tmp_path, branch):
+    manager = runtime
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    finished = []
+    on_complete = lambda: finished.append(True)
+    if branch == "sender_unavailable":
+        request = QueueRequest("send_message", (), {"chat_id": -100, "text": "plain", "_send_mode": "eventual"})
+        manager.select_sender = lambda row, now: SenderSelectionResult(terminal_error_class="BotRemoved")
+    else:
+        media = tmp_path / "temporary.bin"
+        media.write_bytes(b"temporary media")
+        manager.transport.send_document = lambda chat_id, document, **kwargs: None
+        request = QueueRequest("send_document", (-100, media.as_uri()), {}, cleanup_files=(str(media),))
+    row_id, waiter = manager._enqueue_requests(
+        [request], db_log_context=QueuedDbLogContext(source("plain", "body"), None, on_complete))
+    row_id = int(row_id)
+    if branch == "external_media_missing":
+        media.unlink()
+    assert list(manager._queued_completion_callbacks) == [row_id]
+
+    scheduler.dispatch_once()
+
+    assert not queue.contains(row_id)
+    assert waiter.done() and waiter.exception() is not None
+    assert finished == [True]
+    assert manager._queued_completion_callbacks == {}
+
+
+def test_reopen_after_an_appended_member_was_withdrawn_edits_the_earlier_container(runtime):
+    manager = runtime
+    aggregation = manager.live_aggregation
+    key, _ = append(manager, "one", 1)
+    complete(manager)
+    with aggregation.independent(key):
+        media_id, _ = manager._enqueue_requests([QueueRequest("send_message", (), {"chat_id": -100, "text": "media"})])
+    media_id = int(media_id)
+    append(manager, "two", 2)
+    assert aggregation.remove_source_member(key, (key[0], "two"))
+    media = manager._outbound_queue.load_queued(media_id)
+    manager._outbound_queue.delete(media_id)
+    aggregation.reopen(media)
+    append(manager, "three", 3)
+    complete(manager)
+    assert [call[0] for call in manager.transport.calls] == ["send_message", "edit_message_text"]
+
+
+def test_an_edit_of_a_batch_that_keeps_failing_waits_while_later_messages_go(runtime, monkeypatch):
+    manager = runtime
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    real_time, real_monotonic, skipped = time.time, time.monotonic, [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + skipped[0])
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + skipped[0])
+    not_sent = NetworkError("request not sent")
+    not_sent.__cause__ = httpx.ConnectError("connection refused")
+    manager.transport.error = not_sent
+    key, member = append(manager, "one", 1)
+    batch = queue.aggregation_rows()[0].id
+    scheduler.dispatch_once()
+    next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+    # While the batch is in flight: a media message, then the removal of its member.
+    with manager.live_aggregation.independent(key):
+        request = manager.live_aggregation.bind_independent_requests(
+            [QueueRequest("send_message", (), {"chat_id": -100, "text": "media"})])
+        media, _ = queue.enqueue_many(request, manager._queue_operation)
+        manager.live_aggregation.note_independent_enqueued(media)
+    assert manager.live_aggregation.remove_source_member(key, member_identity(member))
+    removal = max(row.id for row in queue.aggregation_rows())
+    assert decode_aggregation(queue.aggregation_context(removal))["kind"] == "member_update"
+    later, _ = queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": -100, "text": "later"})], manager._queue_operation)
+    scheduler.harvest_completed()
+    for _ in range(2):
+        skipped[0] += 2
+        scheduler.dispatch_once()
+        next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+        scheduler.harvest_completed()
+    assert [call[2] for call in manager.transport.calls].count("media") == 0
+    manager.transport.error = None
+
+    # The third failure is a second ago: the media and the message queued after
+    # the removal go, the removal keeps waiting.
+    complete(manager)
+    assert manager.transport.calls[-1][2] == "media"
+    scheduler.dispatch_once()  # The removal is elected and set aside.
+    complete(manager)
+    assert manager.transport.calls[-1][2] == "later"
+    scheduler.dispatch_once()
+    assert not scheduler.in_flight and scheduler.failure is None
+    assert queue.contains(batch) and queue.contains(removal) and not queue.contains(later)
+
+    # The batch is delivered late, and only then is its member removed.
+    skipped[0] += 2
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "send_message"
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "edit_message_text"
+    assert [call[0] for call in manager.transport.calls] == ["send_message"] * 6 + ["edit_message_text"]
+    assert not queue.aggregation_rows()
+
+
+def test_a_message_ordered_behind_a_waiting_edit_waits_too(runtime, monkeypatch, caplog):
+    manager = runtime
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    real_time, real_monotonic, skipped = time.time, time.monotonic, [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + skipped[0])
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + skipped[0])
+    not_sent = NetworkError("request not sent")
+    not_sent.__cause__ = httpx.ConnectError("connection refused")
+    manager.transport.error = not_sent
+    key, member = append(manager, "one", 1)
+    batch = queue.aggregation_rows()[0].id
+    scheduler.dispatch_once()
+    next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+    assert manager.live_aggregation.remove_source_member(key, member_identity(member))
+    removal = max(row.id for row in queue.aggregation_rows())
+    assert decode_aggregation(queue.aggregation_context(removal))["kind"] == "member_update"
+    chained, _ = queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": -100, "text": "chained"}, predecessor_id=removal)],
+        manager._queue_operation)
+    scheduler.harvest_completed()
+    for _ in range(2):
+        skipped[0] += 2
+        scheduler.dispatch_once()
+        next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+        scheduler.harvest_completed()
+    manager.transport.error = None
+
+    # Nothing else is queued: the chain ends at a send that is retried later,
+    # so it is not a cycle to break and the message keeps its place.
+    with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
+        for _ in range(3):
+            scheduler.dispatch_once()
+            assert not scheduler.in_flight and scheduler.failure is None
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert "chained" not in [call[2] for call in manager.transport.calls]
+    assert queue.contains(batch) and queue.contains(removal) and queue.contains(chained)
+
+    # The batch is delivered late, then its member is removed, then the message goes.
+    skipped[0] += 2
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "send_message"
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "edit_message_text"
+    complete(manager)
+    assert manager.transport.calls[-1][2] == "chained"
+    assert not queue.contains(chained) and not queue.aggregation_rows()
+
+
+def test_an_append_into_a_batch_that_keeps_failing_waits_while_later_messages_go(runtime, monkeypatch):
+    manager = runtime
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    real_time, real_monotonic, skipped = time.time, time.monotonic, [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + skipped[0])
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + skipped[0])
+    not_sent = NetworkError("request not sent")
+    not_sent.__cause__ = httpx.ConnectError("connection refused")
+    manager.transport.error = not_sent
+    append(manager, "one", 1, "first")
+    batch = queue.aggregation_rows()[0].id
+    for attempt in range(3):
+        skipped[0] += 2
+        scheduler.dispatch_once()
+        next(iter(scheduler.in_flight.values())).future.exception(timeout=2)
+        if attempt == 2:
+            # A member arriving while the batch is in flight is appended into its
+            # container from a row of its own.
+            append(manager, "two", 2, "second")
+        scheduler.harvest_completed()
+    manager.transport.error = None
+    appended = max(row.id for row in queue.aggregation_rows())
+    assert decode_aggregation(queue.aggregation_context(appended))["inherit"]
+    queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": -100, "text": "later"})], manager._queue_operation)
+
+    scheduler.dispatch_once()  # The append is elected and set aside.
+    complete(manager)
+    assert manager.transport.calls[-1][2] == "later"
+    scheduler.dispatch_once()
+    assert not scheduler.in_flight and scheduler.failure is None
+    assert queue.contains(batch) and queue.contains(appended)
+
+    # The batch is delivered late, and only then is the append sent.
+    skipped[0] += 60
+    complete(manager)
+    assert manager.transport.calls[-1][2].endswith("first")
+    complete(manager)
+    assert manager.transport.calls[-1][0] == "edit_message_text"
+    assert manager.transport.calls[-1][2].endswith("second")
+    assert not queue.aggregation_rows()

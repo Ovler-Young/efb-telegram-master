@@ -1,5 +1,6 @@
 import asyncio
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from itertools import chain
 from typing import List, Optional
@@ -10,7 +11,9 @@ from pytest import mark
 from telethon.errors import MessageIdInvalidError
 from telethon.tl.custom import Message, MessageButton
 from telethon.tl.functions.channels import DeleteChannelRequest
-from telethon.tl.functions.messages import CreateChatRequest, DeleteChatRequest, MigrateChatRequest
+from telethon.tl.functions.messages import (
+    CreateChatRequest, DeleteChatRequest, GetChatsRequest, MigrateChatRequest,
+)
 from telethon.tl.types import MessageEntityCode, Updates, Chat as TelethonChat
 from telethon.utils import get_peer_id
 
@@ -263,24 +266,41 @@ class UpgradeTestGroup:
 
 
 async def _delete_upgrade_test_group(client, group: UpgradeTestGroup):
-    """Delete every chat this test created, however the test ended."""
+    """Delete every chat this test created, however the test ended.
+
+    Each delete runs even if an earlier one failed; the first failure is raised at the end.
+    """
     deleted_ids = set()
+    errors: list[Exception] = []
+
+    @asynccontextmanager
+    async def isolated(chat_id=None):
+        try:
+            yield
+            deleted_ids.add(chat_id)
+        except Exception as error:  # noqa: BLE001 - keep cleaning up, raise the first failure afterwards
+            errors.append(error)
+
     if group.migrated is not None:
-        await client(DeleteChannelRequest(group.migrated))
-        deleted_ids.add(group.migrated.id)
+        async with isolated(group.migrated.id):
+            await client(DeleteChannelRequest(group.migrated))
     # A failure between migrating and reading the result leaves the supergroup unknown:
     # find it by the unique title among the newest dialogs.
-    async for dialog in client.iter_dialogs(limit=50):
-        if dialog.title != group.title or dialog.entity.id in deleted_ids:
-            continue
-        if dialog.is_channel:
-            await client(DeleteChannelRequest(dialog.entity))
-        else:
-            await client(DeleteChatRequest(dialog.entity.id))
-        deleted_ids.add(dialog.entity.id)
+    async with isolated():
+        async for dialog in client.iter_dialogs(limit=50):
+            if dialog.title != group.title or dialog.entity.id in deleted_ids:
+                continue
+            async with isolated(dialog.entity.id):
+                if dialog.is_channel:
+                    await client(DeleteChannelRequest(dialog.entity))
+                else:
+                    await client(DeleteChatRequest(dialog.entity.id))
     if group.chat is not None and group.chat.id not in deleted_ids:
         # The basic group stays behind, deactivated, after it is migrated.
-        await client(DeleteChatRequest(group.chat.id))
+        async with isolated(group.chat.id):
+            await client(DeleteChatRequest(group.chat.id))
+    if errors:
+        raise errors[0]
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -311,10 +331,15 @@ async def test_group_chat_migration(client, helper, channel, slave, upgrade_test
                 chats = mega_chat_response.updates.chats
             else:
                 chats = []
-            mega_chat: TelethonChat = next(
+            mega_chat: TelethonChat | None = next(
                 (c for c in chats if getattr(c, "id", None) != chat.id),
                 None
-            ) or await client.get_entity(get_peer_id(chat))
+            )
+            if mega_chat is None:
+                # The response did not carry the supergroup: follow the basic group's own pointer to it.
+                refreshed = (await client(GetChatsRequest(id=[chat.id]))).chats[0]
+                assert refreshed.migrated_to is not None, "the basic group points to the supergroup it migrated to"
+                mega_chat = await client.get_entity(refreshed.migrated_to)
             upgrade_test_group.migrated = mega_chat
 
             deadline = asyncio.get_running_loop().time() + 20

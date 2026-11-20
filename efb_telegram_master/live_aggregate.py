@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
+import math
 import pickle
 import time
 from contextlib import contextmanager
@@ -17,7 +18,8 @@ from .aggregate import (
     render_members,
 )
 from .aggregation_states import (
-    CloseReason, ContextEvent, ContextKind, ContextState, StreamEvent, StreamState, next_stream_state,
+    CloseReason, ContextEvent, ContextKind, ContextState, StreamEvent, StreamState, needs_delivered_predecessor,
+    next_stream_state,
 )
 from .outbound import IllegalAggregationTransitionError, QueueRequest, check_context_transition
 from .queued_log import decode_aggregation, encode_aggregation
@@ -31,26 +33,26 @@ class _Stream:
     recent: list[float] = field(default_factory=list)
     last_new: float = 0
     generation: int = 0
-    # The (base, generation) a close replaced, kept for one reopen; set while CLOSED.
+    state: StreamState = StreamState.OPEN
+    # The (base, generation) the latest close replaced. Only a close overwrites it
+    # and only a reopen consumes it; an append leaves it alone.
     closed: Optional[tuple] = None
 
     def apply(self, event: StreamEvent) -> None:
         """Move this stream along ``STREAM_TRANSITIONS``."""
-        after = next_stream_state(_stream_state(self), event)
+        after = next_stream_state(self.state, event)
         if after is StreamState.CLOSED:
             self.closed = (self.base, self.generation)
             self.base = None
             self.generation += 1
-        elif after is StreamState.OPEN:
-            if event is StreamEvent.REOPEN and self.closed is not None:
-                self.base, self.generation = self.closed
+        elif event is StreamEvent.REOPEN and self.closed is not None:
+            self.base, self.generation = self.closed
             self.closed = None
+        self.state = after
 
 
 def _stream_state(stream: _Stream | None) -> StreamState:
-    if stream is None:
-        return StreamState.ABSENT
-    return StreamState.OPEN if stream.closed is None else StreamState.CLOSED
+    return StreamState.ABSENT if stream is None else stream.state
 
 
 # Rows that end a container: later members of the source start a new one.
@@ -343,7 +345,14 @@ class LiveTextAggregation:
             return None
         payload = self.queue.aggregation_context(row.id)
         context = decode_aggregation(payload) if payload else None
-        return context.get("due") if context and context["kind"] in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE} else None
+        if context is None:
+            return None
+        failing = self.queue.failing_predecessor(row.id)
+        if failing is not None:
+            predecessor = decode_aggregation(failing[1]) if failing[1] else None
+            if needs_delivered_predecessor(context, predecessor):
+                return math.inf
+        return context.get("due") if context["kind"] in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE} else None
 
     def materialize(self, row, selection):
         context = decode_aggregation(row.log_context) if row.log_context else None

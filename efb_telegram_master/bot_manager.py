@@ -1840,12 +1840,8 @@ class TelegramBotManager(LocaleMixin):
     def _pop_queued_completion_callback(self, row_id: object) -> Optional[Callable[[], None]]:
         if not isinstance(row_id, int):
             return None
-        callbacks = getattr(self, "_queued_completion_callbacks", None)
-        context_lock = getattr(self, "_queued_db_log_context_lock", None)
-        if callbacks is None or context_lock is None:
-            return None
-        with context_lock:
-            return callbacks.pop(row_id, None)
+        with self._queued_db_log_context_lock:
+            return self._queued_completion_callbacks.pop(row_id, None)
 
     def reconcile_queued_delivery(self, row) -> bool:
         """Write a persisted Telegram completion to MsgLog."""
@@ -1939,13 +1935,19 @@ class TelegramBotManager(LocaleMixin):
                 raise ValueError("This queue row requires the original document message.")
             completion = self._queued_completion_result(row, args, kwargs, message, selection)
             receipt = self.encode_queued_completion_receipt(message, selection, file_bot_id=file_bot_id)
-            if isinstance(completion, QueuedDeliveryResult):
-                queue.record_telegram_completion(
-                    row_id, receipt, supplement=completion.supplement,
-                    operation_resolver=self._queue_operation, operator_confirmed=True,
-                )
-            else:
-                queue.record_telegram_completion(row_id, receipt, operator_confirmed=True)
+            try:
+                if isinstance(completion, QueuedDeliveryResult):
+                    queue.record_telegram_completion(
+                        row_id, receipt, supplement=completion.supplement,
+                        operation_resolver=self._queue_operation, operator_confirmed=True,
+                    )
+                else:
+                    queue.record_telegram_completion(row_id, receipt, operator_confirmed=True)
+            except IllegalAggregationTransitionError:
+                raise ValueError(
+                    "This batch was never sent to Telegram as one message, so no reply can confirm it. "
+                    "It stays held and no data was changed."
+                ) from None
             if has_log:
                 completed = row_id in self._outbound_scheduler.reconcile_sent_pending(row_id)
             else:
@@ -2062,6 +2064,10 @@ class TelegramBotManager(LocaleMixin):
 
     def reopen_aggregation(self, row) -> None:
         self.live_aggregation.reopen(row)
+
+    def finish_discarded_delivery(self, row) -> None:
+        """Finish the source delivery of a row discarded before it reached Telegram."""
+        self._run_database_update_callback(self._pop_queued_completion_callback(row.id))
 
     def record_queued_retry_after(
         self, row, error: telegram.error.RetryAfter, selection: SenderSelection

@@ -513,6 +513,10 @@ def test_recovery_streams_an_exact_381320453_byte_v1_payload_and_survives_restar
                 return asyncio.run(bot.send_document(*args, **kwargs))
             def record_queued_success(self, *args):
                 return SimpleNamespace(kind="success")
+            def queued_aggregation_deadline(self, row):
+                return None
+            def materialize_queued_aggregation(self, row, selection):
+                return row
 
         queue = OutboundQueue(sys.argv[1])
         with ThreadPoolExecutor(max_workers=1) as executor:

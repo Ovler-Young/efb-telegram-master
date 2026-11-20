@@ -275,6 +275,21 @@ class RecordingAdapter:
         self.successes.append((row, result))
         return CompletionDecision("success")
 
+    def finish_discarded_delivery(self, row) -> None:
+        pass
+
+    def queued_aggregation_deadline(self, row) -> float | None:
+        return None
+
+    def materialize_queued_aggregation(self, row, _selection: SenderSelection):
+        return row
+
+    def encode_queued_completion_receipt(self, result: object, _selection: SenderSelection) -> bytes:
+        return b"receipt"
+
+    def reconcile_queued_delivery(self, row) -> bool:
+        return False
+
 
 @pytest.fixture
 def retained_queue(tmp_path: Path) -> OutboundQueue:

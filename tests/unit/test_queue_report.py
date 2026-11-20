@@ -5,7 +5,7 @@ import sqlite3
 
 from efb_telegram_master.outbound import OutboundQueue, QueueRequest
 from efb_telegram_master.queue_report import (
-    QUEUE_FILENAME, TG_FILENAME, queued_topic, report,
+    QUEUE_FILENAME, TG_FILENAME, queued_topic, report, resolve_data_dir,
 )
 
 
@@ -62,6 +62,12 @@ def test_report_prints_depth_age_and_sources_per_destination(tmp_path):
     # Read-only: the queue is untouched and can still be opened exclusively.
     reopened = OutboundQueue(tmp_path)
     reopened.close()
+
+
+def test_data_dir_defaults_to_the_directory_holding_the_queue(tmp_path, monkeypatch):
+    (tmp_path / QUEUE_FILENAME).write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    assert resolve_data_dir(None) == tmp_path
 
 
 def test_report_measures_rows_that_still_carry_a_topic_in_their_request(tmp_path):

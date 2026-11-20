@@ -29,11 +29,15 @@ NOW_SECONDS = "CAST(strftime('%s','now') AS INTEGER)"
 AGGREGATION_MARKER = b"\x03"
 MEDIA_SIDECAR_MARKER = b"\x02"
 
-# Copied from efb_telegram_master.delivery_states, because this file must run on
-# its own; a unit test keeps both copies identical. A row is "waiting" when it is
-# queued and unheld, a predecessor is a "barrier" while it is waiting, in flight or
-# awaiting its MsgLog write, and a waiting row no barrier defers is "ready": the
-# scheduler elects each destination's next send among ready rows.
+# ``waiting_sql``, ``barrier_sql``, ``backing_off_sql`` and ``ready_sql`` are
+# copied from efb_telegram_master.delivery_states, because this file must run on
+# its own; a unit test keeps those copies identical. ``behind_barrier_sql`` exists
+# only here and only for the report. A row is "waiting" when it is queued and
+# unheld, a predecessor is a "barrier" while it is awaiting its MsgLog write, or
+# waiting or in flight with fewer than 3 failed attempts in a row, and a waiting
+# row no barrier defers is "ready": the scheduler elects each destination's next
+# send among ready rows, passing over a row that failed 3 times and is "backing
+# off" until its retry deadline.
 
 
 def waiting_sql(alias: str = "") -> str:
@@ -43,12 +47,22 @@ def waiting_sql(alias: str = "") -> str:
 
 
 def barrier_sql(alias: str) -> str:
-    """The row ``alias`` still defers its dependents: waiting, in flight or awaiting MsgLog."""
+    """The row ``alias`` still defers its dependents: awaiting MsgLog, or waiting or
+    in flight with fewer than 3 failed attempts."""
     return (
         f"({alias}.delivery_state = 'sent_pending' "
         f"OR ({alias}.delivery_state = 'queued' "
+        f"AND {alias}.reconcile_attempts < 3 "
         f"AND ({alias}.delivery_hold IS NULL "
         f"OR {alias}.delivery_hold = 'in_flight')))"
+    )
+
+
+def backing_off_sql(alias: str, now: str) -> str:
+    """The row ``alias`` failed too often and waits for its retry deadline."""
+    return (
+        f"({alias}.reconcile_attempts >= 3 "
+        f"AND {alias}.reconcile_after > {now})"
     )
 
 
@@ -145,7 +159,7 @@ QUERIES = (
             SELECT COALESCE(MIN(CASE WHEN r.priority = 1 THEN r.id END), MIN(r.id)) AS head_id,
                    COUNT(*) AS lane_depth
             FROM outbound_queue r
-            WHERE {ready_sql("r")}
+            WHERE {ready_sql("r")} AND NOT {backing_off_sql("r", NOW_SECONDS)}
             GROUP BY r.telegram_chat_id, COALESCE(r.thread_id, 0)
         )
         SELECT q.telegram_chat_id AS tg_chat, COALESCE(q.thread_id, 0) AS topic, q.id AS head_id,

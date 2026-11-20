@@ -9,15 +9,21 @@ to. Queue mutators consult ``next_state`` before they write, so an event a
 state does not accept is rejected or reported instead of being applied.
 
 The ordering-link rule (which predecessor still defers its dependent) is
-defined here too, once as SQL fragments and once as a Python mirror.
-``queue_report.py`` runs without the package and keeps a copy of the SQL
-builders; a unit test keeps that copy identical to these.
+defined here too, as SQL fragments. ``queue_report.py`` runs without the
+package and keeps a copy of the builders it needs; a unit test keeps those
+copies identical to these.
 """
 from enum import Enum
 
 # Persisted ``delivery_state`` values.
 QUEUED = "queued"
 SENT_PENDING = "sent_pending"
+
+# ``reconcile_attempts`` of a queued row counts its failed attempts in a row
+# (Telegram flood waits excluded). From this many on, the row no longer defers
+# the rows ordered after it: it keeps retrying and is delivered late. A send
+# interrupted by a restart is raised to this count when the queue opens.
+FAILED_ATTEMPTS_LIMIT = 3
 
 
 class HoldKind(Enum):
@@ -62,21 +68,14 @@ _HOLD_STATES = {
     HoldKind.AGGREGATION_FAILED: RowState.AGGREGATION_FAILED,
 }
 
-# Rows the scheduler may pick: queued and unheld (a deferred row only after its deadline).
-WAITING_STATES = frozenset({RowState.WAITING, RowState.DEFERRED})
 # Rows kept for an operator: never sent automatically and never an ordering barrier.
 HELD_STATES = frozenset({
     RowState.UNCERTAIN, RowState.INVALID_PAYLOAD, RowState.HISTORY_FAILED,
     RowState.SUPPLEMENT_FAILED, RowState.AGGREGATION_FAILED, RowState.UNRECOGNIZED_HOLD,
 })
-# A predecessor in one of these states still defers its dependents.
-BARRIER_STATES = frozenset({
-    RowState.WAITING, RowState.DEFERRED, RowState.IN_FLIGHT, RowState.SENT_PENDING,
-})
 
 
 class Event(Enum):
-    ENQUEUE = "enqueue"
     BEGIN_ATTEMPT = "begin_attempt"
     MATERIALIZE = "materialize"
     RELEASE_ATTEMPT = "release_attempt"
@@ -87,12 +86,12 @@ class Event(Enum):
     HOLD_FAILED_SUPPLEMENT = "hold_failed_supplement"
     HOLD_FAILED_AGGREGATION = "hold_failed_aggregation"
     DEFER_ACQUISITION = "defer_acquisition"
+    DEFER_FAILED_SEND = "defer_failed_send"
     RECORD_COMPLETION = "record_completion"
     OPERATOR_CONFIRM = "operator_confirm"
     DEFER_RECONCILIATION = "defer_reconciliation"
     REMOVE = "remove"
     WITHDRAW = "withdraw"
-    REPAIR_HISTORY_SENDER = "repair_history_sender"
 
 
 def _from(states, event: Event, target: RowState) -> dict:
@@ -103,7 +102,6 @@ _ATTEMPTABLE = (RowState.WAITING, RowState.DEFERRED)
 _UNSETTLED = (RowState.WAITING, RowState.DEFERRED, RowState.IN_FLIGHT)
 
 TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
-    (RowState.ABSENT, Event.ENQUEUE): RowState.WAITING,
     **_from(_ATTEMPTABLE, Event.BEGIN_ATTEMPT, RowState.IN_FLIGHT),
     **_from(_ATTEMPTABLE, Event.MATERIALIZE, RowState.IN_FLIGHT),
     (RowState.IN_FLIGHT, Event.RELEASE_ATTEMPT): RowState.WAITING,
@@ -114,6 +112,10 @@ TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
     **_from(_UNSETTLED, Event.HOLD_FAILED_SUPPLEMENT, RowState.SUPPLEMENT_FAILED),
     **_from(_UNSETTLED, Event.HOLD_FAILED_AGGREGATION, RowState.AGGREGATION_FAILED),
     **_from(_UNSETTLED, Event.DEFER_ACQUISITION, RowState.DEFERRED),
+    # A send that failed with a retryable error; its attempt was released first.
+    # Earlier failures only count; the one that makes the row failing stores its
+    # backoff.
+    **_from(_ATTEMPTABLE, Event.DEFER_FAILED_SEND, RowState.DEFERRED),
     **_from(_UNSETTLED, Event.RECORD_COMPLETION, RowState.SENT_PENDING),
     **_from((RowState.IN_FLIGHT, *HELD_STATES), Event.OPERATOR_CONFIRM, RowState.SENT_PENDING),
     (RowState.SENT_PENDING, Event.DEFER_RECONCILIATION): RowState.SENT_PENDING,
@@ -121,9 +123,6 @@ TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
     # Cancelling an empty batch or a pending source, or splitting a batch into
     # rows that replace it, removes only a row no attempt has started on.
     **_from(_ATTEMPTABLE, Event.WITHDRAW, RowState.ABSENT),
-    # Startup clears only `history_failed:RequiredSenderUnavailableError` on
-    # history rows that never started an attempt; see OutboundQueue._migrate_schema.
-    (RowState.HISTORY_FAILED, Event.REPAIR_HISTORY_SENDER): RowState.WAITING,
 }
 
 
@@ -168,9 +167,10 @@ def classify(
 ) -> RowState:
     """Read stored columns into a state. ``delivery_state`` None means no row.
 
-    ``reconcile_after`` is the acquisition retry deadline while a row is queued
-    and the receipt-reconciliation deadline once it is ``sent_pending``; only
-    the former makes a row DEFERRED, and only when ``now`` is given.
+    ``reconcile_after`` is the retry deadline after a failed acquisition or send
+    while a row is queued and the receipt-reconciliation deadline once it is
+    ``sent_pending``; only the former makes a row DEFERRED, and only when
+    ``now`` is given.
     """
     if delivery_state is None:
         return RowState.ABSENT
@@ -186,24 +186,6 @@ def classify(
     return RowState.UNRECOGNIZED_HOLD if parsed is None else _HOLD_STATES[parsed[0]]
 
 
-def is_waiting(state: RowState) -> bool:
-    """Python mirror of ``waiting_sql``."""
-    return state in WAITING_STATES
-
-
-def is_barrier(state: RowState) -> bool:
-    """Python mirror of ``barrier_sql``: this predecessor still defers its dependents."""
-    return state in BARRIER_STATES
-
-
-def is_ready(row_id: int, state: RowState, predecessor_id: int | None,
-             predecessor_state: RowState) -> bool:
-    """Python mirror of ``ready_sql``. Pass ABSENT for a missing predecessor."""
-    if not is_waiting(state):
-        return False
-    return predecessor_id is None or predecessor_id == row_id or not is_barrier(predecessor_state)
-
-
 # SQL builders. They emit SQLite 3.31-compatible SQL. ``alias`` qualifies the
 # columns of the row being tested; an empty alias leaves them unqualified.
 
@@ -213,24 +195,38 @@ def waiting_sql(alias: str = "") -> str:
     return f"{prefix}delivery_state = '{QUEUED}' AND {prefix}delivery_hold IS NULL"
 
 
+def failing_sql(alias: str) -> str:
+    """The row ``alias`` is waiting or in flight after too many failed attempts."""
+    return (
+        f"({alias}.delivery_state = '{QUEUED}' "
+        f"AND {alias}.reconcile_attempts >= {FAILED_ATTEMPTS_LIMIT} "
+        f"AND ({alias}.delivery_hold IS NULL "
+        f"OR {alias}.delivery_hold = '{HoldKind.IN_FLIGHT.value}'))"
+    )
+
+
 def barrier_sql(alias: str) -> str:
-    """The row ``alias`` still defers its dependents: waiting, in flight or awaiting MsgLog."""
+    """The row ``alias`` still defers its dependents: awaiting MsgLog, or waiting or
+    in flight with fewer than ``FAILED_ATTEMPTS_LIMIT`` failed attempts."""
     return (
         f"({alias}.delivery_state = '{SENT_PENDING}' "
         f"OR ({alias}.delivery_state = '{QUEUED}' "
+        f"AND {alias}.reconcile_attempts < {FAILED_ATTEMPTS_LIMIT} "
         f"AND ({alias}.delivery_hold IS NULL "
         f"OR {alias}.delivery_hold = '{HoldKind.IN_FLIGHT.value}')))"
     )
 
 
-def behind_barrier_sql(alias: str, predecessor: str = "predecessor") -> str:
-    """The row ``alias`` links to another existing row that is still a barrier."""
+def backing_off_sql(alias: str, now: str) -> str:
+    """The row ``alias`` failed too often and waits for its retry deadline.
+
+    It is not its destination's head meanwhile, so the destination's later rows
+    are elected; once the deadline passes it is the oldest row again and is
+    retried. ``now`` is an SQL expression for the current Unix time.
+    """
     return (
-        f"{alias}.predecessor_id IS NOT NULL AND EXISTS ("
-        f"SELECT 1 FROM outbound_queue AS {predecessor} "
-        f"WHERE {predecessor}.id = {alias}.predecessor_id "
-        f"AND {predecessor}.id != {alias}.id "
-        f"AND {barrier_sql(predecessor)})"
+        f"({alias}.reconcile_attempts >= {FAILED_ATTEMPTS_LIMIT} "
+        f"AND {alias}.reconcile_after > {now})"
     )
 
 

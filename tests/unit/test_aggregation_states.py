@@ -3,13 +3,23 @@
 import copy
 import datetime
 import logging
+from types import SimpleNamespace
 
 import pytest
+from telegram import Chat, Message, User
 
 from efb_telegram_master.aggregate import make_source_member
-from efb_telegram_master.aggregation_states import ContextState, context_state
+from efb_telegram_master.aggregation_states import (
+    ContextState,
+    context_state,
+    needs_delivered_predecessor,
+)
 from efb_telegram_master.db import MsgLog
-from efb_telegram_master.outbound import IllegalAggregationTransitionError, QueueRequest
+from efb_telegram_master.outbound import (
+    IllegalAggregationTransitionError,
+    QueueRequest,
+    SenderSelectionResult,
+)
 from efb_telegram_master.queued_log import decode_aggregation, encode_aggregation
 from tests.unit import test_live_aggregate_runtime
 from tests.unit.test_live_aggregate import source
@@ -26,6 +36,11 @@ def states(manager):
 def stored(manager, row_id):
     return manager._outbound_queue.connection.execute(
         "SELECT * FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
+
+
+def state_and_hold(manager, row_id):
+    return manager._outbound_queue.connection.execute(
+        "SELECT delivery_state, delivery_hold FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
 
 
 def member_of(uid, text, at):
@@ -136,15 +151,43 @@ def test_illegal_materialisation_stops_delivery_with_the_row_named(runtime):
     assert stored(manager, row_id) == before
 
 
-def test_illegal_receipt_kind_is_reported_once_and_deferred(runtime, caplog):
+def test_confirm_send_refuses_a_batch_that_was_never_sent(runtime):
+    manager = runtime
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    append(manager, "one", 1)
+    batch = queue.aggregation_rows()[0]
+    select_sender = manager.select_sender
+    manager.select_sender = lambda row, now: SenderSelectionResult(terminal_error_class="BotRemoved")
+    scheduler.dispatch_once()
+    manager.select_sender = select_sender
+    append(manager, "two", 2)
+    later = [row.id for row in queue.aggregation_rows() if row.id != batch.id]
+    held = stored(manager, batch.id)
+    assert state_and_hold(manager, batch.id)[1].startswith("aggregation_failed:")
+    manager.me = SimpleNamespace(id=42)
+    reply = Message(77, datetime.datetime.fromtimestamp(3), Chat(-100, "supergroup"),
+                    from_user=User(42, "bot", True), text="something else the bot said")
+    with pytest.raises(ValueError, match="never sent to Telegram as one message"):
+        manager.confirm_queued_delivery(batch.id, reply)
+    assert stored(manager, batch.id) == held
+    assert decode_aggregation(queue.aggregation_context(batch.id))["kind"] == "logical"
+    assert len(later) == 1
+    assert state_and_hold(manager, later[0])[0] == "queued"
+    assert later[0] in [row.id for row in queue.heads(include_payload=False, ready_only=True)]
+
+
+def test_receipt_stored_for_an_unsent_batch_by_an_older_version_is_reported_once_and_deferred(runtime, caplog):
     manager = runtime
     queue = manager._outbound_queue
     append(manager, "one", 1)
     row = queue.aggregation_rows()[0]
-    # A receipt saved for a batch that was never frozen into a container request.
+    # Older versions let a batch that was never sent keep a receipt; only the row itself is written here.
     message = manager.transport.send_message(-100, "body")
-    queue.record_telegram_completion(row.id, manager.encode_queued_completion_receipt(
-        message, manager.select_sender(row, 0).selection))
+    receipt = manager.encode_queued_completion_receipt(message, manager.select_sender(row, 0).selection)
+    queue.connection.execute(
+        "UPDATE outbound_queue SET delivery_state='sent_pending', completion_receipt=?, delivery_hold=NULL "
+        "WHERE id=?", (receipt, row.id))
+    queue.connection.commit()
     scheduler = manager._outbound_scheduler
     with caplog.at_level(logging.WARNING):
         for attempt in (1, 2):
@@ -160,3 +203,21 @@ def test_illegal_receipt_kind_is_reported_once_and_deferred(runtime, caplog):
     assert f"Receipt of queue row {row.id} (aggregation kind 'logical') cannot be reconciled" in warnings[0].getMessage()
     assert "MsgLog reconciliation failed" not in caplog.text
     assert decode_aggregation(stored(manager, row.id)[8])["kind"] == "logical"
+
+
+def _member(source_id):
+    return {"origin_uid": "origin", "source_id": source_id}
+
+
+@pytest.mark.parametrize("context, predecessor, waits", [
+    ({"kind": "member_update", "updates": [_member("one")]}, None, True),
+    ({"kind": "logical", "members": [_member("two")], "inherit": True}, None, True),
+    ({"kind": "logical", "members": [_member("two")], "inherit": True, "incoming_boundary": True}, None, False),
+    ({"kind": "logical", "members": [_member("two")], "inherit": False}, None, False),
+    ({"kind": "boundary", "members": []}, None, False),
+    ({"kind": "source", "member": _member("one")}, {"kind": "logical", "members": [_member("one")]}, True),
+    ({"kind": "source", "member": _member("two")}, {"kind": "logical", "members": [_member("one")]}, False),
+], ids=["container edit", "append into its container", "append after a Telegram message",
+        "new batch", "independent message", "output of its member", "output of another member"])
+def test_only_rows_that_need_a_failing_predecessor_on_telegram_wait_for_it(context, predecessor, waits):
+    assert needs_delivered_predecessor(context, predecessor) is waits
