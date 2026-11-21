@@ -370,7 +370,7 @@ def test_unsupported_source_data_fails_without_loss(sqlite_source, postgres_conf
         elif kind == "column":
             source.execute("ALTER TABLE msglog ADD COLUMN important_extra TEXT")
         elif kind == "nul":
-            source.execute("UPDATE msglog SET text = ?", ("embedded\0NUL",))
+            source.execute("UPDATE msglog SET slave_message_id = ?", ("embedded\0NUL",))
         else:
             source.execute("UPDATE msglog SET time = 'not a timestamp'")
         source.commit()
@@ -378,6 +378,88 @@ def test_unsupported_source_data_fails_without_loss(sqlite_source, postgres_conf
         migrate_db.migrate(sqlite_source, postgres_config)
     assert (sqlite_source / "tgdata.db").exists()
     assert not (sqlite_source / migrate_db.RECEIPT_FILE).exists()
+
+
+NUL_TEXTS = ("a\0b\0\0c\ufffd\0", "name\0", "\0alias")
+
+
+def test_nul_in_content_text_is_replaced_on_import_and_recovered(sqlite_source, postgres_config, caplog):
+    sources = {
+        "msglog": ("text", "master_msg_id = 'z.1'"),
+        "historymigrationentry": ("formatted_text", "id = 74"),
+        "slavechatinfo": ("slave_chat_name", "id = 63"),
+    }
+    with sqlite3.connect(sqlite_source / "tgdata.db") as source:
+        for table, (column, where) in sources.items():
+            source.execute(f"UPDATE {table} SET {column} = ? WHERE {where}", (NUL_TEXTS[0],))
+        source.execute("UPDATE slavechatinfo SET slave_chat_alias = ? WHERE id = 63", (NUL_TEXTS[2],))
+    caplog.set_level("INFO", logger=migrate_db.logger.name)
+    receipt = migrate_db.migrate(sqlite_source, postgres_config)
+    counts = [record.getMessage() for record in caplog.records if "Replaced U+0000" in record.getMessage()]
+    assert sorted(counts) == [
+        "Replaced U+0000 in 1 values of historymigrationentry.formatted_text",
+        "Replaced U+0000 in 1 values of msglog.text",
+        "Replaced U+0000 in 1 values of slavechatinfo.slave_chat_alias",
+        "Replaced U+0000 in 1 values of slavechatinfo.slave_chat_name",
+    ]
+    with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source:
+        assert source.execute("SELECT text FROM msglog WHERE master_msg_id = 'z.1'").fetchone()[0] == NUL_TEXTS[0]
+    target = postgresql_database(postgres_config)
+    with connection_scope(target):
+        stored = [
+            target.execute_sql("SELECT text FROM msglog WHERE master_msg_id = 'z.1'").fetchone()[0],
+            target.execute_sql("SELECT formatted_text FROM historymigrationentry WHERE id = 74").fetchone()[0],
+            target.execute_sql("SELECT slave_chat_name FROM slavechatinfo WHERE id = 63").fetchone()[0],
+            target.execute_sql("SELECT slave_chat_alias FROM slavechatinfo WHERE id = 63").fetchone()[0],
+        ]
+    target.close_all()
+    assert stored == [NUL_TEXTS[0].replace("\0", "\ufffd")] * 3 + [NUL_TEXTS[2].replace("\0", "\ufffd")]
+    caplog.clear()
+    assert migrate_db.migrate(sqlite_source, postgres_config)["import_id"] == receipt["import_id"]
+    assert "Replaced U+0000" not in caplog.text
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_nul_in_content_text_is_replaced_only_on_postgresql(tmp_path, request, manager_factory, backend):
+    from efb_telegram_master.aggregate import make_aggregate, make_source_member
+    from tests.unit.test_live_aggregate import receipt, source
+
+    manager = manager_factory(tmp_path, request.getfixturevalue("postgres_config") if backend == "postgresql" else None)
+    expected = (lambda value: value.replace("\0", "\ufffd")) if backend == "postgresql" else (lambda value: value)
+    text, name, alias = NUL_TEXTS
+    chat = SimpleNamespace(module_id="slave", uid="chat")
+    author = SimpleNamespace(module_id="slave", uid="author")
+    message = SimpleNamespace(
+        uid="nul-source", text=text, chat=chat, author=author, sender_bot_id=None, type=SimpleNamespace(name="Text"), type_telegram=SimpleNamespace(value="Text"),
+        deliver_to=SimpleNamespace(channel_id="blueset.telegram"), file_id=None, file_unique_id=None, mime=None,
+        is_system=False, attributes=None, commands=None, substitutions=None, reactions={"👍": [author]}, target=None,
+    )
+    manager.add_or_update_message_log(message, SimpleNamespace(chat_id=-100123, message_id=1))
+    first = manager.get_msg_log(master_msg_id="-100123.1")
+    assert first.text == expected(text)
+    message.text = text + "\0"
+    for _ in range(2):
+        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=-100123, message_id=1))
+        again = manager.get_msg_log(master_msg_id="-100123.1")
+        assert again.text == expected(text + "\0")
+
+    aggregate = make_aggregate([make_source_member(source("one", text))], 1)
+    assert "\0" in aggregate["confirmed_text"]
+    manager.finalize_aggregate_message(receipt(2), aggregate, "700")
+    assert manager.get_msg_log(master_msg_id="-100.2").text == expected(aggregate["confirmed_text"])
+
+    manager.replace_history_migration_entries("slave chat", -100123, None, [{
+        "slave_chat_id": "slave chat", "target_chat_id": "-100123", "message_thread_id": None,
+        "source_master_msg_id": "-100123.1", "formatted_text": text, "position": 0,
+    }])
+    assert manager.get_history_migration_entries("slave chat", -100123)[0].formatted_text == expected(text)
+
+    chat_object = SimpleNamespace(module_id="slave", channel_emoji="", uid="chat", name=name, alias=alias,
+                                  chat_type_name="PrivateChat", pickle=b"")
+    for _ in range(2):
+        manager.set_slave_chat_info(chat_object)
+        info = manager.get_slave_chat_info("slave", "chat")
+        assert (info.slave_chat_name, info.slave_chat_alias) == (expected(name), expected(alias))
 
 
 def test_historic_nullable_columns_and_missing_optional_tables(sqlite_source, postgres_config):
