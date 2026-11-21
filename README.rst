@@ -181,9 +181,14 @@ Use a private YAML file containing the target ``database`` mapping:
 The importer snapshots both SQLite stores, streams and verifies every supported
 row, and records a recoverable cutover before PostgreSQL startup is permitted.
 The original SQLite files and older backups are retained. The outbound queue
-continues to use ``outbound-queue.sqlite3`` together with ``outbound-media/``;
-keep both in the same data directory. Migration archives also copy referenced
-external attachments into portable queue-owned media files.
+moves into PostgreSQL in the same run, so with PostgreSQL configured both stores
+live there; its retained ``outbound-queue.sqlite3`` is a frozen copy and is never
+used again. Queue media bytes stay in ``outbound-media/``; keep it in the same data
+directory. Migration archives also copy referenced external attachments into
+portable queue-owned media files. An install that already runs on PostgreSQL with a
+SQLite queue does not start after upgrading until its queue is moved with the same
+command plus ``--queue-only``. Never start an older version after the queue move:
+it would send again what the PostgreSQL queue has already sent.
 Read the `migration and rollback guide <docs/database-migration.md>`_ before
 changing production configuration.
 
@@ -195,8 +200,9 @@ startup in a schema transaction; this is separate from the offline cross-backend
 import above. Missing MsgLog lookup/history indexes and history-generation
 indexes are built on first startup; existing indexes are reused. SQLite holds
 a writer reservation for this schema transaction, so a large first build delays
-startup and other writers. The outbound queue separately adds missing metadata
-columns, its ownership table and scheduling/reconciliation indexes. Startup also
+startup and other writers. On SQLite the outbound queue separately adds missing
+metadata columns, its ownership table and scheduling/reconciliation indexes; on
+PostgreSQL the same schema transaction creates the queue tables. Startup also
 reclaims inactive history staging rows and inspects queue media. These costs
 depend on the existing schema and retained data; there is no fixed startup-time
 estimate. Database operation scopes return pooled connections even on errors,

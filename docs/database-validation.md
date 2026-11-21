@@ -34,9 +34,12 @@ Normal sends and history text batches are never pinned to an original bot.
 [`DatabaseManager._check_and_run_migrations` and `_create_lookup_indexes`](../efb_telegram_master/db.py)
 add missing nullable columns and indexes within the startup schema transaction.
 SQLite uses an IMMEDIATE transaction: first-time index construction delays
-startup and competing writers. Existing indexes are reused. The queue separately
-adds its missing metadata, ownership table and indexes in
-[`OutboundQueue._open` and `_migrate_schema`](../efb_telegram_master/outbound.py).
+startup and competing writers. Existing indexes are reused. On SQLite the queue
+separately adds its missing metadata, ownership table and indexes in
+[`OutboundQueue._open` and `_migrate_schema`](../efb_telegram_master/outbound.py). On
+PostgreSQL [`create_postgresql_queue_tables`](../efb_telegram_master/outbound.py) creates
+the three queue tables and their indexes inside the same startup schema transaction, and
+`OutboundQueue._open_postgresql` fails when one is missing instead of creating it.
 Recurring history reclamation and queue-media inspection are separate startup
 costs. No machine-independent startup duration follows from this code.
 
@@ -47,6 +50,16 @@ and supported actual schemas of `topiciconcache` and `useremojicache`. Its
 projections only while omitted columns are NULL and omitted tables are empty.
 Unsupported generated/hidden columns are rejected rather than lost.
 
+The outbound queue moves in a second step, `migrate_db._import_queue`. It reads the live
+queue file read-only, validates every value against its PostgreSQL column type
+(`_queue_value`: type, integer range, NUL in text, 256 MiB per value), copies rows in
+byte-bounded batches (`_copy_queue_table`), compares row counts and SHA-256 digests
+computed by PostgreSQL (`_queue_target_digest`), and commits the rows, the queue import
+record and the version-3 mark on an existing data import record in one transaction. The
+local marker follows the commit. `validate_runtime_queue` refuses PostgreSQL startup while
+a SQLite queue file has no queue import record, or the marker is missing. The media bytes
+stay in `outbound-media/`; the step never renames, deletes or rewrites a source file.
+
 `_backup_queue` copies referenced external attachments into archive-owned
 sidecars and rewrites only archived payloads. `_queue_digest` and recovery verify
 both original and portable backup representations against the committed import
@@ -56,7 +69,10 @@ external hashes can establish a first baseline but cannot detect earlier changes
 [`test_database_safety.py`](../tests/unit/test_database_safety.py) covers transaction
 rollback, forced exits around commit, receipt reconstruction, WAL backups,
 source/target divergence, thread/cache preservation, legacy projections,
-relocated external archives, tampering and missing files. Its
+relocated external archives, tampering and missing files. For the queue it covers the
+move with rows in every state, refused values and sources, a crash between the commit and
+the marker, the startup refusals before the move, the single queue owner and the
+missing-table failure. Its
 `test_import_recovery_cutover_preserves_published_history_and_queue_ownership`
 checks the history state across cutover. Follow
 [the migration guide](database-migration.md) for restore and rollback procedures.
@@ -91,11 +107,14 @@ payload access for version checks, startup inspection and legacy-media recovery.
 Python 3.11+ uses native `blobopen`. Python 3.10 runs the system SQLite reader in
 an isolated helper process, preserving the queue process's writer locks when the
 helper closes its handles. Unavailable incremental access fails closed.
+On PostgreSQL `_PostgresqlBlobReader` offers the same interface with `substring()` in
+1 MiB chunks on the queue's own session; the payload column is `STORAGE EXTERNAL`, so a
+chunk does not decompress the whole value.
 
 `OutboundQueue._stream_legacy_pickle` streams recognized inline `BytesIO` media
 to sidecars while bounding the retained non-media pickle and accounting for log/
 receipt metadata. `recover_legacy_media_payload` holds a reserved writer
-transaction until the compact replacement commits. Filenames, MIME metadata and
+transaction (on PostgreSQL a row lock) until the compact replacement commits. Filenames, MIME metadata and
 aliased media references survive conversion. Oversized opaque data is retained;
 this is not a blanket conversion of arbitrary bytes into attachments.
 
@@ -107,7 +126,11 @@ unknown version, or an oversized or corrupt v2 payload, disables orphan deletion
 A lifetime `.outbound-queue.lock` excludes another queue owner from the same data
 directory. Preparation and publication also hold the instance lock so shutdown
 cannot release ownership while an unpublished sidecar is still being created.
-Constructor failure and close release ownership; the lock file stays in place.
+Constructor failure and close release ownership; the lock file stays in place. On
+PostgreSQL a session-level advisory lock, keyed by the schema, also excludes another owner
+from another directory or host, and `hold_send` and the queue move take the same key. The
+queue does not reconnect: when its session ends, queue calls fail and the outbound worker
+stops until ETM restarts, with every row retained.
 
 [`test_restart_memory.py`](../tests/unit/test_restart_memory.py) covers incremental
 recovery, startup inspection, oversized opaque-data retention and interrupted
@@ -126,7 +149,9 @@ for arbitrary inline queue BLOBs during offline migration.
 ## Running verification
 
 The [test workflow](../.github/workflows/tests.yml) defines a dedicated PostgreSQL
-service job, a Peewee matrix and SQLite compatibility checks. SQLite 3.31.1 is a
+service job, a Peewee matrix and SQLite compatibility checks. The queue tests build their
+queue through the `make_queue` fixture in `tests/unit/conftest.py`, so the same test runs on
+SQLite and, when `TEST_POSTGRES_HOST` is set, on PostgreSQL. SQLite 3.31.1 is a
 compatibility target, not a production-version recommendation. SQLite documents
 a rare WAL-reset race fixed in 3.51.3 and later, with official backports including
 3.44.6 and 3.50.7: see [SQLite's WAL-reset advisory](https://sqlite.org/wal.html).
@@ -152,7 +177,13 @@ python -m pytest --mode=unit \
   tests/unit/test_history_sender.py \
   tests/unit/test_delivery_uncertainty.py \
   tests/unit/test_outbound.py \
-  tests/unit/test_restart_memory.py
+  tests/unit/test_restart_memory.py \
+  tests/unit/test_outbound_scheduler_liveness.py \
+  tests/unit/test_orphan_media_scan.py \
+  tests/unit/test_aggregation_row_scan.py \
+  tests/unit/test_live_aggregate_runtime.py \
+  tests/unit/test_live_aggregate_source.py \
+  tests/unit/test_queue_report.py
 ```
 
 Record the actual revision, command, environment and results when running these
