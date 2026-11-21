@@ -224,12 +224,11 @@ def test_ffmpeg_stream_command_waits_for_exit_before_reading_the_exit_code(monke
             return self._returncode
 
         def wait(self, timeout=None):
-            self._returncode = 1
+            self._returncode = 0
             return self._returncode
 
     monkeypatch.setattr(utils.subprocess, "Popen", FakeProcess)
-    with raises(utils.ffmpeg.Error):
-        utils._run_ffmpeg_stream_command(["ffmpeg"], BytesIO(b"input"))
+    assert utils._run_ffmpeg_stream_command(["ffmpeg"], BytesIO(b"input")) == b"output"
 
 
 @pytest.mark.parametrize("flag_name", ["topic_channel_emoji", "topic_chat_type_emoji"])
