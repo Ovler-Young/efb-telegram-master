@@ -61,6 +61,23 @@ if TYPE_CHECKING:
 database = DatabaseProxy()
 
 
+def replace_nul(text: str) -> str:
+    """PostgreSQL text cannot hold U+0000; store U+FFFD in its place, one for one."""
+    return text.replace("\x00", "\ufffd")
+
+
+class ContentTextField(TextField):
+    """Message and chat text. On PostgreSQL, U+0000 is stored as U+FFFD; SQLite keeps it."""
+
+    def db_value(self, value):
+        value = super().db_value(value)
+        if isinstance(value, str) and "\x00" in value:
+            db = self.model._meta.database
+            if isinstance(getattr(db, "obj", db), PostgresqlDatabase):
+                return replace_nul(value)
+        return value
+
+
 class _SenderDefault(Enum):
     INHERIT = 0
 
@@ -147,7 +164,7 @@ class MsgLog(BaseModel):
     """
     slave_message_id = TextField()
     """Message from slave channel."""
-    text = TextField()
+    text = ContentTextField()
     """Text in the message."""
     slave_origin_uid = TextField()
     """Channel + chat ID of chat the message is sent to."""
@@ -310,7 +327,7 @@ class HistoryMigrationEntry(BaseModel):
     target_chat_id = TextField()
     message_thread_id = TextField(null=True)
     source_master_msg_id = TextField()
-    formatted_text = TextField(null=True)
+    formatted_text = ContentTextField(null=True)
     media_type = TextField(null=True)
     source_time = DateTimeField(null=True)
     received_time = DateTimeField(null=True)
@@ -363,8 +380,8 @@ class SlaveChatInfo(BaseModel):
     slave_channel_emoji = CharField()
     slave_chat_uid = TextField()
     slave_chat_group_id = TextField(null=True)
-    slave_chat_name = TextField()
-    slave_chat_alias = TextField(null=True)
+    slave_chat_name = ContentTextField()
+    slave_chat_alias = ContentTextField(null=True)
     slave_chat_type = CharField()
     text_aggregation_enabled = BooleanField(null=True)
     pickle = BlobField(null=True)
