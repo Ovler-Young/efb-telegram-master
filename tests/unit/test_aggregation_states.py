@@ -47,7 +47,7 @@ def member_of(uid, text, at):
     return make_source_member(source(uid, text), received_time=datetime.datetime.fromtimestamp(at))
 
 
-def test_rows_of_every_kind_recover_and_reconcile(runtime):
+def test_rows_of_every_kind_recover_and_reconcile(runtime, make_queue):
     manager = runtime
     queue = manager._outbound_queue
     scheduler = manager._outbound_scheduler
@@ -88,7 +88,7 @@ def test_rows_of_every_kind_recover_and_reconcile(runtime):
                              (encode_aggregation(older_update), update.id))
     queue.connection.commit()
 
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     assert manager._outbound_scheduler.reconcile_sent_pending() == {sent_id}
     for _ in range(6):
         if not manager._outbound_queue.aggregation_rows():

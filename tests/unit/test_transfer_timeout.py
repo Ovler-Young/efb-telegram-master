@@ -6,7 +6,7 @@ import pytest
 from telegram import InputFile, InputMediaDocument
 
 from efb_telegram_master.bot_manager import TelegramBotManager
-from efb_telegram_master.outbound import OutboundQueue, QueueRequest, SenderSelection
+from efb_telegram_master.outbound import QueueRequest, SenderSelection
 from efb_telegram_master.transfer_timeout import media_size, parse_transfer_min_mbps, transfer_timeout
 
 
@@ -37,11 +37,11 @@ def test_album_size_includes_streams_and_thumbnail_without_consuming_them(tmp_pa
     assert stream.tell() == 3
 
 
-def test_queued_upload_and_retry_budget_use_the_same_media_size(tmp_path):
+def test_queued_upload_and_retry_budget_use_the_same_media_size(tmp_path, make_queue):
     manager = TelegramBotManager.__new__(TelegramBotManager)
     manager._transfer_min_mbps = 2.5
     manager._request_kwargs = {'read_timeout': 15, 'media_write_timeout': 20}
-    queue = OutboundQueue(tmp_path, transfer_min_mbps=2.5)
+    queue = make_queue(tmp_path, transfer_min_mbps=2.5)
     manager._outbound_queue = queue
     sender = SimpleNamespace(send_document=Mock(return_value='sent'))
     selection = SenderSelection(sender=sender, sender_bot_id=None)

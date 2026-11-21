@@ -21,7 +21,6 @@ from efb_telegram_master.custom_emoji import (
     fallback_emoji,
 )
 from efb_telegram_master.outbound import (
-    OutboundQueue,
     QueuedDeliveryResult,
     QueueRequest,
     SenderSelection,
@@ -115,7 +114,7 @@ def make_processor(store):
     return processor, creator
 
 
-def make_manager(tmp_path, store):
+def make_manager(tmp_path, store, make_queue):
     manager = object.__new__(TelegramBotManager)
     manager._bot = FakeBot()
     manager._cleanup_tls = SimpleNamespace(pending_cleanup=[])
@@ -123,7 +122,7 @@ def make_manager(tmp_path, store):
     manager.live_aggregation = idle_live_aggregation()
     manager.channel = SimpleNamespace(custom_emoji=store)
     manager._custom_emoji_auxiliary_ids = frozenset({CAPABLE_AUXILIARY})
-    manager._outbound_queue = OutboundQueue(tmp_path)
+    manager._outbound_queue = make_queue(tmp_path)
     manager._outbound_scheduler = SimpleNamespace(
         _lock=threading.RLock(), stopping=False, failure=None, wake_event=threading.Event())
     manager._queued_db_log_context_lock = threading.Lock()
@@ -157,10 +156,10 @@ def sent_text(sender):
 
 
 def test_cached_author_tag_reaches_a_capable_sender_and_the_fallback_an_incapable_one(
-        profile, tmp_path, author, author_uid):  # noqa: F811
+        profile, tmp_path, author, author_uid, make_queue):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
     message = Message(chat=author.chat, author=author)
     fallback = fallback_emoji(author_uid)
 
@@ -183,10 +182,10 @@ def test_cached_author_tag_reaches_a_capable_sender_and_the_fallback_an_incapabl
 
 
 def test_header_in_a_group_chat_header_keeps_the_emoji_after_the_chat_name_icons(
-        profile, tmp_path, author, author_uid):  # noqa: F811
+        profile, tmp_path, author, author_uid, make_queue):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
 
     header = processor.generate_message_template(Message(chat=author.chat, author=author), False)
     _, args, _ = enqueue(manager, "hi", header)
@@ -200,10 +199,10 @@ def test_header_in_a_group_chat_header_keeps_the_emoji_after_the_chat_name_icons
 
 @pytest.mark.parametrize("operation", ["send_sticker", "send_location"])
 def test_header_in_an_inline_keyboard_is_queued_as_plain_text(
-        profile, tmp_path, author, author_uid, operation):  # noqa: F811
+        profile, tmp_path, author, author_uid, operation, make_queue):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
     message = Message(chat=author.chat, author=author, text="")
 
     header = processor.generate_message_template(message, False)
@@ -222,10 +221,10 @@ def test_header_in_an_inline_keyboard_is_queued_as_plain_text(
     assert type(button.text) is str and button.text == str(header)
 
 
-def test_markdown_send_gets_the_plain_header(profile, tmp_path, author, author_uid):  # noqa: F811
+def test_markdown_send_gets_the_plain_header(profile, tmp_path, author, author_uid, make_queue):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
 
     header = processor.generate_message_template(Message(chat=author.chat, author=author), True)
     _, args, _ = enqueue(manager, "hi", header, parse_mode="Markdown")
@@ -233,10 +232,10 @@ def test_markdown_send_gets_the_plain_header(profile, tmp_path, author, author_u
     assert args[1] == f"{fallback_emoji(author_uid)} {author.long_name}:\nhi"
 
 
-def test_edit_by_an_incapable_authoring_bot_drops_the_tag(profile, tmp_path, author, author_uid):  # noqa: F811
+def test_edit_by_an_incapable_authoring_bot_drops_the_tag(profile, tmp_path, author, author_uid, make_queue):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
     header = processor.generate_message_template(Message(chat=author.chat, author=author), True)
     manager.edit_message_text(
         "edited", chat_id=123, message_id=9, prefix=header, parse_mode="HTML", _sender_bot_id=INCAPABLE_AUXILIARY)
@@ -252,10 +251,10 @@ def test_edit_by_an_incapable_authoring_bot_drops_the_tag(profile, tmp_path, aut
     assert "<tg-emoji" not in edited and edited.startswith(fallback_emoji(author_uid))
 
 
-def test_parse_error_retry_sends_the_fallback_not_the_tag(profile, tmp_path, author, author_uid):  # noqa: F811
+def test_parse_error_retry_sends_the_fallback_not_the_tag(profile, tmp_path, author, author_uid, make_queue):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
     header = processor.generate_message_template(Message(chat=author.chat, author=author), True)
     row, args, kwargs = enqueue(manager, "hi", header)
 
@@ -270,9 +269,9 @@ def test_parse_error_retry_sends_the_fallback_not_the_tag(profile, tmp_path, aut
 
 @pytest.mark.parametrize("operation", ["send_message", "send_photo"])
 @pytest.mark.parametrize("name_length", [3, 80, 100])
-def test_oversized_content_never_carries_or_splits_the_tag(tmp_path, profile, name_length, operation):  # noqa: F811
+def test_oversized_content_never_carries_or_splits_the_tag(tmp_path, profile, name_length, operation, make_queue):  # noqa: F811
     store = make_store(profile)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
     emoji = UserEmoji("5001", "🙂")
     name = "n" * name_length
     header = AuthorEmojiHeader(f"🙂 {name}:", emoji, 0)
@@ -289,10 +288,10 @@ def test_oversized_content_never_carries_or_splits_the_tag(tmp_path, profile, na
     assert "tg-emoji" not in attachment and f"🙂 {name}:" in attachment
 
 
-def test_user_text_with_a_literal_tag_is_delivered_unchanged(profile, tmp_path, author, author_uid):  # noqa: F811
+def test_user_text_with_a_literal_tag_is_delivered_unchanged(profile, tmp_path, author, author_uid, make_queue):  # noqa: F811
     store = make_store(profile, [saved_row(author_uid, "5001")])
     processor, _ = make_processor(store)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
     literal = '<tg-emoji emoji-id="42">🙂</tg-emoji>'
     escaped = html.escape(literal)
     with_header = processor.generate_message_template(Message(chat=author.chat, author=author), True)
@@ -310,9 +309,9 @@ def test_user_text_with_a_literal_tag_is_delivered_unchanged(profile, tmp_path, 
 
 @pytest.mark.parametrize("enabled", [True, False])
 def test_header_text_that_looks_like_a_tag_is_kept_when_no_parse_mode_is_set(
-        profile, tmp_path, author_uid, enabled):  # noqa: F811
+        profile, tmp_path, author_uid, enabled, make_queue):  # noqa: F811
     store = make_store(profile, enabled=enabled)
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
     literal = '<tg-emoji emoji-id="1">😀</tg-emoji> Alice:'
     row, args, kwargs = enqueue(manager, "hello", literal, parse_mode=None)
     assert args[1] == f"{literal}\nhello"
@@ -383,7 +382,7 @@ def test_disabled_feature_leaves_headers_as_they_were(profile, author, author_ui
 
 
 def test_disabled_feature_still_uses_configured_ids_and_creates_nothing(
-        profile, tmp_path, author, author_uid):  # noqa: F811
+        profile, tmp_path, author, author_uid, make_queue):  # noqa: F811
     other = next(member for member in author.chat.members if member.uid not in ("__self__", author.uid))
     store = make_store(profile, [saved_row(author_uid, "5001")], enabled=False,
                        custom_emoji_ids={author_uid: "9001"})
@@ -397,7 +396,7 @@ def test_disabled_feature_still_uses_configured_ids_and_creates_nothing(
     processor.channel.custom_emoji_creator.request.assert_not_called()
     processor.channel.custom_emoji_creator.refresh.assert_not_called()
 
-    manager = make_manager(tmp_path, store)
+    manager = make_manager(tmp_path, store, make_queue=make_queue)
     row, args, kwargs = enqueue(manager, "hi", configured)
     sender = FakeSender()
     manager.execute_queued_call(row, args, kwargs, SenderSelection(sender, None))

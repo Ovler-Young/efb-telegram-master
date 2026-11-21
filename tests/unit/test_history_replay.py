@@ -17,7 +17,7 @@ from efb_telegram_master.aggregate import make_aggregate, make_source_member
 from efb_telegram_master.chat_binding import ChatBindingManager
 from efb_telegram_master.db import DatabaseManager, HistoryMigrationEntry, MsgLog, MsgLogMember, database
 from efb_telegram_master.db_runtime import connection_scope
-from efb_telegram_master.outbound import HISTORY_REPLAY_KEY, OutboundQueue, OutboundQueueScheduler
+from efb_telegram_master.outbound import HISTORY_REPLAY_KEY, OutboundQueueScheduler
 from tests.unit.test_outbound_queue_runtime_evidence import ControlledExecutor, manager_adapter
 from tests.unit.test_live_aggregate import source, receipt, SourceCache
 from tests.unit.test_database_safety import (
@@ -151,7 +151,7 @@ def test_failed_batch_enqueue_preserves_all_source_entries(history):
 
 
 @pytest.mark.parametrize('history', ['sqlite', 'postgresql'], indirect=True)
-def test_live_members_expand_saved_content_and_interleave_with_legacy_media(history):
+def test_live_members_expand_saved_content_and_interleave_with_legacy_media(history, make_queue):
     start = datetime(2026, 1, 1)
     messages = [source('one', 'same_<&', 'Alice'), source('two', 'same_<&', 'Bob'),
                 source('removed', 'saved before withdrawal', 'Carol'),
@@ -192,7 +192,7 @@ def test_live_members_expand_saved_content_and_interleave_with_legacy_media(hist
     assert staged[5].formatted_text.endswith('new moved body\n\n')
     assert all('live destination prefix' not in (entry.formatted_text or '') for entry in staged)
     sender = Sender()
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     manager.channel = SimpleNamespace(db=history.db)
 
     def enqueue_and_complete(**kwargs):
@@ -309,14 +309,14 @@ class Sender:
         return SimpleNamespace(message_id=502)
 
 
-def prepare_runtime(history, sender):
+def prepare_runtime(history, sender, make_queue):
     manager = manager_adapter()
     manager._bot = sender
     media = history.path / 'saved-video.mp4'
     media.write_bytes(b'saved media')
     sender.file_path = str(media)
     manager.logger = Mock()
-    manager._outbound_queue = OutboundQueue(history.path)
+    manager._outbound_queue = make_queue(history.path)
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(manager._outbound_queue, manager, executor, worker_count=2)
     manager._outbound_scheduler = scheduler
@@ -335,13 +335,13 @@ def finish_attempt(executor, scheduler):
 
 
 @pytest.mark.parametrize('auxiliary', [False, True])
-def test_video_copy_missing_fetches_with_owner_but_sends_normally(history, auxiliary):
+def test_video_copy_missing_fetches_with_owner_but_sends_normally(history, auxiliary, make_queue):
     target = populate(history, [None])
     if auxiliary:
         with connection_scope(history.db._managed_database):
             MsgLog.update(sender_bot_id='aux-7').execute()
     sender = Sender(copy_error=BadRequest('Message to copy not found'))
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     owner = Sender() if auxiliary else sender
     owner.file_path = sender.file_path
     if auxiliary:
@@ -386,12 +386,12 @@ def test_edited_video_replay_copies_the_latest_alternate_message(history):
     assert '_required_sender_bot_id' not in kwargs
 
 
-def test_unavailable_original_sender_never_reuses_its_file_id_with_main_bot(history):
+def test_unavailable_original_sender_never_reuses_its_file_id_with_main_bot(history, make_queue):
     target = populate(history, [None])
     with connection_scope(history.db._managed_database):
         MsgLog.update(sender_bot_id='removed-bot').execute()
     sender = Sender(copy_error=BadRequest('Message to copy not found'))
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     op, kwargs = history.binding._prepare_history_migration_call(target, -1002, 42)
     try:
         waiter = manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,
@@ -406,10 +406,10 @@ def test_unavailable_original_sender_never_reuses_its_file_id_with_main_bot(hist
         manager._outbound_queue.close()
 
 
-def test_video_copy_success_never_invokes_file_id_fallback(history):
+def test_video_copy_success_never_invokes_file_id_fallback(history, make_queue):
     target = populate(history, [None])
     sender = Sender()
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     op, kwargs = history.binding._prepare_history_migration_call(target, -1002, 42)
     try:
         waiter = manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,
@@ -423,13 +423,13 @@ def test_video_copy_success_never_invokes_file_id_fallback(history):
 
 
 @pytest.mark.parametrize('during_fallback', [False, True])
-def test_video_response_loss_stays_uncertain_and_is_never_sent_again(history, during_fallback):
+def test_video_response_loss_stays_uncertain_and_is_never_sent_again(history, during_fallback, make_queue):
     target = populate(history, [None])
     timeout = TimedOut()
     timeout.__cause__ = httpx.ReadTimeout('response lost')
     sender = Sender(copy_error=BadRequest('Message to copy not found') if during_fallback else timeout,
                     media_error=timeout if during_fallback else None)
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     op, kwargs = history.binding._prepare_history_migration_call(target, -1002, 42)
     try:
         manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,
@@ -445,10 +445,10 @@ def test_video_response_loss_stays_uncertain_and_is_never_sent_again(history, du
         manager._outbound_queue.close()
 
 
-def test_failed_video_replay_is_retained_and_later_history_can_continue(history):
+def test_failed_video_replay_is_retained_and_later_history_can_continue(history, make_queue):
     target = populate(history, [None])
     sender = Sender(copy_error=BadRequest('Message to copy not found'), media_error=BadRequest('Wrong file identifier'))
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     op, kwargs = history.binding._prepare_history_migration_call(target, -1002, 42)
     try:
         manager.enqueue_history_operation(source_key='slave chat', target_chat_id=-1002,

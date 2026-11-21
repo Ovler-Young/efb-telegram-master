@@ -36,6 +36,26 @@ class ImmediateExecutor:
         return result
 
 
+
+def fail_receipt_updates(queue, queue_backend):
+    """Make every later write of a completion receipt fail, as an unavailable database would."""
+    with queue.connection:
+        if queue_backend is None:
+            queue.connection.execute(
+                "CREATE TRIGGER fail_completion BEFORE UPDATE OF completion_receipt ON outbound_queue "
+                "BEGIN SELECT RAISE(FAIL, 'database unavailable'); END")
+        else:
+            queue.connection.execute(
+                "ALTER TABLE outbound_queue ADD CONSTRAINT fail_completion CHECK (completion_receipt IS NULL) NOT VALID")
+
+
+def allow_receipt_updates(queue, queue_backend):
+    with queue.connection:
+        if queue_backend is None:
+            queue.connection.execute("DROP TRIGGER fail_completion")
+        else:
+            queue.connection.execute("ALTER TABLE outbound_queue DROP CONSTRAINT fail_completion")
+
 def document(chat_id, document, **kwargs):
     return None
 
@@ -53,10 +73,10 @@ def accepted_then_lost_response(accepted, cause_type=httpx.ReadTimeout):
 
 
 @pytest.mark.parametrize("cause_type", [httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.RemoteProtocolError])
-def test_accepted_document_with_lost_response_is_not_retried_or_deleted(tmp_path, monkeypatch, cause_type):
+def test_accepted_document_with_lost_response_is_not_retried_or_deleted(tmp_path, monkeypatch, cause_type, make_queue):
     clock = [100.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, waiter = queue.enqueue_many(
         [QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document,
     )
@@ -92,8 +112,8 @@ def setup_manager(queue):
     return manager
 
 
-def test_unknown_result_survives_restart_and_other_messages_continue(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_unknown_result_survives_restart_and_other_messages_continue(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     original, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     accepted = []
     manager = setup_manager(queue)
@@ -103,7 +123,7 @@ def test_unknown_result_survives_restart_and_other_messages_continue(tmp_path):
     assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue WHERE id=?", (original,)).fetchone()[0].startswith("uncertain:")
     queue.close()
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     new_calls = []
     manager._bot = SimpleNamespace(send_document=accepted_then_lost_response(accepted),
@@ -118,8 +138,8 @@ def test_unknown_result_survives_restart_and_other_messages_continue(tmp_path):
     queue.close()
 
 
-def test_crash_after_remote_acceptance_before_harvest_does_not_resend(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_crash_after_remote_acceptance_before_harvest_does_not_resend(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     sender = Mock(return_value=delivered_message())
     manager = setup_manager(queue)
@@ -128,7 +148,7 @@ def test_crash_after_remote_acceptance_before_harvest_does_not_resend(tmp_path):
     # Simulated crash boundary: ACK returned, but harvest never persisted the receipt.
     assert sender.call_count == 1
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager._bot = SimpleNamespace(send_document=sender)
     for _ in range(3):
@@ -142,8 +162,8 @@ def test_crash_after_remote_acceptance_before_harvest_does_not_resend(tmp_path):
 
 
 @pytest.mark.parametrize("cause_type", [httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError])
-def test_proven_presend_failure_still_retries(tmp_path, cause_type):
-    queue = OutboundQueue(tmp_path)
+def test_proven_presend_failure_still_retries(tmp_path, cause_type, make_queue):
+    queue = make_queue(tmp_path)
     _, waiter = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     failure = TimedOut()
     failure.__cause__ = cause_type("request not sent")
@@ -159,8 +179,8 @@ def test_proven_presend_failure_still_retries(tmp_path, cause_type):
     queue.close()
 
 
-def test_known_rate_limit_remains_retryable(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_known_rate_limit_remains_retryable(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     _, waiter = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     sender = Mock(side_effect=[RetryAfter(0), delivered_message()])
     manager = setup_manager(queue)
@@ -198,9 +218,9 @@ def _skip_time(monkeypatch):
     return skip
 
 
-def test_a_send_that_keeps_failing_lets_later_messages_go_and_arrives_late(tmp_path, monkeypatch, caplog):
+def test_a_send_that_keeps_failing_lets_later_messages_go_and_arrives_late(tmp_path, monkeypatch, caplog, make_queue):
     skip = _skip_time(monkeypatch)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     failing, waiter = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     _later_message(queue, failing)
     sender = Mock(side_effect=[_not_sent(), _not_sent(), _not_sent(), delivered_message()])
@@ -237,9 +257,9 @@ def test_a_send_that_keeps_failing_lets_later_messages_go_and_arrives_late(tmp_p
         queue.close()
 
 
-def test_flood_waits_do_not_count_as_failed_attempts(tmp_path, monkeypatch):
+def test_flood_waits_do_not_count_as_failed_attempts(tmp_path, monkeypatch, make_queue):
     skip = _skip_time(monkeypatch)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     failing, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     _later_message(queue, failing)
     sender = Mock(side_effect=[_not_sent(), _not_sent(), RetryAfter(0), RetryAfter(0), RetryAfter(0),
@@ -267,8 +287,8 @@ def test_flood_waits_do_not_count_as_failed_attempts(tmp_path, monkeypatch):
         queue.close()
 
 
-def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confirmable(tmp_path, caplog):
-    queue = OutboundQueue(tmp_path)
+def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confirmable(tmp_path, caplog, make_queue):
+    queue = make_queue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     _later_message(queue, row_id)
     sender = Mock(return_value=delivered_message())
@@ -278,7 +298,7 @@ def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confir
     # Restart before the response was harvested: the outcome of the send is unknown.
     queue.close()
     with caplog.at_level(logging.WARNING, logger="efb_telegram_master.outbound"):
-        queue = OutboundQueue(tmp_path)
+        queue = make_queue(tmp_path)
     assert f"Queue row {row_id} for chat 42 was interrupted by a restart" in caplog.text
     manager = setup_manager(queue)
     later_sender = Mock(return_value=delivered_message())
@@ -296,9 +316,9 @@ def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confir
         queue.close()
 
 
-def test_operator_confirmation_writes_real_msglog_without_resending(tmp_path, manager_factory):
+def test_operator_confirmation_writes_real_msglog_without_resending(tmp_path, manager_factory, make_queue):
     db = manager_factory(tmp_path)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager.channel = SimpleNamespace(db=db)
     context = manager._encode_queued_log_context(QueuedDbLogContext(message_with_group(), None))
@@ -326,9 +346,9 @@ def test_operator_confirmation_writes_real_msglog_without_resending(tmp_path, ma
     queue.close()
 
 
-def test_msglog_failure_keeps_receipt_and_never_reuploads(tmp_path, manager_factory):
+def test_msglog_failure_keeps_receipt_and_never_reuploads(tmp_path, manager_factory, make_queue):
     db = manager_factory(tmp_path)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager.channel = SimpleNamespace(db=db)
     context = manager._encode_queued_log_context(QueuedDbLogContext(message_with_group(), None))
@@ -354,7 +374,7 @@ def test_msglog_failure_keeps_receipt_and_never_reuploads(tmp_path, manager_fact
 
 
 @pytest.mark.parametrize("supplemental", [False, True])
-def test_real_ptb_httpx_lost_response_does_not_generate_second_send(tmp_path, monkeypatch, supplemental):
+def test_real_ptb_httpx_lost_response_does_not_generate_second_send(tmp_path, monkeypatch, supplemental, make_queue):
     """Actual PTB + HTTPX exception conversion; no external Telegram side effects."""
     accepted = []
     original_read = _NamedMediaFile.read
@@ -379,7 +399,7 @@ def test_real_ptb_httpx_lost_response_does_not_generate_second_send(tmp_path, mo
         return httpx.Response(200, stream=LostResponseBody())
     request = HTTPXRequest(httpx_kwargs={"transport": httpx.MockTransport(transport)})
     bot = Bot("900:test-token", request=request)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     loop = asyncio.new_event_loop()
     runtime = SimpleNamespace(call=loop.run_until_complete)
@@ -413,6 +433,7 @@ def test_real_ptb_httpx_lost_response_does_not_generate_second_send(tmp_path, mo
         queue.close()
 
 
+# SQLite only: the offline hold tool edits the SQLite file.
 def test_offline_hold_preserves_payload_and_no_default_mutation(tmp_path):
     queue = OutboundQueue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {}, b"log")], lambda _: document)
@@ -426,7 +447,7 @@ def test_offline_hold_preserves_payload_and_no_default_mutation(tmp_path):
     queue.close()
 
 
-def test_381_mb_sidecar_reaches_http_transport_without_whole_file_read(tmp_path, monkeypatch):
+def test_381_mb_sidecar_reaches_http_transport_without_whole_file_read(tmp_path, monkeypatch, make_queue):
     size = 381_320_453
     source = tmp_path / "archive.zip"
     with source.open("wb") as stream:
@@ -448,7 +469,7 @@ def test_381_mb_sidecar_reaches_http_transport_without_whole_file_read(tmp_path,
             raise httpx.ReadTimeout("accepted upload; dropped response", request=request)
     request = HTTPXRequest(httpx_kwargs={"transport": StreamingTransport()})
     bot = Bot("900:test-token", request=request)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     loop = asyncio.new_event_loop()
     runtime = SimpleNamespace(call=loop.run_until_complete)
@@ -470,8 +491,8 @@ def test_381_mb_sidecar_reaches_http_transport_without_whole_file_read(tmp_path,
         queue.close()
 
 
-def test_invalid_json_response_is_not_treated_as_definite_rejection(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_invalid_json_response_is_not_treated_as_definite_rejection(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     accepted = []
     manager = setup_manager(queue)
@@ -492,9 +513,9 @@ def test_invalid_json_response_is_not_treated_as_definite_rejection(tmp_path):
 
 
 @pytest.mark.parametrize("failure", [BadRequest("rejected attachment"), TimedOut("response lost")])
-def test_supplement_failure_keeps_content_and_reconciles_primary(tmp_path, manager_factory, failure):
+def test_supplement_failure_keeps_content_and_reconciles_primary(tmp_path, manager_factory, failure, make_queue):
     db = manager_factory(tmp_path)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager.channel = SimpleNamespace(db=db)
     context = manager._encode_queued_log_context(QueuedDbLogContext(message_with_group(), None))
@@ -517,7 +538,7 @@ def test_supplement_failure_keeps_content_and_reconciles_primary(tmp_path, manag
         assert manager._decode_queued_completion_receipt(receipt)[0].message_id == 100
     # Restart after primary receipt and supplemental work have committed together.
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager.channel = SimpleNamespace(db=db)
     manager._bot = SimpleNamespace(send_document=send)
@@ -536,8 +557,8 @@ def test_supplement_failure_keeps_content_and_reconciles_primary(tmp_path, manag
     queue.close()
 
 
-def test_primary_receipt_and_supplement_retry_atomic_commit_without_resending(tmp_path, monkeypatch):
-    queue = OutboundQueue(tmp_path)
+def test_primary_receipt_and_supplement_retry_atomic_commit_without_resending(tmp_path, monkeypatch, make_queue, queue_backend):
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     row_id, waiter = queue.enqueue_many([QueueRequest(
         "send_document", (42, b"archive bytes"), {"caption": "x" * 2048}
@@ -553,9 +574,7 @@ def test_primary_receipt_and_supplement_retry_atomic_commit_without_resending(tm
     clock = [100.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
     # Fail after the supplemental INSERT, before the primary receipt UPDATE.
-    with queue.connection:
-        queue.connection.execute("CREATE TRIGGER fail_completion BEFORE UPDATE OF completion_receipt ON outbound_queue "
-                                 "BEGIN SELECT RAISE(FAIL, 'database unavailable'); END")
+    fail_receipt_updates(queue, queue_backend)
     manager._outbound_scheduler.dispatch_once()
     manager._outbound_scheduler.harvest_completed()
     assert not waiter.done() and not supplemental_calls
@@ -563,13 +582,12 @@ def test_primary_receipt_and_supplement_retry_atomic_commit_without_resending(tm
     assert manager._outbound_scheduler.next_deadline == 101.0
     assert queue.connection.execute("SELECT id, delivery_hold FROM outbound_queue").fetchall() == [(row_id, "in_flight")]
     assert len(list(queue.media_dir.iterdir())) == 1
-    with queue.connection:
-        queue.connection.execute("DROP TRIGGER fail_completion")
+    allow_receipt_updates(queue, queue_backend)
     clock[0] += 2
     manager._outbound_scheduler.harvest_completed()
     assert waiter.result(timeout=1).message_id == 100
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager._bot = SimpleNamespace(send_document=send)
     manager._outbound_scheduler.dispatch_once()
@@ -580,8 +598,8 @@ def test_primary_receipt_and_supplement_retry_atomic_commit_without_resending(tm
     queue.close()
 
 
-def test_attempt_marker_failure_prevents_network_send(tmp_path, monkeypatch):
-    queue = OutboundQueue(tmp_path)
+def test_attempt_marker_failure_prevents_network_send(tmp_path, monkeypatch, make_queue):
+    queue = make_queue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     manager = setup_manager(queue)
     sender = Mock(return_value=delivered_message())
@@ -606,13 +624,13 @@ def test_confirmation_command_rejects_non_admin():
 
 
 @pytest.mark.parametrize("stage", ["get_file", "download", "missing_path"])
-def test_acquisition_failure_retries_after_restart_without_delivery_uncertainty(tmp_path, monkeypatch, stage):
+def test_acquisition_failure_retries_after_restart_without_delivery_uncertainty(tmp_path, monkeypatch, stage, make_queue):
     from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
 
     clock = [1000.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: clock[0])
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     source = tmp_path / "saved-media"
     source.write_bytes(b"saved media bytes")
     row_id, _ = queue.enqueue_many([QueueRequest("copy_message", (), {
@@ -636,7 +654,7 @@ def test_acquisition_failure_retries_after_restart_without_delivery_uncertainty(
         "SELECT delivery_hold, reconcile_attempts, reconcile_after FROM outbound_queue WHERE id=?", (row_id,)
     ).fetchone() == (None, 1, 1001.0)
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager._bot = SimpleNamespace(copy_message=copies, send_document=uploads)
     manager.get_file = Mock(return_value=SimpleNamespace(file_path=str(source)))
@@ -651,13 +669,13 @@ def test_acquisition_failure_retries_after_restart_without_delivery_uncertainty(
     queue.close()
 
 
-def test_transient_acquisition_recovers_after_repeated_failures_and_restart(tmp_path, monkeypatch):
+def test_transient_acquisition_recovers_after_repeated_failures_and_restart(tmp_path, monkeypatch, make_queue):
     from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
 
     clock = [1000.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: clock[0])
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, waiter = queue.enqueue_many([QueueRequest("copy_message", (), {
         "chat_id": 42, "from_chat_id": 1, "message_id": 2, "_slave_id": "__history__:source",
         HISTORY_REPLAY_KEY: {"source_sender_bot_id": "owner", "fallback_operation": "send_document",
@@ -678,7 +696,7 @@ def test_transient_acquisition_recovers_after_repeated_failures_and_restart(tmp_
     assert delays == [1, 2, 4, 8, 16, 32, 60, 60, 60, 60]
     assert uploads.call_count == 0
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager._bot = SimpleNamespace(copy_message=copies, send_document=uploads)
     source = tmp_path / "saved-media"
@@ -691,8 +709,8 @@ def test_transient_acquisition_recovers_after_repeated_failures_and_restart(tmp_
     queue.close()
 
 
-def test_long_edit_attachment_retries_presend_failure_and_holds_interrupted_send(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_long_edit_attachment_retries_presend_failure_and_holds_interrupted_send(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     _, waiter = queue.enqueue_many([QueueRequest("edit_message_text", (), {
         "chat_id": 42, "message_id": 100, "text": "x" * 5000,
         "_required_sender_bot_id": "__main__", "_send_mode": "blocking",
@@ -715,7 +733,7 @@ def test_long_edit_attachment_retries_presend_failure_and_holds_interrupted_send
     assert supplement.call_count == 2
     # Crash after the supplemental request, before its receipt can be harvested.
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager._bot = SimpleNamespace(edit_message_text=primary, send_document=supplement)
     manager._outbound_scheduler.dispatch_once()
@@ -729,8 +747,8 @@ def test_long_edit_attachment_retries_presend_failure_and_holds_interrupted_send
     ("send_document", SimpleNamespace(message_id=100, unpickleable=lambda: None)),
     ("edit_message_text", True),
 ])
-def test_unusable_primary_receipt_retains_full_content_without_occupying_worker(tmp_path, operation, result):
-    queue = OutboundQueue(tmp_path)
+def test_unusable_primary_receipt_retains_full_content_without_occupying_worker(tmp_path, operation, result, make_queue):
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     if operation == "send_document":
         request = QueueRequest(operation, (42, b"archive bytes"), {"caption": "x" * 2048})
@@ -764,10 +782,10 @@ def test_unusable_primary_receipt_retains_full_content_without_occupying_worker(
 
 
 @pytest.mark.parametrize("rejection", [BadRequest("File not found"), Forbidden("Bot was blocked")])
-def test_permanent_acquisition_rejection_is_retained_without_retry(tmp_path, rejection):
+def test_permanent_acquisition_rejection_is_retained_without_retry(tmp_path, rejection, make_queue):
     from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, waiter = queue.enqueue_many([QueueRequest("copy_message", (), {
         "chat_id": 42, "from_chat_id": 1, "message_id": 2, "_slave_id": "__history__:source",
         HISTORY_REPLAY_KEY: {"source_sender_bot_id": "owner", "fallback_operation": "send_document",
@@ -788,8 +806,8 @@ def test_permanent_acquisition_rejection_is_retained_without_retry(tmp_path, rej
 
 
 @pytest.mark.parametrize("operation", ["send_document", "edit_message_text"])
-def test_confirming_primary_after_crash_preserves_pending_attachment(tmp_path, operation):
-    queue = OutboundQueue(tmp_path)
+def test_confirming_primary_after_crash_preserves_pending_attachment(tmp_path, operation, make_queue):
+    queue = make_queue(tmp_path)
     if operation == "send_document":
         request = QueueRequest(operation, (42, b"archive bytes"), {"caption": "x" * 2048})
         resolver = document
@@ -811,7 +829,7 @@ def test_confirming_primary_after_crash_preserves_pending_attachment(tmp_path, o
     manager._outbound_scheduler.dispatch_once()
     # The primary ACK reached the process, but its durable transaction did not run.
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager._bot = sender
     manager._outbound_scheduler.dispatch_once()
@@ -828,12 +846,12 @@ def test_confirming_primary_after_crash_preserves_pending_attachment(tmp_path, o
 
 
 @pytest.mark.parametrize("path", ["fallback", "ordinary_copy", "copy_after_retry"])
-def test_history_confirmation_after_crash_uses_last_attempted_operation(tmp_path, path):
+def test_history_confirmation_after_crash_uses_last_attempted_operation(tmp_path, path, make_queue):
     from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
 
     source = tmp_path / "saved-media"
     source.write_bytes(b"saved media bytes")
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("copy_message", (), {
         "chat_id": 42, "from_chat_id": 1, "message_id": 2, "_slave_id": "__history__:source",
         HISTORY_REPLAY_KEY: {"source_sender_bot_id": "owner", "fallback_operation": "send_document",
@@ -865,7 +883,7 @@ def test_history_confirmation_after_crash_uses_last_attempted_operation(tmp_path
         scheduler.dispatch_once()
     # Lose the process after the ACK, before harvesting the primary receipt.
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager._bot = sender
     manager._outbound_scheduler.dispatch_once()
@@ -881,21 +899,19 @@ def test_history_confirmation_after_crash_uses_last_attempted_operation(tmp_path
 
 
 @pytest.mark.parametrize("timeout", [0, 1.1])
-def test_shutdown_releases_accepted_future_with_unpersistable_receipt(tmp_path, timeout):
+def test_shutdown_releases_accepted_future_with_unpersistable_receipt(tmp_path, timeout, make_queue, queue_backend):
     from efb_telegram_master.etm_metrics import Metrics
     from efb_telegram_master.outbound import SchedulerStoppedError
 
     metrics = Metrics()
-    queue = OutboundQueue(tmp_path, metrics=metrics)
+    queue = make_queue(tmp_path, metrics=metrics)
     manager = setup_manager(queue)
     row_id, waiter = queue.enqueue_many([QueueRequest(
         "send_document", (42, b"archive bytes"), {"caption": "x" * 2048}
     )], lambda _: document)
     primary = Mock(return_value=delivered_message())
     manager._bot = SimpleNamespace(send_document=primary)
-    with queue.connection:
-        queue.connection.execute("CREATE TRIGGER fail_completion BEFORE UPDATE OF completion_receipt ON outbound_queue "
-                                 "BEGIN SELECT RAISE(FAIL, 'database unavailable'); END")
+    fail_receipt_updates(queue, queue_backend)
     scheduler = manager._outbound_scheduler
     scheduler.dispatch_once()
     scheduler.harvest_completed()
@@ -912,7 +928,7 @@ def test_shutdown_releases_accepted_future_with_unpersistable_receipt(tmp_path, 
     ]
     assert len(list(queue.media_dir.iterdir())) == 1
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager._bot = SimpleNamespace(send_document=primary)
     manager._outbound_scheduler.dispatch_once()
@@ -921,12 +937,12 @@ def test_shutdown_releases_accepted_future_with_unpersistable_receipt(tmp_path, 
     queue.close()
 
 
-def test_receipt_recovery_during_drain_settles_primary_and_preserves_attachment(tmp_path, manager_factory):
+def test_receipt_recovery_during_drain_settles_primary_and_preserves_attachment(tmp_path, manager_factory, make_queue, queue_backend):
     from efb_telegram_master.etm_metrics import Metrics
 
     db = manager_factory(tmp_path)
     metrics = Metrics()
-    queue = OutboundQueue(tmp_path, metrics=metrics)
+    queue = make_queue(tmp_path, metrics=metrics)
     manager = setup_manager(queue)
     manager.channel = SimpleNamespace(db=db)
     context = manager._encode_queued_log_context(QueuedDbLogContext(message_with_group(), None))
@@ -936,15 +952,12 @@ def test_receipt_recovery_during_drain_settles_primary_and_preserves_attachment(
     result = delivered_message()
     primary = Mock(return_value=result)
     manager._bot = SimpleNamespace(send_document=primary)
-    with queue.connection:
-        queue.connection.execute("CREATE TRIGGER fail_completion BEFORE UPDATE OF completion_receipt ON outbound_queue "
-                                 "BEGIN SELECT RAISE(FAIL, 'database unavailable'); END")
+    fail_receipt_updates(queue, queue_backend)
     scheduler = manager._outbound_scheduler
     scheduler.dispatch_once()
     scheduler.harvest_completed()
     assert scheduler.in_flight[row_id].future.done() and not waiter.done()
-    with queue.connection:
-        queue.connection.execute("DROP TRIGGER fail_completion")
+    allow_receipt_updates(queue, queue_backend)
     scheduler.stop_and_drain(timeout=1.2)
     assert waiter.result(timeout=0) is result
     assert db.get_msg_log(master_msg_id="42.100").slave_message_id == "source-1"
@@ -971,11 +984,11 @@ def test_receipt_recovery_during_drain_settles_primary_and_preserves_attachment(
     queue.close()
 
 
-def test_main_replacement_receipt_replaces_auxiliary_snapshot_identity(tmp_path, manager_factory):
+def test_main_replacement_receipt_replaces_auxiliary_snapshot_identity(tmp_path, manager_factory, make_queue):
     from efb_telegram_master.outbound import SenderSelection
 
     db = manager_factory(tmp_path)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager.channel = SimpleNamespace(db=db)
     message = message_with_group()
@@ -998,13 +1011,13 @@ def test_main_replacement_receipt_replaces_auxiliary_snapshot_identity(tmp_path,
         queue.close()
 
 
-def test_main_reply_confirmation_preserves_file_issuer_through_restart(tmp_path, manager_factory):
+def test_main_reply_confirmation_preserves_file_issuer_through_restart(tmp_path, manager_factory, make_queue):
     from efb_telegram_master import TelegramChannel
     from efb_telegram_master.chat_binding import ChatBindingManager
     from efb_telegram_master.outbound import HISTORY_REPLAY_KEY
 
     db = manager_factory(tmp_path)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager.channel = SimpleNamespace(db=db)
     source = message_with_group()
@@ -1025,7 +1038,7 @@ def test_main_reply_confirmation_preserves_file_issuer_through_restart(tmp_path,
         TelegramChannel.confirm_send(channel, update, SimpleNamespace(args=[str(row_id)]))
     assert queue.connection.execute("SELECT delivery_state FROM outbound_queue").fetchone() == ("sent_pending",)
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = setup_manager(queue)
     manager.channel = SimpleNamespace(db=db)
     try:

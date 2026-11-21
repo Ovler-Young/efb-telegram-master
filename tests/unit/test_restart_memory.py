@@ -23,7 +23,7 @@ from ehforwarderbot.chat import GroupChat, ChatMember
 from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManager
 from efb_telegram_master.message import ETMMsg
 from efb_telegram_master.msg_type import TGMsgType
-from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest
+from efb_telegram_master.outbound import OutboundQueueScheduler, QueueRequest
 from tests.unit.test_outbound import DurableAdapter, send_message
 
 
@@ -71,14 +71,14 @@ def test_legacy_log_recovery_does_not_download_or_open_media():
     assert stored.target.uid == message.target.uid
 
 
-def test_reconciliation_streams_large_contexts_instead_of_fetchall(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_reconciliation_streams_large_contexts_instead_of_fetchall(tmp_path, make_queue, queue_backend):
+    queue = make_queue(tmp_path)
     try:
         with queue.connection:
             queue.connection.executemany(
                 "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at, "
-                "log_context, delivery_state, completion_receipt) VALUES(0,1,'send_message',X'',0,?,'sent_pending',X'01')",
-                ((b"c" * (1024 * 1024),) for _ in range(32)),
+                "log_context, delivery_state, completion_receipt) VALUES(0,1,'send_message',?,0,?,'sent_pending',?)",
+                ((b"", b"c" * (1024 * 1024), b"\x01") for _ in range(32)),
             )
         tracemalloc.start()
         try:
@@ -90,7 +90,9 @@ def test_reconciliation_streams_large_contexts_instead_of_fetchall(tmp_path):
         finally:
             tracemalloc.stop()
         assert count == 32
-        assert peak < 5 * 1024 * 1024, f"replay batch allocated {peak} bytes"
+        # PostgreSQL sends bytea as text, so one row briefly exists as text and as bytes.
+        limit = (5 if queue_backend is None else 8) * 1024 * 1024
+        assert peak < limit, f"replay batch allocated {peak} bytes"
     finally:
         queue.close()
 
@@ -99,16 +101,16 @@ def test_reconciliation_streams_large_contexts_instead_of_fetchall(tmp_path):
     ("queued", "payload"), ("queued", "log_context"), ("queued", "completion_receipt"),
     ("sent_pending", "log_context"), ("sent_pending", "completion_receipt"),
 ])
-def test_oversized_legacy_record_is_retained_without_loading_it(tmp_path, state, field):
-    queue = OutboundQueue(tmp_path)
+def test_oversized_legacy_record_is_retained_without_loading_it(tmp_path, state, field, make_queue, queue_backend):
+    queue = make_queue(tmp_path)
     queue.MAX_REPLAY_BYTES = 1024 * 1024
     with queue.connection:
         queue.connection.execute(
             "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at, "
-            "log_context, delivery_state, completion_receipt) VALUES(0,1,'send_message',X'',0,X'01',?,X'01')",
-            (state,),
+            "log_context, delivery_state, completion_receipt) VALUES(0,1,'send_message',?,0,?,?,?)",
+            (b"", b"\x01", state, b"\x01"),
         )
-        queue.connection.execute(f"UPDATE outbound_queue SET {field} = zeroblob(?)", (8 * 1024 * 1024,))
+        queue.connection.execute(f"UPDATE outbound_queue SET {field} = ?", (bytes(8 * 1024 * 1024),))
     adapter = DurableAdapter(reconcile=True)
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -127,7 +129,8 @@ def test_oversized_legacy_record_is_retained_without_loading_it(tmp_path, state,
             else:
                 assert scheduler.stopping
                 assert "Row retained" in str(scheduler.failure)
-            assert peak < 1024 * 1024
+            # PostgreSQL reads the first 1 MiB chunk as text and as bytes; the 8 MiB row is never loaded.
+            assert peak < (1 if queue_backend is None else 6) * 1024 * 1024
             assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 1
             assert adapter.calls == [] and adapter.reconciled == []
     finally:
@@ -135,14 +138,14 @@ def test_oversized_legacy_record_is_retained_without_loading_it(tmp_path, state,
 
 
 @pytest.mark.parametrize("same_destination", [False, True], ids=["other-destination", "same-destination"])
-def test_oversized_legacy_row_does_not_block_newer_runnable_rows(tmp_path, same_destination):
-    queue = OutboundQueue(tmp_path)
+def test_oversized_legacy_row_does_not_block_newer_runnable_rows(tmp_path, same_destination, make_queue):
+    queue = make_queue(tmp_path)
     queue.MAX_REPLAY_BYTES = 1024 * 1024
     with queue.connection:
         queue.connection.execute(
             "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at) "
-            "VALUES(0,1,'send_message',zeroblob(?),0)",
-            (8 * 1024 * 1024,),
+            "VALUES(0,1,'send_message',?,0)",
+            (bytes(8 * 1024 * 1024),),
         )
     normal_chat = 1 if same_destination else 2
     normal_id, _waiter = queue.enqueue_many(
@@ -165,8 +168,8 @@ def test_oversized_legacy_row_does_not_block_newer_runnable_rows(tmp_path, same_
         queue.close()
 
 
-def test_quarantined_row_is_rechecked_when_replay_budget_changes(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_quarantined_row_is_rechecked_when_replay_budget_changes(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     payload = b"\x01" + pickle.dumps(((), {"chat_id": 1, "text": "x" * (2 * 1024 * 1024)}), protocol=5)
     with queue.connection:
         queue.connection.execute(
@@ -195,19 +198,19 @@ def test_quarantined_row_is_rechecked_when_replay_budget_changes(tmp_path):
         queue.close()
 
 
-def test_oversized_legacy_media_is_compacted_and_sent_without_blocking_same_destination(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_oversized_legacy_media_is_compacted_and_sent_without_blocking_same_destination(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     queue.MAX_REPLAY_BYTES = 1024 * 1024
     legacy_payload = b"\x01" + pickle.dumps(
         ((1, io.BytesIO(b"x" * (2 * 1024 * 1024))), {}), protocol=5
     )
     with queue.connection:
-        cursor = queue.connection.execute(
+        queue.connection.execute(
             "INSERT INTO outbound_queue(priority, telegram_chat_id, operation, payload, created_at) "
             "VALUES(0,1,'send_document',?,0)",
             (legacy_payload,),
         )
-        legacy_id = int(cursor.lastrowid)
+    legacy_id = queue.connection.execute("SELECT MAX(id) FROM outbound_queue").fetchone()[0]
     newer_id, _waiter = queue.enqueue_many(
         [QueueRequest("send_message", (), {"chat_id": 1, "text": "new"})],
         lambda name: send_message if name == "send_message" else (lambda chat_id, document: None),
@@ -238,8 +241,8 @@ def test_oversized_legacy_media_is_compacted_and_sent_without_blocking_same_dest
         queue.close()
 
 
-def test_worker_count_does_not_override_replay_byte_budget(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_worker_count_does_not_override_replay_byte_budget(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     queue.MAX_REPLAY_BYTES = 1024
     with queue.connection:
         for chat_id in range(1, 4):
@@ -320,6 +323,7 @@ def _outbound_import_rss() -> int:
     )["rss_kib"]
 
 
+# SQLite only: child processes measure memory on the SQLite file (sqlite3, zeroblob, SQLite blob reads).
 def test_startup_cleanup_does_not_materialize_a_nonmatching_128_mib_payload(tmp_path):
     size = 128 * 1024 * 1024
     baseline_rss = _outbound_import_rss()
@@ -357,6 +361,7 @@ def test_startup_cleanup_does_not_materialize_a_nonmatching_128_mib_payload(tmp_
     assert report["rss_kib"] - baseline_rss < 32 * 1024, {"baseline_rss": baseline_rss, **report}
 
 
+# SQLite only: child processes measure memory on the SQLite file (sqlite3, zeroblob, SQLite blob reads).
 def test_recovery_streams_an_exact_381320453_byte_v1_payload_and_survives_restart(tmp_path):
     total_size = 381_320_453
     baseline_rss = _outbound_import_rss()
@@ -541,6 +546,7 @@ def test_recovery_streams_an_exact_381320453_byte_v1_payload_and_survives_restar
     assert restarted["rss_kib"] - baseline_rss < 32 * 1024, {"baseline_rss": baseline_rss, **restarted}
 
 
+# SQLite only: child processes measure memory on the SQLite file (sqlite3, zeroblob, SQLite blob reads).
 def test_oversized_legacy_opaque_bytes_are_retained_without_sidecar_leaks(tmp_path):
     opaque_size = 32 * 1024 * 1024
     baseline_rss = _outbound_import_rss()
@@ -602,6 +608,7 @@ def test_oversized_legacy_opaque_bytes_are_retained_without_sidecar_leaks(tmp_pa
     assert report["rss_kib"] - baseline_rss < 16 * 1024, {"baseline_rss": baseline_rss, **report}
 
 
+# SQLite only: child processes measure memory on the SQLite file (sqlite3, zeroblob, SQLite blob reads).
 def test_startup_cleanup_retains_sidecars_for_oversized_matching_v2_payload(tmp_path):
     size = 128 * 1024 * 1024
     baseline_rss = _outbound_import_rss()
@@ -645,32 +652,32 @@ def test_startup_cleanup_retains_sidecars_for_oversized_matching_v2_payload(tmp_
     assert report["rss_kib"] - baseline_rss < 32 * 1024, {"baseline_rss": baseline_rss, **report}
 
 
-def test_interrupted_legacy_stream_rolls_back_and_reclaims_crash_sidecar(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_interrupted_legacy_stream_rolls_back_and_reclaims_crash_sidecar(tmp_path, make_queue, queue_backend):
+    queue = make_queue(tmp_path)
     payload = b"\x01" + pickle.dumps(((1, io.BytesIO(b"legacy media")), {}), protocol=5)
     with queue.connection:
-        cursor = queue.connection.execute(
+        queue.connection.execute(
             "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
             "VALUES(0,1,'send_document',?,0)", (payload,),
         )
-    row_id = cursor.lastrowid
+    row_id = queue.connection.execute("SELECT MAX(id) FROM outbound_queue").fetchone()[0]
     queue.close()
     result = subprocess.run([
         sys.executable, "-c", textwrap.dedent("""
-            import os, sys
+            import json, os, sys
             from efb_telegram_master.outbound import OutboundQueue
-            queue = OutboundQueue(sys.argv[1])
+            queue = OutboundQueue(sys.argv[1], database=json.loads(sys.argv[3]))
             store = queue._store_media_stream
             def interrupted(*args, **kwargs):
                 store(*args, **kwargs)
                 os._exit(17)
             queue._store_media_stream = interrupted
             queue.recover_legacy_media_payload(int(sys.argv[2]))
-        """), str(tmp_path), str(row_id),
+        """), str(tmp_path), str(row_id), json.dumps(queue_backend),
     ], check=False)
     assert result.returncode == 17
     assert len(list((tmp_path / "outbound-media").iterdir())) == 1
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     try:
         assert list(queue.media_dir.iterdir()) == []
         assert queue.load_queued(row_id).payload == payload
