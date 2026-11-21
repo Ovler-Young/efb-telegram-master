@@ -1127,11 +1127,21 @@ class DatabaseManager:
     @observe_database_method("get_source_message_logs")
     def get_source_message_logs(self, origin_uid: str, source_id: str) -> List[MsgLog]:
         """Read saved source snapshots so status-only events can resolve their current destination."""
-        mappings = MsgLogMember.select(MsgLogMember.master_msg_id).where(
-            (MsgLogMember.slave_origin_uid == origin_uid) & (MsgLogMember.slave_message_id == source_id))
-        return list(MsgLog.select().where(MsgLog.master_msg_id.in_(mappings) |
-            ((MsgLog.slave_origin_uid == origin_uid) & (MsgLog.slave_message_id == source_id)))
+        return list(MsgLog.select().where(MsgLog.master_msg_id.in_(self._source_message_ids(origin_uid, source_id)))
             .order_by(MsgLog.time.desc(nulls="LAST")))
+
+    @staticmethod
+    def _source_message_ids(origin_uid: str, source_id: str):
+        """Ids of the logs for one source message, found through the source indexes only.
+
+        Matching both sources in one OR condition forces PostgreSQL to scan every log row,
+        so each source is searched on its own and the ids are merged.
+        """
+        mapped = MsgLogMember.select(MsgLogMember.master_msg_id).where(
+            (MsgLogMember.slave_origin_uid == origin_uid) & (MsgLogMember.slave_message_id == source_id))
+        direct = MsgLog.select(MsgLog.master_msg_id).where(
+            (MsgLog.slave_origin_uid == origin_uid) & (MsgLog.slave_message_id == source_id))
+        return mapped | direct
 
     @observe_database_method("resolve_source_member")
     def resolve_source_member(self, slave_origin_uid: str, slave_msg_id: str, target_chat_id: str,
@@ -1141,11 +1151,7 @@ class DatabaseManager:
         Legacy independent messages return a None member and keep their ordinary
         restoration path. Ambiguous active mappings require explicit selection.
         """
-        mappings = MsgLogMember.select(MsgLogMember.master_msg_id).where(
-            (MsgLogMember.slave_origin_uid == slave_origin_uid) & (MsgLogMember.slave_message_id == slave_msg_id))
-        rows = MsgLog.select().where(
-            MsgLog.master_msg_id.in_(mappings) |
-            ((MsgLog.slave_origin_uid == slave_origin_uid) & (MsgLog.slave_message_id == slave_msg_id)))
+        rows = MsgLog.select().where(MsgLog.master_msg_id.in_(self._source_message_ids(slave_origin_uid, slave_msg_id)))
         candidates = []
         topic = str(message_thread_id) if message_thread_id is not None else None
         for row in rows:
