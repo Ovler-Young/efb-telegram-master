@@ -841,6 +841,8 @@ _QUEUE_TABLES = ("outbound_queue", "history_ownership", "source_cancellations")
 # Session lock key base for the PostgreSQL queue owner; the schema's OID is
 # added, so queues in different schemas of one database do not exclude each other.
 _POSTGRESQL_OWNER_LOCK = 0x4554_4D51_0000_0000
+# Written next to the SQLite queue once its rows are in PostgreSQL.
+POSTGRESQL_QUEUE_MARKER = ".outbound-queue-postgresql.json"
 
 
 def create_postgresql_queue_tables(execute: Callable[[str], object]) -> None:
@@ -944,6 +946,11 @@ class OutboundQueue:
             if self._postgresql_config is not None:
                 connection = self._open_postgresql(self._postgresql_config)
             else:
+                if (self.path.parent / POSTGRESQL_QUEUE_MARKER).exists():
+                    raise QueuePersistenceError(
+                        "This outbound queue was moved to PostgreSQL; refusing to resume its retained "
+                        "SQLite copy, which would send its rows again."
+                    )
                 connection = self._open_sqlite()
             self._connection = connection
             self._cleanup_orphan_media()

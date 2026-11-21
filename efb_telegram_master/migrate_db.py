@@ -1,7 +1,8 @@
 """Offline, verified SQLite -> PostgreSQL import. Never deletes a source file.
 
 Run ``python -m efb_telegram_master.migrate_db --help``. The bot and all other
-writers must be stopped. The existing outbound SQLite queue remains in place.
+writers must be stopped. The outbound queue moves too; its SQLite file and media
+stay in place.
 """
 
 import argparse
@@ -50,6 +51,39 @@ V1_OPTIONAL_COLUMNS = {"msglogmember": ["master_msg_id", "slave_origin_uid", "sl
 CACHE_TABLES = {"topiciconcache", "useremojicache"}
 IMPORT_TABLE = "etm_sqlite_import"
 RECEIPT_FILE = ".postgresql-cutover.json"
+QUEUE_FILE = "outbound-queue.sqlite3"
+QUEUE_IMPORT_TABLE = "etm_queue_import"
+# Marks a queue column that every released queue has; other columns were added
+# later and take this default when an older queue lacks them.
+_REQUIRED = object()
+# Each queue table's columns as PostgreSQL stores them: (name, type, nullable, default).
+QUEUE_COLUMNS = {
+    "outbound_queue": (
+        ("id", "bigint", False, _REQUIRED), ("priority", "integer", False, _REQUIRED),
+        ("telegram_chat_id", "bigint", False, _REQUIRED), ("operation", "text", False, _REQUIRED),
+        ("payload", "bytea", False, _REQUIRED), ("slave_id", "text", True, _REQUIRED),
+        ("required_sender_bot_id", "text", True, _REQUIRED), ("created_at", "double", False, _REQUIRED),
+        ("log_context", "bytea", True, None), ("delivery_state", "text", False, "queued"),
+        ("completion_receipt", "bytea", True, None), ("reconcile_after", "double", False, 0.0),
+        ("reconcile_attempts", "integer", False, 0), ("delivery_hold", "text", True, None),
+        ("attempt_sender_bot_id", "text", True, None), ("attempt_started_at", "double", True, None),
+        ("predecessor_id", "bigint", True, None), ("thread_id", "bigint", True, None),
+    ),
+    "history_ownership": (("entry_key", "text", False, _REQUIRED),),
+    "source_cancellations": (
+        ("origin_uid", "text", False, _REQUIRED), ("source_id", "text", False, _REQUIRED),
+        ("source_revision", "integer", False, _REQUIRED), ("log_context", "bytea", False, _REQUIRED),
+    ),
+}
+QUEUE_KEYS = {"outbound_queue": ("id",), "history_ownership": ("entry_key",),
+              "source_cancellations": ("origin_uid", "source_id")}
+_INTEGER_LIMITS = {"integer": 2**31, "bigint": 2**63}
+# psycopg2 sends a BYTEA value hex-encoded inside one statement, which PostgreSQL
+# caps at 1 GiB; this keeps one value, and the memory it needs, well below that.
+MAX_QUEUE_VALUE_BYTES = 256 * 1024 * 1024
+# One INSERT carries at most this many value bytes, whatever the row count; hex
+# encoding and the statement copy need about five times this much memory.
+QUEUE_BATCH_BYTES = 4 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -75,13 +109,16 @@ def _read_import(db) -> Optional[dict]:
     if len(rows) != 1:
         raise RuntimeError("Invalid PostgreSQL import record; refusing to infer migration success.")
     manifest = json.loads(rows[0][0])
+    # Version 3 is version 2 after the outbound queue moved into PostgreSQL. Older
+    # versions accept only 1 and 2, so they refuse the target instead of resuming
+    # the retained SQLite queue and sending its rows again.
     if (
-        not isinstance(manifest, dict) or manifest.get("version") not in (1, 2)
+        not isinstance(manifest, dict) or manifest.get("version") not in (1, 2, 3)
         or not isinstance(manifest.get("import_id"), str) or not manifest["import_id"]
         or not isinstance(manifest.get("tables"), dict)
         or not {model._meta.table_name for model in CORE_MODELS}.issubset(manifest["tables"])
         or set(manifest["tables"]) - {model._meta.table_name for model in MODELS} - CACHE_TABLES
-        or (manifest.get("version") == 2 and (
+        or (manifest.get("version") in (2, 3) and (
             not isinstance(manifest.get("columns"), dict)
             or set(manifest["columns"]) != set(manifest["tables"])
         ))
@@ -117,13 +154,56 @@ def validate_runtime_cutover(directory: Path, db) -> None:
     receipt = json.loads(receipt_path.read_text())
     if receipt.get("import_id") != manifest.get("import_id"):
         raise RuntimeError("Cutover receipt belongs to a different PostgreSQL import; preserving both databases.")
-    if manifest["queue"] is not None and not (directory / "outbound-queue.sqlite3").is_file():
+    if manifest["queue"] is not None and not (directory / QUEUE_FILE).is_file():
         raise RuntimeError(
             "The imported outbound queue is missing; refusing to replace pending sends and "
             "Telegram receipts with an empty queue. Restore the current queue before startup."
         )
     if source_path.exists() and receipt.get("source_fingerprint") != _fingerprint(source_path):
         raise RuntimeError("SQLite source changed after import; refusing an ambiguous cutover. Keep both databases offline.")
+
+
+def _read_queue_import(db) -> Optional[dict]:
+    tables = set(db.get_tables(schema=current_schema(db)))
+    if QUEUE_IMPORT_TABLE not in tables:
+        return None
+    rows = db.execute_sql(f"SELECT manifest FROM {QUEUE_IMPORT_TABLE} WHERE id = 1").fetchall()
+    record = json.loads(rows[0][0]) if len(rows) == 1 else None
+    if (
+        not isinstance(record, dict) or record.get("version") != 1
+        or not isinstance(record.get("import_id"), str) or not record["import_id"]
+        or not isinstance(record.get("tables"), dict) or set(record["tables"]) != set(QUEUE_COLUMNS)
+        or "queue" not in record or "backup_queue" not in record
+    ):
+        raise RuntimeError("Unsupported or corrupt PostgreSQL queue import record; preserving both queues.")
+    missing = set(QUEUE_COLUMNS) - tables
+    if missing:
+        raise RuntimeError(
+            f"Moved outbound queue tables are missing: {sorted(missing)}; "
+            "refusing to recreate empty replacements. Restore the complete target."
+        )
+    return record
+
+
+def validate_runtime_queue(directory: Path, db) -> None:
+    """On PostgreSQL, refuse a queue that is still in SQLite or whose move is unfinished."""
+    from .outbound import POSTGRESQL_QUEUE_MARKER
+
+    record = _read_queue_import(db)
+    if record is None:
+        if (directory / QUEUE_FILE).exists():
+            raise RuntimeError(
+                f"The outbound queue is still in {QUEUE_FILE}. Stop the bot and move it with python -m "
+                "efb_telegram_master.migrate_db --data-dir <directory> --config <postgresql.yaml> --queue-only; "
+                "startup never moves it implicitly."
+            )
+        return
+    marker = directory / POSTGRESQL_QUEUE_MARKER
+    if not marker.exists() or json.loads(marker.read_text()).get("import_id") != record["import_id"]:
+        raise RuntimeError(
+            "The outbound queue move into PostgreSQL is unfinished or belongs to another data directory; "
+            "run the same migrate_db command again to verify and finish it."
+        )
 
 
 @contextmanager
@@ -588,7 +668,8 @@ def _validate_recovery_extras(source, db, columns):
          lambda table: {field.name for field in db.get_columns(table, schema=current_schema(db))}),
     ):
         for table in tables:
-            if table == IMPORT_TABLE or table.startswith("sqlite_"):
+            # The outbound queue has its own import record and verification.
+            if table in (IMPORT_TABLE, QUEUE_IMPORT_TABLE) or table in QUEUE_COLUMNS or table.startswith("sqlite_"):
                 continue
             if table not in columns:
                 if execute(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone():
@@ -615,100 +696,305 @@ def _write_receipt(path: Path, receipt: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
+def _queue_value(table: str, key: tuple, name: str, kind: str, nullable: bool, value):
+    """Return ``value`` as PostgreSQL stores it; anything else fails, naming the row."""
+    if value is None:
+        if nullable:
+            return None
+    elif kind in _INTEGER_LIMITS:
+        if type(value) is int and -_INTEGER_LIMITS[kind] <= value < _INTEGER_LIMITS[kind]:
+            return value
+    elif kind == "double":
+        if type(value) in (int, float):
+            return float(value)
+    elif kind == "text":
+        if isinstance(value, str) and "\x00" not in value:
+            return value
+    elif isinstance(value, bytes) and len(value) <= MAX_QUEUE_VALUE_BYTES:
+        return value
+    raise RuntimeError(
+        f"Outbound queue {table} row {key}: {name} cannot be stored in PostgreSQL as {kind} (NULL, a "
+        f"different type, a NUL character or over {MAX_QUEUE_VALUE_BYTES // (1024 * 1024)} MiB); "
+        "the queue was not moved and its source is preserved."
+    )
+
+
+def _queue_source_columns(source: sqlite3.Connection) -> dict:
+    """Each queue table's columns, or None when an older queue does not have the table."""
+    tables = _source_tables(source)
+    for table in tables - set(QUEUE_COLUMNS):
+        if not table.startswith("sqlite_") and source.execute(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone():
+            raise RuntimeError(f"Nonempty unsupported outbound queue table {table!r}; the queue was not moved.")
+    present: dict[str, Optional[set]] = {}
+    for table, columns in QUEUE_COLUMNS.items():
+        if table not in tables:
+            present[table] = None
+            continue
+        actual = {row[1] for row in _source_columns(source, table)}
+        unknown = actual - {name for name, *_ in columns}
+        if unknown:
+            raise RuntimeError(f"Unsupported columns in outbound queue {table}: {sorted(unknown)}; the queue was not moved.")
+        missing = [name for name, _, _, default in columns if default is _REQUIRED and name not in actual]
+        if missing:
+            raise RuntimeError(f"Missing required columns in outbound queue {table}: {missing}")
+        present[table] = actual
+    return present
+
+
+def _queue_source_rows(source: sqlite3.Connection, table: str, present) -> Iterator[tuple]:
+    if present is None:
+        return
+    columns = QUEUE_COLUMNS[table]
+    names = [name for name, *_ in columns]
+    projection = ", ".join(_quote(name) if name in present else "NULL" for name in names)
+    order = ", ".join(_quote(name) + " COLLATE BINARY" for name in QUEUE_KEYS[table])
+    keys = [names.index(name) for name in QUEUE_KEYS[table]]
+    cursor = source.execute(f"SELECT {projection} FROM {_quote(table)} ORDER BY {order}")
+    try:
+        for row in cursor:
+            key = tuple(row[index] for index in keys)
+            yield tuple(
+                default if name not in present else _queue_value(table, key, name, kind, nullable, value)
+                for (name, kind, nullable, default), value in zip(columns, row)
+            )
+    finally:
+        cursor.close()
+
+
+def _queue_digest_row(row) -> tuple:
+    # BYTEA values are compared by their SHA-256, which PostgreSQL computes
+    # itself, so verification never pulls a large payload into memory.
+    return tuple(hashlib.sha256(value).digest() if isinstance(value, bytes) else value for value in row)
+
+
+def _copy_queue_table(db, source: sqlite3.Connection, table: str, present, batch_size: int) -> dict:
+    names = [name for name, *_ in QUEUE_COLUMNS[table]]
+    insert = f"INSERT INTO {_quote(table)} ({', '.join(_quote(name) for name in names)}) VALUES "
+    placeholders = "(" + ", ".join("%s" for _ in names) + ")"
+    digest = hashlib.sha256()
+    count = 0
+    batch: list = []
+    size = 0
+    for row in _queue_source_rows(source, table, present):
+        batch.append(row)
+        size += sum(len(value) for value in row if isinstance(value, (bytes, str)))
+        _hash_row(digest, _queue_digest_row(row))
+        count += 1
+        if len(batch) >= batch_size or size >= QUEUE_BATCH_BYTES:
+            db.execute_sql(insert + ", ".join(placeholders for _ in batch), [value for item in batch for value in item])
+            batch, size = [], 0
+    if batch:
+        db.execute_sql(insert + ", ".join(placeholders for _ in batch), [value for item in batch for value in item])
+    logger.info("Moved outbound queue %s: %d rows", table, count)
+    return {"rows": count, "sha256": digest.hexdigest()}
+
+
+def _queue_target_digest(db, table: str, batch_size: int) -> dict:
+    projection = ", ".join(f"sha256({_quote(name)})" if kind == "bytea" else _quote(name)
+                           for name, kind, *_ in QUEUE_COLUMNS[table])
+    order = ", ".join(_quote(name) + ' COLLATE "C"' if table != "outbound_queue" else _quote(name)
+                      for name in QUEUE_KEYS[table])
+    with db.connection().cursor(name="etm_verify_" + uuid.uuid4().hex, withhold=True) as cursor:
+        cursor.itersize = batch_size
+        cursor.execute(f"SELECT {projection} FROM {_quote(table)} ORDER BY {order}")
+        return _digest(tuple(bytes(value) if isinstance(value, memoryview) else value for value in row)
+                       for row in cursor)
+
+
+def _import_queue(db, directory: Path, archive: Path, expected: dict, batch_size: int) -> dict:
+    """Move the SQLite outbound queue into PostgreSQL, or verify an earlier move.
+
+    Reads the live queue under the caller's write fence: its rows keep naming the
+    live ``outbound-media`` files, which stay where they are. One transaction
+    holds the rows, the identity reset, verification and the queue import record.
+    """
+    from .outbound import _POSTGRESQL_OWNER_LOCK, POSTGRESQL_QUEUE_MARKER, create_postgresql_queue_tables
+
+    queue_path = directory / QUEUE_FILE
+    marker_path = directory / POSTGRESQL_QUEUE_MARKER
+    with (
+        closing(sqlite3.connect(queue_path.resolve().as_uri() + "?mode=ro", uri=True)) as source,
+        connection_scope(db), db.atomic(),
+    ):
+        db.execute_sql("SET LOCAL lock_timeout = '5s'")
+        db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
+        record = _read_queue_import(db)
+        # The bot's queue holds this lock for as long as it runs.
+        free = db.execute_sql(
+            "SELECT pg_try_advisory_xact_lock(%s::bigint + oid::bigint) FROM pg_namespace "
+            "WHERE nspname = current_schema()", (_POSTGRESQL_OWNER_LOCK,),
+        ).fetchone()
+        if not free or not free[0]:
+            raise RuntimeError("The PostgreSQL outbound queue is in use; stop the bot before moving the queue.")
+        if marker_path.exists() and (
+            record is None or json.loads(marker_path.read_text()).get("import_id") != record["import_id"]
+        ):
+            raise RuntimeError("Existing outbound queue marker does not match this target; refusing another queue move.")
+        present = _queue_source_columns(source)
+        if record is None:
+            create_postgresql_queue_tables(db.execute_sql)
+            for table in QUEUE_COLUMNS:
+                if db.execute_sql(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone():
+                    raise RuntimeError(
+                        f"PostgreSQL queue table {table} is not empty and has no verified queue import "
+                        "record; refusing to merge two queues."
+                    )
+            tables = {table: _copy_queue_table(db, source, table, present[table], batch_size)
+                      for table in QUEUE_COLUMNS}
+            # SQLite never reuses a deleted queue id; an aggregation context or a
+            # predecessor link may still name one.
+            sequence = (source.execute("SELECT seq FROM sqlite_sequence WHERE name = 'outbound_queue'").fetchone()
+                        if "sqlite_sequence" in _source_tables(source) else None)
+            last = 0 if sequence is None else sequence[0]
+            if type(last) is not int:
+                raise RuntimeError("Invalid outbound queue id sequence; the queue was not moved.")
+            db.execute_sql(
+                "SELECT setval(pg_get_serial_sequence('outbound_queue', 'id'), "
+                "GREATEST(COALESCE(MAX(id), 0), %s, 1), GREATEST(COALESCE(MAX(id), 0), %s) >= 1) "
+                "FROM outbound_queue", (last, last),
+            )
+            record = {
+                "version": 1, "import_id": uuid.uuid4().hex, "tables": tables, "queue": expected,
+                "backup_queue": _queue_digest(archive / QUEUE_FILE), "backup_directory": str(archive),
+            }
+            db.execute_sql(f"CREATE TABLE {QUEUE_IMPORT_TABLE} (id INTEGER PRIMARY KEY CHECK (id = 1), manifest TEXT NOT NULL)")
+            db.execute_sql(f"INSERT INTO {QUEUE_IMPORT_TABLE} (id, manifest) VALUES (1, %s)", (_json(record),))
+            manifest = _read_import(db)
+            if manifest is not None and manifest["version"] == 2:
+                db.execute_sql(f"UPDATE {IMPORT_TABLE} SET manifest = %s WHERE id = 1",
+                               (_json(dict(manifest, version=3)),))
+        elif expected not in (record["queue"], record["backup_queue"]):
+            raise RuntimeError("Outbound queue changed since it was moved; refusing to merge divergent queues.")
+        for table in QUEUE_COLUMNS:
+            if _queue_target_digest(db, table, batch_size) != record["tables"][table]:
+                raise RuntimeError(f"Content verification failed for outbound queue {table}; the SQLite queue is preserved.")
+        if _queue_digest(queue_path) != expected:
+            raise RuntimeError("Outbound queue or media changed during import; keep all writers stopped and retry.")
+    return record
+
+
+def _import_tables(db, directory: Path, archive: Path, queue_summary: Optional[dict], batch_size: int) -> dict:
+    source_path = directory / "tgdata.db"
+    queue_path = directory / QUEUE_FILE
+    with (
+        closing(sqlite3.connect(archive / source_path.name)) as source,
+        ExitStack() as bindings, connection_scope(db), db.atomic(),
+    ):
+        db.execute_sql("SET LOCAL lock_timeout = '5s'")
+        db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
+        manifest = _read_import(db)
+        models = MODELS + _cache_models(source, manifest)
+        _validate_source(source, models)
+        bindings.enter_context(db.bind_ctx(models))
+        receipt_path = directory / RECEIPT_FILE
+        if receipt_path.exists():
+            previous = json.loads(receipt_path.read_text())
+            if manifest is None or previous.get("import_id") != manifest.get("import_id"):
+                raise RuntimeError("Existing cutover receipt does not match this target; refusing another import.")
+        if manifest is None:
+            if db.get_tables(schema=current_schema(db)):
+                raise RuntimeError("Target schema is not empty and has no verified import record; refusing to overwrite or skip SQLite.")
+            db.create_tables(models)
+            tables = _import_rows(db, source, batch_size, models)
+            columns = {model._meta.table_name: [field.column_name for field in model._meta.sorted_fields]
+                       for model in models}
+            DatabaseManager._create_lookup_indexes(db)
+            manifest = {
+                "version": 2, "import_id": uuid.uuid4().hex,
+                "tables": tables, "columns": columns, "queue": queue_summary,
+                "backup_queue": _queue_digest(archive / queue_path.name),
+                "backup_directory": str(archive),
+            }
+        else:
+            # Recovery must not verify different tables at different
+            # points in a concurrent target writer's transaction.
+            names = ", ".join(_quote(name) for name in db.get_tables(schema=current_schema(db)))
+            db.execute_sql(f"LOCK TABLE {names} IN SHARE ROW EXCLUSIVE MODE")
+            columns = _recovery_columns(models, manifest)
+            _validate_recovery_extras(source, db, columns)
+            models = tuple(model for model in models if model._meta.table_name in columns)
+            tables = {model._meta.table_name: _digest(_source_rows(source, model, columns[model._meta.table_name]))
+                      for model in models}
+            queue_matches = _queue_digest_matches(
+                queue_summary, manifest["queue"], legacy_external=manifest["version"] == 1
+            ) or ("backup_queue" in manifest and queue_summary == manifest["backup_queue"])
+            if tables != manifest["tables"] or not queue_matches:
+                raise RuntimeError("Source changed since the committed import; refusing to merge divergent databases.")
+            if (queue_summary is not None and "external" in queue_summary
+                    and "external" not in manifest["queue"]):
+                logger.warning(
+                    "Legacy import has no external-media content hashes. Verified current files and "
+                    "established their first content baseline; pre-existing changes cannot be detected."
+                )
+            manifest = dict(manifest, queue=queue_summary,
+                            backup_queue=_queue_digest(archive / queue_path.name),
+                            backup_directory=str(archive))
+        for model in models:
+            if _target_digest(db, model, batch_size, columns[model._meta.table_name]) != tables[model._meta.table_name]:
+                raise RuntimeError(f"Content verification failed for {model._meta.table_name}; both sources are preserved.")
+        if _queue_digest(queue_path) != queue_summary:
+            raise RuntimeError("Outbound queue or media changed during import; keep all writers stopped and retry.")
+        db.execute_sql(f"CREATE TABLE IF NOT EXISTS {IMPORT_TABLE} (id INTEGER PRIMARY KEY CHECK (id = 1), manifest TEXT NOT NULL)")
+        db.execute_sql(f"INSERT INTO {IMPORT_TABLE} (id, manifest) VALUES (1, %s) ON CONFLICT (id) DO UPDATE SET manifest = EXCLUDED.manifest", (_json(manifest),))
+    return manifest
+
+
+def migrate(directory: Path, config: dict, batch_size: int = 500, *, queue_only: bool = False) -> dict:
     """Import an empty target, or verify/recover an already-committed import.
 
     The transaction includes all rows, indexes, sequence resets, verification
     and provenance. After a post-commit crash, re-running verifies both sides
     before recreating the local cutover receipt; no rows are inserted twice.
+    The outbound queue then moves the same way in a second transaction.
+    ``queue_only`` moves just the queue, for an install whose other data is
+    already in PostgreSQL; it returns the queue import record.
     """
     if not 1 <= batch_size <= 1000:
         raise ValueError("batch_size must be between 1 and 1000")
     if config.get("type") != "postgresql":
         raise ValueError("Migration requires database.type: postgresql in the supplied configuration")
+    from .outbound import POSTGRESQL_QUEUE_MARKER
+
     directory = directory.resolve()
     source_path = directory / "tgdata.db"
-    if not source_path.is_file():
-        raise FileNotFoundError(f"SQLite source does not exist: {source_path}")
+    queue_path = directory / QUEUE_FILE
+    required = queue_path if queue_only else source_path
+    if not required.is_file():
+        raise FileNotFoundError(f"SQLite source does not exist: {required}")
     db = postgresql_database(config)
     with DataDirectoryLock(directory):
         try:
             with ExitStack() as fences:
-                fences.enter_context(_fence(source_path))
-                queue_path = directory / "outbound-queue.sqlite3"
+                if not queue_only:
+                    fences.enter_context(_fence(source_path))
                 if queue_path.exists():
                     fences.enter_context(_fence(queue_path))
                 backup_root = directory / "database-backups"
                 backup_root.mkdir(mode=0o700, exist_ok=True)
                 archive = Path(tempfile.mkdtemp(prefix="sqlite-", dir=backup_root))
-                _backup(source_path, archive / source_path.name)
+                if not queue_only:
+                    _backup(source_path, archive / source_path.name)
                 queue_summary = _backup_queue(queue_path, archive)
                 for path in (archive, backup_root, directory):
                     _sync_directory(path)
                 logger.info("Consistent SQLite backups: %s", archive)
-                with closing(sqlite3.connect(archive / source_path.name)) as source:
-                    with ExitStack() as bindings, connection_scope(db), db.atomic():
-                        db.execute_sql("SET LOCAL lock_timeout = '5s'")
-                        db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
-                        manifest = _read_import(db)
-                        models = MODELS + _cache_models(source, manifest)
-                        _validate_source(source, models)
-                        bindings.enter_context(db.bind_ctx(models))
-                        receipt_path = directory / RECEIPT_FILE
-                        if receipt_path.exists():
-                            previous = json.loads(receipt_path.read_text())
-                            if manifest is None or previous.get("import_id") != manifest.get("import_id"):
-                                raise RuntimeError("Existing cutover receipt does not match this target; refusing another import.")
-                        if manifest is None:
-                            if db.get_tables(schema=current_schema(db)):
-                                raise RuntimeError("Target schema is not empty and has no verified import record; refusing to overwrite or skip SQLite.")
-                            db.create_tables(models)
-                            tables = _import_rows(db, source, batch_size, models)
-                            columns = {model._meta.table_name: [field.column_name for field in model._meta.sorted_fields]
-                                       for model in models}
-                            DatabaseManager._create_lookup_indexes(db)
-                            manifest = {
-                                "version": 2, "import_id": uuid.uuid4().hex,
-                                "tables": tables, "columns": columns, "queue": queue_summary,
-                                "backup_queue": _queue_digest(archive / queue_path.name),
-                                "backup_directory": str(archive),
-                            }
-                        else:
-                            # Recovery must not verify different tables at different
-                            # points in a concurrent target writer's transaction.
-                            names = ", ".join(_quote(name) for name in db.get_tables(schema=current_schema(db)))
-                            db.execute_sql(f"LOCK TABLE {names} IN SHARE ROW EXCLUSIVE MODE")
-                            columns = _recovery_columns(models, manifest)
-                            _validate_recovery_extras(source, db, columns)
-                            models = tuple(model for model in models if model._meta.table_name in columns)
-                            tables = {model._meta.table_name: _digest(_source_rows(source, model, columns[model._meta.table_name]))
-                                      for model in models}
-                            queue_matches = _queue_digest_matches(
-                                queue_summary, manifest["queue"], legacy_external=manifest["version"] == 1
-                            ) or ("backup_queue" in manifest and queue_summary == manifest["backup_queue"])
-                            if tables != manifest["tables"] or not queue_matches:
-                                raise RuntimeError("Source changed since the committed import; refusing to merge divergent databases.")
-                            if (queue_summary is not None and "external" in queue_summary
-                                    and "external" not in manifest["queue"]):
-                                logger.warning(
-                                    "Legacy import has no external-media content hashes. Verified current files and "
-                                    "established their first content baseline; pre-existing changes cannot be detected."
-                                )
-                            manifest = dict(manifest, queue=queue_summary,
-                                            backup_queue=_queue_digest(archive / queue_path.name),
-                                            backup_directory=str(archive))
-                        for model in models:
-                            if _target_digest(db, model, batch_size, columns[model._meta.table_name]) != tables[model._meta.table_name]:
-                                raise RuntimeError(f"Content verification failed for {model._meta.table_name}; both sources are preserved.")
-                        if _queue_digest(queue_path) != queue_summary:
-                            raise RuntimeError("Outbound queue or media changed during import; keep all writers stopped and retry.")
-                        db.execute_sql(f"CREATE TABLE IF NOT EXISTS {IMPORT_TABLE} (id INTEGER PRIMARY KEY CHECK (id = 1), manifest TEXT NOT NULL)")
-                        db.execute_sql(f"INSERT INTO {IMPORT_TABLE} (id, manifest) VALUES (1, %s) ON CONFLICT (id) DO UPDATE SET manifest = EXCLUDED.manifest", (_json(manifest),))
+                manifest = None if queue_only else _import_tables(db, directory, archive, queue_summary, batch_size)
+                queue_record = None if queue_summary is None else _import_queue(
+                    db, directory, archive, queue_summary, batch_size,
+                )
             # SQLite locks/connections have closed, including any resulting WAL
             # checkpoint, so the recorded fingerprint is stable across startup.
-            receipt = dict(manifest, source_fingerprint=_fingerprint(source_path))
-            _write_receipt(archive / "manifest.json", receipt)
-            _write_receipt(directory / RECEIPT_FILE, receipt)
+            receipt = None
+            if manifest is not None:
+                receipt = dict(manifest, source_fingerprint=_fingerprint(source_path))
+                _write_receipt(archive / "manifest.json", receipt)
+                _write_receipt(directory / RECEIPT_FILE, receipt)
+            if queue_record is not None:
+                _write_receipt(directory / POSTGRESQL_QUEUE_MARKER, queue_record)
+                logger.info("Outbound queue is in PostgreSQL. Its SQLite file is retained and must not be resumed.")
+            if receipt is None:
+                assert queue_record is not None
+                return queue_record
             logger.info("Import verified. Retained source and outbound queue; switch configuration to PostgreSQL.")
             return receipt
         finally:
@@ -717,9 +1003,12 @@ def migrate(directory: Path, config: dict, batch_size: int = 500) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, required=True, help="Channel data directory containing tgdata.db; stop all writers first")
+    parser.add_argument("--data-dir", type=Path, required=True,
+                        help="Channel data directory (tgdata.db, outbound-queue.sqlite3); stop all writers first")
     parser.add_argument("--config", type=Path, required=True, help="YAML with the target database mapping (password is never printed)")
     parser.add_argument("--batch-size", type=int, default=500)
+    parser.add_argument("--queue-only", action="store_true",
+                        help="Move only the outbound queue, when the other data is already in PostgreSQL")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
@@ -727,7 +1016,7 @@ def main(argv=None) -> int:
             config = YAML(typ="safe").load(stream)
         if not isinstance(config, dict) or not isinstance(config.get("database"), dict):
             raise ValueError("Configuration must contain a database mapping")
-        result = migrate(args.data_dir, config["database"], args.batch_size)
+        result = migrate(args.data_dir, config["database"], args.batch_size, queue_only=args.queue_only)
         print(_json({"import_id": result["import_id"], "tables": result["tables"], "backup_directory": result["backup_directory"]}))
     except Exception as error:
         parser.exit(1, f"Migration failed: {error}\nOriginal SQLite files were not deleted.\n")

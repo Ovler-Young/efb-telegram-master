@@ -29,7 +29,7 @@ from efb_telegram_master.db import (
 from efb_telegram_master.db_runtime import DataDirectoryLock, connection_scope, current_schema, postgresql_database
 from efb_telegram_master.delivery_states import FAILED_ATTEMPTS_LIMIT, HoldKind
 from efb_telegram_master.outbound import (
-    OutboundQueue, QueuePersistenceError, QueueRequest, SenderSelection,
+    POSTGRESQL_QUEUE_MARKER, OutboundQueue, QueuePersistenceError, QueueRequest, SenderSelection,
 )
 
 MODELS = migrate_db.MODELS
@@ -974,7 +974,7 @@ def test_import_recovery_cutover_preserves_published_history_and_queue_ownership
     )} == keys
     with connection_scope(restarted._managed_database):
         assert not HistoryMigrationEntry.select().where(HistoryMigrationEntry.id == abandoned.id).exists()
-    queue = OutboundQueue(sqlite_source)
+    queue = OutboundQueue(sqlite_source, database=postgres_config)
     try:
         assert queue.owned_history_entries(keys) == {pending[0].ownership_key}
     finally:
@@ -1329,3 +1329,542 @@ def test_postgresql_queue_refuses_to_start_without_its_tables(tmp_path, postgres
     with connection_scope(admin):
         assert admin.execute_sql("SELECT to_regclass('source_cancellations')").fetchone()[0] is None
     admin.close_all()
+
+
+# Moving a SQLite queue into PostgreSQL.
+
+QUEUE_SELECT = ", ".join(name for name, *_ in migrate_db.QUEUE_COLUMNS["outbound_queue"])
+MOVE_ATTEMPT = SenderSelection(None, "901")
+
+
+class _FrozenClock:
+    """The queue's clock: both backends then write and compare the same timestamps."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def __getattr__(self, name):
+        import time
+
+        return getattr(time, name)
+
+
+@pytest.fixture
+def frozen_queue_clock(monkeypatch):
+    import time
+
+    from efb_telegram_master import outbound
+
+    clock = _FrozenClock(round(time.time(), 3))
+    monkeypatch.setattr(outbound, "time", clock)
+    return clock
+
+
+def _queue_operation(chat_id, text=None, document=None, caption=None, message_thread_id=None):
+    raise AssertionError("Queue move tests never send")
+
+
+def _enqueue(queue, request, **options):
+    row_id, _ = queue.enqueue_many([request], lambda _: _queue_operation, **options)
+    return row_id
+
+
+def _member(uid):
+    from efb_telegram_master.aggregate import make_source_member
+    from tests.unit.test_live_aggregate import source
+
+    return make_source_member(source(uid, f"text {uid}"))
+
+
+def _build_every_queue_state(directory, external, now):
+    """A queue as the current code writes it, plus the raw updates other versions leave behind."""
+    from efb_telegram_master.outbound import RequiredSenderUnavailableError
+    from efb_telegram_master.queued_log import encode_aggregation
+
+    key = ("slave", -2000, None)
+    members = {uid: _member(uid) for uid in ("a", "b", "c", "d", "e")}
+    queue = OutboundQueue(directory)
+    rows = {}
+    try:
+        def row(name, chat_id, *, text=None, predecessor=None, context=None, **kwargs):
+            rows[name] = _enqueue(queue, QueueRequest(
+                "send_message", (), dict({"chat_id": chat_id, "text": text or name}, **kwargs),
+                None if context is None else encode_aggregation(dict(context, format_version=1, key=key)),
+                predecessor_id=rows.get(predecessor)))
+            return rows[name]
+
+        row("waiting", -1001)
+        row("behind waiting", -1001, predecessor="waiting")
+        row("blocking", -1001, _send_mode="blocking")
+        topic = row("legacy topic", -1001, message_thread_id=7)
+        row("deferred", -1002)
+        queue.defer_acquisition(rows["deferred"])
+        row("behind deferred", -1012, predecessor="deferred")
+        queue.begin_delivery_attempt(row("in flight", -1003), MOVE_ATTEMPT)
+        queue.begin_delivery_attempt(row("uncertain", -1004), MOVE_ATTEMPT)
+        queue.hold_uncertain_delivery(rows["uncertain"], TimeoutError("lost"))
+        row("operator hold", -1005)
+        queue.hold_invalid_payload(row("invalid payload", -1006))
+        queue.hold_failed_history(row("history failed", -1007), RuntimeError("rejected"))
+        queue.hold_failed_history(row("history sender", -1017, _slave_id="__history__:slave"),
+                                  RequiredSenderUnavailableError("gone"))
+        queue.begin_delivery_attempt(row("supplement failed", -1008), MOVE_ATTEMPT)
+        queue.hold_failed_history(rows["supplement failed"], RuntimeError("rejected"), supplement=True)
+        queue.begin_delivery_attempt(row("aggregation failed", -1009), MOVE_ATTEMPT)
+        row("behind aggregation failed", -1010, predecessor="aggregation failed")
+        assert queue.hold_failed_aggregation(rows["aggregation failed"], RuntimeError("failed"))
+        row("unrecognized hold", -1011)
+        queue.begin_delivery_attempt(row("sent pending", -1013), MOVE_ATTEMPT)
+        queue.record_telegram_completion(rows["sent pending"], b"\x01receipt")
+        queue.defer_reconciliation([rows["sent pending"]], now)
+        row("behind sent", -1014, predecessor="sent pending")
+
+        logical = {"kind": "logical", "members": [members["a"]]}
+        row("logical", -2000, context=logical)
+        row("aggregate", -2000, context=logical)
+        queue.materialize_aggregation(
+            rows["aggregate"], "send_message", {"chat_id": -2000, "text": "batch"},
+            encode_aggregation({"format_version": 1, "kind": "aggregate", "key": key,
+                                "retry_context": dict(logical, format_version=1, key=key)}), MOVE_ATTEMPT)
+        row("member update", -2000, predecessor="aggregate",
+            context={"kind": "member_update", "container_id": "-2000.1", "updates": [members["b"]]})
+        row("source", -2000, context={"kind": "source", "member": members["c"]})
+        row("redirect", -2000, context={"kind": "redirect", "member": members["d"], "frozen": True})
+        row("boundary", -2000, context={"kind": "boundary", "members": []})
+        row("cancelled source", -2000, context={"kind": "source", "member": members["e"]})
+        assert queue.cancel_pending_source(key, members["e"])
+        rows.pop("cancelled source")
+
+        rows["history"] = _enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1015, "text": "history"}),
+                                   history_keys=["history.1", "history.2"])
+        rows["sidecar media"] = _enqueue(queue, QueueRequest(
+            "send_document", (), {"chat_id": -3000, "document": b"sidecar media bytes", "caption": "v2"}))
+        rows["external media"] = _enqueue(queue, QueueRequest(
+            "send_document", (), {"chat_id": -3001, "document": external.as_uri()}, cleanup_files=(str(external),)))
+        legacy = b"\x01" + pickle.dumps(((-3002, io.BytesIO(b"legacy inline media")), {"caption": "v1"}), protocol=5)
+        with queue.connection:
+            rows["legacy media"] = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,-3002,'send_document',?,?)", (legacy, now)).lastrowid
+            queue.connection.execute("UPDATE outbound_queue SET delivery_hold=? WHERE id=?",
+                                     ("uncertain:operator_observed_delivery", rows["operator hold"]))
+            queue.connection.execute("UPDATE outbound_queue SET delivery_hold='paused_by_newer_version' WHERE id=?",
+                                     (rows["unrecognized hold"],))
+            queue.connection.execute("UPDATE outbound_queue SET thread_id=NULL WHERE id=?", (topic,))
+        # A removed newest row: its id must not be handed out again.
+        queue.delete(_enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1016, "text": "gone"})))
+    finally:
+        queue.close()
+    return rows
+
+
+def _queue_tables(queue):
+    return {
+        "outbound_queue": queue.connection.execute(f"SELECT {QUEUE_SELECT} FROM outbound_queue ORDER BY id").fetchall(),
+        "history_ownership": sorted(queue.connection.execute("SELECT entry_key FROM history_ownership").fetchall()),
+        "source_cancellations": sorted(queue.connection.execute("SELECT * FROM source_cancellations").fetchall()),
+    }
+
+
+def _observe_queue(queue, now):
+    from efb_telegram_master.aggregation_states import context_state
+    from efb_telegram_master.delivery_states import classify
+    from efb_telegram_master.queued_log import decode_aggregation
+
+    lanes = sorted(set(queue.connection.execute("SELECT telegram_chat_id, thread_id FROM outbound_queue").fetchall()),
+                   key=lambda lane: (lane[0], -1 if lane[1] is None else lane[1]))
+    states = queue.connection.execute(
+        "SELECT id, delivery_state, delivery_hold, reconcile_after, reconcile_attempts FROM outbound_queue ORDER BY id"
+    ).fetchall()
+    return [
+        ("ready heads", [head.id for head in queue.heads(include_payload=False, ready_only=True)]),
+        ("queued heads", [head.id for head in queue.heads(include_payload=False)]),
+        ("lanes", [(chat, topic, getattr(queue.head_for(chat, topic), "id", None)) for chat, topic in lanes]),
+        ("states", [(row[0], classify(row[1], row[2], row[3], now).value, row[4]) for row in states]),
+        ("waiting", queue.has_waiting_rows(), queue.has_unresolvable_dependency()),
+        ("sent pending", [row.id for row in queue.sent_pending()], queue.next_reconciliation_time()),
+        ("failing", sorted(queue.failing_retries())),
+        ("aggregation", [(row.id, context_state(decode_aggregation(row.log_context)).value)
+                         for row in queue.aggregation_rows()]),
+    ]
+
+
+def _progress_moved_queue(queue, rows, now):
+    """Load every row, then drive each one through the same events; returns what happened.
+
+    Legacy media recovery names its new sidecar at random, so rows are compared before it.
+    """
+    seen = [_observe_queue(queue, now), ("rows after loading", _queue_tables(queue))]
+    member = _member("e")
+    seen.append(("cancelled", queue.cancelled_source((member["origin_uid"], member["source_id"]))))
+    seen.append(("history", queue.history_ownership_page(), sorted(queue.owned_history_entries(["history.1", "other"]))))
+    legacy = rows["legacy media"]
+    seen.append(("legacy version", queue.queued_payload_version(legacy)))
+    for name in ("legacy media", "sidecar media", "external media"):
+        row = queue.recover_legacy_media_payload(legacy) if name == "legacy media" else queue.load_queued(rows[name])
+        args, kwargs = queue.decode_payload(row.payload)
+        media = args[1] if name == "legacy media" else kwargs["document"]
+        if isinstance(media, str):
+            seen.append((name, media))
+        else:
+            stream = getattr(media, "input_file_content", media)
+            seen.append((name, stream.read() if hasattr(stream, "read") else stream))
+            for closeable in queue.payload_closeables(args, kwargs):
+                closeable.close()
+    seen.append(("legacy version", queue.queued_payload_version(legacy)))
+    events = (
+        ("begin", lambda row_id: queue.begin_delivery_attempt(row_id, MOVE_ATTEMPT)),
+        ("complete", lambda row_id: queue.record_telegram_completion(row_id, b"\x01receipt")),
+        ("confirm", lambda row_id: queue.record_telegram_completion(row_id, b"\x01seen", operator_confirmed=True)),
+        ("reconcile", lambda row_id: queue.defer_reconciliation([row_id], now)),
+        ("delete", lambda row_id: queue.delete(row_id, successful=True)),
+    )
+    for name, row_id in sorted(rows.items(), key=lambda item: item[1]):
+        for event, apply in events:
+            try:
+                apply(row_id)
+                outcome = "ok"
+            except Exception as error:  # noqa: BLE001 - the refusal itself is what both backends must agree on
+                outcome = type(error).__name__
+            seen.append((name, event, outcome))
+        seen.append(("after " + name, [head.id for head in queue.heads(include_payload=False, ready_only=True)]))
+    seen.append(_observe_queue(queue, now))
+    seen.append(("next id", _enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "next"}))))
+    return seen
+
+
+def test_moved_queue_loads_and_progresses_exactly_as_its_sqlite_copy(
+    tmp_path, postgres_config, manager_factory, frozen_queue_clock,
+):
+    now = frozen_queue_clock.now
+    moved, copy = tmp_path / "moved", tmp_path / "sqlite-copy"
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"external media bytes")
+    rows = _build_every_queue_state(moved, external, now)
+    shutil.copytree(moved, copy)
+    with closing(sqlite3.connect(moved / "outbound-queue.sqlite3")) as source:
+        before = source.execute(f"SELECT {QUEUE_SELECT} FROM outbound_queue ORDER BY id").fetchall()
+
+    record = migrate_db.migrate(moved, postgres_config, queue_only=True)
+    assert record["tables"]["outbound_queue"]["rows"] == len(before) == len(rows)
+    assert record["tables"]["history_ownership"]["rows"] == 2
+    assert record["tables"]["source_cancellations"]["rows"] == 1
+    with pytest.raises(QueuePersistenceError, match="moved to PostgreSQL"):
+        OutboundQueue(moved)
+    manager_factory(moved, postgres_config)  # Starts on the moved queue.
+    queue = _postgresql_queue(moved, postgres_config)
+    try:
+        imported = queue.connection.execute(f"SELECT {QUEUE_SELECT} FROM outbound_queue ORDER BY id").fetchall()
+        # Opening repairs exactly what it repairs on SQLite; everything else is byte-identical.
+        repaired = {rows["legacy topic"], rows["history sender"], rows["in flight"], rows["aggregate"]}
+        assert [row for row in imported if row[0] not in repaired] == [row for row in before if row[0] not in repaired]
+        on_postgresql = _progress_moved_queue(queue, rows, now)
+        postgresql_tables = _queue_tables(queue)
+    finally:
+        queue.close()
+    external.write_bytes(b"external media bytes")  # The first run's delete removed this shared file.
+    sqlite_queue = OutboundQueue(copy)
+    try:
+        on_sqlite = _progress_moved_queue(sqlite_queue, rows, now)
+        sqlite_tables = _queue_tables(sqlite_queue)
+    finally:
+        sqlite_queue.close()
+
+    assert on_postgresql == on_sqlite
+    assert postgresql_tables == sqlite_tables
+    assert sorted(path.name for path in (moved / "outbound-media").iterdir()) == sorted(
+        path.name for path in (copy / "outbound-media").iterdir())
+    # The comparison is not vacuous: rows loaded, repaired, sent and removed.
+    initial = {item[0]: item[1] for item in on_postgresql[0]}
+    assert rows["blocking"] in initial["ready heads"]  # A blocking row goes ahead of its lane.
+    assert rows["behind waiting"] not in initial["ready heads"]
+    states = {row_id: (state, attempts) for row_id, state, attempts in initial["states"]}
+    assert states[rows["in flight"]] == ("in_flight", FAILED_ATTEMPTS_LIMIT)
+    assert states[rows["sent pending"]][0] == "sent_pending"
+    assert len({state for state, _ in states.values()}) >= 6
+    assert ("legacy media", b"legacy inline media") in on_postgresql
+    assert ("sidecar media", b"sidecar media bytes") in on_postgresql
+    assert ("external media", external.as_uri()) in on_postgresql
+    assert ("waiting", "delete", "ok") in on_postgresql and ("logical", "complete", "IllegalAggregationTransitionError") in on_postgresql
+    assert on_postgresql[-1] == ("next id", max(rows.values()) + 2)
+    loaded = dict(item for item in on_postgresql if item[0] == "rows after loading")["rows after loading"]
+    assert len(loaded["outbound_queue"]) == len(rows) and len(loaded["source_cancellations"]) == 1
+
+
+def _sqlite_queue(directory, rows=2):
+    queue = OutboundQueue(directory)
+    try:
+        for index in range(rows):
+            _enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": f"row {index}"}))
+        _enqueue(queue, QueueRequest("send_document", (), {"chat_id": -1001, "document": b"sidecar bytes"}))
+    finally:
+        queue.close()
+    return directory
+
+
+def _queue_tables_in(config):
+    target = postgresql_database(config)
+    try:
+        with connection_scope(target):
+            return sorted(set(target.get_tables(schema=current_schema(target))) & {
+                migrate_db.QUEUE_IMPORT_TABLE, *migrate_db.QUEUE_COLUMNS})
+    finally:
+        target.close_all()
+
+
+def _import_version(config):
+    target = postgresql_database(config)
+    try:
+        with connection_scope(target):
+            return migrate_db._read_import(target)["version"]
+    finally:
+        target.close_all()
+
+
+def _sqlite_rows(directory):
+    with closing(sqlite3.connect(directory / "outbound-queue.sqlite3")) as source:
+        return source.execute(f"SELECT {QUEUE_SELECT} FROM outbound_queue ORDER BY id").fetchall()
+
+
+def test_queue_from_the_first_schema_gets_the_same_defaults_and_next_id(tmp_path, postgres_config, manager_factory):
+    moved, copy = tmp_path / "moved", tmp_path / "sqlite-copy"
+    moved.mkdir()
+    with closing(sqlite3.connect(moved / "outbound-queue.sqlite3")) as source, source:
+        source.execute(
+            "CREATE TABLE outbound_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "priority INTEGER NOT NULL CHECK (priority IN (0, 1)), telegram_chat_id INTEGER NOT NULL, "
+            "operation TEXT NOT NULL, payload BLOB NOT NULL, slave_id TEXT NULL, "
+            "required_sender_bot_id TEXT NULL, created_at REAL NOT NULL)")
+        payload = OutboundQueue.encode_payload((), {"chat_id": -1001, "text": "old"})
+        source.executemany(
+            "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,slave_id,"
+            "required_sender_bot_id,created_at) VALUES(?,?,?,?,?,?,?)",
+            [(0, -1001, "send_message", payload, None, None, 1000.5), (1, -1002, "send_message", payload, "slave", "77", 1001)])
+        source.execute("INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                       "VALUES(0,-1003,'send_message',?,1002)", (payload,))
+        source.execute("DELETE FROM outbound_queue WHERE id = 3")
+    shutil.copytree(moved, copy)
+
+    record = migrate_db.migrate(moved, postgres_config, queue_only=True)
+    assert {table: summary["rows"] for table, summary in record["tables"].items()} == {
+        "outbound_queue": 2, "history_ownership": 0, "source_cancellations": 0}
+    manager_factory(moved, postgres_config)
+    queue = _postgresql_queue(moved, postgres_config)
+    sqlite_queue = OutboundQueue(copy)
+    try:
+        assert _queue_tables(queue) == _queue_tables(sqlite_queue)
+        assert _queue_tables(queue)["outbound_queue"][0][8:13] == (None, "queued", None, 0.0, 0)
+        added = [_enqueue(each, QueueRequest("send_message", (), {"chat_id": -1001, "text": "new"}))
+                 for each in (queue, sqlite_queue)]
+        assert added == [4, 4]
+    finally:
+        queue.close()
+        sqlite_queue.close()
+
+
+def test_queue_move_refuses_a_target_that_already_has_queue_rows(tmp_path, postgres_config, manager_factory):
+    manager_factory(tmp_path / "native", postgres_config)
+    native = _postgresql_queue(tmp_path / "native", postgres_config)
+    try:
+        _enqueue(native, QueueRequest("send_message", (), {"chat_id": -1, "text": "native"}))
+    finally:
+        native.close()
+    source = _sqlite_queue(tmp_path / "upgrade")
+    with pytest.raises(RuntimeError, match="not empty and has no verified queue import record"):
+        migrate_db.migrate(source, postgres_config, queue_only=True)
+    assert migrate_db.QUEUE_IMPORT_TABLE not in _queue_tables_in(postgres_config)
+    assert not (source / POSTGRESQL_QUEUE_MARKER).exists()
+    assert len(_sqlite_rows(source)) == 3
+
+
+def test_queue_move_refuses_while_a_bot_owns_the_postgresql_queue(tmp_path, postgres_config, manager_factory):
+    manager_factory(tmp_path / "running", postgres_config)
+    running = _postgresql_queue(tmp_path / "running", postgres_config)
+    try:
+        with pytest.raises(RuntimeError, match="stop the bot before moving the queue"):
+            migrate_db.migrate(_sqlite_queue(tmp_path / "upgrade"), postgres_config, queue_only=True)
+    finally:
+        running.close()
+    assert migrate_db.QUEUE_IMPORT_TABLE not in _queue_tables_in(postgres_config)
+
+
+def test_queue_change_during_the_move_rolls_it_back(tmp_path, postgres_config, monkeypatch):
+    source = _sqlite_queue(tmp_path / "channel")
+    original = migrate_db._copy_queue_table
+
+    def copy_then_change_media(db, connection, table, *args):
+        summary = original(db, connection, table, *args)
+        (source / "outbound-media" / "late.bin").write_bytes(b"written by a running bot")
+        return summary
+
+    monkeypatch.setattr(migrate_db, "_copy_queue_table", copy_then_change_media)
+    with pytest.raises(RuntimeError, match="changed during import"):
+        migrate_db.migrate(source, postgres_config, queue_only=True)
+    assert _queue_tables_in(postgres_config) == []
+    assert not (source / POSTGRESQL_QUEUE_MARKER).exists()
+
+
+def test_queue_change_after_the_move_is_not_merged(tmp_path, postgres_config, manager_factory):
+    source = _sqlite_queue(tmp_path / "channel")
+    with patch.object(migrate_db, "_write_receipt", side_effect=OSError("injected marker failure")), \
+            pytest.raises(OSError):
+        migrate_db.migrate(source, postgres_config, queue_only=True)
+    with pytest.raises(RuntimeError, match="unfinished or belongs to another data directory"):
+        manager_factory(source, postgres_config)
+    with closing(sqlite3.connect(source / "outbound-queue.sqlite3")) as connection, connection:
+        connection.execute("UPDATE outbound_queue SET priority = 1 WHERE id = 1")
+    with pytest.raises(RuntimeError, match="changed since it was moved; refusing to merge"):
+        migrate_db.migrate(source, postgres_config, queue_only=True)
+    assert not (source / POSTGRESQL_QUEUE_MARKER).exists()
+
+
+def test_queue_move_refuses_a_missing_media_sidecar(tmp_path, postgres_config):
+    source = _sqlite_queue(tmp_path / "channel")
+    for sidecar in (source / "outbound-media").iterdir():
+        sidecar.unlink()
+    with pytest.raises(RuntimeError, match="Local queued media is missing"):
+        migrate_db.migrate(source, postgres_config, queue_only=True)
+    assert _queue_tables_in(postgres_config) == []
+
+
+def test_process_death_after_the_queue_commit_is_finished_by_a_rerun(tmp_path, postgres_config, manager_factory):
+    source = _sqlite_queue(tmp_path / "channel")
+    program = (
+        "import os,json,sys; from pathlib import Path; from efb_telegram_master import migrate_db as m; "
+        "m._write_receipt=lambda *a,**k: os._exit(97); "
+        "m.migrate(Path(sys.argv[1]),json.loads(sys.argv[2]),1,queue_only=True)"
+    )
+    result = subprocess.run([sys.executable, "-c", program, str(source), json.dumps(postgres_config)],
+                            capture_output=True, timeout=30, check=False)
+    assert result.returncode == 97, result.stderr.decode()
+    assert not (source / POSTGRESQL_QUEUE_MARKER).exists()
+    target = postgresql_database(postgres_config)
+    with connection_scope(target):
+        committed = migrate_db._read_queue_import(target)
+    target.close_all()
+    with pytest.raises(RuntimeError, match="unfinished"):
+        manager_factory(source, postgres_config)
+
+    record = migrate_db.migrate(source, postgres_config, queue_only=True)
+    assert record["import_id"] == committed["import_id"]
+    assert json.loads((source / POSTGRESQL_QUEUE_MARKER).read_text())["import_id"] == record["import_id"]
+    manager_factory(source, postgres_config)
+    queue = _postgresql_queue(source, postgres_config)
+    try:
+        assert len(queue.heads(include_payload=False)) == 1
+        assert queue.connection.execute("SELECT count(*) FROM outbound_queue").fetchone() == (3,)
+    finally:
+        queue.close()
+
+
+def test_native_install_with_a_sqlite_queue_starts_only_after_the_queue_move(tmp_path, postgres_config, manager_factory):
+    source = _sqlite_queue(tmp_path / "channel")
+    with pytest.raises(RuntimeError, match="still in outbound-queue.sqlite3.*--queue-only"):
+        manager_factory(source, postgres_config)
+    assert _queue_tables_in(postgres_config) == []
+    config_path = tmp_path / "postgresql.yaml"
+    config_path.write_text(json.dumps({"database": postgres_config}))
+    result = subprocess.run(
+        [sys.executable, "-m", "efb_telegram_master.migrate_db", "--data-dir", str(source),
+         "--config", str(config_path), "--queue-only"], capture_output=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr.decode()
+    assert json.loads(result.stdout)["tables"]["outbound_queue"]["rows"] == 3
+    assert "password" not in result.stdout.decode()
+    assert (source / "outbound-queue.sqlite3").exists()
+    manager_factory(source, postgres_config)
+    target = postgresql_database(postgres_config)
+    with connection_scope(target):
+        assert migrate_db._read_import(target) is None  # A native install gets no data import record.
+    target.close_all()
+
+
+def _as_an_earlier_import(directory, config):
+    """What an import by a version that left the queue in SQLite looks like."""
+    migrate_db.migrate(directory, config)
+    target = postgresql_database(config)
+    with connection_scope(target):
+        target.execute_sql(f"DROP TABLE {migrate_db.QUEUE_IMPORT_TABLE}, "
+                           + ", ".join(migrate_db.QUEUE_COLUMNS))
+        manifest = migrate_db._read_import(target)
+        target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s",
+                           (json.dumps(dict(manifest, version=2)),))
+    target.close_all()
+    (directory / POSTGRESQL_QUEUE_MARKER).unlink()
+
+
+@pytest.mark.parametrize("queue_only", [True, False])
+def test_imported_install_starts_only_after_the_queue_move(sqlite_source, postgres_config, manager_factory, queue_only):
+    _as_an_earlier_import(sqlite_source, postgres_config)
+    assert _import_version(postgres_config) == 2
+    with pytest.raises(RuntimeError, match="still in outbound-queue.sqlite3"):
+        manager_factory(sqlite_source, postgres_config)
+    migrate_db.migrate(sqlite_source, postgres_config, queue_only=queue_only)
+    assert _import_version(postgres_config) == 3
+    manager_factory(sqlite_source, postgres_config)
+    queue = _postgresql_queue(sqlite_source, postgres_config)
+    try:
+        assert queue.connection.execute("SELECT count(*) FROM outbound_queue").fetchone() == (2,)
+    finally:
+        queue.close()
+
+
+def test_queue_move_marks_the_import_record_and_only_with_a_committed_move(sqlite_source, postgres_config, manager_factory):
+    with patch.object(migrate_db, "_copy_queue_table", side_effect=RuntimeError("injected queue failure")), \
+            pytest.raises(RuntimeError, match="injected queue failure"):
+        migrate_db.migrate(sqlite_source, postgres_config)
+    assert _import_version(postgres_config) == 2
+    assert _queue_tables_in(postgres_config) == []
+
+    receipt = migrate_db.migrate(sqlite_source, postgres_config)
+    assert _import_version(postgres_config) == 3
+    assert migrate_db.migrate(sqlite_source, postgres_config)["import_id"] == receipt["import_id"]
+    assert _import_version(postgres_config) == 3
+    manager_factory(sqlite_source, postgres_config)
+
+
+@pytest.mark.parametrize("damage, message", [
+    ("UPDATE outbound_queue SET telegram_chat_id = 'chat' WHERE id = 1", "telegram_chat_id"),
+    ("UPDATE outbound_queue SET slave_id = 'a' || char(0) || 'b' WHERE id = 1", "slave_id"),
+    ("UPDATE outbound_queue SET reconcile_attempts = 9223372036854775807 WHERE id = 1", "reconcile_attempts"),
+    ("ALTER TABLE outbound_queue ADD COLUMN extra TEXT", "extra"),
+    ("CREATE TABLE unknown_queue_state(value)", None),
+])
+def test_queue_move_refuses_values_postgresql_would_change(tmp_path, postgres_config, damage, message):
+    source = _sqlite_queue(tmp_path / "channel")
+    with closing(sqlite3.connect(source / "outbound-queue.sqlite3")) as connection, connection:
+        connection.execute(damage)
+        if message is None:
+            connection.execute("INSERT INTO unknown_queue_state VALUES (1)")
+    with pytest.raises(RuntimeError, match=message or "unknown_queue_state"):
+        migrate_db.migrate(source, postgres_config, queue_only=True)
+    assert _queue_tables_in(postgres_config) == []
+
+
+def test_queue_move_refuses_a_value_too_large_to_send(tmp_path, postgres_config, monkeypatch):
+    monkeypatch.setattr(migrate_db, "MAX_QUEUE_VALUE_BYTES", 16)
+    with pytest.raises(RuntimeError, match="payload"):
+        migrate_db.migrate(_sqlite_queue(tmp_path / "channel"), postgres_config, queue_only=True)
+    assert _queue_tables_in(postgres_config) == []
+
+
+def test_queue_move_keeps_python_memory_bounded_by_bytes(tmp_path, postgres_config):
+    import tracemalloc
+
+    source = _sqlite_queue(tmp_path / "channel", rows=0)
+    blob = OutboundQueue.encode_payload((), {"chat_id": -1, "text": "x" * (1024 * 1024)})
+    with closing(sqlite3.connect(source / "outbound-queue.sqlite3")) as connection, connection:
+        connection.executemany(
+            "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) VALUES(0,-1,'send_message',?,1)",
+            ((blob,) for _ in range(96)))
+    tracemalloc.start()
+    try:
+        record = migrate_db.migrate(source, postgres_config, batch_size=500, queue_only=True)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert record["tables"]["outbound_queue"]["rows"] == 97
+    # 96 MiB of payloads would go into one 500-row batch; the byte bound splits it.
+    assert peak < 32 * 1024 * 1024

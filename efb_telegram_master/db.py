@@ -413,7 +413,7 @@ class DatabaseManager:
         self._managed_database = actual_db
         database.initialize(actual_db)
         try:
-            from .migrate_db import validate_runtime_cutover
+            from .migrate_db import validate_runtime_cutover, validate_runtime_queue
 
             # SQLite must be checked before opening it (opening can create a new file).
             if self._is_sqlite:
@@ -423,6 +423,7 @@ class DatabaseManager:
                     if not self._is_sqlite:
                         actual_db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
                         validate_runtime_cutover(base_path, actual_db)
+                        validate_runtime_queue(base_path, actual_db)
                     self._create_missing_tables()
                     self._check_and_run_migrations()
                     if not self._is_sqlite:
