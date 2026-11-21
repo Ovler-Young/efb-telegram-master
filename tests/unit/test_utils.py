@@ -141,3 +141,108 @@ def test_gif_conversion_uses_process_timeout(monkeypatch, tmp_path):
         with utils.gif_conversion(input_file, "tests.slave") as output:
             assert output.read() == b"GIF89a"
         assert input_file.closed
+
+
+def _load_windows_utils(monkeypatch):
+    """Load a copy of the utils module that defines the Windows variants."""
+    import importlib.util
+
+    from efb_telegram_master import utils
+
+    spec = importlib.util.spec_from_file_location("efb_telegram_master._utils_windows", utils.__file__)
+    module = importlib.util.module_from_spec(spec)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Uses the non-Windows file conversion path")
+@pytest.mark.parametrize("first_size, retried", [(1_000_001, True), (1_000_000, False)])
+def test_gif_conversion_retries_once_at_12_fps_only_when_over_limit(monkeypatch, tmp_path, first_size, retried):
+    from efb_telegram_master import utils
+
+    source = tmp_path / "animation.mp4"
+    source.write_bytes(b"video input")
+    conversions = []
+
+    def run(args, **kwargs):
+        if args[0] == "ffprobe":
+            return SimpleNamespace(returncode=0, stdout=b'{"streams": [], "format": {}}', stderr=b"")
+        conversions.append(args)
+        size = first_size if len(conversions) == 1 else 10
+        Path(args[-2]).write_bytes(b"\0" * size)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(utils.subprocess, "run", run)
+    with source.open("rb") as input_file, utils.gif_conversion(input_file, "tests.slave") as output:
+        assert len(output.read()) == (10 if retried else first_size)
+
+    assert len(conversions) == (2 if retried else 1)
+    assert "fps=fps=12" not in " ".join(conversions[0])
+    if retried:
+        assert "fps=fps=12" in " ".join(conversions[1])
+
+
+@pytest.mark.parametrize("first_size, retried", [(1_000_001, True), (1_000_000, False)])
+def test_windows_gif_conversion_retries_once_at_12_fps_only_when_over_limit(monkeypatch, first_size, retried):
+    utils = _load_windows_utils(monkeypatch)
+    conversions = []
+
+    def ffprobe(stream):
+        return {}
+
+    def run(args, input_stream):
+        conversions.append(args)
+        assert input_stream.read() == b"video input"
+        return b"\0" * (first_size if len(conversions) == 1 else 10)
+
+    monkeypatch.setattr(utils, "ffprobe", ffprobe)
+    monkeypatch.setattr(utils, "_run_ffmpeg_stream_command", run)
+    output = utils.gif_conversion(BytesIO(b"video input"), "tests.slave")
+    assert len(output.read()) == (10 if retried else first_size)
+    output.close()
+
+    assert len(conversions) == (2 if retried else 1)
+    assert "fps=fps=12" not in " ".join(conversions[0])
+    if retried:
+        assert "fps=fps=12" in " ".join(conversions[1])
+
+
+def test_ffmpeg_stream_command_waits_for_exit_before_reading_the_exit_code(monkeypatch):
+    from efb_telegram_master import utils
+
+    class FakeProcess:
+        def __init__(self, *args, **kwargs):
+            self.stdin = BytesIO()
+            self.stdout = BytesIO(b"output")
+            self.stderr = BytesIO(b"failed")
+            self._returncode = None
+
+        @property
+        def returncode(self):
+            return self._returncode
+
+        def wait(self, timeout=None):
+            self._returncode = 0
+            return self._returncode
+
+    monkeypatch.setattr(utils.subprocess, "Popen", FakeProcess)
+    assert utils._run_ffmpeg_stream_command(["ffmpeg"], BytesIO(b"input")) == b"output"
+
+
+@pytest.mark.parametrize("flag_name", ["topic_channel_emoji", "topic_chat_type_emoji"])
+def test_topic_emoji_flags_default_on_and_reject_non_booleans(flag_name):
+    assert ExperimentalFlagsManager(SimpleNamespace(config={}))(flag_name) is True
+    assert ExperimentalFlagsManager(SimpleNamespace(config={"flags": {flag_name: False}}))(flag_name) is False
+    for bad_value in ("false", 0, None):
+        with raises(ValueError, match=flag_name):
+            ExperimentalFlagsManager(SimpleNamespace(config={"flags": {flag_name: bad_value}}))
+
+
+def test_wechat_quote_reply_flag_defaults_off_and_rejects_non_booleans():
+    assert ExperimentalFlagsManager(SimpleNamespace(config={}))("wechat_quote_reply") is False
+    assert ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"wechat_quote_reply": True}}))("wechat_quote_reply") is True
+    for bad_value in ("true", 1, None):
+        with raises(ValueError, match="wechat_quote_reply"):
+            ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"wechat_quote_reply": bad_value}}))

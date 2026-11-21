@@ -6,12 +6,13 @@ import html
 import json
 import logging
 import os
+import re
 import subprocess
 import urllib.parse
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
+from typing import Any, Dict, NamedTuple, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
 
 import ffmpeg
 import telegram
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
     from .db import DatabaseManager
 
 FFMPEG_TIMEOUT = 60
+GIF_SIZE_LIMIT = 1_000_000
+GIF_RETRY_FPS = 12
 DEFAULT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 AGGREGATION_CHAT_TYPES = ("group", "private", "system", "official_account")
 TOPIC_GROUP_CHAT_TYPES = tuple(chat_type for chat_type in AGGREGATION_CHAT_TYPES if chat_type != "system")
@@ -82,6 +85,45 @@ def removal_edit(media_type: str, text: str, *, prefix: str = "", link: Optional
     return "edit_message_caption", dict(caption=text or "[message removed]", caption_entities=entities, parse_mode=None)
 
 
+_WECHAT_QUOTE_RE = re.compile(r"^「(.+?)」\n-[\- ]{10,80}\n", re.DOTALL)
+
+
+class WeChatQuote(NamedTuple):
+    """A quote block at the start of a WeChat text: ``「sender：quoted text」`` and a dashed divider line."""
+    sender: str | None
+    body: str
+    content_end: int
+    """Offset of the closing ``」`` in the text."""
+    end: int
+    """Offset of the first character after the divider line."""
+
+
+def parse_wechat_quote(text: str) -> WeChatQuote | None:
+    """Parse the quote block a WeChat slave puts in front of a reply, or None if the text has none."""
+    if not text.startswith("「"):
+        return None
+    found = _WECHAT_QUOTE_RE.match(text)
+    if found is None:
+        return None
+    content = found.group(1)
+    sender: str | None = None
+    body = content
+    for index, char in enumerate(content):
+        if char in "：:":
+            sender = content[:index].strip().lstrip("@").strip() or None
+            body = content[index + 1:]
+            break
+    return WeChatQuote(sender, " ".join(body.split()), found.end(1), found.end())
+
+
+def quote_text_key(text: str) -> str:
+    """Whitespace-normalised text, with any leading quote block removed, for comparing a quote with a stored message."""
+    quote = parse_wechat_quote(text) if text.startswith("「") else None
+    if quote is not None:
+        text = text[quote.end:]
+    return " ".join(text.split())
+
+
 TelegramChatID = NewType('TelegramChatID', int)
 TopicGroup = TelegramChatID | dict[str, TelegramChatID] | None
 TelegramTopicID = NewType('TelegramTopicID', int)
@@ -114,6 +156,8 @@ class ExperimentalFlagsManager(LocaleMixin):
         "api_base_file_url": None,
         "local_tdlib_api": False,
         "topic_group": None,
+        "topic_channel_emoji": True,
+        "topic_chat_type_emoji": True,
         "timezone": DEFAULT_TIMEZONE.key,
         # Concurrent outbound sends; also sizes the HTTP connection pool.
         "send_worker_count": 8,
@@ -125,6 +169,7 @@ class ExperimentalFlagsManager(LocaleMixin):
         "text_aggregation_idle_seconds": 1800,
         "text_aggregation_max_members": 200,
         "text_aggregation_max_payload_bytes": 256 * 1024,
+        "wechat_quote_reply": False,
     }
 
     @staticmethod
@@ -176,6 +221,11 @@ class ExperimentalFlagsManager(LocaleMixin):
                                for chat_type in rule["chat_types"])):
                     raise ValueError("flags.text_aggregation_rules rules require non-empty origins and chat_types lists; "
                                      "chat_types supports group, private, system, official_account")
+        for topic_emoji_flag in ("topic_channel_emoji", "topic_chat_type_emoji"):
+            if type(self.config[topic_emoji_flag]) is not bool:
+                raise ValueError(f"flags.{topic_emoji_flag} must be true or false")
+        if type(self.config["wechat_quote_reply"]) is not bool:
+            raise ValueError("flags.wechat_quote_reply must be true or false")
         try:
             timezone_name = self.config["timezone"]
             if not isinstance(timezone_name, str):
@@ -502,47 +552,74 @@ if os.name == "nt":
 
 
     def gif_conversion(file: IO[bytes], channel_id: str) -> IO[bytes]:
-        """Convert Telegram GIF to real GIF, the NT way."""
-        gif_file = NamedTemporaryFile(suffix='.gif')
+        """Convert Telegram GIF to real GIF, the NT way.
+
+        If the result is larger than :data:`GIF_SIZE_LIMIT`, convert once more
+        at :data:`GIF_RETRY_FPS` frames per second.
+        """
         file.seek(0)
 
         # Use custom ffprobe command to read from stream
         metadata = ffprobe(file)
 
-        # Set input/output of ffmpeg to stream
-        stream = ffmpeg.input("pipe:")
-        if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
-            # Workaround: Compress GIF for slave channel `blueset.wechat`
-            # TODO: Move this logic to `blueset.wechat` in the future
-            stream = stream.filter("scale", 600, -2)
-        # Need to specify file format here as no extension hint presents.
-        args = stream.output("pipe:", format="gif").compile()
-        file.seek(0)
+        for attempt in range(2):
+            gif_file = NamedTemporaryFile(suffix='.gif')
+            file.seek(0)
 
-        # subprocess.Popen would still try to access the file handle instead of
-        # using standard IO interface. Not sure if that would work on Windows.
-        # Using the most classic buffer and copy via IO interface just to play
-        # safe.
-        gif_file.write(_run_ffmpeg_stream_command(args, file))
+            # Set input/output of ffmpeg to stream
+            stream = ffmpeg.input("pipe:")
+            if attempt == 1:
+                stream = stream.filter("fps", fps=GIF_RETRY_FPS)
+            if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
+                # Workaround: Compress GIF for slave channel `blueset.wechat`
+                # TODO: Move this logic to `blueset.wechat` in the future
+                stream = stream.filter("scale", 600, -2)
+            # Need to specify file format here as no extension hint presents.
+            args = stream.output("pipe:", format="gif").compile()
+
+            # subprocess.Popen would still try to access the file handle instead of
+            # using standard IO interface. Not sure if that would work on Windows.
+            # Using the most classic buffer and copy via IO interface just to play
+            # safe.
+            gif_file.write(_run_ffmpeg_stream_command(args, file))
+            gif_file.flush()
+            if attempt == 0 and os.path.getsize(gif_file.name) > GIF_SIZE_LIMIT:
+                gif_file.close()
+                continue
+            break
+
         file.close()
         gif_file.seek(0)
         return gif_file
 
 else:
     def gif_conversion(file: IO[bytes], channel_id: str) -> IO[bytes]:
-        """Convert Telegram GIF to real GIF, the non-NT way."""
-        gif_file = NamedTemporaryFile(suffix='.gif')
+        """Convert Telegram GIF to real GIF, the non-NT way.
+
+        If the result is larger than :data:`GIF_SIZE_LIMIT`, convert once more
+        at :data:`GIF_RETRY_FPS` frames per second.
+        """
         file.seek(0)
         metadata = json.loads(_run_ffmpeg_command([
             'ffprobe', '-show_format', '-show_streams', '-of', 'json', file.name,
         ]).decode('utf-8'))
-        stream = ffmpeg.input(file.name)
-        if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
-            # Workaround: Compress GIF for slave channel `blueset.wechat`
-            # TODO: Move this logic to `blueset.wechat` in the future
-            stream = stream.filter("scale", 600, -2)
-        args = stream.output(gif_file.name).overwrite_output().compile()
-        _run_ffmpeg_command(args)
+
+        for attempt in range(2):
+            gif_file = NamedTemporaryFile(suffix='.gif')
+            stream = ffmpeg.input(file.name)
+            if attempt == 1:
+                stream = stream.filter("fps", fps=GIF_RETRY_FPS)
+            if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
+                # Workaround: Compress GIF for slave channel `blueset.wechat`
+                # TODO: Move this logic to `blueset.wechat` in the future
+                stream = stream.filter("scale", 600, -2)
+            args = stream.output(gif_file.name).overwrite_output().compile()
+            _run_ffmpeg_command(args)
+            if attempt == 0 and os.path.getsize(gif_file.name) > GIF_SIZE_LIMIT:
+                gif_file.close()
+                continue
+            break
+
         file.close()
         gif_file.seek(0)
         return gif_file
