@@ -549,7 +549,7 @@ def _import_rows(db, source: sqlite3.Connection, batch_size: int, models=MODELS)
     for model in models:
         count = 0
         digest = hashlib.sha256()
-        replaced = Counter()
+        replaced: Counter[str] = Counter()
         for batch in chunked(_source_rows(source, model, replaced=replaced), batch_size):
             model.insert_many(batch, fields=model._meta.sorted_fields).execute()
             for row in batch:
