@@ -235,22 +235,22 @@ def topic_forum_ids(topic_group: TopicGroup) -> list[TelegramChatID]:
     return [topic_group] if topic_group else []
 
 
-def topic_forum_for(topic_group: TopicGroup, chat: BaseChat,
+def topic_forum_for(topic_group: TopicGroup, slave_uid: EFBChannelChatIDStr, chat_type: str | None,
                     db: 'DatabaseManager') -> TelegramChatID | None:
     """Choose the forum chat that holds the topic of a remote chat.
+
+    ``chat_type`` is the classification from ``chat_type_of``, or None when the type is not known (for
+    example, the chat can no longer be resolved).
 
     A single chat ID is used for every chat. A mapping picks the forum by chat type, falling back to the
     ``private`` entry. With a mapping, a chat that already has a topic stays in the forum of that topic.
     System chats and chats without a forum stay in the main chat (None).
     """
-    if not topic_group:
-        return None
-    chat_type = chat_type_of(chat)
-    if chat_type == "system":
+    if not topic_group or chat_type == "system":
         return None
     if not isinstance(topic_group, dict):
         return TelegramChatID(topic_group)
-    existing = db.get_topic_chat_id(chat_id_to_str(chat=chat))
+    existing = db.get_topic_chat_id(slave_uid)
     if existing is not None:
         return existing
     forum = topic_group.get(chat_type or "private") or topic_group.get("private")

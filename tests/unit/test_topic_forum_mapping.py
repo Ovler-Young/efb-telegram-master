@@ -175,3 +175,23 @@ def test_topic_group_flag_rejects_bad_shapes(channel, value):
     with patch.dict(channel.config, {"flags": {"topic_group": value}}), \
          pytest.raises(ValueError, match="topic_group"):
         ExperimentalFlagsManager(channel)
+
+
+@pytest.mark.parametrize("config", [PRIVATE_FORUM, MAPPING], ids=["single_forum", "mapping"])
+def test_route_of_a_chat_that_can_no_longer_be_resolved_matches_the_sender(channel, chats, forum, config):
+    with patch.object(channel, "topic_group", config):
+        sent = _send(channel, chats.official)
+        channel.chat_manager.cache.pop((chats.official.module_id, chats.official.uid), None)
+        channel.db.delete_slave_chat_info(chats.official.module_id, chats.official.uid)
+
+        assert _route(channel, chats.official) == (sent[0], str(sent[1]))
+
+
+def test_every_database_metric_label_is_allowed():
+    import re
+    from pathlib import Path
+
+    from efb_telegram_master import db, etm_metrics
+    labels = re.findall(r'@observe_database_method\("(\w+)"\)', Path(db.__file__).read_text())
+    assert labels
+    assert set(labels) <= etm_metrics._DATABASE_METHODS

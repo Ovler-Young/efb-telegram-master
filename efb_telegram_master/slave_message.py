@@ -530,7 +530,8 @@ class SlaveMessageProcessor(LocaleMixin):
 
         if tg_chat:
             tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
-        topic_group_to_use = utils.topic_forum_for(self.channel.topic_group, chat, self.db)
+        topic_group_to_use = utils.topic_forum_for(
+            self.channel.topic_group, chat_uid, utils.chat_type_of(chat), self.db)
         if topic_group_to_use:
             if not isinstance(chat, SystemChat):
                 if not tg_chat:

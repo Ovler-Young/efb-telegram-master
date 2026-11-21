@@ -36,8 +36,10 @@ def current_source_route(channel: 'TelegramChannel', origin: str) -> Tuple[int, 
     """Read the current source association without creating a topic."""
     associations = channel.db.get_chat_assoc(slave_uid=origin)
     module_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(origin))
-    chat = channel.chat_manager.get_chat(module_id, chat_id, build_dummy=True)
-    forum = utils.topic_forum_for(channel.topic_group, chat, channel.db)
+    # An unresolved chat has an unknown type; it must not be taken for a system chat.
+    chat = channel.chat_manager.get_chat(module_id, chat_id)
+    forum = utils.topic_forum_for(channel.topic_group, EFBChannelChatIDStr(origin),
+                                  utils.chat_type_of(chat) if chat else None, channel.db)
     target = int(utils.chat_id_str_to_id(associations[0])[1]) if associations else int(
         forum or channel.config['admins'][0])
     topic = channel.db.get_topic_thread_id(slave_uid=origin, topic_chat_id=target) if forum else None
