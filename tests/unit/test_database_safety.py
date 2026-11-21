@@ -29,7 +29,7 @@ from efb_telegram_master.db import (
 from efb_telegram_master.db_runtime import DataDirectoryLock, connection_scope, current_schema, postgresql_database
 from efb_telegram_master.delivery_states import FAILED_ATTEMPTS_LIMIT, HoldKind
 from efb_telegram_master.outbound import (
-    OutboundQueue, QueuePersistenceError, QueueRequest, SenderSelection, _PostgresqlBlobReader,
+    OutboundQueue, QueuePersistenceError, QueueRequest, SenderSelection,
 )
 
 MODELS = migrate_db.MODELS
@@ -1243,7 +1243,7 @@ def test_postgresql_queue_delivers_holds_retargets_and_reconciles(tmp_path, post
 
 def test_postgresql_queue_recovers_a_raw_legacy_inline_media_row(tmp_path, postgres_config, manager_factory):
     manager_factory(tmp_path, postgres_config)
-    media = bytes(range(256)) * (3 * _PostgresqlBlobReader.CHUNK_BYTES // 256 + 7)
+    media = bytes(range(256)) * (3 * 4096 + 7)  # Just over 3 MiB, so the read spans several chunks.
     legacy = b"\x01" + pickle.dumps(((QUEUE_CHAT, io.BytesIO(media)), {"caption": "c"}), protocol=5)
     queue = _postgresql_queue(tmp_path, postgres_config)
     try:
@@ -1269,6 +1269,34 @@ def test_postgresql_queue_recovers_a_raw_legacy_inline_media_row(tmp_path, postg
         assert list(reopened.media_dir.iterdir()) == []
     finally:
         reopened.close()
+
+
+def test_postgresql_payload_version_reads_under_the_queue_lock(tmp_path, postgres_config, manager_factory):
+    manager_factory(tmp_path, postgres_config)
+    queue = _postgresql_queue(tmp_path, postgres_config)
+    other_thread_took_lock = []
+
+    def try_lock():
+        acquired = queue._lock.acquire(blocking=False)
+        if acquired:
+            queue._lock.release()
+        other_thread_took_lock.append(acquired)
+
+    def opening_reader(reader, *args, original=OutboundQueue._payload_reader):
+        # The read shares the queue session, so another thread's transaction must wait for it.
+        attempt = threading.Thread(target=try_lock)
+        attempt.start()
+        attempt.join()
+        return original(reader, *args)
+
+    try:
+        row_id, _ = queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -7, "text": "x"})],
+                                       lambda _: _send_message)
+        with patch.object(OutboundQueue, "_payload_reader", opening_reader):
+            assert queue.queued_payload_version(row_id) == 2
+        assert other_thread_took_lock == [False]
+    finally:
+        queue.close()
 
 
 def test_postgresql_queue_has_one_owner_and_releases_interrupted_sends(tmp_path, postgres_config, manager_factory):

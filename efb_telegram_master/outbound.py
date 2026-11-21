@@ -23,6 +23,7 @@ from functools import partial
 import time
 import urllib.request
 from concurrent.futures import Executor, Future
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, IO, Iterable, Mapping, Optional, Protocol, TYPE_CHECKING, final
@@ -2484,7 +2485,10 @@ class OutboundQueue:
             ).fetchone()
         if row is None:
             return None
-        with self._payload_reader(row_id) as payload:
+        # The PostgreSQL reader runs on the shared queue session, so it must
+        # not interleave with another thread's transaction there.
+        shared_session = isinstance(self.connection, _PostgresqlConnection)
+        with self._lock if shared_session else nullcontext(), self._payload_reader(row_id) as payload:
             marker = payload.read(1)
         return marker[0] if marker else None
 
