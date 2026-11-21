@@ -165,3 +165,29 @@ def test_etm_chat_copy(db, slave):
     for i in attributes:
         assert getattr(chat, i) == getattr(copied, i)
     assert chat.db is copied.db
+
+
+@fixture
+def topic_chat(db, slave):
+    return convert_chat(db, slave.chat_with_alias)
+
+
+def test_topic_title_follows_each_emoji_option(topic_chat, slave):
+    name = topic_chat.display_name
+    channel_emoji, type_emoji = slave.channel_emoji, topic_chat.chat_type_emoji
+
+    assert topic_chat.topic_title() == topic_chat.chat_title == f"{channel_emoji}{type_emoji} {name}"
+    assert topic_chat.topic_title(channel_emoji=False) == f"{type_emoji} {name}"
+    assert topic_chat.topic_title(chat_type_emoji=False) == f"{channel_emoji} {name}"
+    assert topic_chat.topic_title(channel_emoji=False, chat_type_emoji=False) == name
+
+
+def test_topic_title_keeps_instance_mark_and_blank_name_full_form(topic_chat):
+    custom_instance = topic_chat.copy()
+    custom_instance.module_id += "#custom"
+    assert custom_instance.topic_title(channel_emoji=False, chat_type_emoji=False) == f"*{topic_chat.display_name}"
+
+    blank = topic_chat.copy()
+    blank.name = ""
+    blank.alias = None
+    assert blank.topic_title(channel_emoji=False, chat_type_emoji=False) == blank.chat_title

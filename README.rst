@@ -856,6 +856,59 @@ e.g.:
       to route messages between a topic and its linked remote chat.
     - The id(s) set here will be the default topic group(s) for new chats.
 
+-   ``topic_channel_emoji`` *(bool)* [Default: ``true``]
+
+    Put the slave channel's emoji in front of a forum topic's name, so
+    topics from several slave channels in one forum can be told apart.
+    Turn it off to leave it out.
+
+-   ``topic_chat_type_emoji`` *(bool)* [Default: ``true``]
+
+    Put an emoji for the chat type (private, group, or system) in front of
+    a forum topic's name, so chats of different types in one forum can be
+    told apart. Turn it off to leave it out.
+
+    With both topic emoji flags on, a topic is named like ``💬👤 Alice``.
+    Telegram draws a topic's default icon from the first character of its
+    name, so some clients show an emoji as the icon when the name starts
+    with one. With both flags off the topic is named ``Alice`` and its
+    default icon is the letter ``A``. The asterisk (``*``) that marks a
+    slave channel running on a non-default instance stays in either case
+    (``*Alice``), and a chat with a blank name keeps the full form because
+    Telegram does not accept empty topic names. A new setting applies to
+    topics ETM creates afterwards and to topics it renames when it refreshes
+    topic info, relinks a forum, or repairs one with ``/relink repair``.
+    Existing topics are not renamed at startup.
+
+    .. code:: yaml
+
+       flags:
+           topic_channel_emoji: false
+           topic_chat_type_emoji: false
+
+-   ``wechat_quote_reply`` *(bool)* [Default: ``false``]
+
+    Show a WeChat quote as a Telegram reply. A WeChat slave delivers a reply
+    to a message as text that starts with the quoted message in ``「…」``,
+    followed by a line of dashes. With this flag on, that quote is shown as
+    a collapsible quote, and the message is sent as a reply to the quoted
+    message when exactly one of the chat's newest 200 logged messages from
+    the last 48 hours has that text. If the quote names a sender, the
+    sender is used to tell apart messages with the same text. With no
+    unique match the message is sent without a reply, quote included.
+
+    Only text quotes are matched. A quoted message that is still waiting to
+    be sent or is older than 48 hours gets no reply, and neither does a
+    quote in a chat where text aggregation is on, as the message is then
+    merged into an aggregated one. A quote of an aggregated message replies
+    to the aggregated message that contains it. In a forum topic the quote
+    is shown, but no reply is attached yet.
+
+    .. code:: yaml
+
+       flags:
+           wechat_quote_reply: true
+
 Network configuration: timeout tweaks
 -------------------------------------
 

@@ -707,6 +707,7 @@ def test_durable_reaction_reply_updates_the_canonical_mapping(
     processor = object.__new__(SlaveMessageProcessor)
     processor.logger = logging.getLogger("tests.canonical-reaction")
     processor.chat_manager = SimpleNamespace(update_chat_obj=lambda chat: chat)
+    processor.flag = lambda name: False
     destinations = []
 
     def send(msg, destination, thread_id, template, reactions, edit_id, target_id, markup, silent, *, on_db_complete):

@@ -52,7 +52,7 @@ from .aggregate import (
     AggregatePayload, MemberEvent, MemberStatus, SourceMember, apply_member_event, member_identity, member_message,
 )
 from .utils import TelegramChatID, EFBChannelChatIDStr, TgChatMsgIDStr, message_id_to_str, \
-    chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID, message_id_str_to_id
+    chat_id_to_str, OldMsgID, chat_id_str_to_id, TelegramMessageID, TelegramTopicID, message_id_str_to_id, quote_text_key
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -1349,6 +1349,53 @@ class DatabaseManager:
             ).order_by(MsgLog.time.desc(nulls="LAST")).limit(1).first()
         except DoesNotExist:
             return None
+
+    @observe_database_method("find_quote_sources")
+    def find_quote_sources(self, slave_origin_uid: EFBChannelChatIDStr, target_chat_id: TelegramChatID,
+                           quote_body: str, since: datetime.datetime,
+                           limit: int = 200) -> list[tuple[str, str, str | None, str | None]]:
+        """Find the sources of recent messages in a chat whose text is a quoted text.
+
+        Reads the newest ``limit`` messages of the chat since ``since`` (the chat-and-time index
+        bounds the scan) and keeps those delivered to ``target_chat_id``. Independent messages match
+        when their text equals ``quote_body``; a combined message that contains it is opened to look
+        for the member with that text. Other messages that merely contain the text are ignored.
+        Nothing is written.
+
+        Returns:
+            One ``(origin_uid, source_id, author_uid, author_name)`` per matching source, the author
+            name only known for members of a combined message. Empty when a lookup is not bounded
+            (more than 5 combined messages contain the text).
+        """
+        rows = MsgLog.select(MsgLog.master_msg_id, MsgLog.slave_origin_uid, MsgLog.slave_message_id,
+                             MsgLog.slave_member_uid, MsgLog.text) \
+            .where((MsgLog.slave_origin_uid == slave_origin_uid) & (MsgLog.time >= since)) \
+            .order_by(MsgLog.time.desc(nulls="LAST")).limit(limit)
+        found: dict[tuple[str, str], tuple[str, str, str | None, str | None]] = {}
+        containers: list[str] = []
+        for row in rows:
+            if not row.master_msg_id.startswith(f"{target_chat_id}."):
+                continue
+            text = quote_text_key(row.text)
+            if text == quote_body:
+                identity = (row.slave_origin_uid, row.slave_message_id)
+                found[identity] = (*identity, row.slave_member_uid, None)
+            elif quote_body in text:
+                containers.append(row.master_msg_id)
+        if containers:
+            combined = {member.master_msg_id for member in MsgLogMember.select(MsgLogMember.master_msg_id).where(
+                MsgLogMember.master_msg_id.in_(containers)).distinct()}
+            containers = [master_msg_id for master_msg_id in containers if master_msg_id in combined]
+        if len(containers) > 5:
+            return []
+        for master_msg_id in containers:
+            container = MsgLog.get_or_none(MsgLog.master_msg_id == master_msg_id)
+            aggregate = container.aggregate if container is not None else None
+            for child in (aggregate["children"] if aggregate else []):
+                if quote_text_key(member_message(child).text or "") == quote_body:
+                    identity = member_identity(child)
+                    found[identity] = (*identity, child["author_uid"], child["author_name"])
+        return list(found.values())
 
     @observe_database_method("get_previous_forum_message")
     def get_previous_forum_message(self, slave_chat_id: EFBChannelChatIDStr,

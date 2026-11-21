@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 from telegram import Update
 
 from ehforwarderbot import Message
@@ -179,3 +181,109 @@ def test_master_message_ignores_unknown_forum_thread(channel, slave):
 
     process_telegram_message.assert_not_called()
     channel.db.remove_topic_assoc(slave_uid=other_slave_uid)
+
+
+TOPIC_EMOJI_CASES = [
+    pytest.param(True, True, "{channel}{kind} {name}", id="defaults"),
+    pytest.param(False, True, "{kind} {name}", id="channel-emoji-off"),
+    pytest.param(True, False, "{channel} {name}", id="chat-type-emoji-off"),
+    pytest.param(False, False, "{name}", id="both-off"),
+]
+
+
+@pytest.fixture
+def topic_names(channel, slave, monkeypatch):
+    """Set the topic emoji flags and compute the expected name for the aliased chat."""
+    chat = channel.chat_binding.chat_manager.get_chat(slave.channel_id, slave.chat_with_alias.uid, build_dummy=True)
+
+    def configure(channel_emoji, chat_type_emoji, template):
+        monkeypatch.setitem(channel.flag.config, "topic_channel_emoji", channel_emoji)
+        monkeypatch.setitem(channel.flag.config, "topic_chat_type_emoji", chat_type_emoji)
+        return template.format(channel=slave.channel_emoji, kind=chat.chat_type_emoji, name=chat.display_name)
+
+    return configure
+
+
+@pytest.mark.parametrize(("channel_emoji", "chat_type_emoji", "template"), TOPIC_EMOJI_CASES)
+def test_create_topic_names_topic_by_emoji_flags(channel, slave, topic_names, channel_emoji, chat_type_emoji, template):
+    expected = topic_names(channel_emoji, chat_type_emoji, template)
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+    forum_topic = SimpleNamespace(message_thread_id=TelegramTopicID(61001))
+    try:
+        with patch.object(channel.bot_manager, "create_forum_topic", return_value=forum_topic) as create_forum_topic:
+            channel.chat_binding.create_topic(slave_uid, TelegramChatID(-100500001))
+    finally:
+        channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+    create_forum_topic.assert_called_once_with(chat_id=TelegramChatID(-100500001), name=expected)
+
+
+@pytest.mark.parametrize(("channel_emoji", "chat_type_emoji", "template"), TOPIC_EMOJI_CASES)
+def test_topic_refresh_paths_name_topic_by_emoji_flags(
+        channel, slave, topic_names, channel_emoji, chat_type_emoji, template):
+    expected = topic_names(channel_emoji, chat_type_emoji, template)
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    forum_chat_id = TelegramChatID(-100500002)
+    thread_id = TelegramTopicID(61002)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_topic_assoc(forum_chat_id, thread_id, slave_uid)
+    expected_call = {"chat_id": forum_chat_id, "message_thread_id": thread_id, "name": expected,
+                     "icon_custom_emoji_id": ""}
+
+    message = Mock(chat_id=int(forum_chat_id), message_thread_id=int(thread_id))
+    message.chat = SimpleNamespace(id=int(forum_chat_id), is_forum=True)
+    update = Update(update_id=2, message=message)
+    try:
+        with patch.object(channel.bot_manager, "edit_forum_topic") as edit_forum_topic, \
+             patch.object(channel.chat_binding, "_get_chat_info_and_picture", return_value=(None, None, None)):
+            assert channel.chat_binding._update_single_topic_info(forum_chat_id, thread_id, slave_uid)
+            edit_forum_topic.assert_called_once_with(**expected_call)
+
+            edit_forum_topic.reset_mock()
+            with patch("efb_telegram_master.chat_binding.sync_reply_text"):
+                channel.chat_binding.update_thread_info(update, Mock())
+            edit_forum_topic.assert_called_once_with(**expected_call)
+    finally:
+        channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+@pytest.mark.parametrize(("channel_emoji", "chat_type_emoji", "template"), TOPIC_EMOJI_CASES)
+def test_relink_and_repair_name_topic_by_emoji_flags(
+        channel, slave, topic_names, channel_emoji, chat_type_emoji, template):
+    expected = topic_names(channel_emoji, chat_type_emoji, template)
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    old_forum_id = TelegramChatID(-100500003)
+    new_forum_id = TelegramChatID(-100500004)
+    old_master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(old_forum_id)))
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_chat_assoc(old_master_uid, slave_uid, multiple_slave=True)
+    message = Mock()
+    message.chat = SimpleNamespace(id=int(new_forum_id), is_forum=True)
+    update = Update(update_id=3, message=message)
+
+    try:
+        with patch.object(channel.bot_manager, "get_chat_info", return_value=SimpleNamespace(is_forum=True)), \
+             patch.object(channel.bot_manager, "create_forum_topic",
+                          return_value=SimpleNamespace(message_thread_id=TelegramTopicID(61003))) as create_forum_topic, \
+             patch.object(channel.bot_manager, "send_message"), \
+             patch.object(channel.chat_binding, "_update_single_topic_info"), \
+             patch("efb_telegram_master.chat_binding.sync_reply_text"):
+            channel.chat_binding.relink_forum(update, SimpleNamespace(args=[str(old_forum_id)]))
+        create_forum_topic.assert_called_once_with(chat_id=new_forum_id, name=expected)
+
+        # Repair restores the same name when the chat is only known from its stored row.
+        channel.chat_binding.chat_manager.cache.pop((slave.channel_id, slave.chat_with_alias.uid), None)
+        stored = channel.db.get_slave_chat_info(slave.channel_id, slave.chat_with_alias.uid)
+        assert stored is not None
+        stored.pickle = None
+        stored.save()
+        with patch.object(channel.bot_manager, "edit_forum_topic") as edit_forum_topic, \
+             patch("efb_telegram_master.chat_binding.sync_reply_text"):
+            channel.chat_binding.relink_forum(update, SimpleNamespace(args=["repair"]))
+        edit_forum_topic.assert_called_once_with(
+            chat_id=new_forum_id, message_thread_id=TelegramTopicID(61003), name=expected)
+    finally:
+        channel.db.remove_topic_assoc(slave_uid=slave_uid)
+        channel.db.remove_chat_assoc(slave_uid=slave_uid)
