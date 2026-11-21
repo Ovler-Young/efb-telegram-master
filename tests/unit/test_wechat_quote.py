@@ -129,6 +129,18 @@ def test_an_earlier_quote_does_not_hide_a_quoting_target(manager):
     assert last_send(manager)[3]["reply_to_message_id"] == 2
 
 
+def test_short_quote_still_replies_when_other_messages_contain_its_text(manager):
+    h = handler(manager)
+    send(manager, h, "target", "ok")
+    complete(manager)
+    for index in range(6):
+        send(manager, h, f"other{index}", f"ok then {index}")
+        complete(manager)
+    send(manager, h, "quoting", quote("Alice", "ok"), name="Bob")
+    complete(manager)
+    assert last_send(manager)[3]["reply_to_message_id"] == 1
+
+
 def test_quote_of_an_aggregated_message_replies_to_the_container(manager):
     h = handler(manager)
     now = datetime.datetime.now().timestamp()
@@ -151,7 +163,7 @@ def test_a_target_that_is_still_queued_gets_no_reply(manager):
     assert all(call[3].get("reply_to_message_id") is None for call in manager.transport.calls)
 
 
-def test_forum_topic_quote_resolves_like_a_native_reply(manager):
+def test_forum_topic_attaches_no_reply_for_a_native_reply_or_a_quote(manager):
     h = handler(manager, thread=7)
     target = send(manager, h, "target", "topic words")
     complete(manager)
@@ -160,10 +172,12 @@ def test_forum_topic_quote_resolves_like_a_native_reply(manager):
     quoting.chat.members.append(quoting.author)
     h.send_message(quoting)
     complete(manager)
-    native = last_send(manager)[3].get("reply_to_message_id")
+    assert last_send(manager)[3].get("reply_to_message_id") is None
     send(manager, h, "quoting", quote("Alice", "topic words"), name="Bob")
     complete(manager)
-    assert last_send(manager)[3].get("reply_to_message_id") == native
+    _, _, text, kwargs = last_send(manager)
+    assert kwargs.get("reply_to_message_id") is None
+    assert "<blockquote expandable>" in text and "topic words</blockquote>\nreply" in text
 
 
 def test_mention_across_the_quote_end_leaves_plain_text(manager):

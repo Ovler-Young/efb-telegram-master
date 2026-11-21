@@ -873,7 +873,8 @@ e.g.:
     be sent or is older than 48 hours gets no reply, and neither does a
     quote in a chat where text aggregation is on, as the message is then
     merged into an aggregated one. A quote of an aggregated message replies
-    to the aggregated message that contains it.
+    to the aggregated message that contains it. In a forum topic the quote
+    is shown, but no reply is attached yet.
 
     .. code:: yaml
 

@@ -1335,7 +1335,8 @@ class DatabaseManager:
         Reads the newest ``limit`` messages of the chat since ``since`` (the chat-and-time index
         bounds the scan) and keeps those delivered to ``target_chat_id``. Independent messages match
         when their text equals ``quote_body``; a combined message that contains it is opened to look
-        for the member with that text. Nothing is written.
+        for the member with that text. Other messages that merely contain the text are ignored.
+        Nothing is written.
 
         Returns:
             One ``(origin_uid, source_id, author_uid, author_name)`` per matching source, the author
@@ -1357,6 +1358,10 @@ class DatabaseManager:
                 found[identity] = (*identity, row.slave_member_uid, None)
             elif quote_body in text:
                 containers.append(row.master_msg_id)
+        if containers:
+            combined = {member.master_msg_id for member in MsgLogMember.select(MsgLogMember.master_msg_id).where(
+                MsgLogMember.master_msg_id.in_(containers)).distinct()}
+            containers = [master_msg_id for master_msg_id in containers if master_msg_id in combined]
         if len(containers) > 5:
             return []
         for master_msg_id in containers:
