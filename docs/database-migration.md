@@ -183,8 +183,17 @@ The importer:
    imported when present, using their actual supported column types, nullability
    and simple primary keys, including schemas without an integer `id`. This is
    not arbitrary SQLite DDL conversion. Unknown nonempty tables, unsupported
-   columns/types, generated or hidden columns, cache foreign keys, invalid
-   timestamps and PostgreSQL-incompatible text are rejected.
+   columns/types, non-text values in text columns, generated or hidden columns,
+   cache foreign keys, invalid timestamps and text containing U+0000 in any
+   column other than the message and chat text columns below are rejected.
+   PostgreSQL text cannot hold U+0000. In `msglog.text`,
+   `historymigrationentry.formatted_text`, `slavechatinfo.slave_chat_name` and
+   `slavechatinfo.slave_chat_alias`, each U+0000 is stored as U+FFFD, one for
+   one, both by the importer and by the running bot. This is lossy on the
+   PostgreSQL copy: the original text stays in the retained SQLite file and in
+   the importer's backup. Text the bot logs later on PostgreSQL has no such
+   original. The import logs, per column, how many values were replaced, never
+   their content.
 3. Reads source rows incrementally, writes bounded batches (1–1,000 rows), and
    compares ordered row counts and SHA-256 content digests with the target using
    server-side cursors. Unicode ordering, binary fields and microsecond timestamps
