@@ -822,32 +822,36 @@ e.g.:
     Enable Telegram forum topics mode: send and receive messages in a
     forum-enabled supergroup (topic group), **one topic per linked chat**.
 
-    Can be configured as:
-    
-    1. **Single chat ID** (all chat types go to one group):
+    The value is either one chat ID, or a mapping from chat type to the
+    chat ID of the forum for that type.
 
-       .. code:: yaml
+    .. code:: yaml
 
-           flags:
-               topic_group: -1001234567890
+        # One forum for every chat
+        flags:
+            topic_group: -1001234567890
 
-    2. **Dictionary** (different chat types go to different groups):
+    .. code:: yaml
 
-       .. code:: yaml
+        # One forum per chat type
+        flags:
+            topic_group:
+                private: -1001234567891
+                group: -1001234567892
+                official_account: -1001234567893
 
-           flags:
-               topic_group:
-                   1: -1002564525716  # 微信（私聊）
-                   2: -1003954649710  # 微信-群
-                   3: -1001234567892  # 微信-系统
-                   4: -1001364178352  # 微信-公众号
-
-       Dictionary key definitions:
-       - 1: Private chat (friend)
-       - 2: Group chat
-       - 3: System chat
-       - 4: Official account (MP)
-
+    - The mapping keys are ``private``, ``group`` and ``official_account``,
+      the same chat type names as in ``text_aggregation_chat_types``. Other
+      keys, including ``system``, are rejected.
+    - A chat type missing from the mapping uses the ``private`` forum.
+      If ``private`` is missing too, those chats get no topic and stay in
+      the main chat.
+    - System chats never get a topic and always stay in the main chat.
+    - A chat that already has a topic stays in that forum when you switch
+      to a mapping. The mapping only decides the forum of chats that
+      have no topic yet.
+    - Every forum needs the bot as an administrator with the right to
+      manage topics.
     - When enabled, ETM will store and use Telegram's ``message_thread_id``
       to route messages between a topic and its linked remote chat.
     - The id(s) set here will be the default topic group(s) for new chats.
