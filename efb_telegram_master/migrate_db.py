@@ -163,7 +163,7 @@ def validate_runtime_cutover(directory: Path, db) -> None:
         raise RuntimeError("SQLite source changed after import; refusing an ambiguous cutover. Keep both databases offline.")
 
 
-def _read_queue_import(db) -> Optional[dict]:
+def _read_queue_import(db) -> dict | None:
     tables = set(db.get_tables(schema=current_schema(db)))
     if QUEUE_IMPORT_TABLE not in tables:
         return None
@@ -725,7 +725,7 @@ def _queue_source_columns(source: sqlite3.Connection) -> dict:
     for table in tables - set(QUEUE_COLUMNS):
         if not table.startswith("sqlite_") and source.execute(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone():
             raise RuntimeError(f"Nonempty unsupported outbound queue table {table!r}; the queue was not moved.")
-    present: dict[str, Optional[set]] = {}
+    present: dict[str, set | None] = {}
     for table, columns in QUEUE_COLUMNS.items():
         if table not in tables:
             present[table] = None
@@ -808,7 +808,11 @@ def _import_queue(db, directory: Path, archive: Path, expected: dict, batch_size
     live ``outbound-media`` files, which stay where they are. One transaction
     holds the rows, the identity reset, verification and the queue import record.
     """
-    from .outbound import _POSTGRESQL_OWNER_LOCK, POSTGRESQL_QUEUE_MARKER, create_postgresql_queue_tables
+    from .outbound import (
+        _POSTGRESQL_OWNER_LOCK,
+        POSTGRESQL_QUEUE_MARKER,
+        create_postgresql_queue_tables,
+    )
 
     queue_path = directory / QUEUE_FILE
     marker_path = directory / POSTGRESQL_QUEUE_MARKER
@@ -873,7 +877,7 @@ def _import_queue(db, directory: Path, archive: Path, expected: dict, batch_size
     return record
 
 
-def _import_tables(db, directory: Path, archive: Path, queue_summary: Optional[dict], batch_size: int) -> dict:
+def _import_tables(db, directory: Path, archive: Path, queue_summary: dict | None, batch_size: int) -> dict:
     source_path = directory / "tgdata.db"
     queue_path = directory / QUEUE_FILE
     with (
@@ -964,6 +968,17 @@ def migrate(directory: Path, config: dict, batch_size: int = 500, *, queue_only:
     db = postgresql_database(config)
     with DataDirectoryLock(directory):
         try:
+            if queue_only and source_path.exists():
+                with connection_scope(db):
+                    imported = _read_import(db) is not None
+                if not imported:
+                    # Moving only the queue would leave tgdata.db unimportable
+                    # (the target is no longer empty) and the SQLite queue closed.
+                    raise RuntimeError(
+                        "tgdata.db has not been imported into this PostgreSQL target; run python -m "
+                        "efb_telegram_master.migrate_db --data-dir <directory> --config <postgresql.yaml> "
+                        "without --queue-only to move the data and the outbound queue together."
+                    )
             with ExitStack() as fences:
                 if not queue_only:
                     fences.enter_context(_fence(source_path))

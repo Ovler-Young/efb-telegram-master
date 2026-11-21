@@ -1680,6 +1680,16 @@ def test_queue_move_refuses_a_target_that_already_has_queue_rows(tmp_path, postg
     assert len(_sqlite_rows(source)) == 3
 
 
+def test_queue_only_refuses_an_install_whose_data_was_not_imported(sqlite_source, postgres_config, manager_factory):
+    with pytest.raises(RuntimeError, match="tgdata.db has not been imported.*without --queue-only"):
+        migrate_db.migrate(sqlite_source, postgres_config, queue_only=True)
+    assert _queue_tables_in(postgres_config) == []
+    assert not (sqlite_source / POSTGRESQL_QUEUE_MARKER).exists()
+    migrate_db.migrate(sqlite_source, postgres_config)
+    assert _import_version(postgres_config) == 3
+    manager_factory(sqlite_source, postgres_config)
+
+
 def test_queue_move_refuses_while_a_bot_owns_the_postgresql_queue(tmp_path, postgres_config, manager_factory):
     manager_factory(tmp_path / "running", postgres_config)
     running = _postgresql_queue(tmp_path / "running", postgres_config)
