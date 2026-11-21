@@ -3,7 +3,10 @@
 import html
 import logging
 import mimetypes
+import os
 import time
+import gettext
+import shlex
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
@@ -11,15 +14,15 @@ from xmlrpc.server import SimpleXMLRPCServer
 import telegram  # lgtm [py/import-and-import-from]
 import telegram.constants
 import telegram.error
+from language_tags import tags
 from PIL import Image, WebPImagePlugin
-from pkg_resources import resource_filename
 from ruamel.yaml import YAML
 from telegram import Update, Message
-from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext, Filters
+from telegram.constants import ChatType
+from telegram.ext import CommandHandler, CallbackQueryHandler, CallbackContext, TypeHandler
 
 import ehforwarderbot  # lgtm [py/import-and-import-from]
 from ehforwarderbot import Channel, coordinator
-from ehforwarderbot import utils as efb_utils
 from ehforwarderbot.channel import MasterChannel
 from ehforwarderbot.message import Message as EFBMessage
 from ehforwarderbot.chat import Chat
@@ -29,6 +32,7 @@ from ehforwarderbot.exceptions import EFBException, EFBOperationNotSupported, EF
     EFBMessageReactionNotPossible
 from ehforwarderbot.status import ReactToMessage
 from ehforwarderbot.types import ModuleID, InstanceID, MessageID, ReactionName, ChatID
+from .aggregation_settings import AggregationSettings
 from . import utils as etm_utils
 from .__version__ import __version__
 from .bot_manager import TelegramBotManager
@@ -36,9 +40,12 @@ from .chat_binding import ChatBindingManager
 from .chat_destination_cache import ChatDestinationCache
 from .chat_object_cache import ChatObjectCacheManager
 from .commands import CommandsManager
+from .custom_emoji import CustomEmojiConfig, CustomEmojiStore, UserEmojiCreator
 from .db import DatabaseManager
 from .master_message import MasterMessageProcessor
 from .message import ETMMsg
+from .paths import LOCALE_DIR, get_config_path
+from .ptb_compat import Filters, get_forwarded_chat, sync_reply_html, sync_reply_text
 from .rpc_utils import RPCUtilities
 from .slave_message import SlaveMessageProcessor
 from .utils import ExperimentalFlagsManager, EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
@@ -84,7 +91,7 @@ class TelegramChannel(MasterChannel):
 
     # Translator
     translator: NullTranslations = translation("efb_telegram_master",
-                                               resource_filename('efb_telegram_master', 'locale'),
+                                               os.fspath(LOCALE_DIR),
                                                fallback=True)
     locale: Optional[str] = None
 
@@ -122,10 +129,16 @@ class TelegramChannel(MasterChannel):
         # Initialize managers
         self.flag: ExperimentalFlagsManager = ExperimentalFlagsManager(self)
         self.db: DatabaseManager = DatabaseManager(self)
+        self.custom_emoji: CustomEmojiStore = CustomEmojiStore(self.db, CustomEmojiConfig.from_channel_config(self.config))
+        self.custom_emoji.load()
         self.chat_manager: ChatObjectCacheManager = ChatObjectCacheManager(self)
         self.chat_dest_cache: ChatDestinationCache = ChatDestinationCache(self.flag("send_to_last_chat"))
         self.bot_manager: TelegramBotManager = TelegramBotManager(self)
+        self.custom_emoji_creator: UserEmojiCreator = UserEmojiCreator(
+            self.custom_emoji, self.bot_manager.build_standalone_bot,
+            self.bot_manager.me.username if self.bot_manager.me else None, self._("ETM user avatars"))
         self.commands: CommandsManager = CommandsManager(self)
+        self.aggregation_settings = AggregationSettings(self)
         self.chat_binding: ChatBindingManager = ChatBindingManager(self)
         self.slave_messages: SlaveMessageProcessor = SlaveMessageProcessor(self)
         # topic_group can be either a single integer or a list
@@ -133,32 +146,55 @@ class TelegramChannel(MasterChannel):
 
         if not self.flag('auto_locale'):
             self.translator = translation("efb_telegram_master",
-                                          resource_filename('efb_telegram_master', 'locale'),
+                                          os.fspath(LOCALE_DIR),
                                           fallback=True)
+
+        # Observe new messages before commands or the incoming message worker.
+        self.bot_manager.dispatcher.add_handler(
+            TypeHandler(Update, self.bot_manager.as_async_callback(self.observe_aggregation_boundary)), group=-2)
 
         # Basic message handlers
         non_edit_filter = Filters.update.message | Filters.update.channel_post
         self.bot_manager.dispatcher.add_handler(
-            CommandHandler("start", self.start, filters=non_edit_filter))
+            CommandHandler("start", self.bot_manager.as_async_callback(self.start), filters=non_edit_filter))
         self.bot_manager.dispatcher.add_handler(
-            CommandHandler("help", self.help, filters=non_edit_filter))
+            CommandHandler("help", self.bot_manager.as_async_callback(self.help), filters=non_edit_filter))
         self.bot_manager.dispatcher.add_handler(
-            CommandHandler("info", self.info, filters=non_edit_filter))
+            CommandHandler("info", self.bot_manager.as_async_callback(self.info), filters=non_edit_filter))
         self.bot_manager.dispatcher.add_handler(
-            CallbackQueryHandler(self.void_callback_handler, pattern="void"))
+            CallbackQueryHandler(self.bot_manager.as_async_callback(self.void_callback_handler), pattern="void"))
         self.bot_manager.dispatcher.add_handler(
-            CallbackQueryHandler(self.bot_manager.session_expired))
+            CommandHandler("react", self.bot_manager.as_async_callback(self.react), filters=non_edit_filter)
+        )
+
         self.bot_manager.dispatcher.add_handler(
-            CommandHandler("react", self.react, filters=non_edit_filter)
+            CommandHandler("confirm_send", self.bot_manager.as_async_callback(self.confirm_send), filters=non_edit_filter)
         )
 
         # Register master message handlers after commands to prevent commands
         # commands to be delivered as messages
         self.master_messages: MasterMessageProcessor = MasterMessageProcessor(self)
+        self.bot_manager.dispatcher.add_handler(
+            CallbackQueryHandler(self.bot_manager.as_async_callback(self.bot_manager.session_expired)))
 
-        self.bot_manager.dispatcher.add_error_handler(self.error)
+        self.bot_manager.dispatcher.add_error_handler(self.bot_manager.as_async_callback(self.error))
 
         self.rpc_utilities = RPCUtilities(self)
+
+    def observe_aggregation_boundary(self, update: Update, context: CallbackContext):
+        """Close text append eligibility when a new Telegram message arrives."""
+        message = update.message or update.channel_post
+        if message is None:
+            return
+        manager = self.bot_manager
+        author = message.from_user
+        own_ids = {manager.me.id} if manager.me is not None else set()
+        if manager.bot_pool:
+            own_ids.update(bot.bot_id for bot in manager.bot_pool.bots)
+        if author is not None and author.id in own_ids:
+            return
+        topic = str(message.message_thread_id) if message.message_thread_id is not None else None
+        manager.live_aggregation.close_destination(message.chat_id, topic)
 
     @property
     def _(self) -> Callable[[str], str]:
@@ -174,7 +210,7 @@ class TelegramChannel(MasterChannel):
 
         Configuration file is in YAML format.
         """
-        config_path = efb_utils.get_config_path(self.channel_id)
+        config_path = get_config_path(self.channel_id)
         if not config_path.exists():
             raise FileNotFoundError(self._("Config File does not exist. ({path})").format(path=config_path))
         with config_path.open() as f:
@@ -221,22 +257,22 @@ class TelegramChannel(MasterChannel):
         """
         assert isinstance(update, Update)
         assert isinstance(update.effective_message, Message)
-        if update.effective_message.chat.type != telegram.Chat.PRIVATE:  # Group message
+        if update.effective_message.chat.type != ChatType.PRIVATE:  # Group message
             if update.effective_chat and update.effective_chat.is_forum:
                 msg = self.info_topic(update)
             else:
                 msg = self.info_group(update)
-        elif update.effective_message.forward_from_chat and \
-                update.effective_message.forward_from_chat.type == 'channel':  # Forwarded channel command.
+        elif (forwarded_chat := get_forwarded_chat(update.effective_message)) and \
+                forwarded_chat.type == ChatType.CHANNEL:  # Forwarded channel command.
             msg = self.info_channel(update)
         else:  # Talking to the bot.
             msg = self.info_general()
 
         if len(msg) > 4095:
             for x in range(0, len(msg), 4095):
-                update.effective_message.reply_text(msg[x:x+4095])
+                sync_reply_text(self.bot_manager, update.effective_message, msg[x:x + 4095])
         else:
-            update.effective_message.reply_text(msg)
+            sync_reply_text(self.bot_manager, update.effective_message, msg)
 
     def info_topic(self, update: Update):
         """Generate string for chat linking info of a topic."""
@@ -302,7 +338,8 @@ class TelegramChannel(MasterChannel):
 
     def info_channel(self, update):
         """Generate string for chat linking info of a channel."""
-        chat = update.effective_message.forward_from_chat
+        chat = get_forwarded_chat(update.effective_message)
+        assert chat is not None
         links = self.db.get_chat_assoc(master_uid=etm_utils.chat_id_to_str(self.channel_id, chat.id))
         if links:  # Linked chat
             # TRANSLATORS: ‘channel’ here refers to a Telegram channel.
@@ -365,6 +402,32 @@ class TelegramChannel(MasterChannel):
                     )
         return msg
 
+    def update_locale(self, update: Update, context: CallbackContext):
+        if not self.flag('auto_locale'):
+            return
+        if not update.effective_user or not update.effective_user.language_code:
+            return
+
+        language_code = update.effective_user.language_code
+        if language_code == self.locale:
+            return
+
+        self.locale = language_code
+        tag = tags.tag(language_code)
+        if tag.language:
+            locale = tag.language.format
+            if tag.region:
+                locale += "_" + tag.region.format
+        else:
+            locale = language_code.replace('-', '_')
+        self.logger.info("Updating locale to %s", locale)
+        self.translator = gettext.translation(
+            "efb_telegram_master",
+            os.fspath(LOCALE_DIR),
+            languages=[locale, 'C'],
+            fallback=True,
+        )
+
     def start(self, update: Update, context: CallbackContext):
         """
         Process bot command `/start`.
@@ -372,29 +435,19 @@ class TelegramChannel(MasterChannel):
         assert isinstance(update, Update)
         assert isinstance(update.effective_message, telegram.Message)
         assert isinstance(update.effective_chat, telegram.Chat)
-        if context.args:  # Group binding command
-            # Check if topic_group is a single value or dict
-            is_topic_group = False
-            if self.topic_group is not None:
-                if isinstance(self.topic_group, dict):
-                    is_topic_group = update.effective_chat.id in self.topic_group.values()
-                else:
-                    is_topic_group = update.effective_chat.id == self.topic_group
-            if (update.effective_message.chat.type != telegram.Chat.PRIVATE and not is_topic_group) or \
-                    (update.effective_message.forward_from_chat and
-                     update.effective_message.forward_from_chat.type == telegram.Chat.CHANNEL):
-                # Check if forwarded channel is in topic_group (dict or single)
-                forward_is_topic = False
-                if update.effective_message.forward_from_chat:
-                    if isinstance(self.topic_group, dict):
-                        forward_is_topic = update.effective_message.forward_from_chat.id in self.topic_group.values()
-                    else:
-                        forward_is_topic = update.effective_message.forward_from_chat.id == self.topic_group
-                if not forward_is_topic:
-                    self.chat_binding.link_chat(update, context.args)
-                else:
-                    self.bot_manager.send_message(update.effective_chat.id,
-                                                  self._('You cannot link remote chats to here. Please try again.'))
+        command_args = self._resolve_command_args(update.effective_message.text, context.args)
+        if command_args:  # Group binding command
+            forwarded_chat = get_forwarded_chat(update.effective_message)
+            if isinstance(self.topic_group, dict):
+                topic_groups = list(self.topic_group.values())
+            else:
+                topic_groups = [self.topic_group]
+            if (update.effective_message.chat.type != ChatType.PRIVATE and
+                update.effective_chat.id not in topic_groups) or \
+                    (forwarded_chat and
+                     forwarded_chat.type == ChatType.CHANNEL and
+                     forwarded_chat.id not in topic_groups):
+                self.chat_binding.link_chat(update, command_args)
             else:
                 self.bot_manager.send_message(update.effective_chat.id,
                                               self._('You cannot link remote chats to here. Please try again.'))
@@ -402,6 +455,41 @@ class TelegramChannel(MasterChannel):
             txt = self._("This is EFB Telegram Master Channel.\n\n"
                          "To learn more, please visit https://etm.1a23.studio .")
             self.bot_manager.send_message(update.effective_chat.id, txt)
+
+    @staticmethod
+    def _resolve_command_args(message_text: Optional[str], parsed_args: Optional[List[str]]) -> List[str]:
+        args = list(parsed_args or [])
+        if not message_text:
+            return args
+        try:
+            raw_args = shlex.split(message_text)[1:]
+        except ValueError:
+            raw_args = message_text.split()[1:]
+        if len(raw_args) > len(args):
+            return raw_args
+        return args
+
+    def confirm_send(self, update: Update, context: CallbackContext):
+        """An admin may confirm a held send by replying to its actual Telegram message."""
+        user, message = update.effective_user, update.effective_message
+        if user is None or user.id not in self.config["admins"] or message is None:
+            return
+        args = context.args or []
+        if len(args) != 1 or not args[0].isdigit() or message.reply_to_message is None:
+            sync_reply_text(self.bot_manager, message,
+                            "Reply to the already delivered bot message with /confirm_send <queue-row-id>. This does not resend it.")
+            return
+        try:
+            # Nested reply file IDs belong to this main bot receiving the update.
+            complete = self.bot_manager.confirm_queued_delivery(
+                int(args[0]), message.reply_to_message, file_bot_id="__main__",
+            )
+        except ValueError as error:
+            sync_reply_text(self.bot_manager, message, str(error))
+            return
+        sync_reply_text(self.bot_manager, message,
+                        "Delivery confirmed; stored message log retained. No resend was made." if complete else
+                        "Telegram receipt saved; MsgLog reconciliation remains pending. No resend will be made.")
 
     def react(self, update: Update, context: CallbackContext):
         """React to a message."""
@@ -415,29 +503,38 @@ class TelegramChannel(MasterChannel):
             reaction = ReactionName(args[1])
 
         if not message.reply_to_message:
-            message.reply_html(self._("Reply to a message with this command and an emoji "
-                                      "to send a reaction. "
-                                      "Ex.: <code>/react 👍</code>.\n"
-                                      "Send <code>/react -</code> to remove your reaction "
-                                      "from a message."))
+            sync_reply_html(self.bot_manager, message,
+                            self._("Reply to a message with this command and an emoji "
+                                   "to send a reaction. "
+                                   "Ex.: <code>/react 👍</code>.\n"
+                                   "Send <code>/react -</code> to remove your reaction "
+                                   "from a message."))
             return
 
         target: Message = message.reply_to_message
         msg_log = self.db.get_msg_log(master_msg_id=etm_utils.message_id_to_str(chat_id=TelegramChatID(target.chat_id),
-                                                                                message_id=TelegramMessageID(target.message_id)))
+                                                                                message_id=TelegramMessageID(target.message_id)),
+                                     include_managed_alt=True)
         if msg_log is None:
-            message.reply_text(self._("The message you replied to is not recorded in ETM database. "
-                                      "You cannot react to this message."))
+            sync_reply_text(self.bot_manager, message,
+                            self._("The message you replied to is not recorded in ETM database. "
+                                   "You cannot react to this message."))
+            return
+
+        if msg_log.aggregate:
+            sync_reply_text(self.bot_manager, message,
+                            self._("Reactions to aggregated messages are not supported yet."))
             return
 
         if not reaction:
             msg_log_obj: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
             reactors = msg_log_obj.reactions
             if not reactors:
-                message.reply_html(self._("This message has no reactions yet. "
-                                          "Reply to a message with this command and "
-                                          "an emoji to send a reaction. "
-                                          "Ex.: <code>/react 👍</code>."))
+                sync_reply_html(self.bot_manager, message,
+                                self._("This message has no reactions yet. "
+                                       "Reply to a message with this command and "
+                                       "an emoji to send a reaction. "
+                                       "Ex.: <code>/react 👍</code>."))
                 return
             else:
                 text = ""
@@ -448,29 +545,32 @@ class TelegramChannel(MasterChannel):
                     for j in values:
                         text += f"    {j.display_name}\n"
                 text = text.strip()
-                message.reply_text(text)
+                sync_reply_text(self.bot_manager, message, text)
                 return
 
         message_id = msg_log.slave_message_id
-        channel_id, chat_uid, _ = etm_utils.chat_id_str_to_id(msg_log.slave_origin_uid)
+        channel_id, chat_uid, _ = etm_utils.chat_id_str_to_id(EFBChannelChatIDStr(msg_log.slave_origin_uid))
 
         if channel_id not in coordinator.slaves:
-            message.reply_text(self._("The slave channel involved in this message ({}) is not available. "
-                                      "You cannot react to this message.").format(channel_id))
+            sync_reply_text(self.bot_manager, message,
+                            self._("The slave channel involved in this message ({}) is not available. "
+                                   "You cannot react to this message.").format(channel_id))
             return
 
         channel = coordinator.slaves[channel_id]
 
         if channel.suggested_reactions is None:
-            message.reply_text(self._("The channel involved in this message ({}) does not accept reactions. "
-                                      "You cannot react to this message.").format(channel_id))
+            sync_reply_text(self.bot_manager, message,
+                            self._("The channel involved in this message ({}) does not accept reactions. "
+                                   "You cannot react to this message.").format(channel_id))
             return
 
         try:
             chat_obj = channel.get_chat(chat_uid)
         except EFBChatNotFound:
-            message.reply_text(self._("The chat involved in this message ({}) is not found. "
-                                      "You cannot react to this message.").format(chat_uid))
+            sync_reply_text(self.bot_manager, message,
+                            self._("The chat involved in this message ({}) is not found. "
+                                   "You cannot react to this message.").format(chat_uid))
             return
 
         if reaction == ReactionName("-"):
@@ -479,14 +579,14 @@ class TelegramChannel(MasterChannel):
         try:
             coordinator.send_status(ReactToMessage(chat=chat_obj, msg_id=message_id, reaction=reaction))
         except EFBOperationNotSupported:
-            message.reply_text(self._("You cannot react anything to this message."))
+            sync_reply_text(self.bot_manager, message, self._("You cannot react anything to this message."))
             return
         except EFBMessageReactionNotPossible:
             prompt = self._("{} is not accepted as a reaction to this message.").format(reaction)
             if channel.suggested_reactions:
                 # TRANSLATORS: {} is a list of names of possible reactions, separated with comma.
                 prompt += "\n" + self._("You may want to try: {}").format(", ".join(channel.suggested_reactions[:10]))
-            message.reply_text(prompt)
+            sync_reply_text(self.bot_manager, message, prompt)
             return
 
     def help(self, update: Update, context: CallbackContext):
@@ -503,8 +603,14 @@ class TelegramChannel(MasterChannel):
                      "    List all additional features from slave channels.\n"
                      "/unlink_all\n"
                      "    Unlink all remote chats in this chat.\n"
+                     "/relink <old_forum_id>\n"
+                     "    Move linked remote chats from an old forum without copying history.\n"
+                     "/relink repair\n"
+                     "    Restore cached titles and add available previous-message links to current forum topics.\n"
                      "/info\n"
                      "    Show information of the current Telegram chat.\n"
+                     "/aggregation [on|off|reset]\n"
+                     "    Show or set text aggregation for a linked source chat.\n"
                      "/react [emoji]\n"
                      "    React to a message with an emoji, or show a list of members reacted.\n"
                      "/update_info\n"
@@ -514,12 +620,13 @@ class TelegramChannel(MasterChannel):
                      "    Remove the quoted message from its remote chat.\n"
                      "/help\n"
                      "    Print this command list.")
-        update.message.reply_text(txt)
+        sync_reply_text(self.bot_manager, update.message, txt)
 
     def poll(self):
         """
         Message polling process.
         """
+        self.custom_emoji_creator.start()
         self.bot_manager.polling()
 
     def error(self, update: object, context: CallbackContext):
@@ -547,7 +654,7 @@ class TelegramChannel(MasterChannel):
         # noinspection PyBroadException
         try:
             raise error
-        except telegram.error.Unauthorized:
+        except telegram.error.Forbidden:
             self.logger.error("The bot is not authorised to send update:\n%s\n%s", str(update), str(error))
         except telegram.error.BadRequest as e:
             assert isinstance(update, Update)
@@ -566,11 +673,14 @@ class TelegramChannel(MasterChannel):
                               "Number of network error occurred since last startup: %s\n%s\nUpdate: %s",
                               self.timeout_count, str(error), str(update))
             if isinstance(update, Update) and isinstance(update.message, Message):
-                update.message.reply_text(self._("This message is not processed due to poor internet environment "
-                                                 "of the server.\n"
-                                                 "<code>{code}</code>").format(code=html.escape(str(error))),
-                                          quote=True,
-                                          parse_mode="HTML")
+                sync_reply_html(
+                    self.bot_manager,
+                    update.message,
+                    self._("This message is not processed due to poor internet environment "
+                           "of the server.\n"
+                           "<code>{code}</code>").format(code=html.escape(str(error))),
+                    quote=True,
+                )
 
             timeout_interval = self.flag('network_error_prompt_interval')
             if timeout_interval > 0 and self.timeout_count % timeout_interval == 0:
@@ -621,35 +731,68 @@ class TelegramChannel(MasterChannel):
                 self.logger.exception('Unhandled telegram bot error!\n'
                                       'Update %s caused error %s. Exception', update, error)
 
+    def _is_stopping(self) -> bool:
+        bot_manager = getattr(self, "bot_manager", None)
+        manager_stopping = getattr(bot_manager, "_stopping", False)
+        if hasattr(manager_stopping, "is_set"):
+            manager_stopping = manager_stopping.is_set()
+        return bool(
+            getattr(self, "_stop_polling_called", False)
+            or manager_stopping
+        )
+
     def send_message(self, msg: EFBMessage) -> EFBMessage:
+        if self._is_stopping():
+            self.logger.debug("Dropping slave message during Telegram Master shutdown: %s", msg)
+            return msg
         return self.slave_messages.send_message(msg)
 
     def send_status(self, status: Status):
+        if self._is_stopping():
+            self.logger.debug("Dropping slave status during Telegram Master shutdown: %s", status)
+            return None
         return self.slave_messages.send_status(status)
 
     def get_message_by_id(self, chat: Chat,
                           msg_id: MessageID) -> Optional[EFBMessage]:
+        from .member_selection import current_source_route
+
         origin_uid = etm_utils.chat_id_to_str(chat=chat)
-        msg_log = self.db.get_msg_log(slave_origin_uid=origin_uid,
-                                      slave_msg_id=msg_id)
-        if msg_log is not None:
-            return msg_log.build_etm_msg(self.chat_manager)
-        else:
-            # Message is not found.
+        target_chat, topic = current_source_route(self, str(origin_uid))
+        try:
+            resolved = self.db.resolve_source_member(str(origin_uid), str(msg_id), str(target_chat), topic)
+        except ValueError:
             return None
+        if resolved:
+            msg_log, member = resolved
+            if member is not None:
+                return msg_log.build_source_member(member, self.chat_manager)
+            return msg_log.build_etm_msg(self.chat_manager)
+        # Preserve legacy independent lookups when their original target was
+        # changed; indexed members require an effective current association.
+        msg_log = self.db.get_msg_log(slave_origin_uid=origin_uid, slave_msg_id=msg_id)
+        if msg_log is not None and not msg_log.aggregate and not msg_log.source_member:
+            return msg_log.build_etm_msg(self.chat_manager)
+        return None
 
     def void_callback_handler(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
         assert update.effective_message
+        assert update.effective_chat
         assert update.callback_query
         self.bot_manager.answer_callback_query(update.callback_query.id,
                                                text=self._("This button does nothing."),
+                                               chat_id=update.effective_chat.id,
                                                message_id=update.effective_message.message_id,
                                                cache_time=180)
 
     def stop_polling(self):
+        if getattr(self, "_stop_polling_called", False):
+            return
+        self._stop_polling_called = True
         self.logger.debug("Gracefully stopping %s (%s).", self.channel_name, self.channel_id)
         self.rpc_utilities.shutdown()
+        self.custom_emoji_creator.stop()
         self.bot_manager.graceful_stop()
         self.master_messages.stop_worker()
         self.db.stop_worker()

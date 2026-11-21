@@ -2,9 +2,9 @@ import sys
 import os
 from setuptools import setup, find_packages
 
-if sys.version_info < (3, 7):
+if sys.version_info < (3, 10):
     raise Exception(
-        "Python 3.7 or higher is required. Your version is %s." % sys.version)
+        "Python 3.10 or higher is required. Your version is %s." % sys.version)
 
 version_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                             'efb_telegram_master/__version__.py')
@@ -30,7 +30,7 @@ setup(
     url='https://etm.1a23.studio',
     license='AGPLv3+',
     include_package_data=True,
-    python_requires='>=3.7',
+    python_requires='>=3.10',
     keywords=['ehforwarderbot', 'EH Forwarder Bot', 'EH Forwarder Bot Master Channel', 'Telegram',
               'Telegram Bot', 'chatbot'],
     classifiers=[
@@ -39,9 +39,6 @@ setup(
         "Intended Audience :: Developers",
         "Intended Audience :: End Users/Desktop",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
@@ -54,17 +51,13 @@ setup(
     install_requires=[
         "ehforwarderbot>=2.0.0",
         "setuptools==81.0.0; python_version>='3.9'",
-        "python-telegram-bot~=13.15",
-        "urllib3<2", # used by python-telegram-bot 13.x
-        # Python 3.13 removes the stdlib 'imghdr' module (PEP 594). Some deps
-        # (including python-telegram-bot 13.x) still import it.
-        "standard-imghdr; python_version>='3.13'",
-        "audioop-lts; python_version>='3.13'",
+        "python-telegram-bot~=22.7",
         "python-magic",
         "ffmpeg-python",
-        "peewee",
+        "peewee>=3.19,<5",
         "requests",
         "pydub",
+        "audioop-lts; python_version >= '3.13'",
         "ruamel.yaml",
         "pillow",
         "language-tags",
@@ -73,6 +66,9 @@ setup(
         "cjkwrap",
         "humanize",
         "typing-extensions>=3.7.4.1",
+        "prometheus_client",
+        "psutil>=5.9,<8",
+        "pyrate-limiter>=3.9.0",
     ],
     extras_require={
         "tests": tests_require,

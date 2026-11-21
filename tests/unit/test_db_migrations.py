@@ -1,17 +1,34 @@
 import os
+import logging
+import pickle
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
 
 import pytest
+from prometheus_client import generate_latest
 
 from ehforwarderbot import Message, MsgType
-from ehforwarderbot.types import MessageID
+from ehforwarderbot.types import ChatID, MessageID, ModuleID
 
+from efb_telegram_master import db as db_module
 from efb_telegram_master import utils
-from efb_telegram_master.db import MsgLog, TopicAssoc
+from efb_telegram_master.chat_binding import ChatBindingManager
+from efb_telegram_master.chat_object_cache import ChatObjectCacheManager
+from efb_telegram_master.db import (
+    ChatAssoc,
+    DatabaseManager,
+    HistoryMigrationEntry,
+    MsgLog,
+    SlaveChatInfo,
+    TopicAssoc,
+    database,
+)
 from efb_telegram_master.message import ETMMsg
+from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
 
@@ -22,6 +39,212 @@ def test_msglog_schema_has_sender_bot_id(channel):
         from efb_telegram_master.db import database
         columns = {column.name for column in database.get_columns("msglog")}
     assert "sender_bot_id" in columns
+
+
+def test_database_method_metrics_record_success_failure_and_bounded_labels(channel):
+    metrics = Metrics()
+    channel.db.set_metrics(metrics)
+
+    assert channel.db.get_chat_assoc(master_uid="metrics-master") == []
+    with pytest.raises(ValueError, match="mutual exclusive"):
+        channel.db.get_msg_log()
+    with pytest.raises(ValueError, match="database method is invalid"):
+        metrics.record_database_method_call("SELECT * FROM msglog", 0.1, "success")
+
+    rendered = generate_latest(metrics.registry).decode()
+
+    assert 'etm_database_method_duration_seconds_count{method="get_chat_assoc"} 1.0' in rendered
+    assert 'etm_database_method_duration_seconds_sum{method="get_chat_assoc"}' in rendered
+    assert 'etm_database_method_duration_seconds_count{method="get_msg_log"} 1.0' in rendered
+    assert 'etm_database_method_failures_total{method="get_msg_log"} 1.0' in rendered
+    assert "metrics-master" not in rendered
+    assert "SELECT * FROM msglog" not in rendered
+
+
+def test_history_migration_entry_table_exists():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    with test_db.bind_ctx([HistoryMigrationEntry, MsgLog]):
+        test_db.create_tables([HistoryMigrationEntry, MsgLog])
+        history_columns = {column.name for column in test_db.get_columns("historymigrationentry")}
+        msglog_columns = {column.name for column in test_db.get_columns("msglog")}
+
+    assert {
+        "slave_chat_id",
+        "target_chat_id",
+        "message_thread_id",
+        "source_master_msg_id",
+        "formatted_text",
+        "received_time",
+        "position",
+    }.issubset(history_columns)
+    assert "source_master_msg_id" not in msglog_columns
+
+
+def test_database_manager_uses_transactional_wal_sqlite(tmp_path, monkeypatch):
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    channel = SimpleNamespace(channel_id="tests.sqlite", config={})
+    manager = DatabaseManager(channel)
+    try:
+        assert isinstance(database.obj, SqliteDatabase)
+        assert database.obj.pragma("journal_mode").lower() == "wal"
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
+
+
+def test_startup_observes_raw_legacy_rows_without_mutating_them(tmp_path, monkeypatch, caplog):
+    from peewee import SqliteDatabase
+
+    database_path = tmp_path / "tgdata.db"
+    raw_db = SqliteDatabase(database_path)
+    raw_db.connect()
+    try:
+        raw_db.execute_sql(
+            "CREATE TABLE outbound_workflow (id INTEGER PRIMARY KEY, state TEXT, marker TEXT)"
+        )
+        raw_db.execute_sql(
+            "CREATE TABLE outbound_task (id INTEGER PRIMARY KEY, state TEXT, marker TEXT)"
+        )
+        raw_db.execute_sql(
+            "INSERT INTO outbound_workflow (id, state, marker) VALUES (1, 'completed', 'workflow-marker')"
+        )
+        for index, state in enumerate(DatabaseManager._LEGACY_OUTBOUND_STATES, start=1):
+            raw_db.execute_sql(
+                "INSERT INTO outbound_task (id, state, marker) VALUES (?, ?, ?)",
+                (index, state, f"marker-{index}"),
+            )
+        snapshot = {
+            table: raw_db.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            for table in DatabaseManager._LEGACY_OUTBOUND_TABLES
+        }
+    finally:
+        raw_db.close()
+
+    original_database = database.obj
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    channel = SimpleNamespace(channel_id="tests.legacy", config={})
+    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.db"):
+        manager = DatabaseManager(channel)
+    try:
+        observed = {
+            table: database.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            for table in DatabaseManager._LEGACY_OUTBOUND_TABLES
+        }
+    finally:
+        manager.stop_worker()
+        database.initialize(original_database)
+
+    assert observed == snapshot
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "workflows=1 tasks=8" in warnings[0]
+    for state in DatabaseManager._LEGACY_OUTBOUND_STATES:
+        assert f"{state}=1" in warnings[0]
+
+
+def test_relink_forum_binding_moves_chat_and_topic_atomically():
+    from peewee import SqliteDatabase
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    test_db.create_tables([ChatAssoc, TopicAssoc])
+    manager = object.__new__(DatabaseManager)
+    metrics = Metrics()
+    manager.set_metrics(metrics)
+    try:
+        ChatAssoc.create(master_uid="old", slave_uid="slave-a")
+        TopicAssoc.create(topic_chat_id="old-forum", message_thread_id="1", slave_uid="slave-a")
+        ChatAssoc.create(master_uid="new", slave_uid="slave-b")
+        TopicAssoc.create(topic_chat_id="new-forum", message_thread_id="2", slave_uid="slave-b")
+
+        manager.relink_forum_binding("new", TelegramChatID(-100123), TelegramTopicID(3), "slave-a")
+
+        rendered = generate_latest(metrics.registry).decode()
+        assert 'etm_database_method_duration_seconds_count{method="relink_forum_binding"} 1.0' in rendered
+
+        assert [(row.master_uid, row.slave_uid) for row in ChatAssoc.select().order_by(ChatAssoc.slave_uid)] == [
+            ("new", "slave-a"), ("new", "slave-b"),
+        ]
+        assert [(row.topic_chat_id, row.message_thread_id, row.slave_uid)
+                for row in TopicAssoc.select().order_by(TopicAssoc.slave_uid)] == [
+            ("-100123", "3", "slave-a"), ("new-forum", "2", "slave-b"),
+        ]
+    finally:
+        test_db.close()
+        database.initialize(original_database)
+
+
+@pytest.mark.parametrize(
+    ("cached_pickle", "cached_name", "cached_alias", "expected_title"),
+    [
+        (None, "Cached QQ group", None, "👥👥 Cached QQ group"),
+        (b"unreadable cache", "Cached QQ group", "Saved QQ alias " * 9,
+         "👥👥 " + "Saved QQ alias " * 8 + "Save…"),
+    ],
+)
+def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum(
+        cached_pickle, cached_name, cached_alias, expected_title):
+    from telegram import Update
+    from peewee import SqliteDatabase
+    from efb_telegram_master import chat_binding as chat_binding_module
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    test_db.create_tables([ChatAssoc, SlaveChatInfo, TopicAssoc])
+    db_manager = object.__new__(DatabaseManager)
+    channel_id = ModuleID("tests.unavailable")
+    chat_uid = ChatID("qq-group")
+    slave_uid = utils.chat_id_to_str(channel_id, chat_uid)
+    old_chat_id = TelegramChatID(-10090001)
+    new_chat_id = TelegramChatID(-10090002)
+    old_master_uid = utils.chat_id_to_str(channel_id, ChatID(str(old_chat_id)))
+    new_master_uid = utils.chat_id_to_str(channel_id, ChatID(str(new_chat_id)))
+    db_manager.add_chat_assoc(old_master_uid, slave_uid, multiple_slave=True)
+    SlaveChatInfo.create(slave_channel_id=channel_id, slave_channel_emoji="👥", slave_chat_uid=chat_uid,
+                         slave_chat_name=cached_name, slave_chat_alias=cached_alias,
+                         slave_chat_type="Group", pickle=cached_pickle)
+
+    unavailable = RuntimeError("retcode=100")
+    bot = Mock()
+    bot.get_chat_info.return_value = SimpleNamespace(is_forum=True)
+    bot.create_forum_topic.return_value = SimpleNamespace(message_thread_id=TelegramTopicID(90003))
+    binding = object.__new__(ChatBindingManager)
+    binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text,
+                                      ngettext=lambda singular, plural, count: singular if count == 1 else plural)
+    binding.bot = bot
+    binding.db = db_manager
+    cache_manager = object.__new__(ChatObjectCacheManager)
+    cache_manager.db = db_manager
+    cache_manager.cache = {}
+    binding.chat_manager = cache_manager
+    binding._topic_mutex = threading.RLock()
+    binding.logger = Mock()
+    message = Mock()
+    message.chat = SimpleNamespace(id=int(new_chat_id), is_forum=True)
+    update = Update(update_id=4, message=message)
+
+    try:
+        with patch.object(chat_binding_module.coordinator, "slaves", {
+            channel_id: SimpleNamespace(get_chat=Mock(side_effect=unavailable)),
+        }), patch.object(chat_binding_module, "sync_reply_text"):
+            binding.relink_forum(update, SimpleNamespace(args=[str(old_chat_id)]))
+
+        assert db_manager.get_chat_assoc(master_uid=new_master_uid) == [slave_uid]
+        assert db_manager.get_topic_thread_id(slave_uid, new_chat_id) == TelegramTopicID(90003)
+        bot.create_forum_topic.assert_called_once_with(chat_id=new_chat_id, name=expected_title)
+        assert "https://t.me/c/90001" in bot.send_message.call_args.args[1]
+    finally:
+        test_db.close()
+        database.initialize(original_database)
 
 
 def test_topic_assoc_table_exists_and_round_trips(channel, slave):
@@ -35,6 +258,42 @@ def test_topic_assoc_table_exists_and_round_trips(channel, slave):
     assert isinstance(assoc, TopicAssoc)
     assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == thread_id
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_create_missing_tables_preserves_existing_chat_assoc(channel):
+    channel.db.add_chat_assoc("master-existing", "slave-existing", multiple_slave=True)
+    TopicAssoc.drop_table(safe=True)
+    HistoryMigrationEntry.drop_table(safe=True)
+
+    channel.db._create_missing_tables()
+
+    assert TopicAssoc.table_exists()
+    assert HistoryMigrationEntry.table_exists()
+    assert ChatAssoc.get_or_none(ChatAssoc.master_uid == "master-existing") is not None
+    channel.db.remove_chat_assoc(master_uid="master-existing")
+
+
+def test_topic_assoc_is_replaced_for_same_slave_and_thread(channel, slave):
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    topic_chat_id = TelegramChatID(33333)
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, TelegramTopicID(44444), slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, TelegramTopicID(55555), slave_uid)
+
+    assert channel.db.get_topic_thread_id(slave_uid, topic_chat_id) == TelegramTopicID(55555)
+    rows = list(TopicAssoc.select().where(TopicAssoc.slave_uid == slave_uid))
+    assert len(rows) == 1
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_remove_chat_assoc_removes_topic_assoc(channel):
+    channel.db.add_chat_assoc("master-topic-cleanup", "slave-topic-cleanup", multiple_slave=True)
+    channel.db.add_topic_assoc(TelegramChatID(66666), TelegramTopicID(77777), "slave-topic-cleanup")
+
+    channel.db.remove_chat_assoc(master_uid="master-topic-cleanup")
+
+    assert channel.db.get_topic_thread_id("slave-topic-cleanup", TelegramChatID(66666)) is None
 
 
 def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):
@@ -60,6 +319,31 @@ def test_add_or_update_message_log_persists_sender_bot_id(channel, slave):
     stored.delete_instance()
 
 
+def test_repeated_delivery_reconciliation_keeps_one_master_message(channel, slave):
+    chat = slave.chat_with_alias
+    etm_msg = ETMMsg(
+        uid=MessageID("durable-delivery"),
+        chat=channel.chat_manager.update_chat_obj(chat),
+        author=channel.chat_manager.get_or_enrol_member(chat, chat.self),
+        text="durable delivery",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=channel,
+    )
+    master_message = SimpleNamespace(chat_id=123456, message_id=654322)
+
+    channel.db.add_or_update_message_log(etm_msg, master_message, sender_bot_id="777")
+    channel.db.add_or_update_message_log(etm_msg, master_message, sender_bot_id="777")
+
+    master_msg_id = utils.message_id_to_str(
+        TelegramChatID(123456), TelegramMessageID(654322)
+    )
+    rows = list(MsgLog.select().where(MsgLog.master_msg_id == master_msg_id))
+    assert len(rows) == 1
+    assert rows[0].sender_bot_id == "777"
+    rows[0].delete_instance()
+
+
 def test_build_etm_msg_restores_sender_bot_id(channel, slave):
     chat = slave.chat_with_alias
     etm_msg = ETMMsg(
@@ -82,17 +366,313 @@ def test_build_etm_msg_restores_sender_bot_id(channel, slave):
     row.delete_instance()
 
 
+def test_reaction_alternate_updates_one_canonical_row_and_clears_retraction():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
+    message = SimpleNamespace(
+        uid=MessageID("reaction-message"),
+        chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"),
+        text="message",
+        type=MsgType.Text,
+        type_telegram=TGMsgType.Text,
+        deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+        file_id=None,
+        file_unique_id=None,
+        mime=None,
+        is_system=False,
+        attributes=None,
+        commands=None,
+        substitutions=None,
+        target=None,
+        sender_bot_id=None,
+        reactions={},
+    )
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        manager.add_or_update_message_log(message, SimpleNamespace(chat_id=100, message_id=10))
+
+        message.reactions = {"R0": [reactor]}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=11),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(10)),
+            sender_bot_id="777",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.11", "777")
+        assert pickle.loads(bytes(row.pickle))["reactions"] == {"R0": ("tests.mocks.slave reactor",)}
+
+        message.reactions = {}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=11),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(11)),
+            sender_bot_id="777",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.11", "777")
+        assert row.pickle is None
+
+        message.reactions = {"R1": [reactor]}
+        manager.add_or_update_message_log(
+            message,
+            SimpleNamespace(chat_id=100, message_id=12),
+            old_message_id=(TelegramChatID(100), TelegramMessageID(11)),
+            sender_bot_id="888",
+        )
+        row = MsgLog.get()
+        assert MsgLog.select().count() == 1
+        assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == ("100.10", "100.12", "888")
+        assert pickle.loads(bytes(row.pickle))["reactions"] == {"R1": ("tests.mocks.slave reactor",)}
+
+
+def test_reaction_alternate_db_failures_preserve_then_update_canonical_row():
+    from peewee import SqliteDatabase
+
+    test_db = SqliteDatabase(":memory:")
+    manager = object.__new__(DatabaseManager)
+    manager.logger = Mock()
+    reactor = SimpleNamespace(module_id="tests.mocks.slave", uid="reactor")
+    message = SimpleNamespace(
+        uid=MessageID("reaction-message"), chat=SimpleNamespace(module_id="tests.mocks.slave", uid="chat"),
+        author=SimpleNamespace(module_id="tests.mocks.slave", uid="author"), text="message", type=MsgType.Text,
+        type_telegram=TGMsgType.Text, deliver_to=SimpleNamespace(channel_id="tests.mocks.slave"),
+        file_id=None, file_unique_id=None, mime=None, is_system=False, attributes=None, commands=None,
+        substitutions=None, target=None, sender_bot_id=None, reactions={"NEW": [reactor]},
+    )
+    scenarios = (
+        (None, 10, 11, 12),
+        ("100.11", 11, 12, 13),
+    )
+
+    with test_db.bind_ctx([MsgLog]):
+        test_db.create_tables([MsgLog])
+        for initial_alt, old_id, failed_id, success_id in scenarios:
+            MsgLog.delete().execute()
+            MsgLog.create(
+                master_msg_id="100.10", master_msg_id_alt=initial_alt, slave_message_id="reaction-message",
+                text="old", slave_origin_uid="tests.mocks.slave chat",
+                slave_member_uid="tests.mocks.slave author", msg_type=MsgType.Text.name,
+                sent_to="tests.mocks.slave", sender_bot_id="700",
+                pickle=pickle.dumps({"reactions": {"OLD": ("tests.mocks.slave reactor",)}}),
+            )
+
+            with patch.object(MsgLog, "save", side_effect=RuntimeError("db failed")):
+                with pytest.raises(RuntimeError, match="db failed"):
+                    manager.add_or_update_message_log(
+                        message, SimpleNamespace(chat_id=100, message_id=failed_id),
+                        old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="800",
+                    )
+
+            row = MsgLog.get()
+            assert (row.master_msg_id_alt, row.sender_bot_id) == (initial_alt, "700")
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "OLD": ("tests.mocks.slave reactor",),
+            }
+
+            manager.add_or_update_message_log(
+                message, SimpleNamespace(chat_id=100, message_id=success_id),
+                old_message_id=(TelegramChatID(100), TelegramMessageID(old_id)), sender_bot_id="900",
+            )
+            row = MsgLog.get()
+            assert MsgLog.select().count() == 1
+            assert (row.master_msg_id, row.master_msg_id_alt, row.sender_bot_id) == (
+                "100.10", f"100.{success_id}", "900",
+            )
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "NEW": ("tests.mocks.slave reactor",),
+            }
+
+            message.reactions = {"FINAL": [reactor]}
+            manager.add_or_update_message_log(
+                message, SimpleNamespace(chat_id=100, message_id=success_id),
+                old_message_id=(TelegramChatID(100), TelegramMessageID(success_id)), sender_bot_id="900",
+            )
+            row = MsgLog.get()
+            assert MsgLog.select().count() == 1
+            assert row.master_msg_id_alt == f"100.{success_id}"
+            assert pickle.loads(bytes(row.pickle))["reactions"] == {
+                "FINAL": ("tests.mocks.slave reactor",),
+            }
+            message.reactions = {"NEW": [reactor]}
+
+
 @pytest.mark.skipif(
     not os.getenv("TEST_POSTGRES_HOST"),
     reason="PostgreSQL test environment is not configured",
 )
-def test_postgresql_env_is_configured():
-    required = [
-        "TEST_POSTGRES_HOST",
-        "TEST_POSTGRES_PORT",
-        "TEST_POSTGRES_DB",
-        "TEST_POSTGRES_USER",
-        "TEST_POSTGRES_PASSWORD",
-    ]
-    for key in required:
-        assert os.getenv(key)
+def test_postgresql_startup_observes_raw_legacy_rows_without_mutating_them(
+    tmp_path, monkeypatch, caplog
+):
+    from peewee import PostgresqlDatabase
+
+    connection_kwargs = {
+        "database": os.environ["TEST_POSTGRES_DB"],
+        "host": os.environ["TEST_POSTGRES_HOST"],
+        "port": int(os.environ["TEST_POSTGRES_PORT"]),
+        "user": os.environ["TEST_POSTGRES_USER"],
+        "password": os.environ["TEST_POSTGRES_PASSWORD"],
+    }
+    database_name = f"etm_legacy_{uuid.uuid4().hex}"
+    admin_db = PostgresqlDatabase(**connection_kwargs)
+    admin_db.connect()
+    admin_db.connection().autocommit = True
+    original_database = database.obj
+    manager = None
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    try:
+        admin_db.execute_sql(f'CREATE DATABASE "{database_name}"')
+        test_db = PostgresqlDatabase(
+            database_name,
+            **{key: value for key, value in connection_kwargs.items() if key != "database"},
+        )
+        test_db.connect()
+        with test_db.atomic():
+            test_db.execute_sql("CREATE TABLE outbound_workflow (id BIGSERIAL PRIMARY KEY, marker TEXT)")
+            test_db.execute_sql(
+                "CREATE TABLE outbound_task (id BIGSERIAL PRIMARY KEY, state TEXT, marker TEXT)"
+            )
+            test_db.execute_sql("INSERT INTO outbound_workflow (marker) VALUES ('workflow-marker')")
+            for index, state in enumerate(DatabaseManager._LEGACY_OUTBOUND_STATES, start=1):
+                test_db.execute_sql(
+                    "INSERT INTO outbound_task (state, marker) VALUES (%s, %s)",
+                    (state, f"marker-{index}"),
+                )
+        snapshot = {
+            table: test_db.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            for table in DatabaseManager._LEGACY_OUTBOUND_TABLES
+        }
+        test_db.close()
+
+        channel = SimpleNamespace(
+            channel_id="tests.postgresql",
+            config={
+                "database": {
+                    "type": "postgresql",
+                    "database": database_name,
+                    **{key: value for key, value in connection_kwargs.items() if key != "database"},
+                }
+            },
+        )
+        with caplog.at_level(logging.WARNING, logger="efb_telegram_master.db"):
+            manager = DatabaseManager(channel)
+
+        live_db = database.obj
+        observed = {
+            table: live_db.execute_sql(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            for table in DatabaseManager._LEGACY_OUTBOUND_TABLES
+        }
+        assert observed == snapshot
+        assert "Retained legacy outbound rows: workflows=1 tasks=8" in caplog.text
+    finally:
+        if manager is not None:
+            manager.stop_worker()
+        database.initialize(original_database)
+        admin_db.execute_sql(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()",
+            (database_name,),
+        )
+        admin_db.execute_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
+        admin_db.close()
+
+
+def test_relink_repair_posts_previous_history_links_and_reports_missing_topics():
+    from telegram import Update
+    from telegram.error import TelegramError
+    from peewee import SqliteDatabase
+    from efb_telegram_master import chat_binding as chat_binding_module
+
+    original_database = database.obj
+    test_db = SqliteDatabase(":memory:")
+    database.initialize(test_db)
+    test_db.connect()
+    test_db.create_tables([TopicAssoc, SlaveChatInfo, MsgLog])
+    db_manager = object.__new__(DatabaseManager)
+    channel_id = ModuleID("tests.repair")
+    slave_with_history = utils.chat_id_to_str(channel_id, ChatID("chat-a"))
+    slave_without_history = utils.chat_id_to_str(channel_id, ChatID("chat-b"))
+    slave_without_title = utils.chat_id_to_str(channel_id, ChatID("chat-c"))
+    new_chat_id = TelegramChatID(-10090002)
+    TopicAssoc.create(topic_chat_id=new_chat_id, message_thread_id="11", slave_uid=slave_with_history)
+    TopicAssoc.create(topic_chat_id=new_chat_id, message_thread_id="22", slave_uid=slave_without_history)
+    TopicAssoc.create(topic_chat_id=new_chat_id, message_thread_id="33", slave_uid=slave_without_title)
+    SlaveChatInfo.create(slave_channel_id=channel_id, slave_channel_emoji="👥", slave_chat_uid="chat-a",
+                         slave_chat_name="History chat", slave_chat_alias="History title",
+                         slave_chat_type="Group")
+    SlaveChatInfo.create(slave_channel_id=channel_id, slave_channel_emoji="👥", slave_chat_uid="chat-b",
+                         slave_chat_name="Title-only chat", slave_chat_alias="Recovered title",
+                         slave_chat_type="Group")
+    base_time = datetime(2026, 1, 1)
+    for master_msg_id, timestamp in (
+        ("-10090001.42", base_time),
+        (f"{new_chat_id}.99", base_time.replace(day=3)),
+        ("12345.100", base_time.replace(day=4)),
+    ):
+        MsgLog.create(
+            master_msg_id=master_msg_id,
+            slave_message_id=master_msg_id,
+            text="history",
+            slave_origin_uid=slave_with_history,
+            msg_type="Text",
+            sent_to=channel_id,
+            time=timestamp,
+        )
+    bot = Mock()
+    def fail_history_title(**kwargs):
+        if kwargs["message_thread_id"] == TelegramTopicID(11):
+            raise TelegramError("topic edit failed")
+        if kwargs["message_thread_id"] == TelegramTopicID(22):
+            raise TelegramError("Topic_not_modified")
+
+    bot.edit_forum_topic.side_effect = fail_history_title
+
+    class UnreadableCachedChat:
+        @property
+        def alias(self):
+            raise RuntimeError("cache object unreadable")
+
+    binding = object.__new__(ChatBindingManager)
+    binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text)
+    binding.bot = bot
+    binding.db = db_manager
+    binding.chat_manager = SimpleNamespace(cache={
+        (channel_id, ChatID("chat-b")): UnreadableCachedChat(),
+    })
+    binding.logger = Mock()
+    message = Mock()
+    message.chat = SimpleNamespace(id=int(new_chat_id), is_forum=True)
+    update = Update(update_id=5, message=message)
+
+    try:
+        with patch.object(chat_binding_module, "sync_reply_text") as reply:
+            binding.relink_forum(update, SimpleNamespace(args=["repair"]))
+
+        bot.get_chat_info.assert_not_called()
+        bot.send_message.assert_called_once_with(
+            chat_id=new_chat_id,
+            text=("This chat was previously linked. History messages are not migrated. "
+                  "You can view previous messages here: https://t.me/c/90001/42"),
+            message_thread_id=TelegramTopicID(11),
+            disable_notification=True,
+        )
+        bot.edit_forum_topic.assert_has_calls([
+            call(chat_id=new_chat_id, message_thread_id=TelegramTopicID(11), name="👥👥 History title"),
+            call(chat_id=new_chat_id, message_thread_id=TelegramTopicID(22), name="👥👥 Recovered title"),
+        ], any_order=True)
+        assert "posted 1 previous-message link" in reply.call_args.args[2]
+        assert "restored or confirmed 1 cached topic title" in reply.call_args.args[2]
+        assert "No cached title for topic IDs: 33" in reply.call_args.args[2]
+        assert "Failed to restore cached titles for topic IDs: 11" in reply.call_args.args[2]
+        assert "topic IDs: 33, 22" in reply.call_args.args[2]
+    finally:
+        test_db.close()
+        database.initialize(original_database)

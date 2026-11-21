@@ -1,4 +1,6 @@
+import re
 from contextlib import contextmanager
+from itertools import chain
 from typing import Iterable
 
 from telethon import TelegramClient
@@ -7,6 +9,9 @@ from telethon.tl.types import ChannelParticipantsAdmins
 from efb_telegram_master import TelegramChannel
 from efb_telegram_master.utils import chat_id_to_str
 from ehforwarderbot import Chat
+from ehforwarderbot.types import ChatID
+
+from .helper.filters import has_button, in_chats
 
 
 @contextmanager
@@ -21,17 +26,19 @@ def link_chats(channel: TelegramChannel,
     slave_ids = [
         chat_id_to_str(chat=i) for i in slave_chats
     ]
-    master_str = chat_id_to_str(channel.channel_id, str(telegram_chat_id))
+    master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     backup = db.get_chat_assoc(master_uid=master_str)
 
     db.remove_chat_assoc(master_uid=master_str)
     for i in slave_ids:
         db.add_chat_assoc(master_str, i, multiple_slave=True)
-    yield
-    # Unlink the chats and revert back
-    db.remove_chat_assoc(master_uid=master_str)
-    for i in backup:
-        db.add_chat_assoc(master_str, i, multiple_slave=True)
+    try:
+        yield
+    finally:
+        # Unlink the chats and revert back
+        db.remove_chat_assoc(master_uid=master_str)
+        for i in backup:
+            db.add_chat_assoc(master_str, i, multiple_slave=True)
 
 
 async def is_bot_admin(client: TelegramClient, bot_id: int, group):
@@ -42,10 +49,26 @@ async def is_bot_admin(client: TelegramClient, bot_id: int, group):
     return False
 
 
+async def get_start_token(client, helper, bot_id, chat_uid, private_response):
+    message = await private_response(
+        lambda: client.send_message(bot_id, f"/link {chat_uid}"),
+        lambda timeout: helper.wait_for_message(in_chats(bot_id) & has_button, timeout),
+    )
+    await message.buttons[0][0].click()
+    message = await helper.wait_for_message(in_chats(bot_id) & has_button)
+    url = None
+    for button in chain.from_iterable(message.buttons):
+        if button.url:
+            url = button.url
+            break
+    assert url
+    return re.search(r"\?startgroup=(.+)", url).groups()[0]
+
+
 def assert_is_linked(channel: TelegramChannel,
                      slave_chats: Iterable[Chat],
                      telegram_chat_id: int):
-    master_str = chat_id_to_str(channel.channel_id, str(telegram_chat_id))
+    master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     chats_str = set(channel.db.get_chat_assoc(master_uid=master_str))
     slave_ids = {
         chat_id_to_str(chat=i) for i in slave_chats
@@ -55,5 +78,5 @@ def assert_is_linked(channel: TelegramChannel,
 
 
 def unlink_all_chats(channel: TelegramChannel, telegram_chat_id: int):
-    master_str = chat_id_to_str(channel.channel_id, str(telegram_chat_id))
+    master_str = chat_id_to_str(channel.channel_id, ChatID(str(telegram_chat_id)))
     channel.db.remove_chat_assoc(master_uid=master_str)

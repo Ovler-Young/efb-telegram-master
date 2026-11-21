@@ -8,7 +8,21 @@ from ehforwarderbot.types import ChatID
 
 from efb_telegram_master import utils
 from efb_telegram_master.chat_binding import ChatListStorage
+from efb_telegram_master.ptb_compat import sync_reply_text
 from efb_telegram_master.utils import TelegramChatID, TelegramTopicID, TelegramMessageID
+
+
+class _ReadOnlyReplyMessage:
+    def __init__(self, reply_to_message):
+        self.chat = SimpleNamespace(id=0, is_forum=True)
+        self.message_id = reply_to_message.message_thread_id + 1
+        self.message_thread_id = reply_to_message.message_thread_id
+        self._reply_to_message = reply_to_message
+        self.to_dict = Mock(return_value={})
+
+    @property
+    def reply_to_message(self):
+        return self._reply_to_message
 
 
 def _build_slave_message(slave, chat=None, author=None):
@@ -55,6 +69,15 @@ def test_get_slave_msg_dest_uses_topic_group(channel, slave):
     )
 
 
+def test_flag_manager_reads_top_level_topic_group(channel):
+    channel.config["topic_group"] = 34567
+    channel.config["flags"] = {}
+
+    flag = utils.ExperimentalFlagsManager(channel)
+
+    assert flag("topic_group") == 34567
+
+
 def test_create_topic_creates_once_and_reuses_cached_assoc(channel, slave):
     slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
     topic_chat_id = TelegramChatID(50005)
@@ -98,6 +121,42 @@ def test_master_message_routes_forum_thread_to_slave(channel, slave):
     assert kwargs["quote"] is True
 
     channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_master_message_ignores_forum_topic_auto_reply_without_mutating_message(channel, slave):
+    topic_chat_id = TelegramChatID(80009)
+    thread_id = TelegramTopicID(80010)
+    slave_uid = utils.chat_id_to_str(chat=slave.chat_with_alias)
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+    channel.db.add_topic_assoc(topic_chat_id, thread_id, slave_uid)
+
+    reply_to_topic_starter = Mock(message_id=int(thread_id), message_thread_id=int(thread_id))
+    message = _ReadOnlyReplyMessage(reply_to_topic_starter)
+    message.chat.id = int(topic_chat_id)
+
+    update = Update(update_id=3, message=message)
+
+    with patch.object(channel.master_messages, "process_telegram_message") as process_telegram_message:
+        channel.master_messages.msg(update, None)
+
+    process_telegram_message.assert_called_once()
+    kwargs = process_telegram_message.call_args.kwargs
+    assert kwargs["quote"] is False
+
+    channel.db.remove_topic_assoc(slave_uid=slave_uid)
+
+
+def test_sync_reply_text_keeps_forum_topic_thread():
+    bot = Mock()
+    bot.send_message.return_value = Mock(message_id=2)
+    message = Mock()
+    message.chat.id = -100123
+    message.message_id = 1
+    message.message_thread_id = 456
+
+    sync_reply_text(bot, message, "Processing...")
+
+    bot.send_message.assert_called_once_with(-100123, text="Processing...", message_thread_id=456)
 
 
 def test_master_message_ignores_unknown_forum_thread(channel, slave):

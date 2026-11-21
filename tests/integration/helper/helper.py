@@ -1,20 +1,60 @@
 import asyncio
+import inspect
 import logging
 import os
 import time
 from asyncio import QueueEmpty
-from typing import Tuple, Optional, Dict, Iterable, Sequence, Union
+from typing import Awaitable, Callable, Tuple, Optional, Dict, Iterable, List, Sequence, TypeVar, Union
 
 from telethon import TelegramClient
 from telethon.events import NewMessage, UserUpdate, MessageDeleted, MessageEdited, ChatAction
 from telethon.events.common import EventCommon
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
-from telethon.tl.types import TypeInputPeer
+from telethon.tl.types import PeerChannel, TypeInputPeer
+from telethon.utils import get_peer_id
 
 from . import filters
 from .filters import BaseFilter
 from .utils import parse_socks5_link
+
+
+CLIENT_START_TIMEOUT = 60
+CLIENT_STOP_TIMEOUT = 10
+PRIVATE_RESPONSE_WAIT_CAP = 65.0
+Response = TypeVar("Response")
+
+
+async def wait_for_limiter_slot(peek_delay: Callable[[], float], *,
+                                cap: float = PRIVATE_RESPONSE_WAIT_CAP) -> None:
+    """Wait for one outbound limiter slot, never beyond its 60-second window plus margin."""
+    deadline = time.monotonic() + cap
+    while True:
+        delay = max(0.0, peek_delay())
+        if delay == 0.0:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(f"Outbound limiter did not free a slot within {cap:g} seconds")
+        await asyncio.sleep(min(delay, remaining))
+
+
+async def wait_for_private_response(
+        peek_delay: Callable[[], float], trigger: Callable[[], Awaitable[object]],
+        receive: Callable[[float], Awaitable[Response]], *,
+        cap: float = PRIVATE_RESPONSE_WAIT_CAP,
+) -> Response:
+    """Use one deadline for the limiter wait, command, and its response."""
+    async def wait() -> Response:
+        deadline = time.monotonic() + cap
+        await wait_for_limiter_slot(peek_delay, cap=deadline - time.monotonic())
+        await trigger()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(f"Private response did not arrive within {cap:g} seconds")
+        return await receive(remaining)
+
+    return await asyncio.wait_for(wait(), timeout=cap)
 
 
 class TelegramIntegrationTestHelper:
@@ -54,6 +94,9 @@ class TelegramIntegrationTestHelper:
 
         # Queue for incoming messages
         self.queue: "asyncio.queues.Queue[EventCommon]" = asyncio.queues.Queue()
+        # Events may arrive in a different order than the assertions that
+        # consume them. Keep unmatched events for a later, compatible wait.
+        self.pending_events: List[EventCommon] = []
 
         # Collect mappings from message ID to its chat (as Telegram API is not sending them)
         self.message_chat_map: Dict[int, TypeInputPeer] = dict()
@@ -77,6 +120,7 @@ class TelegramIntegrationTestHelper:
         await self.queue.put(event)
 
     def clear_queue(self):
+        self.pending_events.clear()
         while not self.queue.empty():
             try:
                 self.queue.get_nowait()
@@ -101,7 +145,7 @@ class TelegramIntegrationTestHelper:
         await self.queue.put(event)
 
     async def wait_for_event(self, event_filter: BaseFilter = filters.everything,
-                             timeout: float = 60.0) -> EventCommon:
+                             timeout: float = 20.0) -> EventCommon:
         """
         Args:
             event_filter: Filter updates to collect
@@ -114,27 +158,30 @@ class TelegramIntegrationTestHelper:
         Raises:
             :exc:`asyncio.TimeoutError`: when the request timed out
         """
-        t = time.time() + timeout
-        while t > time.time():
-            time_left = t - time.time()
+        for index, value in enumerate(self.pending_events):
+            if event_filter is None or event_filter(value):
+                return self.pending_events.pop(index)
+
+        deadline = time.monotonic() + timeout
+        while deadline > time.monotonic():
+            time_left = deadline - time.monotonic()
             # print("START TO WAIT FOR EVENTS")
             value = await asyncio.wait_for(self.queue.get(), time_left)
             self.queue.task_done()
             # print("EVENT", time.time(), value)
-            if callable(event_filter) and event_filter(value):
+            if event_filter is None or event_filter(value):
                 return value
-            elif event_filter is None:
-                return value
+            self.pending_events.append(value)
 
     async def wait_for_message(self, event_filter: BaseFilter = filters.everything,
-                               timeout: float = 60.0) -> Message:
+                               timeout: float = 20.0) -> Message:
         """Short cut for “Wait for a message and return its entity”."""
         event = await self.wait_for_event(filters.message & event_filter, timeout=timeout)
         # noinspection PyUnresolvedReferences
         return event.message  # type: ignore
 
     async def wait_for_message_text(self, event_filter: BaseFilter = filters.everything,
-                                    timeout: float = 60.0) -> str:
+                                    timeout: float = 20.0) -> str:
         """Short cut for “Wait for a text message and return its text”."""
         event = await self.wait_for_event(filters.text & event_filter, timeout=timeout)
         # noinspection PyUnresolvedReferences
@@ -143,13 +190,48 @@ class TelegramIntegrationTestHelper:
     # Context management
     # ------------------
 
-    async def __aenter__(self) -> 'TelegramIntegrationTestHelper':
-        await self.client.connect()
+    async def _startup_step(self, phase: str, operation):
+        try:
+            return await asyncio.wait_for(operation, timeout=CLIENT_START_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Telegram integration helper timed out during {phase} after "
+                f"{CLIENT_START_TIMEOUT} seconds"
+            ) from exc
 
-        # Issue a high level command to start receiving message
-        await self.client.get_me()
-        # Fill the entity cache
-        await self.client.get_dialogs()
+    async def _disconnect_client(self) -> None:
+        await asyncio.wait_for(self.client.disconnect(), timeout=CLIENT_STOP_TIMEOUT)
+        disconnected = getattr(self.client, "disconnected", None)
+        if inspect.isawaitable(disconnected):
+            await asyncio.wait_for(disconnected, timeout=CLIENT_STOP_TIMEOUT)
+
+    async def __aenter__(self) -> 'TelegramIntegrationTestHelper':
+        try:
+            await self._startup_step("client connect", self.client.connect())
+
+            # Issue a high level command to start receiving message
+            await self._startup_step("client get_me", self.client.get_me())
+            # Fill the entity cache
+            await self._startup_step("client get_dialogs", self.client.get_dialogs())
+            # get_dialogs also tracks every account channel. Their 15-minute
+            # idle catch-up runs before live updates and can exhaust test waits.
+            message_box = self.client._message_box
+            for channel_id in list(message_box.map):
+                if (isinstance(channel_id, int)
+                        and channel_id not in self.chats
+                        and abs(get_peer_id(PeerChannel(channel_id))) not in self.chats
+                        and channel_id not in message_box.getting_diff_for
+                        and channel_id not in message_box.possible_gaps):
+                    del message_box.map[channel_id]
+            message_box.next_deadline = min(
+                message_box.map, key=lambda entry: message_box.map[entry].deadline, default=None,
+            )
+        except BaseException:
+            try:
+                await self._disconnect_client()
+            except BaseException:
+                self.logger.exception("Failed to clean up Telegram client after startup failure")
+            raise
 
         return self
 
@@ -164,8 +246,7 @@ class TelegramIntegrationTestHelper:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.client.disconnect()
-        await self.client.disconnected
+        await self._disconnect_client()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Trigger the event to end the main async task."""

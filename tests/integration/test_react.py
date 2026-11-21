@@ -9,9 +9,9 @@ from tests.integration.utils import link_chats
 pytestmark = mark.asyncio
 
 
-async def test_react_help(helper, client, bot_id):
-    await client.send_message(bot_id, "/react")
-    content = await helper.wait_for_message_text(in_chats(bot_id) & regex(r"/react"))
+async def test_react_help(helper, client, bot_group):
+    await client.send_message(bot_group, "/react")
+    content = await helper.wait_for_message_text(in_chats(bot_group) & regex(r"/react"))
     assert "/react" in content, f"{content!r} is not a help message for /react."
 
 

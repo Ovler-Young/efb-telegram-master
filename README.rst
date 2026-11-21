@@ -136,6 +136,7 @@ A sample config file can be as follows:
     #   user: postgres
     #   password: ""
     #   max_connections: 8
+    #   pool_timeout: 5
     #   stale_timeout: 300
 
     # [Experimental Flags]
@@ -167,30 +168,78 @@ sample above) and install the optional dependency set:
 
     pip install "efb-telegram-master[postgresql]"
 
-On first startup with PostgreSQL enabled, ETM can automatically import data
-from an existing SQLite database (if present) and rename the old SQLite file
-to ``tgdata.db.migrated`` as a backup.
+Existing SQLite data must be imported explicitly while the bot and all other
+writers are stopped. Startup never imports or renames a database automatically.
+Use a private YAML file containing the target ``database`` mapping:
+
+.. code:: shell
+
+    python -m efb_telegram_master.migrate_db \
+        --data-dir /absolute/path/to/channel-data \
+        --config /private/path/postgresql.yaml
+
+The importer snapshots both SQLite stores, streams and verifies every supported
+row, and records a recoverable cutover before PostgreSQL startup is permitted.
+The original SQLite files and older backups are retained. The outbound queue
+continues to use ``outbound-queue.sqlite3`` together with ``outbound-media/``;
+keep both in the same data directory. Migration archives also copy referenced
+external attachments into portable queue-owned media files.
+Read the `migration and rollback guide <docs/database-migration.md>`_ before
+changing production configuration.
 
 Database migrations (what to expect)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-ETM performs basic database migrations automatically on startup.
-Notable additions in this branch include:
+ETM upgrades missing historical columns and query indexes automatically on
+startup in a schema transaction; this is separate from the offline cross-backend
+import above. Missing MsgLog lookup/history indexes and history-generation
+indexes are built on first startup; existing indexes are reused. SQLite holds
+a writer reservation for this schema transaction, so a large first build delays
+startup and other writers. The outbound queue separately adds missing metadata
+columns, its ownership table and scheduling/reconciliation indexes. Startup also
+reclaims inactive history staging rows and inspects queue media. These costs
+depend on the existing schema and retained data; there is no fixed startup-time
+estimate. Database operation scopes return pooled connections even on errors,
+and the data directory is protected against a second runtime/importer.
+
+The stored data includes:
 
 - **Forum topics associations** (for ``topic_group``): ETM stores a mapping
   between a forum group's chat ID + a topic thread ID (``message_thread_id``)
   and the linked remote chat.
 - **`sender_bot_id` in message logs**: when auxiliary bots are enabled, ETM
-  records which bot token sent each Telegram message so future edits/deletes
-  can be routed to the correct bot.
+  records which bot user ID authored each Telegram message so future edits/deletes
+  can be routed to the correct bot. File-ID issuer provenance is stored
+  separately when it differs, including confirmations received through another
+  bot. Older misrecorded ownership is not reconstructed automatically.
+- **Historical thread IDs and caches**: the importer preserves
+  ``master_message_thread_id`` and supported schemas of ``topiciconcache`` and
+  ``useremojicache``.
+- **History replay generations**: preparation uses a disk spool and short write
+  transactions, then publishes the complete generation. Durable ownership keys
+  make the handoff to the outbound queue idempotent across restarts.
+
+Normal sends and history text batching use ordinary sender selection, never
+an original-bot constraint. Only saved-file acquisition uses the file-ID issuer.
+See the `history replay guide <docs/history-replay.md>`_ and
+`delivery recovery guide <docs/delivery-recovery.md>`_ for recovery boundaries.
+
+Runtime queue recovery streams oversized legacy media into sidecars while
+retaining filenames. Failed preparation and decoding preserve existing media;
+corrupt queued payloads are held for repair. The encoded queue budget is not a
+total-process memory limit; see the migration guide for the runtime and offline
+import boundaries.
+
+New code reads older completion receipts, but older code cannot read new receipts
+that include a separate file-ID issuer; this is not rollback compatibility.
 
 Optional: Auxiliary bots (higher throughput)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If you run ETM in high-volume groups, you can configure ``auxiliary_bots`` to
 increase outbound throughput under Telegram rate limits. Auxiliary bots are
-used for sending only; edits/deletes will be routed to the bot that sent the
-original message.
+used for ordinary outbound sending and acquisition of their own saved file IDs;
+edits/deletes are routed to the bot that authored the original message.
 
 Notes:
 
@@ -200,6 +249,90 @@ Notes:
 - Under heavy rate limiting, some outbound sends may be queued for delayed
   execution; ETM will update message logs once the real Telegram message is
   sent.
+- Auxiliary bots show custom emoji in message headers only when their entry
+  sets ``custom_emoji: true`` (see below).
+
+Optional: Custom emoji for message authors
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In group chats, ETM can put the sender's avatar, turned into a Telegram custom
+emoji, in front of the sender's name in the message header. This is off
+unless the configuration file has a ``user_emoji`` section (not under
+``flags``); add ``user_emoji: {enabled: true}`` to turn it on:
+
+-   ``user_emoji`` *(dict)* [Default: not set, the feature is off]
+
+    - ``enabled`` *(bool)* [Default: ``true`` when the ``user_emoji`` section
+      is present]: set to ``false`` to stop ETM from creating or using
+      generated avatar emoji. Headers then use the plain emoji character,
+      except for users listed in ``custom_emoji_ids``, which are still used.
+    - ``sticker_set_name`` *(str)* [Default: ``etm_user_avatars``]: base name
+      of the custom emoji sticker sets that ETM creates. ETM appends
+      ``_by_<bot username>`` when it is not already there. When a set reaches
+      Telegram's limit of 200 stickers, ETM continues in a new set and adds
+      ``_<n>`` before the ``_by_<bot username>`` part.
+    - ``owner_user_id`` *(int)* [Default: the first user in ``admins``]:
+      Telegram user ID that owns the sticker sets ETM creates.
+    - ``custom_emoji_ids`` *(dict)* [Default: ``{}``]: custom emoji IDs you
+      choose yourself, as a mapping from the remote user, written as
+      ``<slave channel ID> <user ID>``, to a ``custom_emoji_id``. These take
+      precedence over generated emoji.
+
+    .. code:: yaml
+
+       user_emoji:
+           enabled: true
+           sticker_set_name: etm_user_avatars
+           owner_user_id: 102938475
+           custom_emoji_ids:
+               "example.slave_channel user-id": "5368324170671202286"
+
+    To let an auxiliary bot show custom emoji too, opt in on its entry:
+
+    .. code:: yaml
+
+       auxiliary_bots:
+       - token: "111111:AUX_BOT_TOKEN_1"
+         custom_emoji: true
+
+How it behaves:
+
+- Telegram only shows a bot's custom emoji when the bot's owner has Telegram
+  Premium (or the bot has a Fragment username). Messages sent by any other
+  bot show the plain emoji character in the same place, so enabling the
+  feature is harmless. The main bot uses generated emoji whenever the
+  ``user_emoji`` section is present and ``enabled`` is ``true``, and the
+  ``custom_emoji_ids`` you configure either way. An auxiliary bot uses them
+  only with ``custom_emoji: true``, and the setting should be used only for
+  bots whose owner has Premium (or that have a Fragment username).
+- The sticker set owner must have started the bot (send ``/start`` to it
+  once), otherwise Telegram refuses to create the sets.
+  Member rights in the group are enough; no admin rights are needed.
+- Messages never wait for custom emoji. The first message of an author goes
+  out at once with the plain emoji character. In the background ETM downloads
+  the author's avatar and adds it to a sticker set, and later messages from
+  that author use it. If this fails, ETM tries again later, with longer waits
+  after repeated failures.
+- Generated emoji are saved in ETM's database and reused after a restart.
+  Sticker sets that already exist, including those made by earlier ETM
+  versions, are reused.
+- When an author writes, ETM compares their avatar with the one their emoji
+  was made from, in the background: at most once every 7 days per author
+  when the message comes from a group, and at most once a day when it comes
+  from a private chat.
+  If the avatar has changed, ETM makes a new emoji and puts it in place of
+  the old one in its sticker set, so sets do not fill up with old avatars.
+  Messages never wait for this: they use the old emoji until the new one is
+  ready.
+- Emoji made by earlier ETM versions do not record which avatar they show,
+  so each of them is made again once, from the current avatar, the next time
+  its author writes (in the background, like any avatar change). The new
+  emoji takes the old one's place in its sticker set and the old sticker is
+  removed, so earlier messages that used it may then show the plain emoji
+  character. Authors who do not write keep their emoji as it is.
+- The custom emoji is shown in group chats, in messages sent as HTML with
+  short text. Long messages, plain-text sends, keyboards and private chats
+  show the plain header.
 
 Usage
 -----
@@ -747,6 +880,11 @@ done by adjusting values ``request_kwargs`` section in ETM’s
        read_timeout: 6
        connect_timeout: 7
 
+For high queued-send throughput, ETM sizes the Telegram HTTPX connection
+pool from the send worker count. Set the environment variable
+``ETM_HTTPX_POOL_MULTIPLIER`` to a positive number to tune that pool size
+multiplier; the default is ``2.0``.
+
 Run ETM behind a proxy
 ----------------------
 
@@ -850,6 +988,13 @@ Development notes (CI and tooling)
   ETM can copy files into a shared directory derived from ``api_base_file_url``
   (when it is a ``file://`` URL) for better container/shared-filesystem
   compatibility.
+- **Remote image URLs from slave channels**: for Telegram-specific delivery,
+  slave channels may set ``msg.vendor_specific["blueset.telegram.image_url"]``
+  on ``MsgType.Image`` messages to an HTTP(S) image URL. ETM will pass the URL
+  to Telegram for server-side download instead of requiring ``msg.file`` and
+  ``msg.path``. If Telegram cannot download the URL on first send, ETM sends
+  an editable placeholder media message so a later media edit can replace it
+  with a reachable URL.
 
 License
 -------

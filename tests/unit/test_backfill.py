@@ -1,15 +1,21 @@
-from datetime import datetime, timedelta
+import threading
+from concurrent.futures import Future
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
+import pytest
 from telegram import Update
 
-from ehforwarderbot.types import ChatID
+from efb_telegram_master import TelegramChannel
+from ehforwarderbot.types import ChatID, ModuleID
 
 from efb_telegram_master import utils
-from efb_telegram_master.chat_binding import ChatListStorage
-from efb_telegram_master.db import MsgLog
-from efb_telegram_master.utils import TelegramChatID, TelegramMessageID
+from efb_telegram_master.chat_binding import ChatBindingManager, ChatListStorage
+from efb_telegram_master.constants import Flags
+from efb_telegram_master.db import HistoryMigrationEntry, MsgLog
+from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
+from tests.unit.test_history_replay import history as history
 
 
 def _build_link_update(chat_id, *, is_forum=False):
@@ -33,17 +39,135 @@ def _cleanup_link_state(channel, chat, master_chat_id):
     channel.db.remove_topic_assoc(slave_uid=utils.chat_id_to_str(chat=chat))
 
 
+def _sent_link_message(chat_id, message_id, sender_bot_id=None):
+    sent_message = Mock()
+    sent_message.chat.id = chat_id
+    sent_message.message_id = message_id
+    sent_message.reply_text = Mock()
+    sent_message.sender_bot_id = sender_bot_id
+    return sent_message
+
+
+def _build_link_manager(storage_key, chat):
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.channel = SimpleNamespace(
+        channel_id=ModuleID("blueset.telegram"),
+        flag=Mock(return_value=True),
+        _=lambda message: message,
+    )
+    manager.db = SimpleNamespace(remove_topic_assoc=Mock())
+    manager.link_handler = SimpleNamespace(_conversations={})
+    manager.bot = SimpleNamespace(
+        send_message=Mock(return_value=_sent_link_message(-100500, 600)),
+        edit_message_text=Mock(),
+    )
+    manager.msg_storage[storage_key] = SimpleNamespace(chats=[chat], backfill_mode=None)
+    return manager
+
+
+def _build_start_update(token):
+    return Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1,
+                "text": f"/start {token}",
+                "chat": {"id": -100500, "type": "supergroup", "title": "Test Group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Tester"},
+            },
+        },
+        None,
+    )
+
+
+@pytest.mark.parametrize("backfill_override", [None, "true"], ids=["automatic", "true"])
+def test_link_chat_backfill_passes_original_storage_key(backfill_override):
+    storage_key = (TelegramChatID(-100123), TelegramMessageID(458))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(
+        module_id=ModuleID("tests.mocks.slave"),
+        uid=ChatID("chat"),
+        linked=False,
+        full_name="Test chat",
+        link=Mock(),
+    )
+    manager = _build_link_manager(storage_key, chat)
+
+    with patch("efb_telegram_master.chat_binding.coordinator.get_module_by_id"), \
+         patch.object(manager, "migrate_chat_history") as migrate_chat_history, \
+         patch.object(manager, "send_history_link") as send_history_link:
+        args = [token] if backfill_override is None else [token, backfill_override]
+        manager.link_chat(_build_start_update(token), args)
+
+    migrate_chat_history.assert_called_once_with(
+        "tests.mocks.slave chat", -100500, None, storage_key
+    )
+    send_history_link.assert_not_called()
+
+
+def test_link_chat_false_skips_backfill_and_history_notice():
+    storage_key = (TelegramChatID(-100123), TelegramMessageID(459))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    chat = SimpleNamespace(
+        module_id=ModuleID("tests.mocks.slave"),
+        uid=ChatID("chat"),
+        linked=False,
+        full_name="Test chat",
+        link=Mock(),
+    )
+    manager = _build_link_manager(storage_key, chat)
+
+    with patch("efb_telegram_master.chat_binding.coordinator.get_module_by_id"), \
+         patch.object(manager, "migrate_chat_history") as migrate_chat_history, \
+         patch.object(manager, "send_history_link") as send_history_link:
+        manager.link_chat(_build_start_update(token), [token, "false"])
+
+    migrate_chat_history.assert_not_called()
+    send_history_link.assert_not_called()
+
+
+def test_empty_history_backfill_sends_empty_history_notice_to_requested_thread():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager._history_migration_locks_lock = threading.Lock()
+    manager._history_migration_locks = {}
+    manager.logger = Mock()
+    manager.channel = SimpleNamespace(_=lambda message: message)
+    manager.bot = SimpleNamespace(send_message=Mock())
+    manager.db = SimpleNamespace(
+        get_recent_messages=Mock(return_value=[]),
+        replace_history_migration_entries=Mock(return_value=0),
+    )
+    storage_key = (TelegramChatID(-100123), TelegramMessageID(456))
+    thread_id = TelegramTopicID(789)
+
+    ChatBindingManager._queue_and_process_history_migration(
+        manager,
+        "tests.mocks.slave.chat",
+        12345,
+        thread_id,
+        storage_key,
+    )
+
+    manager.bot.send_message.assert_called_once_with(
+        chat_id=12345,
+        text="No historical messages were available to backfill.",
+        disable_notification=True,
+        message_thread_id=thread_id,
+    )
+
+
 def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
     chat = slave.chat_with_alias
     storage_key = (TelegramChatID(bot_group), TelegramMessageID(101))
     token = utils.b64en(utils.message_id_to_str(*storage_key))
     _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    ChatBindingManager._set_conversation_state(
+        channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC
+    )
     update = _build_link_update(bot_group)
 
-    sent_message = Mock()
-    sent_message.chat.id = bot_group
-    sent_message.message_id = 500
-    sent_message.reply_text = Mock()
+    sent_message = _sent_link_message(bot_group, 500)
 
     with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
          patch.object(channel.bot_manager, "edit_message_text"), \
@@ -53,6 +177,48 @@ def test_link_chat_auto_mode_backfills_on_first_link(channel, slave, bot_group):
 
     migrate_chat_history.assert_called_once()
     send_history_link.assert_not_called()
+    assert storage_key not in channel.chat_binding.link_handler._conversations
+    _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_link_chat_preserves_session_when_link_fails(channel, slave, bot_group):
+    chat = channel.chat_manager.update_chat_obj(slave.chat_with_alias)
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(106))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    ChatBindingManager._set_conversation_state(
+        channel.chat_binding.link_handler, storage_key, Flags.LINK_EXEC
+    )
+    update = _build_link_update(bot_group)
+
+    with patch.object(channel.bot_manager, "send_message", return_value=_sent_link_message(bot_group, 506)), \
+         patch.object(chat, "link", side_effect=RuntimeError("link failed")):
+        with pytest.raises(RuntimeError, match="link failed"):
+            channel.chat_binding.link_chat(update, [token])
+
+    assert storage_key in channel.chat_binding.msg_storage
+    assert channel.chat_binding.link_handler._conversations[storage_key] == Flags.LINK_EXEC
+
+
+def test_link_chat_edits_status_message_with_sender_bot(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(105))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    update = _build_link_update(bot_group)
+
+    sent_message = _sent_link_message(bot_group, 505, sender_bot_id="8465204282")
+
+    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
+         patch.object(channel.bot_manager, "edit_message_text") as edit_message_text, \
+         patch.object(channel.chat_binding, "migrate_chat_history"), \
+         patch.object(channel.chat_binding, "send_history_link"):
+        channel.chat_binding.link_chat(update, [token])
+
+    target_status_edit = edit_message_text.call_args_list[0].kwargs
+    assert target_status_edit["chat_id"] == bot_group
+    assert target_status_edit["message_id"] == 505
+    assert target_status_edit["_sender_bot_id"] == "8465204282"
     _cleanup_link_state(channel, chat, bot_group)
 
 
@@ -65,10 +231,7 @@ def test_link_chat_auto_mode_sends_history_link_on_relink(channel, slave, bot_gr
     channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
     update = _build_link_update(bot_group)
 
-    sent_message = Mock()
-    sent_message.chat.id = bot_group
-    sent_message.message_id = 501
-    sent_message.reply_text = Mock()
+    sent_message = _sent_link_message(bot_group, 501)
 
     with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
          patch.object(channel.bot_manager, "edit_message_text"), \
@@ -90,10 +253,7 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
     channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
     update = _build_link_update(bot_group)
 
-    sent_message = Mock()
-    sent_message.chat.id = bot_group
-    sent_message.message_id = 502
-    sent_message.reply_text = Mock()
+    sent_message = _sent_link_message(bot_group, 502)
 
     with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
          patch.object(channel.bot_manager, "edit_message_text"), \
@@ -106,32 +266,434 @@ def test_link_chat_backfill_override_forces_behavior(channel, slave, bot_group):
     _cleanup_link_state(channel, chat, bot_group)
 
 
-def test_migrate_chat_history_batches_text_and_forwards_media(channel):
+def test_link_chat_raw_message_override_forces_behavior_when_args_are_truncated(channel, slave, bot_group):
+    chat = slave.chat_with_alias
+    storage_key = (TelegramChatID(bot_group), TelegramMessageID(104))
+    token = utils.b64en(utils.message_id_to_str(*storage_key))
+    _store_link_session(channel, chat, storage_key, backfill_mode=None)
+    master_uid = utils.chat_id_to_str(channel.channel_id, ChatID(str(bot_group)))
+    channel.db.add_chat_assoc(master_uid, utils.chat_id_to_str(chat=chat))
+    update = _build_link_update(bot_group)
+    update.effective_message.text = f"/start {token} true"
+
+    sent_message = _sent_link_message(bot_group, 503)
+
+    with patch.object(channel.bot_manager, "send_message", return_value=sent_message), \
+         patch.object(channel.bot_manager, "edit_message_text"), \
+         patch.object(channel.chat_binding, "migrate_chat_history") as migrate_chat_history, \
+         patch.object(channel.chat_binding, "send_history_link") as send_history_link:
+        channel.chat_binding.link_chat(update, [token])
+
+    migrate_chat_history.assert_called_once()
+    send_history_link.assert_not_called()
+    _cleanup_link_state(channel, chat, bot_group)
+
+
+def test_resolve_command_args_falls_back_to_raw_message_text():
+    args = TelegramChannel._resolve_command_args("/start token true", ["token"])
+
+    assert args == ["token", "true"]
+
+
+def test_start_uses_raw_message_args_for_link_chat(channel):
+    update = Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1,
+                "text": "/start token true",
+                "chat": {"id": -1001, "type": "supergroup", "title": "Test Group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Tester"},
+            },
+        },
+        channel.bot_manager._async_bot,
+    )
+    context = SimpleNamespace(args=["token"])
+
+    with patch.object(channel.chat_binding, "link_chat") as link_chat:
+        channel.start(update, context)
+
+    link_chat.assert_called_once_with(update, ["token", "true"])
+
+
+def test_migrate_chat_history_enqueues_ordered_batches_and_clears_pending_entries(history):
+    manager = history.binding
+    manager._history_migration_locks_lock = threading.Lock()
+    manager._history_migration_locks = {}
+    manager.bot.history_ownership_page = Mock(return_value=[])
     msg_logs = []
     base_time = datetime.now()
     for idx in range(3):
-        msg_log = Mock()
-        msg_log.text = "x" * 2000
-        msg_log.media_type = "Text"
-        msg_log.time = base_time + timedelta(seconds=idx)
+        # Each source exceeds half the batch limit, so these stay separate.
+        msg_log = MsgLog(master_msg_id=f"1.{idx}", text="x" * 2500,
+                         media_type="Text", time=base_time + timedelta(seconds=idx))
         etm_msg = SimpleNamespace(author=SimpleNamespace(display_name=f"author-{idx}"))
-        msg_log.build_etm_msg.return_value = etm_msg
+        msg_log.build_etm_msg = Mock(return_value=etm_msg)
         msg_logs.append(msg_log)
 
-    media_log = Mock()
-    media_log.text = ""
-    media_log.media_type = "Photo"
-    media_log.master_msg_id = "1.2"
-    media_log.time = base_time + timedelta(seconds=10)
+    media_log = MsgLog(master_msg_id="1.2", text="", media_type="Photo",
+                       time=base_time + timedelta(seconds=10))
     msg_logs.append(media_log)
 
-    with patch.object(channel.db, "get_recent_messages", return_value=msg_logs), \
-         patch.object(channel.chat_binding, "_migration_send_text") as send_text, \
-         patch.object(channel.chat_binding, "_migration_forward_media") as forward_media:
-        channel.chat_binding._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
+    waiters = []
+    for _ in range(4):
+        waiter = Future()
+        waiter.set_result(None)
+        waiters.append(waiter)
+    source = SimpleNamespace(sender_bot_id=None, master_msg_id_alt=None, media_type=None, file_id=None)
+    with patch.object(manager.db, "get_recent_messages", return_value=msg_logs), \
+         patch.object(manager.db, "get_msg_log", return_value=source), \
+         patch.object(manager.bot, "enqueue_history_operation", side_effect=waiters) as enqueue:
+        manager._migrate_chat_history_background("tests.mocks.slave.chat", 12345)
 
-    assert send_text.call_count == 2
-    forward_media.assert_called_once_with(media_log, 12345, None)
+    assert enqueue.call_count == 4
+    assert [call.kwargs["operation"] for call in enqueue.call_args_list] == [
+        "send_message",
+        "send_message",
+        "send_message",
+        "copy_message",
+    ]
+    assert HistoryMigrationEntry.select().count() == 0
+
+
+def test_queue_history_migration_entries_persists_pending_rows():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.db = Mock()
+    manager.chat_manager = Mock()
+    manager.logger = Mock()
+    base_time = datetime(2026, 10, 9, 11, 33, 31, tzinfo=timezone.utc)
+    text_log = Mock()
+    text_log.master_msg_id = "10.20"
+    text_log.text = "hello"
+    text_log.media_type = "Text"
+    text_log.time = base_time
+    text_log.aggregate = None
+    text_log.source_member = None
+    text_log.build_etm_msg.return_value = SimpleNamespace(author=SimpleNamespace(display_name="author"))
+    media_log = Mock()
+    media_log.master_msg_id = "10.21"
+    media_log.text = ""
+    media_log.media_type = "Photo"
+    media_log.time = base_time + timedelta(seconds=1)
+    media_log.aggregate = None
+    media_log.source_member = None
+    manager.db.get_recent_messages.return_value = [text_log, media_log]
+    manager.db.replace_history_migration_entries.return_value = 2
+
+    queued_count = ChatBindingManager._queue_history_migration_entries(
+        manager,
+        "tests.mocks.slave.chat",
+        12345,
+    )
+
+    entries = list(manager.db.replace_history_migration_entries.call_args.args[3])
+    assert queued_count == 2
+    assert len(entries) == 2
+    assert entries[0]["source_master_msg_id"] == "10.20"
+    assert entries[0]["formatted_text"] == "*author* `19:33:31`\nhello\n\n"
+    assert entries[1]["source_master_msg_id"] == "10.21"
+    assert entries[1]["formatted_text"] is None
+
+
+def test_process_pending_history_migrations_transfers_entries_to_durable_queue_before_waiting():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.logger = Mock()
+    manager._history_ownership_swept = False
+    pending_entries = [
+        SimpleNamespace(
+            id=1, ownership_key="legacy:1",
+            slave_chat_id="tests.mocks.slave.chat",
+            target_chat_id="12345",
+            message_thread_id=None,
+            source_master_msg_id="10.20",
+            formatted_text="first\n",
+            media_type="Text",
+            source_time=datetime.now(),
+            position=0,
+        ),
+        SimpleNamespace(
+            id=2, ownership_key="legacy:2",
+            slave_chat_id="tests.mocks.slave.chat",
+            target_chat_id="12345",
+            message_thread_id=None,
+            source_master_msg_id="10.21",
+            formatted_text="second\n",
+            media_type="Text",
+            source_time=datetime.now() + timedelta(seconds=1),
+            position=1,
+        ),
+        SimpleNamespace(
+            id=3, ownership_key="legacy:3",
+            slave_chat_id="tests.mocks.slave.chat",
+            target_chat_id="12345",
+            message_thread_id=None,
+            source_master_msg_id="10.22",
+            formatted_text=None,
+            media_type="Photo",
+            source_time=datetime.now() + timedelta(seconds=2),
+            position=2,
+        ),
+    ]
+
+    def get_next_history_migration_target(*_args, **_kwargs):
+        return pending_entries[0] if pending_entries else None
+
+    def get_history_migration_entries(_slave_chat_id, _tg_chat_id, _thread_id, limit=None):
+        return list(pending_entries)
+
+    events = []
+
+    def delete_entry(entry_id):
+        events.append(("delete", entry_id))
+        pending_entries.remove(next(entry for entry in pending_entries if entry.id == entry_id))
+
+    manager.db = SimpleNamespace(
+        get_next_history_migration_target=Mock(side_effect=get_next_history_migration_target),
+        get_history_migration_entries=Mock(side_effect=get_history_migration_entries),
+        get_recent_messages=Mock(),
+        get_history_migration_ownership_keys=lambda ids: [f"legacy:{i}" for i in ids],
+        get_msg_log=Mock(return_value=SimpleNamespace(
+            sender_bot_id=None, master_msg_id_alt=None, media_type='Photo', file_id=None,
+        )),
+        delete_history_migration_entry=Mock(side_effect=delete_entry),
+    )
+
+    class Waiter:
+        def __init__(self, entry_id):
+            self.entry_id = entry_id
+
+        def result(self):
+            events.append(("wait", self.entry_id))
+
+    def enqueue_history_operation(**kwargs):
+        entry_id = kwargs["history_entry_ids"][0]
+        events.append(("enqueue", entry_id))
+        return Waiter(entry_id)
+
+    manager.bot = SimpleNamespace(enqueue_history_operation=Mock(side_effect=enqueue_history_operation),
+                                  history_ownership_page=lambda **kwargs: [],
+                                  owned_history_entries=lambda keys: set(), forget_history_entries=lambda keys: None)
+
+    ChatBindingManager._process_pending_history_migrations_locked(manager)
+
+    manager.db.get_recent_messages.assert_not_called()
+    manager.bot.enqueue_history_operation.assert_has_calls([
+        call(
+            source_key="tests.mocks.slave.chat",
+            target_chat_id=12345,
+            operation="send_message",
+            args=(),
+            kwargs={
+                "chat_id": 12345,
+                "text": "first\nsecond\n",
+                "parse_mode": "Markdown",
+                "disable_notification": True,
+            },
+            history_entry_ids=[1, 2], history_keys=["legacy:1", "legacy:2"],
+        ),
+        call(
+            source_key="tests.mocks.slave.chat",
+            target_chat_id=12345,
+            operation="copy_message",
+            args=(),
+            kwargs={
+                "chat_id": 12345,
+                "from_chat_id": 10,
+                "message_id": 22,
+                "disable_notification": True,
+            },
+            history_entry_ids=[3], history_keys=["legacy:3"],
+        ),
+    ])
+    assert events == [
+        ("enqueue", 1), ("delete", 1), ("delete", 2), ("wait", 1),
+        ("enqueue", 3), ("delete", 3), ("wait", 3),
+    ]
+    assert pending_entries == []
+
+
+def test_history_migration_lanes_serialize_per_topic_not_per_chat():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager._history_migration_locks_lock = threading.Lock()
+    manager._history_migration_locks = {}
+    manager.logger = Mock()
+
+    queued_targets = []
+    manager._queue_history_migration_entries = lambda _source, target, thread: (
+        queued_targets.append((target, thread)) or 1
+    )
+
+    entered = {}
+    releases = {}
+    active = set()
+    active_lock = threading.Lock()
+
+    def process_target(target, thread=None):
+        key = (target, thread)
+        with active_lock:
+            assert key not in active, "one topic must not run two lanes at once"
+            active.add(key)
+            entered.setdefault(key, threading.Event()).set()
+            releases.setdefault(key, threading.Event())
+        assert releases[key].wait(timeout=2)
+        with active_lock:
+            active.discard(key)
+
+    manager._process_pending_history_migrations_locked = process_target
+
+    def migrate(target, thread=None):
+        ChatBindingManager._queue_and_process_history_migration(manager, "source", target, thread)
+
+    # Two topics of one chat are separate lanes and must not block each other.
+    first = threading.Thread(target=migrate, args=(101, 11))
+    first.start()
+    second = threading.Thread(target=migrate, args=(101, 12))
+    second.start()
+    assert entered[(101, 11)].wait(timeout=2)
+    assert entered[(101, 12)].wait(timeout=2)
+
+    # A second run of an already active topic waits for that topic's lane.
+    duplicate_done = threading.Event()
+    duplicate = threading.Thread(target=lambda: (migrate(101, 11), duplicate_done.set()))
+    duplicate.start()
+    assert not duplicate_done.wait(timeout=0.05)
+
+    for event in tuple(releases.values()):
+        event.set()
+    assert duplicate_done.wait(timeout=2)
+    for worker in (first, second, duplicate):
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert sorted(queued_targets) == [(101, 11), (101, 11), (101, 12)]
+
+
+def test_history_migration_continues_after_terminal_delivery_failure():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.logger = Mock()
+    entry = SimpleNamespace(
+        id=7, ownership_key="legacy:7",
+        slave_chat_id="tests.mocks.slave.chat",
+        target_chat_id="12345",
+        message_thread_id=None,
+        source_master_msg_id="10.20",
+        formatted_text="first\n",
+    )
+    manager.db = SimpleNamespace(
+        get_history_migration_entries=Mock(return_value=[entry]),
+        delete_history_migration_entry=Mock(),
+        get_history_migration_ownership_keys=lambda ids: [f"legacy:{i}" for i in ids],
+    )
+    manager.db.get_msg_log = Mock(return_value=SimpleNamespace(sender_bot_id=None))
+    failed_waiter = Future()
+    failed_waiter.set_exception(RuntimeError("Telegram failed"))
+    manager.bot = SimpleNamespace(owned_history_entries=lambda keys: set(), forget_history_entries=lambda keys: None, enqueue_history_operation=Mock(return_value=failed_waiter))
+
+    processed = ChatBindingManager._process_history_migration_target(manager, entry)
+
+    assert processed is True
+    manager.db.delete_history_migration_entry.assert_called_once_with(7)
+    manager.logger.warning.assert_called_once_with(
+        "History migration entries %s failed after durable enqueue: %s",
+        [7],
+        ANY,
+    )
+
+
+def test_history_migration_retains_entry_when_durable_enqueue_fails():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.logger = Mock()
+    entry = SimpleNamespace(
+        id=9, ownership_key="legacy:9",
+        slave_chat_id="tests.mocks.slave.chat",
+        target_chat_id="12345",
+        message_thread_id=None,
+        source_master_msg_id="10.20",
+        formatted_text="first\n",
+    )
+    manager.db = SimpleNamespace(
+        get_history_migration_entries=Mock(return_value=[entry]),
+        delete_history_migration_entry=Mock(),
+        get_history_migration_ownership_keys=lambda ids: [f"legacy:{i}" for i in ids],
+    )
+    manager.db.get_msg_log = Mock(return_value=SimpleNamespace(sender_bot_id=None))
+    manager.bot = SimpleNamespace(owned_history_entries=lambda keys: set(), forget_history_entries=lambda keys: None,
+        enqueue_history_operation=Mock(side_effect=RuntimeError("queue unavailable"))
+    )
+
+    processed = ChatBindingManager._process_history_migration_target(manager, entry)
+
+    assert processed is False
+    manager.db.delete_history_migration_entry.assert_not_called()
+    manager.logger.warning.assert_called_once_with(
+        "History migration entries %s retained because durable enqueue failed: %s",
+        [9],
+        ANY,
+    )
+
+
+def test_history_migration_retains_unpreparable_entry_without_claiming_completion():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.logger = Mock()
+    invalid = SimpleNamespace(
+        id=10, ownership_key="legacy:10",
+        slave_chat_id="tests.mocks.slave.chat",
+        target_chat_id="12345",
+        message_thread_id=None,
+    )
+    valid = SimpleNamespace(id=11, ownership_key="legacy:11")
+    manager.db = SimpleNamespace(
+        get_history_migration_entries=Mock(return_value=[invalid, valid]),
+        delete_history_migration_entry=Mock(),
+        get_history_migration_ownership_keys=lambda ids: [f"legacy:{i}" for i in ids],
+    )
+    completed_waiter = Future()
+    completed_waiter.set_result(None)
+    manager.bot = SimpleNamespace(owned_history_entries=lambda keys: set(), forget_history_entries=lambda keys: None,
+        enqueue_history_operation=Mock(return_value=completed_waiter)
+    )
+
+    with patch.object(
+        ChatBindingManager,
+        "_prepare_history_migration_call",
+        side_effect=[ValueError("invalid source id"), ("send_message", {"chat_id": 12345})],
+    ):
+        processed = ChatBindingManager._process_history_migration_target(manager, invalid)
+
+    assert processed is False
+    manager.db.delete_history_migration_entry.assert_not_called()
+    manager.bot.enqueue_history_operation.assert_not_called()
+    manager.logger.warning.assert_called_once_with(
+        "History migration entry %d retained because it could not be prepared: %s",
+        10,
+        ANY,
+    )
+
+
+def test_history_migration_deletes_zero_call_entry_without_queueing():
+    manager = ChatBindingManager.__new__(ChatBindingManager)
+    manager.logger = Mock()
+    entry = SimpleNamespace(
+        id=8, ownership_key="legacy:8",
+        slave_chat_id="tests.mocks.slave.chat",
+        target_chat_id="12345",
+        message_thread_id=None,
+        source_master_msg_id="",
+        formatted_text="",
+    )
+    manager.db = SimpleNamespace(
+        get_history_migration_entries=Mock(return_value=[entry]),
+        delete_history_migration_entry=Mock(),
+        get_history_migration_ownership_keys=lambda ids: [f"legacy:{i}" for i in ids],
+    )
+    manager.bot = SimpleNamespace(owned_history_entries=lambda keys: set(), forget_history_entries=lambda keys: None, enqueue_history_operation=Mock())
+
+    processed = ChatBindingManager._process_history_migration_target(manager, entry)
+
+    assert processed is True
+    manager.bot.enqueue_history_operation.assert_not_called()
+    manager.db.delete_history_migration_entry.assert_called_once_with(8)
+    manager.logger.info.assert_any_call("History migration entry %d completed 0 calls", 8)
 
 
 def test_get_recent_messages_returns_oldest_first(channel, slave):

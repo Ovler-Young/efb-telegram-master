@@ -7,10 +7,11 @@ from threading import Thread
 from typing import Optional, TYPE_CHECKING, Tuple, Any
 
 import humanize
-from telegram import Update, Message, Chat, TelegramError, Contact, File
-from telegram.constants import MAX_FILESIZE_DOWNLOAD
-from telegram.ext import MessageHandler, Filters, CallbackContext, CommandHandler
-from telegram.utils.helpers import escape_markdown
+from telegram import Update, Message, Chat, Contact, File
+from telegram.constants import FileSizeLimit
+from telegram.error import TelegramError
+from telegram.ext import MessageHandler, CallbackContext, CommandHandler
+from telegram.helpers import escape_markdown
 
 from ehforwarderbot import coordinator
 from ehforwarderbot.constants import MsgType
@@ -23,8 +24,13 @@ from . import utils
 from .chat_destination_cache import ChatDestinationCache
 from .locale_mixin import LocaleMixin
 from .message import ETMMsg
+from .member_selection import SourceMemberSelector, SourceIdentity
 from .msg_type import TGMsgType, get_msg_type
-from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID
+from .ptb_compat import Filters, sync_reply_text
+from .utils import EFBChannelChatIDStr, TelegramChatID, TelegramMessageID, removal_edit
+
+ForumRoute = Tuple[Optional[EFBChannelChatIDStr]]
+QueuedMessage = Tuple[Update, CallbackContext, Optional[ForumRoute]]
 
 if TYPE_CHECKING:
     from . import TelegramChannel
@@ -66,19 +72,27 @@ class MasterMessageProcessor(LocaleMixin):
         self.chat_dest_cache: ChatDestinationCache = channel.chat_dest_cache
         self.chat_manager: 'ChatObjectCacheManager' = channel.chat_manager
 
-        self.bot.dispatcher.add_handler(CommandHandler("rm", self.delete_message))
+        self.members = SourceMemberSelector(self)
+        self.bot.dispatcher.add_handler(CommandHandler("rm", self.bot.as_async_callback(self.delete_message)))
+
+        message_update_filter = (
+            Filters.update.message
+            | Filters.update.channel_post
+            | Filters.update.edited_message
+            | Filters.update.edited_channel_post
+        )
 
         self.bot.dispatcher.add_handler(MessageHandler(
             (Filters.text | Filters.photo | Filters.sticker | Filters.document |
              Filters.venue | Filters.location | Filters.audio | Filters.voice |
-             Filters.video | Filters.contact | Filters.video_note | Filters.dice) &
-            Filters.update,
-            self.enqueue_message
+             Filters.video | Filters.animation | Filters.contact | Filters.video_note |
+             Filters.dice) & message_update_filter,
+            self.bot.as_async_callback(self.enqueue_message)
         ))
         self.bot.dispatcher.add_handler(MessageHandler(
             (Filters.passport_data | Filters.invoice | Filters.game | Filters.successful_payment |
-             Filters.poll) & Filters.update,
-            self.unsupported_message
+             Filters.poll) & message_update_filter,
+            self.bot.as_async_callback(self.unsupported_message)
         ))
         self.logger: logging.Logger = logging.getLogger(__name__)
 
@@ -87,7 +101,7 @@ class MasterMessageProcessor(LocaleMixin):
         if self.channel.flag("animated_stickers"):
             self.TYPE_DICT[TGMsgType.AnimatedSticker] = MsgType.Animation
 
-        self.message_queue: 'Queue[Optional[Tuple[Update, CallbackContext]]]' = Queue()
+        self.message_queue: 'Queue[Optional[QueuedMessage]]' = Queue()
         self.message_worker_thread = Thread(target=self.message_worker, name="ETM master messages worker thread")
         self.message_worker_thread.start()
 
@@ -98,17 +112,20 @@ class MasterMessageProcessor(LocaleMixin):
             if content is None:
                 self.message_queue.task_done()
                 return
-            update, context = content
+            update, context, forum_route = content
             try:
-                self.msg(update, context)
+                self.msg(update, context, forum_route)
             except Exception as e:
                 self.logger.exception(
                     "Error [%r] occurred while processing update %s.", e, update)
                 if update.effective_message:
-                    update.effective_message.reply_text(
+                    sync_reply_text(
+                        self.bot,
+                        update.effective_message,
                         self._("Unknown error has occurred while "
                                "trying to process this message. See log for "
-                               "details.\n\n{error!r}").format(error=e))
+                               "details.\n\n{error!r}").format(error=e),
+                    )
             finally:
                 self.message_queue.task_done()
 
@@ -136,14 +153,29 @@ class MasterMessageProcessor(LocaleMixin):
     def enqueue_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
 
-        self.message_queue.put((update, context))
+        forum_route: Optional[ForumRoute] = None
+        message = update.effective_message
+        if message and message.chat.is_forum and message.message_thread_id:
+            with self.channel.chat_binding._topic_mutex:
+                topic_destinations = self.db.get_topic_slaves(TelegramChatID(message.chat.id))
+            if topic_destinations:
+                destination = next(
+                    (dest for dest, topic_id in topic_destinations if topic_id == message.message_thread_id),
+                    None,
+                )
+                forum_route = (destination,)
+        self.message_queue.put((update, context, forum_route))
         if not self.message_worker_thread.is_alive():
             if update.effective_message:
-                update.effective_message.reply_text(
+                sync_reply_text(
+                    self.bot,
+                    update.effective_message,
                     self._(
-                        "ETM message worker is not running due to unforeseen reason. This might be a bug. Please see log for details."))
+                        "ETM message worker is not running due to unforeseen reason. This might be a bug. Please see log for details."),
+                )
 
-    def msg(self, update: Update, context: CallbackContext):
+    def msg(self, update: Update, context: CallbackContext,
+            forum_route: Optional[ForumRoute] = None):
         """
         Process, wrap and dispatch messages from user.
         """
@@ -153,25 +185,50 @@ class MasterMessageProcessor(LocaleMixin):
 
         message: Message = update.effective_message
         mid = utils.message_id_to_str(update=update)
+        master_chat_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id)))
+        if message.chat.is_forum:
+            self.channel.chat_binding.warn_forum_limit(message.chat.id, message.message_id)
+        linked_slave_chats: Optional[list[EFBChannelChatIDStr]] = None
+
+        def get_linked_slave_chats() -> list[EFBChannelChatIDStr]:
+            nonlocal linked_slave_chats
+            if linked_slave_chats is None:
+                linked_slave_chats = self.db.get_chat_assoc(master_uid=master_chat_uid)
+            return linked_slave_chats
 
         self.logger.debug("[%s] Received message from Telegram: %s", mid, message.to_dict())
 
-        destination = None
-        edited = None
+        destination: Optional[EFBChannelChatIDStr] = None
+        edited: Optional["MsgLog"] = None
         quote = False
 
         if update.edited_message or update.edited_channel_post:
             self.logger.debug('[%s] Message is edited: %s', mid, message.edit_date)
-            msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update))
-            if not msg_log or msg_log.slave_message_id == self.db.FAIL_FLAG:
-                message.reply_text(self._("Error: This message cannot be edited, and thus is not sent. (ME01)"), quote=True)
+            msg_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(update=update), include_managed_alt=True)
+            if not msg_log or msg_log.aggregate or msg_log.slave_message_id == self.db.FAIL_FLAG:
+                sync_reply_text(self.bot, message,
+                                self._("Error: This message cannot be edited, and thus is not sent. (ME01)"),
+                                quote=True)
                 return
-            destination = msg_log.slave_origin_uid
+            destination = EFBChannelChatIDStr(msg_log.slave_origin_uid)
             edited = msg_log
             quote = msg_log.build_etm_msg(self.chat_manager).target is not None
 
+        elif forum_route is not None:
+            destination, = forum_route
+            if destination is None:
+                self.logger.debug("[%s] Ignored message as it's a topic which wasn't created by this bot", mid)
+                return
+            reply_to_message = message.reply_to_message
+            quote = (
+                reply_to_message is not None
+                and reply_to_message.message_id != reply_to_message.message_thread_id
+            )
+
         if destination is None:
-            destination = self.get_singly_linked_chat_id_str(update.effective_chat)
+            chats = get_linked_slave_chats()
+            if len(chats) == 1:
+                destination = chats[0]
             if destination:
                 quote = message.reply_to_message is not None
                 self.logger.debug("[%s] Chat %s is singly-linked to %s", mid, message.chat, destination)
@@ -189,19 +246,21 @@ class MasterMessageProcessor(LocaleMixin):
                 thread_id = message.message_thread_id
                 if thread_id and topic_destinations:
                     for (dest, topic_id) in topic_destinations:
-                        if topic_id == thread_id:
-                            self.logger.debug("[%s] Chat %s is singly-linked to %s in topic %s", mid, message.chat, dest, topic_id)
-                            destination = dest
-                            quote = message.reply_to_message.message_id != message.reply_to_message.message_thread_id
-                            if not quote:
-                                message.reply_to_message = None  # type: ignore[assignment]
-                            break
+                         if topic_id == thread_id:
+                             self.logger.debug("[%s] Chat %s is singly-linked to %s in topic %s", mid, message.chat, dest, topic_id)
+                             destination = dest
+                             reply_to_message = message.reply_to_message
+                             quote = (
+                                 reply_to_message is not None
+                                 and reply_to_message.message_id != reply_to_message.message_thread_id
+                             )
+                             break
                     if destination is None:
                         self.logger.debug("[%s] Ignored message as it's a topic which wasn't created by this bot", mid)
                         return
                 else:
                     self.logger.debug("[%s] Chat %s is a forum, but no thread ID is found.", mid, message.chat)
-                    destinations = self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id))))
+                    destinations = get_linked_slave_chats()
                     if topic_destinations is not None and len(destinations) == len(topic_destinations):
                         self.logger.debug("[%s] Chat %s is a forum, and all destinations are in topics. The new message is not in any topic, so ignore it.", mid, message.chat)
                         return
@@ -217,15 +276,24 @@ class MasterMessageProcessor(LocaleMixin):
                     master_msg_id=utils.message_id_to_str(
                         TelegramChatID(reply_to.chat.id),
                         TelegramMessageID(reply_to.message_id)
-                    )
+                    ), include_managed_alt=True
                 )
                 if dest_msg:
-                    destination = dest_msg.slave_origin_uid
+                    if dest_msg.aggregate:
+                        origins = {child["origin_uid"] for child in dest_msg.aggregate["children"]}
+                        if len(origins) != 1:
+                            return self.bot.reply_error(update, self._("Cannot determine the source chat of this container."))
+                        destination = EFBChannelChatIDStr(origins.pop())
+                        quote = True
+                    else:
+                        destination = EFBChannelChatIDStr(dest_msg.slave_origin_uid)
+                        if dest_msg.source_member:
+                            quote = True
                     self.chat_dest_cache.set(str(message.chat.id), destination)
                     self.logger.debug("[%s] Quoted message is found in database with destination: %s", mid, destination)
             elif cached_dest:
                 self.logger.debug("[%s] Cached destination found: %s", mid, cached_dest)
-                destination = cached_dest
+                destination = EFBChannelChatIDStr(cached_dest)
                 self._send_cached_chat_warning(update, TelegramChatID(message.chat.id), cached_dest)
 
         self.logger.debug("[%s] Destination chat = %s", mid, destination)
@@ -234,35 +302,30 @@ class MasterMessageProcessor(LocaleMixin):
             self.logger.debug("[%s] Destination is not found for this message", mid)
             candidates = (
                  self.db.get_recent_slave_chats(TelegramChatID(message.chat.id), limit=5) or
-                 self.db.get_chat_assoc(master_uid=utils.chat_id_to_str(self.channel_id, ChatID(str(message.chat.id))))[:5]
+                 get_linked_slave_chats()[:5]
             )
             if candidates:
                 self.logger.debug("[%s] Candidate suggestions are found for this message: %s", mid, candidates)
-                tg_err_msg = message.reply_text(self._("Error: No recipient specified.\n"
-                                                       "Please reply to a previous message. (MS01)"), quote=True)
+                tg_err_msg = sync_reply_text(self.bot, message,
+                                             self._("Error: No recipient specified.\n"
+                                                    "Please reply to a previous message. (MS01)"),
+                                             quote=True)
                 self.channel.chat_binding.register_suggestions(update, candidates,
                                                                TelegramChatID(update.effective_chat.id),
                                                                TelegramMessageID(tg_err_msg.message_id))
             else:
                 self.logger.debug("[%s] Candidate suggestions not found, give up.", mid)
-                message.reply_text(self._("Error: No recipient specified.\n"
-                                          "Please reply to a previous message. (MS02)"), quote=True)
+                sync_reply_text(self.bot, message,
+                                self._("Error: No recipient specified.\n"
+                                       "Please reply to a previous message. (MS02)"),
+                                quote=True)
         else:
             return self.process_telegram_message(update, context, destination, quote=quote, edited=edited)
 
-    def get_singly_linked_chat_id_str(self, chat: Chat) -> Optional[EFBChannelChatIDStr]:
-        """Return the singly-linked remote chat if available.
-        Otherwise return None.
-        """
-        master_chat_uid = utils.chat_id_to_str(self.channel_id, ChatID(str(chat.id)))
-        chats = self.db.get_chat_assoc(master_uid=master_chat_uid)
-        if len(chats) == 1:
-            return chats[0]
-        return None
-
     def process_telegram_message(self, update: Update, context: CallbackContext,
                                  destination: EFBChannelChatIDStr, quote: bool = False,
-                                 edited: Optional["MsgLog"] = None):
+                                 edited: Optional["MsgLog"] = None,
+                                 selected_identity: Optional[SourceIdentity] = None):
         """
         Process messages came from Telegram.
 
@@ -280,6 +343,19 @@ class MasterMessageProcessor(LocaleMixin):
         message_id = utils.message_id_to_str(update=update)
 
         message: Message = update.effective_message
+
+        selected_target = None
+        if quote and message.reply_to_message:
+            target_log = self.db.get_msg_log(master_msg_id=utils.message_id_to_str(
+                TelegramChatID(message.reply_to_message.chat_id),
+                TelegramMessageID(message.reply_to_message.message_id)), include_managed_alt=True)
+            if target_log and (target_log.aggregate or target_log.source_member):
+                selected_target = self.members.select(update, context, target_log, destination, 'reply', selected_identity)
+                if selected_target is None:
+                    return
+            elif selected_identity is not None:
+                return self.bot.reply_error(update, self._(
+                    'This selection has expired. Please retry the reply or /rm.'))
 
         channel, uid, gid = utils.chat_id_str_to_id(destination)
         if channel not in coordinator.slaves:
@@ -310,7 +386,9 @@ class MasterMessageProcessor(LocaleMixin):
 
             m.deliver_to = coordinator.slaves[channel]
 
-            if quote:
+            if selected_target is not None:
+                m.target = selected_target
+            elif quote:
                 self.attach_target_message(message, m, channel)
             # Type specific stuff
             self.logger.debug("[%s] Message type from Telegram: %s", message_id, mtype)
@@ -340,20 +418,20 @@ class MasterMessageProcessor(LocaleMixin):
                 m.edit = True
                 text = msg_md_text or msg_md_caption
 
-                m.uid = edited.slave_message_id
+                m.uid = MessageID(edited.slave_message_id)
                 if text.startswith(self.DELETE_FLAG):
                     coordinator.send_status(MessageRemoval(
                         source_channel=self.channel,
                         destination_channel=coordinator.slaves[channel],
                         message=m
                     ))
-                    if not self.channel.flag('prevent_message_removal'):
-                        try:
-                            message.delete()
-                        except TelegramError:
-                            message.reply_text(self._("Message is removed in remote chat."))
-                    else:
-                        message.reply_text(self._("Message is removed in remote chat."))
+                    try:
+                        operation, kwargs = removal_edit(get_msg_type(message).value,
+                                                         (message.text or message.caption or "").removeprefix(self.DELETE_FLAG))
+                        getattr(self.bot, operation)(chat_id=message.chat_id, message_id=message.message_id,
+                                                    _sender_bot_id=edited.sender_bot_id, **kwargs)
+                    except TelegramError:
+                        sync_reply_text(self.bot, message, self._("Message is removed in remote chat."))
                     log_message = False
                     return
                 self.logger.debug('[%s] Message is edited (%s)', m.uid, m.edit)
@@ -477,17 +555,26 @@ class MasterMessageProcessor(LocaleMixin):
 
         target_log = self.db.get_msg_log(
             master_msg_id=utils.message_id_to_str(
-                TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)))
+                TelegramChatID(reply_to.chat.id), TelegramMessageID(reply_to.message_id)), include_managed_alt=True)
         if not target_log or not target_log.slave_origin_uid:
             self.logger.error("[%s] Quoted message not found in database, give up quoting.",
                               tg_msg.message_id)
             return etm_msg
-        target_channel, _, _ = utils.chat_id_str_to_id(target_log.slave_origin_uid)
+        target_channel, _, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(target_log.slave_origin_uid))
         if target_channel != channel:
             self.logger.error("[%s] Quoted message is sent to channel %s, but this message is sent to %s, give up quoting.",
                               tg_msg.message_id, target_channel, channel)
             return etm_msg
-        target_msg: ETMMsg = target_log.build_etm_msg(self.chat_manager, recur=False)
+        if target_log.aggregate:
+            # Aggregate targets are selected before processing the Telegram body.
+            return etm_msg
+        if target_log.source_member:
+            member = target_log.source_member
+            target_msg = self.members.resolve(target_log, (member['origin_uid'], member['source_id']))
+            if target_msg is None:
+                return etm_msg
+        else:
+            target_msg = target_log.build_etm_msg(self.chat_manager, recur=False)
         target_msg.target = None
         etm_msg.target = target_msg
 
@@ -516,7 +603,9 @@ class MasterMessageProcessor(LocaleMixin):
                 dest_name = dest_chat.full_name
             else:
                 dest_name = cached_dest
-            update.effective_message.reply_text(
+            sync_reply_text(
+                self.bot,
+                update.effective_message,
                 self._(
                     "This message is sent to “{dest}” with quick reply feature.\n"
                     "\n"
@@ -525,7 +614,8 @@ class MasterMessageProcessor(LocaleMixin):
                 ).format(dest=dest_name,
                          docs="https://etm.1a23.studio/"),
                 quote=True,
-                disable_web_page_preview=True)
+                disable_web_page_preview=True,
+            )
 
     def _check_file_download(self, file_obj: Any):
         """
@@ -539,15 +629,16 @@ class MasterMessageProcessor(LocaleMixin):
         """
         size = getattr(file_obj, "file_size", None)
         if size and not self.channel.flag("local_tdlib_api")\
-                and size > MAX_FILESIZE_DOWNLOAD:
+                and size > FileSizeLimit.FILESIZE_DOWNLOAD:
             size_str = humanize.naturalsize(size)
-            max_size_str = humanize.naturalsize(MAX_FILESIZE_DOWNLOAD)
+            max_size_str = humanize.naturalsize(FileSizeLimit.FILESIZE_DOWNLOAD)
             raise EFBMessageError(
                 self._(
                     "Attachment is too large ({size}). Maximum allowed by Telegram Bot API is {max_size}. (AT01)").format(
                     size=size_str, max_size=max_size_str))
 
-    def delete_message(self, update: Update, context: CallbackContext):
+    def delete_message(self, update: Update, context: CallbackContext,
+                       selected_identity: Optional[SourceIdentity] = None):
         """Remove an arbitrary message from its remote chat.
         Triggered by command ``/rm``.
         """
@@ -563,13 +654,31 @@ class MasterMessageProcessor(LocaleMixin):
         msg_log = self.db.get_msg_log(
             master_msg_id=utils.message_id_to_str(
                 chat_id=TelegramChatID(reply.chat_id),
-                message_id=TelegramMessageID(reply.message_id)))
+                message_id=TelegramMessageID(reply.message_id)), include_managed_alt=True)
         if not msg_log or msg_log.slave_member_uid == self.db.FAIL_FLAG:
             return self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."
             ))
+        aggregate = msg_log.aggregate
         try:
-            etm_msg: ETMMsg = msg_log.build_etm_msg(self.chat_manager)
+            if aggregate:
+                origins = {child['origin_uid'] for child in aggregate['children']}
+                if len(origins) != 1:
+                    return self.bot.reply_error(update, self._('Cannot determine the source chat of this container.'))
+                etm_msg = self.members.select(update, context, msg_log, origins.pop(), 'rm', selected_identity)
+                if etm_msg is None:
+                    return
+            elif selected_identity is not None:
+                return self.bot.reply_error(update, self._(
+                    'This selection has expired. Please retry the reply or /rm.'))
+            elif msg_log.source_member:
+                source_member = msg_log.source_member
+                etm_msg = self.members.resolve(msg_log, (source_member['origin_uid'], source_member['source_id']))
+                if etm_msg is None:
+                    return self.bot.reply_error(update, self._(
+                        'This source message is no longer available here. Please retry the reply or /rm.'))
+            else:
+                etm_msg = msg_log.build_etm_msg(self.chat_manager)
         except UnpicklingError:
             return self.bot.reply_error(update, self._(
                 "This message is not found in ETM database. You cannot remove it from its remote chat."
@@ -586,21 +695,29 @@ class MasterMessageProcessor(LocaleMixin):
             ))
         except EFBException as e:
             self.logger.exception("Failed to remove message from remote chat. Message: %s; Error: %s", etm_msg, e)
-            return reply.reply_text(self._(
+            return sync_reply_text(self.bot, reply, self._(
                 "Failed to remove this message from remote chat.\n\n{error!s}"
             ).format(error=e))
         except Exception as e:
             self.logger.exception("Failed to remove message from remote chat. Message: %s; Error: %s", etm_msg, e)
-            return reply.reply_text(self._(
+            return sync_reply_text(self.bot, reply, self._(
                 "Failed to remove this message from remote chat.\n\n{error!r}"
             ).format(error=e))
-        if not self.channel.flag('prevent_message_removal'):
-            try:
-                reply.delete()
-            except TelegramError:
-                reply.reply_text(self._("Message is removed in remote chat."))
-        else:
-            reply.reply_text(self._("Message is removed in remote chat."))
+        if aggregate or msg_log.source_member:
+            origin = str(utils.chat_id_to_str(chat=etm_msg.chat))
+            key = (origin, reply.chat_id, msg_log.master_message_thread_id)
+            self.bot.live_aggregation.remove_source_member(key, (origin, str(etm_msg.uid)))
+            return sync_reply_text(self.bot, message, self._("Message is removed in remote chat."))
+        try:
+            operation, kwargs = removal_edit(get_msg_type(reply).value, reply.text or reply.caption or "")
+            getattr(self.bot, operation)(
+                chat_id=reply.chat_id,
+                message_id=reply.message_id,
+                _sender_bot_id=msg_log.sender_bot_id,
+                **kwargs,
+            )
+        except TelegramError:
+            sync_reply_text(self.bot, reply, self._("Message is removed in remote chat."))
 
     def unsupported_message(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)

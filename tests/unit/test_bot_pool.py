@@ -1,103 +1,76 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from efb_telegram_master.bot_pool import BotPool
 
 
-def _make_aux_bot(bot_id, *, disabled=False, membership=True, delay=0.0, username=None):
-    aux_bot = Mock()
-    aux_bot.bot_id = bot_id
-    aux_bot.username = username or f"bot{bot_id}"
-    aux_bot.disabled = disabled
-    aux_bot.check_membership_tri.return_value = membership
-    aux_bot.check_membership_sync.return_value = membership
-    aux_bot.check_membership.return_value = bool(membership)
-    aux_bot.peek_delay.return_value = delay
-    aux_bot.reserve_slot.return_value = delay
-    aux_bot.has_pending_probes.return_value = False
-    return aux_bot
+def _bot(
+    bot_id: int,
+    *,
+    disabled: bool = False,
+    membership: bool | None = True,
+    limiter_delay: float = 0.0,
+) -> Mock:
+    bot = Mock()
+    bot.bot_id = bot_id
+    bot.disabled = disabled
+    bot.check_membership_tri.return_value = membership
+    bot.peek_delay.return_value = limiter_delay
+    bot.has_pending_probes.return_value = False
+    return bot
 
 
-def test_acquire_send_slot_picks_lowest_delay_bot():
-    bot_a = _make_aux_bot(1, delay=1.5)
-    bot_b = _make_aux_bot(2, delay=0.25)
-    pool = BotPool([bot_a, bot_b], SimpleNamespace(admins=[1], send_message=Mock()))
-
-    selected = pool.acquire_send_slot(100, max_delay=2.0)
-
-    assert selected == (bot_b, 0.25)
-    bot_b.reserve_slot.assert_called_once_with(100)
+def _pool(*bots: Mock) -> BotPool:
+    return BotPool(list(bots), SimpleNamespace())
 
 
-def test_acquire_send_slot_skips_disabled_and_respects_max_delay():
-    disabled_bot = _make_aux_bot(1, disabled=True, delay=0.0)
-    slow_bot = _make_aux_bot(2, delay=5.0)
-    pool = BotPool([disabled_bot, slow_bot], SimpleNamespace(admins=[1], send_message=Mock()))
+def test_candidate_bots_exclude_disabled_and_preserve_unknown_membership() -> None:
+    disabled = _bot(1, disabled=True)
+    unknown = _bot(20, membership=None)
+    member = _bot(3)
 
-    assert pool.acquire_send_slot(100, max_delay=1.0) is None
-    disabled_bot.reserve_slot.assert_not_called()
-    slow_bot.reserve_slot.assert_not_called()
+    candidates = _pool(disabled, unknown, member).candidate_bots(100)
 
-
-def test_send_blocking_waits_until_slot_is_available():
-    aux_bot = _make_aux_bot(1, delay=1.0)
-    aux_bot.peek_delay.side_effect = [1.0, 0.0]
-    manager = SimpleNamespace(admins=[1], send_message=Mock())
-    pool = BotPool([aux_bot], manager)
-
-    time_values = iter([0.0, 0.1, 0.2, 0.3])
-    with patch("efb_telegram_master.bot_pool.time.time", side_effect=lambda: next(time_values)), \
-         patch("efb_telegram_master.bot_pool.time.sleep") as sleep:
-        selected = pool.send_blocking(100, timeout=1.0)
-
-    assert selected is aux_bot
-    assert sleep.called
-    aux_bot.reserve_slot.assert_called_once_with(100)
+    assert candidates == [(unknown, None), (member, True)]
+    disabled.check_membership_tri.assert_not_called()
 
 
-def test_membership_updates_are_forwarded_to_bots():
-    aux_bot = _make_aux_bot(10)
-    pool = BotPool([aux_bot], SimpleNamespace(admins=[1], send_message=Mock()))
+def test_successful_main_and_null_slave_do_not_change_affinity() -> None:
+    bot = _bot(10)
+    pool = _pool(bot)
+    pool.record_successful_auxiliary_send("slave-a", 10)
 
-    pool.on_bots_joined_chat([10], 1000)
-    pool.on_bot_left_chat(10, 1000)
+    pool.record_successful_auxiliary_send(None, 10)
 
-    aux_bot.update_membership.assert_any_call(1000, True)
-    aux_bot.update_membership.assert_any_call(1000, False)
-
-
-def test_notify_admin_only_fires_once_per_chat():
-    aux_bot = _make_aux_bot(10)
-    pool = BotPool([aux_bot], SimpleNamespace(admins=[1], send_message=Mock()))
-
-    started_targets = []
-
-    class ImmediateThread:
-        def __init__(self, target, args, daemon, name):
-            self.target = target
-            self.args = args
-
-        def start(self):
-            started_targets.append(self.args)
-            self.target(*self.args)
-
-    with patch("efb_telegram_master.bot_pool.threading.Thread", ImmediateThread), \
-         patch.object(pool, "_send_admin_notification") as notify:
-        pool._maybe_notify_admin(100, [aux_bot])
-        pool._maybe_notify_admin(100, [aux_bot])
-
-    assert notify.call_count == 1
-    assert len(started_targets) == 1
+    assert pool.preferred_sender("slave-a") is bot
+    assert pool.preferred_sender(None) is None
 
 
-def test_get_pool_stats_reports_disabled_and_cache_size():
-    aux_bot = _make_aux_bot(10, username="aux")
-    aux_bot._membership_cache = {1: (True, 0.0), 2: (False, 1.0)}
-    pool = BotPool([aux_bot], SimpleNamespace(admins=[1], send_message=Mock()))
+def test_disabling_bot_removes_every_affinity_to_that_bot() -> None:
+    first = _bot(10)
+    second = _bot(20)
+    pool = _pool(first, second)
+    pool.record_successful_auxiliary_send("slave-a", 10)
+    pool.record_successful_auxiliary_send("slave-b", 10)
+    pool.record_successful_auxiliary_send("slave-c", 20)
 
-    stats = pool.get_pool_stats()
+    pool.disable_bot(10)
 
-    assert stats["total_bots"] == 1
-    assert stats["active_bots"] == 1
-    assert stats["bots"][0]["bot_id"] == 10
-    assert stats["bots"][0]["membership_cache_size"] == 2
+    assert pool.preferred_sender("slave-a") is None
+    assert pool.preferred_sender("slave-b") is None
+    assert pool.preferred_sender("slave-c") is second
+
+
+def test_confirmed_membership_failure_removes_only_matching_task_affinity() -> None:
+    first = _bot(10)
+    second = _bot(20)
+    pool = _pool(first, second)
+    pool.record_successful_auxiliary_send("slave-a", 10)
+    pool.record_successful_auxiliary_send("slave-b", 10)
+    pool.record_successful_auxiliary_send("slave-c", 20)
+
+    pool.remove_failed_membership_affinity("slave-a", 10)
+
+    assert pool.preferred_sender("slave-a") is None
+    assert pool.preferred_sender("slave-b") is first
+    assert pool.preferred_sender("slave-c") is second

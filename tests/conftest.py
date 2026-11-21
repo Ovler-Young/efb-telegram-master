@@ -1,24 +1,32 @@
 import pytest
+import os
 from pathlib import Path
+from types import ModuleType
 
+from collections.abc import Iterator
 from ruamel.yaml import YAML
 from typing import List
 
-from telegram.error import TimedOut, NetworkError
+os.environ.setdefault("PTB_TIMEDELTA", "1")
 
-import ehforwarderbot.utils
+from telegram.error import NetworkError, TimedOut
+
 import ehforwarderbot.coordinator
 
 from .mocks.slave import MockSlaveChannel
 from .bot import get_bot
 from efb_telegram_master import TelegramChannel
+from efb_telegram_master.paths import get_config_path
 
 pytestmark = [pytest.mark.xfail(raises=TimedOut), pytest.mark.xfail(raises=NetworkError)]
 
 
 @pytest.fixture(scope='session')
 def bot_info():
-    return get_bot()
+    try:
+        return get_bot()
+    except ValueError as error:
+        pytest.skip(str(error))
 
 
 @pytest.fixture(scope='session')
@@ -46,7 +54,7 @@ def bot_groups(bot_info) -> List[int]:
     return bot_info['groups']
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def bot_group(bot_groups) -> int:
     return bot_groups[0]
 
@@ -97,11 +105,11 @@ def build_channel_config(bot_token, bot_admins, *, topic_group=None, aux_bot_tok
     return config
 
 
-def load_test_coordinator(tmp_path_factory, monkey_class, channel_config):
+def load_test_coordinator(tmp_path_factory, monkey_class, channel_config) -> ModuleType:
     tmp_path = tmp_path_factory.mktemp("etm_test")
     monkey_class.setenv("EFB_DATA_PATH", str(tmp_path))
 
-    config_path = ehforwarderbot.utils.get_config_path()
+    config_path = get_config_path()
     dump_config(config_path, {
         "master_channel": TelegramChannel.channel_id,
         "slave_channels": ["tests.mocks.slave"],
@@ -110,7 +118,7 @@ def load_test_coordinator(tmp_path_factory, monkey_class, channel_config):
 
     ehforwarderbot.coordinator.add_channel(MockSlaveChannel())
 
-    channel_config_path = ehforwarderbot.utils.get_config_path(TelegramChannel.channel_id)
+    channel_config_path = get_config_path(TelegramChannel.channel_id)
     dump_config(channel_config_path, channel_config)
 
     ehforwarderbot.coordinator.add_channel(TelegramChannel())
@@ -127,7 +135,7 @@ def monkey_class():
 
 
 @pytest.fixture(scope="module")
-def coordinator(tmp_path_factory, monkey_class, bot_token, bot_admins) -> ehforwarderbot.coordinator:
+def coordinator(tmp_path_factory, monkey_class, bot_token, bot_admins) -> Iterator[ModuleType]:
     """Loaded coordinator with ETM and mock modules"""
     coordinator_obj = load_test_coordinator(
         tmp_path_factory,
@@ -144,7 +152,7 @@ def coordinator(tmp_path_factory, monkey_class, bot_token, bot_admins) -> ehforw
 
 @pytest.fixture(scope="module")
 def coordinator_with_topic_group(tmp_path_factory, monkey_class, bot_token, bot_admins,
-                                 bot_topic_group) -> ehforwarderbot.coordinator:
+                                 bot_topic_group) -> Iterator[ModuleType]:
     if bot_topic_group is None:
         pytest.skip("TOPIC_GROUP is not configured")
 
@@ -163,7 +171,7 @@ def coordinator_with_topic_group(tmp_path_factory, monkey_class, bot_token, bot_
 
 @pytest.fixture(scope="module")
 def coordinator_with_auxiliary_bots(tmp_path_factory, monkey_class, bot_token, bot_admins,
-                                    aux_bot_tokens) -> ehforwarderbot.coordinator:
+                                    aux_bot_tokens) -> Iterator[ModuleType]:
     if not aux_bot_tokens:
         pytest.skip("AUX_BOT_TOKEN is not configured")
 

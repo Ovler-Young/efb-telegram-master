@@ -6,10 +6,10 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(scope="module")
-def poll_bot(channel_with_auxiliary_bots):
-    channel_with_auxiliary_bots.bot_manager.polling(drop_pending_updates=True)
+def poll_bot(channel_with_auxiliary_bots, poll_bot_factory):
+    poll_bot_factory.start(channel_with_auxiliary_bots)
     yield channel_with_auxiliary_bots.bot_manager
-    channel_with_auxiliary_bots.bot_manager.graceful_stop()
+    poll_bot_factory.stop(channel_with_auxiliary_bots)
 
 
 @pytest.fixture(scope="function")

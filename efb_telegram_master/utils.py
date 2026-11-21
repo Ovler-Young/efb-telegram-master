@@ -1,15 +1,17 @@
 # coding=utf-8
 
 import base64
+import datetime
+import html
 import json
 import logging
 import os
 import subprocess
-import sys
+import urllib.parse
 from io import BytesIO
-from shutil import copyfileobj
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
 
 import ffmpeg
 import telegram
@@ -18,12 +20,64 @@ from ffmpeg._utils import convert_kwargs_to_cmd_line_args
 from typing_extensions import NewType
 
 from ehforwarderbot import Channel
-from ehforwarderbot.chat import BaseChat, ChatMember
+from ehforwarderbot.chat import BaseChat, ChatMember, GroupChat, PrivateChat, SystemChat
+from ehforwarderbot.message import LinkAttribute
 from ehforwarderbot.types import ChatID, ModuleID
 from .locale_mixin import LocaleMixin
 
 if TYPE_CHECKING:
     from . import TelegramChannel
+
+FFMPEG_TIMEOUT = 60
+DEFAULT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+AGGREGATION_CHAT_TYPES = ("group", "private", "system", "official_account")
+
+
+def format_message_time(value: datetime.datetime, display_timezone: ZoneInfo = DEFAULT_TIMEZONE) -> str:
+    """Display saved timestamps, interpreting naive values in the host local zone."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.astimezone()
+    return value.astimezone(display_timezone).strftime("%H:%M:%S")
+
+
+def removed_text(text: str) -> str:
+    # Code/pre entities cannot be nested inside Telegram strikethrough entities.
+    return f"<s>{html.escape(text)}</s>" if text else "[message removed]"
+
+
+def link_text(attributes: LinkAttribute, body: str, *, as_html: bool = False) -> str:
+    """Render a link's title, description and optional source note."""
+    title = attributes.title or attributes.url
+    description = attributes.description or ""
+    thumbnail = "🔗"
+    if as_html:
+        image = urllib.parse.quote(attributes.image or "", safe="?=&#:/")
+        thumbnail = f'<a href="{image}">🔗</a>' if image else thumbnail
+        title = f'<a href="{urllib.parse.quote(attributes.url, safe="?=&#:/")}">{html.escape(title)}</a>'
+        description = html.escape(description)
+    text = f"{thumbnail} {title}\n{description}"
+    return text + ("\n\n" + body if body else "")
+
+
+def removal_edit(media_type: str, text: str, *, prefix: str = "", link: Optional[LinkAttribute] = None):
+    """Retain the Telegram message and edit its text or media caption."""
+    if link is not None:
+        text = link_text(link, text)
+    header = prefix + "\n" if prefix else ""
+    text = header + text
+    entities = [telegram.MessageEntity(telegram.MessageEntity.STRIKETHROUGH, 0,
+                                      len(text.encode("utf-16-le")) // 2)] if text else []
+    if link is not None:
+        title = link.title or link.url
+        entities.append(telegram.MessageEntity(telegram.MessageEntity.TEXT_LINK,
+            len((header + "🔗 ").encode("utf-16-le")) // 2, len(title.encode("utf-16-le")) // 2,
+            url=urllib.parse.quote(link.url, safe="?=&#:/")))
+        if link.image:
+            entities.append(telegram.MessageEntity(telegram.MessageEntity.TEXT_LINK,
+                len(header.encode("utf-16-le")) // 2, 2, url=urllib.parse.quote(link.image, safe="?=&#:/")))
+    if media_type == "Text":
+        return "edit_message_text", dict(text=text or "[message removed]", entities=entities, parse_mode=None)
+    return "edit_message_caption", dict(caption=text or "[message removed]", caption_entities=entities, parse_mode=None)
 
 
 TelegramChatID = NewType('TelegramChatID', int)
@@ -57,6 +111,17 @@ class ExperimentalFlagsManager(LocaleMixin):
         "api_base_file_url": None,
         "local_tdlib_api": False,
         "topic_group": None,
+        "timezone": DEFAULT_TIMEZONE.key,
+        # Concurrent outbound sends; also sizes the HTTP connection pool.
+        "send_worker_count": 8,
+        "text_aggregation": False,
+        "text_aggregation_origins": None,
+        "text_aggregation_chat_types": None,
+        "text_aggregation_rules": None,
+        "text_aggregation_window_seconds": 3,
+        "text_aggregation_idle_seconds": 1800,
+        "text_aggregation_max_members": 200,
+        "text_aggregation_max_payload_bytes": 256 * 1024,
     }
 
     @staticmethod
@@ -84,11 +149,64 @@ class ExperimentalFlagsManager(LocaleMixin):
         self.channel = channel
         self.config: Dict[str, Any] = ExperimentalFlagsManager.DEFAULT_VALUES.copy()
         self.config.update(channel.config.get('flags', dict()) or dict())
+        aggregation_origins = self.config["text_aggregation_origins"]
+        if aggregation_origins is not None and (
+                not isinstance(aggregation_origins, list)
+                or any(not isinstance(origin, str) or not origin.strip() for origin in aggregation_origins)):
+            raise ValueError("flags.text_aggregation_origins must be null or a list of non-empty source IDs")
+        aggregation_chat_types = self.config["text_aggregation_chat_types"]
+        if aggregation_chat_types is not None and (
+                not isinstance(aggregation_chat_types, list)
+                or any(not isinstance(chat_type, str) or chat_type not in AGGREGATION_CHAT_TYPES
+                       for chat_type in aggregation_chat_types)):
+            raise ValueError("flags.text_aggregation_chat_types must be null or a list of group, private, system, official_account")
+        aggregation_rules = self.config["text_aggregation_rules"]
+        if aggregation_rules is not None:
+            if not isinstance(aggregation_rules, list):
+                raise ValueError("flags.text_aggregation_rules must be null or a list of rules")
+            for rule in aggregation_rules:
+                if (not isinstance(rule, dict) or set(rule) != {"origins", "chat_types"}
+                        or not isinstance(rule["origins"], list) or not rule["origins"]
+                        or any(not isinstance(origin, str) or not origin.strip() for origin in rule["origins"])
+                        or not isinstance(rule["chat_types"], list) or not rule["chat_types"]
+                        or any(not isinstance(chat_type, str) or chat_type not in AGGREGATION_CHAT_TYPES
+                               for chat_type in rule["chat_types"])):
+                    raise ValueError("flags.text_aggregation_rules rules require non-empty origins and chat_types lists; "
+                                     "chat_types supports group, private, system, official_account")
+        try:
+            timezone_name = self.config["timezone"]
+            if not isinstance(timezone_name, str):
+                raise ValueError("Timezone name must be a string")
+            self.timezone = ZoneInfo(timezone_name)
+        except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("flags.timezone must be a valid IANA time zone, such as Asia/Shanghai") from exc
+        if self.config.get("topic_group") is None and channel.config.get("topic_group") is not None:
+            self.config["topic_group"] = channel.config["topic_group"]
 
     def __call__(self, flag_key: str) -> Any:
         if flag_key not in self.config:
             raise ValueError(self._("{0} is not a valid experimental flag").format(flag_key))
         return self.config[flag_key]
+
+    def allows_text_aggregation(self, chat: BaseChat, origin: str, override: Optional[bool] = None) -> bool:
+        if override is not None:
+            return override
+        if isinstance(chat, PrivateChat):
+            chat_type = "official_account" if (chat.vendor_specific or {}).get("is_mp") is True else "private"
+        elif isinstance(chat, GroupChat):
+            chat_type = "group"
+        elif isinstance(chat, SystemChat):
+            chat_type = "system"
+        else:
+            chat_type = None
+        rules = self.config["text_aggregation_rules"]
+        if rules is not None:
+            return any((chat.module_id in rule["origins"] or origin in rule["origins"])
+                       and chat_type in rule["chat_types"] for rule in rules)
+        origins = self.config["text_aggregation_origins"]
+        chat_types = self.config["text_aggregation_chat_types"]
+        return ((origins is None or chat.module_id in origins or origin in origins)
+                and (chat_types is None or chat_type in chat_types))
 
 
 def b64en(s: str) -> str:
@@ -184,6 +302,76 @@ def chat_id_str_to_id(s: EFBChannelChatIDStr) -> Tuple[ModuleID, ChatID, Optiona
     return channel_id, chat_uid, group_id
 
 
+def _copy_binary_stream(src: BinaryIO, dst: BinaryIO, chunk_size: int = 64 * 1024) -> None:
+    while True:
+        chunk = src.read(chunk_size)
+        if not chunk:
+            break
+        dst.write(chunk)
+
+
+def _run_ffmpeg_command(args, *, input_data: Optional[bytes] = None) -> bytes:
+    try:
+        completed = subprocess.run(
+            args,
+            input=input_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=FFMPEG_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"ffmpeg command timed out after {FFMPEG_TIMEOUT} seconds") from exc
+    if completed.returncode != 0:
+        raise ffmpeg.Error(args[0], completed.stdout, completed.stderr)
+    return cast(bytes, completed.stdout)
+
+
+def _write_stream_to_process(stream: IO[bytes], process: subprocess.Popen) -> None:
+    assert process.stdin
+    try:
+        _copy_binary_stream(cast(BinaryIO, stream), cast(BinaryIO, process.stdin))
+    except Exception:
+        process.kill()
+        raise
+    finally:
+        process.stdin.close()
+
+
+def _read_process_stream(stream: IO[bytes], output: BytesIO) -> None:
+    _copy_binary_stream(cast(BinaryIO, stream), output)
+
+
+def _run_ffmpeg_stream_command(args, input_stream: IO[bytes]) -> bytes:
+    process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout = BytesIO()
+    stderr = BytesIO()
+    try:
+        from threading import Thread
+
+        assert process.stdout
+        assert process.stderr
+        writer = Thread(target=_write_stream_to_process, args=(input_stream, process), daemon=True)
+        stdout_reader = Thread(target=_read_process_stream, args=(process.stdout, stdout), daemon=True)
+        stderr_reader = Thread(target=_read_process_stream, args=(process.stderr, stderr), daemon=True)
+        writer.start()
+        stdout_reader.start()
+        stderr_reader.start()
+        process.wait(timeout=FFMPEG_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        raise TimeoutError(f"ffmpeg command timed out after {FFMPEG_TIMEOUT} seconds") from exc
+    writer.join(timeout=1)
+    stdout_reader.join(timeout=1)
+    stderr_reader.join(timeout=1)
+    out = stdout.getvalue()
+    err = stderr.getvalue()
+    if process.returncode != 0:
+        raise ffmpeg.Error(args[0], out, err)
+    return out
+
+
 def export_gif(animation, fp, dpi=96, skip_frames=5):
     """ Fork of lottie.exporters.gif.export_gif
     Adapted from jqqqqqqqqqq/UnifiedMessageRelay
@@ -261,13 +449,7 @@ if os.name == "nt":
         args += convert_kwargs_to_cmd_line_args(kwargs)
         args += ["-"]
 
-        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
-        assert p.stdin
-        copyfileobj(p.stdin, stream)
-        out, err = p.communicate()
-        if p.returncode != 0:
-            raise ffmpeg.Error('ffprobe', out, err)
+        out = _run_ffmpeg_stream_command(args, stream)
         return json.loads(out.decode('utf-8'))
 
 
@@ -293,19 +475,7 @@ if os.name == "nt":
         # using standard IO interface. Not sure if that would work on Windows.
         # Using the most classic buffer and copy via IO interface just to play
         # safe.
-        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        assert p.stdin
-        copyfileobj(file, p.stdin)
-        p.stdin.close()
-
-        # Raise exception if error occurs, just like ffmpeg-python.
-        if p.returncode != 0 and p.stderr:
-            err = p.stderr.read().decode()
-            print(err, file=sys.stderr)
-            raise ffmpeg.Error('ffmpeg', "", err)
-
-        assert p.stdout
-        copyfileobj(p.stdout, gif_file)
+        gif_file.write(_run_ffmpeg_stream_command(args, file))
         file.close()
         gif_file.seek(0)
         return gif_file
@@ -315,13 +485,16 @@ else:
         """Convert Telegram GIF to real GIF, the non-NT way."""
         gif_file = NamedTemporaryFile(suffix='.gif')
         file.seek(0)
-        metadata = ffmpeg.probe(file.name)
+        metadata = json.loads(_run_ffmpeg_command([
+            'ffprobe', '-show_format', '-show_streams', '-of', 'json', file.name,
+        ]).decode('utf-8'))
         stream = ffmpeg.input(file.name)
         if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
             # Workaround: Compress GIF for slave channel `blueset.wechat`
             # TODO: Move this logic to `blueset.wechat` in the future
             stream = stream.filter("scale", 600, -2)
-        stream.output(gif_file.name).overwrite_output().run()
+        args = stream.output(gif_file.name).overwrite_output().compile()
+        _run_ffmpeg_command(args)
         file.close()
         gif_file.seek(0)
         return gif_file
