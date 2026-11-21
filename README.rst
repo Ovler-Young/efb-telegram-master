@@ -828,6 +828,36 @@ e.g.:
       to route messages between a topic and its linked remote chat.
     - The id set here will be the default topic group for new chats.
 
+-   ``topic_channel_emoji`` *(bool)* [Default: ``true``]
+
+    Put the slave channel's emoji in front of a forum topic's name, so
+    topics from several slave channels in one forum can be told apart.
+    Turn it off to leave it out.
+
+-   ``topic_chat_type_emoji`` *(bool)* [Default: ``true``]
+
+    Put an emoji for the chat type (private, group, or system) in front of
+    a forum topic's name, so chats of different types in one forum can be
+    told apart. Turn it off to leave it out.
+
+    With both topic emoji flags on, a topic is named like ``💬👤 Alice``.
+    Telegram draws a topic's default icon from the first character of its
+    name, so some clients show an emoji as the icon when the name starts
+    with one. With both flags off the topic is named ``Alice`` and its
+    default icon is the letter ``A``. The asterisk (``*``) that marks a
+    slave channel running on a non-default instance stays in either case
+    (``*Alice``), and a chat with a blank name keeps the full form because
+    Telegram does not accept empty topic names. A new setting applies to
+    topics ETM creates afterwards and to topics it renames when it refreshes
+    topic info, relinks a forum, or repairs one with ``/relink repair``.
+    Existing topics are not renamed at startup.
+
+    .. code:: yaml
+
+       flags:
+           topic_channel_emoji: false
+           topic_chat_type_emoji: false
+
 Network configuration: timeout tweaks
 -------------------------------------
 

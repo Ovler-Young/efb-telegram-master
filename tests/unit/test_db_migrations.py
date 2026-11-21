@@ -182,15 +182,20 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
 
 
 @pytest.mark.parametrize(
-    ("cached_pickle", "cached_name", "cached_alias", "expected_title"),
+    ("cached_pickle", "cached_name", "cached_alias", "topic_flags", "expected_title"),
     [
-        (None, "Cached QQ group", None, "👥👥 Cached QQ group"),
-        (b"unreadable cache", "Cached QQ group", "Saved QQ alias " * 9,
+        (None, "Cached QQ group", None, {}, "👥👥 Cached QQ group"),
+        (b"unreadable cache", "Cached QQ group", "Saved QQ alias " * 9, {},
          "👥👥 " + "Saved QQ alias " * 8 + "Save…"),
+        (None, "Cached QQ group", None, {"topic_channel_emoji": False}, "👥 Cached QQ group"),
+        (None, "Cached QQ group", None, {"topic_chat_type_emoji": False}, "👥 Cached QQ group"),
+        (None, "Cached QQ group", None,
+         {"topic_channel_emoji": False, "topic_chat_type_emoji": False}, "Cached QQ group"),
     ],
 )
 def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum(
-        cached_pickle, cached_name, cached_alias, expected_title):
+        cached_pickle, cached_name, cached_alias, topic_flags, expected_title):
+    topic_flags = {**utils.ExperimentalFlagsManager.DEFAULT_VALUES, **topic_flags}
     from telegram import Update
     from peewee import SqliteDatabase
     from efb_telegram_master import chat_binding as chat_binding_module
@@ -219,6 +224,7 @@ def test_relink_keeps_unavailable_remote_chat_bound_to_new_forum(
     bot.create_forum_topic.return_value = SimpleNamespace(message_thread_id=TelegramTopicID(90003))
     binding = object.__new__(ChatBindingManager)
     binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text,
+                                      flag=lambda key: topic_flags[key],
                                       ngettext=lambda singular, plural, count: singular if count == 1 else plural)
     binding.bot = bot
     binding.db = db_manager
@@ -641,7 +647,8 @@ def test_relink_repair_posts_previous_history_links_and_reports_missing_topics()
             raise RuntimeError("cache object unreadable")
 
     binding = object.__new__(ChatBindingManager)
-    binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text)
+    binding.channel = SimpleNamespace(channel_id=channel_id, _=lambda text: text,
+                                      flag=utils.ExperimentalFlagsManager.DEFAULT_VALUES.get)
     binding.bot = bot
     binding.db = db_manager
     binding.chat_manager = SimpleNamespace(cache={

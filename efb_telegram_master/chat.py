@@ -20,8 +20,22 @@ if TYPE_CHECKING:
 
 __all__ = ['ETMChatMember', 'ETMSelfChatMember', 'ETMSystemChatMember',
            'ETMPrivateChat', 'ETMSystemChat', 'ETMGroupChat',
-           'convert_chat', 'unpickle',
+           'convert_chat', 'unpickle', 'build_topic_title',
            'ETMChatType', 'ETMBaseChatType']
+
+
+def build_topic_title(module_id: str, name: str, channel_emoji_text: str, chat_type_emoji_text: str, *,
+                      channel_emoji: bool = True, chat_type_emoji: bool = True) -> str:
+    """The one definition of a forum topic name.
+
+    A blank name keeps the full form with both emoji, because Telegram
+    rejects empty topic names.
+    """
+    instance_mark = "*" if "#" in module_id else ""
+    if not name.strip():
+        channel_emoji = chat_type_emoji = True
+    prefix = f"{channel_emoji_text if channel_emoji else ''}{chat_type_emoji_text if chat_type_emoji else ''}"
+    return f"{instance_mark}{prefix}{' ' if prefix else ''}{name}"
 
 
 class ETMBaseChatMixin(BaseChat, ABC):  # lgtm [py/missing-equals]
@@ -203,16 +217,17 @@ class ETMChatMixin(ETMBaseChatMixin, Chat, ABC):
                f"{self.channel_emoji}{self.chat_type_emoji} " \
                f"{self.display_name}"
 
-    @property
-    def topic_title(self) -> str:
-        """Chat title used for forum topic names in topic_group.
+    def topic_title(self, *, channel_emoji: bool = True, chat_type_emoji: bool = True) -> str:
+        """Chat title used for forum topic names.
 
-        Same as chat_title but without channel_emoji and chat_type_emoji
-        prefixes, so that Telegram auto-generates a cleaner topic icon
-        from the first character of the actual chat name.
+        Telegram draws a topic's default icon from the first character of
+        its name, so the channel emoji and the chat type emoji in front of
+        the name can each be left out. The asterisk for a non-default
+        instance is always kept.
         """
-        non_default_instance_flag = "*" if "#" in self.module_id else ""
-        return f"{non_default_instance_flag}{self.display_name}"
+        return build_topic_title(self.module_id, self.display_name,
+                                 self.channel_emoji, self.chat_type_emoji,
+                                 channel_emoji=channel_emoji, chat_type_emoji=chat_type_emoji)
 
     @property
     def last_message_time(self) -> datetime:

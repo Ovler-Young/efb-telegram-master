@@ -28,7 +28,7 @@ from ehforwarderbot.types import ModuleID, ChatID, MessageID
 from . import utils
 from .aggregate import MemberStatus, render_members
 from .utils import DEFAULT_TIMEZONE, format_message_time
-from .chat import ETMChatType, ETMGroupChat, unpickle
+from .chat import ETMChatType, ETMGroupChat, build_topic_title, unpickle
 from .constants import Emoji, Flags
 from .history_states import ENTRY_TRANSITIONS, EntryEvent, entry_state
 from .locale_mixin import LocaleMixin
@@ -853,7 +853,7 @@ class ChatBindingManager(LocaleMixin):
             try:
                 chat = self.chat_manager.get_chat(channel_id, chat_uid, build_dummy=True)
                 if chat.alias or str(chat.name) != str(chat_uid):
-                    topic_name = chat.chat_title
+                    topic_name = self._topic_title(chat)
             except Exception as e:
                 self.logger.warning("Could not retrieve relink topic title for %s: %s", slave_uid, e)
             if topic_name is None:
@@ -897,7 +897,7 @@ class ChatBindingManager(LocaleMixin):
         try:
             cached_chat = self.chat_manager.cache.get((channel_id, chat_uid))
             if cached_chat and (cached_chat.alias or str(cached_chat.name) != str(chat_uid)):
-                return cached_chat.chat_title
+                return self._topic_title(cached_chat)
         except Exception as e:
             self.logger.warning("Could not read in-memory topic title for %s: %s", chat_uid, e)
 
@@ -908,7 +908,7 @@ class ChatBindingManager(LocaleMixin):
             try:
                 cached_chat = unpickle(chat_info.pickle, self.db)
                 if cached_chat.alias or str(cached_chat.name) != str(chat_uid):
-                    return cached_chat.chat_title
+                    return self._topic_title(cached_chat)
             except Exception as e:
                 self.logger.warning("Could not read cached topic title for %s: %s", chat_uid, e)
         cached_name = chat_info.slave_chat_alias or chat_info.slave_chat_name
@@ -919,7 +919,14 @@ class ChatBindingManager(LocaleMixin):
             "System": Emoji.SYSTEM, "SystemChat": Emoji.SYSTEM,
             "Group": Emoji.GROUP, "GroupChat": Emoji.GROUP,
         }.get(chat_info.slave_chat_type, Emoji.UNKNOWN)
-        return f"{'*' if '#' in channel_id else ''}{chat_info.slave_channel_emoji}{type_emoji} {cached_name}"
+        return build_topic_title(channel_id, cached_name, chat_info.slave_channel_emoji, type_emoji,
+                                 channel_emoji=self.channel.flag("topic_channel_emoji"),
+                                 chat_type_emoji=self.channel.flag("topic_chat_type_emoji"))
+
+    def _topic_title(self, chat: ETMChatType) -> str:
+        """Forum topic name of a chat, following the topic emoji flags."""
+        return chat.topic_title(channel_emoji=self.channel.flag("topic_channel_emoji"),
+                                chat_type_emoji=self.channel.flag("topic_chat_type_emoji"))
 
     def repair_forum_history(self, update: Update, new_chat_id: TelegramChatID):
         """Restore cached topic names and post available previous-message links."""
@@ -1482,7 +1489,7 @@ class ChatBindingManager(LocaleMixin):
                     chat_id=tg_chat_id,
                     message_thread_id=thread_id,
                     name=self.truncate_ellipsis(
-                        chat.topic_title,
+                        self._topic_title(chat),
                         self.MAX_LEN_CHAT_TITLE),
                     icon_custom_emoji_id=""
                 )
@@ -1589,7 +1596,7 @@ class ChatBindingManager(LocaleMixin):
                 chat_id=update.effective_chat.id,
                 message_thread_id=thread_id,
                 name=self.truncate_ellipsis(
-                    etm_chat.topic_title,
+                    self._topic_title(etm_chat),
                     self.MAX_LEN_CHAT_TITLE),
                 icon_custom_emoji_id=""  # param required by telegram
             )
@@ -1633,7 +1640,7 @@ class ChatBindingManager(LocaleMixin):
                     channel_id, chat_id, _ = utils.chat_id_str_to_id(slave_uid)
                     chat: ETMChatType = self.chat_manager.get_chat(channel_id, chat_id, build_dummy=True)
                     try:
-                        topic_name = chat.topic_title
+                        topic_name = self._topic_title(chat)
                         topic = self.bot.create_forum_topic(
                             chat_id=telegram_chat_id,
                             name=topic_name

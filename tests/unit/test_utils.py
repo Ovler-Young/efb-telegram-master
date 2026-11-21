@@ -141,3 +141,12 @@ def test_gif_conversion_uses_process_timeout(monkeypatch, tmp_path):
         with utils.gif_conversion(input_file, "tests.slave") as output:
             assert output.read() == b"GIF89a"
         assert input_file.closed
+
+
+@pytest.mark.parametrize("flag_name", ["topic_channel_emoji", "topic_chat_type_emoji"])
+def test_topic_emoji_flags_default_on_and_reject_non_booleans(flag_name):
+    assert ExperimentalFlagsManager(SimpleNamespace(config={}))(flag_name) is True
+    assert ExperimentalFlagsManager(SimpleNamespace(config={"flags": {flag_name: False}}))(flag_name) is False
+    for bad_value in ("false", 0, None):
+        with raises(ValueError, match=flag_name):
+            ExperimentalFlagsManager(SimpleNamespace(config={"flags": {flag_name: bad_value}}))

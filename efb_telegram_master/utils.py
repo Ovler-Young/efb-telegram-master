@@ -111,6 +111,8 @@ class ExperimentalFlagsManager(LocaleMixin):
         "api_base_file_url": None,
         "local_tdlib_api": False,
         "topic_group": None,
+        "topic_channel_emoji": True,
+        "topic_chat_type_emoji": True,
         "timezone": DEFAULT_TIMEZONE.key,
         # Concurrent outbound sends; also sizes the HTTP connection pool.
         "send_worker_count": 8,
@@ -173,6 +175,9 @@ class ExperimentalFlagsManager(LocaleMixin):
                                for chat_type in rule["chat_types"])):
                     raise ValueError("flags.text_aggregation_rules rules require non-empty origins and chat_types lists; "
                                      "chat_types supports group, private, system, official_account")
+        for topic_emoji_flag in ("topic_channel_emoji", "topic_chat_type_emoji"):
+            if type(self.config[topic_emoji_flag]) is not bool:
+                raise ValueError(f"flags.{topic_emoji_flag} must be true or false")
         try:
             timezone_name = self.config["timezone"]
             if not isinstance(timezone_name, str):
