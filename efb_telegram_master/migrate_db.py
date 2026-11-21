@@ -970,15 +970,20 @@ def migrate(directory: Path, config: dict, batch_size: int = 500, *, queue_only:
         try:
             if queue_only and source_path.exists():
                 with connection_scope(db):
-                    imported = _read_import(db) is not None
-                if not imported:
+                    manifest = _read_import(db)
+                receipt_path = directory / RECEIPT_FILE
+                if manifest is None or not receipt_path.exists():
                     # Moving only the queue would leave tgdata.db unimportable
                     # (the target is no longer empty) and the SQLite queue closed.
+                    # Without a receipt the plain command verifies the import first.
                     raise RuntimeError(
                         "tgdata.db has not been imported into this PostgreSQL target; run python -m "
                         "efb_telegram_master.migrate_db --data-dir <directory> --config <postgresql.yaml> "
                         "without --queue-only to move the data and the outbound queue together."
                     )
+                if json.loads(receipt_path.read_text()).get("import_id") != manifest["import_id"]:
+                    # Another install's target would take this directory's queue.
+                    raise RuntimeError("Existing cutover receipt does not match this target; refusing another import.")
             with ExitStack() as fences:
                 if not queue_only:
                     fences.enter_context(_fence(source_path))

@@ -1835,6 +1835,44 @@ def test_imported_install_starts_only_after_the_queue_move(sqlite_source, postgr
         queue.close()
 
 
+@pytest.fixture
+def other_postgres_config(postgres_server_config):
+    """A second install's schema on the same server."""
+    schema = "etm_test_" + uuid.uuid4().hex
+    admin = postgresql_database(postgres_server_config)
+    with connection_scope(admin):
+        admin.execute_sql(f'CREATE SCHEMA "{schema}"')
+    try:
+        yield dict(postgres_server_config, options=f"-c search_path={schema} -c timezone=UTC")
+    finally:
+        with connection_scope(admin):
+            admin.execute_sql(f'DROP SCHEMA "{schema}" CASCADE')
+        admin.close_all()
+
+
+def test_queue_only_refuses_another_installs_target(sqlite_source, tmp_path, postgres_config, other_postgres_config):
+    other = tmp_path / "other-channel"
+    shutil.copytree(sqlite_source, other)
+    _as_an_earlier_import(sqlite_source, postgres_config)
+    _as_an_earlier_import(other, other_postgres_config)
+
+    def state():
+        target = postgresql_database(other_postgres_config)
+        with connection_scope(target):
+            record = migrate_db._read_import(target)
+        target.close_all()
+        return (record, _queue_tables_in(other_postgres_config), _sqlite_rows(sqlite_source),
+                (sqlite_source / migrate_db.RECEIPT_FILE).read_bytes(),
+                (sqlite_source / POSTGRESQL_QUEUE_MARKER).exists(),
+                sorted((sqlite_source / "database-backups").iterdir()))
+
+    before = state()
+    with pytest.raises(RuntimeError, match="cutover receipt does not match this target"):
+        migrate_db.migrate(sqlite_source, other_postgres_config, queue_only=True)
+    assert state() == before
+    assert before[0]["version"] == 2 and before[1] == [] and not before[4]
+
+
 def test_queue_move_marks_the_import_record_and_only_with_a_committed_move(sqlite_source, postgres_config, manager_factory):
     with patch.object(migrate_db, "_copy_queue_table", side_effect=RuntimeError("injected queue failure")), \
             pytest.raises(RuntimeError, match="injected queue failure"):
