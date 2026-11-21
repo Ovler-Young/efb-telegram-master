@@ -817,16 +817,44 @@ e.g.:
     Enable this option if the bot API is running in ``--local`` mode and
     is using the same file system with ETM.
 
--   ``topic_group`` *(str)* [Default: ``null``]
+-   ``topic_group`` *(int/dict)* [Default: ``null``]
 
     Enable Telegram forum topics mode: send and receive messages in a
     forum-enabled supergroup (topic group), **one topic per linked chat**.
 
-    - The value should be the Telegram chat ID of the forum supergroup
-      (commonly in the form ``-100...``).
+    The value is either one chat ID, or a mapping from chat type to the
+    chat ID of the forum for that type.
+
+    .. code:: yaml
+
+        # One forum for every chat
+        flags:
+            topic_group: -1001234567890
+
+    .. code:: yaml
+
+        # One forum per chat type
+        flags:
+            topic_group:
+                private: -1001234567891
+                group: -1001234567892
+                official_account: -1001234567893
+
+    - The mapping keys are ``private``, ``group`` and ``official_account``,
+      the same chat type names as in ``text_aggregation_chat_types``. Other
+      keys, including ``system``, are rejected.
+    - A chat type missing from the mapping uses the ``private`` forum.
+      If ``private`` is missing too, those chats get no topic and stay in
+      the main chat.
+    - System chats never get a topic and always stay in the main chat.
+    - A chat that already has a topic stays in that forum when you switch
+      to a mapping. The mapping only decides the forum of chats that
+      have no topic yet.
+    - Every forum needs the bot as an administrator with the right to
+      manage topics.
     - When enabled, ETM will store and use Telegram's ``message_thread_id``
       to route messages between a topic and its linked remote chat.
-    - The id set here will be the default topic group for new chats.
+    - The id(s) set here will be the default topic group(s) for new chats.
 
 Network configuration: timeout tweaks
 -------------------------------------

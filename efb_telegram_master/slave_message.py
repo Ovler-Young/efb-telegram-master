@@ -530,12 +530,12 @@ class SlaveMessageProcessor(LocaleMixin):
 
         if tg_chat:
             tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
-        if self.channel.topic_group:
+        topic_group_to_use = utils.topic_forum_for(
+            self.channel.topic_group, chat_uid, utils.chat_type_of(chat), self.db)
+        if topic_group_to_use:
             if not isinstance(chat, SystemChat):
-                if tg_chat:
-                    tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
-                else:
-                    tg_dest = TelegramChatID(self.channel.topic_group)
+                if not tg_chat:
+                    tg_dest = TelegramChatID(topic_group_to_use)
                 if self._get_master_chat_is_forum(xid, tg_dest):
                     with self._timed_phase(xid, f"Topic thread lookup for Telegram chat {tg_dest}"):
                         existing_thread_id = self.db.get_topic_thread_id(
