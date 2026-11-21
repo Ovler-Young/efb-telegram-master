@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from . import TelegramChannel
 
 FFMPEG_TIMEOUT = 60
+GIF_SIZE_LIMIT = 1_000_000
+GIF_RETRY_FPS = 12
 DEFAULT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 AGGREGATION_CHAT_TYPES = ("group", "private", "system", "official_account")
 
@@ -459,47 +461,74 @@ if os.name == "nt":
 
 
     def gif_conversion(file: IO[bytes], channel_id: str) -> IO[bytes]:
-        """Convert Telegram GIF to real GIF, the NT way."""
-        gif_file = NamedTemporaryFile(suffix='.gif')
+        """Convert Telegram GIF to real GIF, the NT way.
+
+        If the result is larger than :data:`GIF_SIZE_LIMIT`, convert once more
+        at :data:`GIF_RETRY_FPS` frames per second.
+        """
         file.seek(0)
 
         # Use custom ffprobe command to read from stream
         metadata = ffprobe(file)
 
-        # Set input/output of ffmpeg to stream
-        stream = ffmpeg.input("pipe:")
-        if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
-            # Workaround: Compress GIF for slave channel `blueset.wechat`
-            # TODO: Move this logic to `blueset.wechat` in the future
-            stream = stream.filter("scale", 600, -2)
-        # Need to specify file format here as no extension hint presents.
-        args = stream.output("pipe:", format="gif").compile()
-        file.seek(0)
+        for attempt in range(2):
+            gif_file = NamedTemporaryFile(suffix='.gif')
+            file.seek(0)
 
-        # subprocess.Popen would still try to access the file handle instead of
-        # using standard IO interface. Not sure if that would work on Windows.
-        # Using the most classic buffer and copy via IO interface just to play
-        # safe.
-        gif_file.write(_run_ffmpeg_stream_command(args, file))
+            # Set input/output of ffmpeg to stream
+            stream = ffmpeg.input("pipe:")
+            if attempt == 1:
+                stream = stream.filter("fps", fps=GIF_RETRY_FPS)
+            if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
+                # Workaround: Compress GIF for slave channel `blueset.wechat`
+                # TODO: Move this logic to `blueset.wechat` in the future
+                stream = stream.filter("scale", 600, -2)
+            # Need to specify file format here as no extension hint presents.
+            args = stream.output("pipe:", format="gif").compile()
+
+            # subprocess.Popen would still try to access the file handle instead of
+            # using standard IO interface. Not sure if that would work on Windows.
+            # Using the most classic buffer and copy via IO interface just to play
+            # safe.
+            gif_file.write(_run_ffmpeg_stream_command(args, file))
+            gif_file.flush()
+            if attempt == 0 and os.path.getsize(gif_file.name) > GIF_SIZE_LIMIT:
+                gif_file.close()
+                continue
+            break
+
         file.close()
         gif_file.seek(0)
         return gif_file
 
 else:
     def gif_conversion(file: IO[bytes], channel_id: str) -> IO[bytes]:
-        """Convert Telegram GIF to real GIF, the non-NT way."""
-        gif_file = NamedTemporaryFile(suffix='.gif')
+        """Convert Telegram GIF to real GIF, the non-NT way.
+
+        If the result is larger than :data:`GIF_SIZE_LIMIT`, convert once more
+        at :data:`GIF_RETRY_FPS` frames per second.
+        """
         file.seek(0)
         metadata = json.loads(_run_ffmpeg_command([
             'ffprobe', '-show_format', '-show_streams', '-of', 'json', file.name,
         ]).decode('utf-8'))
-        stream = ffmpeg.input(file.name)
-        if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
-            # Workaround: Compress GIF for slave channel `blueset.wechat`
-            # TODO: Move this logic to `blueset.wechat` in the future
-            stream = stream.filter("scale", 600, -2)
-        args = stream.output(gif_file.name).overwrite_output().compile()
-        _run_ffmpeg_command(args)
+
+        for attempt in range(2):
+            gif_file = NamedTemporaryFile(suffix='.gif')
+            stream = ffmpeg.input(file.name)
+            if attempt == 1:
+                stream = stream.filter("fps", fps=GIF_RETRY_FPS)
+            if channel_id.startswith("blueset.wechat") and metadata.get('width', 0) > 600:
+                # Workaround: Compress GIF for slave channel `blueset.wechat`
+                # TODO: Move this logic to `blueset.wechat` in the future
+                stream = stream.filter("scale", 600, -2)
+            args = stream.output(gif_file.name).overwrite_output().compile()
+            _run_ffmpeg_command(args)
+            if attempt == 0 and os.path.getsize(gif_file.name) > GIF_SIZE_LIMIT:
+                gif_file.close()
+                continue
+            break
+
         file.close()
         gif_file.seek(0)
         return gif_file
