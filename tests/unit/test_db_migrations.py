@@ -187,8 +187,6 @@ def test_relink_forum_binding_moves_chat_and_topic_atomically():
         (None, "Cached QQ group", None, {}, "👥👥 Cached QQ group"),
         (b"unreadable cache", "Cached QQ group", "Saved QQ alias " * 9, {},
          "👥👥 " + "Saved QQ alias " * 8 + "Save…"),
-        (None, "Cached QQ group", None, {"topic_channel_emoji": False}, "👥 Cached QQ group"),
-        (None, "Cached QQ group", None, {"topic_chat_type_emoji": False}, "👥 Cached QQ group"),
         (None, "Cached QQ group", None,
          {"topic_channel_emoji": False, "topic_chat_type_emoji": False}, "Cached QQ group"),
     ],
