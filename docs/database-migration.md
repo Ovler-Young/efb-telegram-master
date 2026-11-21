@@ -2,12 +2,20 @@
 
 ## Runtime behavior
 
-The channel has two logical stores. `tgdata.db` holds message logs and associations;
-the outbound store consists of `outbound-queue.sqlite3` plus `outbound-media/`.
-The SQLite file holds request metadata, compact durable media references and Telegram
-completion receipts; queue-owned media bytes live in `outbound-media/`. Selecting
-PostgreSQL changes the first store only. Keep both outbound paths in the same channel
-data directory.
+The channel has two logical stores. The first holds message logs and associations
+(`tgdata.db` on SQLite). The outbound store holds request metadata, compact durable
+media references and Telegram completion receipts, and its media bytes live in
+`outbound-media/`. The `database` setting decides where both stores are kept; there is
+no separate setting and no mixed mode:
+
+- On SQLite the outbound rows are in `outbound-queue.sqlite3`, next to `tgdata.db`.
+- On PostgreSQL they are in three tables of the same schema as the message tables:
+  `outbound_queue`, `history_ownership` and `source_cancellations`. Receipts and holds
+  are columns of `outbound_queue`. The startup schema transaction creates them.
+
+Media bytes are never stored in PostgreSQL. `outbound-media/` stays a directory in the
+channel data directory on both backends, so keep it with that directory and back it up
+with the database.
 
 Startup adds missing nullable historical columns and lookup indexes in one
 schema transaction. Existing message IDs, timestamps, duplicate source-message
@@ -22,9 +30,12 @@ The one-time startup work depends on which objects are missing: nullable columns
 indexes, history-generation/target/cleanup indexes, association indexes and the
 `slavechatinfo` identity lookup index. SQLite runs this schema work inside an
 IMMEDIATE transaction; other writers wait while missing indexes are built.
-Existing indexes are reused via `CREATE INDEX IF NOT EXISTS`. The outbound store
-separately adds missing receipt/retry/hold columns, `history_ownership`, and
-three scheduling and reconciliation indexes without rebuilding the queue table.
+Existing indexes are reused via `CREATE INDEX IF NOT EXISTS`. On SQLite the outbound
+store separately adds missing receipt/retry/hold columns, `history_ownership`, and
+its scheduling and reconciliation indexes without rebuilding the queue table. On
+PostgreSQL the queue tables and their indexes are created in the startup schema
+transaction, complete. The queue itself never creates them: if one is missing, queue
+startup fails instead of opening an empty queue that could drop pending sends.
 
 These schema/index builds are distinct from recurring startup work: inactive
 history staging is scanned and reclaimed in pages of 256 after the schema
@@ -37,7 +48,9 @@ success and failure. Nested operations reuse the outer connection. Both backends
 use a pool (default 8 connections, 5-second pool acquisition timeout, 300-second
 stale timeout). `database.max_connections`, `database.pool_timeout` and
 `database.stale_timeout` configure these limits. SQLite retains WAL, a 5-second
-busy timeout and the existing synchronous durability setting.
+busy timeout and the existing synchronous durability setting. The outbound queue does
+not use the pool: on PostgreSQL it keeps one dedicated session for its whole life, with
+a 5-second lock timeout.
 
 The outbound scheduler selects per-destination head IDs using a covering index.
 It does not load upload bytes for every queued item, in-flight destination or
@@ -62,10 +75,13 @@ Fresh live completions still write their own receipt immediately.
 The encoded in-flight queue data budget is 128 MiB. New media is streamed into
 queue-owned sidecars; local Bot API `file://` media that ETM already owns can
 remain an external durable reference. Runtime payload-version checks and startup
-media inspection use incremental SQLite BLOB access. Python 3.11+ uses native
+media inspection use incremental BLOB access. On SQLite, Python 3.11+ uses native
 `sqlite3.Connection.blobopen`; Python 3.10 uses an isolated helper process with a
 system SQLite library. The helper does not load a second SQLite library into the
 queue process, so closing its handles cannot release the queue's writer locks.
+On PostgreSQL the same reads fetch the payload with `substring()` in 1 MiB chunks on
+the queue's own session; the payload column is created with `STORAGE EXTERNAL`, so a
+chunk does not decompress the whole value, and no helper process is involved.
 If incremental access is unavailable, recovery fails rather than falling back to
 an unbounded payload read.
 
@@ -73,8 +89,9 @@ Oversized legacy v1 media is converted on demand before dispatch. The converter
 reads pickle opcodes incrementally and streams recognized inline `BytesIO` media
 to sidecars, preserving filenames and media metadata. Non-media values and log/
 receipt metadata must fit the encoded budget; oversized opaque data is retained
-for offline recovery. A reserved writer transaction protects the original row
-until the compact v2 replacement commits. This conversion is distinct from the
+for offline recovery. A reserved writer transaction (on PostgreSQL, a transaction
+that locks the row) protects the original row until the compact v2 replacement
+commits. This conversion is distinct from the
 first-start schema/index upgrade; startup does not bulk-rewrite every v1 row.
 
 Oversized non-v1 queued rows are quarantined. Payloads that fail decoding are
@@ -91,13 +108,30 @@ materializes size-checked payloads, and decoded objects, upstream caches and
 media conversion add allocations. The offline migration backup/digest routines
 also read queue rows directly; runtime incremental recovery is not a streaming
 contract for those separate routines. During a memory incident, stop the bot and
-automatic restarts before diagnosis, keeping both databases, WAL files and
-`outbound-media/` intact.
+automatic restarts before diagnosis, keeping both databases, any SQLite WAL files
+and `outbound-media/` intact.
 
 Sidecar files are removed after their queue row reaches a terminal state. One
 queue owner holds `.outbound-queue.lock` for its lifetime, covering startup
 cleanup and sidecar publication; a second owner fails before inspecting or
-reclaiming media. Do not remove that lock file while an owner is running.
+reclaiming media. Do not remove that lock file while an owner is running. On
+PostgreSQL the queue also holds a session-level advisory lock for its schema, so a
+second ETM that uses the same schema, from another data directory or another host, is
+refused with the same "already in use by another owner" error; the lock ends with the
+queue's session.
+
+On PostgreSQL the queue does not reconnect. If the server restarts or drops the queue's
+session (for example when a database container is updated or restarted), queue calls
+fail and the outbound worker stops sending: it logs `Outbound recovery stopped; durable
+rows retained` and sends nothing until ETM is restarted. Nothing queued is lost. Rows
+stay in PostgreSQL, and a send that was in flight stays held for `/confirm_send`, as
+after any restart. Restart ETM after a database restart, and avoid automatic restarts or
+image updates of the database container.
+
+PostgreSQL text cannot contain NUL characters, which SQLite stores. A message whose
+slave chat ID contains one cannot be queued on PostgreSQL: its enqueue fails with
+`Unable to commit queued Telegram call.` The queue move refuses a queue row, in any
+text column, that contains one and names the row (see below).
 
 Startup inspects payload markers incrementally and skips known v1 payloads.
 An unknown payload version, or any live v2 payload exceeding the inspection
@@ -145,7 +179,7 @@ selected schema. For a non-default schema, create it first and include
 Keep an independent backup of the complete channel directory and configuration,
 including any files referenced by historical data. Allow space for the original
 databases, a new snapshot of both databases on every attempt, PostgreSQL data and
-indexes, and PostgreSQL WAL. Snapshots contain private message data and are
+indexes (the queue rows included), and PostgreSQL WAL. Snapshots contain private message data and are
 placed in a private, uniquely named directory.
 
 ## Import and verification
@@ -203,6 +237,8 @@ The importer:
    PostgreSQL transaction. A local `.postgresql-cutover.json` receipt is written
    atomically only after commit. The command prints the import ID, per-table
    counts/digests and snapshot directory, never database credentials.
+5. Moves the outbound queue in a second PostgreSQL transaction, in the same run
+   (see "Moving the outbound queue" below).
 
 After a successful command, point the channel's `database` configuration at the
 same target and start the bot. Keep the original directory and outbound queue.
@@ -215,12 +251,91 @@ not bypass verification: the imported target still requires its matching receipt
 Every imported table must still exist; a missing table causes startup to fail
 rather than silently recreating an empty replacement. Restore the complete target
 when recovering an incomplete PostgreSQL restore.
-If the import included an outbound queue, that file must still exist at startup;
-the runtime refuses to silently replace it with an empty queue. `outbound-media/`
-is part of the same durable queue state: valid v2 rows whose referenced media is
-missing fail closed rather than being silently dropped. Restore the current queue
-and its matching media directory, not a stale pre-send snapshot, when recovering
-missing local files.
+If the import included an outbound queue, that file must still exist at startup, also
+after the queue moved into PostgreSQL: it stays in place as a frozen copy that is never
+resumed, and the runtime refuses to silently replace it with an empty queue.
+`outbound-media/` is part of the same durable queue state: valid v2 rows whose
+referenced media is missing fail closed rather than being silently dropped. Restore the
+current queue and its matching media directory, not a stale pre-send snapshot, when
+recovering missing local files.
+
+## Moving the outbound queue
+
+With PostgreSQL configured the queue lives in PostgreSQL too, so the importer moves it
+after the data step, in a second PostgreSQL transaction of the same run and the same
+downtime. It needs `outbound-queue.sqlite3` in the data directory. If there is none,
+there is nothing to move and PostgreSQL startup creates an empty queue. The move needs
+PostgreSQL 12 or later, for the `sha256()` function and the floating-point output its
+digests compare. The queue step:
+
+1. Fences the SQLite queue and snapshots it, with `outbound-media/`, into the backup
+   directory of the run. That snapshot is the rollback copy.
+2. Reads the **live** queue file read-only, not the snapshot. Its rows keep naming the
+   live `outbound-media/`, which the PostgreSQL queue keeps using.
+3. Validates before writing and refuses, naming the row, anything PostgreSQL would
+   change: a value of the wrong type or out of range, a NUL character in text, or a
+   value over 256 MiB. It also refuses unknown columns and nonempty unknown tables. A
+   queue written by an older version that lacks later columns gets the defaults that
+   version's own upgrade would add.
+4. Requires empty queue tables, or the tables of its own verified earlier move, and
+   copies the rows with their IDs, in batches limited by their bytes rather than by row
+   count. It sets the ID sequence beyond every ID the SQLite queue ever issued, deleted
+   ones included, because an aggregation context or an ordering link may still name one.
+5. Compares row counts and SHA-256 digests with the source, checks again that the live
+   queue and its media are unchanged, then commits the rows and the queue import record
+   (`etm_queue_import`) in one transaction. In that same transaction a data import
+   record of version 2 is rewritten as version 3, everything else unchanged. The step
+   refuses while a bot holds the queue's owner lock.
+6. After the commit it writes `.outbound-queue-postgresql.json` in the data directory,
+   atomically. The SQLite queue file and `outbound-media/` are left in place and are never
+   renamed, deleted or rewritten.
+
+Startup on PostgreSQL then requires the queue import record, all three queue tables and
+that file with the matching import ID. Without the file it stops with a message saying the
+move is unfinished; run the same command again to verify and finish it.
+
+### An install that already runs on PostgreSQL
+
+Versions without the queue move kept the outbound queue in `outbound-queue.sqlite3` even
+with PostgreSQL configured. After upgrading such an install, whether its data was imported
+earlier or it started on PostgreSQL with a leftover queue file, PostgreSQL startup finds the
+file and no queue import record and refuses to start. Startup never moves the queue by
+itself, so an automatic restart policy repeats the refusal until the queue is moved. Stop
+the bot and all other writers, then run:
+
+```sh
+python -m efb_telegram_master.migrate_db \
+  --data-dir /absolute/path/to/the/channel-data-directory \
+  --config /private/path/postgresql.yaml \
+  --queue-only
+```
+
+On an install whose queue kept running after an earlier data import, only `--queue-only`
+works: the plain command compares the recorded queue state, which no longer matches, and
+reports that the source changed. `--queue-only` moves just the queue and does not need
+`tgdata.db`. If `tgdata.db` is present, the directory's cutover receipt must name the
+target's import. Without one (`tgdata.db` was never imported, or the import did not
+finish) it refuses and asks for the plain command, which verifies or moves the data and
+the queue together. With another import's receipt, as when the configuration names another
+install's target, it refuses as the plain command does and writes nothing. An install with
+no queue file starts with an empty queue.
+
+### Older versions after the queue move
+
+**Never start an older version on this data after the queue move.** Older versions do not
+know the PostgreSQL queue. With the PostgreSQL configuration they reopen the retained
+`outbound-queue.sqlite3` and send again what the PostgreSQL queue has already sent.
+
+- On an install imported with a version-2 record, the move rewrites that record as version 3.
+  An older version started with the PostgreSQL configuration stops with `Unsupported or
+  corrupt PostgreSQL import record; preserving both databases.` before it opens the queue
+  or sends anything. That refusal is intended, not damage. Do not edit the record to get
+  past it.
+- An install imported with a version-1 record keeps it, and a native PostgreSQL install has
+  no import record. Nothing stops an older version on those installs: this warning is the
+  only protection.
+- A current version configured for SQLite in a directory whose queue moved refuses to open
+  the retained SQLite queue, and an imported install is also blocked by its cutover receipt.
 
 ## Failure and restart behavior
 
@@ -228,14 +343,24 @@ A failure before PostgreSQL commit rolls back the import, including its new
 schema. Original SQLite stores and completed backup snapshots remain. Correct
 the reported problem and rerun the same command.
 
+A failure in the queue step rolls back its rows and its import record; the SQLite queue,
+its media and the snapshot remain. Rerun the same command: it verifies the data import
+again, which still matches because nothing ran in between, and retries the queue step. A
+process exit after the queue commit but before `.outbound-queue-postgresql.json` is
+written is finished by the same rerun, which verifies the PostgreSQL rows against the
+queue import record and writes the file; startup refuses until it exists. A rerun is
+refused once the live queue file or its media differ from what was moved, for example after
+the bot has run on the moved queue. Divergent queues are never merged.
+
 A process exit after commit but before the local receipt does **not** trigger a
 second import. Rerunning compares the source, queue snapshot and target contents
 against the committed import record under target table locks, then recreates
 the receipt. It refuses source or target divergence and refuses a receipt from a
 different target. Verification is not based on row counts alone.
 
-Recovery accepts legacy v1 and v2 import records. V1 uses its fixed historical
-column projection; v2 uses the recorded projection. Added columns omitted by an
+Recovery accepts legacy v1 and v2 import records, and v3, which is a v2 record after
+the queue move. V1 uses its fixed historical column projection; v2 and v3 use the recorded
+projection. Added columns omitted by an
 old projection must remain NULL and omitted tables must remain empty on both
 sides. Nonempty unrecorded caches or history publications are rejected. If a
 legacy record lacks external-file hashes, recovery verifies the currently
@@ -265,13 +390,22 @@ understands the retained queue receipts: newer code reads older receipt formats,
 but older code cannot read receipts carrying a separate file-ID issuer. Restoring
 SQLite does not itself make an older executable compatible.
 
+After the queue step has committed, the retained `outbound-queue.sqlite3` and the live
+`outbound-media/` are not a rollback source. The PostgreSQL queue keeps deleting media
+files that the frozen rows still name, and those rows would be sent again. Roll back only
+from the archived copies of the queue and of `outbound-media/` in the run's backup
+directory (`database-backups/sqlite-*`), restored into a fresh channel directory, and never
+start an older version against the live data.
+
 For an unchanged PostgreSQL cutover whose local directory must be relocated:
 
 1. Keep all writers stopped. Copy the complete verified archive into a fresh
    channel directory, including `tgdata.db`, `outbound-queue.sqlite3`,
    `outbound-media/` and `manifest.json`. External attachment copies are already
    referenced by portable storage names; the original absolute paths are not
-   required for those archived queue rows.
+   required for those archived queue rows. After the queue move, the queue that runs is
+   the PostgreSQL copy of the live rows, which keep their original `file://` references:
+   those external media files must exist at the same paths on the relocated host.
 2. Run the same importer command with the new `--data-dir` and the original
    PostgreSQL target configuration. Do not simply copy the old local cutover
    receipt: source file fingerprints change when files are relocated.
@@ -286,7 +420,8 @@ record, not authorization to use a stale queue after Telegram work has resumed.
 
 After the bot has resumed, changing `database.type` back to SQLite is not a
 lossless rollback: new MsgLog rows, queue removals, retries and Telegram receipts
-must first be reconciled. Stop all writers and preserve both current stores;
+must first be reconciled. A moved queue is not moved back by any tool, and the
+queue move cannot be repeated once the live media no longer match the record. Stop all writers and preserve both current stores;
 do not replay a stale outbound snapshot into Telegram.
 
 ## Acceptance tests
@@ -294,7 +429,10 @@ do not replay a stale outbound snapshot into Telegram.
 The tests require no Telegram credentials. CI has a separate `database` job with
 a real PostgreSQL 16 service and Peewee 3.19/4.5 coverage. It explicitly runs the
 database tests in unit mode with PostgreSQL variables set, so the old
-unit/integration selector cannot silently skip them.
+unit/integration selector cannot silently skip them. The queue tests run on SQLite and,
+when the PostgreSQL variables are set, on PostgreSQL too (a `make_queue` fixture in
+`tests/unit/conftest.py` builds the queue on the backend under test), apart from tests that
+need a SQLite-only feature such as WAL or the Python 3.10 BLOB helper.
 
 With `TEST_POSTGRES_HOST`, `TEST_POSTGRES_PORT`, `TEST_POSTGRES_DB`,
 `TEST_POSTGRES_USER` and `TEST_POSTGRES_PASSWORD` pointing at a test server:
@@ -309,6 +447,9 @@ python -m pytest --mode=unit \
   tests/unit/test_restart_memory.py
 ```
 
+The CI job's full file list is in `.github/workflows/tests.yml`; it adds the delivery,
+history, scheduler, aggregation and queue report tests to the files above.
+
 Alternatively, on a supported development platform, install the optional test
 utility `pgserver` along with `.[tests,tgs,postgresql]`; the acceptance fixtures
 start an isolated PostgreSQL server automatically. Every test uses its own target
@@ -316,7 +457,9 @@ schema. Coverage includes forced process death before and after commit, active
 WAL, old archive preservation, divergent recovery, missing historical columns,
 next-ID allocation, pool reuse across short-lived threads, new/reply/edit/reaction
 message logs, history backfill persistence, incremental import verification,
-scheduler byte checks, incremental legacy-media recovery, startup BLOB inspection
-and retry deadlines across restarts. These are database/queue tests, not a claim
+scheduler byte checks, incremental legacy-media recovery, startup BLOB inspection,
+retry deadlines across restarts, the queue move (every row state, receipts, holds,
+cancellations, old column sets, refused sources, a changed source, a crash after the
+commit, an upgrade install refused until moved) and the single queue owner. These are database/queue tests, not a claim
 that a production Telegram deployment has been exercised or that a particular
 release revision has passed CI.

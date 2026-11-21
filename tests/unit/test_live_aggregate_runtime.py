@@ -19,7 +19,7 @@ from efb_telegram_master.bot_manager import QueuedDbLogContext, TelegramBotManag
 from efb_telegram_master.custom_emoji import CustomEmojiConfig, CustomEmojiStore
 from efb_telegram_master.db import DatabaseManager, MsgLog, database
 from efb_telegram_master.live_aggregate import LiveTextAggregation
-from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest, SenderSelection, SenderSelectionResult
+from efb_telegram_master.outbound import OutboundQueueScheduler, QueueRequest, SenderSelection, SenderSelectionResult
 from efb_telegram_master.queued_log import decode_aggregation
 from efb_telegram_master.utils import ExperimentalFlagsManager, format_message_time
 from tests.unit.test_live_aggregate import source
@@ -78,7 +78,7 @@ class Manager(TelegramBotManager):
 
 
 @pytest.fixture
-def runtime(tmp_path, monkeypatch):
+def runtime(tmp_path, monkeypatch, make_queue):
     original_database = database.obj
     monkeypatch.setattr("efb_telegram_master.db.utils.get_data_path", lambda _: tmp_path)
     db = DatabaseManager(SimpleNamespace(channel_id="tests.aggregate.runtime", config={}))
@@ -97,7 +97,7 @@ def runtime(tmp_path, monkeypatch):
     manager._bot_chat_disabled_until = {}
     manager._queued_db_log_context_lock = threading.Lock()
     manager._queued_completion_callbacks = {}
-    manager._outbound_queue = OutboundQueue(tmp_path)
+    manager._outbound_queue = make_queue(tmp_path)
     executor = ThreadPoolExecutor(max_workers=1)
     manager._outbound_scheduler = OutboundQueueScheduler(manager._outbound_queue, manager, executor, 1)
     manager.live_aggregation = LiveTextAggregation(manager)
@@ -150,7 +150,7 @@ def test_durable_append_owner_switch_and_parsed_capacity(runtime):
     assert len(manager.transport.calls) == 3
 
 
-def test_in_flight_arrival_receipt_failure_and_restart(runtime, monkeypatch):
+def test_in_flight_arrival_receipt_failure_and_restart(runtime, monkeypatch, make_queue):
     manager = runtime
     append(manager, "one", 1)
     scheduler = manager._outbound_scheduler
@@ -166,7 +166,7 @@ def test_in_flight_arrival_receipt_failure_and_restart(runtime, monkeypatch):
     assert len(manager.transport.calls) == 1
     queue_path = manager._outbound_queue.path.parent
     manager._outbound_queue.close()
-    manager._outbound_queue = OutboundQueue(queue_path)
+    manager._outbound_queue = make_queue(queue_path)
     executor = scheduler.executor
     manager._outbound_scheduler = OutboundQueueScheduler(manager._outbound_queue, manager, executor, 1)
     manager.live_aggregation = LiveTextAggregation(manager)

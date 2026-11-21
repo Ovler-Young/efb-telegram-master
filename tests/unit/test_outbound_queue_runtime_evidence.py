@@ -292,10 +292,10 @@ class RecordingAdapter:
 
 
 @pytest.fixture
-def retained_queue(tmp_path: Path) -> OutboundQueue:
-    queue = OutboundQueue(tmp_path)
+def retained_queue(tmp_path: Path, make_queue) -> OutboundQueue:
+    queue = make_queue(tmp_path)
     queue.close()
-    restarted = OutboundQueue(tmp_path)
+    restarted = make_queue(tmp_path)
     yield restarted
     restarted.close()
 
@@ -440,14 +440,14 @@ def test_video_cover_retry_reconstructs_a_fresh_offset_zero_value(
 
 
 def test_nested_local_media_reopen_and_retry_reconstruct_distinct_offset_zero_values(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_queue
 ) -> None:
     local_path = tmp_path / "nested-retry.bin"
     local_path.write_bytes(b"nested retry media")
     source = local_path.open("rb")
     source.seek(4)
     media = InputMediaDocument(local_path)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, _waiter = queue.enqueue_many(
         [QueueRequest("send_media_group", (41, [media]), {})],
         lambda _operation: send_media_group,
@@ -459,7 +459,7 @@ def test_nested_local_media_reopen_and_retry_reconstruct_distinct_offset_zero_va
     moved_path.unlink()
     queue.close()
 
-    reopened = OutboundQueue(tmp_path)
+    reopened = make_queue(tmp_path)
     row = reopened.heads()[0]
     reopen_media = reopened.decode_payload(row.payload)[0][1][0].media
     assert row.id == row_id
@@ -1110,9 +1110,9 @@ def test_harvest_completed_signals_only_after_removing_a_completed_future(
     assert scheduler.wake_event.is_set()
 
 
-def test_scheduler_publishes_metrics_for_actual_dequeue_and_completion(tmp_path: Path) -> None:
+def test_scheduler_publishes_metrics_for_actual_dequeue_and_completion(tmp_path: Path, make_queue) -> None:
     metrics = Metrics()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     queue.metrics = metrics
     row_id, waiter = enqueue(queue, 47, "metrics")
     executor = ControlledExecutor()
@@ -1184,9 +1184,9 @@ def test_scheduler_telemetry_failure_preserves_delivery_and_worker_capacity(
     ) == 2
 
 
-def test_scheduler_records_attempt_failure_and_only_terminal_success_after_retry(tmp_path: Path) -> None:
+def test_scheduler_records_attempt_failure_and_only_terminal_success_after_retry(tmp_path: Path, make_queue) -> None:
     metrics = Metrics()
-    queue = OutboundQueue(tmp_path, metrics=metrics)
+    queue = make_queue(tmp_path, metrics=metrics)
     _row_id, waiter = enqueue(queue, 49, "retry metrics")
     adapter = RecordingAdapter(failure_decision=CompletionDecision("retry_eventual", retry_at=10.0))
     executor = ControlledExecutor()
@@ -1217,9 +1217,9 @@ def test_scheduler_records_attempt_failure_and_only_terminal_success_after_retry
     queue.close()
 
 
-def test_scheduler_records_transport_retry_reason(tmp_path: Path) -> None:
+def test_scheduler_records_transport_retry_reason(tmp_path: Path, make_queue) -> None:
     metrics = Metrics()
-    queue = OutboundQueue(tmp_path, metrics=metrics)
+    queue = make_queue(tmp_path, metrics=metrics)
     enqueue(queue, 50, "transport retry")
     adapter = RecordingAdapter(
         failure_decision=CompletionDecision("retry_eventual", retry_at=10.0)
@@ -1246,9 +1246,9 @@ def test_scheduler_records_transport_retry_reason(tmp_path: Path) -> None:
 
 
 def test_transport_retry_deadline_blocks_only_its_destination(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_queue
 ) -> None:
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     first_id, _first_waiter = enqueue(queue, 50, "first")
     manager = manager_adapter()
     executor = ControlledExecutor()
@@ -1281,9 +1281,9 @@ def test_transport_retry_deadline_blocks_only_its_destination(
     queue.close()
 
 
-def test_chat_migration_redispatches_retained_row_only_after_harvest(tmp_path: Path) -> None:
+def test_chat_migration_redispatches_retained_row_only_after_harvest(tmp_path: Path, make_queue) -> None:
     metrics = Metrics()
-    queue = OutboundQueue(tmp_path, metrics=metrics)
+    queue = make_queue(tmp_path, metrics=metrics)
     first_id, _waiter = enqueue(queue, 61, "first")
     sender = Mock()
     sender.send_message.side_effect = [ChatMigrated(62), "sent"]
@@ -1322,8 +1322,8 @@ def test_chat_migration_redispatches_retained_row_only_after_harvest(tmp_path: P
     queue.close()
 
 
-def test_chat_migration_binding_failure_retains_original_row(tmp_path: Path) -> None:
-    queue = OutboundQueue(tmp_path)
+def test_chat_migration_binding_failure_retains_original_row(tmp_path: Path, make_queue) -> None:
+    queue = make_queue(tmp_path)
     row_id, _waiter = enqueue(queue, 61, "first")
     row = queue.heads()[0]
     sender = Mock()
@@ -1354,9 +1354,9 @@ def test_chat_migration_binding_failure_retains_original_row(tmp_path: Path) -> 
 
 
 def test_chat_migration_binding_failure_observes_retry_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_queue
 ) -> None:
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, _waiter = enqueue(queue, 61, "first")
     sender = Mock()
     sender.send_message.side_effect = ChatMigrated(62)
@@ -1392,9 +1392,9 @@ def test_chat_migration_binding_failure_observes_retry_deadline(
 
 
 def test_chat_migration_retarget_failure_stops_scheduler_and_retains_row(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_queue
 ) -> None:
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, waiter = enqueue(queue, 61, "first")
     sender = Mock()
     sender.send_message.side_effect = ChatMigrated(62)
@@ -1430,12 +1430,12 @@ def test_chat_migration_retarget_failure_stops_scheduler_and_retains_row(
     queue.close()
 
 
-def test_retarget_updates_only_current_row_and_ignores_corrupt_sibling(tmp_path: Path) -> None:
-    queue = OutboundQueue(tmp_path)
+def test_retarget_updates_only_current_row_and_ignores_corrupt_sibling(tmp_path: Path, make_queue) -> None:
+    queue = make_queue(tmp_path)
     first_id, _waiter = enqueue(queue, 61, "first")
     second_id, _second_waiter = enqueue(queue, 61, "second")
     queue.connection.execute(
-        "UPDATE outbound_queue SET payload = X'02' WHERE id = ?", (second_id,)
+        "UPDATE outbound_queue SET payload = ? WHERE id = ?", (b"\x02", second_id)
     )
     queue.connection.commit()
 
@@ -1454,8 +1454,8 @@ def test_retarget_updates_only_current_row_and_ignores_corrupt_sibling(tmp_path:
     queue.close()
 
 
-def test_manager_registers_runtime_snapshot_collectors_with_configured_destination_cap(tmp_path: Path) -> None:
-    queue = OutboundQueue(tmp_path)
+def test_manager_registers_runtime_snapshot_collectors_with_configured_destination_cap(tmp_path: Path, make_queue) -> None:
+    queue = make_queue(tmp_path)
     enqueue(queue, 61, "first")
     enqueue(queue, 61, "second")
     enqueue(queue, 62, "third")
@@ -1483,16 +1483,16 @@ def test_manager_registers_runtime_snapshot_collectors_with_configured_destinati
     queue.close()
 
 
-def test_queue_metrics_include_corrupt_retained_rows_without_removal(tmp_path: Path) -> None:
-    retained = OutboundQueue(tmp_path)
+def test_queue_metrics_include_corrupt_retained_rows_without_removal(tmp_path: Path, make_queue) -> None:
+    retained = make_queue(tmp_path)
     enqueue(retained, 53, "retained")
     retained.close()
     metrics = Metrics()
-    queue = OutboundQueue(tmp_path, metrics=metrics)
+    queue = make_queue(tmp_path, metrics=metrics)
     queue.connection.execute(
         "INSERT INTO outbound_queue "
         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, created_at) "
-        "VALUES (1, 53, 'send_message', X'02', NULL, NULL, 0)"
+        "VALUES (1, 53, 'send_message', ?, NULL, NULL, 0)", (b"\x02",)
     )
     queue.connection.commit()
     queue.refresh_depth()
@@ -1589,6 +1589,7 @@ class DeleteCommitFailureConnection(sqlite3.Connection):
         super().rollback()
 
 
+# SQLite only: the failures are injected through sqlite3 connection subclasses.
 @pytest.mark.parametrize(
     ("connection_type", "failure_attribute"),
     [(DeleteStatementFailureConnection, "fail_delete"), (DeleteCommitFailureConnection, "fail_commit")],
@@ -1663,7 +1664,7 @@ def test_invalid_payload_is_retained_without_upload_and_later_traffic_runs(
     retained_queue.connection.execute(
         "INSERT INTO outbound_queue "
         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, created_at) "
-        "VALUES (0, 151, 'send_message', X'02', NULL, NULL, 0)"
+        "VALUES (0, 151, 'send_message', ?, NULL, NULL, 0)", (b"\x02",)
     )
     retained_queue.connection.commit()
     row_id = retained_queue.heads()[0].id
@@ -1701,11 +1702,11 @@ def test_invalid_payload_is_retained_without_upload_and_later_traffic_runs(
 
 
 def test_missing_external_media_is_discarded_without_blocking_other_queue_rows(
-    tmp_path: Path,
+    tmp_path: Path, make_queue,
 ) -> None:
     external_media = tmp_path / "tdlib-temporary.bin"
     external_media.write_bytes(b"temporary media")
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     missing_row_id, _waiter = queue.enqueue_many(
         [QueueRequest(
             "send_document",
@@ -1720,7 +1721,7 @@ def test_missing_external_media_is_discarded_without_blocking_other_queue_rows(
     queue.close()
     external_media.unlink()
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     executor = ControlledExecutor()
     scheduler = OutboundQueueScheduler(
         queue, RecordingAdapter(), executor, worker_count=2
@@ -1832,6 +1833,7 @@ class InitializationFailureConnection(sqlite3.Connection):
         return super().execute(statement, parameters)
 
 
+# SQLite only: the failure is injected through a sqlite3 connection subclass.
 def test_initialization_failure_rolls_back_closes_and_retains_queue_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

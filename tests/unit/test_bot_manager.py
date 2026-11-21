@@ -237,8 +237,8 @@ def _queued_send_document(chat_id, document, **kwargs):
     [("explicit", "explicit.bin"), ("input-file", "input.bin"),
      ("local-basename", "source.bin"), ("none", None)],
 )
-def test_queued_document_filename_precedence(tmp_path, kind, expected_filename):
-    queue = OutboundQueue(tmp_path)
+def test_queued_document_filename_precedence(tmp_path, kind, expected_filename, make_queue):
+    queue = make_queue(tmp_path)
     kwargs = {}
     if kind in {"explicit", "input-file"}:
         media = InputFile(b"media", filename="input.bin")
@@ -1302,10 +1302,10 @@ def test_graceful_stop_runs_ptb_shutdown_on_runtime_loop():
     manager._runtime.shutdown.assert_not_called()
 
 
-def test_graceful_stop_is_idempotent_after_outbound_queue_closes(tmp_path):
+def test_graceful_stop_is_idempotent_after_outbound_queue_closes(tmp_path, make_queue):
     shutdown_complete_event = threading.Event()
     shutdown_complete_event.set()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     queue.close()
     metrics_httpd = Mock(thread=None)
     runtime = SimpleNamespace(_owns_loop_thread=True, shutdown=Mock())

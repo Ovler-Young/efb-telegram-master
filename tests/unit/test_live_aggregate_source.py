@@ -16,7 +16,7 @@ from efb_telegram_master.aggregate import make_aggregate, make_source_member, me
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.live_aggregate import LiveTextAggregation
 from efb_telegram_master.msg_type import TGMsgType
-from efb_telegram_master.outbound import OutboundQueue, OutboundQueueScheduler, QueueRequest
+from efb_telegram_master.outbound import OutboundQueueScheduler, QueueRequest
 from efb_telegram_master.queued_log import decode_aggregation
 from efb_telegram_master.slave_message import SlaveMessageProcessor
 from efb_telegram_master.utils import chat_id_to_str
@@ -24,11 +24,11 @@ from tests.unit.test_live_aggregate import source, SourceCache
 from tests.unit.test_live_aggregate_runtime import runtime, append, complete
 
 
-def restart(manager):
+def restart(manager, make_queue):
     queue_path = manager._outbound_queue.path.parent
     executor = manager._outbound_scheduler.executor
     manager._outbound_queue.close()
-    manager._outbound_queue = OutboundQueue(queue_path)
+    manager._outbound_queue = make_queue(queue_path)
     manager._outbound_scheduler = OutboundQueueScheduler(manager._outbound_queue, manager, executor, 1)
     manager.live_aggregation = LiveTextAggregation(manager)
 
@@ -64,7 +64,7 @@ def edit(processor, uid, text):
     processor.send_message(message)
 
 
-def test_pending_and_inflight_source_edit_removal_recover(runtime):
+def test_pending_and_inflight_source_edit_removal_recover(runtime, make_queue):
     manager = runtime
     handler = processor(manager)
     key, first = append(manager, "one", 1)
@@ -76,7 +76,7 @@ def test_pending_and_inflight_source_edit_removal_recover(runtime):
     next(iter(scheduler.in_flight.values())).future.result(timeout=2)
     edit(handler, "one", "edited during first send")
     scheduler.harvest_completed()
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     complete(manager)
     row = MsgLog.get()
     assert len(row.aggregate["children"]) == 1
@@ -99,12 +99,12 @@ def test_pending_and_inflight_source_edit_removal_recover(runtime):
     assert len(manager.transport.calls) == 3
 
 
-def test_independent_boundary_survives_restart(runtime):
+def test_independent_boundary_survives_restart(runtime, make_queue):
     manager = runtime
     key, _ = append(manager, "one", 1)
     with manager.live_aggregation.independent(key):
         manager._enqueue_requests([QueueRequest("send_message", (), {"chat_id": -100, "text": "media"})])
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     append(manager, "three", 1.2)
     complete(manager)
     complete(manager)
@@ -140,7 +140,7 @@ def test_legacy_source_removal_edits_original_text_or_caption(runtime, photo):
         assert retained.photo == receipt.photo
 
 
-def test_persisted_photo_removal_edits_caption_and_preserves_alternate_route(runtime):
+def test_persisted_photo_removal_edits_caption_and_preserves_alternate_route(runtime, make_queue):
     manager = runtime
     original = source("photo", "saved <caption>")
     original.type, original.type_telegram = MsgType.Image, TGMsgType.Photo
@@ -163,7 +163,7 @@ def test_persisted_photo_removal_edits_caption_and_preserves_alternate_route(run
     manager._outbound_queue.connection.execute("UPDATE outbound_queue SET operation=?, payload=? WHERE id=?",
                                                ("delete_message", payload, row.id))
     manager._outbound_queue.connection.commit()
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     complete(manager)
     assert manager.transport.calls == [("edit_message_caption", -100, "Alice:\nsaved <caption>", {"message_id": 89})]
     assert manager.transport.messages[89].photo == alternate.photo
@@ -208,7 +208,7 @@ def test_uneditable_source_removal_keeps_media_and_notifies(runtime):
     assert removed["status"] == "removed" and removed["snapshot"] == member["snapshot"]
 
 
-def test_removal_keeps_confirmed_legacy_marker_without_restoring_old_body(runtime):
+def test_removal_keeps_confirmed_legacy_marker_without_restoring_old_body(runtime, make_queue):
     manager = runtime
     first = make_source_member(source("old", "A" * 3500), received_time=datetime.datetime.fromtimestamp(1))
     first.update(status="removed", source_revision=2)
@@ -226,7 +226,7 @@ def test_removal_keeps_confirmed_legacy_marker_without_restoring_old_body(runtim
     manager.channel.db.finalize_aggregate_message(receipt, aggregate)
     key = (first["origin_uid"], -100, None)
     manager.live_aggregation.remove_source_member(key, (key[0], "current"))
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     complete(manager)
     saved = manager.channel.db.get_msg_log(master_msg_id="-100.1")
     assert saved.text == aggregate["confirmed_text"]
@@ -238,7 +238,7 @@ def test_removal_keeps_confirmed_legacy_marker_without_restoring_old_body(runtim
     assert manager.transport.messages[2].text.endswith("delivery continues")
 
 
-def test_link_removal_preserves_title_description_note_and_url(runtime):
+def test_link_removal_preserves_title_description_note_and_url(runtime, make_queue):
     manager = runtime
     handler = processor(manager)
     original = source("link", "optional 😀 note")
@@ -256,7 +256,7 @@ def test_link_removal_preserves_title_description_note_and_url(runtime):
     manager.channel.db.finalize_source_message(original, receipt, member)
     key = (member["origin_uid"], -100, None)
     manager.live_aggregation.remove_source_member(key, (key[0], "link"))
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     complete(manager)
     retained = manager.transport.messages[88]
     assert retained.text == visible
@@ -301,7 +301,7 @@ def test_topic_association_change_closes_the_former_source_stream(runtime, monke
     assert manager.transport.messages[3].message_thread_id == 8
 
 
-def test_fixed_owner_update_uncertainty_survives_restart(runtime):
+def test_fixed_owner_update_uncertainty_survives_restart(runtime, make_queue):
     manager = runtime
     key, member = append(manager, "one", 1)
     complete(manager)
@@ -314,7 +314,7 @@ def test_fixed_owner_update_uncertainty_survives_restart(runtime):
     with pytest.raises(NetworkError):
         submitted.future.result(timeout=2)
     manager._outbound_scheduler.harvest_completed()
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     member["source_revision"] = 3
     child = manager.live_aggregation.queue_container_update("-100.1", [member], key=key)
     # A permanently held parent must not strand its dependent: the held row stays
@@ -323,7 +323,7 @@ def test_fixed_owner_update_uncertainty_survives_restart(runtime):
     assert manager._outbound_queue.contains(parent)
 
 
-def test_redirect_confirmation_survives_hint_failure_and_newer_edit(runtime):
+def test_redirect_confirmation_survives_hint_failure_and_newer_edit(runtime, make_queue):
     manager = runtime
     handler = processor(manager)
     key, _ = append(manager, "one", 1)
@@ -369,13 +369,13 @@ def test_redirect_confirmation_survives_hint_failure_and_newer_edit(runtime):
     manager._outbound_scheduler.harvest_completed()
     assert manager.channel.db.resolve_source_member(key[0], "one", "-100")[0].master_msg_id == "-100.2"
     assert manager.channel.db.get_msg_log(master_msg_id="-100.1").aggregate["confirmed_text"] == old.text
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     edit(handler, "one", "editable after failed hint")
     complete(manager)
     assert member_message(manager.channel.db.resolve_source_member(key[0], "one", "-100")[1]).text == "editable after failed hint"
 
 
-def test_pending_qualification_split_preserves_source_order(runtime):
+def test_pending_qualification_split_preserves_source_order(runtime, make_queue):
     manager = runtime
     handler = processor(manager)
     key, _ = append(manager, "before", 1)
@@ -386,7 +386,7 @@ def test_pending_qualification_split_preserves_source_order(runtime):
     changed.edit = True
     changed.commands = MessageCommands([MessageCommand(name="Action", callable_name="action")])
     handler.send_message(changed)
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     manager.channel.commands = SimpleNamespace(register_command=lambda *a: None)
     with patch("ehforwarderbot.coordinator.get_module_by_id", return_value=SimpleNamespace()):
         complete(manager)
@@ -398,7 +398,7 @@ def test_pending_qualification_split_preserves_source_order(runtime):
 
 
 @pytest.mark.parametrize("late_after_confirmation", [False, True])
-def test_split_recovery_keeps_preexisting_media_after_split_members(runtime, late_after_confirmation):
+def test_split_recovery_keeps_preexisting_media_after_split_members(runtime, late_after_confirmation, make_queue):
     manager = runtime
     handler = processor(manager)
     append(manager, "before", 1)
@@ -411,7 +411,7 @@ def test_split_recovery_keeps_preexisting_media_after_split_members(runtime, lat
     changed.edit = True
     changed.commands = MessageCommands([MessageCommand(name="Action", callable_name="action")])
     handler.send_message(changed)
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     manager.channel.commands = SimpleNamespace(register_command=lambda *a: None)
     with patch("ehforwarderbot.coordinator.get_module_by_id", return_value=SimpleNamespace()):
         if late_after_confirmation:
@@ -425,7 +425,7 @@ def test_split_recovery_keeps_preexisting_media_after_split_members(runtime, lat
     ]
 
 
-def test_minimum_removal_resolves_pending_independent_source(runtime, tmp_path):
+def test_minimum_removal_resolves_pending_independent_source(runtime, tmp_path, make_queue):
     manager = runtime
     handler = processor(manager)
     key, _ = append(manager, "split", 1)
@@ -445,7 +445,7 @@ def test_minimum_removal_resolves_pending_independent_source(runtime, tmp_path):
     remove(handler, "split")
     assert not list(manager._outbound_queue.media_dir.iterdir())
     assert path.read_bytes() == b"complete attachment content"
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     _, member, _ = manager.live_aggregation.source_state(key, (key[0], "split"))
     assert member["status"] == "removed"
     assert member_message(member).text == "independent body"
@@ -453,13 +453,13 @@ def test_minimum_removal_resolves_pending_independent_source(runtime, tmp_path):
     assert not manager.transport.calls
 
 
-def test_pending_withdrawal_survives_restart_binding_change_and_explicit_edit(runtime):
+def test_pending_withdrawal_survives_restart_binding_change_and_explicit_edit(runtime, make_queue):
     manager = runtime
     manager.channel.flag.config["text_aggregation"] = True
     handler = processor(manager)
     key, _ = append(manager, "withdrawn", 1, "saved withdrawn body")
     remove(handler, "withdrawn")
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     _, member, predecessor = manager.live_aggregation.source_state(key, (key[0], "withdrawn"))
     assert member["status"] == "removed" and member["source_revision"] == 2
     assert member_message(member).text == "saved withdrawn body" and predecessor is None
@@ -472,7 +472,7 @@ def test_pending_withdrawal_survives_restart_binding_change_and_explicit_edit(ru
     # An explicit newer source update is accepted durably before publication.
     handler.get_slave_msg_dest = lambda msg: ("Alice:", (-100, None))
     edit(handler, "withdrawn", "explicitly restored body")
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     _, newer, _ = manager.live_aggregation.source_state(key, (key[0], "withdrawn"))
     assert newer["status"] == "active" and newer["source_revision"] == 3
     complete(manager)
@@ -480,7 +480,7 @@ def test_pending_withdrawal_survives_restart_binding_change_and_explicit_edit(ru
     assert manager.channel.db.resolve_source_member(key[0], "withdrawn", "-100")[1]["source_revision"] == 3
 
 
-def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtime):
+def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtime, make_queue):
     manager = runtime
     handler = processor(manager)
     key, _ = append(manager, "one", 1)
@@ -505,7 +505,7 @@ def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtim
     complete(manager)
     resolved, member = manager.channel.db.resolve_source_member(key[0], "one", "-100")
     assert member_message(member).text == long_body
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     # The full-content child remains the durable publication barrier after restart.
     complete(manager)
     assert manager.transport.calls[-1][0] == "send_document"
@@ -515,7 +515,7 @@ def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtim
     assert old.text == "Alice: 08:00:01\nbody\n\nAlice: 08:00:01\nother body"
     assert any(decode_aggregation(row.log_context).get("routing_hint")
                for row in manager._outbound_queue.aggregation_rows())
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     complete(manager)
     assert manager.transport.calls[-1][2] == "Alice: <code>08:00:10</code>\nnext text"
     complete(manager)
@@ -535,7 +535,7 @@ def test_oversize_redirect_keeps_full_content_attachment_before_successor(runtim
     assert not manager._outbound_queue.aggregation_rows()
 
 
-def test_file_redirect_persists_source_type_and_actual_file_owner(runtime, tmp_path):
+def test_file_redirect_persists_source_type_and_actual_file_owner(runtime, tmp_path, make_queue):
     manager = runtime
     handler = processor(manager)
     key, _ = append(manager, "one", 1)
@@ -562,7 +562,7 @@ def test_file_redirect_persists_source_type_and_actual_file_owner(runtime, tmp_p
     message.filename = "source.txt"
     message.mime = "text/plain"
     handler.send_message(message)
-    restart(manager)
+    restart(manager, make_queue=make_queue)
     complete(manager)
     row, member = manager.channel.db.resolve_source_member(key[0], "one", "-100")
     assert uploaded == [b"complete attachment content"]

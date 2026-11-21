@@ -1,15 +1,15 @@
 """Aggregation recovery must not read queued payloads."""
 import pickle
 
-from efb_telegram_master.outbound import OutboundQueue, QueueRequest
+from efb_telegram_master.outbound import QueueRequest
 from tests.unit.test_outbound import enqueue
 
 
-def test_aggregation_rows_return_identity_without_payloads(tmp_path):
+def test_aggregation_rows_return_identity_without_payloads(tmp_path, make_queue):
     """Recovery reads contexts and ordering only, never the stored media."""
     from efb_telegram_master.queued_log import decode_aggregation, encode_aggregation
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     context = encode_aggregation({
         "format_version": 1, "kind": "aggregate", "key": ["slave.origin", -100, None],
         "members": [], "children": [], "generation": 0, "recent": [], "last_new": 0.0,
@@ -30,11 +30,11 @@ def test_aggregation_rows_return_identity_without_payloads(tmp_path):
         queue.close()
 
 
-def test_aggregation_rows_skip_legacy_inline_media(tmp_path):
+def test_aggregation_rows_skip_legacy_inline_media(tmp_path, make_queue):
     """A legacy row with the whole file inline must not be read by recovery."""
     from efb_telegram_master.queued_log import decode_aggregation, encode_aggregation
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     context = encode_aggregation({
         "format_version": 1, "kind": "source", "key": ["slave.origin", -100, None],
         "members": [], "generation": 0, "recent": [], "last_new": 0.0,

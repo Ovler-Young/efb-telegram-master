@@ -27,9 +27,9 @@ def states(history, queue):
             for row in rows]
 
 
-def test_entry_is_staged_published_queued_and_finished_once_across_a_restart(history, monkeypatch):
+def test_entry_is_staged_published_queued_and_finished_once_across_a_restart(history, monkeypatch, make_queue):
     sender = Sender()
-    manager, _, _ = prepare_runtime(history, sender)
+    manager, _, _ = prepare_runtime(history, sender, make_queue=make_queue)
     queue = manager._outbound_queue
 
     def interrupted_publication(**kwargs):
@@ -65,7 +65,7 @@ def test_entry_is_staged_published_queued_and_finished_once_across_a_restart(his
     history.db.stop_worker()
     history.db = history.binding.db = db_module.DatabaseManager(
         SimpleNamespace(channel_id='history-test', config={}))
-    manager, _, _ = prepare_runtime(history, sender)
+    manager, _, _ = prepare_runtime(history, sender, make_queue=make_queue)
     queue = manager._outbound_queue
     try:
         # Startup reclamation keeps entries the queue already owns.

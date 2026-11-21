@@ -34,6 +34,19 @@ limit, or longer timeout can supply that missing evidence.
    an operator hold before restarting, so the old queued row is not sent once
    more on startup. It changes only queue metadata, never media or MsgLog. The
    helper refuses to run while the data-directory lock is held by EFB.
+
+   When the queue is in PostgreSQL, add `--config` with the private YAML file that
+   holds the same `database` settings the bot uses (only its `database` mapping is read):
+
+   ```sh
+   python -m efb_telegram_master.hold_send --data-dir /channel/data --row-id ROW_ID \
+     --config /private/path/postgresql.yaml
+   ```
+
+   It then holds the row in PostgreSQL and also refuses while a running ETM owns the
+   queue, even one started from another data directory or host. After the queue moved
+   into PostgreSQL, running it without `--config` is refused, because the retained
+   `outbound-queue.sqlite3` is a frozen copy that no longer sends.
 4. Start EFB. As a configured EFB administrator, **reply to the original, already
    delivered bot message** with `/confirm_send ROW_ID`. A forward is not accepted.
    The chat and sending bot must match the recorded attempt. An operator hold
@@ -148,8 +161,9 @@ unconfirmed duplicate upload.
 The queue's state machines are described in this guide, and text aggregation's
 in the [text aggregation guide](text-aggregation.md).
 
-Every row of `outbound-queue.sqlite3` is in exactly one state, read from its
-`delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
+Every row of the outbound queue (the `outbound_queue` table, in `outbound-queue.sqlite3`
+on SQLite and in the same PostgreSQL schema as the message tables on PostgreSQL) is in
+exactly one state, read from its `delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
 deferred row). On a queued row `reconcile_attempts` counts its failed attempts
 in a row; from 3 on (`FAILED_ATTEMPTS_LIMIT`) it no longer holds back the rows
 ordered after it (see [Ordering links](#ordering-links)). The definition lives
@@ -270,8 +284,8 @@ way (`OutboundQueue.still_waiting_for_failing`); once a row's predecessor is
 delivered, confirmed, held or gone, or the row itself stopped waiting, the row
 takes part in head election again and its destination is re-elected. The set
 lives in memory only; after a restart the first pass finds such rows again.
-`queue_report.py` cannot read aggregation contexts, so its `head per
-destination` still shows a set-aside row as its destination's head. A row
+`queue_report.py` (on a PostgreSQL queue it takes `--dsn`) cannot read aggregation
+contexts, so its `head per destination` still shows a set-aside row as its destination's head. A row
 ordered behind such a waiting row also waits, because the waiting row itself
 has no failed attempts.
 

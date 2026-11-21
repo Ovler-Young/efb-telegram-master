@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from efb_telegram_master.outbound import (
-    OutboundQueue,
     OutboundQueueScheduler,
     QueueRequest,
     SenderSelectionResult,
@@ -19,16 +18,16 @@ from efb_telegram_master.outbound import (
 from tests.unit.test_outbound import Adapter, DurableAdapter, enqueue
 
 
-def _scheduler(tmp_path, adapter, *, workers=1):
-    queue = OutboundQueue(tmp_path)
+def _scheduler(tmp_path, adapter, make_queue, *, workers=1):
+    queue = make_queue(tmp_path)
     return queue, OutboundQueueScheduler(queue, adapter, ThreadPoolExecutor(workers), workers)
 
 
-def test_pass_without_progress_reschedules_instead_of_waiting_for_an_event(tmp_path, caplog):
+def test_pass_without_progress_reschedules_instead_of_waiting_for_an_event(tmp_path, caplog, make_queue):
     """No dispatch, no deadline and nothing in flight must still retry."""
     adapter = Adapter()
     adapter.select_sender = lambda row, now: SenderSelectionResult()
-    queue, scheduler = _scheduler(tmp_path, adapter)
+    queue, scheduler = _scheduler(tmp_path, adapter, make_queue=make_queue)
     enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "left behind"}))
     try:
         with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
@@ -40,9 +39,9 @@ def test_pass_without_progress_reschedules_instead_of_waiting_for_an_event(tmp_p
         queue.close()
 
 
-def test_idle_queue_keeps_waiting_for_events(tmp_path):
+def test_idle_queue_keeps_waiting_for_events(tmp_path, make_queue):
     """An idle queue must not turn the worker into a poller."""
-    queue, scheduler = _scheduler(tmp_path, DurableAdapter(reconcile=True))
+    queue, scheduler = _scheduler(tmp_path, DurableAdapter(reconcile=True), make_queue=make_queue)
     try:
         scheduler.dispatch_once()
         assert scheduler.next_deadline is None
@@ -50,10 +49,10 @@ def test_idle_queue_keeps_waiting_for_events(tmp_path):
         queue.close()
 
 
-def test_permits_held_without_a_submission_are_reset(tmp_path):
+def test_permits_held_without_a_submission_are_reset(tmp_path, make_queue):
     """Permits no submitted call owns cannot be released by a completion."""
     adapter = Adapter()
-    queue, scheduler = _scheduler(tmp_path, adapter)
+    queue, scheduler = _scheduler(tmp_path, adapter, make_queue=make_queue)
     enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "resumes"}))
     try:
         assert scheduler.slots.reserve() is not None  # Lost with an aborted attempt.
@@ -64,9 +63,9 @@ def test_permits_held_without_a_submission_are_reset(tmp_path):
         queue.close()
 
 
-def test_link_to_a_predecessor_that_no_longer_exists_does_not_block(tmp_path):
+def test_link_to_a_predecessor_that_no_longer_exists_does_not_block(tmp_path, make_queue):
     """A discarded or failed predecessor must not strand its dependent forever."""
-    queue, scheduler = _scheduler(tmp_path, Adapter())
+    queue, scheduler = _scheduler(tmp_path, Adapter(), make_queue=make_queue)
     row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "kept"}))
     with queue.connection:
         queue.connection.execute(
@@ -80,9 +79,9 @@ def test_link_to_a_predecessor_that_no_longer_exists_does_not_block(tmp_path):
         queue.close()
 
 
-def test_waiting_predecessor_keeps_deferring_its_dependent(tmp_path):
+def test_waiting_predecessor_keeps_deferring_its_dependent(tmp_path, make_queue):
     """Ordering is preserved while the predecessor is itself still waiting."""
-    queue, scheduler = _scheduler(tmp_path, Adapter())
+    queue, scheduler = _scheduler(tmp_path, Adapter(), make_queue=make_queue)
     parent, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "parent"}))
     child, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "child"}))
     with queue.connection:
@@ -97,9 +96,9 @@ def test_waiting_predecessor_keeps_deferring_its_dependent(tmp_path):
         queue.close()
 
 
-def test_dependency_cycle_is_broken_instead_of_stalling(tmp_path, caplog):
+def test_dependency_cycle_is_broken_instead_of_stalling(tmp_path, caplog, make_queue):
     """Rows that only defer to each other have no order, so delivery must resume."""
-    queue, scheduler = _scheduler(tmp_path, Adapter())
+    queue, scheduler = _scheduler(tmp_path, Adapter(), make_queue=make_queue)
     first, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "first"}))
     second, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "second"}))
     with queue.connection:
@@ -117,16 +116,16 @@ def test_dependency_cycle_is_broken_instead_of_stalling(tmp_path, caplog):
         queue.close()
 
 
-def test_a_delivered_predecessor_still_awaits_reconciliation(tmp_path):
+def test_a_delivered_predecessor_still_awaits_reconciliation(tmp_path, make_queue):
     """A sent parent keeps its dependent until its MsgLog write commits."""
-    queue, scheduler = _scheduler(tmp_path, Adapter())
+    queue, scheduler = _scheduler(tmp_path, Adapter(), make_queue=make_queue)
     parent, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "parent"}))
     child, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "child"}))
     with queue.connection:
         queue.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE id=?", (parent, child))
         queue.connection.execute(
-            "UPDATE outbound_queue SET delivery_state='sent_pending', completion_receipt=X'00' WHERE id=?",
-            (parent,),
+            "UPDATE outbound_queue SET delivery_state='sent_pending', completion_receipt=? WHERE id=?",
+            (b"\x00", parent),
         )
     try:
         assert queue.heads(ready_only=True) == []
@@ -136,13 +135,13 @@ def test_a_delivered_predecessor_still_awaits_reconciliation(tmp_path):
         queue.close()
 
 
-def test_a_persistent_stall_is_reported_once_per_interval(tmp_path, monkeypatch, caplog):
+def test_a_persistent_stall_is_reported_once_per_interval(tmp_path, monkeypatch, caplog, make_queue):
     """Wakes from new traffic must not turn a stall into a log flood."""
     clock = [1000.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
     adapter = Adapter()
     adapter.select_sender = lambda row, now: SenderSelectionResult()
-    queue, scheduler = _scheduler(tmp_path, adapter)
+    queue, scheduler = _scheduler(tmp_path, adapter, make_queue=make_queue)
     enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "left behind"}))
     try:
         with caplog.at_level(logging.ERROR, logger="efb_telegram_master.outbound"):
@@ -165,9 +164,9 @@ def _enqueue_topic(queue, thread_id, text):
     )], lambda _operation: send_message)
 
 
-def test_topics_of_one_chat_dispatch_in_parallel(tmp_path):
+def test_topics_of_one_chat_dispatch_in_parallel(tmp_path, make_queue):
     """Two topics of one group are separate ordering units."""
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     _enqueue_topic(queue, 11, "a")
     _enqueue_topic(queue, 12, "b")
     _enqueue_topic(queue, 11, "c")
@@ -187,9 +186,9 @@ def test_topics_of_one_chat_dispatch_in_parallel(tmp_path):
             queue.close()
 
 
-def test_one_topic_keeps_serial_order(tmp_path):
+def test_one_topic_keeps_serial_order(tmp_path, make_queue):
     """A second row of the same topic waits for the first."""
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     first, _ = _enqueue_topic(queue, 11, "a")
     second, _ = _enqueue_topic(queue, 11, "b")
     adapter = Adapter(block=True)
@@ -206,9 +205,9 @@ def test_one_topic_keeps_serial_order(tmp_path):
     assert second > first
 
 
-def test_head_slots_go_one_per_depth_tier_shallowest_first(tmp_path):
+def test_head_slots_go_one_per_depth_tier_shallowest_first(tmp_path, make_queue):
     """Every waiting destination gets a slot before a tier gets a second one."""
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     try:
         def send_message(chat_id: int, text: str):
             return chat_id, text
@@ -238,9 +237,9 @@ def test_head_slots_go_one_per_depth_tier_shallowest_first(tmp_path):
         queue.close()
 
 
-def test_equal_depths_keep_the_plain_fifo_order(tmp_path):
+def test_equal_depths_keep_the_plain_fifo_order(tmp_path, make_queue):
     """Equal queue depths fall back to the age of the head row."""
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     try:
         chats = (-1001, -1002, -1003)
         rows = [enqueue(queue, QueueRequest("send_message", (), {"chat_id": chat, "text": "x"}))[0]
@@ -250,9 +249,9 @@ def test_equal_depths_keep_the_plain_fifo_order(tmp_path):
         queue.close()
 
 
-def test_a_deep_queue_is_not_squeezed_out_by_shallow_ones(tmp_path):
+def test_a_deep_queue_is_not_squeezed_out_by_shallow_ones(tmp_path, make_queue):
     """A pass spends one slot per depth tier, not all of them on the shallowest."""
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     adapter = Adapter(block=True)
     with ThreadPoolExecutor(max_workers=2) as executor:
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=2)
@@ -269,10 +268,10 @@ def test_a_deep_queue_is_not_squeezed_out_by_shallow_ones(tmp_path):
             queue.close()
 
 
-def test_a_completion_re_elects_only_its_own_destination(tmp_path, monkeypatch):
+def test_a_completion_re_elects_only_its_own_destination(tmp_path, monkeypatch, make_queue):
     """A pass must not re-read every waiting row when one destination moved."""
     adapter = Adapter()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     scans = []
     original = queue.heads
 
@@ -300,9 +299,9 @@ def test_a_completion_re_elects_only_its_own_destination(tmp_path, monkeypatch):
             queue.close()
 
 
-def test_one_destination_head_matches_the_full_scan(tmp_path):
+def test_one_destination_head_matches_the_full_scan(tmp_path, make_queue):
     """The single-destination election must pick exactly what a full scan picks."""
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     try:
         for index in range(3):
             enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": f"a{index}"}))
@@ -358,12 +357,12 @@ PASS_SCENARIOS = {
 
 
 @pytest.mark.parametrize("scenario_name", list(PASS_SCENARIOS))
-def test_each_way_a_pass_ends_sets_the_wait_the_worker_uses(tmp_path, monkeypatch, scenario_name):
+def test_each_way_a_pass_ends_sets_the_wait_the_worker_uses(tmp_path, monkeypatch, scenario_name, make_queue):
     """Only a stall adds its own rescan deadline; the worker otherwise waits for an event."""
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: 1000.0)
     scenario, deadline, in_flight, stopped = PASS_SCENARIOS[scenario_name]
     adapter = Adapter()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(queue, adapter, executor, worker_count=1)
         try:
@@ -378,7 +377,7 @@ def test_each_way_a_pass_ends_sets_the_wait_the_worker_uses(tmp_path, monkeypatc
             queue.close()
 
 
-def test_a_failing_sender_lookup_releases_its_slot_and_delivery_continues(tmp_path, monkeypatch, caplog):
+def test_a_failing_sender_lookup_releases_its_slot_and_delivery_continues(tmp_path, monkeypatch, caplog, make_queue):
     """A sender lookup that raises defers its row; the worker's only slot serves the next one."""
     clock = [1000.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: clock[0])
@@ -392,7 +391,7 @@ def test_a_failing_sender_lookup_releases_its_slot_and_delivery_continues(tmp_pa
         return select_sender(row, now)
 
     adapter.select_sender = failing_select_sender
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     failing, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "first"}))
     later, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 8, "text": "next"}))
     with ThreadPoolExecutor(max_workers=1) as executor:

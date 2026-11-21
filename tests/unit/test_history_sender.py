@@ -12,7 +12,7 @@ from telegram.error import BadRequest, RetryAfter
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.db_runtime import connection_scope
 from efb_telegram_master.etm_metrics import Metrics
-from efb_telegram_master.outbound import HISTORY_REPLAY_KEY, OutboundQueue, RequiredSenderUnavailableError
+from efb_telegram_master.outbound import HISTORY_REPLAY_KEY, RequiredSenderUnavailableError
 from tests.unit.test_history_replay import (
     Sender, finish_attempt, history as history, populate, prepare_runtime,
 )
@@ -72,7 +72,7 @@ def enqueue_owned(manager, target, operation, kwargs):
     )
 
 
-def test_acquisition_retry_is_counted_after_durable_deferral(history, monkeypatch):
+def test_acquisition_retry_is_counted_after_durable_deferral(history, monkeypatch, make_queue):
     class ThrottledAcquisition(Sender):
         def get_file(self, file_id):
             self.file_requests.append(file_id)
@@ -80,7 +80,7 @@ def test_acquisition_retry_is_counted_after_durable_deferral(history, monkeypatc
 
     target, operation, kwargs = prepare_owned(history, owner=None)
     sender = ThrottledAcquisition(copy_error=BadRequest('Message to copy not found'))
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     queue = manager._outbound_queue
     metrics = Metrics()
     queue.metrics = metrics
@@ -112,10 +112,10 @@ def test_acquisition_retry_is_counted_after_durable_deferral(history, monkeypatc
 
 @pytest.mark.parametrize('media_type,operation,argument', MEDIA)
 @pytest.mark.parametrize('owner_id', [None, 'aux-7', '123'])
-def test_media_is_acquired_by_owner_and_sent_by_normal_selection(history, media_type, operation, argument, owner_id):
+def test_media_is_acquired_by_owner_and_sent_by_normal_selection(history, media_type, operation, argument, owner_id, make_queue):
     target, copy_operation, kwargs = prepare_owned(history, owner=owner_id, media_type=media_type)
     main = MediaSender(copy_error=BadRequest('Message to copy not found'))
-    manager, executor, scheduler = prepare_runtime(history, main)
+    manager, executor, scheduler = prepare_runtime(history, main, make_queue=make_queue)
     manager.me = SimpleNamespace(id=123)
     owner = MediaSender() if owner_id == 'aux-7' else main
     owner.file_path = main.file_path
@@ -141,10 +141,10 @@ def test_media_is_acquired_by_owner_and_sent_by_normal_selection(history, media_
         queue.close()
 
 
-def test_send_can_choose_auxiliary_even_when_file_owner_is_main(history):
+def test_send_can_choose_auxiliary_even_when_file_owner_is_main(history, make_queue):
     target, operation, kwargs = prepare_owned(history, owner=None)
     main, selected = MediaSender(), MediaSender(copy_error=BadRequest('Message to copy not found'))
-    manager, executor, scheduler = prepare_runtime(history, main)
+    manager, executor, scheduler = prepare_runtime(history, main, make_queue=make_queue)
     attach_owner(manager, selected, membership=True, prefer=True)
     try:
         waiter = enqueue_owned(manager, target, operation, kwargs)
@@ -160,10 +160,10 @@ def test_send_can_choose_auxiliary_even_when_file_owner_is_main(history):
 
 
 @pytest.mark.parametrize('unavailable', ['missing', 'disabled', 'not_member'])
-def test_text_does_not_depend_on_original_bot_availability(history, unavailable, monkeypatch):
+def test_text_does_not_depend_on_original_bot_availability(history, unavailable, monkeypatch, make_queue):
     target, operation, kwargs = prepare_owned(history, 'historical text')
     main, owner = Sender(), Sender()
-    manager, executor, scheduler = prepare_runtime(history, main)
+    manager, executor, scheduler = prepare_runtime(history, main, make_queue=make_queue)
     if unavailable != 'missing':
         attach_owner(manager, owner, disabled=unavailable == 'disabled')
     monkeypatch.setattr(history.db, 'get_msg_log', Mock(side_effect=AssertionError('text must not fetch its owner')))
@@ -180,10 +180,10 @@ def test_text_does_not_depend_on_original_bot_availability(history, unavailable,
 
 
 @pytest.mark.parametrize('text', ['old text', None])
-def test_old_queued_sender_pin_is_not_a_send_constraint_after_restart(history, text):
+def test_old_queued_sender_pin_is_not_a_send_constraint_after_restart(history, text, make_queue):
     target, operation, kwargs = prepare_owned(history, text)
     sender = Sender()  # Successful source copy needs no media acquisition.
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     queue = manager._outbound_queue
     try:
         enqueue_owned(manager, target, operation, kwargs)
@@ -191,7 +191,7 @@ def test_old_queued_sender_pin_is_not_a_send_constraint_after_restart(history, t
         with queue.connection:
             queue.connection.execute('UPDATE outbound_queue SET required_sender_bot_id=? WHERE id=?', ('removed-bot', row.id))
         queue.close()
-        manager._outbound_queue = queue = OutboundQueue(history.path)
+        manager._outbound_queue = queue = make_queue(history.path)
         scheduler.queue = queue
         scheduler.dispatch_once()
         assert executor.submissions[0][1][-1].sender is sender
@@ -208,15 +208,15 @@ def test_old_queued_sender_pin_is_not_a_send_constraint_after_restart(history, t
     ('uncertain:TimedOut', True, False),
     ('in_flight', True, False),
 ])
-def test_only_legacy_unattempted_sender_rejection_is_released(history, hold, attempted, ready):
+def test_only_legacy_unattempted_sender_rejection_is_released(history, hold, attempted, ready, make_queue):
     target, operation, kwargs = prepare_owned(history, 'text')
-    manager, _, _ = prepare_runtime(history, Sender())
+    manager, _, _ = prepare_runtime(history, Sender(), make_queue=make_queue)
     queue = manager._outbound_queue
     enqueue_owned(manager, target, operation, kwargs)
     with queue.connection:
         queue.connection.execute('UPDATE outbound_queue SET delivery_hold=?, attempt_started_at=?', (hold, 123.0 if attempted else None))
     queue.close()
-    with_reopened = OutboundQueue(history.path)
+    with_reopened = make_queue(history.path)
     try:
         assert bool(with_reopened.heads(ready_only=True)) is ready
         assert with_reopened.connection.execute('SELECT COUNT(*) FROM outbound_queue').fetchone()[0] == 1
@@ -225,9 +225,9 @@ def test_only_legacy_unattempted_sender_rejection_is_released(history, hold, att
 
 
 @pytest.mark.parametrize('state', ['missing', 'disabled', 'rejected'])
-def test_get_file_never_falls_back_to_another_bot(history, state):
+def test_get_file_never_falls_back_to_another_bot(history, state, make_queue):
     main, owner = Sender(), Sender()
-    manager, _, _ = prepare_runtime(history, main)
+    manager, _, _ = prepare_runtime(history, main, make_queue=make_queue)
     if state != 'missing':
         attach_owner(manager, owner, disabled=state == 'disabled')
     if state == 'rejected':
@@ -240,8 +240,8 @@ def test_get_file_never_falls_back_to_another_bot(history, state):
         manager._outbound_queue.close()
 
 
-def test_remote_download_is_chunked_and_not_forwarded_as_owner_url(history, monkeypatch):
-    manager, _, _ = prepare_runtime(history, Sender())
+def test_remote_download_is_chunked_and_not_forwarded_as_owner_url(history, monkeypatch, make_queue):
+    manager, _, _ = prepare_runtime(history, Sender(), make_queue=make_queue)
     url = 'https://files.example/file/botOWNER/media.mp4'
     manager._transfer_min_mbps = 2.5
     owner = SimpleNamespace(get_file=Mock(return_value=SimpleNamespace(
@@ -274,11 +274,11 @@ def test_remote_download_is_chunked_and_not_forwarded_as_owner_url(history, monk
         manager._outbound_queue.close()
 
 
-def test_legacy_media_owner_column_is_used_only_for_acquisition(history):
+def test_legacy_media_owner_column_is_used_only_for_acquisition(history, make_queue):
     target, operation, kwargs = prepare_owned(history)
     main = Sender(copy_error=BadRequest('Message to copy not found'))
     owner = Sender()
-    manager, executor, scheduler = prepare_runtime(history, main)
+    manager, executor, scheduler = prepare_runtime(history, main, make_queue=make_queue)
     owner.file_path = main.file_path
     attach_owner(manager, owner, membership=False)
     queue = manager._outbound_queue
@@ -293,7 +293,7 @@ def test_legacy_media_owner_column_is_used_only_for_acquisition(history):
                 ('aux-7', queue.encode_payload(args, raw), row.id),
             )
         queue.close()
-        manager._outbound_queue = queue = OutboundQueue(history.path)
+        manager._outbound_queue = queue = make_queue(history.path)
         scheduler.queue = queue
         scheduler.dispatch_once()
         finish_attempt(executor, scheduler)
@@ -304,10 +304,10 @@ def test_legacy_media_owner_column_is_used_only_for_acquisition(history):
         queue.close()
 
 
-def test_etm_message_acquisition_uses_shared_owner_route_without_main_fallback(history, monkeypatch):
+def test_etm_message_acquisition_uses_shared_owner_route_without_main_fallback(history, monkeypatch, make_queue):
     from efb_telegram_master import message as message_module
     main, owner = Sender(), Sender()
-    manager, _, _ = prepare_runtime(history, main)
+    manager, _, _ = prepare_runtime(history, main, make_queue=make_queue)
     attach_owner(manager, owner)
     owner.get_file = Mock(side_effect=BadRequest('file unavailable'))
     monkeypatch.setattr(message_module, 'coordinator', SimpleNamespace(master=SimpleNamespace(bot_manager=manager)))
@@ -321,8 +321,8 @@ def test_etm_message_acquisition_uses_shared_owner_route_without_main_fallback(h
         manager._outbound_queue.close()
 
 
-def test_local_api_acquisition_reuses_local_path_without_reading_file(history, monkeypatch):
-    manager, _, _ = prepare_runtime(history, Sender())
+def test_local_api_acquisition_reuses_local_path_without_reading_file(history, monkeypatch, make_queue):
+    manager, _, _ = prepare_runtime(history, Sender(), make_queue=make_queue)
     manager._local_mode = True
     owner = SimpleNamespace(get_file=Mock(return_value=SimpleNamespace(file_path=manager._bot.file_path)))
     attach_owner(manager, owner, membership=False)

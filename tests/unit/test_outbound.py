@@ -27,6 +27,7 @@ from efb_telegram_master import delivery_states, queue_report
 from efb_telegram_master.delivery_states import FAILED_ATTEMPTS_LIMIT, Event, RowState, classify, next_state
 from efb_telegram_master.hold_send import hold as operator_hold
 from efb_telegram_master.outbound import (
+    _POSTGRESQL_OWNER_LOCK,
     IllegalDeliveryTransitionError,
     InvalidQueuedPayloadError,
     OutboundQueue,
@@ -40,6 +41,7 @@ from efb_telegram_master.outbound import (
 )
 from efb_telegram_master.queued_log import encode_aggregation
 from tests.unit.test_live_aggregate import bare_manager
+from tests.unit.test_queue_report import _dsn
 
 
 def send_message(chat_id, text):
@@ -66,6 +68,10 @@ def enqueue(queue, *requests):
     return queue.enqueue_many(requests, operation)
 
 
+def _inserted_id(queue):
+    return queue.connection.execute("SELECT MAX(id) FROM outbound_queue").fetchone()[0]
+
+
 def media_bytes(value):
     if isinstance(value, InputFile):
         value = value.input_file_content
@@ -79,6 +85,7 @@ def media_bytes(value):
         value.seek(position)
 
 
+# SQLite only: WAL mode, busy timeout and sqlite_master are SQLite features.
 def test_queue_schema_wal_and_restart_retention(tmp_path):
     queue = OutboundQueue(tmp_path)
     row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 12, "text": "first"}))
@@ -97,8 +104,8 @@ def test_queue_schema_wal_and_restart_retention(tmp_path):
     assert OutboundQueue(tmp_path).heads() == []
 
 
-def test_queue_removal_clamps_residence_after_wall_clock_rollback(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_queue_removal_clamps_residence_after_wall_clock_rollback(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     enqueue(queue, QueueRequest("send_message", (), {"chat_id": 12, "text": "first"}))
     row = queue.heads()[0]
     metrics = Mock()
@@ -110,8 +117,8 @@ def test_queue_removal_clamps_residence_after_wall_clock_rollback(tmp_path):
     metrics.record_removal.assert_called_once_with(0, "send_message", "submitted", 0.0)
 
 
-def test_destination_snapshot_limits_and_ranks_in_sql_order(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_destination_snapshot_limits_and_ranks_in_sql_order(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     enqueue(
         queue,
         QueueRequest("send_message", (), {"chat_id": 30, "text": "a"}),
@@ -136,6 +143,7 @@ def test_destination_snapshot_limits_and_ranks_in_sql_order(tmp_path):
         assert queue.destination_snapshot(0) == []
 
 
+# SQLite only: upgrades a hand-built SQLite file from before the delivery columns.
 def test_queue_adds_delivery_columns_to_existing_database(tmp_path):
     path = tmp_path / OutboundQueue.filename
     connection = sqlite3.connect(path)
@@ -160,8 +168,8 @@ def test_queue_adds_delivery_columns_to_existing_database(tmp_path):
     assert row.completion_receipt is None
 
 
-def test_payload_version_round_trip_and_invalid_shapes(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_payload_version_round_trip_and_invalid_shapes(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     payload = queue.encode_payload((1,), {"chat_id": 2, "value": {"x": 1}})
     assert queue.decode_payload(payload) == ((1,), {"chat_id": 2, "value": {"x": 1}})
     for invalid in (b"\x02value", b"\x01not-a-pickle", b"\x01\x80\x05K\x01."):
@@ -171,8 +179,8 @@ def test_payload_version_round_trip_and_invalid_shapes(tmp_path):
         queue.encode_payload((), {"value": threading.Lock()})
 
 
-def test_media_snapshot_preserves_caller_stream_lifecycle_and_decodes_fresh_values(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_media_snapshot_preserves_caller_stream_lifecycle_and_decodes_fresh_values(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     caller_stream = io.BufferedReader(io.BytesIO(b"complete media"))
     caller_stream.seek(5)
 
@@ -216,19 +224,20 @@ class _UnrestorableStream(io.BytesIO):
 
 
 @pytest.mark.parametrize(
-    "stream",
-    [_UntellableStream(b"media"), _UnreadableStream(b"media"), _UnrestorableStream(b"media")],
+    "stream_type", [_UntellableStream, _UnreadableStream, _UnrestorableStream],
+    ids=["untellable", "unreadable", "unrestorable"],
 )
-def test_media_snapshot_classifies_stream_read_and_restore_failures(tmp_path, stream):
-    queue = OutboundQueue(tmp_path)
+def test_media_snapshot_classifies_stream_read_and_restore_failures(tmp_path, stream_type, make_queue):
+    stream = stream_type(b"media")
+    queue = make_queue(tmp_path)
     with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
         queue._snapshot_media_value(stream)
 
     assert not stream.closed
 
 
-def test_media_snapshot_restores_position_after_read_failure(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_media_snapshot_restores_position_after_read_failure(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     stream = _UnreadableStream(b"media")
 
     with pytest.raises(QueueEnqueueError):
@@ -260,9 +269,9 @@ def _buffered_media(content, random_access):
     ids=["small-image", "large-image", "sticker", "file", "video", "voice"],
 )
 def test_initial_send_media_streams_enqueue_as_inline_version_one_snapshots(
-    tmp_path, operation_name, media_key, content, random_access, keyword
+    tmp_path, operation_name, media_key, content, random_access, keyword, make_queue
 ):
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     caller_stream = _buffered_media(content, random_access)
     caller_stream.seek(2)
     args = () if keyword else (100, caller_stream)
@@ -287,8 +296,8 @@ def test_initial_send_media_streams_enqueue_as_inline_version_one_snapshots(
     assert decoded_kwargs["disable_notification"] is True
 
 
-def test_direct_media_normalization_failure_and_non_media_stream_commit_zero_rows(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_direct_media_normalization_failure_and_non_media_stream_commit_zero_rows(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     requests = [
         QueueRequest("send_photo", (100, _UnreadableStream(b"photo")), {}),
         QueueRequest("send_message", (100, io.BufferedReader(io.BytesIO(b"not text"))), {}),
@@ -310,8 +319,8 @@ def _open_input_file(content, filename):
     return InputFile(stream, filename=filename, attach=True, read_file_handle=False), stream
 
 
-def test_thumbnail_keyword_enqueues_an_inline_snapshot(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_thumbnail_keyword_enqueues_an_inline_snapshot(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     thumbnail = io.BufferedReader(io.BytesIO(b"thumbnail"))
     thumbnail.seek(3)
 
@@ -337,9 +346,9 @@ def test_thumbnail_keyword_enqueues_an_inline_snapshot(tmp_path):
     ],
 )
 def test_video_cover_enqueues_an_inline_version_one_snapshot(
-    tmp_path, kind, expected_filename
+    tmp_path, kind, expected_filename, make_queue
 ):
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     content = f"{kind} cover".encode()
     source = None
     local_path = None
@@ -384,8 +393,8 @@ def test_video_cover_enqueues_an_inline_version_one_snapshot(
         assert getattr(decoded_cover, "name", None) == expected_filename
 
 
-def test_malformed_video_cover_commits_zero_rows(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_malformed_video_cover_commits_zero_rows(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
 
     with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
         queue.enqueue_many(
@@ -407,9 +416,9 @@ def test_malformed_video_cover_commits_zero_rows(tmp_path):
     ids=["photo", "document", "video"],
 )
 def test_edit_media_snapshots_nested_input_file_and_attach_name(
-    tmp_path, keyword, media_type, content, filename
+    tmp_path, keyword, media_type, content, filename, make_queue
 ):
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     uploaded, source = _open_input_file(content, filename)
     media = media_type(uploaded, caption="caption")
     attach_name = uploaded.attach_name
@@ -432,8 +441,8 @@ def test_edit_media_snapshots_nested_input_file_and_attach_name(
 
 
 @pytest.mark.parametrize("keyword", [False, True], ids=["positional", "keyword"])
-def test_media_group_snapshots_nested_files_thumbnails_and_attach_names(tmp_path, keyword):
-    queue = OutboundQueue(tmp_path)
+def test_media_group_snapshots_nested_files_thumbnails_and_attach_names(tmp_path, keyword, make_queue):
+    queue = make_queue(tmp_path)
     photo, photo_source = _open_input_file(b"photo", "photo.jpg")
     video, video_source = _open_input_file(b"video", "video.mp4")
     thumbnail, thumbnail_source = _open_input_file(b"thumb", "thumb.jpg")
@@ -476,7 +485,7 @@ def test_media_group_snapshots_nested_files_thumbnails_and_attach_names(tmp_path
     ids=["audio", "document", "photo", "video", "live-photo"],
 )
 def test_media_group_accepts_exact_supported_subtypes_and_normalizes_upload_fields(
-    tmp_path, media_type, attachment_fields
+    tmp_path, media_type, attachment_fields, make_queue
 ):
     uploads = {}
     sources = []
@@ -494,7 +503,7 @@ def test_media_group_accepts_exact_supported_subtypes_and_normalizes_upload_fiel
     media = media_type(
         uploads["media"], caption="preserved caption", **constructor_kwargs
     )
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
 
     queue.enqueue_many(
         [QueueRequest(
@@ -521,8 +530,8 @@ def test_media_group_accepts_exact_supported_subtypes_and_normalizes_upload_fiel
         assert delivered.attach_name == attach_name
 
 
-def test_media_group_rejects_input_media_animation_before_insert(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_media_group_rejects_input_media_animation_before_insert(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     animation = InputMediaAnimation(
         InputFile(b"animation", filename="animation.gif", attach=True)
     )
@@ -546,7 +555,7 @@ def test_media_group_rejects_input_media_animation_before_insert(tmp_path):
     ],
 )
 def test_nested_input_media_preserves_bytes_filename_precedence_and_attachment_link(
-    tmp_path, kind, expected_filename
+    tmp_path, kind, expected_filename, make_queue
 ):
     content = f"nested {kind}".encode()
     expected_attach_name = None
@@ -567,7 +576,7 @@ def test_nested_input_media_preserves_bytes_filename_precedence_and_attachment_l
     else:
         media = InputMediaDocument("placeholder")
         object.__setattr__(media, "media", io.BufferedReader(io.BytesIO(content)))
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
 
     queue.enqueue_many(
         [QueueRequest("send_media_group", (100, [media]), {})],
@@ -586,11 +595,11 @@ def test_nested_input_media_preserves_bytes_filename_precedence_and_attachment_l
         assert getattr(delivered, "name", None) == expected_filename
 
 
-def test_nested_local_media_read_failure_commits_zero_rows(tmp_path, monkeypatch):
+def test_nested_local_media_read_failure_commits_zero_rows(tmp_path, monkeypatch, make_queue):
     local_path = tmp_path / "nested-unreadable.bin"
     local_path.write_bytes(b"nested media")
     media = InputMediaDocument(local_path)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
 
     def failing_open(_path, *_args, **_kwargs):
         raise OSError("nested read failed")
@@ -605,8 +614,8 @@ def test_nested_local_media_read_failure_commits_zero_rows(tmp_path, monkeypatch
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
 
 
-def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     source = io.BufferedReader(io.BytesIO(b"reopened media"))
     row_id, _waiter = queue.enqueue_many(
         [QueueRequest("send_document", (100, source), {})],
@@ -616,7 +625,7 @@ def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
     source.close()
     queue.close()
 
-    reopened = OutboundQueue(tmp_path)
+    reopened = make_queue(tmp_path)
     row = reopened.heads()[0]
     media = reopened.decode_payload(row.payload)[0][1]
     assert row.id == row_id
@@ -625,11 +634,11 @@ def test_inline_media_snapshot_reconstructs_after_queue_reopen(tmp_path):
     reopened.close()
 
 
-def test_set_chat_photo_snapshots_an_open_file_before_persistence(tmp_path):
+def test_set_chat_photo_snapshots_an_open_file_before_persistence(tmp_path, make_queue):
     def set_chat_photo(chat_id, photo):
         return True
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     photo = io.BufferedReader(io.BytesIO(b"chat photo"))
     row_id, _waiter = queue.enqueue_many(
         [QueueRequest("set_chat_photo", (100, photo), {"_send_mode": "blocking"})],
@@ -646,13 +655,13 @@ def test_set_chat_photo_snapshots_an_open_file_before_persistence(tmp_path):
 @pytest.mark.parametrize("input_kind", ["string", "path"])
 @pytest.mark.parametrize("after_enqueue", ["mutate", "move", "delete"])
 def test_local_file_media_is_owned_inline_after_enqueue_and_reopen(
-    tmp_path, input_kind, after_enqueue
+    tmp_path, input_kind, after_enqueue, make_queue
 ):
     source_path = tmp_path / f"{input_kind}-{after_enqueue}.bin"
     original_content = f"original {input_kind} {after_enqueue}".encode()
     source_path.write_bytes(original_content)
     media = str(source_path) if input_kind == "string" else source_path
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
 
     row_id, _waiter = queue.enqueue_many(
         [QueueRequest("send_document", (100, media), {})],
@@ -669,7 +678,7 @@ def test_local_file_media_is_owned_inline_after_enqueue_and_reopen(
     else:
         source_path.unlink()
     queue.close()
-    reopened = OutboundQueue(tmp_path)
+    reopened = make_queue(tmp_path)
     row = reopened.heads()[0]
     decoded_media = reopened.decode_payload(row.payload)[0][1]
     assert row.id == row_id
@@ -682,8 +691,8 @@ def test_local_file_media_is_owned_inline_after_enqueue_and_reopen(
     reopened.close()
 
 
-def test_corrupt_live_v2_payload_preserves_all_sidecars_during_orphan_scan(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_corrupt_live_v2_payload_preserves_all_sidecars_during_orphan_scan(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     orphan = queue.media_dir / "media-unknown.bin"
     orphan.write_bytes(b"must preserve")
     with queue.connection:
@@ -694,15 +703,15 @@ def test_corrupt_live_v2_payload_preserves_all_sidecars_during_orphan_scan(tmp_p
         )
     queue.close()
 
-    reopened = OutboundQueue(tmp_path)
+    reopened = make_queue(tmp_path)
     try:
         assert orphan.read_bytes() == b"must preserve"
     finally:
         reopened.close()
 
 
-def test_orphan_sidecar_is_removed_on_restart_while_live_sidecar_is_preserved(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_orphan_sidecar_is_removed_on_restart_while_live_sidecar_is_preserved(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     live_id, _waiter = queue.enqueue_many(
         [QueueRequest("send_document", (100, io.BytesIO(b"live")), {})],
         lambda _name: media_operation,
@@ -713,7 +722,7 @@ def test_orphan_sidecar_is_removed_on_restart_while_live_sidecar_is_preserved(tm
     orphan.write_bytes(b"orphan")
     queue.close()
 
-    reopened = OutboundQueue(tmp_path)
+    reopened = make_queue(tmp_path)
     try:
         assert not orphan.exists()
         assert {path.name for path in reopened.media_dir.iterdir()} == live_files
@@ -724,12 +733,12 @@ def test_orphan_sidecar_is_removed_on_restart_while_live_sidecar_is_preserved(tm
 
 @pytest.mark.parametrize("cleanup_path_kind", ["absolute", "relative"])
 def test_local_tdlib_file_uri_stays_out_of_sqlite_and_is_cleaned_after_row_delete(
-    tmp_path, monkeypatch, cleanup_path_kind
+    tmp_path, monkeypatch, cleanup_path_kind, make_queue
 ):
     source_path = tmp_path / "tdlib-large.bin"
     with source_path.open("wb") as source:
         source.truncate(381_320_453)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     uri = source_path.as_uri()
     cleanup_path = str(source_path)
     if cleanup_path_kind == "relative":
@@ -765,8 +774,8 @@ def test_local_tdlib_file_uri_stays_out_of_sqlite_and_is_cleaned_after_row_delet
     ],
     ids=["http-url", "https-url", "telegram-file-id"],
 )
-def test_remote_string_media_stays_opaque(remote_value, tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_remote_string_media_stays_opaque(remote_value, tmp_path, make_queue):
+    queue = make_queue(tmp_path)
 
     queue.enqueue_many(
         [QueueRequest("send_document", (100, remote_value), {})],
@@ -778,7 +787,7 @@ def test_remote_string_media_stays_opaque(remote_value, tmp_path):
 
 
 @pytest.mark.parametrize("failure", ["open", "read"])
-def test_local_file_media_failure_commits_zero_rows(tmp_path, monkeypatch, failure):
+def test_local_file_media_failure_commits_zero_rows(tmp_path, monkeypatch, failure, make_queue):
     source_path = tmp_path / "unreadable.bin"
     source_path.write_bytes(b"media")
     original_open = Path.open
@@ -791,7 +800,7 @@ def test_local_file_media_failure_commits_zero_rows(tmp_path, monkeypatch, failu
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", failing_open)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
 
     with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
         queue.enqueue_many(
@@ -811,8 +820,8 @@ def test_local_file_media_failure_commits_zero_rows(tmp_path, monkeypatch, failu
     ],
     ids=["direct", "thumbnail", "media-group"],
 )
-def test_unsupported_media_values_commit_zero_rows(tmp_path, queue_request):
-    queue = OutboundQueue(tmp_path)
+def test_unsupported_media_values_commit_zero_rows(tmp_path, queue_request, make_queue):
+    queue = make_queue(tmp_path)
 
     with pytest.raises(QueueEnqueueError, match="Unable to serialize queued Telegram call"):
         queue.enqueue_many([queue_request], lambda _name: media_operation)
@@ -822,8 +831,8 @@ def test_unsupported_media_values_commit_zero_rows(tmp_path, queue_request):
 
 @pytest.mark.parametrize("operation_name", ["edit_message_media", "send_media_group"])
 @pytest.mark.parametrize("field", ["media", "thumbnail"])
-def test_unsupported_nested_media_values_commit_zero_rows(tmp_path, operation_name, field):
-    queue = OutboundQueue(tmp_path)
+def test_unsupported_nested_media_values_commit_zero_rows(tmp_path, operation_name, field, make_queue):
+    queue = make_queue(tmp_path)
     nested = (
         InputMediaPhoto(object())
         if field == "media"
@@ -844,8 +853,8 @@ def test_unsupported_nested_media_values_commit_zero_rows(tmp_path, operation_na
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
 
 
-def test_nested_media_accepts_file_ids_urls_bytes_and_matching_telegram_objects(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_nested_media_accepts_file_ids_urls_bytes_and_matching_telegram_objects(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     photo_size = PhotoSize("photo-size-id", "unique-id", 10, 10)
     telegram_media = InputMediaPhoto("placeholder")
     object.__setattr__(telegram_media, "media", photo_size)
@@ -880,8 +889,8 @@ def test_nested_media_accepts_file_ids_urls_bytes_and_matching_telegram_objects(
         ((), {"chat_id": "7", "text": "text"}, False),
     ],
 )
-def test_chat_id_binds_after_scheduler_metadata_is_removed(tmp_path, args, kwargs, valid):
-    queue = OutboundQueue(tmp_path)
+def test_chat_id_binds_after_scheduler_metadata_is_removed(tmp_path, args, kwargs, valid, make_queue):
+    queue = make_queue(tmp_path)
     request = QueueRequest("send_message", args, {**kwargs, "_send_mode": "eventual"})
     if valid:
         enqueue(queue, request)
@@ -891,8 +900,8 @@ def test_chat_id_binds_after_scheduler_metadata_is_removed(tmp_path, args, kwarg
             enqueue(queue, request)
 
 
-def test_internal_keys_are_validated_and_absent_from_payload(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_internal_keys_are_validated_and_absent_from_payload(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {
         "chat_id": 7, "text": "text", "_send_mode": "blocking", "_slave_id": "slave",
     }))
@@ -914,8 +923,8 @@ def test_internal_keys_are_validated_and_absent_from_payload(tmp_path):
         }))
 
 
-def test_send_message_main_bot_sentinel_persists_but_other_required_sender_is_rejected(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_send_message_main_bot_sentinel_persists_but_other_required_sender_is_rejected(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
 
     row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {
         "chat_id": 7,
@@ -935,8 +944,8 @@ def test_send_message_main_bot_sentinel_persists_but_other_required_sender_is_re
         }))
 
 
-def test_multi_call_is_atomic_ordered_and_returns_only_first_waiter(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_multi_call_is_atomic_ordered_and_returns_only_first_waiter(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     first, waiter = enqueue(queue,
         QueueRequest("send_message", (), {"chat_id": 7, "text": "one"}),
         QueueRequest("send_message", (), {"chat_id": 7, "text": "two"}),
@@ -1016,14 +1025,14 @@ class DurableAdapter(Adapter):
         return self.reconcile
 
 
-def test_log_context_survives_restart_before_send(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_log_context_survives_restart_before_send(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     row_id, _waiter = enqueue(queue, QueueRequest(
         "send_message", (), {"chat_id": 7, "text": "durable"}, log_context=b"\x01context",
     ))
     queue.close()
 
-    restarted = OutboundQueue(tmp_path)
+    restarted = make_queue(tmp_path)
     adapter = DurableAdapter(reconcile=True)
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(restarted, adapter, executor, worker_count=1)
@@ -1037,9 +1046,9 @@ def test_log_context_survives_restart_before_send(tmp_path):
     assert restarted.sent_pending() == []
 
 
-def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path, monkeypatch):
+def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path, monkeypatch, make_queue):
     monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1000.0)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, waiter = enqueue(queue, QueueRequest(
         "send_message", (), {"chat_id": 7, "text": "durable"}, log_context=b"\x01context",
     ))
@@ -1055,7 +1064,7 @@ def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path, monk
     assert [row.id for row in queue.sent_pending()] == [row_id]
     queue.close()
 
-    restarted = OutboundQueue(tmp_path)
+    restarted = make_queue(tmp_path)
     second_adapter = DurableAdapter(reconcile=True)
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(restarted, second_adapter, executor, worker_count=1)
@@ -1071,8 +1080,8 @@ def test_sent_pending_row_reconciles_after_restart_without_resend(tmp_path, monk
     assert restarted.sent_pending() == []
 
 
-def test_blocking_log_context_row_survives_restart_before_send(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_blocking_log_context_row_survives_restart_before_send(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     row_id, _waiter = enqueue(queue, QueueRequest(
         "send_message", (),
         {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
@@ -1080,7 +1089,7 @@ def test_blocking_log_context_row_survives_restart_before_send(tmp_path):
     ))
     queue.close()
 
-    restarted = OutboundQueue(tmp_path)
+    restarted = make_queue(tmp_path)
     adapter = DurableAdapter(reconcile=True)
     with ThreadPoolExecutor(max_workers=1) as executor:
         scheduler = OutboundQueueScheduler(restarted, adapter, executor, worker_count=1)
@@ -1097,9 +1106,9 @@ def test_blocking_log_context_row_survives_restart_before_send(tmp_path):
     assert restarted.sent_pending() == []
 
 
-def test_blocking_failed_reconciliation_keeps_row_for_retry(tmp_path, monkeypatch):
+def test_blocking_failed_reconciliation_keeps_row_for_retry(tmp_path, monkeypatch, make_queue):
     monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: 1000.0)
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, waiter = enqueue(queue, QueueRequest(
         "send_message", (),
         {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
@@ -1129,8 +1138,8 @@ def test_blocking_failed_reconciliation_keeps_row_for_retry(tmp_path, monkeypatc
     assert queue.heads() == []
 
 
-def test_blocking_terminal_failure_discards_retained_log_context_row(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_blocking_terminal_failure_discards_retained_log_context_row(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     row_id, waiter = enqueue(queue, QueueRequest(
         "send_message", (),
         {"chat_id": 7, "text": "durable", "_send_mode": "blocking"},
@@ -1159,8 +1168,8 @@ def test_blocking_terminal_failure_discards_retained_log_context_row(tmp_path):
         waiter.result(timeout=1)
 
 
-def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     normal_id, _normal = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "normal"}))
     blocking_id, _blocking = enqueue(queue, QueueRequest("send_message", (), {
         "chat_id": 7, "text": "blocking", "_send_mode": "blocking"
@@ -1181,8 +1190,8 @@ def test_scheduler_prioritizes_blocking_and_never_submits_two_destination_rows(t
         assert adapter.calls[-1][0] == normal_id
 
 
-def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch):
-    queue = OutboundQueue(tmp_path)
+def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch, make_queue):
+    queue = make_queue(tmp_path)
     _row_id, waiter = enqueue(queue, QueueRequest("send_message", (), {
         "chat_id": 7, "text": "text", "_send_mode": "blocking"
     }))
@@ -1203,8 +1212,8 @@ def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch)
         ).fetchone()[0] == "in_flight"
 
 
-def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path, monkeypatch):
-    queue = OutboundQueue(tmp_path)
+def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path, monkeypatch, make_queue):
+    queue = make_queue(tmp_path)
     row_id, waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 8, "text": "text"}))
     adapter = Adapter(acquire=False)
     scheduler = OutboundQueueScheduler(queue, adapter, ThreadPoolExecutor(max_workers=1), worker_count=1)
@@ -1218,8 +1227,8 @@ def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path
     assert adapter.calls == []
 
 
-def test_shutdown_keeps_queued_row_and_fails_abandoned_waiter(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_shutdown_keeps_queued_row_and_fails_abandoned_waiter(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     row_id, waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "text"}))
     adapter = Adapter(block=True)
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -1233,10 +1242,10 @@ def test_shutdown_keeps_queued_row_and_fails_abandoned_waiter(tmp_path):
         adapter.release.set()
 
 
-def test_failed_batch_cleans_only_new_sidecars_after_partial_preparation(tmp_path):
+def test_failed_batch_cleans_only_new_sidecars_after_partial_preparation(tmp_path, make_queue):
     from efb_telegram_master.outbound import _LegacyInlineBlob
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     existing = queue._store_media_stream(io.BytesIO(b"existing"), "existing.bin")
     assert existing.storage_name is not None
 
@@ -1260,19 +1269,19 @@ def test_failed_batch_cleans_only_new_sidecars_after_partial_preparation(tmp_pat
     assert queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0] == 0
 
 
-def test_legacy_recovery_preserves_opaque_binary_kwargs(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_legacy_recovery_preserves_opaque_binary_kwargs(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     try:
         media = io.BytesIO(b"inline media")
         legacy = b"\x01" + pickle.dumps(
             ((100, media), {"api_kwargs": b"keep", "nested": {"alias": media}}), protocol=5,
         )
         with queue.connection:
-            cursor = queue.connection.execute(
+            queue.connection.execute(
                 "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
                 "VALUES(0,100,'send_document',?,0)", (legacy,),
             )
-        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        row = queue.recover_legacy_media_payload(_inserted_id(queue))
         args, kwargs = queue.decode_payload(row.payload)
         try:
             assert args[1].read() == b"inline media"
@@ -1287,6 +1296,7 @@ def test_legacy_recovery_preserves_opaque_binary_kwargs(tmp_path):
         queue.close()
 
 
+# SQLite only: injects the failure with a SQLite trigger.
 def test_failed_legacy_recovery_keeps_preexisting_media_and_external_paths(tmp_path):
     from efb_telegram_master.outbound import _LegacyInlineBlob, _StoredMediaSnapshot
 
@@ -1322,19 +1332,19 @@ def test_failed_legacy_recovery_keeps_preexisting_media_and_external_paths(tmp_p
         queue.close()
 
 
-def test_legacy_recovery_preserves_bytearray_with_opcode_like_contents(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_legacy_recovery_preserves_bytearray_with_opcode_like_contents(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     try:
         opaque = bytearray(b"abc\x95ABCDEFGHz")
         legacy = b"\x01" + pickle.dumps(
             ((100, io.BytesIO(b"inline media")), {"opaque": opaque}), protocol=5,
         )
         with queue.connection:
-            cursor = queue.connection.execute(
+            queue.connection.execute(
                 "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
                 "VALUES(0,100,'send_document',?,0)", (legacy,),
             )
-        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        row = queue.recover_legacy_media_payload(_inserted_id(queue))
         args, kwargs = queue.decode_payload(row.payload)
         try:
             assert args[1].read() == b"inline media"
@@ -1345,8 +1355,8 @@ def test_legacy_recovery_preserves_bytearray_with_opcode_like_contents(tmp_path)
         queue.close()
 
 
-def test_prepare_failure_after_snapshot_cleans_its_new_sidecar(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_prepare_failure_after_snapshot_cleans_its_new_sidecar(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     existing = queue._store_media_stream(io.BytesIO(b"existing"), "existing.bin")
     assert existing.storage_name is not None
     try:
@@ -1360,8 +1370,8 @@ def test_prepare_failure_after_snapshot_cleans_its_new_sidecar(tmp_path):
     finally:
         queue.close()
 
-def test_legacy_recovery_streams_memoized_distinct_bytesio_media_and_aliases(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_legacy_recovery_streams_memoized_distinct_bytesio_media_and_aliases(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     first = io.BytesIO(b"first media")
     second = io.BytesIO(b"second thumbnail")
     legacy = b"\x01" + pickle.dumps(
@@ -1370,11 +1380,11 @@ def test_legacy_recovery_streams_memoized_distinct_bytesio_media_and_aliases(tmp
     )
     try:
         with queue.connection:
-            cursor = queue.connection.execute(
+            queue.connection.execute(
                 "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
                 "VALUES(0,100,'send_video',?,0)", (legacy,),
             )
-        row = queue.recover_legacy_media_payload(int(cursor.lastrowid))
+        row = queue.recover_legacy_media_payload(_inserted_id(queue))
         args, kwargs = queue.decode_payload(row.payload)
         try:
             assert media_bytes(args[1]) == b"first media"
@@ -1388,8 +1398,8 @@ def test_legacy_recovery_streams_memoized_distinct_bytesio_media_and_aliases(tmp
         queue.close()
 
 
-def test_nested_prepare_failure_reclaims_only_new_media(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_nested_prepare_failure_reclaims_only_new_media(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     existing = queue._store_media_stream(io.BytesIO(b"existing"), None)
     media = InputMediaVideo("remote-id")
     object.__setattr__(media, "media", b"new video")
@@ -1406,10 +1416,10 @@ def test_nested_prepare_failure_reclaims_only_new_media(tmp_path):
         queue.close()
 
 
-def test_partial_decode_closes_open_files_and_preserves_queued_data(tmp_path, monkeypatch):
+def test_partial_decode_closes_open_files_and_preserves_queued_data(tmp_path, monkeypatch, make_queue):
     import efb_telegram_master.outbound as outbound
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     row_id, waiter = queue.enqueue_many(
         [QueueRequest("send_media_group", (100, [
             InputMediaVideo(b"first"), InputMediaVideo(b"missing"),
@@ -1442,6 +1452,7 @@ def test_partial_decode_closes_open_files_and_preserves_queued_data(tmp_path, mo
         queue.close()
 
 
+# SQLite only: the competing writer takes the SQLite write lock with BEGIN IMMEDIATE.
 def test_legacy_recovery_excludes_competing_writer_until_commit(tmp_path, monkeypatch):
     queue = OutboundQueue(tmp_path)
     legacy = b"\x01" + pickle.dumps(((100, io.BytesIO(b"document")), {}), protocol=5)
@@ -1492,10 +1503,10 @@ finally:
         queue.close()
 
 
-def test_legacy_recovery_preserves_multipart_filename_and_mime(tmp_path):
+def test_legacy_recovery_preserves_multipart_filename_and_mime(tmp_path, make_queue):
     import httpx
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     document = io.BytesIO(b"%PDF-document")
     document.name = "report.pdf"
     legacy = b"\x01" + pickle.dumps(((100, document), {}), protocol=5)
@@ -1520,8 +1531,8 @@ def test_legacy_recovery_preserves_multipart_filename_and_mime(tmp_path):
         queue.close()
 
 
-def test_unknown_payload_version_preserves_media_until_row_is_repaired(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_unknown_payload_version_preserves_media_until_row_is_repaired(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     row_id, _ = queue.enqueue_many(
         [QueueRequest("send_document", (1, b"recoverable media"), {})],
         lambda _: media_operation,
@@ -1530,7 +1541,7 @@ def test_unknown_payload_version_preserves_media_until_row_is_repaired(tmp_path)
     with queue.connection:
         queue.connection.execute("UPDATE outbound_queue SET payload=? WHERE id=?", (b"\x03" + payload[1:], row_id))
     queue.close()
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     try:
         assert queue.load_queued(row_id).payload == b"\x03" + payload[1:]
         with queue.connection:
@@ -1547,17 +1558,18 @@ def test_unknown_payload_version_preserves_media_until_row_is_repaired(tmp_path)
 
 
 @pytest.mark.parametrize("publication", ["enqueue", "supplement", "legacy"])
-def test_queue_owner_excludes_cross_process_cleanup_during_publication(tmp_path, monkeypatch, publication):
-    queue = OutboundQueue(tmp_path)
+def test_queue_owner_excludes_cross_process_cleanup_during_publication(tmp_path, monkeypatch, publication, make_queue):
+    queue = make_queue(tmp_path)
     if publication == "supplement":
         parent_id, _ = enqueue(queue, QueueRequest("send_message", (1, "primary"), {}))
     elif publication == "legacy":
         payload = b"\x01" + pickle.dumps(((1, io.BytesIO(b"owned media")), {}), protocol=5)
         with queue.connection:
-            parent_id = queue.connection.execute(
+            queue.connection.execute(
                 "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
                 "VALUES(0,1,'send_document',?,0)", (payload,),
-            ).lastrowid
+            )
+        parent_id = _inserted_id(queue)
     store = queue._store_media_stream
     contender = """
 import sys
@@ -1595,7 +1607,7 @@ else:
     finally:
         queue.close()
     # The next owner must acquire the lock and retain the committed media.
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     try:
         args, kwargs = queue.decode_payload(queue.load_queued(row_id).payload)
         try:
@@ -1608,11 +1620,11 @@ else:
         queue.close()
 
 
-def test_shutdown_waits_for_preparation_and_rejects_publication_after_close(tmp_path, monkeypatch):
+def test_shutdown_waits_for_preparation_and_rejects_publication_after_close(tmp_path, monkeypatch, make_queue):
     from concurrent.futures import TimeoutError
     from efb_telegram_master.outbound import QueuePersistenceError
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     manager = bare_manager()
     manager.logger = Mock()
     manager._outbound_queue = queue
@@ -1653,7 +1665,7 @@ def test_shutdown_waits_for_preparation_and_rejects_publication_after_close(tmp_
         queue.enqueue_many([request], lambda _: media_operation)
     with pytest.raises(QueuePersistenceError, match="closed"):
         queue.record_telegram_completion(row_id, b"receipt", supplement=request, operation_resolver=lambda _: media_operation)
-    restarted = OutboundQueue(tmp_path)
+    restarted = make_queue(tmp_path)
     try:
         args, kwargs = restarted.decode_payload(restarted.load_queued(row_id).payload)
         try:
@@ -1664,12 +1676,12 @@ def test_shutdown_waits_for_preparation_and_rejects_publication_after_close(tmp_
         restarted.close()
 
 
-def test_constructor_failure_releases_queue_ownership(tmp_path, monkeypatch):
+def test_constructor_failure_releases_queue_ownership(tmp_path, monkeypatch, make_queue):
     with monkeypatch.context() as patcher:
-        patcher.setattr(OutboundQueue, "_migrate_schema", Mock(side_effect=RuntimeError("schema failure")))
-        with pytest.raises(RuntimeError, match="schema failure"):
-            OutboundQueue(tmp_path)
-    queue = OutboundQueue(tmp_path)
+        patcher.setattr(OutboundQueue, "_release_interrupted_attempts", Mock(side_effect=RuntimeError("startup failure")))
+        with pytest.raises(RuntimeError, match="startup failure"):
+            make_queue(tmp_path)
+    queue = make_queue(tmp_path)
     try:
         row_id, _ = enqueue(queue, QueueRequest("send_message", (1, "after failed startup"), {}))
         assert queue.load_queued(row_id).operation == "send_message"
@@ -1677,7 +1689,7 @@ def test_constructor_failure_releases_queue_ownership(tmp_path, monkeypatch):
         queue.close()
 
 
-def test_rows_written_before_the_topic_column_regain_their_lane(tmp_path):
+def test_rows_written_before_the_topic_column_regain_their_lane(tmp_path, make_queue):
     """A topic carried only by the request must not stay in the chat's main lane."""
     from efb_telegram_master.queued_log import encode_aggregation
 
@@ -1690,7 +1702,7 @@ def test_rows_written_before_the_topic_column_regain_their_lane(tmp_path):
             inherit=False, generation=1, recent=[], last_new=0, waiting=False, due=0, silent=False,
         ))
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     for topic in (11, 12, 11, 12):
         queue.enqueue_many([QueueRequest("send_photo", (b"image",), {
             "chat_id": -1001, "message_thread_id": topic,
@@ -1703,7 +1715,7 @@ def test_rows_written_before_the_topic_column_regain_their_lane(tmp_path):
         "legacy rows all collapse into the main lane"
     queue.close()
 
-    reopened = OutboundQueue(tmp_path)  # opening the queue repairs them
+    reopened = make_queue(tmp_path)  # opening the queue repairs them
     try:
         assert sorted(row.thread_id for row in reopened.heads(ready_only=True)) == [11, 12, 13]
         # Idempotent: a second pass has nothing left to do.
@@ -1767,6 +1779,24 @@ def _fail_send_to_limit(queue, row_id):
     queue.defer_failed_send(row_id, time.time() + 60)
 
 
+def _offline_hold(queue, directory, row_id):
+    """Hold a row with the offline tool, as an operator does once the bot has stopped.
+
+    On PostgreSQL the tool refuses while the queue's session owns the queue, so the
+    test queue gives up that ownership for the call and takes it back afterwards.
+    """
+    database = queue._postgresql_config
+    if database is None:
+        return operator_hold(directory, row_id, apply=True)
+    owner = ("SELECT pg_advisory_{}lock(?::bigint + oid::bigint) FROM pg_namespace "
+             "WHERE nspname = current_schema()")
+    queue.connection.execute(owner.format("un"), (_POSTGRESQL_OWNER_LOCK,))
+    try:
+        return operator_hold(directory, row_id, apply=True, database=database)
+    finally:
+        queue.connection.execute(owner.format(""), (_POSTGRESQL_OWNER_LOCK,))
+
+
 def _apply(queue, directory, row_id, event):
     calls = {
         Event.BEGIN_ATTEMPT: lambda: queue.begin_delivery_attempt(row_id, ATTEMPT),
@@ -1776,7 +1806,7 @@ def _apply(queue, directory, row_id, event):
             ATTEMPT),
         Event.RELEASE_ATTEMPT: lambda: queue.release_delivery_attempt(row_id),
         Event.HOLD_UNCERTAIN: lambda: queue.hold_uncertain_delivery(row_id, _ambiguous_error()),
-        Event.OPERATOR_HOLD: lambda: operator_hold(directory, row_id, apply=True),
+        Event.OPERATOR_HOLD: lambda: _offline_hold(queue, directory, row_id),
         Event.HOLD_INVALID_PAYLOAD: lambda: queue.hold_invalid_payload(row_id),
         Event.HOLD_FAILED_HISTORY: lambda: queue.hold_failed_history(
             row_id, RequiredSenderUnavailableError("gone")),
@@ -1825,7 +1855,7 @@ def _table(queue):
 
 
 @pytest.mark.parametrize("spelling", sorted(ROW_SPELLINGS))
-def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spelling, caplog):
+def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spelling, caplog, make_queue):
     """Rows as the current code writes them load, classify and follow the transition table.
 
     A legal event leads to the table's state; an illegal one raises or warns and
@@ -1835,7 +1865,7 @@ def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spell
     mismatches = []
     for event in Event:
         directory = tmp_path / event.value
-        queue = OutboundQueue(directory)
+        queue = make_queue(directory)
         try:
             row_id = _write_row(queue, directory, spelling)
             columns = queue.connection.execute(
@@ -1870,8 +1900,8 @@ def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spell
     assert mismatches == []
 
 
-def test_a_hold_never_replaces_another_hold(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_a_hold_never_replaces_another_hold(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     try:
         row_id = _write_row(queue, tmp_path, "invalid_payload")
         with pytest.raises(IllegalDeliveryTransitionError, match="invalid_payload"):
@@ -1885,9 +1915,9 @@ def test_a_hold_never_replaces_another_hold(tmp_path):
         queue.close()
 
 
-def test_releasing_a_held_aggregate_keeps_its_frozen_request(tmp_path, caplog):
+def test_releasing_a_held_aggregate_keeps_its_frozen_request(tmp_path, caplog, make_queue):
     """Only an in-flight attempt rewinds to its logical batch; a held one stays for the operator."""
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     try:
         logical = {"format_version": 1, "kind": "logical", "key": ("slave", -1001, None), "members": []}
         row_id, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": ""},
@@ -1911,19 +1941,24 @@ def _lane_section(output, title):
     return [dict(zip(header, (value.strip() for value in line.split("|")))) for line in lines[1:]]
 
 
-def _run_report(queue_path, *arguments):
+def _run_report(queue_path, *arguments, backend=None):
     from efb_telegram_master.queue_report import __file__ as script
+    source = ["--queue", str(queue_path)]
+    env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": ""}
+    if backend is not None:
+        source = ["--dsn", _dsn(backend)]
+        env["PGPASSWORD"] = backend["password"]
     result = subprocess.run(
-        [sys.executable, script, "--queue", str(queue_path), *arguments],
-        capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ""}, check=False,
+        [sys.executable, script, *source, *arguments],
+        capture_output=True, text=True, env=env, check=False,
     )
     assert result.returncode == 0, result.stderr
     return result.stdout
 
 
-def test_every_readiness_user_elects_the_same_rows(tmp_path):
+def test_every_readiness_user_elects_the_same_rows(tmp_path, make_queue, queue_backend):
     """Scheduler heads and the standalone report agree on which rows may send."""
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     chats = iter(range(-1001, -1100, -1))
     rows = {}
     try:
@@ -1964,7 +1999,7 @@ def test_every_readiness_user_elects_the_same_rows(tmp_path):
     finally:
         queue.close()
 
-    printed = _run_report(tmp_path / "outbound-queue.sqlite3")
+    printed = _run_report(tmp_path / "outbound-queue.sqlite3", backend=queue_backend)
     heads = _lane_section(printed, "head per destination: age, position and retry")
     assert {int(head["head_id"]) for head in heads} == expected
     depth = _lane_section(printed, "per destination: depth, holds, age")
@@ -1974,14 +2009,15 @@ def test_every_readiness_user_elects_the_same_rows(tmp_path):
     }
     sendable = set()
     for (chat,) in destinations:
-        lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", f"--lane={chat}:0"),
+        lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", f"--lane={chat}:0",
+                                         backend=queue_backend),
                              f"lane {chat}:0 in send order")
         sendable |= {int(item["id"]) for item in lane if item["election"] == "sendable"}
     assert sendable == expected
 
 
-def test_rows_that_only_wait_for_each_other_are_reported_as_a_cycle(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_rows_that_only_wait_for_each_other_are_reported_as_a_cycle(tmp_path, make_queue, queue_backend):
+    queue = make_queue(tmp_path)
     try:
         first, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "a"}))
         second, _ = enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "b"},
@@ -1993,7 +2029,7 @@ def test_rows_that_only_wait_for_each_other_are_reported_as_a_cycle(tmp_path):
         assert queue.has_unresolvable_dependency()
     finally:
         queue.close()
-    lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", "--lane=-1001:0"),
+    lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", "--lane=-1001:0", backend=queue_backend),
                          "lane -1001:0 in send order")
     assert [item["election"] for item in lane] == ["behind predecessor", "behind predecessor"]
 

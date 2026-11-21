@@ -169,7 +169,14 @@ message names the row, its kind and the event, for example
   outbound worker stops, as for any queue persistence error, and stops again
   after a restart. Find the row with
   `python3 -m efb_telegram_master.queue_report --data-dir <channel data directory>`
-  and report the message with the log lines around it.
+  and report the message with the log lines around it. When the queue is in
+  PostgreSQL, add `--dsn "host=... dbname=... user=..."` (the password comes from
+  `PGPASSWORD` or `~/.pgpass`, never the command line). An install whose
+  `database.options` sets `search_path` puts the same schema in the DSN
+  (`options=-csearch_path=<schema>`). With `--dsn`, `--data-dir` is used only
+  to size `outbound-media/`, and the script needs only `psycopg2`. Without `--dsn` it
+  refuses a data directory whose queue moved to PostgreSQL, because the retained
+  SQLite copy shows stale rows.
 * **At receipt reconciliation**, the scheduler logs once per row
   `Receipt of queue row 12 (aggregation kind 'logical') cannot be reconciled; it stays queued and is retried: ...`
   and keeps retrying on the usual backoff. Other rows continue.

@@ -121,8 +121,8 @@ def fill_queue(queue, count, destinations=10, payload_size=65536, state="queued"
         )
 
 
-def test_queue_loads_one_blob_per_destination_and_keeps_priority_fifo(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_queue_loads_one_blob_per_destination_and_keeps_priority_fifo(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     fill_queue(queue, 1000)
     tracemalloc.start()
     try:
@@ -139,8 +139,8 @@ def test_queue_loads_one_blob_per_destination_and_keeps_priority_fifo(tmp_path):
     queue.close()
 
 
-def test_sent_pending_never_fetches_upload_blobs_and_is_bounded(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_sent_pending_never_fetches_upload_blobs_and_is_bounded(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     fill_queue(queue, 1000, state="sent_pending")
     tracemalloc.start()
     try:
@@ -154,11 +154,11 @@ def test_sent_pending_never_fetches_upload_blobs_and_is_bounded(tmp_path):
     queue.close()
 
 
-def test_failed_reconciliation_is_fair_bounded_and_not_retried_on_each_wake(tmp_path, monkeypatch):
+def test_failed_reconciliation_is_fair_bounded_and_not_retried_on_each_wake(tmp_path, monkeypatch, make_queue):
     now = [1000.0]
     monkeypatch.setattr("efb_telegram_master.outbound.time.time", lambda: now[0])
     monkeypatch.setattr("efb_telegram_master.outbound.time.monotonic", lambda: now[0])
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     fill_queue(queue, 70, payload_size=10, state="sent_pending")
     adapter = DurableAdapter(reconcile=False)
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -188,8 +188,8 @@ def test_failed_reconciliation_is_fair_bounded_and_not_retried_on_each_wake(tmp_
     queue.close()
 
 
-def test_reconciliation_delay_doubles_caps_and_survives_restart(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_reconciliation_delay_doubles_caps_and_survives_restart(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     fill_queue(queue, 1, payload_size=10, state="sent_pending")
     now = 1000.0
     for delay in (1, 2, 4, 8, 16, 32, 60, 60):
@@ -197,14 +197,14 @@ def test_reconciliation_delay_doubles_caps_and_survives_restart(tmp_path):
         assert queue.sent_pending(due_before=now + delay - 0.01) == []
         assert [row.id for row in queue.sent_pending(due_before=now + delay)] == [1]
         queue.close()
-        queue = OutboundQueue(tmp_path)
+        queue = make_queue(tmp_path)
         assert queue.sent_pending(due_before=now + delay - 0.01) == []
         now += delay
     queue.close()
 
 
-def test_single_completion_does_not_rescan_other_receipts(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_single_completion_does_not_rescan_other_receipts(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
     fill_queue(queue, 70, payload_size=10, state="sent_pending")
     adapter = DurableAdapter(reconcile=True)
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -215,8 +215,8 @@ def test_single_completion_does_not_rescan_other_receipts(tmp_path):
     queue.close()
 
 
-def test_backoff_persistence_failure_stops_scheduler_without_losing_receipt(tmp_path, monkeypatch):
-    queue = OutboundQueue(tmp_path)
+def test_backoff_persistence_failure_stops_scheduler_without_losing_receipt(tmp_path, monkeypatch, make_queue):
+    queue = make_queue(tmp_path)
     fill_queue(queue, 1, payload_size=10, state="sent_pending")
     adapter = DurableAdapter(reconcile=False)
 
@@ -233,10 +233,10 @@ def test_backoff_persistence_failure_stops_scheduler_without_losing_receipt(tmp_
     queue.close()
 
 
-def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkeypatch):
+def test_scheduler_does_not_load_blobs_for_waiting_destinations(tmp_path, monkeypatch, make_queue):
     from efb_telegram_master.outbound import SenderSelectionResult
 
-    queue = OutboundQueue(tmp_path)
+    queue = make_queue(tmp_path)
     fill_queue(queue, 100, destinations=10)
     adapter = DurableAdapter(reconcile=True)
     loads = []
@@ -339,6 +339,7 @@ def test_history_preparation_and_restart_do_not_materialize_the_backlog(manager)
     assert not manager.has_pending_history_migrations()
 
 
+# SQLite only: asserts SQLite's index list and query plan.
 def test_dispatch_head_scan_is_served_by_a_covering_index(tmp_path):
     """A pass reads every waiting row; it must not also fetch each row's table page."""
     queue = OutboundQueue(tmp_path)

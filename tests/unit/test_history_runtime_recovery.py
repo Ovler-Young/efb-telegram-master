@@ -206,10 +206,10 @@ def test_null_and_equal_timestamps_cross_pages_without_loss(history):
 
 @pytest.mark.parametrize('history', ['sqlite', 'postgresql'], indirect=True)
 @pytest.mark.parametrize('boundary', ['before_commit', 'after_commit', 'first_delete', 'all_deleted', 'completed'])
-def test_durable_handoff_survives_each_interruption(history, monkeypatch, boundary):
+def test_durable_handoff_survives_each_interruption(history, monkeypatch, boundary, make_queue, queue_backend):
     target = populate(history, ['A', 'B'])
     sender = Sender()
-    manager, executor, scheduler = prepare_runtime(history, sender)
+    manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
     enqueue = manager.enqueue_history_operation
     delete = history.db.delete_history_migration_entry
     forgotten = manager.forget_history_entries
@@ -242,7 +242,10 @@ def test_durable_handoff_survives_each_interruption(history, monkeypatch, bounda
     monkeypatch.setattr(history.db, 'delete_history_migration_entry', interrupted_delete)
     queue = manager._outbound_queue
     if boundary == 'before_commit':
-        queue.connection.execute("CREATE TRIGGER interrupt_enqueue BEFORE INSERT ON outbound_queue BEGIN SELECT RAISE(ABORT, 'interrupted'); END")
+        if queue_backend is None:
+            queue.connection.execute("CREATE TRIGGER interrupt_enqueue BEFORE INSERT ON outbound_queue BEGIN SELECT RAISE(ABORT, 'interrupted'); END")
+        else:
+            queue.connection.execute("ALTER TABLE outbound_queue ADD CONSTRAINT interrupt_enqueue CHECK (false) NOT VALID")
     try:
         if boundary in ('first_delete', 'all_deleted'):
             with pytest.raises(RuntimeError, match='interrupted'):
@@ -250,10 +253,13 @@ def test_durable_handoff_survives_each_interruption(history, monkeypatch, bounda
         else:
             assert not history.binding._process_history_migration_target(target)
         if boundary == 'before_commit':
-            queue.connection.execute('DROP TRIGGER interrupt_enqueue')
+            if queue_backend is None:
+                queue.connection.execute('DROP TRIGGER interrupt_enqueue')
+            else:
+                queue.connection.execute('ALTER TABLE outbound_queue DROP CONSTRAINT interrupt_enqueue')
         queue.close()
         # Reopen the real queue: completion may have already deleted its row.
-        manager, executor, scheduler = prepare_runtime(history, sender)
+        manager, executor, scheduler = prepare_runtime(history, sender, make_queue=make_queue)
         queue = manager._outbound_queue
         monkeypatch.setattr(history.db, 'delete_history_migration_entry', delete)
 
