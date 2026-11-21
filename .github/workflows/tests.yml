@@ -126,7 +126,7 @@ jobs:
         TEST_POSTGRES_USER: postgres
         TEST_POSTGRES_PASSWORD: postgres
       run: |
-        pytest --mode=unit -v tests/unit/test_database_safety.py tests/unit/test_database_performance.py tests/unit/test_restart_memory.py tests/unit/test_db_migrations.py tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py tests/unit/test_bot_manager.py tests/unit/test_outbound_adapter.py
+        pytest --mode=unit -v tests/unit/test_database_safety.py tests/unit/test_database_performance.py tests/unit/test_restart_memory.py tests/unit/test_db_migrations.py tests/unit/test_outbound.py tests/unit/test_outbound_queue_runtime_evidence.py tests/unit/test_delivery_uncertainty.py tests/unit/test_history_replay.py tests/unit/test_history_sender.py tests/unit/test_history_runtime_recovery.py tests/unit/test_bot_manager.py tests/unit/test_outbound_adapter.py tests/unit/test_outbound_scheduler_liveness.py tests/unit/test_orphan_media_scan.py tests/unit/test_aggregation_row_scan.py tests/unit/test_live_aggregate_runtime.py tests/unit/test_live_aggregate_source.py tests/unit/test_author_emoji_header.py tests/unit/test_transfer_timeout.py tests/unit/test_aggregation_states.py tests/unit/test_history_states.py tests/unit/test_queue_report.py
     - name: Verify SQLite 3.31.1 compatibility
       if: matrix.python-version == '3.10'
       timeout-minutes: 8
