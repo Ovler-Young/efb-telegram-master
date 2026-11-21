@@ -41,6 +41,7 @@ from efb_telegram_master.outbound import (
 )
 from efb_telegram_master.queued_log import encode_aggregation
 from tests.unit.test_live_aggregate import bare_manager
+from tests.unit.test_queue_report import _dsn
 
 
 def send_message(chat_id, text):
@@ -1940,11 +1941,16 @@ def _lane_section(output, title):
     return [dict(zip(header, (value.strip() for value in line.split("|")))) for line in lines[1:]]
 
 
-def _run_report(queue_path, *arguments):
+def _run_report(queue_path, *arguments, backend=None):
     from efb_telegram_master.queue_report import __file__ as script
+    source = ["--queue", str(queue_path)]
+    env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": ""}
+    if backend is not None:
+        source = ["--dsn", _dsn(backend)]
+        env["PGPASSWORD"] = backend["password"]
     result = subprocess.run(
-        [sys.executable, script, "--queue", str(queue_path), *arguments],
-        capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ""}, check=False,
+        [sys.executable, script, *source, *arguments],
+        capture_output=True, text=True, env=env, check=False,
     )
     assert result.returncode == 0, result.stderr
     return result.stdout
@@ -1993,9 +1999,7 @@ def test_every_readiness_user_elects_the_same_rows(tmp_path, make_queue, queue_b
     finally:
         queue.close()
 
-    if queue_backend is not None:
-        return  # The standalone report reads the SQLite file.
-    printed = _run_report(tmp_path / "outbound-queue.sqlite3")
+    printed = _run_report(tmp_path / "outbound-queue.sqlite3", backend=queue_backend)
     heads = _lane_section(printed, "head per destination: age, position and retry")
     assert {int(head["head_id"]) for head in heads} == expected
     depth = _lane_section(printed, "per destination: depth, holds, age")
@@ -2005,7 +2009,8 @@ def test_every_readiness_user_elects_the_same_rows(tmp_path, make_queue, queue_b
     }
     sendable = set()
     for (chat,) in destinations:
-        lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", f"--lane={chat}:0"),
+        lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", f"--lane={chat}:0",
+                                         backend=queue_backend),
                              f"lane {chat}:0 in send order")
         sendable |= {int(item["id"]) for item in lane if item["election"] == "sendable"}
     assert sendable == expected
@@ -2024,9 +2029,7 @@ def test_rows_that_only_wait_for_each_other_are_reported_as_a_cycle(tmp_path, ma
         assert queue.has_unresolvable_dependency()
     finally:
         queue.close()
-    if queue_backend is not None:
-        return  # The standalone report reads the SQLite file.
-    lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", "--lane=-1001:0"),
+    lane = _lane_section(_run_report(tmp_path / "outbound-queue.sqlite3", "--lane=-1001:0", backend=queue_backend),
                          "lane -1001:0 in send order")
     assert [item["election"] for item in lane] == ["behind predecessor", "behind predecessor"]
 

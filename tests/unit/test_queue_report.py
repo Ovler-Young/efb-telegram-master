@@ -207,7 +207,7 @@ def test_report_refuses_the_retained_sqlite_queue_of_a_moved_install(tmp_path, p
         report(tmp_path / QUEUE_FILENAME, out=io.StringIO())
     out = io.StringIO()
     assert report(tmp_path / QUEUE_FILENAME, out=out, dsn=_dsn(postgres_config)) == 0
-    assert "row" in out.getvalue() or "send_message" in out.getvalue()
+    assert "send_message" in out.getvalue()
 
 
 def test_a_negative_chat_id_is_accepted_as_a_lane(tmp_path, capsys, make_queue, queue_backend):
