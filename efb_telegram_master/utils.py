@@ -186,7 +186,7 @@ class ExperimentalFlagsManager(LocaleMixin):
         if self.config.get("topic_group") is None and channel.config.get("topic_group") is not None:
             self.config["topic_group"] = channel.config["topic_group"]
         topic_group = self.config["topic_group"]
-        if topic_group is not None:
+        if topic_group is not None and topic_group is not False:
             if isinstance(topic_group, dict):
                 valid_topic_group = (
                     set(topic_group) <= set(TOPIC_GROUP_CHAT_TYPES)

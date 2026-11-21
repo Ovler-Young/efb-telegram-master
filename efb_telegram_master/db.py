@@ -806,8 +806,9 @@ class DatabaseManager:
 
     @observe_database_method("get_topic_chat_id")
     def get_topic_chat_id(self, slave_uid: EFBChannelChatIDStr) -> TelegramChatID | None:
-        """Get the forum chat that already holds a topic of a slave chat, if any."""
-        assoc = TopicAssoc.select(TopicAssoc.topic_chat_id).where(TopicAssoc.slave_uid == slave_uid).first()
+        """Get the forum chat that holds the newest topic of a slave chat, if any."""
+        assoc = TopicAssoc.select(TopicAssoc.topic_chat_id).where(TopicAssoc.slave_uid == slave_uid)\
+            .order_by(TopicAssoc.id.desc()).first()
         return TelegramChatID(int(assoc.topic_chat_id)) if assoc else None
 
     @observe_database_method("get_topic_slave")

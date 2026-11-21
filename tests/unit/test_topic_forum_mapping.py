@@ -10,6 +10,7 @@ from ehforwarderbot.types import ChatID
 from telegram import Update
 
 from efb_telegram_master import utils
+from efb_telegram_master.db import TopicAssoc
 from efb_telegram_master.member_selection import current_source_route
 from efb_telegram_master.utils import (
     ExperimentalFlagsManager,
@@ -132,6 +133,20 @@ def test_single_forum_config_still_uses_one_forum_for_every_chat(channel, chats,
         assert _route(channel, chats.group)[0] == PRIVATE_FORUM
 
 
+def test_newest_topic_wins_when_a_chat_has_topics_in_two_forums(channel, chats, forum):
+    slave_uid = utils.chat_id_to_str(chat=chats.private)
+    # Databases written before one topic per chat was enforced can hold a row for each forum.
+    TopicAssoc.create(topic_chat_id=PRIVATE_FORUM, message_thread_id=10, slave_uid=slave_uid)
+    TopicAssoc.create(topic_chat_id=GROUP_FORUM, message_thread_id=20, slave_uid=slave_uid)
+
+    assert channel.db.get_topic_chat_id(slave_uid) == GROUP_FORUM
+    mapped_route = _route(channel, chats.private)
+    with patch.object(channel, "topic_group", GROUP_FORUM):
+        single_forum_route = _route(channel, chats.private)
+
+    assert mapped_route == single_forum_route == (GROUP_FORUM, "20")
+
+
 def _start_update(channel, chat_id):
     return Update.de_json(
         {
@@ -162,7 +177,7 @@ def test_start_link_refused_in_every_configured_forum(channel, chat_id, accepted
 
 
 @pytest.mark.parametrize("value", [
-    None, 123, {}, {"private": 1}, MAPPING, {"group": -5, "official_account": -6}])
+    None, False, 123, {}, {"private": 1}, MAPPING, {"group": -5, "official_account": -6}])
 def test_topic_group_flag_accepts_chat_id_or_type_mapping(channel, value):
     with patch.dict(channel.config, {"flags": {"topic_group": value}}):
         assert ExperimentalFlagsManager(channel)("topic_group") == value
