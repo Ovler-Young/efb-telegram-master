@@ -145,8 +145,8 @@ unconfirmed duplicate upload.
 
 ## Queue row states
 
-Every state machine in the queue and in text aggregation is listed in
-[State machines](state-machines.md).
+The queue's state machines are described in this guide, and text aggregation's
+in the [text aggregation guide](text-aggregation.md).
 
 Every row of `outbound-queue.sqlite3` is in exactly one state, read from its
 `delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
