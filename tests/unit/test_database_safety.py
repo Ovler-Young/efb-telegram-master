@@ -26,7 +26,9 @@ from efb_telegram_master import migrate_db
 from efb_telegram_master.db import (
     ChatAssoc, DatabaseManager, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database,
 )
-from efb_telegram_master.db_runtime import DataDirectoryLock, connection_scope, current_schema, postgresql_database
+from efb_telegram_master.db_runtime import (
+    DataDirectoryLock, connection_scope, current_schema, postgresql_connection, postgresql_database,
+)
 from efb_telegram_master.delivery_states import FAILED_ATTEMPTS_LIMIT, HoldKind
 from efb_telegram_master.outbound import (
     POSTGRESQL_QUEUE_MARKER, OutboundQueue, QueuePersistenceError, QueueRequest, SenderSelection,
@@ -1191,6 +1193,18 @@ def _send_message(chat_id, text, message_thread_id=None):
 
 def _postgresql_queue(directory, config):
     return OutboundQueue(directory, database=config)
+
+
+def test_postgresql_restart_does_not_wait_for_a_reader_of_the_queue_table(tmp_path, postgres_config, manager_factory):
+    manager_factory(tmp_path, postgres_config).stop_worker()  # The first start creates the queue tables.
+    reader = postgresql_connection(postgres_config)
+    try:
+        # pg_dump, or a psql session left inside a transaction, holds this lock until it ends.
+        reader.cursor().execute("SELECT count(*) FROM outbound_queue")
+        # Startup has no lock timeout of its own; this one turns a wait into a failure.
+        manager_factory(tmp_path, dict(postgres_config, options=postgres_config["options"] + " -c lock_timeout=2s"))
+    finally:
+        reader.close()
 
 
 def test_postgresql_queue_delivers_holds_retargets_and_reconciles(tmp_path, postgres_config, manager_factory):

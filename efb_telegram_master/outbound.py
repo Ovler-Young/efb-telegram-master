@@ -875,7 +875,14 @@ def create_postgresql_queue_tables(execute: Callable[[str], object]) -> None:
     )
     # Payloads are read in chunks (legacy recovery, media sweeps, large
     # deletes). Compressed values would be decompressed whole for every chunk.
-    execute("ALTER TABLE outbound_queue ALTER COLUMN payload SET STORAGE EXTERNAL")
+    # The ALTER needs an ACCESS EXCLUSIVE lock, which waits for any reader such
+    # as pg_dump and queues the running owner's writes behind it; run it only
+    # once, on a table that does not have the setting yet.
+    execute(
+        "DO $$ BEGIN IF (SELECT attstorage FROM pg_attribute "
+        "WHERE attrelid = 'outbound_queue'::regclass AND attname = 'payload') <> 'e' THEN "
+        "ALTER TABLE outbound_queue ALTER COLUMN payload SET STORAGE EXTERNAL; END IF; END $$"
+    )
     execute("CREATE TABLE IF NOT EXISTS history_ownership (entry_key TEXT PRIMARY KEY)")
     execute(
         "CREATE TABLE IF NOT EXISTS source_cancellations ("
