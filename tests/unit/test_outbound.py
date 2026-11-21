@@ -27,6 +27,7 @@ from efb_telegram_master import delivery_states, queue_report
 from efb_telegram_master.delivery_states import FAILED_ATTEMPTS_LIMIT, Event, RowState, classify, next_state
 from efb_telegram_master.hold_send import hold as operator_hold
 from efb_telegram_master.outbound import (
+    _POSTGRESQL_OWNER_LOCK,
     IllegalDeliveryTransitionError,
     InvalidQueuedPayloadError,
     OutboundQueue,
@@ -1777,6 +1778,24 @@ def _fail_send_to_limit(queue, row_id):
     queue.defer_failed_send(row_id, time.time() + 60)
 
 
+def _offline_hold(queue, directory, row_id):
+    """Hold a row with the offline tool, as an operator does once the bot has stopped.
+
+    On PostgreSQL the tool refuses while the queue's session owns the queue, so the
+    test queue gives up that ownership for the call and takes it back afterwards.
+    """
+    database = queue._postgresql_config
+    if database is None:
+        return operator_hold(directory, row_id, apply=True)
+    owner = ("SELECT pg_advisory_{}lock(?::bigint + oid::bigint) FROM pg_namespace "
+             "WHERE nspname = current_schema()")
+    queue.connection.execute(owner.format("un"), (_POSTGRESQL_OWNER_LOCK,))
+    try:
+        return operator_hold(directory, row_id, apply=True, database=database)
+    finally:
+        queue.connection.execute(owner.format(""), (_POSTGRESQL_OWNER_LOCK,))
+
+
 def _apply(queue, directory, row_id, event):
     calls = {
         Event.BEGIN_ATTEMPT: lambda: queue.begin_delivery_attempt(row_id, ATTEMPT),
@@ -1786,7 +1805,7 @@ def _apply(queue, directory, row_id, event):
             ATTEMPT),
         Event.RELEASE_ATTEMPT: lambda: queue.release_delivery_attempt(row_id),
         Event.HOLD_UNCERTAIN: lambda: queue.hold_uncertain_delivery(row_id, _ambiguous_error()),
-        Event.OPERATOR_HOLD: lambda: operator_hold(directory, row_id, apply=True),
+        Event.OPERATOR_HOLD: lambda: _offline_hold(queue, directory, row_id),
         Event.HOLD_INVALID_PAYLOAD: lambda: queue.hold_invalid_payload(row_id),
         Event.HOLD_FAILED_HISTORY: lambda: queue.hold_failed_history(
             row_id, RequiredSenderUnavailableError("gone")),
@@ -1835,8 +1854,7 @@ def _table(queue):
 
 
 @pytest.mark.parametrize("spelling", sorted(ROW_SPELLINGS))
-# SQLite only: the operator hold writes the SQLite file directly.
-def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spelling, caplog):
+def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spelling, caplog, make_queue):
     """Rows as the current code writes them load, classify and follow the transition table.
 
     A legal event leads to the table's state; an illegal one raises or warns and
@@ -1846,7 +1864,7 @@ def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spell
     mismatches = []
     for event in Event:
         directory = tmp_path / event.value
-        queue = OutboundQueue(directory)
+        queue = make_queue(directory)
         try:
             row_id = _write_row(queue, directory, spelling)
             columns = queue.connection.execute(

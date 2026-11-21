@@ -15,7 +15,7 @@ from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut, RetryA
 from telegram.request import BaseRequest, HTTPXRequest
 
 from efb_telegram_master.outbound import (
-    DeliveryUncertainError, OutboundQueue, OutboundQueueScheduler, QueueRequest, QueuePersistenceError, _NamedMediaFile,
+    DeliveryUncertainError, OutboundQueueScheduler, QueueRequest, QueuePersistenceError, _NamedMediaFile,
 )
 from efb_telegram_master.bot_manager import SyncBotFacade, QueuedDbLogContext
 from efb_telegram_master.hold_send import hold
@@ -433,17 +433,38 @@ def test_real_ptb_httpx_lost_response_does_not_generate_second_send(tmp_path, mo
         queue.close()
 
 
-# SQLite only: the offline hold tool edits the SQLite file.
-def test_offline_hold_preserves_payload_and_no_default_mutation(tmp_path):
-    queue = OutboundQueue(tmp_path)
+def test_offline_hold_preserves_payload_and_no_default_mutation(tmp_path, make_queue, queue_backend):
+    queue = make_queue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {}, b"log")], lambda _: document)
     before = queue.connection.execute("SELECT payload, log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone()
-    assert not hold(tmp_path, row_id)["held"]
+    queue.close()
+    assert not hold(tmp_path, row_id, database=queue_backend)["held"]
+    queue = make_queue(tmp_path)
     assert queue.heads(ready_only=True)
-    assert hold(tmp_path, row_id, apply=True)["held"]
+    queue.close()
+    assert hold(tmp_path, row_id, apply=True, database=queue_backend)["held"]
+    queue = make_queue(tmp_path)
     assert not queue.heads(ready_only=True)
     assert queue.connection.execute("SELECT payload, log_context FROM outbound_queue WHERE id=?", (row_id,)).fetchone() == before
     assert list(queue.media_dir.iterdir())
+    queue.close()
+
+
+def test_offline_hold_refuses_while_the_bot_owns_the_queue(tmp_path, make_queue, queue_backend):
+    """A running bot holds the data directory (SQLite) or the queue's session lock (PostgreSQL)."""
+    from efb_telegram_master.db_runtime import DataDirectoryLock
+
+    queue = make_queue(tmp_path)
+    row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {}, b"log")], lambda _: document)
+    if queue_backend is None:
+        owner = DataDirectoryLock(tmp_path)
+        release = owner.close
+    else:
+        release = queue.close
+    with pytest.raises(RuntimeError, match="in use"):
+        hold(tmp_path, row_id, apply=True, database=queue_backend)
+    release()
+    assert hold(tmp_path, row_id, apply=True, database=queue_backend)["held"]
     queue.close()
 
 
