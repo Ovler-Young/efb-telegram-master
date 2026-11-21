@@ -16,8 +16,8 @@ DIVIDER = "- - - - - - - - - - - - - - -"
 
 
 @pytest.fixture
-def manager(request):
-    return request.getfixturevalue("runtime")
+def manager(runtime):  # noqa: F811
+    return runtime
 
 
 def handler(manager, enabled=True, thread=None):
