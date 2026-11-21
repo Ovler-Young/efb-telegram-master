@@ -171,7 +171,9 @@ message names the row, its kind and the event, for example
   `python3 -m efb_telegram_master.queue_report --data-dir <channel data directory>`
   and report the message with the log lines around it. When the queue is in
   PostgreSQL, add `--dsn "host=... dbname=... user=..."` (the password comes from
-  `PGPASSWORD` or `~/.pgpass`, never the command line); `--data-dir` is then used only
+  `PGPASSWORD` or `~/.pgpass`, never the command line). An install whose
+  `database.options` sets `search_path` puts the same schema in the DSN
+  (`options=-csearch_path=<schema>`). With `--dsn`, `--data-dir` is used only
   to size `outbound-media/`, and the script needs only `psycopg2`. Without `--dsn` it
   refuses a data directory whose queue moved to PostgreSQL, because the retained
   SQLite copy shows stale rows.

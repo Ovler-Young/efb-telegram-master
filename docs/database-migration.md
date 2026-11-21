@@ -255,7 +255,9 @@ recovering missing local files.
 With PostgreSQL configured the queue lives in PostgreSQL too, so the importer moves it
 after the data step, in a second PostgreSQL transaction of the same run and the same
 downtime. It needs `outbound-queue.sqlite3` in the data directory. If there is none,
-there is nothing to move and PostgreSQL startup creates an empty queue. The queue step:
+there is nothing to move and PostgreSQL startup creates an empty queue. The move needs
+PostgreSQL 12 or later, for the `sha256()` function and the floating-point output its
+digests compare. The queue step:
 
 1. Fences the SQLite queue and snapshots it, with `outbound-media/`, into the backup
    directory of the run. That snapshot is the rollback copy.
@@ -302,9 +304,12 @@ python -m efb_telegram_master.migrate_db \
 On an install whose queue kept running after an earlier data import, only `--queue-only`
 works: the plain command compares the recorded queue state, which no longer matches, and
 reports that the source changed. `--queue-only` moves just the queue and does not need
-`tgdata.db`. If `tgdata.db` is present but was never imported it refuses and asks for the
-plain command, which moves the data and the queue together. An install with no queue file
-starts with an empty queue.
+`tgdata.db`. If `tgdata.db` is present, the directory's cutover receipt must name the
+target's import. Without one (`tgdata.db` was never imported, or the import did not
+finish) it refuses and asks for the plain command, which verifies or moves the data and
+the queue together. With another import's receipt, as when the configuration names another
+install's target, it refuses as the plain command does and writes nothing. An install with
+no queue file starts with an empty queue.
 
 ### Older versions after the queue move
 
@@ -389,7 +394,9 @@ For an unchanged PostgreSQL cutover whose local directory must be relocated:
    channel directory, including `tgdata.db`, `outbound-queue.sqlite3`,
    `outbound-media/` and `manifest.json`. External attachment copies are already
    referenced by portable storage names; the original absolute paths are not
-   required for those archived queue rows.
+   required for those archived queue rows. After the queue move, the queue that runs is
+   the PostgreSQL copy of the live rows, which keep their original `file://` references:
+   those external media files must exist at the same paths on the relocated host.
 2. Run the same importer command with the new `--data-dir` and the original
    PostgreSQL target configuration. Do not simply copy the old local cutover
    receipt: source file fingerprints change when files are relocated.

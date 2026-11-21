@@ -593,7 +593,9 @@ def main(argv=None) -> int:
     parser.add_argument("--tg", type=Path, default=None, help="Path to tgdata.db")
     parser.add_argument("--dsn", default=None,
                         help="libpq connection string of a PostgreSQL queue, e.g. "
-                             "'host=... dbname=... user=...' (password: PGPASSWORD or ~/.pgpass)")
+                             "'host=... dbname=... user=...' (password: PGPASSWORD or ~/.pgpass); "
+                             "an install whose database options set search_path adds the same "
+                             "schema: options=-csearch_path=<schema>")
     parser.add_argument("--lane", default=None, metavar="CHAT[:TOPIC]",
                         help="Also list one destination's queued rows in send order")
     parser.add_argument("--limit", type=int, default=25, help="Rows to list for --lane")
