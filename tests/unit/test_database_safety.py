@@ -1955,6 +1955,39 @@ def test_queue_only_refuses_another_installs_target(sqlite_source, tmp_path, pos
     assert before[0]["version"] == 2 and before[1] == [] and not before[4]
 
 
+@pytest.mark.parametrize("own_receipt", [True, False])
+def test_queue_only_without_tgdata_refuses_another_installs_target(
+        sqlite_source, tmp_path, postgres_config, other_postgres_config, own_receipt):
+    """An imported install whose tgdata.db is gone, or a native install, has nothing but its receipt to compare."""
+    other = tmp_path / "other-channel"
+    shutil.copytree(sqlite_source, other)
+    _as_an_earlier_import(other, other_postgres_config)
+    if own_receipt:
+        _as_an_earlier_import(sqlite_source, postgres_config)
+        directory = sqlite_source
+        for name in ("tgdata.db", "tgdata.db-wal", "tgdata.db-shm"):
+            (directory / name).unlink(missing_ok=True)
+    else:
+        directory = _sqlite_queue(tmp_path / "native")
+
+    def state():
+        target = postgresql_database(other_postgres_config)
+        with connection_scope(target):
+            record = migrate_db._read_import(target)
+        target.close_all()
+        receipt = directory / migrate_db.RECEIPT_FILE
+        return (record, _queue_tables_in(other_postgres_config), _sqlite_rows(directory),
+                receipt.read_bytes() if receipt.exists() else None,
+                (directory / POSTGRESQL_QUEUE_MARKER).exists(),
+                sorted((directory / "database-backups").iterdir()) if (directory / "database-backups").exists() else [])
+
+    before = state()
+    with pytest.raises(RuntimeError, match="cutover receipt does not match this target"):
+        migrate_db.migrate(directory, other_postgres_config, queue_only=True)
+    assert state() == before
+    assert before[0]["version"] == 2 and before[1] == [] and not before[4]
+
+
 def test_queue_move_marks_the_import_record_and_only_with_a_committed_move(sqlite_source, postgres_config, manager_factory):
     with patch.object(migrate_db, "_copy_queue_table", side_effect=RuntimeError("injected queue failure")), \
             pytest.raises(RuntimeError, match="injected queue failure"):
