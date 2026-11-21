@@ -1,5 +1,6 @@
 """Small connection/ownership helpers shared by the runtime and offline importer."""
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -22,6 +23,23 @@ def postgresql_database(config: dict) -> PooledPostgresqlDatabase:
         max_connections=config.get("max_connections", 8),
         stale_timeout=config.get("stale_timeout", 300),
         timeout=config.get("pool_timeout", 5),
+        options=config.get("options", "-c timezone=UTC"),
+    )
+
+
+def postgresql_connection(config: Mapping):
+    """One dedicated session from the same settings as the pool above.
+
+    The outbound queue keeps it for its whole life and holds its owner lock on it.
+    """
+    import psycopg2
+
+    return psycopg2.connect(
+        dbname=config.get("database", "efb_telegram"),
+        host=config.get("host", "localhost"),
+        port=config.get("port", 5432),
+        user=config.get("user", "postgres"),
+        password=config.get("password", ""),
         options=config.get("options", "-c timezone=UTC"),
     )
 

@@ -1,5 +1,6 @@
 """Offline database acceptance tests: real PostgreSQL, no Telegram credentials."""
 
+import io
 import json
 import os
 import pickle
@@ -26,7 +27,10 @@ from efb_telegram_master.db import (
     ChatAssoc, DatabaseManager, HistoryMigrationEntry, MsgLog, SlaveChatInfo, TopicAssoc, database,
 )
 from efb_telegram_master.db_runtime import DataDirectoryLock, connection_scope, current_schema, postgresql_database
-from efb_telegram_master.outbound import OutboundQueue, QueueRequest
+from efb_telegram_master.delivery_states import FAILED_ATTEMPTS_LIMIT, HoldKind
+from efb_telegram_master.outbound import (
+    OutboundQueue, QueuePersistenceError, QueueRequest, SenderSelection, _PostgresqlBlobReader,
+)
 
 MODELS = migrate_db.MODELS
 
@@ -1176,3 +1180,124 @@ def test_source_member_status_rows_load_and_progress(sqlite_source, manager_fact
     # An older version cannot be redirected over what is already saved.
     with pytest.raises(MemberTransitionError, match="stale receipt"):
         manager.finalize_member_redirect("-100.1", one, source("one"), receipt(6), "700")
+
+
+QUEUE_CHAT = -1001234567890123  # Beyond INTEGER; Telegram chat ids need BIGINT.
+
+
+def _send_message(chat_id, text, message_thread_id=None):
+    raise AssertionError("Queue persistence tests never send")
+
+
+def _postgresql_queue(directory, config):
+    return OutboundQueue(directory, database=config)
+
+
+def test_postgresql_queue_delivers_holds_retargets_and_reconciles(tmp_path, postgres_config, manager_factory):
+    manager_factory(tmp_path, postgres_config)  # The startup transaction creates the queue tables.
+    queue = _postgresql_queue(tmp_path, postgres_config)
+    try:
+        storage = queue.connection.execute(
+            "SELECT attstorage FROM pg_attribute WHERE attrelid = 'outbound_queue'::regclass AND attname = 'payload'"
+        ).fetchone()[0]
+        assert storage == "e"
+        first, _ = queue.enqueue_many(
+            [QueueRequest("send_message", (), {"chat_id": QUEUE_CHAT, "text": "first"})],
+            lambda _: _send_message, history_keys=["history.1"],
+        )
+        held, _ = queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -7, "text": "held"})],
+                                     lambda _: _send_message)
+        moved, _ = queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -8, "text": "moved"})],
+                                      lambda _: _send_message)
+        assert queue.owned_history_entries(["history.1", "other"]) == {"history.1"}
+        assert [row.id for row in queue.heads(include_payload=False, ready_only=True)] == [first, held, moved]
+
+        queue.hold_uncertain_delivery(held, TimeoutError("lost"))
+        args, kwargs = queue.decode_payload_raw(queue.load_queued(moved).payload)
+        queue.retarget(moved, -9, args, dict(kwargs, chat_id=-9))
+        assert queue.head_for(-7, None) is None
+        retargeted = queue.head_for(-9, None)
+        assert retargeted is not None and retargeted.id == moved
+
+        loaded = queue.load_queued(first)
+        assert loaded.telegram_chat_id == QUEUE_CHAT and isinstance(loaded.payload, bytes)
+        queue.begin_delivery_attempt(first, SenderSelection(None, "901"))
+        queue.record_telegram_completion(first, b"receipt")
+        [pending] = queue.sent_pending()
+        assert (pending.id, pending.completion_receipt) == (first, b"receipt")
+        queue.defer_reconciliation([first], 1000.0)
+        queue.defer_reconciliation([first], 1000.0)
+        assert queue.connection.execute(
+            "SELECT reconcile_after, reconcile_attempts FROM outbound_queue WHERE id = ?", (first,)
+        ).fetchone() == (1002.0, 2)
+        assert queue.next_reconciliation_time() == 1002.0
+        queue.delete(first, successful=True)
+        queue.forget_history_entries(["history.1"])
+        assert not queue.contains(first) and queue.owned_history_entries(["history.1"]) == set()
+        assert [row[0] for row in queue.connection.execute(
+            "SELECT delivery_hold FROM outbound_queue WHERE id = ?", (held,)
+        )] == ["uncertain:TimeoutError"]
+    finally:
+        queue.close()
+
+
+def test_postgresql_queue_recovers_a_raw_legacy_inline_media_row(tmp_path, postgres_config, manager_factory):
+    manager_factory(tmp_path, postgres_config)
+    media = bytes(range(256)) * (3 * _PostgresqlBlobReader.CHUNK_BYTES // 256 + 7)
+    legacy = b"\x01" + pickle.dumps(((QUEUE_CHAT, io.BytesIO(media)), {"caption": "c"}), protocol=5)
+    queue = _postgresql_queue(tmp_path, postgres_config)
+    try:
+        with queue.connection:
+            row_id = queue.connection.execute(
+                "INSERT INTO outbound_queue(priority,telegram_chat_id,operation,payload,created_at) "
+                "VALUES(0,?,'send_document',?,1234.5678901234567) RETURNING id", (QUEUE_CHAT, legacy),
+            ).fetchone()[0]
+        assert queue.queued_payload_version(row_id) == 1
+        row = queue.recover_legacy_media_payload(row_id)
+        args, kwargs = queue.decode_payload(row.payload)
+        try:
+            assert args[1].read() == media and kwargs == {"caption": "c"}
+        finally:
+            args[1].close()
+        assert queue.queued_payload_version(row_id) == 2
+    finally:
+        queue.close()
+    reopened = _postgresql_queue(tmp_path, postgres_config)  # The media sweep keeps the recovered sidecar.
+    try:
+        assert len(list(reopened.media_dir.iterdir())) == 1
+        reopened.delete(row_id)
+        assert list(reopened.media_dir.iterdir()) == []
+    finally:
+        reopened.close()
+
+
+def test_postgresql_queue_has_one_owner_and_releases_interrupted_sends(tmp_path, postgres_config, manager_factory):
+    manager_factory(tmp_path, postgres_config)
+    queue = _postgresql_queue(tmp_path / "first", postgres_config)
+    try:
+        row_id, _ = queue.enqueue_many([QueueRequest("send_message", (), {"chat_id": -7, "text": "x"})],
+                                       lambda _: _send_message)
+        queue.begin_delivery_attempt(row_id, SenderSelection(None, "901"))
+        with pytest.raises(QueuePersistenceError, match="already in use by another owner"):
+            _postgresql_queue(tmp_path / "second", postgres_config)
+    finally:
+        queue.close()
+    reopened = _postgresql_queue(tmp_path / "second", postgres_config)
+    try:
+        assert reopened.connection.execute(
+            "SELECT delivery_hold, reconcile_attempts FROM outbound_queue WHERE id = ?", (row_id,)
+        ).fetchone() == (HoldKind.IN_FLIGHT.value, FAILED_ATTEMPTS_LIMIT)
+    finally:
+        reopened.close()
+
+
+def test_postgresql_queue_refuses_to_start_without_its_tables(tmp_path, postgres_config, manager_factory):
+    manager_factory(tmp_path, postgres_config)
+    admin = postgresql_database(postgres_config)
+    with connection_scope(admin):
+        admin.execute_sql("DROP TABLE source_cancellations")
+    with pytest.raises(QueuePersistenceError, match="source_cancellations are missing"):
+        _postgresql_queue(tmp_path, postgres_config)
+    with connection_scope(admin):
+        assert admin.execute_sql("SELECT to_regclass('source_cancellations')").fetchone()[0] is None
+    admin.close_all()

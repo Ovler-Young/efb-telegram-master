@@ -425,6 +425,10 @@ class DatabaseManager:
                         validate_runtime_cutover(base_path, actual_db)
                     self._create_missing_tables()
                     self._check_and_run_migrations()
+                    if not self._is_sqlite:
+                        # The outbound queue uses the same PostgreSQL schema.
+                        from .outbound import create_postgresql_queue_tables
+                        create_postgresql_queue_tables(actual_db.execute_sql)
                 self._text_aggregation_overrides = {
                     (row.slave_channel_id, row.slave_chat_uid): bool(row.text_aggregation_enabled)
                     for row in SlaveChatInfo.select(

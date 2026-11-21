@@ -1,4 +1,4 @@
-"""SQLite-backed outbound Telegram call queue."""
+"""Durable outbound Telegram call queue, stored in SQLite or PostgreSQL."""
 
 from __future__ import annotations
 
@@ -536,8 +536,141 @@ class _SQLiteBlobReader:
         self.close()
 
 
+class _PostgresqlConnection:
+    """The part of ``sqlite3.Connection`` the queue uses, on one PostgreSQL session.
+
+    The session runs in autocommit, so a read never leaves a transaction open.
+    ``BEGIN`` with ``commit()``/``rollback()``, or ``with connection:``, bound
+    each write transaction as they do on SQLite. Queue SQL uses ``?``
+    placeholders and contains no literal ``?`` or ``%``.
+    """
+
+    def __init__(self, connection):
+        import psycopg2
+        import psycopg2.extensions
+
+        connection.autocommit = True
+        # BYTEA arrives as memoryview; queued payloads, contexts and receipts are bytes.
+        as_bytes = psycopg2.extensions.new_type(
+            psycopg2.BINARY.values, "ETM_QUEUE_BYTES",
+            lambda value, cursor: None if value is None else bytes(psycopg2.BINARY(value, cursor)),
+        )
+        psycopg2.extensions.register_type(as_bytes, connection)
+        self._connection = connection
+        self._idle = psycopg2.extensions.TRANSACTION_STATUS_IDLE
+
+    @staticmethod
+    def _translate(sql: str) -> str:
+        return sql.replace("%", "%%").replace("?", "%s")
+
+    def execute(self, sql: str, parameters: Iterable[object] = ()):
+        if sql == "BEGIN IMMEDIATE":
+            # Writers are serialised by the queue owner; rows are locked explicitly.
+            sql = "BEGIN"
+        values = tuple(parameters)
+        cursor = self._connection.cursor()
+        if values:
+            cursor.execute(self._translate(sql), values)
+        else:
+            cursor.execute(sql)
+        return cursor
+
+    def executemany(self, sql: str, parameters: Iterable[Iterable[object]]):
+        cursor = self._connection.cursor()
+        cursor.executemany(self._translate(sql), (tuple(values) for values in parameters))
+        return cursor
+
+    def _in_transaction(self) -> bool:
+        return self._connection.get_transaction_status() != self._idle
+
+    def commit(self) -> None:
+        if self._in_transaction():
+            self._connection.cursor().execute("COMMIT")
+
+    def rollback(self) -> None:
+        if self._in_transaction():
+            self._connection.cursor().execute("ROLLBACK")
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __enter__(self):
+        if not self._in_transaction():
+            self._connection.cursor().execute("BEGIN")
+        return self
+
+    def __exit__(self, exc_type, _exc, _traceback) -> None:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+
+
+class _PostgresqlBlobReader:
+    """Read one queued payload in bounded chunks on the queue's own session.
+
+    The payload column is stored uncompressed, so each chunk reads only its own
+    part of the value.
+    """
+
+    CHUNK_BYTES = 1024 * 1024
+
+    def __init__(self, connection: _PostgresqlConnection, row_id: int):
+        self._connection = connection
+        self._row_id = row_id
+        self._offset = 0
+        self._buffer = b""
+        self._position = 0
+        row = connection.execute(
+            "SELECT octet_length(payload) FROM outbound_queue WHERE id = ?", (row_id,)
+        ).fetchone()
+        if row is None:
+            raise QueuePersistenceError(f"Queued row {row_id} has no payload to read.")
+        self.length = int(row[0])
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self.length - self._offset
+        size = remaining if size < 0 else min(size, remaining)
+        if size <= 0:
+            return b""
+        buffered = len(self._buffer) - self._position
+        if buffered < size:
+            wanted = min(max(size - buffered, self.CHUNK_BYTES), remaining - buffered)
+            row = self._connection.execute(
+                "SELECT substring(payload FROM ? FOR ?) FROM outbound_queue WHERE id = ?",
+                (self._offset + buffered + 1, wanted, self._row_id),
+            ).fetchone()
+            chunk = row[0] if row is not None and row[0] is not None else b""
+            self._buffer = self._buffer[self._position:] + chunk
+            self._position = 0
+            if len(self._buffer) < size:
+                raise QueuePersistenceError("Unable to read queued BLOB incrementally.")
+        value = self._buffer[self._position:self._position + size]
+        self._position += size
+        self._offset += size
+        return value
+
+    def readline(self, size: int = -1) -> bytes:
+        # Pickle only uses this for old text protocol payloads, which v1 never wrote.
+        return self.read(size)
+
+    def close(self) -> None:
+        self._buffer = b""
+        self._position = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+
+_BlobReader = _SQLiteBlobReader | _PostgresqlBlobReader
+_QueueConnection = sqlite3.Connection | _PostgresqlConnection
+
+
 class _BlobSlice:
-    def __init__(self, source: _SQLiteBlobReader, length: int):
+    def __init__(self, source: _BlobReader, length: int):
         self.source = source
         self.remaining = length
 
@@ -689,6 +822,67 @@ class QueueMetrics(Protocol):
         ...
 
 
+_QUEUE_INDEXES = (
+    ("CREATE INDEX IF NOT EXISTS outbound_queue_destination_priority_id "
+     "ON outbound_queue (telegram_chat_id, priority DESC, id ASC)"),
+    ("CREATE INDEX IF NOT EXISTS outbound_queue_state_destination_priority_id "
+     "ON outbound_queue (delivery_state, telegram_chat_id, priority DESC, id)"),
+    ("CREATE INDEX IF NOT EXISTS outbound_queue_reconciliation_due "
+     "ON outbound_queue (delivery_state, reconcile_after, id)"),
+    # A dispatch pass elects one head per destination, so it reads every
+    # waiting row's state, hold, destination, topic, priority and
+    # predecessor. Covering them halves that scan on a large backlog.
+    ("CREATE INDEX IF NOT EXISTS outbound_queue_ready_heads "
+     "ON outbound_queue (delivery_state, delivery_hold, telegram_chat_id, thread_id, "
+     "priority, id, predecessor_id)"),
+)
+_QUEUE_TABLES = ("outbound_queue", "history_ownership", "source_cancellations")
+# Session lock key base for the PostgreSQL queue owner; the schema's OID is
+# added, so queues in different schemas of one database do not exclude each other.
+_POSTGRESQL_OWNER_LOCK = 0x4554_4D51_0000_0000
+
+
+def create_postgresql_queue_tables(execute: Callable[[str], object]) -> None:
+    """Create the outbound queue tables in the current PostgreSQL schema.
+
+    Runs in the database startup transaction; the queue never creates them
+    itself. Columns match the SQLite queue after all of its upgrades.
+    Telegram chat ids need BIGINT, and timestamps need DOUBLE PRECISION because
+    guarded updates compare ``created_at`` exactly. A new queued operation needs
+    this CHECK replaced on existing PostgreSQL tables.
+    """
+    operations = ", ".join(repr(name) for name in sorted(QUEUED_OPERATIONS))
+    execute(
+        "CREATE TABLE IF NOT EXISTS outbound_queue ("
+        "id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, "
+        "priority INTEGER NOT NULL CHECK (priority IN (0, 1)), "
+        "telegram_chat_id BIGINT NOT NULL, "
+        f"operation TEXT NOT NULL CHECK (operation IN ({operations})), "
+        "payload BYTEA NOT NULL, slave_id TEXT NULL, "
+        "required_sender_bot_id TEXT NULL, created_at DOUBLE PRECISION NOT NULL, "
+        "log_context BYTEA NULL, "
+        "delivery_state TEXT NOT NULL DEFAULT 'queued' "
+        "CHECK (delivery_state IN ('queued', 'sent_pending')), "
+        "completion_receipt BYTEA NULL, "
+        "reconcile_after DOUBLE PRECISION NOT NULL DEFAULT 0, "
+        "reconcile_attempts INTEGER NOT NULL DEFAULT 0, "
+        "delivery_hold TEXT NULL, attempt_sender_bot_id TEXT NULL, "
+        "attempt_started_at DOUBLE PRECISION NULL, predecessor_id BIGINT NULL, "
+        "thread_id BIGINT NULL)"
+    )
+    # Payloads are read in chunks (legacy recovery, media sweeps, large
+    # deletes). Compressed values would be decompressed whole for every chunk.
+    execute("ALTER TABLE outbound_queue ALTER COLUMN payload SET STORAGE EXTERNAL")
+    execute("CREATE TABLE IF NOT EXISTS history_ownership (entry_key TEXT PRIMARY KEY)")
+    execute(
+        "CREATE TABLE IF NOT EXISTS source_cancellations ("
+        "origin_uid TEXT NOT NULL, source_id TEXT NOT NULL, source_revision INTEGER NOT NULL, "
+        "log_context BYTEA NOT NULL, PRIMARY KEY (origin_uid, source_id))"
+    )
+    for statement in _QUEUE_INDEXES:
+        execute(statement)
+
+
 class OutboundQueue:
     """Own the queue connection, codec, and transactional row mutations."""
 
@@ -712,12 +906,20 @@ class OutboundQueue:
     # replay budgeting apply to the compact row.
 
     def __init__(self, channel_data_path: Path | str, metrics: Optional[QueueMetrics] = None,
-                 transfer_min_mbps: Optional[float] = None):
+                 transfer_min_mbps: Optional[float] = None, database: Mapping | None = None):
+        """``database`` is ETM's ``database`` setting; the queue uses the same backend."""
+        backend = (database or {}).get("type", "sqlite")
+        if backend not in ("sqlite", "postgresql"):
+            raise ValueError(f"Unknown database type: {backend!r}")
+        self._postgresql_config = database if backend == "postgresql" else None
+        self._database_errors: tuple[type[BaseException], ...] = (sqlite3.Error,)
+        self._empty_blob = "X''" if self._postgresql_config is None else "''::bytea"
+        self._lock_row_sql = "" if self._postgresql_config is None else " FOR UPDATE"
         self.transfer_min_mbps = transfer_min_mbps
         self.path = Path(channel_data_path) / self.filename
         self.media_dir = Path(channel_data_path) / "outbound-media"
         self._lock = threading.RLock()
-        self._connection: Optional[sqlite3.Connection] = None
+        self._connection: _QueueConnection | None = None
         self._ownership_file: Optional[IO[bytes]] = None
         self.metrics = metrics
         self.waiters: dict[int, Future] = {}
@@ -727,18 +929,47 @@ class OutboundQueue:
         self._open()
 
     def _open(self) -> None:
-        connection: Optional[sqlite3.Connection] = None
+        connection: _QueueConnection | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             # Own media preparation, publication and startup reclamation before
-            # acquiring SQLite locks. Keep this file in place across owners.
+            # acquiring database locks. Keep this file in place across owners.
             self._ownership_file = (self.path.parent / ".outbound-queue.lock").open("a+b")
             try:
                 fcntl.flock(self._ownership_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise QueuePersistenceError("Outbound queue is already in use by another owner.") from None
             self.media_dir.mkdir(parents=True, exist_ok=True)
-            connection = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
+            if self._postgresql_config is not None:
+                connection = self._open_postgresql(self._postgresql_config)
+            else:
+                connection = self._open_sqlite()
+            self._connection = connection
+            self._cleanup_orphan_media()
+            repaired = self.repair_legacy_thread_ids()
+            if repaired:
+                logging.getLogger(__name__).info(
+                    "Recovered the forum topic of %d queued row(s) that stored it only in the "
+                    "request; those rows no longer share the chat's main lane.", repaired,
+                )
+            self.refresh_depth()
+        except BaseException:
+            try:
+                if connection is not None:
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
+            finally:
+                self._connection = None
+                if self._ownership_file is not None:
+                    self._ownership_file.close()
+                    self._ownership_file = None
+            raise
+
+    def _open_sqlite(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
+        try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA busy_timeout=5000")
             connection.execute("BEGIN")
@@ -766,49 +997,53 @@ class OutboundQueue:
                 "origin_uid TEXT NOT NULL, source_id TEXT NOT NULL, source_revision INTEGER NOT NULL, "
                 "log_context BLOB NOT NULL, PRIMARY KEY (origin_uid, source_id))"
             )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS outbound_queue_destination_priority_id "
-                "ON outbound_queue (telegram_chat_id, priority DESC, id ASC)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS outbound_queue_state_destination_priority_id "
-                "ON outbound_queue (delivery_state, telegram_chat_id, priority DESC, id)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS outbound_queue_reconciliation_due "
-                "ON outbound_queue (delivery_state, reconcile_after, id)"
-            )
-            # A dispatch pass elects one head per destination, so it reads every
-            # waiting row's state, hold, destination, topic, priority and
-            # predecessor. Covering them halves that scan on a large backlog.
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS outbound_queue_ready_heads "
-                "ON outbound_queue (delivery_state, delivery_hold, telegram_chat_id, thread_id, "
-                "priority, id, predecessor_id)"
-            )
+            for statement in _QUEUE_INDEXES:
+                connection.execute(statement)
             connection.commit()
-            self._connection = connection
-            self._cleanup_orphan_media()
-            repaired = self.repair_legacy_thread_ids()
-            if repaired:
-                logging.getLogger(__name__).info(
-                    "Recovered the forum topic of %d queued row(s) that stored it only in the "
-                    "request; those rows no longer share the chat's main lane.", repaired,
-                )
-            self.refresh_depth()
         except BaseException:
             try:
-                if connection is not None:
-                    try:
-                        connection.rollback()
-                    finally:
-                        connection.close()
+                connection.rollback()
             finally:
-                self._connection = None
-                if self._ownership_file is not None:
-                    self._ownership_file.close()
-                    self._ownership_file = None
+                connection.close()
             raise
+        return connection
+
+    def _open_postgresql(self, config: Mapping) -> _PostgresqlConnection:
+        import psycopg2
+
+        from .db_runtime import postgresql_connection
+
+        self._database_errors = (sqlite3.Error, psycopg2.Error)
+        connection = _PostgresqlConnection(postgresql_connection(config))
+        try:
+            # Fail a blocked statement as SQLite's busy timeout does, instead of waiting forever.
+            connection.execute("SET lock_timeout = '5s'")
+            present = {row[0] for row in connection.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname = current_schema() "
+                "AND tablename IN (" + ", ".join("?" for _ in _QUEUE_TABLES) + ")", _QUEUE_TABLES,
+            )}
+            missing = [name for name in _QUEUE_TABLES if name not in present]
+            if missing:
+                raise QueuePersistenceError(
+                    "Outbound queue table(s) " + ", ".join(missing) + " are missing from the "
+                    "PostgreSQL schema. ETM's database startup creates them; the queue never "
+                    "recreates a missing table, which could drop pending sends."
+                )
+            # Exclude a second owner using the same schema from another directory
+            # or host. The lock lasts as long as this session.
+            owned = connection.execute(
+                "SELECT pg_try_advisory_lock(?::bigint + oid::bigint) FROM pg_namespace "
+                "WHERE nspname = current_schema()", (_POSTGRESQL_OWNER_LOCK,),
+            ).fetchone()
+            if not owned or not owned[0]:
+                raise QueuePersistenceError("Outbound queue is already in use by another owner.")
+            with connection:
+                self._repair_history_sender_holds(connection)
+                self._release_interrupted_attempts(connection)
+        except BaseException:
+            connection.close()
+            raise
+        return connection
 
     def repair_legacy_thread_ids(self, batch: int = 512) -> int:
         """Fill ``thread_id`` for rows that kept their topic only inside the request.
@@ -827,7 +1062,7 @@ class OutboundQueue:
                     "SELECT id, payload, log_context FROM outbound_queue "
                     "WHERE id > ? AND delivery_state = 'queued' AND thread_id IS NULL "
                     "AND length(payload) <= ? "
-                    "AND length(COALESCE(log_context, X'')) <= ? "
+                    f"AND length(COALESCE(log_context, {self._empty_blob})) <= ? "
                     "ORDER BY id LIMIT ?",
                     (after_id, self.MAX_TOPIC_REPAIR_BYTES, self.MAX_TOPIC_REPAIR_BYTES, batch),
                 ).fetchall()
@@ -879,6 +1114,10 @@ class OutboundQueue:
                            ("thread_id", "INTEGER")):
             if name not in columns:
                 connection.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL")
+        OutboundQueue._repair_history_sender_holds(connection)
+
+    @staticmethod
+    def _repair_history_sender_holds(connection: _QueueConnection) -> None:
         # Undo only pre-submission holds caused by the removed history sender
         # constraint. Attempted/uncertain deliveries must never be auto-replayed.
         repaired_hold = format_hold(HoldKind.HISTORY_FAILED, RequiredSenderUnavailableError.__name__)
@@ -890,7 +1129,7 @@ class OutboundQueue:
         )
 
     @staticmethod
-    def _release_interrupted_attempts(connection: sqlite3.Connection) -> None:
+    def _release_interrupted_attempts(connection: _QueueConnection) -> None:
         """A send left in flight by a restart stops deferring the rows after it.
 
         Nothing is in flight while the queue opens, so the outcome of such a send
@@ -917,10 +1156,25 @@ class OutboundQueue:
             )
 
     @property
-    def connection(self) -> sqlite3.Connection:
+    def connection(self) -> _QueueConnection:
         if self._connection is None:
             raise QueuePersistenceError("Outbound queue is closed.")
         return self._connection
+
+    def _insert_row(self, sql: str, parameters: tuple) -> int | None:
+        """Insert one queue row and return its id."""
+        connection = self.connection
+        if isinstance(connection, _PostgresqlConnection):
+            return int(connection.execute(sql + " RETURNING id", parameters).fetchone()[0])
+        # RETURNING needs SQLite 3.35; older supported versions report lastrowid.
+        return connection.execute(sql, parameters).lastrowid
+
+    def _payload_reader(self, row_id: int) -> _BlobReader:
+        """Read one row's payload incrementally without loading it whole."""
+        connection = self.connection
+        if isinstance(connection, _PostgresqlConnection):
+            return _PostgresqlBlobReader(connection, row_id)
+        return _SQLiteBlobReader(self.path, row_id)
 
     def close(self) -> None:
         with self._lock:
@@ -1431,7 +1685,7 @@ class OutboundQueue:
                 return
             cursor = self.connection.execute("SELECT id FROM outbound_queue")
             for (row_id,) in cursor:
-                with _SQLiteBlobReader(self.path, int(row_id)) as payload:
+                with self._payload_reader(int(row_id)) as payload:
                     version = payload.read(1)
                     if version == b"\x01":
                         continue
@@ -1460,7 +1714,7 @@ class OutboundQueue:
                         referenced.add(item.storage_name)
                     # Temporary external files may be cleaned on restart. Dispatch
                     # validates them and discards only the affected queue row.
-        except sqlite3.Error:
+        except self._database_errors:
             return
         try:
             for path in self.media_dir.iterdir():
@@ -1695,7 +1949,7 @@ class OutboundQueue:
                 for request, item in zip(request_list, prepared):
                     operation, _args, _kwargs, chat_id, priority, slave_id, required_sender, payload, log_context, _created_media = item
                     _kwargs_thread = queued_thread_id(_kwargs, log_context)
-                    cursor = self.connection.execute(
+                    identifier = self._insert_row(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
                         "created_at, log_context, predecessor_id, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1703,7 +1957,6 @@ class OutboundQueue:
                          predecessor if logical_split else request.predecessor_id,
                          queued_thread_id(_kwargs, log_context)),
                     )
-                    identifier = cursor.lastrowid
                     if identifier is None:
                         raise QueueEnqueueError("SQLite did not return an inserted queue row ID.")
                     identifiers.append(identifier)
@@ -1719,7 +1972,7 @@ class OutboundQueue:
             except Exception as error:
                 try:
                     self.connection.rollback()
-                except sqlite3.Error:
+                except self._database_errors:
                     pass
                 for item in prepared:
                     self._cleanup_created_media(item[9])
@@ -1757,7 +2010,7 @@ class OutboundQueue:
         """
         with self._lock:
             rows = self.connection.execute(
-                "SELECT id, priority, telegram_chat_id, operation, X'', slave_id, "
+                f"SELECT id, priority, telegram_chat_id, operation, {self._empty_blob}, slave_id, "
                 "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt, "
                 "predecessor_id, thread_id "
                 "FROM outbound_queue WHERE substr(log_context, 1, 1)=? ORDER BY id", (b"\x03",),
@@ -1878,13 +2131,12 @@ class OutboundQueue:
                 for request in requests:
                     item = self._prepare(request, operation_resolver(request.operation))
                     operation, _, kwargs, chat_id, priority, slave_id, required_sender, payload, context, _ = item
-                    cursor = self.connection.execute(
+                    identifier = self._insert_row(
                         "INSERT INTO outbound_queue (priority, telegram_chat_id, operation, payload, slave_id, "
                         "required_sender_bot_id, created_at, log_context, predecessor_id, thread_id) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (priority, chat_id, operation, payload, slave_id, required_sender, time.time(), context,
                          request.predecessor_id, queued_thread_id(kwargs, context)))
-                    identifier = cursor.lastrowid
                     if identifier is None:
                         raise QueuePersistenceError("SQLite did not return the aggregation successor ID.")
                     self.mark_destination_dirty(chat_id, queued_thread_id(kwargs, context))
@@ -2028,8 +2280,9 @@ class OutboundQueue:
         self, *, include_payload: bool = True, excluded_ids: Iterable[int] = (),
         ready_only: bool = False, respect_predecessors: bool = True,
     ) -> list[QueuedCall]:
-        payload = "q.payload" if include_payload else "X''"
-        context = "q.log_context" if include_payload else "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END"
+        payload = "q.payload" if include_payload else self._empty_blob
+        context = ("q.log_context" if include_payload
+                   else f"CASE WHEN q.log_context IS NULL THEN NULL ELSE {self._empty_blob} END")
         receipt = "q.completion_receipt" if include_payload else "NULL"
         excluded = tuple(excluded_ids)
         candidates_sql = f"delivery_state = '{QUEUED}'"
@@ -2091,9 +2344,9 @@ class OutboundQueue:
         and not backing off after repeated failures.
         """
         sql = (
-            "SELECT q.id, q.priority, q.telegram_chat_id, q.operation, X'', q.slave_id, "
+            f"SELECT q.id, q.priority, q.telegram_chat_id, q.operation, {self._empty_blob}, q.slave_id, "
             "q.required_sender_bot_id, q.created_at, "
-            "CASE WHEN q.log_context IS NULL THEN NULL ELSE X'' END, q.delivery_state, NULL, "
+            f"CASE WHEN q.log_context IS NULL THEN NULL ELSE {self._empty_blob} END, q.delivery_state, NULL, "
             "length(q.payload) + COALESCE(length(q.log_context), 0) + COALESCE(length(q.completion_receipt), 0), "
             "q.reconcile_after, q.thread_id, COUNT(*) OVER () "
             "FROM outbound_queue AS q "
@@ -2231,7 +2484,7 @@ class OutboundQueue:
             ).fetchone()
         if row is None:
             return None
-        with _SQLiteBlobReader(self.path, row_id) as payload:
+        with self._payload_reader(row_id) as payload:
             marker = payload.read(1)
         return marker[0] if marker else None
 
@@ -2248,7 +2501,7 @@ class OutboundQueue:
         )
 
     def _stream_legacy_pickle(
-        self, source: _SQLiteBlobReader, *, max_output_bytes: Optional[int] = None,
+        self, source: _BlobReader, *, max_output_bytes: Optional[int] = None,
     ) -> tuple[tuple, dict, set[str]]:
         """Replace v1 ``BytesIO`` data while retaining bounded non-media values.
 
@@ -2523,7 +2776,8 @@ class OutboundQueue:
                 self.connection.execute("BEGIN IMMEDIATE")
                 metadata_size = self.connection.execute(
                     "SELECT COALESCE(length(log_context), 0) + COALESCE(length(completion_receipt), 0) "
-                    "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'", (row_id,),
+                    "FROM outbound_queue WHERE id = ? AND delivery_state = 'queued'" + self._lock_row_sql,
+                    (row_id,),
                 ).fetchone()
                 if metadata_size is None:
                     raise QueuePersistenceError(f"Queued row {row_id} disappeared before recovery.")
@@ -2535,7 +2789,7 @@ class OutboundQueue:
                 ).fetchone()
                 if metadata is None:
                     raise QueuePersistenceError(f"Queued row {row_id} disappeared before recovery.")
-                with _SQLiteBlobReader(self.path, row_id) as source:
+                with self._payload_reader(row_id) as source:
                     if source.read(1) != b"\x01":
                         raise QueuePersistenceError(f"Queued row {row_id} is not a legacy v1 payload.")
                     metadata_bytes = len(metadata[7] or b"") + len(metadata[9] or b"")
@@ -2577,7 +2831,7 @@ class OutboundQueue:
             except Exception:
                 try:
                     self.connection.rollback()
-                except sqlite3.Error:
+                except self._database_errors:
                     pass
                 self._cleanup_created_media(created)
                 raise
@@ -2628,19 +2882,23 @@ class OutboundQueue:
         if row_id is not None:
             filters.append("id = ?")
             parameters.append(row_id)
-        parameters.append(limit)
+        # A negative limit means all rows; PostgreSQL rejects a negative LIMIT.
+        limit_sql = ""
+        if limit >= 0:
+            limit_sql = " LIMIT ?"
+            parameters.append(limit)
         with self._lock:
             # Read IDs first: 32 historical contexts can themselves occupy GBs.
             identifiers = self.connection.execute(
                 "SELECT id, COALESCE(length(log_context), 0) + COALESCE(length(completion_receipt), 0) "
                 "FROM outbound_queue WHERE " + " AND ".join(filters) +
-                " ORDER BY reconcile_after, id LIMIT ?", parameters,
+                " ORDER BY reconcile_after, id" + limit_sql, parameters,
             ).fetchall()
         for identifier, size in identifiers:
             self.check_replay_size(identifier, size)
             with self._lock:
                 row = self.connection.execute(
-                    "SELECT id, priority, telegram_chat_id, operation, X'', slave_id, "
+                    f"SELECT id, priority, telegram_chat_id, operation, {self._empty_blob}, slave_id, "
                     "required_sender_bot_id, created_at, log_context, delivery_state, completion_receipt "
                     f"FROM outbound_queue WHERE id = ? AND delivery_state = '{SENT_PENDING}'",
                     (identifier,),
@@ -2676,8 +2934,10 @@ class OutboundQueue:
                 self.connection.execute("BEGIN")
                 self.connection.executemany(
                     "UPDATE outbound_queue SET "
-                    "reconcile_after = ? + MIN(60, 1 << MIN(reconcile_attempts, 6)), "
-                    "reconcile_attempts = MIN(reconcile_attempts + 1, 7) "
+                    "reconcile_after = ? + CASE WHEN reconcile_attempts >= 6 THEN 60 "
+                    "ELSE 1 << reconcile_attempts END, "
+                    "reconcile_attempts = CASE WHEN reconcile_attempts >= 6 THEN 7 "
+                    "ELSE reconcile_attempts + 1 END "
                     "WHERE id = ? AND delivery_state = ?",
                     [(now, row_id, SENT_PENDING) for row_id in deferred],
                 )
@@ -2909,7 +3169,7 @@ class OutboundQueue:
                         log_context = encode_aggregation(dict(format_version=1, kind=ContextKind.BOUNDARY, key=parent["key"],
                             generation=parent.get("generation", 0), recent=parent.get("recent", []),
                             last_new=parent.get("last_new", 0), members=[], legacy_context=log_context))
-                    supplement_cursor = self.connection.execute(
+                    supplement_id = self._insert_row(
                         "INSERT INTO outbound_queue "
                         "(priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
                         "created_at, log_context, predecessor_id, thread_id) "
@@ -2920,9 +3180,9 @@ class OutboundQueue:
                     )
                     self.mark_destination_dirty(chat_id, queued_thread_id(_kwargs, log_context))
                     if parent is not None:
-                        parent["supplement_id"] = supplement_cursor.lastrowid
+                        parent["supplement_id"] = supplement_id
                         self.connection.execute("UPDATE outbound_queue SET predecessor_id=? WHERE predecessor_id=? AND id!=?",
-                            (supplement_cursor.lastrowid, row_id, supplement_cursor.lastrowid))
+                            (supplement_id, row_id, supplement_id))
                         self.connection.execute("UPDATE outbound_queue SET log_context=? WHERE id=?", (encode_aggregation(parent), row_id))
                 cursor = self.connection.execute(
                     "UPDATE outbound_queue SET delivery_state = ?, completion_receipt = ?, delivery_hold = NULL, "
@@ -2936,7 +3196,7 @@ class OutboundQueue:
             except Exception:
                 try:
                     self.connection.rollback()
-                except sqlite3.Error:
+                except self._database_errors:
                     pass
                 if prepared is not None:
                     self._cleanup_created_media(prepared[9])
@@ -2995,7 +3255,7 @@ class OutboundQueue:
             except Exception as error:
                 try:
                     self.connection.rollback()
-                except sqlite3.Error:
+                except self._database_errors:
                     pass
                 if isinstance(error, QueuePersistenceError):
                     raise
@@ -3022,7 +3282,7 @@ class OutboundQueue:
                     elif self.connection.execute(
                         "SELECT 1 FROM outbound_queue WHERE id = ?", (row_id,)
                     ).fetchone() is not None:
-                        with _SQLiteBlobReader(self.path, row_id) as blob:
+                        with self._payload_reader(row_id) as blob:
                             if blob.read(1) == b"\x02":
                                 payload = self.connection.execute(
                                     "SELECT payload FROM outbound_queue WHERE id = ?", (row_id,)
@@ -3038,7 +3298,7 @@ class OutboundQueue:
             except Exception:
                 try:
                     self.connection.rollback()
-                except sqlite3.Error:
+                except self._database_errors:
                     pass
                 raise
         if payload is not None:

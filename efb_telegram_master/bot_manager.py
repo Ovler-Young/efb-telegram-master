@@ -571,6 +571,7 @@ class TelegramBotManager(LocaleMixin):
         self._outbound_queue = OutboundQueue(
             channel.db._base_path, metrics=self._metrics,
             transfer_min_mbps=self._transfer_min_mbps,
+            database=config.get('database', {}),
         )
         self._send_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._send_worker_count, thread_name_prefix="ETM-send",
