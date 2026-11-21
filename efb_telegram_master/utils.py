@@ -6,12 +6,13 @@ import html
 import json
 import logging
 import os
+import re
 import subprocess
 import urllib.parse
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
+from typing import Any, Dict, NamedTuple, Optional, Tuple, TYPE_CHECKING, BinaryIO, IO, cast
 
 import ffmpeg
 import telegram
@@ -82,6 +83,45 @@ def removal_edit(media_type: str, text: str, *, prefix: str = "", link: Optional
     return "edit_message_caption", dict(caption=text or "[message removed]", caption_entities=entities, parse_mode=None)
 
 
+_WECHAT_QUOTE_RE = re.compile(r"^「(.+?)」\n-[\- ]{10,80}\n", re.DOTALL)
+
+
+class WeChatQuote(NamedTuple):
+    """A quote block at the start of a WeChat text: ``「sender：quoted text」`` and a dashed divider line."""
+    sender: str | None
+    body: str
+    content_end: int
+    """Offset of the closing ``」`` in the text."""
+    end: int
+    """Offset of the first character after the divider line."""
+
+
+def parse_wechat_quote(text: str) -> WeChatQuote | None:
+    """Parse the quote block a WeChat slave puts in front of a reply, or None if the text has none."""
+    if not text.startswith("「"):
+        return None
+    found = _WECHAT_QUOTE_RE.match(text)
+    if found is None:
+        return None
+    content = found.group(1)
+    sender: str | None = None
+    body = content
+    for index, char in enumerate(content):
+        if char in "：:":
+            sender = content[:index].strip().lstrip("@").strip() or None
+            body = content[index + 1:]
+            break
+    return WeChatQuote(sender, " ".join(body.split()), found.end(1), found.end())
+
+
+def quote_text_key(text: str) -> str:
+    """Whitespace-normalised text, with any leading quote block removed, for comparing a quote with a stored message."""
+    quote = parse_wechat_quote(text) if text.startswith("「") else None
+    if quote is not None:
+        text = text[quote.end:]
+    return " ".join(text.split())
+
+
 TelegramChatID = NewType('TelegramChatID', int)
 TelegramTopicID = NewType('TelegramTopicID', int)
 TelegramMessageID = NewType('TelegramMessageID', int)
@@ -126,6 +166,7 @@ class ExperimentalFlagsManager(LocaleMixin):
         "text_aggregation_idle_seconds": 1800,
         "text_aggregation_max_members": 200,
         "text_aggregation_max_payload_bytes": 256 * 1024,
+        "wechat_quote_reply": False,
     }
 
     @staticmethod
@@ -180,6 +221,8 @@ class ExperimentalFlagsManager(LocaleMixin):
         for topic_emoji_flag in ("topic_channel_emoji", "topic_chat_type_emoji"):
             if type(self.config[topic_emoji_flag]) is not bool:
                 raise ValueError(f"flags.{topic_emoji_flag} must be true or false")
+        if type(self.config["wechat_quote_reply"]) is not bool:
+            raise ValueError("flags.wechat_quote_reply must be true or false")
         try:
             timezone_name = self.config["timezone"]
             if not isinstance(timezone_name, str):

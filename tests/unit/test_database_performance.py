@@ -1,5 +1,6 @@
 """Regression checks for query plans, bounded BLOB reads and durable backoff."""
 
+import datetime
 import sqlite3
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +55,26 @@ def test_lookup_indexes_cover_real_queries_and_survive_restart(manager, tmp_path
         assert again._managed_database.is_closed()
     finally:
         again.stop_worker()
+
+
+def test_quote_lookup_is_an_index_search(manager):
+    db = manager._managed_database
+    statements = []
+    with db.connection_context():
+        for index in range(50):
+            MsgLog.create(
+                master_msg_id=f"-100.{index}", slave_message_id=f"source.{index}",
+                text="text", slave_origin_uid="slave.chat", msg_type="Text", sent_to="test",
+            )
+        db.connection().set_trace_callback(statements.append)
+        manager.find_quote_sources("slave.chat", -100, "text", datetime.datetime.now() - datetime.timedelta(hours=48))
+        db.connection().set_trace_callback(None)
+        selects = [sql for sql in statements if sql.startswith("SELECT")]
+        assert len(selects) == 1
+        plan = " ".join(row[3] for row in db.execute_sql("EXPLAIN QUERY PLAN " + selects[0]))
+    assert "SEARCH" in plan
+    assert "SCAN t1" not in plan
+    assert "TEMP B-TREE" not in plan
 
 
 def test_partially_upgraded_schema_adds_only_missing_columns(tmp_path, monkeypatch):

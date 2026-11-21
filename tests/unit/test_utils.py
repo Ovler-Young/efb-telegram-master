@@ -239,3 +239,11 @@ def test_topic_emoji_flags_default_on_and_reject_non_booleans(flag_name):
     for bad_value in ("false", 0, None):
         with raises(ValueError, match=flag_name):
             ExperimentalFlagsManager(SimpleNamespace(config={"flags": {flag_name: bad_value}}))
+
+
+def test_wechat_quote_reply_flag_defaults_off_and_rejects_non_booleans():
+    assert ExperimentalFlagsManager(SimpleNamespace(config={}))("wechat_quote_reply") is False
+    assert ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"wechat_quote_reply": True}}))("wechat_quote_reply") is True
+    for bad_value in ("true", 1, None):
+        with raises(ValueError, match="wechat_quote_reply"):
+            ExperimentalFlagsManager(SimpleNamespace(config={"flags": {"wechat_quote_reply": bad_value}}))

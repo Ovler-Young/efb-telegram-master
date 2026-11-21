@@ -858,6 +858,28 @@ e.g.:
            topic_channel_emoji: false
            topic_chat_type_emoji: false
 
+-   ``wechat_quote_reply`` *(bool)* [Default: ``false``]
+
+    Show a WeChat quote as a Telegram reply. A WeChat slave delivers a reply
+    to a message as text that starts with the quoted message in ``「…」``,
+    followed by a line of dashes. With this flag on, that quote is shown as
+    a collapsible quote, and the message is sent as a reply to the quoted
+    message when exactly one message from the last 48 hours in the same
+    chat has that text. If the quote names a sender, the sender is used to
+    tell apart messages with the same text. With no unique match the
+    message is sent without a reply, quote included.
+
+    Only text quotes are matched. A quoted message that is still waiting to
+    be sent or is older than 48 hours gets no reply, and neither does a
+    quote in a chat where text aggregation is on, as the message is then
+    merged into an aggregated one. A quote of an aggregated message replies
+    to the aggregated message that contains it.
+
+    .. code:: yaml
+
+       flags:
+           wechat_quote_reply: true
+
 Network configuration: timeout tweaks
 -------------------------------------
 

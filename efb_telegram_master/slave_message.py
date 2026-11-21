@@ -1,5 +1,6 @@
 # coding=utf-8
 
+import datetime
 import html
 import itertools
 import logging
@@ -375,21 +376,12 @@ class SlaveMessageProcessor(LocaleMixin):
         target_msg_id = target_msg_id_override
         if target_msg_id is None and isinstance(msg.target, Message):
             self.logger.debug("[%s] Message is replying to %s.", msg.uid, msg.target)
-            resolved = self.db.resolve_source_member(str(utils.chat_id_to_str(chat=msg.target.chat)),
-                str(msg.target.uid), str(tg_dest), str(thread_id) if thread_id is not None else None)
-            log = resolved[0] if resolved else None
-            if not log:
-                self.logger.debug("[%s] Target message %s is not found in database.", msg.uid, msg.target)
-            else:
-                self.logger.debug("[%s] Target message has database entry: %s.", msg.uid, log)
-                target_msg = utils.message_id_str_to_id(utils.TgChatMsgIDStr(log.master_msg_id))
-                if not target_msg or target_msg[0] != int(tg_dest):
-                    self.logger.error('[%s] Trying to reply to a message not from this chat. '
-                                      'Message destination: %s. Target message: %s.',
-                                      msg.uid, tg_dest, target_msg)
-                    target_msg_id = None
-                else:
-                    target_msg_id = target_msg[1]
+            target_msg_id = self._resolve_reply_target(
+                msg.uid, msg.target, str(utils.chat_id_to_str(chat=msg.target.chat)), str(msg.target.uid),
+                tg_dest, thread_id)
+        elif (self.flag("wechat_quote_reply") and target_msg_id is None and old_msg_id is None
+                and not msg.edit and msg.type == MsgType.Text):
+            target_msg_id = self._wechat_quote_target(msg, tg_dest, thread_id)
 
         # Generate basic reply markup
         commands: Optional[List[MessageCommand]] = None
@@ -578,13 +570,84 @@ class SlaveMessageProcessor(LocaleMixin):
         return msg_template, (tg_dest, thread_id)
 
 
-    def html_substitutions(self, msg: Message) -> str:
-        """Build a Telegram-flavored HTML string for message text substitutions."""
+    def _resolve_reply_target(self, xid, target, origin_uid: str, source_id: str,
+                              tg_dest: TelegramChatID,
+                              thread_id: TelegramTopicID | None) -> TelegramMessageID | None:
+        """Find the Telegram message in the destination that shows a source message, to reply to it."""
+        resolved = self.db.resolve_source_member(origin_uid, source_id, str(tg_dest),
+                                                 str(thread_id) if thread_id is not None else None)
+        log = resolved[0] if resolved else None
+        if not log:
+            self.logger.debug("[%s] Target message %s is not found in database.", xid, target)
+            return None
+        self.logger.debug("[%s] Target message has database entry: %s.", xid, log)
+        target_msg = utils.message_id_str_to_id(utils.TgChatMsgIDStr(log.master_msg_id))
+        if not target_msg or target_msg[0] != int(tg_dest):
+            self.logger.error('[%s] Trying to reply to a message not from this chat. '
+                              'Message destination: %s. Target message: %s.',
+                              xid, tg_dest, target_msg)
+            return None
+        return target_msg[1]
+
+    QUOTE_LOOKUP_WINDOW = datetime.timedelta(hours=48)
+
+    def _wechat_quote_target(self, msg: Message, tg_dest: TelegramChatID,
+                             thread_id: TelegramTopicID | None) -> TelegramMessageID | None:
+        """The Telegram message to reply to for a WeChat quote, if exactly one recent message matches it."""
+        quote = utils.parse_wechat_quote(msg.text or "")
+        if quote is None or not quote.body:
+            return None
+        candidates = self.db.find_quote_sources(
+            utils.chat_id_to_str(chat=msg.chat), tg_dest, quote.body,
+            datetime.datetime.now() - self.QUOTE_LOOKUP_WINDOW)
+        if len(candidates) > 1 and quote.sender:
+            members = {utils.chat_id_to_str(chat=member): member for member in getattr(msg.chat, "members", [])}
+            candidates = [candidate for candidate in candidates
+                          if quote.sender in self._quote_author_names(candidate, members)]
+        if len(candidates) != 1:
+            self.logger.debug("[%s] Quote matches %d messages, not replying.", msg.uid, len(candidates))
+            return None
+        origin_uid, source_id = candidates[0][:2]
+        try:
+            return self._resolve_reply_target(msg.uid, f"quoted {source_id}", origin_uid, source_id, tg_dest, thread_id)
+        except ValueError:
+            self.logger.debug("[%s] Quoted message %s has several effective outputs, not replying.", msg.uid, source_id)
+            return None
+
+    @staticmethod
+    def _quote_author_names(candidate: tuple, members: dict) -> set:
+        """Names the author of a quoted message can be shown under."""
+        _origin_uid, _source_id, author_uid, author_name = candidate
+        if author_name is not None:
+            return {author_name}
+        member = members.get(author_uid)
+        if member is None:
+            return set()
+        return {name for name in (member.name, member.alias, member.long_name) if name}
+
+    def html_substitutions(self, msg: Message, wechat_quote: bool = False) -> str:
+        """Build a Telegram-flavored HTML string for message text substitutions.
+
+        With ``wechat_quote``, a quote block at the start of the text is shown as a collapsible quote.
+        """
+        text = msg.text
+        plain = self._html_span(msg, 0, None)
+        if not wechat_quote or not text or len(plain) >= telegram.constants.MessageLimit.MAX_TEXT_LENGTH:
+            return plain
+        quote = utils.parse_wechat_quote(text)
+        # A mention that starts in the quote and ends outside it cannot be nested in the quote tag.
+        if quote is None or any(start < quote.end and (start < 1 or end > quote.content_end)
+                                for start, end in (msg.substitutions or {})):
+            return plain
+        return (f"<blockquote expandable>{self._html_span(msg, 1, quote.content_end)}</blockquote>\n"
+                + self._html_span(msg, quote.end, None))
+
+    def _html_span(self, msg: Message, start: int, end: int | None) -> str:
         text = msg.text
         if msg.substitutions:
-            ranges = sorted(msg.substitutions.keys())
+            ranges = sorted(key for key in msg.substitutions if key[0] >= start and (end is None or key[1] <= end))
             t = ""
-            prev = 0
+            prev = start
             for i in ranges:
                 t += html.escape(text[prev:i[0]])
                 sub_chat = msg.substitutions[i]
@@ -597,10 +660,10 @@ class SlaveMessageProcessor(LocaleMixin):
                     t += html.escape(text[i[0]:i[1]])
                     t += '</code>'
                 prev = i[1]
-            t += html.escape(text[prev:])
+            t += html.escape(text[prev:end])
             return t
         elif text:
-            return html.escape(text)
+            return html.escape(text[start:end])
         return text
 
     def _make_send_kwargs(self, msg: Message,
@@ -725,7 +788,7 @@ class SlaveMessageProcessor(LocaleMixin):
         self.logger.debug("[%s] Sending as a text message.", msg.uid)
         self.bot.send_chat_action(tg_dest, ChatAction.TYPING, message_thread_id=thread_id)
 
-        text = self.html_substitutions(msg)
+        text = self.html_substitutions(msg, wechat_quote=self.flag("wechat_quote_reply"))
 
         _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
 
