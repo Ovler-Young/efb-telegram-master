@@ -27,10 +27,12 @@ from .locale_mixin import LocaleMixin
 
 if TYPE_CHECKING:
     from . import TelegramChannel
+    from .db import DatabaseManager
 
 FFMPEG_TIMEOUT = 60
 DEFAULT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 AGGREGATION_CHAT_TYPES = ("group", "private", "system", "official_account")
+TOPIC_GROUP_CHAT_TYPES = tuple(chat_type for chat_type in AGGREGATION_CHAT_TYPES if chat_type != "system")
 
 
 def format_message_time(value: datetime.datetime, display_timezone: ZoneInfo = DEFAULT_TIMEZONE) -> str:
@@ -81,6 +83,7 @@ def removal_edit(media_type: str, text: str, *, prefix: str = "", link: Optional
 
 
 TelegramChatID = NewType('TelegramChatID', int)
+TopicGroup = TelegramChatID | dict[str, TelegramChatID] | None
 TelegramTopicID = NewType('TelegramTopicID', int)
 TelegramMessageID = NewType('TelegramMessageID', int)
 TgChatMsgIDStr = NewType('TgChatMsgIDStr', str)
@@ -182,6 +185,18 @@ class ExperimentalFlagsManager(LocaleMixin):
             raise ValueError("flags.timezone must be a valid IANA time zone, such as Asia/Shanghai") from exc
         if self.config.get("topic_group") is None and channel.config.get("topic_group") is not None:
             self.config["topic_group"] = channel.config["topic_group"]
+        topic_group = self.config["topic_group"]
+        if topic_group is not None and topic_group is not False:
+            if isinstance(topic_group, dict):
+                valid_topic_group = (
+                    set(topic_group) <= set(TOPIC_GROUP_CHAT_TYPES)
+                    and all(isinstance(forum, int) and not isinstance(forum, bool) for forum in topic_group.values()))
+            else:
+                # A chat ID quoted as a string has always been accepted for a single forum.
+                valid_topic_group = isinstance(topic_group, (int, str)) and not isinstance(topic_group, bool)
+            if not valid_topic_group:
+                raise ValueError("flags.topic_group must be null, a chat ID, or a mapping of "
+                                 "group, private, official_account to chat IDs")
 
     def __call__(self, flag_key: str) -> Any:
         if flag_key not in self.config:
@@ -191,14 +206,7 @@ class ExperimentalFlagsManager(LocaleMixin):
     def allows_text_aggregation(self, chat: BaseChat, origin: str, override: Optional[bool] = None) -> bool:
         if override is not None:
             return override
-        if isinstance(chat, PrivateChat):
-            chat_type = "official_account" if (chat.vendor_specific or {}).get("is_mp") is True else "private"
-        elif isinstance(chat, GroupChat):
-            chat_type = "group"
-        elif isinstance(chat, SystemChat):
-            chat_type = "system"
-        else:
-            chat_type = None
+        chat_type = chat_type_of(chat)
         rules = self.config["text_aggregation_rules"]
         if rules is not None:
             return any((chat.module_id in rule["origins"] or origin in rule["origins"])
@@ -207,6 +215,46 @@ class ExperimentalFlagsManager(LocaleMixin):
         chat_types = self.config["text_aggregation_chat_types"]
         return ((origins is None or chat.module_id in origins or origin in origins)
                 and (chat_types is None or chat_type in chat_types))
+
+
+def chat_type_of(chat: BaseChat) -> str | None:
+    """Classify a chat as one of ``AGGREGATION_CHAT_TYPES``, or None for other chat classes."""
+    if isinstance(chat, PrivateChat):
+        return "official_account" if (chat.vendor_specific or {}).get("is_mp") is True else "private"
+    if isinstance(chat, GroupChat):
+        return "group"
+    if isinstance(chat, SystemChat):
+        return "system"
+    return None
+
+
+def topic_forum_ids(topic_group: TopicGroup) -> list[TelegramChatID]:
+    """Every forum chat configured by ``topic_group``."""
+    if isinstance(topic_group, dict):
+        return list(topic_group.values())
+    return [topic_group] if topic_group else []
+
+
+def topic_forum_for(topic_group: TopicGroup, slave_uid: EFBChannelChatIDStr, chat_type: str | None,
+                    db: 'DatabaseManager') -> TelegramChatID | None:
+    """Choose the forum chat that holds the topic of a remote chat.
+
+    ``chat_type`` is the classification from ``chat_type_of``, or None when the type is not known (for
+    example, the chat can no longer be resolved).
+
+    A single chat ID is used for every chat. A mapping picks the forum by chat type, falling back to the
+    ``private`` entry. With a mapping, a chat that already has a topic stays in the forum of that topic.
+    System chats and chats without a forum stay in the main chat (None).
+    """
+    if not topic_group or chat_type == "system":
+        return None
+    if not isinstance(topic_group, dict):
+        return TelegramChatID(topic_group)
+    existing = db.get_topic_chat_id(slave_uid)
+    if existing is not None:
+        return existing
+    forum = topic_group.get(chat_type or "private") or topic_group.get("private")
+    return TelegramChatID(forum) if forum else None
 
 
 def b64en(s: str) -> str:

@@ -36,6 +36,7 @@ _DATABASE_METHODS = frozenset({
     "get_chat_assoc",
     "add_topic_assoc",
     "get_topic_thread_id",
+    "get_topic_chat_id",
     "get_topic_slave",
     "get_topic_slaves",
     "remove_topic_assoc",
