@@ -450,6 +450,20 @@ def test_offline_hold_preserves_payload_and_no_default_mutation(tmp_path, make_q
     queue.close()
 
 
+def test_offline_hold_refuses_the_retained_sqlite_queue_of_a_moved_install(tmp_path, postgres_config):
+    from efb_telegram_master import migrate_db
+    from efb_telegram_master.outbound import OutboundQueue
+    from tests.unit.test_database_safety import _enqueue
+
+    queue = OutboundQueue(tmp_path)
+    _enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "row"}))
+    queue.close()
+    migrate_db.migrate(tmp_path, postgres_config, queue_only=True)
+    with pytest.raises(RuntimeError, match="moved to PostgreSQL.*--config"):
+        hold(tmp_path, 1, apply=True)
+    assert hold(tmp_path, 1, apply=True, database=postgres_config)["held"]
+
+
 def test_offline_hold_refuses_while_the_bot_owns_the_queue(tmp_path, make_queue, queue_backend):
     """A running bot holds the data directory (SQLite) or the queue's session lock (PostgreSQL)."""
     from efb_telegram_master.db_runtime import DataDirectoryLock

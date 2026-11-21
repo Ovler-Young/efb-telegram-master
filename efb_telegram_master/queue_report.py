@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 QUEUE_FILENAME = "outbound-queue.sqlite3"
+# Must match POSTGRESQL_QUEUE_MARKER in outbound.py; this file runs without the package.
+POSTGRESQL_QUEUE_MARKER = ".outbound-queue-postgresql.json"
 TG_FILENAME = "tgdata.db"
 MODULE_ID = "blueset.telegram"
 NOW_SECONDS = "CAST(strftime('%s','now') AS INTEGER)"
@@ -514,6 +516,11 @@ def report(queue_path: Path | None, tg_path: Path | None = None, out=None,
         queue_path = Path(queue_path).resolve()
         if not queue_path.exists():
             raise FileNotFoundError(f"No outbound queue at {queue_path}")
+        if (queue_path.parent / POSTGRESQL_QUEUE_MARKER).exists():
+            raise RuntimeError(
+                "This outbound queue was moved to PostgreSQL; its SQLite copy is retained and shows stale rows. "
+                "Pass --dsn to report the PostgreSQL queue."
+            )
         tg_file = Path(tg_path if tg_path is not None else queue_path.parent / TG_FILENAME).resolve()
         dialect = SQLITE
         connection = sqlite3.connect(f"{queue_path.as_uri()}?mode=ro", uri=True, timeout=5)
@@ -599,7 +606,7 @@ def main(argv=None) -> int:
     if args.lane:
         chat, _, topic = args.lane.partition(":")
         lane_target = (int(chat), int(topic) if topic else 0)
-    errors: tuple = (OSError, sqlite3.Error)
+    errors: tuple = (OSError, RuntimeError, sqlite3.Error)
     if args.dsn is not None:
         try:
             errors += postgresql_dialect().errors

@@ -28,6 +28,13 @@ def _check_holdable(row) -> tuple:
 
 
 def _hold_sqlite(directory: Path, row_id: int, apply: bool) -> tuple:
+    from .outbound import POSTGRESQL_QUEUE_MARKER
+
+    if (directory / POSTGRESQL_QUEUE_MARKER).exists():
+        raise RuntimeError(
+            "This outbound queue was moved to PostgreSQL; its SQLite copy is retained and no longer sends. "
+            "Pass --config with the database settings the bot uses."
+        )
     with closing(sqlite3.connect(
         (directory / "outbound-queue.sqlite3").as_uri() + "?mode=rw", uri=True, timeout=5,
     )) as db:

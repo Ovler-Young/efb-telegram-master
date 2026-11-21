@@ -193,6 +193,23 @@ def test_lane_listing_shows_why_a_row_is_not_sendable(tmp_path, make_queue, queu
     assert "sendable" in printed
 
 
+def test_report_refuses_the_retained_sqlite_queue_of_a_moved_install(tmp_path, postgres_config, monkeypatch):
+    from efb_telegram_master import migrate_db
+    from efb_telegram_master.outbound import OutboundQueue
+    from tests.unit.test_database_safety import _enqueue
+
+    queue = OutboundQueue(tmp_path)
+    _enqueue(queue, QueueRequest("send_message", (), {"chat_id": -1001, "text": "row"}))
+    queue.close()
+    migrate_db.migrate(tmp_path, postgres_config, queue_only=True)
+    monkeypatch.setenv("PGPASSWORD", postgres_config["password"])
+    with pytest.raises(RuntimeError, match="moved to PostgreSQL.*--dsn"):
+        report(tmp_path / QUEUE_FILENAME, out=io.StringIO())
+    out = io.StringIO()
+    assert report(tmp_path / QUEUE_FILENAME, out=out, dsn=_dsn(postgres_config)) == 0
+    assert "row" in out.getvalue() or "send_message" in out.getvalue()
+
+
 def test_a_negative_chat_id_is_accepted_as_a_lane(tmp_path, capsys, make_queue, queue_backend):
     from efb_telegram_master.queue_report import main
 
