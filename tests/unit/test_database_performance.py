@@ -10,11 +10,11 @@ from types import SimpleNamespace
 import pytest
 
 from efb_telegram_master import db as db_module
-from efb_telegram_master.db import DatabaseManager, MsgLog, database
+from efb_telegram_master.db import DatabaseManager, MsgLog, MsgLogMember, database
 from efb_telegram_master.outbound import (
     OutboundQueue, OutboundQueueScheduler, QueueRequest,
 )
-from tests.unit.test_database_safety import remove_source_columns
+from tests.unit.test_database_safety import manager_factory, remove_source_columns  # noqa: F401
 from tests.unit.test_outbound import DurableAdapter, enqueue
 
 
@@ -55,6 +55,80 @@ def test_lookup_indexes_cover_real_queries_and_survive_restart(manager, tmp_path
         assert again._managed_database.is_closed()
     finally:
         again.stop_worker()
+
+
+def _source_lookup_manager(request, tmp_path, backend):
+    create_manager = request.getfixturevalue("manager_factory")
+    config = request.getfixturevalue("postgres_config") if backend == "postgresql" else None
+    manager = create_manager(tmp_path, config)
+    with manager._managed_database.connection_context():
+        def log(master_msg_id, source_id, origin="slave.chat", time=None):
+            MsgLog.create(master_msg_id=master_msg_id, slave_message_id=source_id, slave_origin_uid=origin,
+                          text="text", msg_type="Text", sent_to="test", time=time)
+
+        def member(master_msg_id, source_id, origin="slave.chat"):
+            MsgLogMember.create(master_msg_id=master_msg_id, slave_origin_uid=origin, slave_message_id=source_id)
+
+        day = datetime.datetime(2024, 5, 1)
+        # Direct only, mapped only, both, and several logs for one source with a log that has no time.
+        log("-100.1", "direct")
+        log("-100.2", "other")
+        member("-100.2", "mapped")
+        log("-100.3", "both")
+        member("-100.3", "both")
+        log("-100.4", "several", time=day)
+        log("-100.5", "several", time=day + datetime.timedelta(hours=2))
+        log("-100.6", "several", time=None)
+        log("-100.7", "elsewhere")
+        member("-100.7", "several", origin="other.chat")
+        log("-100.8", "other", time=day + datetime.timedelta(hours=1))
+        member("-100.8", "several")
+    return manager
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_source_lookups_find_logs_through_both_sources_once(request, tmp_path, backend):
+    manager = _source_lookup_manager(request, tmp_path, backend)
+    expected = {
+        "direct": ["-100.1"], "mapped": ["-100.2"], "both": ["-100.3"], "missing": [],
+        "several": ["-100.5", "-100.8", "-100.4", "-100.6"],
+    }
+    for source_id, ids in expected.items():
+        assert [row.master_msg_id for row in manager.get_source_message_logs("slave.chat", source_id)] == ids
+    assert [row.master_msg_id for row in manager.get_source_message_logs("other.chat", "several")] == ["-100.7"]
+    resolved = {source_id: manager.resolve_source_member("slave.chat", source_id, "-100") for source_id in expected}
+    assert {source_id: pair and pair[0].master_msg_id for source_id, pair in resolved.items()} == {
+        "direct": "-100.1", "mapped": "-100.2", "both": "-100.3", "missing": None, "several": "-100.5"}
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_source_lookups_search_indexes_instead_of_scanning_message_logs(request, tmp_path, backend):
+    manager = _source_lookup_manager(request, tmp_path, backend)
+    db = manager._managed_database
+    statements = []
+    real_execute = db.execute_sql
+
+    def record(sql, params=None, *args, **kwargs):
+        statements.append((sql, params))
+        return real_execute(sql, params, *args, **kwargs)
+
+    with db.connection_context():
+        if backend == "postgresql":
+            real_execute("SET enable_seqscan = off")  # Tables this small would otherwise be scanned legitimately.
+        db.execute_sql = record
+        try:
+            manager.get_source_message_logs("slave.chat", "several")
+            manager.resolve_source_member("slave.chat", "several", "-100")
+        finally:
+            del db.execute_sql
+        assert len(statements) == 2
+        for sql, params in statements:
+            if backend == "postgresql":
+                plan = "\n".join(row[0] for row in real_execute("EXPLAIN " + sql, params))
+                assert "Seq Scan on msglog" not in plan, plan
+            else:
+                plan = "\n".join(row[3] for row in real_execute("EXPLAIN QUERY PLAN " + sql, params))
+                assert "SCAN" not in plan, plan
 
 
 def test_quote_lookup_is_an_index_search(manager):
