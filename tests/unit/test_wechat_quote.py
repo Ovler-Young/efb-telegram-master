@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 from ehforwarderbot.chat import ChatMember
 from ehforwarderbot.message import Substitutions
+from telegram.error import BadRequest
 
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.utils import ExperimentalFlagsManager, parse_wechat_quote
@@ -161,6 +162,25 @@ def test_a_target_that_is_still_queued_gets_no_reply(manager):
     complete(manager)
     complete(manager)
     assert all(call[3].get("reply_to_message_id") is None for call in manager.transport.calls)
+
+
+def test_a_deleted_reply_target_does_not_lose_the_message(manager):
+    h = handler(manager)
+    send(manager, h, "target", "hello there")
+    complete(manager)
+    deliver = manager.transport.send_message
+
+    def reject_missing_target(chat_id, text, **kwargs):
+        if kwargs.get("reply_to_message_id") is not None and not kwargs.get("allow_sending_without_reply"):
+            raise BadRequest("Message to be replied not found")
+        return deliver(chat_id, text, **kwargs)
+
+    manager.transport.send_message = reject_missing_target
+    send(manager, h, "quoting", quote("Alice", "hello there"), name="Bob")
+    complete(manager)
+    _, _, text, kwargs = last_send(manager)
+    assert kwargs["reply_to_message_id"] == 1
+    assert text.endswith("\nreply")
 
 
 def test_forum_topic_attaches_no_reply_for_a_native_reply_or_a_quote(manager):

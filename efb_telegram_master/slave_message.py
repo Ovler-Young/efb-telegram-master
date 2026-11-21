@@ -793,6 +793,10 @@ class SlaveMessageProcessor(LocaleMixin):
         _sender_bot_id = (msg.vendor_specific or {}).get('_sender_bot_id')
 
         if not old_msg_id:
+            reply_kwargs: dict[str, object] = {}
+            if target_msg_id is not None:
+                # A reply target deleted in Telegram must not lose the text.
+                reply_kwargs['allow_sending_without_reply'] = True
             tg_msg = self.bot.send_message(tg_dest,
                                            text=text, prefix=msg_template, suffix=reactions,
                                            parse_mode='HTML',
@@ -800,6 +804,7 @@ class SlaveMessageProcessor(LocaleMixin):
                                            message_thread_id=thread_id,
                                            reply_markup=reply_markup,
                                            disable_notification=silent,
+                                           **reply_kwargs,
                                            **self._make_send_kwargs(msg, old_msg_id, on_complete=on_db_complete))
         else:
             # Cannot change reply_to_message_id when editing a message
