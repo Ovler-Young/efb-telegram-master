@@ -892,10 +892,10 @@ e.g.:
     to a message as text that starts with the quoted message in ``「…」``,
     followed by a line of dashes. With this flag on, that quote is shown as
     a collapsible quote, and the message is sent as a reply to the quoted
-    message when exactly one message from the last 48 hours in the same
-    chat has that text. If the quote names a sender, the sender is used to
-    tell apart messages with the same text. With no unique match the
-    message is sent without a reply, quote included.
+    message when exactly one of the chat's newest 200 logged messages from
+    the last 48 hours has that text. If the quote names a sender, the
+    sender is used to tell apart messages with the same text. With no
+    unique match the message is sent without a reply, quote included.
 
     Only text quotes are matched. A quoted message that is still waiting to
     be sent or is older than 48 hours gets no reply, and neither does a
