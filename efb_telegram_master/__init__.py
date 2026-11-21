@@ -141,8 +141,8 @@ class TelegramChannel(MasterChannel):
         self.aggregation_settings = AggregationSettings(self)
         self.chat_binding: ChatBindingManager = ChatBindingManager(self)
         self.slave_messages: SlaveMessageProcessor = SlaveMessageProcessor(self)
-        # topic_group can be either a single integer or a list
-        self.topic_group = self.flag('topic_group')
+        # topic_group is either one chat ID or a mapping of chat type to chat ID
+        self.topic_group: etm_utils.TopicGroup = self.flag('topic_group')
 
         if not self.flag('auto_locale'):
             self.translator = translation("efb_telegram_master",
@@ -438,10 +438,7 @@ class TelegramChannel(MasterChannel):
         command_args = self._resolve_command_args(update.effective_message.text, context.args)
         if command_args:  # Group binding command
             forwarded_chat = get_forwarded_chat(update.effective_message)
-            if isinstance(self.topic_group, dict):
-                topic_groups = list(self.topic_group.values())
-            else:
-                topic_groups = [self.topic_group]
+            topic_groups = etm_utils.topic_forum_ids(self.topic_group)
             if (update.effective_message.chat.type != ChatType.PRIVATE and
                 update.effective_chat.id not in topic_groups) or \
                     (forwarded_chat and

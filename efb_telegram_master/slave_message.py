@@ -530,34 +530,7 @@ class SlaveMessageProcessor(LocaleMixin):
 
         if tg_chat:
             tg_dest = TelegramChatID(int(utils.chat_id_str_to_id(tg_chat)[1]))
-        
-        # Determine which topic_group to use based on chat type
-        topic_group_to_use = None
-        if self.channel.topic_group:
-            if isinstance(self.channel.topic_group, dict):
-                # Dictionary format: {1: friend, 2: group, 3: system, 4: mp}
-                chat_type_key = 1  # default to friend (type 1)
-                if isinstance(chat, SystemChat):
-                    chat_type_key = 3
-                elif isinstance(chat, GroupChat):
-                    chat_type_key = 2
-                elif isinstance(chat, PrivateChat):
-                    # Check if it's a MP (公众号)
-                    if hasattr(chat, 'vendor_specific') and chat.vendor_specific and chat.vendor_specific.get('is_mp'):
-                        chat_type_key = 4
-                # Use the corresponding key if available, otherwise use key 1
-                if chat_type_key in self.channel.topic_group:
-                    topic_group_to_use = self.channel.topic_group[chat_type_key]
-                elif 1 in self.channel.topic_group:
-                    topic_group_to_use = self.channel.topic_group[1]
-                else:
-                    # Get first available key
-                    first_key = next(iter(self.channel.topic_group.keys()))
-                    topic_group_to_use = self.channel.topic_group[first_key]
-            else:
-                # Single value, use as before
-                topic_group_to_use = self.channel.topic_group
-        
+        topic_group_to_use = utils.topic_forum_for(self.channel.topic_group, chat, self.db)
         if topic_group_to_use:
             if not isinstance(chat, SystemChat):
                 if not tg_chat:

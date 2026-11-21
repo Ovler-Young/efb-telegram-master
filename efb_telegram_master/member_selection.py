@@ -35,9 +35,12 @@ SourceIdentity = Tuple[str, str]
 def current_source_route(channel: 'TelegramChannel', origin: str) -> Tuple[int, Optional[str]]:
     """Read the current source association without creating a topic."""
     associations = channel.db.get_chat_assoc(slave_uid=origin)
+    module_id, chat_id, _ = utils.chat_id_str_to_id(EFBChannelChatIDStr(origin))
+    chat = channel.chat_manager.get_chat(module_id, chat_id, build_dummy=True)
+    forum = utils.topic_forum_for(channel.topic_group, chat, channel.db)
     target = int(utils.chat_id_str_to_id(associations[0])[1]) if associations else int(
-        channel.topic_group or channel.config['admins'][0])
-    topic = channel.db.get_topic_thread_id(slave_uid=origin, topic_chat_id=target) if channel.topic_group else None
+        forum or channel.config['admins'][0])
+    topic = channel.db.get_topic_thread_id(slave_uid=origin, topic_chat_id=target) if forum else None
     return target, str(topic) if topic is not None else None
 
 
