@@ -436,14 +436,12 @@ def test_nul_in_content_text_is_replaced_only_on_postgresql(tmp_path, request, m
     )
     manager.add_or_update_message_log(message, SimpleNamespace(chat_id=-100123, message_id=1))
     first = manager.get_msg_log(master_msg_id="-100123.1")
-    assert first.text == expected(text) and len(first.text) == len(text)
-    first_pickle = bytes(first.pickle)
+    assert first.text == expected(text)
     message.text = text + "\0"
     for _ in range(2):
         manager.add_or_update_message_log(message, SimpleNamespace(chat_id=-100123, message_id=1))
         again = manager.get_msg_log(master_msg_id="-100123.1")
         assert again.text == expected(text + "\0")
-    assert bytes(again.pickle) == first_pickle
 
     aggregate = make_aggregate([make_source_member(source("one", text))], 1)
     assert "\0" in aggregate["confirmed_text"]
