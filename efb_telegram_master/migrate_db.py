@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import tempfile
 import uuid
+from collections import Counter
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -29,7 +30,7 @@ from peewee import (
 )
 from ruamel.yaml import YAML
 
-from .db import ChatAssoc, DatabaseManager, HistoryMigrationEntry, HistoryMigrationTarget, MsgLog, MsgLogMember, SlaveChatInfo, TopicAssoc
+from .db import ChatAssoc, ContentTextField, DatabaseManager, HistoryMigrationEntry, HistoryMigrationTarget, MsgLog, MsgLogMember, SlaveChatInfo, TopicAssoc, replace_nul
 from .db_runtime import SCHEMA_LOCK, DataDirectoryLock, connection_scope, current_schema, postgresql_database
 
 CORE_MODELS = (ChatAssoc, TopicAssoc, SlaveChatInfo, MsgLog, HistoryMigrationEntry)
@@ -338,6 +339,8 @@ def _value(field, value):
         if isinstance(value, float) and value != converted:
             raise ValueError(f"Non-integer value in {field.name}")
         return converted
+    if isinstance(field, ContentTextField) and isinstance(value, str):
+        return replace_nul(value)
     if isinstance(field, (TextField, CharField)):
         if not isinstance(value, str) or "\x00" in value:
             raise ValueError(f"Invalid PostgreSQL text in {field.name}")
@@ -369,7 +372,7 @@ def _order(model, fields, *, postgres=False):
     return ", ".join(terms)
 
 
-def _source_rows(source: sqlite3.Connection, model, columns=None) -> Iterator[tuple]:
+def _source_rows(source: sqlite3.Connection, model, columns=None, replaced=None) -> Iterator[tuple]:
     table = model._meta.table_name
     if table not in _source_tables(source):
         return
@@ -380,6 +383,10 @@ def _source_rows(source: sqlite3.Connection, model, columns=None) -> Iterator[tu
     cursor = source.execute(f"SELECT {projection} FROM {_quote(table)} ORDER BY {order}")
     try:
         for row in cursor:
+            if replaced is not None:
+                for field, value in zip(fields, row):
+                    if isinstance(field, ContentTextField) and isinstance(value, str) and "\x00" in value:
+                        replaced[f"{table}.{field.column_name}"] += 1
             yield tuple(_value(field, value) for field, value in zip(fields, row))
     finally:
         cursor.close()
@@ -622,7 +629,8 @@ def _import_rows(db, source: sqlite3.Connection, batch_size: int, models=MODELS)
     for model in models:
         count = 0
         digest = hashlib.sha256()
-        for batch in chunked(_source_rows(source, model), batch_size):
+        replaced: Counter[str] = Counter()
+        for batch in chunked(_source_rows(source, model, replaced=replaced), batch_size):
             model.insert_many(batch, fields=model._meta.sorted_fields).execute()
             for row in batch:
                 _hash_row(digest, row)
@@ -638,6 +646,8 @@ def _import_rows(db, source: sqlite3.Connection, batch_size: int, models=MODELS)
                 (table, pk),
             )
         logger.info("Imported %s: %d rows", model._meta.table_name, count)
+        for column, replaced_count in sorted(replaced.items()):
+            logger.info("Replaced U+0000 in %d values of %s", replaced_count, column)
     return summaries
 
 
