@@ -889,15 +889,16 @@ def create_postgresql_queue_tables(execute: Callable[[str], object]) -> None:
         "reconcile_attempts INTEGER NOT NULL DEFAULT 0, "
         "delivery_hold TEXT NULL, attempt_sender_bot_id TEXT NULL, "
         "attempt_started_at DOUBLE PRECISION NULL, predecessor_id BIGINT NULL, "
-        "thread_id BIGINT NULL, hold_reason TEXT NULL)"
+        "thread_id BIGINT NULL, hold_reason TEXT NULL, unconfirmed_at DOUBLE PRECISION NULL)"
     )
-    # Tables created by an earlier version lack the hold reason. Adding a column
+    # Tables created by an earlier version lack these columns. Adding a column
     # takes the same exclusive lock as the ALTER below, so only do it once.
-    execute(
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute "
-        "WHERE attrelid = 'outbound_queue'::regclass AND attname = 'hold_reason' AND NOT attisdropped) THEN "
-        "ALTER TABLE outbound_queue ADD COLUMN hold_reason TEXT NULL; END IF; END $$"
-    )
+    for name, kind in (("hold_reason", "TEXT"), ("unconfirmed_at", "DOUBLE PRECISION")):
+        execute(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute "
+            f"WHERE attrelid = 'outbound_queue'::regclass AND attname = '{name}' AND NOT attisdropped) THEN "
+            f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL; END IF; END $$"
+        )
     # Payloads are read in chunks (legacy recovery, media sweeps, large
     # deletes). Compressed values would be decompressed whole for every chunk.
     # The ALTER needs an ACCESS EXCLUSIVE lock, which waits for any reader such
@@ -1151,7 +1152,8 @@ class OutboundQueue:
         # Additive metadata: do not rebuild the large queue or change its legacy CHECK.
         for name, kind in (("delivery_hold", "TEXT"), ("attempt_sender_bot_id", "TEXT"),
                            ("attempt_started_at", "REAL"), ("predecessor_id", "INTEGER"),
-                           ("thread_id", "INTEGER"), ("hold_reason", "TEXT")):
+                           ("thread_id", "INTEGER"), ("hold_reason", "TEXT"),
+                           ("unconfirmed_at", "REAL")):
             if name not in columns:
                 connection.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL")
         OutboundQueue._repair_history_sender_holds(connection)
@@ -3081,21 +3083,21 @@ class OutboundQueue:
     def unconfirmed_edit_superseded(self, row_id: int) -> str | None:
         """Why an edit whose result is unknown is dropped instead of tried again, or None.
 
-        It is dropped once it has already failed an attempt, or when a later row
-        edits the same message with its complete text: replaying the old edit
-        after that would put old text over new. A later aggregated container
+        It is dropped when Telegram did not confirm an earlier try of it either,
+        or when a later row edits the same message with its complete text:
+        replaying the old edit after that would put old text over new. A later aggregated container
         update is not such an edit; it is rendered from the confirmed container
         and would not carry this edit's content.
         """
         with self._lock:
             row = self.connection.execute(
-                "SELECT telegram_chat_id, operation, payload, reconcile_attempts FROM outbound_queue WHERE id=?",
+                "SELECT telegram_chat_id, operation, payload, unconfirmed_at FROM outbound_queue WHERE id=?",
                 (row_id,),
             ).fetchone()
             if row is None or row[1] not in EDIT_OPERATIONS:
                 return None
-            if row[3] > 0:
-                return "it already failed an attempt"
+            if row[3] is not None:
+                return "Telegram did not confirm its earlier try either"
             message_id = self._edited_message_id(row[1], row[2])
             if message_id is None:
                 return None
@@ -3143,10 +3145,11 @@ class OutboundQueue:
             self._note_failed_attempts(row_id, attempts, updated)
         return float(delay)
 
-    def defer_failed_send(self, row_id: int, retry_at: float) -> None:
+    def defer_failed_send(self, row_id: int, retry_at: float, *, unconfirmed: bool = False) -> None:
         """Count a send that failed with a retryable error; retry at ``retry_at`` (Unix time).
 
-        The deadline is stored once the row is failing.
+        The deadline is stored once the row is failing. ``unconfirmed`` records
+        that Telegram may have applied this try (an edit whose result is unknown).
 
         Flood waits are not counted: they hold back the whole chat, not this row.
         A row that is not waiting (its attempt was not released) is left
@@ -3167,8 +3170,10 @@ class OutboundQueue:
             # stored, so head election can step past it.
             self.connection.execute(
                 "UPDATE outbound_queue SET reconcile_attempts=?, "
-                "reconcile_after=COALESCE(?, reconcile_after) WHERE id=? AND " + waiting_sql(),
-                (updated, retry_at if updated >= FAILED_ATTEMPTS_LIMIT else None, row_id),
+                "reconcile_after=COALESCE(?, reconcile_after), unconfirmed_at=COALESCE(?, unconfirmed_at) "
+                "WHERE id=? AND " + waiting_sql(),
+                (updated, retry_at if updated >= FAILED_ATTEMPTS_LIMIT else None,
+                 time.time() if unconfirmed else None, row_id),
             )
             self._note_failed_attempts(row_id, attempts, updated)
 
@@ -4411,7 +4416,8 @@ class OutboundQueueScheduler:
                             # A flood wait holds back the whole chat, not only this row.
                             if not isinstance(error, RetryAfter):
                                 self.queue.defer_failed_send(
-                                    row_id, time.time() + max(0.0, decision.retry_at - time.monotonic())
+                                    row_id, time.time() + max(0.0, decision.retry_at - time.monotonic()),
+                                    unconfirmed=unconfirmed_edit,
                                 )
                         except Exception as persistence_error:
                             self._stop_for_persistence_error(persistence_error)

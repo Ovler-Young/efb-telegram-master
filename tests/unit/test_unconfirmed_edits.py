@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 from telegram import Chat, Message
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 from efb_telegram_master.db_runtime import postgresql_connection
 from efb_telegram_master.outbound import QueueRequest, create_postgresql_queue_tables
@@ -67,6 +67,50 @@ def test_a_timed_out_edit_is_tried_once_more_then_dropped(tmp_path, make_queue):
     assert _row(queue, row_id) is None
     assert isinstance(waiter.exception(timeout=1), TimedOut)
     assert not manager._outbound_scheduler.stopping
+    queue.close()
+
+
+def test_an_edit_refused_before_reaching_telegram_still_gets_its_one_more_try(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
+    row_id, waiter = _edit(queue, "new text")
+    manager = setup_manager(queue)
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    attempts = []
+    lost = accepted_then_lost_response(attempts)
+
+    def refused(*args, **kwargs):
+        attempts.append((args, kwargs))
+        try:
+            raise httpx.ConnectError("connection refused")
+        except httpx.ConnectError as cause:
+            raise NetworkError("connection refused") from cause
+
+    replies = iter([refused, lost, lost])
+    manager._bot = SimpleNamespace(edit_message_text=lambda *args, **kwargs: next(replies)(*args, **kwargs))
+    _run(manager, passes=6)
+    assert len(attempts) == 3
+    assert _row(queue, row_id) is None
+    assert isinstance(waiter.exception(timeout=1), TimedOut)
+    queue.close()
+
+
+def test_an_unconfirmed_try_is_remembered_across_a_restart(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
+    row_id, _ = _edit(queue, "new text")
+    manager = setup_manager(queue)
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    attempts = []
+    manager._bot = SimpleNamespace(edit_message_text=accepted_then_lost_response(attempts))
+    _run(manager, passes=1)
+    assert len(attempts) == 1 and _row(queue, row_id) is not None
+    queue.close()
+    queue = make_queue(tmp_path)
+    manager = setup_manager(queue)
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    manager._bot = SimpleNamespace(edit_message_text=accepted_then_lost_response(attempts))
+    _run(manager)
+    assert len(attempts) == 2
+    assert _row(queue, row_id) is None
     queue.close()
 
 
@@ -161,13 +205,16 @@ def test_a_queue_written_before_the_reason_was_kept_gains_the_column(tmp_path, m
     if queue_backend is None:
         with closing(sqlite3.connect(tmp_path / "outbound-queue.sqlite3")) as db, db:
             db.execute("ALTER TABLE outbound_queue DROP COLUMN hold_reason")
+            db.execute("ALTER TABLE outbound_queue DROP COLUMN unconfirmed_at")
     else:
         with closing(postgresql_connection(queue_backend)) as db, db, db.cursor() as cursor:
             cursor.execute("ALTER TABLE outbound_queue DROP COLUMN hold_reason")
+            cursor.execute("ALTER TABLE outbound_queue DROP COLUMN unconfirmed_at")
             # What database startup runs before the bot opens its queue.
             create_postgresql_queue_tables(cursor.execute)
     queue = make_queue(tmp_path)
     queue.begin_delivery_attempt(row_id, SimpleNamespace(sender_bot_id=None))
     queue.hold_uncertain_delivery(row_id, TimedOut())
     assert _row(queue, row_id) == ("uncertain:TimedOut", "Timed out", 0)
+    assert queue.connection.execute("SELECT unconfirmed_at FROM outbound_queue WHERE id=?", (row_id,)).fetchone() == (None,)
     queue.close()

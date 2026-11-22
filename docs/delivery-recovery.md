@@ -27,11 +27,13 @@ aggregated container update counts as delivered. Replaying an old edit over newe
 text is not harmless. So the edit is released and tried once more after the
 transport retry delay, still ahead of the later rows of its chat and topic. It is
 dropped instead, and its MsgLog update with it, when a later queued row edits the
-same message with its complete text, or when it has already failed an attempt
-(so a second ambiguous result drops it too). A later update of an aggregated
-container does not count as such an edit. It is built from the confirmed
-container and does not carry this edit's content, so the older edit gets its
-second try first. The log shows `Telegram did not confirm the edit ... trying it
+same message with its complete text, or when Telegram did not confirm an earlier
+try of it either. That earlier try is recorded in `unconfirmed_at`, so a second
+ambiguous result drops the edit after a restart too. A try refused before it
+reached Telegram (a connection failure) is retried as usual and does not count.
+A later update of an aggregated container does not count as a newer edit. It is
+built from the confirmed container and does not carry this edit's content, so the
+older edit gets its second try first. The log shows `Telegram did not confirm the edit ... trying it
 once more` or `... dropped because ...`. A blocking caller of a dropped edit gets
 the transport error. An edit interrupted by a restart stays `in_flight`, like a
 send.
@@ -191,11 +193,12 @@ in the [text aggregation guide](text-aggregation.md).
 Every row of the outbound queue (the `outbound_queue` table, in `outbound-queue.sqlite3`
 on SQLite and in the same PostgreSQL schema as the message tables on PostgreSQL) is in
 exactly one state, read from its `delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
-deferred row). `hold_reason` only explains a hold with the error's text and
-never decides a state. A queue written by an earlier version gains the column
-when this version opens it (SQLite) or at database startup (PostgreSQL); rows
-held before then have it empty. An earlier version still runs on the upgraded
-queue and ignores the column, but its `migrate_db` refuses to move an upgraded
+deferred row). `hold_reason` only explains a hold with the error's text, and
+`unconfirmed_at` only marks an edit whose earlier try Telegram did not confirm;
+neither decides a state. A queue written by an earlier version gains both
+columns when this version opens it (SQLite) or at database startup
+(PostgreSQL); rows from before then have them empty. An earlier version still
+runs on the upgraded queue and ignores the columns, but its `migrate_db` refuses to move an upgraded
 SQLite queue (`Unsupported columns`), so move a queue with the version that last
 ran the bot. On a queued row `reconcile_attempts` counts its failed attempts
 in a row; from 3 on (`FAILED_ATTEMPTS_LIMIT`) it no longer holds back the rows
