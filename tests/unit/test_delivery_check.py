@@ -134,6 +134,24 @@ def test_rows_in_different_clusters_never_share_one_message():
     assert {found[1].message.id, found[2].message.id} == {105, 106}
 
 
+def test_cluster_seen_by_only_some_of_its_rows_still_holds_the_message():
+    # rows 1 and 2 sent a.jpg, row 3 sent b.jpg; only row 1's read range reaches the single photo
+    rows = [keys(1, "", kind="photo", file_name="a.jpg"),
+            keys(3, "", kind="photo", file_name="b.jpg", attempt=ATTEMPT + 2),
+            keys(2, "", kind="photo", file_name="a.jpg", attempt=ATTEMPT + 20)]
+    spans = {1: Span(100, 150, ReadState.CLOSED), 3: Span(100, 150, ReadState.CLOSED),
+             2: Span(107, 150, ReadState.CLOSED)}
+    out = decide(rows, spans, {CHAT: {105: seen(105, "", kind="photo")}}, lambda chat, message: message == 106, NOW)
+    assert verdicts(out) == {1: Verdict.AMBIGUOUS, 2: Verdict.AMBIGUOUS, 3: Verdict.AMBIGUOUS}
+
+
+def test_recent_cluster_holds_back_a_message_another_cluster_could_take():
+    rows = [keys(1, "", kind="photo", file_name="a.jpg", attempt=ATTEMPT),
+            keys(2, "", kind="photo", file_name="b.jpg", attempt=ATTEMPT + 3)]
+    out = run(rows, [seen(105, "", kind="photo", date=ATTEMPT + 5)], now=ATTEMPT + dc.WINDOW + dc.AFTER_SLACK + 1)
+    assert verdicts(out) == {1: Verdict.AMBIGUOUS, 2: Verdict.TOO_EARLY}
+
+
 def test_edited_message_matched_on_text_by_one_cluster_is_not_claimed_by_another():
     matched = seen(105, "hello", edited=True)
     assert verdicts(run([keys(1), keys(2, "another text")], [matched])) == {1: Verdict.FOUND, 2: Verdict.AMBIGUOUS}

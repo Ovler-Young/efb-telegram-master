@@ -355,18 +355,22 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
 
     deferred = []
     contenders: list[tuple[list[RowKeys], dict[int, list[Seen]]]] = []
+    early_ids: set[int] = set()
     for cluster in _clusters(sends):
-        if any(too_early(keys.attempt, now) for keys in cluster):
+        early = any(too_early(keys.attempt, now) for keys in cluster)
+        if early:
             out.update({keys.id: Decision(Verdict.TOO_EARLY) for keys in cluster})
-            continue
+            if not all(keys.id in spans for keys in cluster):
+                continue
         chat = seen.get(cluster[0].chat_id, {})
         found = {keys.id: _candidates(keys, spans[keys.id], chat, logged) for keys in cluster}
         strong = {keys.id: [s for s, is_strong in found[keys.id] if is_strong] for keys in cluster}
         if any(strong.values()):
-            if all(strong.values()):
-                contenders.append((cluster, strong))
-            else:
-                out.update({keys.id: Decision(Verdict.AMBIGUOUS) for keys in cluster})
+            contenders.append((cluster, strong))
+            if early:
+                early_ids.update(keys.id for keys in cluster)
+        elif early:
+            continue
         elif any(found.values()):
             deferred.append((cluster, {keys.id: [s for s, _ in found[keys.id]] for keys in cluster}))
         else:
@@ -388,6 +392,8 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
     for members, pools, _ in groups:
         taken = _assign(members, pools)
         for keys in members:
+            if keys.id in early_ids:   # a recent cluster is decided on a later pass, but it still holds its messages
+                continue
             out[keys.id] = Decision(Verdict.FOUND, taken[keys.id]) if taken else Decision(Verdict.AMBIGUOUS)
     taken_by_strong = set().union(*(group[2] for group in groups))
 
@@ -664,8 +670,11 @@ class HeldSendCheck:
         groups = _clusters([keys for keys in every if keys.kind != "edit"]) + _edit_chains(every)
         # a group is decided as a whole, and only when none of its rows is too recent
         groups = [group for group in groups if not all((keys.id, keys.attempt) in self._done for keys in group)]
-        counts["too_early"] += sum(len(group) for group in groups if any(too_early(k.attempt, now) for k in group))
-        groups = [group for group in groups if not any(too_early(keys.attempt, now) for keys in group)]
+        # recent edits wait; a recent send cluster is still read, so it can hold back the messages it may own
+        counts["too_early"] += sum(len(group) for group in groups
+                                   if group[0].kind == "edit" and any(too_early(k.attempt, now) for k in group))
+        groups = [group for group in groups
+                  if group[0].kind != "edit" or not any(too_early(keys.attempt, now) for keys in group)]
         store: dict[int, dict[int, Seen]] = collections.defaultdict(dict)
         asked: dict[int, set[int]] = collections.defaultdict(set)
         spans: dict[int, Span] = {}
