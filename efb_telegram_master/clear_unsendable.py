@@ -1,17 +1,21 @@
-"""Remove held sends that can never be delivered; never send anything.
+"""Remove held sends that can never be delivered; never send anything itself.
 
 Run only while EFB is stopped. Without --apply, this only reports counts.
 A held row is removed when its stored request can no longer be sent: its
 external media file is gone, its queue-owned media file is gone, its request
 cannot be decoded, or Telegram rejected its aggregated batch (BadRequest).
-A held or waiting container edit that has no container yet is removed with
-the row that would have created it; it cannot be sent without it. Every other
-row is left unchanged, so rows that were ordered behind a removed row, or that
-the bot can still send, are free to be sent. With a PostgreSQL queue,
+A held send whose media file is gone but whose message has text is not
+removed: it becomes a text send of its caption, to the same chat and topic,
+from the bot that attempted it, which the bot sends on its next start in the
+row's place. A held or waiting container edit that has no container yet is removed
+with the row that would have created it; it cannot be sent without it. Every
+other row is left unchanged, so rows that were ordered behind a removed row,
+or that the bot can still send, are free to be sent. With a PostgreSQL queue,
 pass the same ``database`` settings the bot uses (``--config``).
 """
 import argparse
 import fcntl
+import inspect
 import pickle
 import sqlite3
 import time
@@ -21,11 +25,19 @@ from contextlib import ExitStack, closing
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from telegram import Bot
+
 from .aggregation_states import ContextKind
 from .db_runtime import DataDirectoryLock, postgresql_connection
 from .delivery_states import Event, RowState, classify, next_state, parse_hold
-from .outbound import _POSTGRESQL_OWNER_LOCK, POSTGRESQL_QUEUE_MARKER, OutboundQueue
-from .queued_log import decode_aggregation
+from .outbound import (
+    _DIRECT_MEDIA_ARGUMENTS,
+    _POSTGRESQL_OWNER_LOCK,
+    POSTGRESQL_QUEUE_MARKER,
+    SUPPLEMENTAL_KEY,
+    OutboundQueue,
+)
+from .queued_log import decode, decode_aggregation
 
 # Why a row is removed; only these names and their counts are reported.
 MISSING_MEDIA = "missing_media"            # external media file gone
@@ -35,6 +47,16 @@ REJECTED_BATCH = "rejected_batch"          # aggregated batch rejected with BadR
 NEEDS_REMOVED_ROW = "needs_removed_row"    # edit of a container its removed predecessor would have created
 
 _WAITING = (RowState.WAITING, RowState.DEFERRED)
+_GONE_FILE = (MISSING_MEDIA, MISSING_SIDECAR)
+# Telegram's names for a caption and its formatting in a text message.
+_AS_TEXT = {"caption": "text", "caption_entities": "entities"}
+_TEXT_PARAMETERS = inspect.signature(Bot.send_message).parameters
+# A held row whose caption is sent as text: its new request, its sender, the row id.
+_REPLACE = (
+    "UPDATE outbound_queue SET operation='send_message', payload=?, required_sender_bot_id=?, "
+    "delivery_state='queued', delivery_hold=NULL, reconcile_after=0, reconcile_attempts=0, "
+    "attempt_sender_bot_id=NULL, attempt_started_at=NULL, completion_receipt=NULL WHERE id=?"
+)
 
 
 def _unsendable(state: RowState, hold: str, references, media_dir: Path) -> str | None:
@@ -60,6 +82,41 @@ def _unsendable(state: RowState, hold: str, references, media_dir: Path) -> str 
     return None
 
 
+def _caption_as_text(operation: str, payload: bytes, log_context: bytes | None) -> bytes | None:
+    """The request that sends a gone media file's caption as text, or None to remove the row.
+
+    This is where the rows that get their caption sent are chosen: every send of
+    one media file, alone or between text batches, whose message has text. A
+    stored caption usually starts with the sender's name and shows a placeholder
+    when the message has no text, so a message without text is removed. A member
+    of a text batch is built again from its batch when sent, and a full-content
+    attachment's caption only announces the file: both are removed too.
+    """
+    if not operation.startswith("send_") or operation not in _DIRECT_MEDIA_ARGUMENTS:
+        return None
+    try:
+        context = None if log_context is None else decode_aggregation(log_context)
+        if context is not None and context.get("kind") != ContextKind.BOUNDARY:
+            return None
+        message = context["legacy_context"] if context is not None else log_context
+        if message is not None and not (decode(message)[0].text or "").strip():
+            return None
+    except Exception:  # noqa: BLE001 - unpickling a damaged context can raise anything
+        return None
+    args, kwargs = pickle.loads(payload[1:])
+    if not isinstance(kwargs.get("caption"), str) or not kwargs["caption"].strip() or kwargs.get(SUPPLEMENTAL_KEY):
+        return None
+    media_parameters = inspect.signature(getattr(Bot, operation)).parameters
+    bound = inspect.signature(getattr(Bot, operation)).bind_partial(None, *args).arguments
+    request = {}
+    for key, value in {**bound, **kwargs}.items():
+        name = _AS_TEXT.get(key, key)
+        # The media file and media-only options go; queue metadata stays.
+        if key != "self" and (name in _TEXT_PARAMETERS or key not in media_parameters):
+            request[name] = value
+    return OutboundQueue.encode_payload((), request)
+
+
 def _references(run: Callable, row_id: int, version: bytes, size: int):
     """The row's stored media references; None when they cannot be read."""
     if version == b"\x01":
@@ -75,8 +132,12 @@ def _references(run: Callable, row_id: int, version: bytes, size: int):
     return references
 
 
-def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict, set[str]]:
-    """Decide which rows go: (row id -> reason, report counts, sidecar names to delete)."""
+def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict[int, tuple], dict, set[str]]:
+    """Decide which rows go and which send their caption as text instead.
+
+    Returns (row id -> reason, row id -> new request and sender, report counts,
+    sidecar names to delete).
+    """
     now = time.time()
     states: dict[int, RowState] = {}
     operations: dict[int, str] = {}
@@ -85,9 +146,11 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict, set[st
     sidecars: dict[int, set[str]] = {}
     uninspected: set[int] = set()
     removed: dict[int, str] = {}
-    for row_id, operation, state, hold, reconcile_after, predecessor, version, size in run(
+    captions: dict[int, tuple[bytes, str]] = {}
+    for row_id, operation, state, hold, reconcile_after, predecessor, version, size, required, attempted in run(
         "SELECT id, operation, delivery_state, delivery_hold, reconcile_after, predecessor_id, "
-        "substr(payload, 1, 1), length(payload) FROM outbound_queue ORDER BY id"
+        "substr(payload, 1, 1), length(payload), required_sender_bot_id, attempt_sender_bot_id "
+        "FROM outbound_queue ORDER BY id"
     ):
         current = classify(state, hold, reconcile_after or 0.0, now)
         states[row_id], operations[row_id] = current, operation
@@ -101,7 +164,14 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict, set[st
             sidecars[row_id] = {item.storage_name for item in references if item.storage_name is not None}
         if next_state(current, Event.DISCARD) is not None:
             reason = _unsendable(current, hold, references, media_dir)
-            if reason is not None:
+            text = None
+            if reason in _GONE_FILE and next_state(current, Event.REPLACE_REQUEST) is not None:
+                payload, log_context = run("SELECT payload, log_context FROM outbound_queue WHERE id=?", (row_id,))[0]
+                text = _caption_as_text(operation, bytes(payload), None if log_context is None else bytes(log_context))
+            if text is not None:
+                # The same bot sends the caption; a row ordered behind it waits for it.
+                captions[row_id] = (text, required or attempted or "__main__")
+            elif reason is not None:
                 removed[row_id] = reason
 
     pending = list(removed)
@@ -124,17 +194,18 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict, set[st
     media: set[str] = set()
     # A row whose media names cannot be read may share any sidecar: then keep them all.
     if not any(row_id in uninspected for row_id in kept):
-        media = set().union(*(sidecars.get(row_id, set()) for row_id in removed))
-        media -= set().union(*(sidecars[row_id] for row_id in kept))
+        media = set().union(*(sidecars.get(row_id, set()) for row_id in (*removed, *captions)))
+        media -= set().union(*(sidecars[row_id] for row_id in kept if row_id not in captions))
     report = {
         "rows": len(states),
         "removed": dict(Counter(removed.values())),
         "removed_by_operation": dict(Counter(operations[row_id] for row_id in removed)),
+        "caption_sent_as_text": len(captions),
         "kept": len(kept),
         # Kept rows that were ordered behind a removed row; nothing defers them now.
         "released": sum(1 for row_id in kept if predecessors.get(row_id) in removed),
     }
-    return removed, report, media
+    return removed, captions, report, media
 
 
 def _clear_sqlite(directory: Path, apply: bool) -> tuple[dict, set[str]]:
@@ -148,10 +219,11 @@ def _clear_sqlite(directory: Path, apply: bool) -> tuple[dict, set[str]]:
     )) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
-            removed, report, media = _clear(
+            removed, captions, report, media = _clear(
                 lambda sql, parameters=(): db.execute(sql, parameters).fetchall(), directory / "outbound-media")
             if apply:
                 db.executemany("DELETE FROM outbound_queue WHERE id=?", ((row_id,) for row_id in removed))
+                db.executemany(_REPLACE, ((*request, row_id) for row_id, request in captions.items()))
                 db.commit()
             else:
                 db.rollback()
@@ -178,9 +250,11 @@ def _clear_postgresql(directory: Path, config: Mapping, apply: bool) -> tuple[di
                 cursor.execute(sql.replace("?", "%s"), parameters)
                 return cursor.fetchall()
 
-            removed, report, media = _clear(run, directory / "outbound-media")
+            removed, captions, report, media = _clear(run, directory / "outbound-media")
             if apply:
                 cursor.executemany("DELETE FROM outbound_queue WHERE id=%s", [(row_id,) for row_id in removed])
+                cursor.executemany(_REPLACE.replace("?", "%s"),
+                                   [(*request, row_id) for row_id, request in captions.items()])
                 connection.commit()
             else:
                 connection.rollback()
@@ -195,9 +269,12 @@ def _clear_postgresql(directory: Path, config: Mapping, apply: bool) -> tuple[di
 def clear(directory: Path, *, apply: bool = False, database: Mapping | None = None) -> dict:
     """Report, and with ``apply`` remove, the rows that can never be sent.
 
-    ``database`` is ETM's ``database`` setting; the rows are read from the queue
-    of that backend. Queue-owned media files of removed rows are deleted only when
-    no remaining row refers to them; external media files are never deleted.
+    A row whose media file is gone and whose message has text becomes a text
+    send of its caption instead of being removed. ``database`` is ETM's ``database`` setting; the
+    rows are read from the queue of that backend. Queue-owned media files of
+    removed rows, and of rows that now send only their caption, are deleted
+    only when no remaining row refers to them; external media files are never
+    deleted.
     """
     directory = directory.resolve()
     backend = (database or {}).get("type", "sqlite")
@@ -230,7 +307,8 @@ def main(argv=None) -> int:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=None,
                         help="YAML with the database mapping the bot uses; needed only for a PostgreSQL queue")
-    parser.add_argument("--apply", action="store_true", help="Remove the rows; without it only counts are printed")
+    parser.add_argument("--apply", action="store_true",
+                        help="Remove the rows and turn captions into text sends; without it only counts are printed")
     args = parser.parse_args(argv)
     errors: tuple = (OSError, ImportError, RuntimeError, ValueError, sqlite3.Error)
     try:

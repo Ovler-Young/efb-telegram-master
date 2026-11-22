@@ -93,6 +93,7 @@ class Event(Enum):
     REMOVE = "remove"
     WITHDRAW = "withdraw"
     DISCARD = "discard"
+    REPLACE_REQUEST = "replace_request"
 
 
 def _from(states, event: Event, target: RowState) -> dict:
@@ -127,6 +128,9 @@ TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
     # An operator removes a held row that can never be sent. A hold another
     # version wrote is left to that version.
     **_from(HELD_STATES - {RowState.UNRECOGNIZED_HOLD}, Event.DISCARD, RowState.ABSENT),
+    # Or replaces its request with one that can be sent (the caption of a gone
+    # media file, as text); the row is then sent like a new one.
+    **_from(HELD_STATES - {RowState.UNRECOGNIZED_HOLD}, Event.REPLACE_REQUEST, RowState.WAITING),
 }
 
 

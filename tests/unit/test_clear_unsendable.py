@@ -1,4 +1,5 @@
 """Clearing held sends that can never be delivered, on the queue as the bot wrote it."""
+import pickle
 import sqlite3
 from contextlib import closing
 
@@ -13,8 +14,9 @@ from efb_telegram_master.outbound import (
     QueueRequest,
     SenderSelection,
 )
-from efb_telegram_master.queued_log import encode_aggregation
+from efb_telegram_master.queued_log import encode, encode_aggregation
 from tests.unit.test_outbound import ROW_SPELLINGS, _write_row
+from tests.unit.test_restart_memory import message_with_group
 
 ATTEMPT = SenderSelection(sender=None, sender_bot_id="901")
 
@@ -27,11 +29,15 @@ def send_message(chat_id, text, **kwargs):
     return None
 
 
+def send_video(chat_id, video, **kwargs):
+    return None
+
+
 def edit_message_text(chat_id, message_id, text, **kwargs):
     return None
 
 
-OPERATIONS = {function.__name__: function for function in (send_document, send_message, edit_message_text)}
+OPERATIONS = {function.__name__: function for function in (send_document, send_message, send_video, edit_message_text)}
 
 
 def _context(kind, **fields):
@@ -61,9 +67,9 @@ def _copy_payload(queue, source, target):
             (source, target))
 
 
-def _rows(directory, database, where="TRUE"):
+def _rows(directory, database, where="TRUE", columns="*"):
     """Stored rows by id, read without opening the queue (which would update some)."""
-    sql = f"SELECT * FROM outbound_queue AS q WHERE {where} ORDER BY id"
+    sql = f"SELECT id, {columns} FROM outbound_queue AS q WHERE {where} ORDER BY id"
     if database is None:
         with closing(sqlite3.connect((directory / "outbound-queue.sqlite3").as_uri() + "?mode=ro", uri=True)) as db:
             rows = db.execute(sql).fetchall()
@@ -71,15 +77,17 @@ def _rows(directory, database, where="TRUE"):
         with closing(postgresql_connection(database)) as db, db.cursor() as cursor:
             cursor.execute(sql)
             rows = cursor.fetchall()
-    return {row[0]: tuple(bytes(value) if isinstance(value, memoryview) else value for value in row) for row in rows}
+    return {row[0]: tuple(bytes(value) if isinstance(value, memoryview) else value for value in row[1:])
+            for row in rows}
 
 
 def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, queue_backend):
     staged = tmp_path / "bot-api"
     staged.mkdir()
-    gone, present = staged / "gone.mp4", staged / "present.mp4"
-    gone.write_bytes(b"gif")
-    present.write_bytes(b"gif")
+    gone, present, captioned_file, untexted_file = (
+        staged / name for name in ("gone.mp4", "present.mp4", "captioned.mp4", "untexted.mp4"))
+    for path in (gone, present, captioned_file, untexted_file):
+        path.write_bytes(b"gif")
     data = tmp_path / "data"
     queue = make_queue(data)
     member = {"origin_uid": "origin", "source_id": "1"}
@@ -105,28 +113,54 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
     kept_media = _add(queue, "send_document", {"chat_id": -1001, "document": present.as_uri()},
                       cleanup=(str(present),))
     kept_text = _add(queue, "send_message", {"chat_id": -1001, "text": "text"})
+    # A gone file of a message with text: its caption is sent as text, and the row behind it waits for it.
+    caption = {"chat_id": -1004, "caption": "<b>Author:</b>\nmessage", "parse_mode": "HTML", "message_thread_id": 7}
+    log = encode(message_with_group(), None)
+    captioned = _add(queue, "send_video", {**caption, "video": captioned_file.as_uri(), "thumbnail": b"thumb",
+                                           "duration": 3, "has_spoiler": True}, cleanup=(str(captioned_file),),
+                     context=_context("boundary", legacy_context=log))
+    # A message without text has only the sender's name and a placeholder as caption: removed.
+    untexted = message_with_group()
+    untexted.text = ""
+    header_only = _add(queue, "send_video", {"chat_id": -1004, "video": untexted_file.as_uri(),
+                                             "caption": "<b>Author:</b>\n🖼️", "parse_mode": "HTML"},
+                       cleanup=(str(untexted_file),), context=encode(untexted, None))
+    _add(queue, "send_message", {"chat_id": -1004, "text": "after"}, predecessor=captioned)
     for row_id, error in ((gone_media, TimedOut()), (rejected, BadRequest("Message is too long")),
-                          (edit, TimedOut()), (source, TimedOut()), (kept_media, TimedOut())):
+                          (edit, TimedOut()), (source, TimedOut()), (kept_media, TimedOut()),
+                          (captioned, TimedOut()), (header_only, TimedOut())):
         _hold(queue, row_id, error)
     _copy_payload(queue, source, rejected)  # A removed row and a kept row name one file.
-    gone.unlink()
+    for path in (gone, captioned_file, untexted_file):
+        path.unlink()
     queue.close()
     before = _rows(data, queue_backend)
+    unchanged = "priority, telegram_chat_id, slave_id, created_at, log_context, predecessor_id, thread_id"
+    before_unchanged = _rows(data, queue_backend, columns=unchanged)[captioned]
     files = set(queue.media_dir.iterdir())
 
-    expected = {"missing_media": 1, "rejected_batch": 1, "needs_removed_row": 1}
+    expected = {"missing_media": 2, "rejected_batch": 1, "needs_removed_row": 1}
     report = clear(data, database=queue_backend)
-    assert report["removed"] == expected and report["released"] == 4 and report["media_files_removed"] == 1
-    assert not report["applied"]
+    assert report["removed"] == expected and report["released"] == 4 and report["media_files_removed"] == 2
+    assert report["caption_sent_as_text"] == 1 and not report["applied"]
     assert _rows(data, queue_backend) == before and set(queue.media_dir.iterdir()) == files
 
     report = clear(data, apply=True, database=queue_backend)
-    assert report["removed"] == expected and report["kept"] == 6 and report["media_files_removed"] == 1
-    # Only the removed row's own file went; the file a kept row still names stays.
-    assert len(files - set(queue.media_dir.iterdir())) == 1 and present.exists()
-    removed = {gone_media, rejected, update}
-    assert _rows(data, queue_backend) == {row_id: row for row_id, row in before.items() if row_id not in removed}
-    assert set(_rows(data, queue_backend, ready_sql("q"))) == {append, behind, kept_text}
+    assert report["removed"] == expected and report["kept"] == 8 and report["media_files_removed"] == 2
+    # Only the files of the removed row and the caption's thumbnail went; the file a kept row names stays.
+    assert len(files - set(queue.media_dir.iterdir())) == 2 and present.exists()
+    removed = {gone_media, rejected, update, header_only}
+    rows = _rows(data, queue_backend)
+    rows.pop(captioned)
+    assert rows == {row_id: row for row_id, row in before.items() if row_id not in removed | {captioned}}
+    assert set(_rows(data, queue_backend, ready_sql("q"))) == {append, behind, kept_text, captioned}
+    # The same chat, topic, text and formatting, without the video, from the bot that attempted it, in its place.
+    assert _rows(data, queue_backend, columns=unchanged)[captioned] == before_unchanged
+    operation, payload, sender = _rows(data, queue_backend, columns="operation, payload, required_sender_bot_id")[
+        captioned]
+    assert operation == "send_message" and sender == "901"
+    text = {key: value for key, value in caption.items() if key != "caption"}
+    assert pickle.loads(payload[1:]) == ((), {**text, "text": caption["caption"]})
 
 
 @pytest.mark.parametrize("spelling", sorted(set(ROW_SPELLINGS) - {"absent"}))
