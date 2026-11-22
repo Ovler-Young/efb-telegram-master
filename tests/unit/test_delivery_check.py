@@ -1,7 +1,11 @@
 """Deciding held sends from the chat: the matcher, the id range lookup and the check loop."""
 import asyncio
 import datetime
+import hashlib
+import json
+import sqlite3
 import time
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +26,7 @@ from efb_telegram_master.delivery_check import (
     eligible,
     row_keys,
 )
-from efb_telegram_master.outbound import OutboundQueue
+from efb_telegram_master.outbound import OutboundQueue, QueueRequest, SenderSelection
 from tests.unit.test_database_safety import (  # noqa: F401
     manager_factory,
     postgres_config,
@@ -387,3 +391,114 @@ def test_stop_before_the_first_pass_ends_the_thread_at_once(scenario):
     started = time.time()
     check.stop(timeout=5)
     assert time.time() - started < 2 and not applied
+
+
+# --------------------------------------------------------------------------- the report for the operator
+def send_message(chat_id, text, **kwargs):
+    return None
+
+
+def send_document(chat_id, document, **kwargs):
+    return None
+
+
+@pytest.fixture(params=["sqlite", "postgresql"])
+def channel(request, tmp_path, monkeypatch):
+    """A channel data directory with a live queue, a message log and five held sends in one chat."""
+    config = request.getfixturevalue("postgres_config") if request.param == "postgresql" else None
+    directory = tmp_path / "channel"
+    directory.mkdir()
+    manager = request.getfixturevalue("manager_factory")(directory, config)
+    (directory / "config.yaml").write_text(json.dumps(
+        {"token": f"{BOT}:secret-token", "api_id": 7, "api_hash": "secret-hash", **({"database": config} if config else {})}))
+    monkeypatch.setattr(dc, "PACE", 0.0)
+    now = time.time()
+    attempt = now - 7200
+    local = datetime.datetime.fromtimestamp
+    log(manager, 10, local(attempt - 60))
+    log(manager, 30, local(attempt + 900))
+    queue = OutboundQueue(directory, database=config)
+    request.addfinalizer(queue.close)
+    rows = [("delivered text", attempt), ("never arrived", attempt + 100), ("twin", attempt + 200),
+            ("twin", attempt + 201), ("recent", now - 5)]
+    ids = {}
+    for text, started in rows:
+        request = (QueueRequest("send_document", (), {"chat_id": CHAT, "document": b"file", "caption": text}, None)
+                   if text == "never arrived" else
+                   QueueRequest("send_message", (), {"chat_id": CHAT, "text": text}, None))
+        row_id, _ = queue.enqueue_many([request], {"send_message": send_message, "send_document": send_document}.__getitem__)
+        ids[text if text not in ids else text + " again"] = row_id
+        queue.begin_delivery_attempt(row_id, SenderSelection(sender=None, sender_bot_id=None))
+        queue.hold_uncertain_delivery(row_id, TimeoutError())
+        with queue._lock, queue.connection:
+            queue.connection.execute("UPDATE outbound_queue SET slave_id=?, attempt_started_at=? WHERE id=?",
+                                     ("mod.chat", started, row_id))
+    client = RecordingClient({
+        12: real_message(12, "delivered text", attempt + 20),
+        14: real_message(14, "twin", attempt + 210),     # one message for two identical rows
+        31: real_message(31, "after the window", attempt + 1000),
+    })
+    monkeypatch.setattr(dc, "TelegramClient", lambda *args, **kwargs: client)
+    return SimpleNamespace(directory=directory, queue=queue, ids=ids, client=client, config=config)
+
+
+def _queue_state(channel):
+    with channel.queue._lock:
+        return channel.queue.connection.execute("SELECT * FROM outbound_queue ORDER BY id").fetchall()
+
+
+def test_report_lists_only_the_rows_not_delivered_and_changes_nothing(channel, tmp_path, capsys):
+    files = [channel.directory / name for name in ("outbound-queue.sqlite3", "tgdata.db")]
+    before = ([hashlib.sha256(path.read_bytes()).digest() for path in files] if channel.config is None else None, _queue_state(channel))
+    schema = channel.queue.connection.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall() \
+        if channel.config is None else None
+    out = tmp_path / "not-delivered.txt"
+    assert dc.main(["--data-dir", str(channel.directory), "--not-delivered-out", str(out)]) == 0
+    assert out.read_text() == f"{channel.ids['never arrived']}\n"      # delivered, undecided and recent rows are not listed
+    shown = capsys.readouterr()
+    assert "found=1" in shown.out and "not_found=1" in shown.out and "ambiguous=2" in shown.out and "too_early=1" in shown.out
+    for secret in ("secret-token", "secret-hash", "delivered text"):
+        assert secret not in shown.out + shown.err
+    assert set(channel.client.calls) == {"entity", "read"}      # the chat was only looked up and read
+    after = ([hashlib.sha256(path.read_bytes()).digest() for path in files] if channel.config is None else None, _queue_state(channel))
+    assert after == before        # the queue file and the log are byte-identical, the rows unchanged
+    if channel.config is None:
+        assert channel.queue.connection.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall() == schema
+    # the clear step reads one row id per line
+    assert frozenset(int(line) for line in out.read_text().split()) == {channel.ids["never arrived"]}
+
+
+def test_report_without_a_finished_read_writes_no_file(channel, tmp_path, capsys):
+    class Refusing(RecordingClient):
+        async def start(self, bot_token):
+            raise ConnectionError(bot_token)
+
+    channel.client.__class__ = Refusing
+    out = tmp_path / "not-delivered.txt"
+    assert dc.report_not_delivered(channel.directory, out, api_id=1, api_hash="h") == 1
+    assert not out.exists() and not list(tmp_path.glob("*.part"))
+    assert "secret-token" not in capsys.readouterr().out
+
+
+def test_report_needs_both_api_keys_in_the_config(channel, tmp_path, capsys):
+    (channel.directory / "config.yaml").write_text(json.dumps({"token": f"{BOT}:secret-token"}))
+    out = tmp_path / "not-delivered.txt"
+    with pytest.raises(SystemExit) as stopped:
+        dc.main(["--data-dir", str(channel.directory), "--not-delivered-out", str(out)])
+    assert stopped.value.code == 1 and not out.exists()
+    assert "secret-token" not in capsys.readouterr().err
+
+
+def test_report_reads_a_queue_file_from_an_older_version(tmp_path):
+    directory = tmp_path / "old"
+    directory.mkdir()
+    (directory / "config.yaml").write_text(json.dumps({"token": f"{BOT}:t"}))
+    (directory / "tgdata.db").touch()
+    with closing(sqlite3.connect(directory / "outbound-queue.sqlite3")) as db, db:
+        db.execute("CREATE TABLE outbound_queue (id INTEGER PRIMARY KEY, telegram_chat_id INTEGER, operation TEXT, "
+                   "payload BLOB, slave_id TEXT, delivery_state TEXT, delivery_hold TEXT)")
+        db.execute("INSERT INTO outbound_queue VALUES (1, ?, 'send_message', x'00', 'mod.chat', 'queued', 'uncertain:TimedOut')",
+                   (CHAT,))
+    out = tmp_path / "not-delivered.txt"
+    assert dc.report_not_delivered(directory, out, api_id=1, api_hash="h") == 0
+    assert out.read_text() == ""       # no attempt time is recorded, so the row cannot be decided

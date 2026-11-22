@@ -334,6 +334,28 @@ were ordered behind a removed row (`released`), and deleted files. To undo `--ap
 (`outbound-queue.sqlite3` and `outbound-media/`, or the PostgreSQL queue tables)
 from a backup taken before it.
 
+To list the held sends that the chats show were not delivered, for the clear
+tool's `--not-delivered` file, run the chat check once, read-only, while the bot
+can still run:
+
+```sh
+python -m efb_telegram_master.delivery_check --data-dir /channel/data \
+    --not-delivered-out not-delivered.txt
+```
+
+It reads the bot tokens, the `database` settings and the `api_id` and `api_hash`
+keys from the channel's `config.yaml` (no option carries a value), reads every
+held send back by the bot that attempted it as the check above does, and writes
+the ids of the rows found not delivered, one per line. It opens the queue file
+and the message log read-only (SQLite `mode=ro`, or a read-only PostgreSQL
+transaction), never through the queue class, so no schema change is made to a
+file an older version owns, and it sends, edits and deletes nothing. A row the
+chat does not decide (several candidates, a near miss, an attempt less than 11
+minutes old, an unreadable chat or a bot that is not configured) is left out of
+the file. The output is counts only. If a bot cannot log in, it prints that and
+exits 1 without writing the file. At one call per bot every 15 seconds, a large
+queue takes about an hour.
+
 A new row is written as waiting by `OutboundQueue.enqueue_many`, the aggregation
 handoff and the supplement insert; it has no earlier state to check, so the table
 below lists only events on an existing row.

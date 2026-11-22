@@ -13,25 +13,31 @@ for each held row whether a message matching it exists:
 Only message reads by id and the lookup of a chat are sent to Telegram; nothing is sent, edited or
 deleted. Logs carry counts only: never message text, titles, chat ids, tokens or API values.
 """
+import argparse
 import asyncio
 import collections
+import contextlib
 import datetime
 import hashlib
 import html
 import logging
 import re
+import sqlite3
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.sessions import StringSession
 
-from .delivery_states import OPERATOR_OBSERVED_DELIVERY, HoldKind, parse_hold
-from .outbound import OutboundQueue
+from .db_runtime import postgresql_connection
+from .delivery_states import OPERATOR_OBSERVED_DELIVERY, QUEUED, HoldKind, parse_hold
+from .migrate_db import RECEIPT_FILE
+from .outbound import POSTGRESQL_QUEUE_MARKER, OutboundQueue
 
 logger = logging.getLogger(__name__)
 
@@ -742,3 +748,190 @@ class HeldSendCheck:
         counts["flood_waits"] += reader.flood_waits
         reader.calls = reader.flood_waits = 0
         return counts
+
+
+# --------------------------------------------------------------------------- a report for the operator
+class ReportError(RuntimeError):
+    """A failure of the report; its message is fixed text and never carries a value read from a file."""
+
+
+class _ReadOnlyLog:
+    """The two message-log lookups the check needs, as plain read-only queries.
+
+    ``run(sql, parameters)`` takes ``?`` placeholders and returns the rows.
+    """
+
+    def __init__(self, run: Callable[..., list], sqlite: bool):
+        self._run = run
+        self._sqlite = sqlite
+
+    def logged_id_bounds(self, slave_origin_uid: str, target_chat_id: int, before: datetime.datetime,
+                         after: datetime.datetime) -> tuple[int | None, int | None]:
+        def seek(operator: str, order: str, moment: datetime.datetime) -> int | None:
+            value = moment.isoformat(" ") if self._sqlite else moment
+            for (master_msg_id,) in self._run(
+                    f"SELECT master_msg_id FROM msglog WHERE slave_origin_uid = ? AND time {operator} ? "
+                    f"ORDER BY time {order} LIMIT 40", (slave_origin_uid, value)):
+                chat, _, message = master_msg_id.partition(".")
+                if chat == str(target_chat_id) and message.isdigit():
+                    return int(message)
+            return None
+
+        return seek("<=", "DESC", before), seek(">", "ASC", after)
+
+    def is_message_logged(self, target_chat_id: int, message_id: int) -> bool:
+        master_msg_id = f"{target_chat_id}.{message_id}"
+        return bool(self._run("SELECT 1 FROM msglog WHERE master_msg_id = ? OR master_msg_id_alt = ? LIMIT 1",
+                              (master_msg_id, master_msg_id)))
+
+
+def _read_config(directory: Path) -> dict:
+    from ruamel.yaml import YAML
+
+    path = directory / "config.yaml"
+    if not path.is_file():
+        raise ReportError("The channel config file was not found in the data directory.")
+    with path.open() as stream:
+        config = YAML(typ="safe").load(stream)
+    if not isinstance(config, dict):
+        raise ReportError("The channel config file is not a mapping.")
+    return config
+
+
+def _tokens(config: Mapping) -> dict[str | None, str]:
+    """The bot tokens, as the bot reads them: the main bot, then each auxiliary bot by its id."""
+    if not isinstance(config.get("token"), str):
+        raise ReportError("The channel config has no bot token.")
+    tokens: dict[str | None, str] = {None: config["token"]}
+    for entry in config.get("auxiliary_bots") or ():
+        token = entry.get("token") if isinstance(entry, dict) else None
+        if isinstance(token, str) and token not in tokens.values():
+            tokens[token.split(":", 1)[0]] = token
+    return tokens
+
+
+def _api_keys(config: Mapping) -> tuple[int, str]:
+    api_id, api_hash = config.get("api_id"), config.get("api_hash")
+    if isinstance(api_id, str) and api_id.isdigit():
+        api_id = int(api_id)
+    if api_id is None or api_hash is None:
+        raise ReportError("api_id and api_hash are not set in the channel config.")
+    if isinstance(api_id, bool) or not isinstance(api_id, int) or not isinstance(api_hash, str):
+        raise ReportError("api_id must be a number and api_hash a string.")
+    return api_id, api_hash
+
+
+@contextlib.contextmanager
+def _read_only(directory: Path, database: Mapping | None) -> Iterator[tuple[Callable[..., list], _ReadOnlyLog, bool]]:
+    """Plain read-only access to the queue and the message log: ``(queue query, log, is SQLite)``.
+
+    Nothing is created or changed: SQLite files are opened with ``mode=ro`` and PostgreSQL in a read-only
+    transaction, and the queue class (which may change the schema of a file an older version owns) is not used.
+    """
+    kind = (database or {}).get("type", "sqlite")
+    if kind == "postgresql":
+        connection = postgresql_connection(database or {})
+        try:
+            connection.set_session(readonly=True)
+            cursor = connection.cursor()
+
+            def run(sql: str, parameters: tuple = ()) -> list:
+                cursor.execute(sql.replace("?", "%s"), parameters)
+                return cursor.fetchall()
+
+            yield run, _ReadOnlyLog(run, False), False
+        finally:
+            connection.rollback()
+            connection.close()
+        return
+    if kind != "sqlite":
+        raise ReportError("The channel config names an unknown database type.")
+    if (directory / POSTGRESQL_QUEUE_MARKER).exists() or (directory / RECEIPT_FILE).exists():
+        raise ReportError("This data directory was moved to PostgreSQL; pass its database settings in the config.")
+    with contextlib.ExitStack() as stack:
+        runners = []
+        for name in (OutboundQueue.filename, "tgdata.db"):
+            connection = sqlite3.connect((directory / name).as_uri() + "?mode=ro", uri=True, timeout=5)
+            stack.callback(connection.close)
+            runners.append(lambda sql, parameters=(), _connection=connection:
+                           _connection.execute(sql, parameters).fetchall())
+        yield runners[0], _ReadOnlyLog(runners[1], True), True
+
+
+def _held_rows(run: Callable[..., list], sqlite: bool) -> list[HeldRow]:
+    """The held rows, read as the bot lists them; columns an older queue file lacks read as NULL."""
+    names = ("id", "telegram_chat_id", "operation", "payload", "slave_id", "attempt_sender_bot_id",
+             "attempt_started_at", "delivery_hold", "thread_id")
+    present = {row[1] for row in run("PRAGMA table_info(outbound_queue)")} if sqlite else set(names)
+    if "delivery_hold" not in present:
+        return []
+    columns = ", ".join(name if name in present else "NULL" for name in names)
+    rows = run(f"SELECT {columns} FROM outbound_queue WHERE delivery_state = ? AND delivery_hold LIKE ? ORDER BY id",
+               (QUEUED, HoldKind.UNCERTAIN.value + "%"))
+    return [HeldRow(*row) for row in rows]
+
+
+async def _one_pass(check: HeldSendCheck) -> collections.Counter:
+    try:
+        return await check.run_pass()
+    finally:
+        await check._close_readers()
+
+
+def report_not_delivered(data_dir: Path | str, out_path: Path | str, *, api_id: int, api_hash: str) -> int:
+    """Write the ids of the held sends the chats show were not delivered, one per line; send nothing.
+
+    One read-only pass over every held send of the channel in ``data_dir`` (the bot tokens and the database
+    settings come from its ``config.yaml``, the way the bot reads them). Prints counts only. Returns 0 when
+    every bot could read; 1, with no file written, when a bot could not log in. A row the chat does not decide
+    (ambiguous, too recent, unreadable) is not listed.
+    """
+    directory = Path(data_dir).resolve()
+    config = _read_config(directory)
+    tokens = _tokens(config)
+    database = config.get("database")
+    if database is not None and not isinstance(database, dict):
+        raise ReportError("The database setting of the channel config is not a mapping.")
+    not_delivered: list[int] = []
+
+    def resolve(row_id: int, verdict: Verdict, seen: Seen | None, reader_bot_id: int) -> bool:
+        if verdict is Verdict.NOT_FOUND:
+            not_delivered.append(row_id)
+        return True
+
+    with _read_only(directory, database) as (run, log, sqlite):
+        rows = _held_rows(run, sqlite)
+        check = HeldSendCheck(api_id=api_id, api_hash=api_hash, tokens=tokens, db=log,
+                              list_rows=lambda: rows, resolve=resolve)
+        counts = asyncio.run(_one_pass(check))
+    print("Delivery check: " + ", ".join(f"{name}={value}" for name, value in sorted(counts.items())))
+    if counts["bot_failed"]:
+        print("Delivery check did not finish: a bot could not read. No file was written.")
+        return 1
+    target = Path(out_path)
+    scratch = target.with_name(target.name + ".part")
+    scratch.write_text("".join(f"{row_id}\n" for row_id in sorted(not_delivered)))
+    scratch.replace(target)
+    print(f"Delivery check: {len(not_delivered)} row id(s) written to the output file.")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Read held sends back from their chats and list the ids of those that were not delivered. "
+                    "Read-only: nothing is sent, edited or changed.")
+    parser.add_argument("--data-dir", type=Path, required=True, help="the channel data directory")
+    parser.add_argument("--not-delivered-out", type=Path, required=True,
+                        help="file to write the ids of held sends found not delivered, one per line")
+    args = parser.parse_args(argv)
+    try:
+        api_id, api_hash = _api_keys(_read_config(args.data_dir.resolve()))
+        return report_not_delivered(args.data_dir, args.not_delivered_out, api_id=api_id, api_hash=api_hash)
+    except ReportError as error:
+        parser.exit(1, f"Delivery check failed: {error}\n")
+    except Exception as error:  # noqa: BLE001 - only the class name is printed: a message may quote the config
+        parser.exit(1, f"Delivery check failed: {type(error).__name__}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
