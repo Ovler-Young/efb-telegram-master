@@ -2191,6 +2191,24 @@ def test_catch_up_live_run_reads_one_snapshot_of_a_file_in_use(sqlite_source, po
     assert _pg_equals(live, postgres_config)
 
 
+def test_catch_up_retries_a_run_refused_after_its_first_write(sqlite_source, postgres_config, tmp_path):
+    base, directory = _catch_up_pair(sqlite_source, postgres_config, tmp_path)
+    live = directory / "tgdata.db"
+    migrate_db.catch_up(directory, postgres_config, base)
+    with closing(sqlite3.connect(live)) as newer, newer:
+        _add_message(newer, "new.6", "2021-07-09 00:00:00")
+    receipt = directory / migrate_db.RECEIPT_FILE
+    receipt.write_text("{}")
+    before = _pg_state(postgres_config)
+    with pytest.raises(RuntimeError, match="cutover receipt for an earlier state"):
+        migrate_db.catch_up(directory, postgres_config, base, final=True)
+    assert _pg_state(postgres_config)[1] == before[1]
+    receipt.unlink()
+    assert migrate_db.catch_up(directory, postgres_config, base, final=True)["tables"]["msglog"] == {
+        "inserted": 1, "updated": 0}
+    assert _pg_equals(live, postgres_config)
+
+
 @pytest.mark.parametrize(("change", "error"), [
     ("wal", "-wal is not empty"),
     ("deleted_old_row", "Rows were deleted or renumbered"),

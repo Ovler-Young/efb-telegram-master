@@ -1,8 +1,9 @@
 """Offline, verified SQLite -> PostgreSQL import. Never deletes a source file.
 
 Run ``python -m efb_telegram_master.migrate_db --help``. The bot and all other
-writers must be stopped. The outbound queue moves too; its SQLite file and media
-stay in place.
+writers must be stopped, except for a catch-up without ``--final``, which runs
+with the bot up. The outbound queue moves too; its SQLite file and media stay in
+place.
 """
 
 import argparse
@@ -19,7 +20,7 @@ import sqlite3
 import tempfile
 import uuid
 from collections import Counter
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterator, Optional
@@ -1192,121 +1193,140 @@ def _catch_up_target(db, directory: Path, base_path: Path, source_path: Path, fi
         # One read transaction: a live run sees one state of a file the bot keeps writing.
         source.execute("BEGIN")
         with connection_scope(db):
-            with db.atomic():
-                db.execute_sql("SET LOCAL lock_timeout = '5s'")
-                db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
-                manifest = _read_import(db)
-                if manifest is None:
-                    raise RuntimeError("PostgreSQL has no import record; import tgdata.db first, without --catch-up.")
-                models = MODELS + _cache_models(source, manifest)
-                _validate_source(source, models)
-                _validate_source(base, MODELS + _cache_models(base, manifest))
-                columns = _recovery_columns(models, manifest)
-                _validate_recovery_extras(source, db, columns)
-                models = tuple(model for model in models if model._meta.table_name in columns)
-                db.execute_sql(f"LOCK TABLE {', '.join(_quote(table) for table in columns)} IN SHARE ROW EXCLUSIVE MODE")
-                previous = manifest.get(CATCH_UP_KEY, {})
-                _check_target(db, manifest, columns, previous.get("baseline"))
+            if db.execute_sql("SELECT to_regprocedure('pg_stat_force_next_flush()')").fetchone()[0] is None:
+                raise RuntimeError("The catch-up needs PostgreSQL 15 or later.")
+            checked: dict | None = None  # the import record, once its baseline was checked
+            try:
+                with db.atomic():
+                    db.execute_sql("SET LOCAL lock_timeout = '5s'")
+                    db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
+                    manifest = _read_import(db)
+                    if manifest is None:
+                        raise RuntimeError("PostgreSQL has no import record; import tgdata.db first, without --catch-up.")
+                    models = MODELS + _cache_models(source, manifest)
+                    _validate_source(source, models)
+                    _validate_source(base, MODELS + _cache_models(base, manifest))
+                    columns = _recovery_columns(models, manifest)
+                    _validate_recovery_extras(source, db, columns)
+                    models = tuple(model for model in models if model._meta.table_name in columns)
+                    db.execute_sql(f"LOCK TABLE {', '.join(_quote(table) for table in columns)} IN SHARE ROW EXCLUSIVE MODE")
+                    previous = manifest.get(CATCH_UP_KEY, {})
+                    _check_target(db, manifest, columns, previous.get("baseline"))
+                    checked = manifest if previous.get("baseline") is not None else None
 
-                base_extent = {table: _extent(base, table) for table in (WINDOWED, APPEND_ONLY) if table in columns}
-                stat = base_path.stat()
-                identity = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-                            "max_rowid": {table: top for table, (_, top) in base_extent.items()}}
-                if "base" in previous:
-                    if previous["base"] != identity:
-                        raise RuntimeError("The base file differs from the one earlier catch-ups used; refusing to catch up.")
-                elif any(manifest["tables"][table]["rows"] != count for table, (count, _) in base_extent.items()):
-                    raise RuntimeError("The base file is not the file this target was imported from; refusing to catch up.")
-                counts = {}
-                for table, (count, top) in base_extent.items():
-                    new_count, new_top = _extent(source, table)
-                    added = source.execute(f"SELECT count(*) FROM {_quote(table)} WHERE rowid > ?", (top,)).fetchone()[0]
-                    if new_top < top or new_count != count + added:
-                        raise RuntimeError(
-                            f"{table} of tgdata.db has {new_count} rows up to rowid {new_top}; the base file has "
-                            f"{count} up to rowid {top}, and {added} were added after it. Rows were deleted or "
-                            "renumbered (for example by VACUUM); refusing to catch up."
-                        )
-                    counts[table] = new_count
-
-                with db.bind_ctx(models):
-                    updated = set(previous.get("updated", []))
-                    changed: set = set()
-                    start = None
-                    if WINDOWED in columns:
-                        fields = _fields(MsgLog, columns[WINDOWED])
-                        key = [field.column_name for field in fields].index("master_msg_id")
-                        start = _window_start(base, base_extent[WINDOWED][1], window_days)
-                        rows = _changed_messages(base, source, fields, start, base_extent[WINDOWED][1], updated, changed)
-                        inserted = rewritten = 0
-                        for batch in chunked((tuple(_value(field, value) for field, value in zip(fields, row))
-                                              for row in rows), batch_size):
-                            written = _write_rows(db, MsgLog, fields, batch, update=True)
-                            expected = {row[key]: row for row in batch}
-                            stored = {row[key]: row for row in (
-                                tuple(_value(field, value) for field, value in zip(fields, values))
-                                for values in db.execute_sql(
-                                    f"SELECT {', '.join(_quote(field.column_name) for field in fields)} FROM msglog "
-                                    "WHERE master_msg_id = ANY(%s)", ([message for message, _ in written],),
-                                )
-                            )}
-                            if any(stored.get(message) != expected[message] for message, _ in written):
-                                raise RuntimeError("Read-back of the written msglog rows failed; nothing was committed.")
-                            inserted += sum(1 for _, new in written if new)
-                            rewritten += sum(1 for _, new in written if not new)
-                        summary[WINDOWED] = {"inserted": inserted, "updated": rewritten}
-                    if APPEND_ONLY in columns:
-                        fields = _fields(MsgLogMember, columns[APPEND_ONLY])
-                        rows = (tuple(_value(field, value) for field, value in zip(fields, values))
-                                for _, *values in _rowid_rows(source, APPEND_ONLY, fields, base_extent[APPEND_ONLY][1] + 1))
-                        summary[APPEND_ONLY] = {"inserted": sum(
-                            len(_write_rows(db, MsgLogMember, fields, batch, update=False))
-                            for batch in chunked(rows, batch_size)
-                        )}
-                    for model in models:
-                        table = model._meta.table_name
-                        if table in (WINDOWED, APPEND_ONLY):
-                            continue
-                        fields = _fields(model, columns[table])
-                        wanted = list(_source_rows(source, model, columns[table]))
-                        counts[table] = len(wanted)
-                        deleted = replaced = 0
-                        if _target_rows(db, model, fields) != wanted:
-                            deleted = db.execute_sql(f"DELETE FROM {_quote(table)}").rowcount
-                            for batch in chunked(wanted, batch_size):
-                                model.insert_many(batch, fields=fields).execute()
-                            _reset_sequence(db, model)
-                            if _target_rows(db, model, fields) != wanted:
-                                raise RuntimeError(f"Read-back of {table} failed; nothing was committed.")
-                            replaced = len(wanted)
-                        summary[table] = {"deleted": deleted, "replaced": replaced}
-                for table in columns:
-                    stored = db.execute_sql(f"SELECT count(*) FROM {_quote(table)}").fetchone()[0]
-                    if stored != counts[table]:
-                        raise RuntimeError(f"{table}: {stored} rows in PostgreSQL, {counts[table]} in tgdata.db; nothing was committed.")
-
-                catch = {"base": identity, "updated": sorted(updated | changed)}
-                if final:
-                    record = {
-                        "version": 2, "import_id": manifest["import_id"],
-                        "tables": {table: {"rows": counts[table], "sha256": ""} for table in columns},
-                        "columns": columns, "queue": None, "backup_queue": None,
-                        "backup_directory": str(directory), CATCH_UP_KEY: catch,
-                    }
-                else:
-                    record = dict(manifest, **{CATCH_UP_KEY: catch})
-                wrote = any(any(values.values()) for values in summary.values())
-                if _comparable(record) != _comparable(manifest):
-                    if final:
-                        if (directory / RECEIPT_FILE).exists():
+                    base_extent = {table: _extent(base, table) for table in (WINDOWED, APPEND_ONLY) if table in columns}
+                    stat = base_path.stat()
+                    identity = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                                "max_rowid": {table: top for table, (_, top) in base_extent.items()}}
+                    if "base" in previous:
+                        if previous["base"] != identity:
+                            raise RuntimeError("The base file differs from the one earlier catch-ups used; refusing to catch up.")
+                    elif any(manifest["tables"][table]["rows"] != count for table, (count, _) in base_extent.items()):
+                        raise RuntimeError("The base file is not the file this target was imported from; refusing to catch up.")
+                    counts = {}
+                    for table, (count, top) in base_extent.items():
+                        new_count, new_top = _extent(source, table)
+                        added = source.execute(f"SELECT count(*) FROM {_quote(table)} WHERE rowid > ?", (top,)).fetchone()[0]
+                        if new_top < top or new_count != count + added:
                             raise RuntimeError(
-                                "A cutover receipt for an earlier state of this target exists; refusing to replace it."
+                                f"{table} of tgdata.db has {new_count} rows up to rowid {new_top}; the base file has "
+                                f"{count} up to rowid {top}, and {added} were added after it. Rows were deleted or "
+                                "renumbered (for example by VACUUM); refusing to catch up."
                             )
-                        record["import_id"] = uuid.uuid4().hex
-                elif not wrote:
-                    record = manifest
-                if record is not manifest:
-                    db.execute_sql(f"UPDATE {IMPORT_TABLE} SET manifest = %s WHERE id = 1", (_json(record),))
+                        counts[table] = new_count
+
+                    with db.bind_ctx(models):
+                        updated = set(previous.get("updated", []))
+                        changed: set = set()
+                        start = None
+                        if WINDOWED in columns:
+                            fields = _fields(MsgLog, columns[WINDOWED])
+                            key = [field.column_name for field in fields].index("master_msg_id")
+                            start = _window_start(base, base_extent[WINDOWED][1], window_days)
+                            rows = _changed_messages(base, source, fields, start, base_extent[WINDOWED][1], updated, changed)
+                            inserted = rewritten = 0
+                            for batch in chunked((tuple(_value(field, value) for field, value in zip(fields, row))
+                                                  for row in rows), batch_size):
+                                written = _write_rows(db, MsgLog, fields, batch, update=True)
+                                expected = {row[key]: row for row in batch}
+                                stored = {row[key]: row for row in (
+                                    tuple(_value(field, value) for field, value in zip(fields, values))
+                                    for values in db.execute_sql(
+                                        f"SELECT {', '.join(_quote(field.column_name) for field in fields)} FROM msglog "
+                                        "WHERE master_msg_id = ANY(%s)", ([message for message, _ in written],),
+                                    )
+                                )}
+                                if any(stored.get(message) != expected[message] for message, _ in written):
+                                    raise RuntimeError("Read-back of the written msglog rows failed; nothing was committed.")
+                                inserted += sum(1 for _, new in written if new)
+                                rewritten += sum(1 for _, new in written if not new)
+                            summary[WINDOWED] = {"inserted": inserted, "updated": rewritten}
+                        if APPEND_ONLY in columns:
+                            fields = _fields(MsgLogMember, columns[APPEND_ONLY])
+                            rows = (tuple(_value(field, value) for field, value in zip(fields, values))
+                                    for _, *values in _rowid_rows(source, APPEND_ONLY, fields, base_extent[APPEND_ONLY][1] + 1))
+                            summary[APPEND_ONLY] = {"inserted": sum(
+                                len(_write_rows(db, MsgLogMember, fields, batch, update=False))
+                                for batch in chunked(rows, batch_size)
+                            )}
+                        for model in models:
+                            table = model._meta.table_name
+                            if table in (WINDOWED, APPEND_ONLY):
+                                continue
+                            fields = _fields(model, columns[table])
+                            wanted = list(_source_rows(source, model, columns[table]))
+                            counts[table] = len(wanted)
+                            deleted = replaced = 0
+                            if _target_rows(db, model, fields) != wanted:
+                                deleted = db.execute_sql(f"DELETE FROM {_quote(table)}").rowcount
+                                for batch in chunked(wanted, batch_size):
+                                    model.insert_many(batch, fields=fields).execute()
+                                _reset_sequence(db, model)
+                                if _target_rows(db, model, fields) != wanted:
+                                    raise RuntimeError(f"Read-back of {table} failed; nothing was committed.")
+                                replaced = len(wanted)
+                            summary[table] = {"deleted": deleted, "replaced": replaced}
+                    for table in columns:
+                        stored = db.execute_sql(f"SELECT count(*) FROM {_quote(table)}").fetchone()[0]
+                        if stored != counts[table]:
+                            raise RuntimeError(f"{table}: {stored} rows in PostgreSQL, {counts[table]} in tgdata.db; nothing was committed.")
+
+                    catch = {"base": identity, "updated": sorted(updated | changed)}
+                    if final:
+                        record = {
+                            "version": 2, "import_id": manifest["import_id"],
+                            "tables": {table: {"rows": counts[table], "sha256": ""} for table in columns},
+                            "columns": columns, "queue": None, "backup_queue": None,
+                            "backup_directory": str(directory), CATCH_UP_KEY: catch,
+                        }
+                    else:
+                        record = dict(manifest, **{CATCH_UP_KEY: catch})
+                    wrote = any(any(values.values()) for values in summary.values())
+                    if _comparable(record) != _comparable(manifest):
+                        if final:
+                            if (directory / RECEIPT_FILE).exists():
+                                raise RuntimeError(
+                                    "A cutover receipt for an earlier state of this target exists; refusing to replace it."
+                                )
+                            record["import_id"] = uuid.uuid4().hex
+                    elif not wrote:
+                        record = manifest
+                    if record is not manifest:
+                        db.execute_sql(f"UPDATE {IMPORT_TABLE} SET manifest = %s WHERE id = 1", (_json(record),))
+            except BaseException:
+                if checked is not None:
+                    # The rollback restored the rows just checked, but PostgreSQL keeps counting
+                    # the rolled-back writes; record the new counters so a retry is not refused.
+                    with suppress(Exception):
+                        db.execute_sql("SELECT pg_stat_force_next_flush()")
+                        with db.atomic():
+                            counters = _write_counters(db, columns)
+                            baseline = checked[CATCH_UP_KEY]["baseline"]
+                            fresh = {table: [baseline[table][0], *counters[table]] for table in columns}
+                            if fresh != baseline:
+                                record = dict(checked, **{CATCH_UP_KEY: dict(checked[CATCH_UP_KEY], baseline=fresh)})
+                                db.execute_sql(f"UPDATE {IMPORT_TABLE} SET manifest = %s WHERE id = 1", (_json(record),))
+                raise
             if record is not manifest:
                 # The next run compares against counters that include this run's writes;
                 # a backend reports its counters only when it goes idle.

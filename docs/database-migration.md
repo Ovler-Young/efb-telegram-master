@@ -334,7 +334,9 @@ Nothing stops an older version on any install: this warning is the only protecti
 
 An import made from a copy of `tgdata.db` while the bot kept running on SQLite can be
 brought up to date with the newer file instead of importing it again. The base is
-the SQLite file the target was imported from. Keep it unchanged until the cutover.
+the SQLite file the target was imported from. Keep it unchanged until the cutover. The
+catch-up needs PostgreSQL 15 or later, for `pg_stat_force_next_flush()`; an older server is
+refused before anything is written.
 
 ```sh
 # With the bot still running on SQLite:
@@ -362,7 +364,9 @@ What it compares with the base file:
 **The window is an assumption.** A change to a message older than the window is not seen,
 for example a user editing old history or a queued edit held for longer than the window.
 
-Neither SQLite file is written, and a rerun with the same files writes nothing.
+Neither SQLite file is written, and a rerun with the same files writes nothing. A run
+without `--final` on a WAL-mode `tgdata.db` that no process has open leaves an empty
+`tgdata.db-wal` and a `tgdata.db-shm` beside it.
 
 - Without `--final`, `tgdata.db` is read while the bot runs: read-only, in one read
   transaction, so the run sees one consistent state of the file. Its WAL is expected. The
@@ -386,7 +390,9 @@ Each run refuses before writing anything when:
   record (first run) or from the last run's baseline, or its write counters changed since
   that run: something else wrote PostgreSQL. Write counters are statistics. A write
   committed a few seconds before a run may not be counted yet, and a server crash resets
-  them, so that the next run refuses;
+  them, so that the next run refuses. A run that fails after its first write is rolled
+  back and records the new counters as its baseline, so a retry is not refused; a run
+  killed mid-write (the process dies) cannot, and the next run refuses;
 - the base file is not the file the target was imported from, or not the one earlier
   runs used.
 
