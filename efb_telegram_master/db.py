@@ -1408,6 +1408,38 @@ class DatabaseManager:
                     found[identity] = (*identity, child["author_uid"], child["author_name"])
         return list(found.values())
 
+    @observe_database_method("logged_id_bounds")
+    def logged_id_bounds(self, slave_origin_uid: EFBChannelChatIDStr, target_chat_id: TelegramChatID,
+                         before: datetime.datetime, after: datetime.datetime) -> Tuple[Optional[int], Optional[int]]:
+        """Telegram message ids logged for a source chat around a time span.
+
+        ``before`` and ``after`` are local times, as ``MsgLog.time`` stores them. Each is one seek
+        on the chat-and-time index.
+
+        Returns:
+            ``(last id logged at or before ``before``, first id logged after ``after``)`` among the
+            messages sent to ``target_chat_id``; None for a side with no such message.
+        """
+        def seek(condition, order):
+            query = MsgLog.select(MsgLog.master_msg_id).where(
+                (MsgLog.slave_origin_uid == slave_origin_uid) & condition).order_by(order).limit(40)
+            for row in query:
+                chat, _, message = row.master_msg_id.partition(".")
+                if chat == str(target_chat_id) and message.isdigit():
+                    return int(message)
+            return None
+
+        return (seek(MsgLog.time <= before, MsgLog.time.desc()),
+                seek(MsgLog.time > after, MsgLog.time.asc()))
+
+    @observe_database_method("is_message_logged")
+    def is_message_logged(self, target_chat_id: TelegramChatID, message_id: int) -> bool:
+        """Whether a Telegram message is already recorded, as a canonical or an alternate id."""
+        master_msg_id = f"{target_chat_id}.{message_id}"
+        return MsgLog.select(MsgLog.master_msg_id).where(
+            (MsgLog.master_msg_id == master_msg_id) | (MsgLog.master_msg_id_alt == master_msg_id)
+        ).limit(1).first() is not None
+
     @observe_database_method("get_previous_forum_message")
     def get_previous_forum_message(self, slave_chat_id: EFBChannelChatIDStr,
                                    current_chat_id: TelegramChatID) -> Optional[MsgLog]:

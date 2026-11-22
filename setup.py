@@ -52,6 +52,7 @@ setup(
         "ehforwarderbot>=2.0.0",
         "setuptools==81.0.0; python_version>='3.9'",
         "python-telegram-bot~=22.7",
+        "telethon>=1.46,<2",
         "python-magic",
         "ffmpeg-python",
         "peewee>=3.19,<5",

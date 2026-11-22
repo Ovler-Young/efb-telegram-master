@@ -57,6 +57,8 @@ _DATABASE_METHODS = frozenset({
     "get_last_message",
     "get_previous_forum_message",
     "find_quote_sources",
+    "logged_id_bounds",
+    "is_message_logged",
     "get_recent_messages",
     "replace_history_migration_entries",
     "has_pending_history_migrations",
