@@ -34,7 +34,7 @@ from telegram import (
     InputMediaDocument, InputMediaLivePhoto, InputMediaPhoto, InputMediaVideo, PhotoSize,
     Sticker, Video, Voice,
 )
-from telegram.error import NetworkError, RetryAfter
+from telegram.error import NetworkError, RetryAfter, TelegramError
 import httpx
 
 from .aggregation_states import (
@@ -74,7 +74,25 @@ MESSAGE_CREATING_OPERATIONS = frozenset(
 )
 
 # Text/caption edits can also create a full-content attachment after their ACK.
-RETAINED_OPERATIONS = MESSAGE_CREATING_OPERATIONS | {"edit_message_text", "edit_message_caption"}
+EDIT_OPERATIONS = frozenset({"edit_message_text", "edit_message_caption"})
+RETAINED_OPERATIONS = MESSAGE_CREATING_OPERATIONS | EDIT_OPERATIONS
+# Retry reason of an edit whose result is unknown. Repeating an edit is harmless,
+# so it is tried once more instead of being held like a send.
+UNCONFIRMED_EDIT_RETRY = "unconfirmed_edit"
+# Longest Telegram error description kept with a held row.
+HOLD_REASON_LIMIT = 200
+
+
+def telegram_error_text(error: BaseException) -> str | None:
+    """Telegram's error description for a hold, cut to ``HOLD_REASON_LIMIT``.
+
+    Only a Telegram error (the error itself or its cause) has one; any other
+    exception text may carry request contents and is never kept.
+    """
+    for candidate in (error, error.__cause__):
+        if isinstance(candidate, TelegramError) and candidate.message:
+            return str(candidate.message)[:HOLD_REASON_LIMIT]
+    return None
 
 
 def transport_definitely_not_sent(error: BaseException) -> bool:
@@ -871,8 +889,16 @@ def create_postgresql_queue_tables(execute: Callable[[str], object]) -> None:
         "reconcile_attempts INTEGER NOT NULL DEFAULT 0, "
         "delivery_hold TEXT NULL, attempt_sender_bot_id TEXT NULL, "
         "attempt_started_at DOUBLE PRECISION NULL, predecessor_id BIGINT NULL, "
-        "thread_id BIGINT NULL)"
+        "thread_id BIGINT NULL, hold_reason TEXT NULL, unconfirmed_at DOUBLE PRECISION NULL)"
     )
+    # Tables created by an earlier version lack these columns. Adding a column
+    # takes the same exclusive lock as the ALTER below, so only do it once.
+    for name, kind in (("hold_reason", "TEXT"), ("unconfirmed_at", "DOUBLE PRECISION")):
+        execute(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute "
+            f"WHERE attrelid = 'outbound_queue'::regclass AND attname = '{name}' AND NOT attisdropped) THEN "
+            f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL; END IF; END $$"
+        )
     # Payloads are read in chunks (legacy recovery, media sweeps, large
     # deletes). Compressed values would be decompressed whole for every chunk.
     # The ALTER needs an ACCESS EXCLUSIVE lock, which waits for any reader such
@@ -1126,7 +1152,8 @@ class OutboundQueue:
         # Additive metadata: do not rebuild the large queue or change its legacy CHECK.
         for name, kind in (("delivery_hold", "TEXT"), ("attempt_sender_bot_id", "TEXT"),
                            ("attempt_started_at", "REAL"), ("predecessor_id", "INTEGER"),
-                           ("thread_id", "INTEGER")):
+                           ("thread_id", "INTEGER"), ("hold_reason", "TEXT"),
+                           ("unconfirmed_at", "REAL")):
             if name not in columns:
                 connection.execute(f"ALTER TABLE outbound_queue ADD COLUMN {name} {kind} NULL")
         OutboundQueue._repair_history_sender_holds(connection)
@@ -2261,10 +2288,11 @@ class OutboundQueue:
         with self._lock, self.connection:
             self._transition(row_id, Event.HOLD_FAILED_AGGREGATION, dependents=True)
             cursor = self.connection.execute(
-                "UPDATE outbound_queue SET delivery_hold=? WHERE id=? AND delivery_state=? "
+                "UPDATE outbound_queue SET delivery_hold=?, hold_reason=? WHERE id=? AND delivery_state=? "
                 "AND (substr(log_context, 1, 1)=? "
                 "OR EXISTS (SELECT 1 FROM outbound_queue child WHERE child.predecessor_id=outbound_queue.id))",
-                (format_hold(HoldKind.AGGREGATION_FAILED, error_detail(error)), row_id, QUEUED, b"\x03"),
+                (format_hold(HoldKind.AGGREGATION_FAILED, error_detail(error)), telegram_error_text(error),
+                 row_id, QUEUED, b"\x03"),
             )
             return cursor.rowcount == 1
 
@@ -3020,20 +3048,80 @@ class OutboundQueue:
                 (row_id, QUEUED, HoldKind.IN_FLIGHT.value),
             )
 
-    def _hold(self, row_id: int, event: Event, hold: str) -> None:
-        """Retain a row under ``hold``; it stops being an ordering barrier for its dependents."""
+    def _hold(self, row_id: int, event: Event, hold: str, reason: str | None = None) -> None:
+        """Retain a row under ``hold``; it stops being an ordering barrier for its dependents.
+
+        ``reason`` is Telegram's error description, kept for the operator.
+        """
         with self._lock, self.connection:
             self._transition(row_id, event, dependents=True)
             cursor = self.connection.execute(
-                "UPDATE outbound_queue SET delivery_hold=? WHERE id=? AND delivery_state=?",
-                (hold, row_id, QUEUED),
+                "UPDATE outbound_queue SET delivery_hold=?, hold_reason=? WHERE id=? AND delivery_state=?",
+                (hold, reason, row_id, QUEUED),
             )
             if cursor.rowcount != 1:
                 raise QueuePersistenceError(f"Queue row {row_id} disappeared before it could be held as {hold}.")
 
     def hold_uncertain_delivery(self, row_id: int, error: BaseException) -> None:
         self._hold(row_id, Event.HOLD_UNCERTAIN,
-                   format_hold(HoldKind.UNCERTAIN, error_detail(error, with_cause=True)))
+                   format_hold(HoldKind.UNCERTAIN, error_detail(error, with_cause=True)),
+                   telegram_error_text(error))
+
+    @classmethod
+    def edited_message_id(cls, operation: str, payload) -> int | None:
+        try:
+            args, kwargs = cls.decode_payload_raw(bytes(payload))
+        except InvalidQueuedPayloadError:
+            return None
+        message_id = kwargs.get("message_id")
+        # Where ``message_id`` sits when it is passed positionally.
+        index = 2 if operation == "edit_message_text" else 1
+        if message_id is None and len(args) > index:
+            message_id = args[index]
+        return message_id if isinstance(message_id, int) else None
+
+    def edit_unconfirmed(self, row_id: int) -> bool:
+        """Whether Telegram did not confirm an earlier try of this edit."""
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT unconfirmed_at FROM outbound_queue WHERE id=?", (row_id,)
+            ).fetchone()
+        return row is not None and row[0] is not None
+
+    def unconfirmed_edit_superseded(self, row_id: int) -> str | None:
+        """Why an edit whose result is unknown is dropped instead of tried again, or None.
+
+        It is dropped when Telegram did not confirm an earlier try of it either,
+        or when a later row edits the same message with its complete text:
+        replaying the old edit after that would put old text over new. A later
+        combined-message update is not such an edit; it is rendered from the
+        confirmed combined message and would not carry this edit's content.
+        """
+        from .queued_log import decode_aggregation
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT telegram_chat_id, operation, payload, unconfirmed_at FROM outbound_queue WHERE id=?",
+                (row_id,),
+            ).fetchone()
+            if row is None or row[1] not in EDIT_OPERATIONS:
+                return None
+            if row[3] is not None:
+                return "Telegram did not confirm its earlier try either"
+            message_id = self.edited_message_id(row[1], row[2])
+            if message_id is None:
+                return None
+            later = self.connection.execute(
+                "SELECT operation, payload, log_context FROM outbound_queue WHERE telegram_chat_id=? AND id>? "
+                "AND operation IN (?, ?) AND length(payload)<=? ORDER BY id",
+                (row[0], row_id, *sorted(EDIT_OPERATIONS), self.MAX_INSPECT_BYTES),
+            ).fetchall()
+        for operation, payload, context in later:
+            if self.edited_message_id(operation, payload) != message_id:
+                continue
+            kind = (decode_aggregation(bytes(context)) or {}).get("kind") if context else None
+            if kind not in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE, ContextKind.AGGREGATE}:
+                return "a newer edit of the same message is queued"
+        return None
 
     def hold_invalid_payload(self, row_id: int) -> None:
         """Retain undecodable work while allowing later rows to dispatch."""
@@ -3043,10 +3131,10 @@ class OutboundQueue:
         """Keep rejected history or supplemental work available for repair."""
         if supplement:
             self._hold(row_id, Event.HOLD_FAILED_SUPPLEMENT,
-                       format_hold(HoldKind.SUPPLEMENT_FAILED, error_detail(error)))
+                       format_hold(HoldKind.SUPPLEMENT_FAILED, error_detail(error)), telegram_error_text(error))
         else:
             self._hold(row_id, Event.HOLD_FAILED_HISTORY,
-                       format_hold(HoldKind.HISTORY_FAILED, error_detail(error)))
+                       format_hold(HoldKind.HISTORY_FAILED, error_detail(error)), telegram_error_text(error))
 
     def defer_acquisition(self, row_id: int, minimum_delay: float = 0, *, counted: bool = True) -> float:
         """Persist capped backoff for an acquisition that never attempted a send.
@@ -3069,10 +3157,11 @@ class OutboundQueue:
             self._note_failed_attempts(row_id, attempts, updated)
         return float(delay)
 
-    def defer_failed_send(self, row_id: int, retry_at: float) -> None:
+    def defer_failed_send(self, row_id: int, retry_at: float, *, unconfirmed: bool = False) -> None:
         """Count a send that failed with a retryable error; retry at ``retry_at`` (Unix time).
 
-        The deadline is stored once the row is failing.
+        The deadline is stored once the row is failing. ``unconfirmed`` records
+        that Telegram may have applied this try (an edit whose result is unknown).
 
         Flood waits are not counted: they hold back the whole chat, not this row.
         A row that is not waiting (its attempt was not released) is left
@@ -3093,8 +3182,10 @@ class OutboundQueue:
             # stored, so head election can step past it.
             self.connection.execute(
                 "UPDATE outbound_queue SET reconcile_attempts=?, "
-                "reconcile_after=COALESCE(?, reconcile_after) WHERE id=? AND " + waiting_sql(),
-                (updated, retry_at if updated >= FAILED_ATTEMPTS_LIMIT else None, row_id),
+                "reconcile_after=COALESCE(?, reconcile_after), unconfirmed_at=COALESCE(?, unconfirmed_at) "
+                "WHERE id=? AND " + waiting_sql(),
+                (updated, retry_at if updated >= FAILED_ATTEMPTS_LIMIT else None,
+                 time.time() if unconfirmed else None, row_id),
             )
             self._note_failed_attempts(row_id, attempts, updated)
 
@@ -4295,7 +4386,40 @@ class OutboundQueueScheduler:
                             lambda metrics: metrics.record_failure(submitted.row.priority, submitted.row.operation, "uncertain")
                         )
                         continue
-                    if decision.kind == "retry_eventual" and submitted.row.priority == 0:
+                    unconfirmed_edit = decision.retry_reason == UNCONFIRMED_EDIT_RETRY
+                    if unconfirmed_edit:
+                        try:
+                            dropped = self.queue.unconfirmed_edit_superseded(row_id)
+                            if dropped is not None:
+                                self.queue.delete(row_id)
+                        except Exception as persistence_error:
+                            self._stop_for_persistence_error(persistence_error)
+                            return
+                        if dropped is not None:
+                            logging.getLogger(__name__).warning(
+                                "Queue row %s (%s): Telegram did not confirm the edit (error=%s/%s); "
+                                "dropped because %s.",
+                                row_id, submitted.row.operation, type(error).__name__,
+                                type(error.__cause__).__name__ if error.__cause__ else "none", dropped,
+                            )
+                            self._record_terminal_discard(submitted.row)
+                            self._row_not_before.pop(row_id, None)
+                            self.queue.fail_waiter(row_id, error)
+                            self.adapter.finish_discarded_delivery(submitted.row)
+                            self.queue.observe_metrics(
+                                lambda metrics: metrics.record_failure(
+                                    submitted.row.priority, submitted.row.operation, "terminal"
+                                )
+                            )
+                            self._record_terminal_completion(submitted.row, submitted.selection, "failure")
+                            continue
+                        logging.getLogger(__name__).warning(
+                            "Queue row %s (%s): Telegram did not confirm the edit (error=%s/%s); "
+                            "trying it once more.",
+                            row_id, submitted.row.operation, type(error).__name__,
+                            type(error.__cause__).__name__ if error.__cause__ else "none",
+                        )
+                    if decision.kind == "retry_eventual" and (submitted.row.priority == 0 or unconfirmed_edit):
                         if decision.retry_at is None:
                             raise RuntimeError("Retry decision requires a retry deadline.")
                         try:
@@ -4304,7 +4428,8 @@ class OutboundQueueScheduler:
                             # A flood wait holds back the whole chat, not only this row.
                             if not isinstance(error, RetryAfter):
                                 self.queue.defer_failed_send(
-                                    row_id, time.time() + max(0.0, decision.retry_at - time.monotonic())
+                                    row_id, time.time() + max(0.0, decision.retry_at - time.monotonic()),
+                                    unconfirmed=unconfirmed_edit,
                                 )
                         except Exception as persistence_error:
                             self._stop_for_persistence_error(persistence_error)
