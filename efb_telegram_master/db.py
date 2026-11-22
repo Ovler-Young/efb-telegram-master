@@ -1410,7 +1410,7 @@ class DatabaseManager:
 
     @observe_database_method("logged_id_bounds")
     def logged_id_bounds(self, slave_origin_uid: EFBChannelChatIDStr, target_chat_id: TelegramChatID,
-                         before: datetime.datetime, after: datetime.datetime) -> Tuple[Optional[int], Optional[int]]:
+                         before: datetime.datetime, after: datetime.datetime) -> tuple[int | None, int | None]:
         """Telegram message ids logged for a source chat around a time span.
 
         ``before`` and ``after`` are local times, as ``MsgLog.time`` stores them. Each is one seek

@@ -152,6 +152,13 @@ def test_recent_cluster_holds_back_a_message_another_cluster_could_take():
     assert verdicts(out) == {1: Verdict.AMBIGUOUS, 2: Verdict.TOO_EARLY}
 
 
+def test_recent_cluster_holds_back_an_edited_message_another_cluster_could_take():
+    rows = [keys(1, "first text"), keys(2, "second text", attempt=ATTEMPT + 3)]
+    edited = seen(105, "changed later", edited=True, date=ATTEMPT + 5)
+    out = run(rows, [edited], now=ATTEMPT + dc.WINDOW + dc.AFTER_SLACK + 1)
+    assert verdicts(out) == {1: Verdict.AMBIGUOUS, 2: Verdict.TOO_EARLY}
+
+
 def test_edited_message_matched_on_text_by_one_cluster_is_not_claimed_by_another():
     matched = seen(105, "hello", edited=True)
     assert verdicts(run([keys(1), keys(2, "another text")], [matched])) == {1: Verdict.FOUND, 2: Verdict.AMBIGUOUS}

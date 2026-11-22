@@ -357,6 +357,7 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
     deferred = []
     contenders: list[tuple[list[RowKeys], dict[int, list[Seen]]]] = []
     early_ids: set[int] = set()
+    early_weak: set[tuple[int, int]] = set()   # edited messages a recent cluster may own
     for cluster in _clusters(sends):
         early = any(too_early(keys.attempt, now) for keys in cluster)
         if early:
@@ -371,6 +372,7 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
             if early:
                 early_ids.update(keys.id for keys in cluster)
         elif early:
+            early_weak.update((keys.chat_id, s.id) for keys in cluster for s, _ in found[keys.id])
             continue
         elif any(found.values()):
             deferred.append((cluster, {keys.id: [s for s, _ in found[keys.id]] for keys in cluster}))
@@ -404,6 +406,7 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
                                  for pool in pools.values() for s in pool)
     for cluster, pools in deferred:
         contested = any(claims[(cluster[0].chat_id, s.id)] > 1 or (cluster[0].chat_id, s.id) in taken_by_strong
+                        or (cluster[0].chat_id, s.id) in early_weak
                         for pool in pools.values() for s in pool)
         taken = None if contested or not all(pools.values()) else _assign(cluster, pools)
         for keys in cluster:
@@ -483,8 +486,10 @@ class BotReader:
             reply = await self._paced(lambda: client(request))
         except errors.RPCError as error:
             raise ChatUnreadable(type(error).__name__) from error
-        return {message.id: Seen.from_message(message) for message in reply.messages
-                if isinstance(message, types.Message)}
+        messages = [message for message in reply.messages if isinstance(message, types.Message)]
+        if any(message.post for message in messages):
+            raise ChatUnreadable("broadcast channel")   # a channel post names no bot, so it cannot be matched
+        return {message.id: Seen.from_message(message) for message in messages}
 
     async def close(self) -> None:
         client, self._client = self._client, None

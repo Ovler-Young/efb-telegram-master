@@ -1,4 +1,5 @@
 """Applying what the destination chat shows about a held send, without ever sending it twice."""
+import asyncio
 import threading
 import time
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ import pytest
 from telegram.error import TimedOut
 from telethon.tl import types as tl
 
+from efb_telegram_master import delivery_check
 from efb_telegram_master.bot_manager import (
     QueuedDbLogContext,
     TelegramBotManager,
@@ -26,6 +28,7 @@ from tests.unit.test_clear_unsendable import (
     _hold,
 )
 from tests.unit.test_database_safety import manager_factory as database_manager_fixture
+from tests.unit.test_delivery_check import RecordingClient
 from tests.unit.test_outbound_queue_runtime_evidence import manager_adapter
 from tests.unit.test_restart_memory import message_with_group
 
@@ -223,6 +226,27 @@ def test_rows_in_flight_or_resolved_meanwhile_are_left_alone(tmp_path, make_queu
     for row_id in (running, confirmed):
         assert not manager._resolve_held_send(row_id, Verdict.NOT_FOUND, None, BOT)
         assert not manager._resolve_held_send(row_id, Verdict.FOUND, chat_message(105, "a"), BOT)
+    assert rows(queue) == before
+
+
+def test_send_to_a_broadcast_channel_stays_held(tmp_path, make_queue, monkeypatch):
+    monkeypatch.setattr(delivery_check, "PACE", 0.0)
+    queue = make_queue(tmp_path)
+    manager = manager_for(queue)
+    row_id = held(queue, "send_message", {"chat_id": CHAT, "text": "hi", "_slave_id": "mod.chat"})
+    age(queue, row_id, 7200)
+    before = rows(queue)
+    attempt = datetime.fromtimestamp(time.time() - 7180, timezone.utc)  # noqa: UP017 - datetime.UTC needs Python 3.11
+    post = tl.Message(id=12, peer_id=tl.PeerChannel(1234), date=attempt, message="hi", post=True)
+    resolved = []
+    check = HeldSendCheck(
+        api_id=1, api_hash="h", tokens={str(BOT): f"{BOT}:secret"},
+        db=SimpleNamespace(logged_id_bounds=lambda *_: (10, 30), is_message_logged=lambda *_: False),
+        list_rows=manager._held_rows, resolve=lambda *call: resolved.append(call),
+        client_factory=lambda: RecordingClient({12: post}))
+
+    counts = asyncio.run(check.run_pass())
+    assert counts["chat_unreadable"] == 1 and not resolved
     assert rows(queue) == before
 
 
