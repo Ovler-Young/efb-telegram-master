@@ -1783,7 +1783,6 @@ def test_queue_only_refuses_an_install_whose_data_was_not_imported(sqlite_source
     assert _queue_tables_in(postgres_config) == []
     assert not (sqlite_source / POSTGRESQL_QUEUE_MARKER).exists()
     migrate_db.migrate(sqlite_source, postgres_config)
-    assert _import_version(postgres_config) == 3
     manager_factory(sqlite_source, postgres_config)
 
 
@@ -1895,9 +1894,6 @@ def _as_an_earlier_import(directory, config):
     with connection_scope(target):
         target.execute_sql(f"DROP TABLE {migrate_db.QUEUE_IMPORT_TABLE}, "
                            + ", ".join(migrate_db.QUEUE_COLUMNS))
-        manifest = migrate_db._read_import(target)
-        target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s",
-                           (json.dumps(dict(manifest, version=2)),))
     target.close_all()
     (directory / POSTGRESQL_QUEUE_MARKER).unlink()
 
@@ -1905,17 +1901,28 @@ def _as_an_earlier_import(directory, config):
 @pytest.mark.parametrize("queue_only", [True, False])
 def test_imported_install_starts_only_after_the_queue_move(sqlite_source, postgres_config, manager_factory, queue_only):
     _as_an_earlier_import(sqlite_source, postgres_config)
-    assert _import_version(postgres_config) == 2
     with pytest.raises(RuntimeError, match="still in outbound-queue.sqlite3"):
         manager_factory(sqlite_source, postgres_config)
     migrate_db.migrate(sqlite_source, postgres_config, queue_only=queue_only)
-    assert _import_version(postgres_config) == 3
-    manager_factory(sqlite_source, postgres_config)
+    assert _import_version(postgres_config) == 2
+    manager = manager_factory(sqlite_source, postgres_config)
     queue = _postgresql_queue(sqlite_source, postgres_config)
     try:
         assert queue.connection.execute("SELECT count(*) FROM outbound_queue").fetchone() == (2,)
     finally:
         queue.close()
+
+    # A record that an earlier build marked as version 3 is still read, moved and started.
+    manager.stop_worker()
+    target = postgresql_database(postgres_config)
+    with connection_scope(target):
+        manifest = migrate_db._read_import(target)
+        target.execute_sql(f"UPDATE {migrate_db.IMPORT_TABLE} SET manifest = %s",
+                           (json.dumps(dict(manifest, version=3)),))
+    target.close_all()
+    migrate_db.migrate(sqlite_source, postgres_config, queue_only=True)
+    assert migrate_db.migrate(sqlite_source, postgres_config)["import_id"] == manifest["import_id"]
+    manager_factory(sqlite_source, postgres_config)
 
 
 @pytest.fixture
@@ -1989,17 +1996,14 @@ def test_queue_only_without_tgdata_refuses_another_installs_target(
     assert before[0]["version"] == 2 and before[1] == [] and not before[4]
 
 
-def test_queue_move_marks_the_import_record_and_only_with_a_committed_move(sqlite_source, postgres_config, manager_factory):
+def test_failed_queue_move_leaves_no_queue_tables_and_a_rerun_completes(sqlite_source, postgres_config, manager_factory):
     with patch.object(migrate_db, "_copy_queue_table", side_effect=RuntimeError("injected queue failure")), \
             pytest.raises(RuntimeError, match="injected queue failure"):
         migrate_db.migrate(sqlite_source, postgres_config)
-    assert _import_version(postgres_config) == 2
     assert _queue_tables_in(postgres_config) == []
 
     receipt = migrate_db.migrate(sqlite_source, postgres_config)
-    assert _import_version(postgres_config) == 3
     assert migrate_db.migrate(sqlite_source, postgres_config)["import_id"] == receipt["import_id"]
-    assert _import_version(postgres_config) == 3
     manager_factory(sqlite_source, postgres_config)
 
 

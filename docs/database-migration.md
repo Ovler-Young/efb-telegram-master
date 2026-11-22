@@ -283,9 +283,8 @@ digests compare. The queue step:
    ones included, because an aggregation context or an ordering link may still name one.
 5. Compares row counts and SHA-256 digests with the source, checks again that the live
    queue and its media are unchanged, then commits the rows and the queue import record
-   (`etm_queue_import`) in one transaction. In that same transaction a data import
-   record of version 2 is rewritten as version 3, everything else unchanged. The step
-   refuses while a bot holds the queue's owner lock.
+   (`etm_queue_import`) in one transaction. The step refuses while a bot holds the
+   queue's owner lock.
 6. After the commit it writes `.outbound-queue-postgresql.json` in the data directory,
    atomically. The SQLite queue file and `outbound-media/` are left in place and are never
    renamed, deleted or rewritten.
@@ -326,14 +325,8 @@ no queue file starts with an empty queue.
 know the PostgreSQL queue. With the PostgreSQL configuration they reopen the retained
 `outbound-queue.sqlite3` and send again what the PostgreSQL queue has already sent.
 
-- On an install imported with a version-2 record, the move rewrites that record as version 3.
-  An older version started with the PostgreSQL configuration stops with `Unsupported or
-  corrupt PostgreSQL import record; preserving both databases.` before it opens the queue
-  or sends anything. That refusal is intended, not damage. Do not edit the record to get
-  past it.
-- An install imported with a version-1 record keeps it, and a native PostgreSQL install has
-  no import record. Nothing stops an older version on those installs: this warning is the
-  only protection.
+Nothing stops an older version on any install: this warning is the only protection.
+
 - A current version configured for SQLite in a directory whose queue moved refuses to open
   the retained SQLite queue, and an imported install is also blocked by its cutover receipt.
 
@@ -358,9 +351,9 @@ against the committed import record under target table locks, then recreates
 the receipt. It refuses source or target divergence and refuses a receipt from a
 different target. Verification is not based on row counts alone.
 
-Recovery accepts legacy v1 and v2 import records, and v3, which is a v2 record after
-the queue move. V1 uses its fixed historical column projection; v2 and v3 use the recorded
-projection. Added columns omitted by an
+Recovery accepts legacy v1 and v2 import records, and a v3 record written by an earlier
+build, which it treats as v2. V1 uses its fixed historical column projection; v2 uses the
+recorded projection. Added columns omitted by an
 old projection must remain NULL and omitted tables must remain empty on both
 sides. Nonempty unrecorded caches or history publications are rejected. If a
 legacy record lacks external-file hashes, recovery verifies the currently

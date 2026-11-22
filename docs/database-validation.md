@@ -54,11 +54,11 @@ The outbound queue moves in a second step, `migrate_db._import_queue`. It reads 
 queue file read-only, validates every value against its PostgreSQL column type
 (`_queue_value`: type, integer range, NUL in text, 256 MiB per value), copies rows in
 byte-bounded batches (`_copy_queue_table`), compares row counts and SHA-256 digests
-computed by PostgreSQL (`_queue_target_digest`), and commits the rows, the queue import
-record and the version-3 mark on an existing data import record in one transaction. The
-local marker follows the commit. `validate_runtime_queue` refuses PostgreSQL startup while
-a SQLite queue file has no queue import record, or the marker is missing. The media bytes
-stay in `outbound-media/`; the step never renames, deletes or rewrites a source file.
+computed by PostgreSQL (`_queue_target_digest`), and commits the rows and the queue
+import record in one transaction. The local marker follows the commit.
+`validate_runtime_queue` refuses PostgreSQL startup while a SQLite queue file has no
+queue import record, or the marker is missing. The media bytes stay in
+`outbound-media/`; the step never renames, deletes or rewrites a source file.
 
 `_backup_queue` copies referenced external attachments into archive-owned
 sidecars and rewrites only archived payloads. `_queue_digest` and recovery verify

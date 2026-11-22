@@ -110,9 +110,7 @@ def _read_import(db) -> Optional[dict]:
     if len(rows) != 1:
         raise RuntimeError("Invalid PostgreSQL import record; refusing to infer migration success.")
     manifest = json.loads(rows[0][0])
-    # Version 3 is version 2 after the outbound queue moved into PostgreSQL. Older
-    # versions accept only 1 and 2, so they refuse the target instead of resuming
-    # the retained SQLite queue and sending its rows again.
+    # Version 3 is accepted because earlier builds wrote it; it is read as version 2.
     if (
         not isinstance(manifest, dict) or manifest.get("version") not in (1, 2, 3)
         or not isinstance(manifest.get("import_id"), str) or not manifest["import_id"]
@@ -873,10 +871,6 @@ def _import_queue(db, directory: Path, archive: Path, expected: dict, batch_size
             }
             db.execute_sql(f"CREATE TABLE {QUEUE_IMPORT_TABLE} (id INTEGER PRIMARY KEY CHECK (id = 1), manifest TEXT NOT NULL)")
             db.execute_sql(f"INSERT INTO {QUEUE_IMPORT_TABLE} (id, manifest) VALUES (1, %s)", (_json(record),))
-            manifest = _read_import(db)
-            if manifest is not None and manifest["version"] == 2:
-                db.execute_sql(f"UPDATE {IMPORT_TABLE} SET manifest = %s WHERE id = 1",
-                               (_json(dict(manifest, version=3)),))
         elif expected not in (record["queue"], record["backup_queue"]):
             raise RuntimeError("Outbound queue changed since it was moved; refusing to merge divergent queues.")
         for table in QUEUE_COLUMNS:
