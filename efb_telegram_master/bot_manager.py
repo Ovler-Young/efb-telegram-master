@@ -48,7 +48,10 @@ from .outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
     QUEUED_OPERATIONS,
+    EDIT_OPERATIONS,
     RETAINED_OPERATIONS,
+    UNCONFIRMED_EDIT_RETRY,
+    telegram_error_text,
     transport_definitely_not_sent,
     IllegalAggregationTransitionError,
     QueueEnqueueError,
@@ -1996,6 +1999,14 @@ class TelegramBotManager(LocaleMixin):
             and not isinstance(error, telegram.error.BadRequest)
             and not transport_definitely_not_sent(error)
         )
+        if operation in EDIT_OPERATIONS and ambiguous_network:
+            # Repeating an edit over the same text is harmless; holding it would
+            # leave an old edit that can never be replayed safely over newer text.
+            return QueuedCompletionDecision(
+                QueuedCompletionKind.RETRY_EVENTUAL,
+                time.monotonic() + self.TRANSPORT_RETRY_SECONDS,
+                UNCONFIRMED_EDIT_RETRY,
+            )
         # No response is not a negative acknowledgment. Retain the log and media,
         # and never let a restart turn an unknown result into another remote send.
         if isinstance(error, InvalidTelegramResponseError) or operation in RETAINED_OPERATIONS and (
@@ -2003,11 +2014,12 @@ class TelegramBotManager(LocaleMixin):
             or (type(error) is telegram.error.TelegramError and isinstance(error.__cause__, ValueError))
         ):
             self.logger.error(
-                "Telegram delivery unconfirmed for queue row %s (%s, sender=%s, error=%s/%s). "
+                "Telegram delivery unconfirmed for queue row %s (%s, sender=%s, error=%s/%s, telegram=%r). "
                 "Row, media and MsgLog context retained; automatic resend disabled. "
                 "Confirm an existing Telegram message before resolving this row.",
                 row.id, operation, selection.sender_bot_id or "main",
                 type(error).__name__, type(error.__cause__).__name__ if error.__cause__ else "none",
+                telegram_error_text(error),
             )
             return QueuedCompletionDecision(QueuedCompletionKind.DELIVERY_UNCERTAIN)
 

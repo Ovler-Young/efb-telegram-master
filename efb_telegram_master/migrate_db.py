@@ -69,6 +69,7 @@ QUEUE_COLUMNS = {
         ("reconcile_attempts", "integer", False, 0), ("delivery_hold", "text", True, None),
         ("attempt_sender_bot_id", "text", True, None), ("attempt_started_at", "double", True, None),
         ("predecessor_id", "bigint", True, None), ("thread_id", "bigint", True, None),
+        ("hold_reason", "text", True, None),
     ),
     "history_ownership": (("entry_key", "text", False, _REQUIRED),),
     "source_cancellations": (

@@ -317,10 +317,24 @@ def test_fixed_owner_update_uncertainty_survives_restart(runtime, make_queue):
     restart(manager, make_queue=make_queue)
     member["source_revision"] = 3
     child = manager.live_aggregation.queue_container_update("-100.1", [member], key=key)
-    # A permanently held parent must not strand its dependent: the held row stays
-    # retained for confirmation, but delivery continues behind it.
+    # An unconfirmed container update is not held: it keeps its one more try,
+    # across the restart, ahead of the newer update.
+    assert child not in [row.id for row in manager._outbound_queue.heads(ready_only=True)]
+    calls = len(manager.transport.calls)
+    manager._outbound_scheduler.dispatch_once()
+    submitted = next(iter(manager._outbound_scheduler.in_flight.values()))
+    assert submitted.row.id == parent
+    with pytest.raises(NetworkError):
+        submitted.future.result(timeout=2)
+    manager._outbound_scheduler.harvest_completed()
+    # Unconfirmed again, it is dropped and delivery continues with the newer update.
+    assert not manager._outbound_queue.contains(parent)
     assert child in [row.id for row in manager._outbound_queue.heads(ready_only=True)]
-    assert manager._outbound_queue.contains(parent)
+    manager.transport.error = None
+    complete(manager)
+    # The second try and the newer update; nothing else was sent.
+    assert [call[0] for call in manager.transport.calls[calls:]] == ["edit_message_text", "edit_message_text"]
+    assert not manager._outbound_queue.contains(child)
 
 
 def test_redirect_confirmation_survives_hint_failure_and_newer_edit(runtime, make_queue):
@@ -371,6 +385,13 @@ def test_redirect_confirmation_survives_hint_failure_and_newer_edit(runtime, mak
     assert manager.channel.db.get_msg_log(master_msg_id="-100.1").aggregate["confirmed_text"] == old.text
     restart(manager, make_queue=make_queue)
     edit(handler, "one", "editable after failed hint")
+    # The unconfirmed hint gets its one more try first; unconfirmed again, it is dropped.
+    manager._outbound_scheduler.dispatch_once()
+    submitted = next(iter(manager._outbound_scheduler.in_flight.values()))
+    with pytest.raises(NetworkError):
+        submitted.future.result(timeout=2)
+    manager._outbound_scheduler.harvest_completed()
+    assert not manager._outbound_queue.contains(submitted.row.id)
     complete(manager)
     assert member_message(manager.channel.db.resolve_source_member(key[0], "one", "-100")[1]).text == "editable after failed hint"
 

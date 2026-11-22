@@ -235,6 +235,16 @@ def queries(dialect: Dialect = SQLITE):
         GROUP BY 1, 2, 3, 4
         ORDER BY rows DESC
         """),
+        # Queues written before the reason was kept have no such column; the
+        # report then skips this section.
+        ("held rows: Telegram's error text", f"""
+        SELECT delivery_hold AS hold, hold_reason, COUNT(*) AS rows, MIN(id) AS first_id,
+               {now} - CAST(MIN(created_at) AS BIGINT) AS oldest_age_s
+        FROM outbound_queue
+        WHERE delivery_hold IS NOT NULL AND hold_reason IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY rows DESC
+        """),
         ("history replay progress: staged entries", f"""
         SELECT target_chat_id AS tg_chat, COALESCE(message_thread_id, '0') AS topic,
                COUNT(*) AS staged,
@@ -447,6 +457,11 @@ def row_detail(db, dialect: Dialect, row_id: int, out) -> None:
     columns = [column[0] for column in cursor.description]
     for name, value in zip(columns, row):
         print(f"   {name} = {value}", file=out)
+    try:
+        reason = db.execute("SELECT hold_reason FROM outbound_queue WHERE id = ?", (row_id,)).fetchone()[0]
+    except dialect.errors:
+        reason = "not recorded by the version that wrote this queue"
+    print(f"   hold_reason = {reason}", file=out)
     blobs = db.execute(
         "SELECT log_context, completion_receipt FROM outbound_queue WHERE id = ?", (row_id,)
     ).fetchone()
